@@ -107,8 +107,15 @@ class _LockLedger:
             *,
             deadline: float | None = None,
             shared: bool = False,
+            release_config_after_check: bool = False,
         ) -> Iterator[None]:
-            with locks(config, wait_seconds, deadline=deadline, shared=shared):
+            with locks(
+                config,
+                wait_seconds,
+                deadline=deadline,
+                shared=shared,
+                release_config_after_check=release_config_after_check,
+            ):
                 if not shared:
                     self.exclusive_rounds += 1
                 yield

@@ -29,3 +29,4 @@ Start with `_mutation_locks`, `_begin_finish`, `_finish_fenced_slot`, `_finish_r
 ## Update (#1367)
 
 [watermelon-full-preview] The remove-agent-batch shape of this issue is folded into #1367 wrkslots-salvage-thin-bundle-fast piece (2): batch items are validated and planned lock-free and commit one record at a time under the ACTIVE locks, following #1287. The remaining shapes named here (fence repair, private cleanup, scoped validation finish, interrupted-operation recovery) stay open on this issue.
+[watermelon-full-preview] Supersession for remove (#1367 piece 2b): the "keep #1194 configuration-lock behavior unchanged" note above does not apply to remove. Ordinary remove now follows #1276 like create: the configuration flock is held only to read/validate config, never across salvage, census, or deletion.

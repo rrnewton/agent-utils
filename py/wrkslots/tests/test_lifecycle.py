@@ -4381,9 +4381,11 @@ def test_create_rechecks_assigned_coordinator_at_mutation_and_publication(
     mutation_started = False
 
     @contextlib.contextmanager
-    def observe_lock(config: wrkslots.Config, wait_seconds: float) -> Iterator[None]:
+    def observe_lock(
+        config: wrkslots.Config, wait_seconds: float, **kwargs: object
+    ) -> Iterator[None]:
         nonlocal mutation_started
-        with original_locks(config, wait_seconds):
+        with original_locks(config, wait_seconds, **kwargs):  # type: ignore[arg-type]
             mutation_started = True
             yield
 
@@ -26511,14 +26513,14 @@ def test_reclaim_shares_live_use_recheck_across_pre_and_post_fence(
 
     assert rc == 0, capsys.readouterr().err
     # Before the fence: once before the registry locks, where the /proc scan
-    # runs (#1108), then under them once before salvage and once immediately
-    # before the fence, which re-read that scan's evidence (the check
-    # _begin_finish used to repeat seconds earlier, within the same lock
-    # hold, is gone); after it: once at the fenced path.
-    assert len(observed) == 4
-    assert [path for path, _budget in observed[:3]] == [canonical] * 3
-    assert observed[3][0].parent == canonical.parent
-    assert observed[3][0].name.startswith(".slot01.fenced.1.")
+    # runs (#1108), then under them once before the fence, which re-reads
+    # that scan's evidence (a plain remove is prepared lock-free now, #1367
+    # piece 2b, so the old before-salvage re-check is gone); after it: once
+    # at the fenced path.
+    assert len(observed) == 3
+    assert [path for path, _budget in observed[:2]] == [canonical] * 2
+    assert observed[2][0].parent == canonical.parent
+    assert observed[2][0].name.startswith(".slot01.fenced.1.")
     assert all(budget is observed[0][1] for _path, budget in observed)
 
 
@@ -26758,8 +26760,10 @@ def test_host_context_recover_rechecks_authority_before_locked_writes(
     real_locks = wrkslots._mutation_locks
 
     @contextlib.contextmanager
-    def lose_at_lock(locked_config: wrkslots.Config, wait: float) -> Iterator[None]:
-        with real_locks(locked_config, wait):
+    def lose_at_lock(
+        locked_config: wrkslots.Config, wait: float, **kwargs: object
+    ) -> Iterator[None]:
+        with real_locks(locked_config, wait, **kwargs):  # type: ignore[arg-type]
             terminate_process(writer)
             yield
 
@@ -26864,9 +26868,9 @@ def test_host_context_runner_rechecks_coordinator_at_locked_removal_boundary(
 
     @contextlib.contextmanager
     def terminate_after_lock(
-        config: wrkslots.Config, wait_seconds: float
+        config: wrkslots.Config, wait_seconds: float, **kwargs: object
     ) -> Iterator[None]:
-        with real_mutation_locks(config, wait_seconds):
+        with real_mutation_locks(config, wait_seconds, **kwargs):  # type: ignore[arg-type]
             terminate_process(coordinator)
             yield
 
@@ -26909,9 +26913,9 @@ def test_host_context_runner_rechecks_pipe_writer_at_locked_removal_boundary(
 
     @contextlib.contextmanager
     def terminate_writer_after_lock(
-        config: wrkslots.Config, wait_seconds: float
+        config: wrkslots.Config, wait_seconds: float, **kwargs: object
     ) -> Iterator[None]:
-        with real_mutation_locks(config, wait_seconds):
+        with real_mutation_locks(config, wait_seconds, **kwargs):  # type: ignore[arg-type]
             terminate_process(proof_writer)
             yield
 
@@ -54326,9 +54330,17 @@ def test_register_and_adopt_git_work_under_locks_does_not_grow_with_rows(
         wait_seconds: float,
         *,
         deadline: float | None = None,
+        shared: bool = False,
+        release_config_after_check: bool = False,
     ) -> Iterator[None]:
         nonlocal held
-        with original_locks(config, wait_seconds, deadline=deadline):
+        with original_locks(
+            config,
+            wait_seconds,
+            deadline=deadline,
+            shared=shared,
+            release_config_after_check=release_config_after_check,
+        ):
             start = len(cwds)
             held = True
             try:
@@ -58084,9 +58096,20 @@ def test_remove_runs_its_lsof_scan_before_taking_the_registry_lock(
 
     @contextlib.contextmanager
     def counted_locks(
-        config: wrkslots.Config, wait_seconds: float, *, deadline: float | None = None
+        config: wrkslots.Config,
+        wait_seconds: float,
+        *,
+        deadline: float | None = None,
+        shared: bool = False,
+        release_config_after_check: bool = False,
     ) -> Iterator[None]:
-        with original_locks(config, wait_seconds, deadline=deadline):
+        with original_locks(
+            config,
+            wait_seconds,
+            deadline=deadline,
+            shared=shared,
+            release_config_after_check=release_config_after_check,
+        ):
             depth[0] += 1
             try:
                 yield
@@ -58192,13 +58215,24 @@ def test_remove_finds_a_use_that_began_during_its_lock_wait(
 
     @contextlib.contextmanager
     def enter_while_waiting(
-        config: wrkslots.Config, wait_seconds: float, *, deadline: float | None = None
+        config: wrkslots.Config,
+        wait_seconds: float,
+        *,
+        deadline: float | None = None,
+        shared: bool = False,
+        release_config_after_check: bool = False,
     ) -> Iterator[None]:
         if scanned and not entered:
             entered.append(
                 subprocess.Popen(["sleep", "300"], cwd=tree, start_new_session=True)
             )
-        with real_locks(config, wait_seconds, deadline=deadline):
+        with real_locks(
+            config,
+            wait_seconds,
+            deadline=deadline,
+            shared=shared,
+            release_config_after_check=release_config_after_check,
+        ):
             yield
 
     monkeypatch.setattr(wrkslots, "_remove_unlocked_use_pass", scan)
@@ -64624,9 +64658,20 @@ def test_agent_remove_runs_no_process_scan_under_the_registry_locks(
 
     @contextlib.contextmanager
     def tracked_locks(
-        config: wrkslots.Config, wait_seconds: float, *, deadline: float | None = None
+        config: wrkslots.Config,
+        wait_seconds: float,
+        *,
+        deadline: float | None = None,
+        shared: bool = False,
+        release_config_after_check: bool = False,
     ) -> Iterator[None]:
-        with real_locks(config, wait_seconds, deadline=deadline):
+        with real_locks(
+            config,
+            wait_seconds,
+            deadline=deadline,
+            shared=shared,
+            release_config_after_check=release_config_after_check,
+        ):
             held[0] += 1
             try:
                 yield

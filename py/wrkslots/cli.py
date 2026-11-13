@@ -6245,10 +6245,43 @@ def _mutation_locks(
     *,
     deadline: float | None = None,
     shared: bool = False,
+    release_config_after_check: bool = False,
 ) -> Iterator[None]:
     effective_deadline = (
         time.monotonic() + wait_seconds if deadline is None else deadline
     )
+
+    def check_config() -> None:
+        with _locked_config(
+            config.config_path,
+            _remaining_lock_wait(effective_deadline),
+            exclusive=not shared,
+        ):
+            current = _load_config(str(config.root), config.machine)
+            if current != config:
+                raise Refusal(
+                    "configuration changed while this command was starting; rerun so it "
+                    "uses one coherent policy"
+                )
+
+    global_subject = config.control / "ACTIVE"
+    if release_config_after_check:
+        # The configuration flock (#1194) is held only to read and
+        # validate the configuration (#1367 piece 2b, following #1276);
+        # the ACTIVE registry locks below guard the transition itself.
+        check_config()
+        with _locked(
+            global_subject,
+            exclusive=not shared,
+            wait_seconds=_remaining_lock_wait(effective_deadline),
+        ):
+            with _locked(
+                _active_path(config),
+                exclusive=not shared,
+                wait_seconds=_remaining_lock_wait(effective_deadline),
+            ):
+                yield
+        return
     with _locked_config(
         config.config_path,
         _remaining_lock_wait(effective_deadline),
@@ -6260,7 +6293,6 @@ def _mutation_locks(
                 "configuration changed while this command was starting; rerun so it "
                 "uses one coherent policy"
             )
-        global_subject = config.control / "ACTIVE"
         with _locked(
             global_subject,
             exclusive=not shared,
@@ -54302,6 +54334,19 @@ def _cmd_remove_in_scope(
             archive_drifted=bool(getattr(args, "archive_drifted_checkouts", False)),
             archive_private_history=bool(getattr(args, "archive_private_history", False)),
         )
+    # A plain remove of one agent slot is a guarded item too (#1367
+    # piece 2b): it validates lock-free and commits one record, like a
+    # batch item, instead of holding the configuration flock across its
+    # pre-deletion work.
+    if (
+        single_item
+        and agent_batch is not None
+        and getattr(args, "_retirement_candidate", None) is None
+        and getattr(args, "_batch_candidate", None) is None
+    ):
+        args._batch_candidate = _BatchRemovalCandidate(
+            config.machine, args.slot, args.expected_generation
+        )
     prepared_removal: _PreparedRemoval | None = None
     if (
         (
@@ -54335,9 +54380,18 @@ def _cmd_remove_in_scope(
             )
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
-        _mutation_locks(config, args.wait_lock)
+        _mutation_locks(
+            config,
+            args.wait_lock,
+            release_config_after_check=prepared_removal is not None,
+        )
         if wait_deadline is None
-        else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+        else _mutation_locks(
+            config,
+            args.wait_lock,
+            deadline=wait_deadline,
+            release_config_after_check=prepared_removal is not None,
+        )
     )
     prepared_private_finish: _PreparedPrivateFinish | None = None
     prepared_deferred_finish: _PreparedDeferredFinish | None = None
@@ -55008,9 +55062,16 @@ def _finish_removal_tail(
                 config, prepared_deferred_finish, finish_context
             )
             completion_scope = (
-                _mutation_locks(config, args.wait_lock)
+                _mutation_locks(
+                    config, args.wait_lock, release_config_after_check=True
+                )
                 if wait_deadline is None
-                else _mutation_locks(config, args.wait_lock, deadline=wait_deadline)
+                else _mutation_locks(
+                    config,
+                    args.wait_lock,
+                    deadline=wait_deadline,
+                    release_config_after_check=True,
+                )
             )
             with completion_scope:
                 _refuse_partial_state(config, allow_validate_batch_seals=True)

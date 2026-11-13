@@ -55,3 +55,36 @@ def test_remove_agent_batch_validates_nothing_under_lock(
     for label in ("validate", "slot-unused", "salvage", "finish-paths"):
         assert ledger.count(label, held=False) > 0, (label, ledger.calls)
     assert ledger.pregather_probes == [False, False]
+
+
+def test_plain_remove_validates_nothing_under_the_configuration_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Plain remove gets the same lock-free treatment (#1367 piece 2b).
+
+    The project-root configuration flock (the lock ledger's probe) is
+    taken only to read/validate config and to commit the slot's record;
+    validation, census, salvage and deletion all run with it released.
+    """
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=1)
+    ledger = _LockLedger(monkeypatch, project)
+
+    code = cli.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            slots[0],
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+    assert code == 0, capsys.readouterr().err
+    for label in _NEVER_HELD:
+        assert ledger.count(label, held=True) == 0, (label, ledger.calls)
+    for label in ("validate", "slot-unused", "salvage", "finish-paths"):
+        assert ledger.count(label, held=False) > 0, (label, ledger.calls)
+    assert ledger.pregather_probes == [False]
