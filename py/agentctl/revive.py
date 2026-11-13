@@ -1,4 +1,4 @@
-"""Token-bound recovery of an owned interactive generation, without queue replay."""
+"""Token-bound recovery of an owned interactive generation, keeping its queued prompts."""
 from __future__ import annotations
 
 import copy
@@ -934,14 +934,24 @@ def _complete_locked(manager: ManagedAgents, journal: dict[str, object]) -> dict
             except Exception as error:
                 result["slot_owner"] = {"owed": str(error)}
     try:
-        result["archived_prompts"] = _report_archived_prompts(manager, name, archive)
+        carry = _carry_over_queue(manager, name, archive)
+        result["queued_carried"] = carry["carried"]
+        result["queued_archived"] = carry["archived"]
+        result["archived_prompts"] = carry["archived"]
+        result["queued_uncertain"] = carry["uncertain"]
+        result["queued_delivered"] = []
+        result["queued_pending"] = [cast(str, row["id"]) for row in carry["carried"]]
     except OSError as exc:
         result["archived_prompts_error"] = str(exc)
+        result["queued_carried"] = []
+        result["queued_archived"] = []
+        result["archived_prompts"] = []
+        result["queued_uncertain"] = []
+        result["queued_delivered"] = []
+        result["queued_pending"] = []
     return result
 
 
-#: Queue lanes whose items a revive archives undelivered, in the order they are reported.
-_UNDELIVERED_LANES = ("inbox", "inbox.v2", "inflight", "failed")
 #: Longest first line one archived prompt's report row carries.
 _FIRST_LINE_CHARS = 80
 
@@ -970,45 +980,159 @@ def _prompt_first_line(text: str) -> str:
     return ""
 
 
-def _report_archived_prompts(manager: ManagedAgents, name: str, archive: Path) -> list[dict[str, object]]:
-    """Name and record the prompts a revive archived without delivering them.
+def _carry_over_queue(manager: ManagedAgents, name: str, archive: Path) -> dict[str, list[dict[str, object]]]:
+    """Carry the archived queue into the new generation (#1413 revive-keeps-queued-messages).
 
-    Every item left in the archived queue's inbox, in flight, or failed is copied into the new
-    generation's ``failed/`` with the reason, unless it is already there, so a sender asking after
-    it reads failed, never delivered, and no drain ever types it. One row per prompt: its ID,
-    sender, first line and old lane.
+    Pending items move with their ids, oldest first; expired or cancelled items are set
+    aside in the new ``cancelled/`` with their reason; in-flight items, whose outcome is
+    unknown, are quarantined in the new ``failed/`` and never retyped; already-failed
+    items stay failed. Delivery itself happens in :func:`_deliver_carried`, after the
+    revive locks are released.
     """
-    failed = manager._directory(name) / "queue" / "failed"
-    reported: list[dict[str, object]] = []
+    old_queue = archive / "queue"
+    new_queue = manager._directory(name) / "queue"
+    carried: list[dict[str, object]] = []
+    archived: list[dict[str, object]] = []
+    uncertain: list[dict[str, object]] = []
     now = time.time()
-    for lane in _UNDELIVERED_LANES:
-        directory = archive / "queue" / lane
+
+    def row(document: dict[str, object], identifier: str, lane: str) -> dict[str, object]:
+        text = document.get("text")
+        return {"id": identifier, "sender": _prompt_sender(document, text if isinstance(text, str) else ""),
+                "first_line": _prompt_first_line(text if isinstance(text, str) else ""), "lane": lane}
+
+    def move(path: Path, lane_directory: Path) -> Path:
+        # A copy, never a move: the archive keeps its complete forensic queue.
+        lane_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target = lane_directory / path.name
+        if not os.path.lexists(target):
+            agent._atomic_json(str(target), json.loads(path.read_text(encoding="utf-8")))
+        return target
+
+    for path in (sorted((old_queue / "failed").glob("*.json")) if (old_queue / "failed").is_dir() else []):
+        identifier = path.stem
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(document, dict) or identifier.startswith("failed-digest-") or document.get("failed_digest") is True:
+            continue
+        target = move(path, new_queue / "failed")
+        sidecar = Path(f"{path}.error")
+        if os.path.lexists(sidecar) and not os.path.lexists(f"{target}.error"):
+            agent._atomic_json(f"{target}.error", json.loads(sidecar.read_text(encoding="utf-8")))
+        archived.append({**row(document, identifier, "failed"), "reason": "failed",
+                         "detail": "already failed before revive; kept failed, never replayed"})
+    for path in (sorted((old_queue / "inflight").glob("*.json")) if (old_queue / "inflight").is_dir() else []):
+        identifier = path.stem
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        target = move(path, new_queue / "failed")
+        if not os.path.lexists(f"{target}.error"):
+            agent._atomic_json(f"{target}.error", {
+                "error": ("archived by revive, outcome unknown: the prompt was in flight to the old "
+                          "pane and may have been typed; it is never replayed"),
+                "failed_at": now,
+            })
+        entry = {**row(document, identifier, "inflight"), "reason": "uncertain",
+                 "detail": "in flight to the old pane; outcome unknown, reported and never replayed"}
+        uncertain.append(entry)
+        archived.append(entry)
+    for lane in ("inbox", "inbox.v2"):
+        directory = old_queue / lane
         if not directory.is_dir():
             continue
-        for path in sorted(directory.glob("*.json")):
+        paths = sorted(directory.glob("*.json"), key=lambda item: _carried_order(item))
+        for path in paths:
             identifier = path.stem
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            text = document.get("text") if isinstance(document, dict) else None
-            if not isinstance(document, dict) or not isinstance(text, str) or not text:
+            if not isinstance(document, dict):
                 continue
-            if identifier.startswith("failed-digest-") or document.get("failed_digest") is True:
+            text = document.get("text")
+            if not isinstance(text, str) or not text:
                 continue
-            target = failed / f"{identifier}.json"
-            if not os.path.lexists(target):
-                for private in (failed.parent, failed):
-                    private.mkdir(mode=0o700, exist_ok=True)
-                agent._atomic_json(str(target), cast(dict[str, object], document))
-                agent._atomic_json(f"{target}.error", {
-                    "error": ("archived by revive, not delivered: the old generation's queue was archived "
-                              f"and is never replayed; the prompt is kept at {path}"),
-                    "failed_at": now,
-                })
-            reported.append({"id": identifier, "sender": _prompt_sender(document, text),
-                             "first_line": _prompt_first_line(text), "lane": lane})
-    return reported
+            reason: str | None = None
+            detail = ""
+            tombstone = old_queue / "cancel" / f"{identifier}.json"
+            not_after = document.get("not_after")
+            if os.path.lexists(tombstone):
+                reason, detail = "cancelled", "cancelled by a tombstone before revive"
+            elif isinstance(not_after, (int, float)) and not isinstance(not_after, bool) and float(not_after) <= time.time() * 1000:
+                reason, detail = "expired", f"not_after {not_after} passed before revive"
+            if reason is not None:
+                aside = dict(document)
+                aside.update({"delivery_state": "cancelled", "cancel_reason": reason,
+                              "cancel_detail": detail, "cancelled_at": now, "archived_by_revive": True})
+                target = new_queue / "cancelled" / f"{identifier}.json"
+                (new_queue / "cancelled").mkdir(mode=0o700, parents=True, exist_ok=True)
+                if not os.path.lexists(target):
+                    agent._atomic_json(str(target), aside)
+                archived.append({**row(document, identifier, lane), "reason": reason, "detail": detail})
+                continue
+            move(path, new_queue / lane)
+            carried.append(row(document, identifier, lane))
+    old_cancelled = old_queue / "cancelled"
+    if old_cancelled.is_dir():
+        for path in sorted(old_cancelled.glob("*.json")):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            move(path, new_queue / "cancelled")
+            archived.append({**row(document, path.stem, "cancelled"),
+                             "reason": str(document.get("cancel_reason") or "cancelled"),
+                             "detail": str(document.get("cancel_detail") or "set aside before revive")})
+    old_cancel = old_queue / "cancel"
+    if old_cancel.is_dir():
+        for path in sorted(old_cancel.glob("*.json")):
+            move(path, new_queue / "cancel")
+    return {"carried": carried, "archived": archived, "uncertain": uncertain}
+
+
+def _carried_order(path: Path) -> tuple[bool, float, str]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        queued_at = document.get("queued_at") if isinstance(document, dict) else None
+    except (OSError, ValueError):
+        queued_at = None
+    numeric = float(queued_at) if isinstance(queued_at, (int, float)) and not isinstance(queued_at, bool) else None
+    return (numeric is None, numeric if numeric is not None else 0.0, path.name)
+
+
+def _deliver_carried(manager: ManagedAgents, name: str, result: dict[str, object]) -> None:
+    """Drain what a revive carried, once its locks are released (#1413).
+
+    This edition does not honour ``inbox.v2`` expiry lanes, so a carried v2 item stays
+    pending for the Rust drainer instead of being typed here.
+    """
+    carried = result.get("queued_carried")
+    if not isinstance(carried, list) or not carried:
+        return
+    rows = [cast(dict[str, object], item) for item in carried if isinstance(item, dict)]
+    ids = [cast(str, row["id"]) for row in rows]
+    if any(row.get("lane") == "inbox.v2" for row in rows):
+        result["queued_pending"] = ids
+        return
+    try:
+        drained = manager.drain(name, ready_timeout=60.0, deliver_while_working=True)
+    except Exception as exc:  # noqa: BLE001 - a failed drain leaves items pending, never archived
+        result["queued_drain_error"] = str(exc)
+        result["queued_pending"] = ids
+        return
+    delivered = [identifier for identifier in drained.delivered if identifier in ids]
+    result["queued_delivered"] = delivered
+    result["queued_pending"] = [identifier for identifier in ids if identifier not in delivered]
+    result["queued_drain"] = {"delivered": delivered, "pending": list(drained.pending),
+                              "quarantined": list(drained.quarantined), "outcome": drained.outcome}
 
 
 def _preserve_unlaunched_setup(
@@ -1355,6 +1479,7 @@ def revive_all(manager: ManagedAgents, *, dry_run: bool = False, startup_timeout
             result = plan(manager, name)
             if not dry_run and result["action"] in ("revive", "recover"):
                 result = revive(manager, name, expected_token=cast(str, result["token"]), startup_timeout=startup_timeout)
+                _deliver_carried(manager, name, result)
                 revived += 1
             elif result["action"] == "blocked":
                 blocked += 1

@@ -1754,7 +1754,7 @@ def registry_bytes(registry: Path) -> dict[str, bytes]:
 
 
 @pytest.mark.parametrize("harness", ["codex", "claude", "muse"])
-def test_revive_resumes_exact_conversation_and_archives_without_replaying(
+def test_revive_resumes_exact_conversation_and_keeps_its_queue(
     harness: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake, old = prepare_revive(tmp_path, monkeypatch, harness=harness, model="chosen")
@@ -1764,7 +1764,7 @@ def test_revive_resumes_exact_conversation_and_archives_without_replaying(
     old._unknown["future_metadata"] = {"preserve": True}
     manager._save(old)
     queue = manager._directory("worker") / "queue"
-    agent.enqueue(str(queue), "must never be replayed", message_id="pending-task")
+    agent.enqueue(str(queue), "queued while dead", message_id="pending-task")
     quarantine = queue / "quarantine"
     quarantine.mkdir(mode=0o700)
     agent._atomic_json(str(quarantine / "uncertain.json"), {"state": "possibly_submitted", "text": "ambiguous old input"})
@@ -1783,16 +1783,18 @@ def test_revive_resumes_exact_conversation_and_archives_without_replaying(
     assert new.goal_message_id is None and new.goal_delivery is None and new.goal_messages == {} and new.goal_session_id is None
     assert new._unknown["future_metadata"] == {"preserve": True} and new._unknown["revived_from"] == old.token
     assert new.pane_id != old.pane_id and fake.closed == [old.tab_id]
-    assert len(fake.launched) == 2 and fake.submitted == [] and fake.keys_sent == []
-    # Archived, never replayed, but reported: the undelivered prompt is named and failed in the
-    # new queue, so its sender reads it as not delivered (#899).
+    assert len(fake.launched) == 2
+    # Carried, never archived (#1413): the prompt queued while dead keeps its id in the
+    # new generation's inbox. This agent is paused for human input, so the automated
+    # drain correctly leaves it pending instead of typing it or archiving it.
+    assert result["queued_pending"] == ["pending-task"], result
+    assert result["queued_delivered"] == [], result
+    assert result["archived_prompts"] == [], result
+    assert "queued while dead" not in fake.submitted
     new_queue = manager._directory("worker") / "queue"
-    assert sorted(path.name for path in new_queue.rglob("*") if path.is_file()) == [
-        "pending-task.json", "pending-task.json.error"]
-    assert "archived by revive" in json.loads((new_queue / "failed/pending-task.json.error").read_text())["error"]
-    assert [row["id"] for row in cast(list[dict[str, object]], result["archived_prompts"])] == ["pending-task"]
+    assert (new_queue / "inbox" / "pending-task.json").is_file()
     for path, content in old_files.items():
-        if path != "agent.json":
+        if path != "agent.json" and not path.startswith("queue/inbox"):
             assert (archive / path).read_bytes() == content
     archived = json.loads((archive / "agent.json").read_text())
     expected = json.loads(old_files["agent.json"])
@@ -1804,6 +1806,47 @@ def test_revive_resumes_exact_conversation_and_archives_without_replaying(
         assert arguments[:2] == ("--resume", new.resume) and "--session-id" not in arguments
     elif harness == "muse":
         assert arguments[-2:] == ("resume", new.resume)
+
+
+def test_revive_delivers_three_queued_prompts_in_order_and_archives_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1413 acceptance: queue three messages to a dead agent, revive it, and all three
+    # are delivered in order, with none archived.
+    manager, fake, _old = prepare_revive(tmp_path, monkeypatch)
+    queue = manager._directory("worker") / "queue"
+    for index, identifier in enumerate(("m-1", "m-2", "m-3")):
+        agent.enqueue(str(queue), f"queued prompt {identifier}", message_id=identifier)
+        item = queue / "inbox" / f"{identifier}.json"
+        document = json.loads(item.read_text())
+        document["queued_at"] = 100.0 + index
+        agent._atomic_json(str(item), document)
+    result = manager.revive("worker")
+    assert result["queued_delivered"] == ["m-1", "m-2", "m-3"], result
+    assert result["queued_archived"] == [], result
+    assert [text for text in fake.submitted if text.startswith("queued prompt")] == [
+        "queued prompt m-1", "queued prompt m-2", "queued prompt m-3"]
+
+
+def test_revive_archives_an_expired_item_with_its_reason_and_status_counts_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1413: an expired item is archived with its reason, and status shows the count.
+    manager, _fake, _old = prepare_revive(tmp_path, monkeypatch)
+    queue = manager._directory("worker") / "queue"
+    expired = queue / "inbox.v2"
+    expired.mkdir(mode=0o700, parents=True, exist_ok=True)
+    agent._atomic_json(str(expired / "m-expired.json"),
+                       {"id": "m-expired", "text": "too late", "queued_at": 100.0, "not_after": 1})
+    result = manager.revive("worker")
+    archived = cast(list[dict[str, object]], result["queued_archived"])
+    assert len(archived) == 1 and archived[0]["id"] == "m-expired", result
+    assert archived[0]["reason"] == "expired", result
+    assert result["queued_delivered"] == [], result
+    assert (queue / "cancelled" / "m-expired.json").is_file() or (
+        manager._directory("worker") / "queue" / "cancelled" / "m-expired.json").is_file()
+    status = manager.status("worker")
+    assert status["queued_archived_undelivered"] == 1, status
 
 
 def test_revive_dry_run_is_byte_pure_and_does_not_create_locks_or_tabs(

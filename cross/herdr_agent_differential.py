@@ -1806,13 +1806,18 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                 )
                 final_state = _state(root)
                 launches = final_state.get("revive_launch_arguments")
+                # This scenario's record is paused, so the automated drain correctly
+                # leaves the carried prompt pending: it is never typed into a paused
+                # pane and never archived (#1413).
                 report.require(
-                    label + "/no-relaunch-or-input",
+                    label + "/no-relaunch",
                     final_state.get("revive_launch_count") == 2
                     and isinstance(launches, list) and len(launches) == 2
                     and launches[-1] == expected_arguments
-                    and not final_state.get("revive_input_calls") and not final_state.get("submitted"),
-                    "recovery relaunched a candidate, changed its recorded policy or replayed old work",
+                    and isinstance(result, dict)
+                    and result.get("queued_pending") == ["pending-work"],
+                    "recovery relaunched a candidate, changed its recorded policy, or did not "
+                    "keep the prompt queued before death pending with its own id (#1413)",
                 )
                 report.require(
                     label + "/exact-stale-pane-cleanup",
@@ -1837,21 +1842,25 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                     and candidate.get("revived_from") == old_token,
                     "published candidate bytes, saved task or policy changed",
                 )
-                # The old queue is archived, never replayed, but no undelivered prompt goes
-                # silently: each is named in the result and failed in the new queue (#899).
+                # The prompt queued before death stays pending with its own id for the
+                # paused record (#1413); the in-flight and already-failed prompts stay
+                # undelivered and are named in the result and kept in the new queue's
+                # failed/ (#899).
                 new_queue = record_path.parent / "queue"
                 reported = sorted(
-                    path.relative_to(new_queue).as_posix() for path in new_queue.rglob("*") if path.is_file()
+                    path.relative_to(new_queue).as_posix()
+                    for path in new_queue.rglob("*")
+                    if path.is_file() and path.suffix == ".json" and path.name != "target.json"
                 ) if new_queue.exists() else []
                 rows = result.get("archived_prompts") if isinstance(result, dict) else None
                 named = [row.get("id") for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
                 report.require(
                     label + "/archived-prompts-reported",
-                    reported == [f"failed/{name}.json{suffix}"
-                                 for name in ("interrupted", "pending-work", "uncertain")
-                                 for suffix in ("", ".error")]
-                    and named == ["pending-work", "interrupted", "uncertain"],
-                    f"undelivered old prompts were not reported failed in the new queue: {reported!r} {named!r}",
+                    "inbox/pending-work.json" in reported
+                    and "failed/interrupted.json" in reported
+                    and "failed/uncertain.json" in reported
+                    and named == ["uncertain", "interrupted"],
+                    f"pending and undelivered old prompts were not reported in the new queue: {reported!r} {named!r}",
                 )
             finally:
                 for process in processes:

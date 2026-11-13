@@ -1624,6 +1624,10 @@ fn recover_agent<A: ManagedApi + ?Sized>(
                     "action": "revived",
                     "pane_id": result["pane_id"],
                     "workspace_id": result["workspace_id"],
+                    "queued_delivered": result["queued_delivered"].as_array().map_or(0, Vec::len),
+                    "queued_archived": result["queued_archived"].as_array().map_or(0, Vec::len),
+                    "queued_uncertain": result["queued_uncertain"].as_array().map_or(0, Vec::len),
+                    "queued_pending": result["queued_pending"].as_array().map_or(0, Vec::len),
                 }),
                 Err(error) => {
                     json!({"name": name, "action": "refused", "reason": error.to_string()})
@@ -1721,6 +1725,10 @@ fn revive_fresh<A: ManagedApi + ?Sized>(
         "action": "revived-fresh",
         "pane_id": result["pane_id"],
         "workspace_id": result["workspace_id"],
+        "queued_delivered": result["queued_delivered"].as_array().map_or(0, Vec::len),
+        "queued_archived": result["queued_archived"].as_array().map_or(0, Vec::len),
+        "queued_uncertain": result["queued_uncertain"].as_array().map_or(0, Vec::len),
+        "queued_pending": result["queued_pending"].as_array().map_or(0, Vec::len),
         "session": session,
         "reason": reason,
         "warning": warning,
@@ -2347,6 +2355,31 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
             }
         ),
         format!("Revived: {}.", list("revived", &pane)),
+        format!(
+            "Queued prompts after revive: {}.",
+            {
+                let items = agents
+                    .iter()
+                    .filter(|row| {
+                        row["queued_delivered"].as_u64().unwrap_or(0) > 0
+                            || row["queued_archived"].as_u64().unwrap_or(0) > 0
+                    })
+                    .map(|row| {
+                        format!(
+                            "{} ({} delivered, {} archived)",
+                            row["name"].as_str().unwrap_or("?"),
+                            row["queued_delivered"].as_u64().unwrap_or(0),
+                            row["queued_archived"].as_u64().unwrap_or(0),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if items.is_empty() {
+                    "none".to_owned()
+                } else {
+                    items.join("; ")
+                }
+            }
+        ),
         format!(
             "STARTED FRESH, no memory of their previous conversation (give them their task again): {}.",
             list("revived-fresh", &reason)

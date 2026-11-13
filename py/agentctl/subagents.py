@@ -3253,9 +3253,12 @@ class ManagedAgents:
         expected_token: str | None = None, startup_timeout: float = 30.0,
     ) -> dict[str, object]:
         """Resume one positively dead owned harness in a fresh tab."""
-        from agentctl.revive import revive
-        return revive(self, name, dry_run=dry_run, expected_token=expected_token,
-                      startup_timeout=startup_timeout)
+        from agentctl.revive import _deliver_carried, revive
+        result = revive(self, name, dry_run=dry_run, expected_token=expected_token,
+                        startup_timeout=startup_timeout)
+        if not dry_run and result.get("revived") is True:
+            _deliver_carried(self, name, result)
+        return result
 
     def restart(
         self, name: str, *, when_idle: bool = False,
@@ -4334,6 +4337,24 @@ class ManagedAgents:
                 keys.add("PATH")
         return sorted(keys)
 
+    def _queued_archived_undelivered(self, name: str) -> int:
+        """Queued items a revive archived undelivered (#1413): set aside in ``cancelled/``
+        with their reason, or quarantined in ``failed/`` with an ``archived by revive`` sidecar."""
+        queue = Path(self._queue(name))
+        count = 0
+        cancelled = queue / "cancelled"
+        if cancelled.is_dir():
+            count += sum(1 for _ in cancelled.glob("*.json"))
+        failed = queue / "failed"
+        if failed.is_dir():
+            for sidecar in failed.glob("*.json.error"):
+                try:
+                    if "archived by revive" in sidecar.read_text(encoding="utf-8"):
+                        count += 1
+                except OSError:
+                    continue
+        return count
+
     def _status_record(self, record: AgentRecord) -> dict[str, object]:
         """Probe one pinned record without resolving its name a second time."""
         name = record.name
@@ -4349,6 +4370,7 @@ class ManagedAgents:
             result["resolved_model"] = record.resolved_model
         if record.purpose is not None:
             result["purpose"] = record.purpose
+        result["queued_archived_undelivered"] = self._queued_archived_undelivered(name)
         try:
             destination = self._pending_move_destination(record)
             if destination is not None:

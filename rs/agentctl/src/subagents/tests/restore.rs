@@ -692,6 +692,40 @@ fn restore_queues_a_catch_up_for_each_revived_agent_without_blocking() {
 }
 
 #[test]
+fn restore_reports_queued_delivered_and_archived_counts_per_agent() {
+    // #1413: the restore report lists, per agent, how many queued items were delivered
+    // and archived, so #1416 team-restore-verify can check nothing was archived undelivered.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    let queue_root = fixture.manager().queue("lane").unwrap();
+    agent::create_private_directory(&queue_root.join("inbox"), "test queue lane", true, false)
+        .unwrap();
+    agent::create_private_directory(&queue_root.join("inbox.v2"), "test queue lane", true, false)
+        .unwrap();
+    agent::atomic_json(
+        &queue_root.join("inbox/queued-1.json"),
+        &json!({"id": "queued-1", "text": "first queued", "queued_at": 100.0}),
+    )
+    .unwrap();
+    agent::atomic_json(
+        &queue_root.join("inbox.v2/queued-expired.json"),
+        &json!({"id": "queued-expired", "text": "too late", "queued_at": 101.0, "not_after": 1}),
+    )
+    .unwrap();
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["agents"][0]["action"], "revived", "{report}");
+    assert_eq!(
+        report["agents"][0]["queued_delivered"],
+        json!(1),
+        "{report}"
+    );
+    assert_eq!(report["agents"][0]["queued_archived"], json!(1), "{report}");
+}
+
+#[test]
 fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
     let fixture = Fixture::new();
     fixture

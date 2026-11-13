@@ -11553,6 +11553,30 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         )
     }
 
+    /// Queued items a revive archived undelivered (#1413): set aside in `cancelled/` with
+    /// their reason, or quarantined in `failed/` with an `archived by revive` sidecar.
+    fn queued_archived_undelivered(&self, record: &AgentRecord) -> usize {
+        let Ok(root) = self.queue(&record.name) else {
+            return 0;
+        };
+        let directories = agent_queue::queue::QueueDirectories::new(&root);
+        let cancelled = agent_queue::queue::json_paths(&directories.cancelled)
+            .map(|paths| paths.len())
+            .unwrap_or(0);
+        let mut failed = 0;
+        if let Ok(paths) = agent_queue::queue::json_paths(&directories.failed) {
+            for path in paths {
+                let sidecar = PathBuf::from(format!("{}.error", path.display()));
+                if std::fs::read_to_string(&sidecar)
+                    .is_ok_and(|text| text.contains("archived by revive"))
+                {
+                    failed += 1;
+                }
+            }
+        }
+        cancelled + failed
+    }
+
     fn status_record(&self, record: &AgentRecord) -> Result<Value> {
         self.status_record_viewing(record, true)
     }
@@ -11603,6 +11627,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let agent_name = &record.name;
         let mut result = self.record_row(record)?;
         result["launch_env_keys"] = json!(self.launch_env_keys(record));
+        result["queued_archived_undelivered"] = json!(self.queued_archived_undelivered(record));
         match self.pending_move_destination(record) {
             Ok(Some(destination)) => {
                 result["agent_status"] = json!("unknown");

@@ -747,6 +747,14 @@ struct Journal {
     unknown: crate::forward_compat::KeptKeys,
 }
 
+/// The outcome of carrying one archived queue into its new generation (#1413).
+#[derive(Default)]
+struct QueueCarry {
+    carried: Vec<Value>,
+    archived: Vec<Value>,
+    uncertain: Vec<Value>,
+}
+
 pub(super) fn token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 80
@@ -2988,47 +2996,21 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "restart of '{agent_name}' exited its harness but could not relaunch it, so its pane holds a shell: {error}; once the cause is fixed, `agentctl revive {agent_name}` finishes the restart"
             ))
         })?;
-        // Drain, never archive (R1 gap 3): prompts that reached the old
-        // generation during the restart window were archived by revive;
-        // re-enqueue their text into the restarted session under fresh
-        // ids, then drain the new inbox. Delivered ids are the
-        // submission evidence; the report maps old id -> new id.
-        let mut replayed = Vec::new();
-        if let (Some(archive), Some(rows)) = (
-            result["archive"].as_str(),
-            result["archived_prompts"].as_array(),
-        ) {
-            use agent_queue::queue::QueueDirectories;
-            let old_queue = QueueDirectories::new(&Path::new(archive).join("queue"));
-            for row in rows {
-                let (Some(id), Some(lane)) = (row["id"].as_str(), row["lane"].as_str()) else {
-                    continue;
-                };
-                if !matches!(lane, "inbox" | "inbox.v2" | "inflight") {
-                    continue;
-                }
-                let directory = match lane {
-                    "inbox" => &old_queue.inbox,
-                    "inbox.v2" => &old_queue.inbox_v2,
-                    _ => &old_queue.inflight,
-                };
-                let Ok(document) =
-                    agent_queue::queue::load_message(&directory.join(format!("{id}.json")))
-                else {
-                    continue;
-                };
-                let Some(text) = document.get("text").and_then(Value::as_str) else {
-                    continue;
-                };
-                let new_id = format!("restart-{id}");
-                if self
-                    .queue_identified(agent_name, text, None, None, Some(&new_id))
-                    .is_ok()
-                {
-                    replayed.push(json!({"old_id": id, "new_id": new_id, "lane": lane}));
-                }
-            }
-        }
+        // Queued prompts survive the restart window (#1413): revive carried them into the
+        // new generation with their own ids and drained them, so a restart replays nothing
+        // under fresh ids. The report maps each carried id to itself.
+        let replayed: Vec<Value> = result["queued_carried"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let id = row["id"].as_str()?;
+                        let lane = row["lane"].as_str()?;
+                        Some(json!({"old_id": id, "new_id": id, "lane": lane}))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let drained = self.drain(
             agent_name,
             DrainOptions {
@@ -3139,6 +3121,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "restart_journal": restart_journal,
             "profile_refresh": profile_changes,
             "replayed_prompts": replayed,
+            "queued_delivered": result["queued_delivered"],
+            "queued_archived": result["queued_archived"],
             "drain": drain_report,
             "peers": peers,
         }))
@@ -3271,9 +3255,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// interrupted revive whose candidate cannot be proved alive or dead is marked failed too,
     /// unless a harness process runs for it. A candidate proved dead is abandoned either way.
     ///
-    /// A revive archives the old queue and never replays it, but no prompt goes silently: the
-    /// result's `archived_prompts` names every one it left undelivered, and each is recorded as
-    /// failed in the new generation's queue ([`Self::report_archived_prompts`]).
+    /// A revive keeps the old queue's queued prompts (#1413 revive-keeps-queued-messages):
+    /// pending items move into the new generation's queue with their ids and order, and are
+    /// drained once the new pane is ready. Only an item that cannot be delivered on its own
+    /// terms is archived undelivered: expired or cancelled items are set aside in
+    /// `cancelled/` with their reason, an item already in flight whose outcome is unknown is
+    /// quarantined in `failed/` as possibly submitted (reported, never retyped), and an
+    /// already-failed item stays failed. The result names them all: `queued_carried`,
+    /// `queued_delivered`, `queued_pending`, `queued_archived` (also spelled
+    /// `archived_prompts` for older readers) and `queued_uncertain`.
     pub fn revive_with(
         &self,
         agent_name: &str,
@@ -3290,8 +3280,50 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             abandon_candidate,
         )?;
         if let Some(archive) = result["archive"].as_str().filter(|_| !dry_run) {
-            match self.report_archived_prompts(agent_name, Path::new(archive)) {
-                Ok(reported) => result["archived_prompts"] = reported,
+            match self.carry_over_queue(agent_name, Path::new(archive)) {
+                Ok(carry) => {
+                    let carried_ids: Vec<String> = carry
+                        .carried
+                        .iter()
+                        .filter_map(|row| row["id"].as_str().map(str::to_owned))
+                        .collect();
+                    result["queued_carried"] = json!(carry.carried);
+                    result["queued_archived"] = json!(carry.archived);
+                    result["archived_prompts"] = result["queued_archived"].clone();
+                    result["queued_uncertain"] = json!(carry.uncertain);
+                    let mut delivered: Vec<String> = Vec::new();
+                    if !carried_ids.is_empty() {
+                        match self.drain(
+                            agent_name,
+                            DrainOptions {
+                                ready_timeout: Duration::from_secs(60),
+                                deliver_while_working: true,
+                                ..DrainOptions::default()
+                            },
+                        ) {
+                            Ok(queue) => {
+                                delivered = queue
+                                    .delivered
+                                    .into_iter()
+                                    .filter(|id| carried_ids.contains(id))
+                                    .collect();
+                                result["queued_drain"] = json!({
+                                    "delivered": delivered,
+                                    "pending": queue.pending,
+                                    "cancelled": queue.cancelled,
+                                    "quarantined": queue.quarantined,
+                                    "outcome": format!("{:?}", queue.outcome),
+                                });
+                            }
+                            Err(error) => result["queued_drain_error"] = json!(error.to_string()),
+                        }
+                    }
+                    result["queued_delivered"] = json!(delivered);
+                    result["queued_pending"] = json!(carried_ids
+                        .into_iter()
+                        .filter(|id| !delivered.contains(id))
+                        .collect::<Vec<_>>());
+                }
                 Err(error) => result["archived_prompts_error"] = json!(error.to_string()),
             }
         }
@@ -3685,38 +3717,29 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.finish_revive(&mut journal, &record)
     }
 
-    /// Name and record the prompts a revive archived without delivering them (#899): every item
-    /// left in the archived queue's inbox, in flight, or failed. Each is copied into the new
-    /// generation's `failed/` with the reason, unless it is already there, so a sender asking
-    /// after it reads failed, never delivered, the failed-queue digest names it, and no drain
-    /// ever types it. Returns one row per prompt: its ID, sender, first line and old lane.
-    fn report_archived_prompts(&self, agent_name: &str, archive: &Path) -> Result<Value> {
+    /// Carry the archived queue into the new generation (#1413): pending items move with
+    /// their ids and `queued_at` order, expired or cancelled items are set aside in the new
+    /// `cancelled/` with their reason, in-flight items (outcome unknown) are quarantined in
+    /// the new `failed/` as possibly submitted, and already-failed items stay failed.
+    fn carry_over_queue(&self, agent_name: &str, archive: &Path) -> Result<QueueCarry> {
         use agent_queue::queue::QueueDirectories;
-        let old = QueueDirectories::new(&archive.join("queue"));
-        let failed = QueueDirectories::new(&self.queue(agent_name)?).failed;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| fail(error.to_string()))?
-            .as_secs_f64();
-        let mut reported = Vec::new();
-        for (lane, directory) in [
-            ("inbox", &old.inbox),
-            ("inbox.v2", &old.inbox_v2),
-            ("inflight", &old.inflight),
-            ("failed", &old.failed),
-        ] {
-            let Ok(entries) = fs::read_dir(directory) else {
-                continue;
-            };
-            let mut paths: Vec<PathBuf> = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .is_some_and(|extension| extension == "json")
-                })
-                .collect();
-            paths.sort();
+        let old_root = archive.join("queue");
+        let old = QueueDirectories::new(&old_root);
+        let new_root = self.queue(agent_name)?;
+        let new = agent_queue::queue::prepare(&new_root)?;
+        let now = agent_queue::queue::unix_seconds();
+        let mut carry = QueueCarry::default();
+        let row = |document: &serde_json::Map<String, Value>, id: &str, lane: &str| {
+            let text = document.get("text").and_then(Value::as_str).unwrap_or("");
+            json!({
+                "id": id,
+                "sender": crate::failed_digest::sender_of(document, text),
+                "first_line": crate::failed_digest::first_line_of(text),
+                "lane": lane,
+            })
+        };
+        // Already-failed items stay failed, with their original sidecar.
+        if let Ok(paths) = agent_queue::queue::json_paths(&old.failed) {
             for path in paths {
                 let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                     continue;
@@ -3729,37 +3752,183 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 {
                     continue;
                 }
-                let text = document.get("text").and_then(Value::as_str).unwrap_or("");
-                let target = failed.join(format!("{id}.json"));
+                let target = new.failed.join(format!("{id}.json"));
                 if !target.exists() {
-                    agent::create_private_directory(
-                        &failed,
-                        "revived queue failed lane",
-                        true,
-                        false,
-                    )?;
-                    agent::atomic_json(&target, &Value::Object(document.clone()))?;
-                    agent::atomic_json(
-                        &PathBuf::from(format!("{}.error", target.display())),
-                        &json!({
-                            "error": format!(
-                                "archived by revive, not delivered: the old generation's queue \
-                                 was archived and is never replayed; the prompt is kept at {}",
-                                path.display()
-                            ),
-                            "failed_at": now,
-                        }),
-                    )?;
+                    fs::copy(&path, &target).map_err(|error| fail(error.to_string()))?;
+                    let sidecar = PathBuf::from(format!("{}.error", path.display()));
+                    if sidecar.exists() {
+                        let _ = fs::copy(
+                            &sidecar,
+                            PathBuf::from(format!("{}.error", target.display())),
+                        );
+                    }
                 }
-                reported.push(json!({
-                    "id": id,
-                    "sender": crate::failed_digest::sender_of(&document, text),
-                    "first_line": crate::failed_digest::first_line_of(text),
-                    "lane": lane,
-                }));
+                let mut archived_row = row(&document, id, "failed");
+                archived_row["reason"] = json!("failed");
+                archived_row["detail"] =
+                    json!("already failed before revive; kept failed, never replayed");
+                carry.archived.push(archived_row);
             }
         }
-        Ok(json!(reported))
+        // In-flight items may have been typed into the old pane: uncertain, never retyped.
+        if let Ok(paths) = agent_queue::queue::json_paths(&old.inflight) {
+            for path in paths {
+                let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let Ok(document) = agent_queue::queue::load_message(&path) else {
+                    continue;
+                };
+                let target = new.failed.join(format!("{id}.json"));
+                if !target.exists() {
+                    fs::copy(&path, &target).map_err(|error| fail(error.to_string()))?;
+                    agent_queue::queue::failed_metadata(
+                        &target,
+                        "possibly_submitted",
+                        "archived by revive, outcome unknown: the prompt was in flight to the \
+                         old pane and may have been typed; it is never replayed",
+                    )?;
+                }
+                let mut uncertain_row = row(&document, id, "inflight");
+                uncertain_row["reason"] = json!("uncertain");
+                uncertain_row["detail"] = json!(
+                    "in flight to the old pane; outcome unknown, reported and never replayed"
+                );
+                carry.uncertain.push(uncertain_row.clone());
+                carry.archived.push(uncertain_row);
+            }
+        }
+        // Pending items, oldest first: deliverable ones are copied in, the rest set aside.
+        // The lanes are walked directly (not through the merged pending order) so one
+        // unreadable lane directory cannot silently drop the other lane's items.
+        let mut pending: Vec<PathBuf> = Vec::new();
+        for directory in [&old.inbox, &old.inbox_v2] {
+            if let Ok(paths) = agent_queue::queue::json_paths(directory) {
+                pending.extend(paths);
+            }
+        }
+        pending.sort_by_key(|path| {
+            let queued_at = agent_queue::queue::load_message(path)
+                .ok()
+                .and_then(|document| {
+                    document
+                        .get("queued_at")
+                        .and_then(Value::as_f64)
+                        .map(|seconds| seconds.to_bits())
+                });
+            (queued_at.is_none(), queued_at.unwrap_or(0), path.clone())
+        });
+        {
+            for path in pending {
+                let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let lane = if path.parent() == Some(old.inbox_v2.as_path()) {
+                    "inbox.v2"
+                } else {
+                    "inbox"
+                };
+                let Ok(document) = agent_queue::queue::load_message(&path) else {
+                    let target = new.failed.join(format!("{id}.json"));
+                    if !target.exists() {
+                        let _ = fs::copy(&path, &target);
+                        agent_queue::queue::failed_metadata(
+                            &target,
+                            "invalid_message",
+                            "archived by revive, not delivered: the queued item could not be read",
+                        )?;
+                    }
+                    carry.archived.push(json!({
+                        "id": id, "sender": "unknown", "first_line": "", "lane": lane,
+                        "reason": "invalid", "detail": "queued item could not be read",
+                    }));
+                    continue;
+                };
+                if let Some((reason, detail)) = agent_queue::queue::set_aside_reason(
+                    &old,
+                    id,
+                    &document,
+                    agent_queue::queue::now_millis(),
+                ) {
+                    agent_queue::queue::prepare_lane(&new_root, &new.cancelled)?;
+                    let mut aside = document.clone();
+                    aside.insert("delivery_state".to_owned(), json!("cancelled"));
+                    aside.insert("cancel_reason".to_owned(), json!(reason));
+                    aside.insert("cancel_detail".to_owned(), json!(detail));
+                    aside.insert("cancelled_at".to_owned(), json!(now));
+                    aside.insert("archived_by_revive".to_owned(), json!(true));
+                    let target = new.cancelled.join(format!("{id}.json"));
+                    if !target.exists() {
+                        agent::atomic_json(&target, &Value::Object(aside))?;
+                    }
+                    let mut archived_row = row(&document, id, lane);
+                    archived_row["reason"] = json!(reason);
+                    archived_row["detail"] = json!(detail);
+                    carry.archived.push(archived_row);
+                    continue;
+                }
+                let target_directory = if lane == "inbox.v2" {
+                    agent_queue::queue::prepare_lane(&new_root, &new.inbox_v2)?;
+                    &new.inbox_v2
+                } else {
+                    &new.inbox
+                };
+                let target = target_directory.join(format!("{id}.json"));
+                if target.exists()
+                    || agent_queue::queue::message_state(&new_root, id)
+                        .is_ok_and(|state| state.is_some())
+                {
+                    let mut archived_row = row(&document, id, lane);
+                    archived_row["reason"] = json!("duplicate");
+                    archived_row["detail"] = json!(
+                        "the new queue already holds this id; the archived copy was not replayed"
+                    );
+                    carry.archived.push(archived_row);
+                    continue;
+                }
+                fs::copy(&path, &target).map_err(|error| fail(error.to_string()))?;
+                carry.carried.push(row(&document, id, lane));
+            }
+        }
+        // Items already set aside in the old queue stay set aside, with their reason.
+        if let Ok(paths) = agent_queue::queue::json_paths(&old.cancelled) {
+            for path in paths {
+                let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                let Ok(document) = agent_queue::queue::load_message(&path) else {
+                    continue;
+                };
+                let target = new.cancelled.join(format!("{id}.json"));
+                if !target.exists() {
+                    agent_queue::queue::prepare_lane(&new_root, &new.cancelled)?;
+                    fs::copy(&path, &target).map_err(|error| fail(error.to_string()))?;
+                }
+                let mut archived_row = row(&document, id, "cancelled");
+                archived_row["reason"] = document
+                    .get("cancel_reason")
+                    .cloned()
+                    .unwrap_or_else(|| json!("cancelled"));
+                archived_row["detail"] = document
+                    .get("cancel_detail")
+                    .cloned()
+                    .unwrap_or_else(|| json!("set aside before revive"));
+                carry.archived.push(archived_row);
+            }
+        }
+        // Tombstones for ids not yet arrived keep their force in the new queue.
+        if let Ok(paths) = agent_queue::queue::json_paths(&old.cancel) {
+            for path in paths {
+                let target = new
+                    .cancel
+                    .join(path.file_name().expect("listed path has filename"));
+                if !target.exists() {
+                    agent_queue::queue::prepare_lane(&new_root, &new.cancel)?;
+                    let _ = fs::copy(&path, &target);
+                }
+            }
+        }
+        Ok(carry)
     }
 
     /// The independent check of `journal`'s candidate (#899), or `None` when the attempt is past

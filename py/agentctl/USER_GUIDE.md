@@ -867,19 +867,22 @@ record without a spec is refused; while its harness still runs, capture one with
 `agentctl anchor NAME --replace`.
 
 Once the replacement is verified, the complete old generation is archived,
-including its queue, quarantine, and terminal output. The stale pane and its
+including its quarantine and terminal output. The stale pane and its
 one-pane tab are closed after publication; a revived adopted agent's old pane
 is left open, because it was never agentctl's to close, and the replacement is
-an owned agent. Old queued prompts and goal delivery
-receipts are never replayed into the replacement; the recorded goal text remains
-available for the coordinator to inspect and assign deliberately. No queued
-prompt goes silently, though (#899). The revive's result lists every prompt the
-old queue held undelivered under `archived_prompts`: waiting, in flight or
-failed, each with its ID, sender, first line and lane. Each is also recorded in
-the new generation's `failed/` with the reason `archived by revive, not
-delivered`. So a sender that asks after it (a chat bridge, `agentctl prompts`)
-reads it as failed, never delivered, and the failed-queue digest names it to
-the revived agent. No drain types it.
+an owned agent. The old queue does not go with it (#1413
+revive-keeps-queued-messages): its waiting prompts move into the new
+generation's queue with their ids and order, and are drained once the new
+pane is ready, oldest first through the normal queue. The recorded goal text
+remains available for the coordinator to inspect and assign deliberately.
+Only a prompt that cannot be delivered on its own terms is archived
+undelivered: an expired or cancelled one is set aside in the new queue's
+`cancelled/` with its reason, one already in flight whose outcome is unknown
+stays uncertain in `failed/` (reported, never retyped), and one already
+failed stays failed. The revive's result lists them under `queued_carried`,
+`queued_delivered`, `queued_pending` and `queued_archived` (also spelled
+`archived_prompts`), and `agentctl status` counts them as
+`queued_archived_undelivered`.
 
 An interrupted revive reserves the name and both generations. Rerun the same
 command to finish publication or stale-tab cleanup; it never starts a second

@@ -284,7 +284,7 @@ def parser() -> argparse.ArgumentParser:
         "replaying its launch spec (launch_spec in status: what ran, written at start and read from the pinned process at "
         "adopt and anchor) with one explicit resume. A record without a spec is rebuilt from its launch policy and profile; "
         "an adopted record needs a spec, and its old pane is left open. "
-        "Preserves the old queue and quarantine in its archive; never replays queued prompts.",
+        "Preserves the old quarantine in its archive; queued prompts are carried into the new generation and delivered once it is ready.",
         "agentctl revive reviewer\n  agentctl revive --all --dry-run")
     revive.add_argument("name", nargs="?", metavar="NAME", help="registered session name; required unless --all is used")
     revive.add_argument("--all", action="store_true", help="consider every registered name; continue past blocked records")

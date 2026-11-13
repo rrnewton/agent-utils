@@ -190,7 +190,7 @@ fn restart_drains_prompts_queued_during_the_restart_window() {
     old.session_value = Some("sess-1".to_owned());
     fixture.manager().save(&old).unwrap();
     // A prompt that reached the old generation while it was down: revive
-    // archives it, and restart must replay it into the new session.
+    // carries it into the new session with its own id and drains it (#1413).
     // The restarted Muse sits at an idle composer, ready to be drained into.
     *fixture.client.muse_editor.lock().unwrap() = Some(
         super::herdr_compatibility::MuseEditor::new("Launch overrides", false, None),
@@ -209,15 +209,10 @@ fn restart_drains_prompts_queued_during_the_restart_window() {
     assert_eq!(result["action"], "restarted", "{result}");
     assert_eq!(
         result["replayed_prompts"],
-        json!([{"old_id": "m-1", "new_id": "restart-m-1", "lane": "inbox"}]),
+        json!([{"old_id": "m-1", "new_id": "m-1", "lane": "inbox"}]),
         "{result}"
     );
-    assert!(
-        result["drain"]["delivered"]
-            .as_array()
-            .is_some_and(|ids| ids.iter().any(|id| id == "restart-m-1")),
-        "{result}"
-    );
+    assert_eq!(result["queued_delivered"], json!(["m-1"]), "{result}");
     assert!(
         fixture
             .client
@@ -227,6 +222,103 @@ fn restart_drains_prompts_queued_during_the_restart_window() {
             .iter()
             .any(|(_, text)| text.contains("please run the gate")),
         "the replayed prompt was typed into the restarted session"
+    );
+}
+
+#[test]
+fn revive_delivers_three_queued_prompts_in_order_and_archives_none() {
+    // #1413 acceptance: queue three messages to a dead agent, revive it, and all three
+    // are delivered in order, with none archived.
+    let (fixture, _old) = recoverable("claude", false);
+    let queue = fixture.root.join("registry/agents/worker/queue/inbox");
+    agent::create_private_directory(&queue, "test queue lane", true, false).unwrap();
+    for (index, id) in ["m-1", "m-2", "m-3"].iter().enumerate() {
+        agent::atomic_json(
+            &queue.join(format!("{id}.json")),
+            &json!({"id": id, "text": format!("queued prompt {id}"), "queued_at": 100.0 + index as f64}),
+        )
+        .unwrap();
+    }
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(
+        result["queued_delivered"],
+        json!(["m-1", "m-2", "m-3"]),
+        "{result}"
+    );
+    assert_eq!(result["queued_archived"], json!([]), "{result}");
+    assert_eq!(result["queued_pending"], json!([]), "{result}");
+    for id in ["m-1", "m-2", "m-3"] {
+        assert_eq!(
+            fixture.manager().message_state("worker", id).unwrap(),
+            Some(crate::agent::QueueMessageState::Processed),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn revive_archives_an_expired_item_with_its_reason_and_status_counts_it() {
+    // #1413: an expired item is archived with its reason, and status shows the count.
+    let (fixture, _old) = recoverable("claude", false);
+    let queue = fixture.root.join("registry/agents/worker/queue/inbox.v2");
+    agent::create_private_directory(&queue, "test queue lane", true, false).unwrap();
+    agent::atomic_json(
+        &queue.join("m-expired.json"),
+        &json!({"id": "m-expired", "text": "too late", "queued_at": 100.0, "not_after": 1}),
+    )
+    .unwrap();
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    let archived = result["queued_archived"].as_array().unwrap();
+    assert_eq!(archived.len(), 1, "{result}");
+    assert_eq!(archived[0]["id"], "m-expired", "{result}");
+    assert_eq!(archived[0]["reason"], "expired", "{result}");
+    assert_eq!(result["queued_delivered"], json!([]), "{result}");
+    assert_eq!(
+        fixture
+            .manager()
+            .message_state("worker", "m-expired")
+            .unwrap(),
+        Some(crate::agent::QueueMessageState::Cancelled),
+        "{result}"
+    );
+    let status = fixture.manager().status("worker").unwrap();
+    assert_eq!(status["queued_archived_undelivered"], json!(1), "{status}");
+}
+
+#[test]
+fn revive_reports_an_inflight_item_as_uncertain_and_never_retypes_it() {
+    // #1413: a prompt typed into the old pane whose outcome is unknown stays uncertain.
+    let (fixture, _old) = recoverable("claude", false);
+    let queue = fixture.root.join("registry/agents/worker/queue/inflight");
+    agent::create_private_directory(&queue, "test queue lane", true, false).unwrap();
+    agent::atomic_json(
+        &queue.join("m-uncertain.json"),
+        &json!({"id": "m-uncertain", "text": "maybe typed", "queued_at": 100.0}),
+    )
+    .unwrap();
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(
+        result["queued_uncertain"].as_array().unwrap().len(),
+        1,
+        "{result}"
+    );
+    assert_eq!(result["queued_delivered"], json!([]), "{result}");
+    assert_eq!(
+        fixture
+            .manager()
+            .message_state("worker", "m-uncertain")
+            .unwrap(),
+        Some(crate::agent::QueueMessageState::Failed),
+        "{result}"
     );
 }
 
@@ -1745,8 +1837,8 @@ fn a_candidate_with_a_live_harness_is_never_abandoned() {
 fn an_unprovable_candidate_is_abandoned_only_when_the_operator_asks() {
     // Interrupted before the candidate recorded a pane: a harness it may have started cannot be
     // checked, so revive refuses and names --abandon-candidate, which then relaunches. The old
-    // queue goes to the archive exactly as in any revive, and its undelivered prompt is reported:
-    // named in the result and failed in the new queue, never typed.
+    // queue is carried into the new generation (#1413): its prompt keeps its id, is not
+    // archived, and is delivered or stays pending in the new queue, never failed unseen.
     let (fixture, old) = recoverable("claude", false);
     let queue = fixture.root.join("registry/agents/worker/queue/inbox");
     agent::create_private_directory(&queue, "test queue lane", true, false).unwrap();
@@ -1785,20 +1877,15 @@ fn an_unprovable_candidate_is_abandoned_only_when_the_operator_asks() {
         "running"
     );
     assert_eq!(
-        result["archived_prompts"],
+        result["queued_carried"],
         json!([{"id": "m-1", "sender": "lane-a", "first_line": "please run the gate", "lane": "inbox"}]),
         "{result}"
     );
-    assert_eq!(
+    assert_eq!(result["queued_archived"], json!([]), "{result}");
+    assert_ne!(
         fixture.manager().message_state("worker", "m-1").unwrap(),
-        Some(crate::agent::QueueMessageState::Failed)
-    );
-    let failed = crate::failed_digest::failed_entries(&fixture.manager().queue("worker").unwrap());
-    assert_eq!(failed.len(), 1, "{failed:?}");
-    assert!(failed[0].error.contains("archived by revive"), "{failed:?}");
-    assert!(
-        fixture.client.runs.lock().unwrap().is_empty(),
-        "never typed"
+        Some(crate::agent::QueueMessageState::Failed),
+        "{result}"
     );
     // With nothing interrupted, there is nothing to abandon.
     assert!(fixture
