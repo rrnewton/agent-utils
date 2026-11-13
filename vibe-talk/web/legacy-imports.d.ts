@@ -136,6 +136,8 @@ declare const createCollapsedLines: LegacyImports["createCollapsedLines"];
 declare const createEnterSends: LegacyImports["createEnterSends"];
 declare const createInAppLinks: LegacyImports["createInAppLinks"];
 declare const createQuoteReadPercent: LegacyImports["createQuoteReadPercent"];
+declare const createMarkReadFirstPercent: LegacyImports["createMarkReadFirstPercent"];
+declare const createMarkReadLongWords: LegacyImports["createMarkReadLongWords"];
 declare const DEFAULT_COLLAPSED_LINES: LegacyImports["DEFAULT_COLLAPSED_LINES"];
 declare const DEFAULT_TWO_COLUMN_SPLIT: LegacyImports["DEFAULT_TWO_COLUMN_SPLIT"];
 declare const DEFAULT_DISCUSS_WIDTH: LegacyImports["DEFAULT_DISCUSS_WIDTH"];
