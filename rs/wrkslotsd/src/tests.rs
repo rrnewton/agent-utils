@@ -5031,6 +5031,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
         names,
         BTreeSet::from([
             "adopt",
+            "adopt-checkout",
             "classify-ownerless-validate-batch",
             "classify-ownerless-validate-batch-text",
             "freeze",
