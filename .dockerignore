@@ -1,0 +1,30 @@
+# Root-context image inputs (Podman also reads this file).
+# Keep unrelated tools, local configuration and generated artifacts out of the context.
+**
+!vibe-talk/
+!vibe-talk/Cargo.toml
+!vibe-talk/Cargo.lock
+!vibe-talk/build.rs
+!vibe-talk/build_page.rs
+!vibe-talk/src/**
+!vibe-talk/web/**
+!vibe-talk/prompts/**
+!vibe-talk/syntaxes/**
+!vibe-talk/contract/
+!vibe-talk/contract/package.json
+!vibe-talk/contract/package-lock.json
+!rs/
+# The Rust-only validation image also builds from the repository root.
+!rs/**
+!validation/
+!validation/rust-only/**
+**/target/
+**/.agent-utils-snapshots/
+**/.agent-utils-locks/
+**/node_modules/
+**/.git/
+**/.env
+**/*.private.json
+**/*.local.toml
+**/*.toml.local
+**/vibe-talk.toml

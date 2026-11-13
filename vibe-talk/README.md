@@ -1320,10 +1320,11 @@ refuses the token.
 
 ### Podman
 
-Build (context is the `vibe-talk` directory):
+Build from the repository root so Cargo can read the sibling Rust path dependencies.
+The root `.dockerignore` excludes local configuration and generated artifacts:
 
 ```sh
-podman build -t vibe-talk:v0 -f vibe-talk/Containerfile vibe-talk
+podman build -t vibe-talk:v0 -f vibe-talk/Containerfile .
 ```
 
 Run with everything from the environment — no configuration file in the image, no secret baked in:

@@ -1364,7 +1364,8 @@ fi
 step "Building $IMAGE_REF from $VIBE_TALK_DIR/Containerfile"
 build_args=(build -t "$IMAGE_REF" -f "$VIBE_TALK_DIR/Containerfile")
 [ -n "$BUILD_NETWORK" ] && build_args+=(--network "$BUILD_NETWORK")
-build_args+=("$VIBE_TALK_DIR")
+# Path dependencies live beside vibe-talk; preserve that layout in the build context.
+build_args+=("$VIBE_TALK_DIR/..")
 if [ "$DRY_RUN" = 1 ]; then
     note "(dry run) $ENGINE ${build_args[*]}"
 else
