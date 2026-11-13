@@ -1,7 +1,7 @@
 ---
 title: 'restore-drill-notices-missing: the restore drill finds no brief or catch-up notice queued for a revived lane on one host, even uncapped and on clean main'
-status: open
-priority: 1
+status: closed
+priority: 2
 issue_type: bug
 labels:
 - agentctl
@@ -43,3 +43,17 @@ Compare a run on each host with the same commit if possible. Record the queue di
 # Notes
 
 Number reserved by the other host's coordinator, filed from devbig030's side at its request (2026-11-12). Supersedes the narrower "restore-drill-happy-path-cpu-capped" description.
+
+## Resolution
+
+[watermelon-full-preview] Test-side only; no restore defect. After
+#1372 (`0d15e1e2`) the resume brief and catch-up carry supersede keys,
+which route them to the queue's `inbox.v2/` lane; the drill's
+`queued()` read only the classic `inbox/`, so it saw `[]` on both hosts
+since #1372 landed (the devbig014-green premise was withdrawn by the
+lead). Full diagnosis, with the instrumented queue dump and the
+real-restore delivery path (the Rust drain merges both lanes), in
+https://github.com/rrnewton/dev-agent-utils/blob/main/ai_docs/reports/research/2026-11-12-restore-drill-notices-missing.md
+Fixed by making the drill read both queue lanes, resolving the brief
+across lanes, and pinning `HOME` to the scratch root; downgraded
+P1 to P2 as a drill-maintenance bug.

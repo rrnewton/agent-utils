@@ -202,6 +202,7 @@ class Drill:
         self.tools_dir.mkdir()
         (self.root / "xdg-data").mkdir()
         (self.root / "xdg-state").mkdir()
+        (self.root / "home").mkdir()
         self.env_file.write_text("# drill launch env\n", encoding="utf-8")
         subprocess.run(
             ["git", "init", "-q", str(self.project)],
@@ -327,6 +328,7 @@ class Drill:
             env["HERDR_SOCKET_PATH"] = str(self.socket)
         env["AGENTCTL_MUSE_BIN"] = str(self.fake)
         env["AGENTCTL_WRKSLOTS_BIN"] = str(WRKSLOTS_BIN)
+        env["HOME"] = str(self.root / "home")
         env["XDG_DATA_HOME"] = str(self.root / "xdg-data")
         env["XDG_STATE_HOME"] = str(self.root / "xdg-state")
         env["FAKE_HARNESS_LOG_DIR"] = str(self.log_dir)
@@ -486,10 +488,24 @@ class Drill:
         return [block for block in blocks if "ARGV:" in block]
 
     def queued(self, name: str) -> list[str]:
-        inbox = self.registry / "agents" / name / "queue" / "inbox"
-        if not inbox.is_dir():
-            return []
-        return sorted(path.name for path in inbox.glob("*.json"))
+        # Pending prompts live in two lanes the real drain merges: the
+        # classic inbox/ and inbox.v2/ (supersede-keyed and expiring items,
+        # #1372). Read both, as agentctl's pending/drain paths do.
+        queue = self.registry / "agents" / name / "queue"
+        names: list[str] = []
+        for lane in ("inbox", "inbox.v2"):
+            inbox = queue / lane
+            if inbox.is_dir():
+                names.extend(path.name for path in inbox.glob("*.json"))
+        return sorted(names)
+
+    def queued_path(self, name: str, filename: str) -> Path:
+        queue = self.registry / "agents" / name / "queue"
+        for lane in ("inbox", "inbox.v2"):
+            path = queue / lane / filename
+            if path.is_file():
+                return path
+        return queue / "inbox" / filename
 
     def slot_owner_pid(self, slot: str) -> int | None:
         status = self.wrkslots_project(
@@ -749,9 +765,8 @@ def test_restore_drill_happy_path_fresh_pane_slot_and_rerun(tmp_path: Path) -> N
                 f"restore-catchup-{boot8}-{name}.json",
             ], name
             brief = json.loads(
-                (
-                    drill.registry / "agents" / name / "queue" / "inbox"
-                    / f"restore-brief-{boot8}-{name}.json"
+                drill.queued_path(
+                    name, f"restore-brief-{boot8}-{name}.json",
                 ).read_text(encoding="utf-8"),
             )
             assert name in cast(str, brief["text"])
