@@ -20,7 +20,7 @@ use crate::ensure_states::{
 };
 use crate::global_state::{event_log_status, load_event_chain, EventLogStatus};
 use crate::hold_write::{
-    acquire_mutation_locks, active_document, refuse_target_storage, validate_global,
+    acquire_mutation_locks, active_document, refuse_target_storage_except_nested, validate_global,
 };
 use crate::journals_state::parse_journals;
 use crate::status_state::{process_state, read_process_identity, Identity};
@@ -403,7 +403,16 @@ pub(crate) fn heartbeat(
             }
         }
     }
-    refuse_target_storage(root, slot)?;
+    // #1492: a nested worktree Git registers inside this slot is a
+    // warning, not a refusal — heartbeat still records. Scope is
+    // strictly heartbeat; remove/retire/write-handoff keep their own
+    // nested handling (see #1400).
+    let _nested_warnings = refuse_target_storage_except_nested(root, slot)?;
+    for detail in &_nested_warnings {
+        eprintln!(
+            "WARNING: slot {slot} has a nested worktree Git registers without a checkout row: {detail}. state: heartbeat recorded anyway; the nested worktree is retained and not inspected"
+        );
+    }
     if let EventLogStatus::Derived = event_log_status(&directory) {
         let events = load_event_chain(&directory, &selected)?;
         if let Some(event) = release_in_effect(&cfg, &record, &events)? {

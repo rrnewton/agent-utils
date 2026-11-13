@@ -25998,7 +25998,7 @@ class _TtlCheckoutRow(TypedDict):
     bundle: str
 
 
-class _TtlReportRow(TypedDict):
+class _TtlReportRow(TypedDict, total=False):
     slot: str
     agent: str
     stage: str
@@ -26008,7 +26008,87 @@ class _TtlReportRow(TypedDict):
     expired_at: str
     overdue_seconds: int
     teardown_at: str
+    blocked: str | None
     checkouts: list[_TtlCheckoutRow]
+
+
+def _ttl_blocked_reason(
+    config: Config, record: ActiveRecord
+) -> tuple[str, str] | None:
+    """``(label, detail)`` when TTL rescue/teardown must refuse ``record``.
+
+    ``label`` is ``blocked: held`` or ``blocked: owner live`` — the exact
+    strings ``ttl-report`` shows as ``next_action`` (#1491).  The judgment
+    mirrors ``remove``: holds via ``_load_hold`` (event log authoritative,
+    snapshot otherwise, same as ``_assert_not_held``) and owner liveness via
+    the pidfd-first ``_process_state`` (#1300 Phase 2a) plus the registered /
+    validation-run authority in ``_owner_liveness_states`` (the same
+    authorities ``_removal_admission`` and ``_assert_owner_liveness`` use).
+    Only a proven-live owner blocks; ``unverifiable`` does not — teardown
+    already required the heartbeat TTL to expire, and a broken liveness
+    probe must not strand every slot forever.  Returns ``None`` when the
+    slot may proceed.
+    """
+
+    try:
+        hold = _load_hold(config, record.slot, record.machine)
+    except (Refusal, StateError) as exc:
+        return ("blocked: held", f"slot {record.slot} hold is unreadable: {exc}")
+    if hold is not None:
+        reason = hold.get("reason")
+        detail = (
+            f"slot {record.slot} is held: {reason}"
+            if isinstance(reason, str) and reason.strip()
+            else f"slot {record.slot} is held"
+        )
+        return ("blocked: held", detail)
+    if record.owner is not None and not _owner_record_is_absent(record):
+        state, detail = _process_state(record.owner)
+        if state == "live":
+            return (
+                "blocked: owner live",
+                f"slot {record.slot} owner is live: {detail}",
+            )
+    try:
+        states = _owner_liveness_states(config, (record,))
+        key = (record.machine, record.slot, record.generation)
+        liveness_state, liveness_detail = states.get(key, ("dead", ""))
+        if liveness_state == "alive":
+            return (
+                "blocked: owner live",
+                f"slot {record.slot} owner is live: {liveness_detail}",
+            )
+    except Exception:
+        # Unverifiable authority never blocks TTL on its own (see above);
+        # the pidfd check above is the fail-closed live-owner guard.
+        pass
+    return None
+
+
+def _assert_ttl_not_blocked(config: Config, record: ActiveRecord) -> None:
+    """Refuse TTL rescue/teardown for a live-owner or held slot (#1491).
+
+    The refusal names the slot, as ``remove`` does, so a coordinator
+    sweeping many slots can tell which one was spared and why.
+    """
+
+    blocked = _ttl_blocked_reason(config, record)
+    if blocked is None:
+        return
+    label, detail = blocked
+    if label == "blocked: held":
+        raise Refusal(
+            f"{detail}; ttl-teardown refused for slot {record.slot}: {label}. "
+            f"state: REFUSED -- no checkout was rescued or removed. "
+            f"remedy: run 'wrkslots unhold {record.slot}' only when the hold "
+            "is no longer needed, then retry"
+        )
+    raise Refusal(
+        f"{detail}; ttl-teardown refused for slot {record.slot}: {label}. "
+        "state: REFUSED -- no checkout was rescued or removed. "
+        "remedy: let the owner finish or stop, run 'wrkslots heartbeat' to "
+        "renew, or retry after the owner is proven dead"
+    )
 
 
 def _ttl_report_rows(
@@ -26042,12 +26122,27 @@ def _ttl_report_rows(
             seconds=thresholds.teardown_after_seconds
         )
         bundle = str(config.control / "ttl-rescue" / f"{record.slot}.bundle")
+        blocked = _ttl_blocked_reason(config, record)
+        blocked_label = blocked[0] if blocked is not None else None
+        # Consumer refinement (#1491): a live-owner slot past expiry reads
+        # "expired (owner live)" with no ladder next-step — most slots have
+        # a 1 h TTL and a daily heartbeat, so the ladder would alarm on
+        # working lanes all day.  The ``blocked`` field still carries
+        # "blocked: owner live" for teardown consumers.  Held slots keep
+        # "blocked: held" as their next action.
+        if blocked_label == "blocked: owner live" and stage != "current":
+            report_next = "expired (owner live)"
+        elif blocked_label is not None:
+            report_next = blocked_label
+        else:
+            report_next = _TTL_STAGE_ACTIONS[stage]
         rows.append(
             {
                 "slot": record.slot,
                 "agent": record.agent,
                 "stage": stage,
-                "next_action": _TTL_STAGE_ACTIONS[stage],
+                "next_action": report_next,
+                "blocked": blocked_label,
                 "heartbeat_at": record.heartbeat_at,
                 "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
                 "expired_at": expired_at.isoformat(),
@@ -26386,12 +26481,15 @@ def _execute_ttl_slot_rescue(
 ) -> _TtlSlotRescueReceipt:
     """Rescue every recorded checkout of an overdue slot (#1293 wiring).
 
-    Refuses only while the slot is still current: rescue is the warn-rung
-    action onward, never something done to a live slot by accident. Each
-    checkout keeps its own bundle file under ``ttl-rescue/`` in the
-    control directory. Registry and removal machinery are untouched;
-    this is the slow work a teardown runs before taking any lock.
+    Refuses while the slot is still current, and — since #1491 — while its
+    recorded owner is live or it is under a HOLD: rescue would commit a WIP
+    and push from a checkout its owner may still be writing. Each checkout
+    keeps its own bundle file under ``ttl-rescue/`` in the control
+    directory. Registry and removal machinery are untouched; this is the
+    slow work a teardown runs before taking any lock, so the caller
+    re-checks the block under the mutation locks before committing.
     """
+    _assert_ttl_not_blocked(config, record)
     stage, expired_at, teardown_at = _ttl_slot_stage(record, now, thresholds)
     if stage == "current":
         raise Refusal(
@@ -26435,13 +26533,15 @@ def _execute_ttl_slot_teardown(
 ) -> _TtlSlotTeardownReceipt:
     """Deterministic teardown of one slot at the teardown rung (#1293).
 
-    Past T+3 d there is no refusal left: rescue runs first (outside any
-    registry lock, as the lock-narrowing pattern requires of slow work),
-    then the slot tree is removed. A failed rescue is held by its
-    verified bundle and reported in the receipt; it never keeps the
-    slot. Archiving the registry row stays with the removal machinery;
-    this core is proven on fixture projects only.
+    Rescue runs first (outside any registry lock, as the lock-narrowing
+    pattern requires of slow work), then the slot tree is removed. A
+    failed rescue is held by its verified bundle and reported in the
+    receipt; it never keeps the slot. Since #1491 a live owner or an
+    active HOLD refuses before any rescue side effect, exactly as
+    ``remove`` refuses. Archiving the registry row stays with the
+    removal machinery; this core is proven on fixture projects only.
     """
+    _assert_ttl_not_blocked(config, record)
     stage, _expired_at, _teardown_at = _ttl_slot_stage(record, now, thresholds)
     if stage != "teardown":
         raise Refusal(
@@ -26472,12 +26572,15 @@ def _ttl_health_lines(
     for row in rows:
         stage = str(row["stage"])
         status = "ok" if stage == "current" else "stale"
+        blocked = row.get("blocked")
+        detail = f"slot {row['slot']} stage={stage} teardown_at={row['teardown_at']}"
+        if blocked:
+            detail = f"slot {row['slot']} stage={stage} {blocked} teardown_at={row['teardown_at']}"
         lines.append(
             f"HEALTH: wrkslots-ttl-{row['slot']} {status} "
             f"age_secs={int(row['overdue_seconds'])} "
             f"threshold_secs={thresholds.alarm_after_seconds} "
-            f"detail=\"slot {row['slot']} stage={stage} "
-            f"teardown_at={row['teardown_at']}\""
+            f"detail=\"{detail}\""
         )
     return lines
 
@@ -26580,10 +26683,11 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
     (slow Git and bundle work) run with no registry lock held; the
     mutation locks are taken only to re-check the slot's registry
     identity and commit the archive/active-state records; the tree
-    deletion itself runs after the locks are released. Past the
-    teardown rung no refusal remains except that identity re-check: a
-    slot changed while rescue ran is deferred by name, never torn down
-    on stale evidence.
+    deletion itself runs after the locks are released. Since #1491 the
+    live-owner and HOLD guards run before the rescue (so a blocked slot
+    gets no rescue side effects) and again under the mutation locks
+    right before the commit — an owner that appears, or a hold placed,
+    while the lock-free rescue ran still refuses, by name.
     """
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
@@ -26606,6 +26710,10 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
             f"slot {args.slot} generation {before.generation} does not match "
             f"--expected-generation {args.expected_generation}"
         )
+    # #1491: liveness/HOLD first, regardless of TTL stage — a live owner
+    # or a hold refuses by name even before the teardown rung, so a
+    # working lane is never described as merely "not yet at teardown".
+    _assert_ttl_not_blocked(config, before)
     stage, _expired_at, _teardown_at = _ttl_slot_stage(before, now, thresholds)
     if stage != "teardown":
         raise Refusal(
@@ -26650,6 +26758,9 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
         _assert_no_journal(config)
         current_state = _load_active(config, require_repository=False)
         current = _find_record(current_state, args.slot)
+        # #1491 re-check under the locks: the owner could have appeared
+        # or a hold could have been placed while the rescue ran lock-free.
+        _assert_ttl_not_blocked(config, current)
         if current != before:
             raise Refusal(
                 f"slot {args.slot} changed in the registry while its rescue ran; "
@@ -40170,7 +40281,25 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             record,
             action="heartbeat",
         )
-        _assert_command_registry_storage(config, states, args)
+        # #1492: a nested worktree Git registers inside this slot (e.g.
+        # <slot>/.muse/worktrees/<name>) is a warning, not a refusal —
+        # lanes keep nested worktrees there routinely, and refusing would
+        # strand a live owner off the TTL ladder.  Tolerate the target's
+        # git-registration-without-row findings and surface them as a
+        # warning while still recording the heartbeat.  Scope is strictly
+        # heartbeat: remove/retire/write-handoff keep their own nested
+        # handling (see #1400 nested-foreign-checkout).
+        _hb_findings = _assert_command_registry_storage(
+            config, states, args, tolerate_target_git_registrations=True
+        )
+        for _detail in _hb_findings.target_git_registrations:
+            print(
+                f"WARNING: slot {record.slot} has a nested worktree Git "
+                f"registers without a checkout row: {_detail}. "
+                "state: heartbeat recorded anyway; the nested worktree is "
+                "retained and not inspected",
+                file=sys.stderr,
+            )
         release = _owner_release_in_effect(
             config, record, _load_events(config, record.machine)
         )
@@ -85075,7 +85204,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         description=(
             "Refresh the heartbeat only when the caller, agent, PID, and process start identity "
             "still match the recorded owner. Expiry is necessary for reclaim but never sufficient. "
-            "Refuses for a generation its owner released with 'wrkslots release'."
+            "Refuses for a generation its owner released with 'wrkslots release'. "
+            "The caller must be the recorded owner process itself or its descendant: a heartbeat "
+            "from a non-owner process is refused (\"owner PID not in the invoking process "
+            "ancestry\"), so a lane whose sub-agent holds the slot must heartbeat from that "
+            "sub-agent, not from its coordinator or parent shell."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -85086,7 +85219,7 @@ usage or audit gate unknown, 3 fail-closed refusal.
         type=int,
         required=True,
         metavar="PID",
-        help="recorded live owner PID",
+        help="recorded live owner PID (must be the caller or its ancestor)",
     )
     heartbeat.add_argument(
         "--expected-generation",
