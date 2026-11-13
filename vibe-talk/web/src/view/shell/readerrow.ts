@@ -7,7 +7,7 @@
 import type { ElementById } from "../dom/index.ts";
 
 /** The item's word for each state: what a press does. */
-const READER_WORDS = Object.freeze({ shown: "Hide reader", hidden: "Hide reader" } as const);
+const READER_WORDS = Object.freeze({ shown: "Hide reader", hidden: "Show reader" } as const);
 
 /** What the row asks of the page. */
 export interface ReaderRowDependencies {
@@ -39,9 +39,6 @@ export function createReaderRow(deps: ReaderRowDependencies): ReaderRow {
     if (hidden()) deps.root().setAttribute("data-reader", "hidden");
     else deps.root().removeAttribute("data-reader");
     deps.byId("reader-toggle-label").textContent = hidden() ? READER_WORDS.hidden : READER_WORDS.shown;
-    const toggle = deps.byId("reader-toggle");
-    const pressed = hidden() ? "true" : "false";
-    if (toggle.getAttribute("aria-pressed") !== pressed) toggle.setAttribute("aria-pressed", pressed);
   }
 
   return {

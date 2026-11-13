@@ -356,6 +356,47 @@ test("IN A THREAD, a reply to the main channel opens All and lands there", async
   assert.equal(rowWithId(page, "200").getAttribute("data-landed"), "true");
 });
 
+test("HIDE READ hiding the message is said, not walked past", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  page.dealtWith.add("301");
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "301", content: "is the runner wedged?" }),
+    message({ id: "302", content: "restarted it", reply_to: "301" }),
+  ]);
+  await turnTodoOn(page);
+  assert.deepStrictEqual(shownIds(page), ["302"]);
+  const reads = page.timelineCalls.length;
+
+  await tapArrow(page, rowWithId(page, "302"));
+  assert.equal(statusText(page), "Hide read is hiding that message.");
+  assert.equal(page.timelineCalls.length, reads, "it went looking for a message it already held");
+});
+
+test("...and when it is All that turns up the message Hide read is hiding, that is said too", async () => {
+  // From Main, a thread root answering a reply inside another thread: Main does not show the
+  // answer, so the tap opens All — where Hide read hides it as well. Said as that, rather than
+  // walked past to "older than what is loaded".
+  const page = newPage();
+  const data = threadData();
+  data.messages[3].reply_to = "202";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  page.dealtWith.add("202");
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await turnTodoOn(page);
+  await pickThread(page, "main");
+  assert.ok(shownIds(page).includes("203"), "the reply is not on screen in Main");
+
+  await tapArrow(page, rowWithId(page, "203"));
+  assert.equal(page.el("thread-select").value, "flat", "the jump did not open All");
+  assert.equal(statusText(page), "Hide read is hiding that message.");
+  assert.ok(!timelineReads(page).some((path) => /[?&]before=/.test(path)),
+    "it walked back looking for a message it already held");
+});
+
 test("...nor is a finger on the arrow the start of a swipe or a press-and-hold on the reply", async () => {
   // The row follows a finger sideways to archive, and opens its details under one that rests. A
   // finger on the arrow is pressing the arrow. A hold there would also leave the row's
@@ -432,6 +473,22 @@ test("...where the row above is the previous one the reader can SEE, and decided
   assert.equal(arrowStyle(reply), "disconnected", "a hidden message is still met by the arrow");
   await page.el("search-toggle").click();
   assert.equal(arrowStyle(reply), "disconnected", "closing the search left the arrow as it was under it");
+});
+
+test("...and Hide read, which does not draw a read row at all, leaves the message directly above", async () => {
+  const page = newPage();
+  page.threadingSupported = true;
+  page.dealtWith.add("302");
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "301", content: "is the runner wedged?" }),
+    message({ id: "302", content: "already dealt with" }),
+    message({ id: "303", content: "restarted it", reply_to: "301", ...ALICE }),
+  ]);
+  assert.equal(arrowStyle(rowWithId(page, "303")), "disconnected");
+  await turnTodoOn(page);
+  assert.deepStrictEqual(shownIds(page), ["301", "303"]);
+  assert.equal(arrowStyle(rowWithId(page, "303")), "adjacent", "Hide read left the arrow pointing past an empty place");
 });
 
 test("...and an older page arriving above can bring in the message a first row answers", async () => {
@@ -822,6 +879,45 @@ test("GATHERED REPLIES OUTLIVE A REFRESH and a live reply joins them; a change o
   assert.deepStrictEqual(shownIds(page), [...SCATTERED, "610"], "All came back in the gathered order");
 });
 
+test("A FILTER THAT TAKES ROWS AWAY puts the replies back; Hide read leaves the stack its unread replies", async () => {
+  const page = await scatteredPage();
+  await gatherChip(page, "601").click();
+  await page.settle();
+  await search(page, "runner");
+  assert.deepStrictEqual(stackPlaces(page), [], "a search left a bridge to rows it hides");
+  assert.deepStrictEqual(shownIds(page), SCATTERED);
+  await page.el("search-toggle").click();
+  // Asking to gather with the search open closes it, as the jump does for a row the search hides.
+  await search(page, "runner");
+  await gatherChip(page, "601").click();
+  await page.settle();
+  assert.equal(page.el("search-field").hidden, true, "the search was left over the replies it hides");
+  assert.deepStrictEqual(shownIds(page), GATHERED);
+  // Hide read: 604 is read, and the stack is what is left of it.
+  page.dealtWith.add("604");
+  await turnTodoOn(page);
+  page.expireTimers(DISCORD_POLL_MS);
+  for (let i = 0; i < 4; i += 1) await page.settle();
+  assert.deepStrictEqual(shownIds(page), GATHERED.filter((id) => id !== "604"), "Hide read did not compose with the stack");
+  assert.deepStrictEqual(stackPlaces(page).map(([id]) => id), ["601", "602", "603", "606", "607"]);
+});
+
+test("WHAT IS NOT GATHERED IS SAID: a thread's count above what is loaded, and Hide read", async () => {
+  const page = await scatteredPage(3);
+  await gatherChip(page, "601").click();
+  await page.settle();
+  assert.equal(statusText(page), "Gathered 5 replies; 1 not loaded.");
+  const hidden = await scatteredPage();
+  hidden.dealtWith.add("604");
+  await turnTodoOn(hidden);
+  hidden.expireTimers(DISCORD_POLL_MS);
+  for (let i = 0; i < 4; i += 1) await hidden.settle();
+  assert.ok(!shownIds(hidden).includes("604"), "Hide read is not hiding the read reply");
+  await gatherChip(hidden, "601").click();
+  await hidden.settle();
+  assert.equal(statusText(hidden), "Gathered 4; Hide read hides 1 more.");
+});
+
 test("TWO STACKS NEVER: gathering another conversation puts the first's back", async () => {
   const page = await scatteredPage();
   await gatherChip(page, "601").click();
@@ -962,6 +1058,29 @@ test("A MISSING PARENT ends the walk up: the head is the topmost message loaded"
   assert.equal(stackPlaces(page)[0][0], "1000000000000000001", "a message not found put the stack away");
 });
 
+test("...and a link through a message Hide read leaves out still joins what is drawn either side of it", async () => {
+  // 302 is read, so Hide read does not draw it; 304 answers it, and it answers 301. Two taps on 304's
+  // arrow pass through 302 to 301, and 304 is gathered under it, with 302 said as hidden.
+  const page = newPage();
+  page.threadingSupported = true;
+  page.dealtWith.add("302");
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "300", content: "the weather is nice" }),
+    message({ id: "301", content: "is the runner wedged?" }),
+    message({ id: "302", content: "restarted it", reply_to: "301", ...ALICE }),
+    message({ id: "303", content: "lunch?" }),
+    message({ id: "304", content: "the queue drains", reply_to: "302", ...OWNER }),
+  ]);
+  await turnTodoOn(page);
+  assert.deepStrictEqual(shownIds(page), ["300", "301", "303", "304"], "Hide read is drawing the read reply");
+  await doubleTapArrow(page, rowWithId(page, "304"));
+  assert.deepStrictEqual(shownIds(page), ["300", "301", "304", "303"]);
+  assert.deepStrictEqual(stackPlaces(page), [["301", "parent"], ["304", "only"]],
+    "the conversation stopped at the message Hide read leaves out");
+  assert.equal(statusText(page), "Gathered 1; Hide read hides 1 more.");
+});
+
 test("COMBINING inside a stack: two quick replies from one author are one gathered row", async () => {
   const page = newPage();
   await signIn(page);
@@ -1058,6 +1177,39 @@ test("A TAP STILL WAITING TO JUMP goes with a change of view or of channel", asy
   await page.el("discord-channel").dispatch("change");
   await page.settle();
   assert.equal(page.expireTimers(REPLY_DOUBLE_TAP_MS), 0, "the tap taken in one channel still waits to jump in another");
+});
+
+test("DONE IN HIDE READ, taking a row out from between, decides the arrows and the stack again", async () => {
+  // A provider without threads, whose Hide read takes a row dealt with out of the list where it is.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1000000000000000001", content: "is the runner wedged?" }),
+    message({ id: "1000000000000000002", content: "the weather is nice" }),
+    message({ id: "1000000000000000003", content: "restarted it", reply_to: "1000000000000000001", ...ALICE }),
+    message({ id: "1000000000000000004", content: "lunch?" }),
+    message({ id: "1000000000000000005", content: "and the queue drains", reply_to: "1000000000000000001", ...OWNER }),
+  ]);
+  await turnTodoOn(page);
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000003")), "disconnected");
+  await doneButton(rowWithId(page, "1000000000000000002")).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), ["1000000000000000001", "1000000000000000003", "1000000000000000004",
+    "1000000000000000005"]);
+  assert.equal(arrowStyle(rowWithId(page, "1000000000000000003")), "adjacent",
+    "the reply's arrow still points past the row Done took away");
+  // Gathered: a reply dealt with leaves the stack one shorter, and its parent dealt with takes the stack.
+  await doubleTapArrow(page, rowWithId(page, "1000000000000000005"));
+  assert.deepStrictEqual(stackPlaces(page).map(([, place]) => place), ["parent", "first", "last"]);
+  await doneButton(rowWithId(page, "1000000000000000003")).click();
+  await page.settle();
+  assert.deepStrictEqual(stackPlaces(page), [["1000000000000000001", "parent"], ["1000000000000000005", "only"]],
+    "the bridge still draws a reply Done took out of the stack");
+  await doneButton(rowWithId(page, "1000000000000000001")).click();
+  await page.settle();
+  assert.deepStrictEqual(stackPlaces(page), [], "the stack outlived its parent");
+  assert.deepStrictEqual(shownIds(page), ["1000000000000000004", "1000000000000000005"],
+    "the replies stayed where the stack had them");
 });
 
 test("IN ALL, a message not loaded yet is walked back to on the timeline's own cursor", async () => {
@@ -2782,6 +2934,25 @@ test("signing out interrupts a pending send and prevents its queued successor fr
   assert.equal(page.repliesPosted.length, 1, "signing back in replayed a saved send automatically");
 });
 
+test("a sent receipt retires when provider history arrives even if To do hides that own message", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(2));
+  const posted = message({ id: "9221", content: "already handled by me", author_id: "own-account" });
+  page.replyResponse = async () => json(200, { posted });
+  await page.el("channel-compose-text").setValue(posted.content);
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(savedOutgoing(page).length, 1, "acknowledgement erased the durable fallback before a history read");
+  page.messages.push(posted);
+  assert.equal(page.el("mark-own-read").checked, true);
+  await turnTodoOn(page);
+  await page.settle();
+  assert.equal(shownIds(page).includes(posted.id), false, "the premise requires the own message to be filtered");
+  assert.equal(outgoingRows(page).length, 0, "a hidden provider message left a local receipt stuck on screen");
+  assert.equal(savedOutgoing(page).length, 0, "filtered history never acknowledged the durable send record");
+});
+
 test("an older in-flight poll cannot erase a sent message, and only a read sent after it retires its receipt", async () => {
   const page = newPage();
   const stream = await withLiveChannel(page, []);
@@ -3337,6 +3508,39 @@ test("IN MAIN, the circle on a message answered from inside a thread opens All a
   assert.equal(statusText(page), "Here is the reply to it.");
   // In All the reply is two rows below, its arrow disconnected: the circle is still there.
   assert.ok(replyMarkerOf(rowWithId(page, "200")));
+});
+
+test("...IN A THREAD as well; but not to a reply Hide read leaves out of All too, which Reply still counts", async () => {
+  const page = newPage();
+  const data = threadData();
+  // The first thread's answer answers the second thread's root.
+  data.messages[2].reply_to = "203";
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await pickThread(page, `thread:${data.threads[1].id}`);
+  assert.deepStrictEqual(shownIds(page), ["203", "204"]);
+  assert.ok(replyMarkerOf(rowWithId(page, "203")), "from a thread, a reply elsewhere has no way down to it");
+  await tapMarker(page, rowWithId(page, "203"));
+  assert.equal(page.el("thread-select").value, "flat");
+  assert.equal(rowWithId(page, "202").getAttribute("data-landed"), "true");
+
+  const hidden = newPage();
+  const again = threadData();
+  again.messages[4].reply_to = "200";
+  hidden.threadingSupported = true;
+  hidden.threads = again.threads;
+  hidden.dealtWith.add("204");
+  await signIn(hidden);
+  await showDiscord(hidden, again.messages);
+  await turnTodoOn(hidden);
+  await pickThread(hidden, "main");
+  const announcement = rowWithId(hidden, "200");
+  assert.ok(announcement, "Main under Hide read is not what this test assumes");
+  assert.equal(replyLabel(announcement), "Reply (1)", "a reply that was written, and read, stopped counting");
+  assert.equal(replyMarkerOf(announcement), undefined,
+    "a circle leads to a reply Hide read hides wherever it could be shown");
 });
 
 test("GATHERED, the stack under its message is the connection: no circle on the parent or in it", async () => {

@@ -30,7 +30,7 @@ const READ_MODE_SAID: Readonly<Record<string, string>> = Object.freeze({
 /** The sentence under the pointer for each mode: what it does, and where a tap goes next. */
 const READ_MODE_TITLES: Readonly<Record<string, string>> = Object.freeze({
   show: "Read messages are shown, greyed. Tap to fold each run of them into one line.",
-  fold: "Each run of read messages, or of read threads, is one line; tap a line to open it. Tap to show read messages.",
+  fold: "Each run of read messages, or of read threads, is one line; tap a line to open it. Tap to hide read messages.",
   hide: "Read messages are hidden. Tap to show them again.",
 });
 
@@ -42,14 +42,14 @@ const READ_MODE_TITLES: Readonly<Record<string, string>> = Object.freeze({
  */
 const READ_MODE_KEY = "vibe-talk.voice.read-mode";
 
-/** The mode a kept UI-state record says. `#432 read-mode-unify`: Fold read was "Collapse read", and a record kept then still means it. `#1168 read-toggle-two-way`: a saved Hide (or only `todo`) loads as Fold on, Hide and the to-do view being gone. */
+/** The mode a kept UI-state record says. `#432 read-mode-unify`: Fold read was "Collapse read", and a record kept then still means it. */
 function savedReadMode(saved: { readonly read?: unknown; readonly todo?: unknown }): string {
-  if (saved.read === "collapse" || saved.read === "hide") return "fold";
-  return READ_MODES.includes(saved.read as string) ? (saved.read as string) : saved.todo ? "fold" : "show";
+  if (saved.read === "collapse") return "fold";
+  return READ_MODES.includes(saved.read as string) ? (saved.read as string) : saved.todo ? "hide" : "show";
 }
 
-/** The mode after `mode` on the read toggle: Show and Fold in turn (`#1168 read-toggle-two-way`). From any other value, Show. */
-const nextReadMode = (mode: string): string => (mode === "show" ? "fold" : "show");
+/** The mode after `mode`, round the cycle. */
+const nextReadMode = (mode: string): string => READ_MODES[(READ_MODES.indexOf(mode) + 1) % READ_MODES.length] as string;
 
 /** What the read mode asks of the page: the device's storage, for the mode's kept copy. */
 export interface ReadModeDependencies {

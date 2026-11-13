@@ -16,7 +16,7 @@ const SUMMARY_FAILED_MARK = "summary failed";
 
 /** The chip over the list, off and on. */
 const SUMMARY_MODE_OFF = "Summaries";
-const SUMMARY_MODE_ON = "Summaries";
+const SUMMARY_MODE_ON = "Summaries on";
 
 /** The median, which is what a reader wants: one slow first call must not describe the rest. */
 function typicalSummaryMs(times: readonly number[]): number | null {

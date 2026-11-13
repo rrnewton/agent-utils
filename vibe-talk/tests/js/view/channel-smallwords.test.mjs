@@ -69,9 +69,10 @@ function makeNoise() {
   const acts = CHANNEL.createNoiseActs({
     providerFacts: { threading: () => state.threading },
     readModes: () => ({ hiding: () => state.hiding }),
+    todoView: () => ({ state: () => ({ noise: 3, window: 9 }) }),
     timelineRows: () => ({ messages: state.rows }),
-    el: () => ({ children: state.rows }),
-    rowMessages: (row) => [row],
+    el: () => ({ children: [] }),
+    rowMessages: () => [],
     selectedChannelId: () => "c1",
     api: async (path, options) => { calls.push(["api", path, options.body.messages]); },
     channelStore: { current: () => canon, open: () => canon },
@@ -83,11 +84,11 @@ function makeNoise() {
   return { acts, calls, canon, state };
 }
 
-test("the tally counts the loaded verdicts", () => {
+test("the tally counts the loaded verdicts, or the to-do window's own numbers", () => {
   const { acts, state } = makeNoise();
   assert.deepEqual(acts.noiseTally(), { matched: 1, total: 2 });
   state.threading = false; state.hiding = true;
-  assert.deepEqual(acts.noiseTally(), { matched: 1, total: 2 }, "without threads the tally still counts the loaded rows");
+  assert.deepEqual(acts.noiseTally(), { matched: 3, total: 9 }, "the to-do list's own count, as the server left them out");
 });
 
 test("a rescue is not optimistic: the server first, then every copy told", async () => {

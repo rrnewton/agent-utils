@@ -42,7 +42,7 @@ function nextAuthorFilter(current: string): string {
  */
 function authorEmptyWords(author: string, searching: boolean, pinned: boolean, ownHiddenByRead: () => boolean): string {
   if (author === "mine" && !pinned && ownHiddenByRead()) {
-    return "Your own messages start read, so they sit in the folded runs — press h for Show read.";
+    return "Your own messages start read, so Hide read leaves them out — press h for Show read.";
   }
   const whose = author === "mine" ? "yours" : "from anyone else";
   if (pinned) {

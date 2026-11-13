@@ -22,7 +22,7 @@ import { BASE_CSS, BOTTOM_SLACK_PX, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS_COD
   settingsGroup, showDiscord, shownIds, signIn, sourceConstant, speakRelay, splitPost, sseMessage,
   startTalking, takesASide, tallChannel, test, threadBadge, threadButton, threadData, threadOptions,
   threadPage, timelineAnswer, turnSummariesOn, turnTodoOn, unreadChip, viewOf, wavHeader, whoOf,
-  withLiveChannel, chooseReadMode} from "./fixture.mjs";
+  withLiveChannel } from "./fixture.mjs";
 
 // Device speech is selected by the backend; cloud audio remains covered by the existing tests.
 const DEVICE_SPEECH = { backend: "browser", label: "Device voice", playback: "browser", local_only: true };
@@ -526,7 +526,7 @@ test("`#886 voice-page-autoplay`: on, a read heard to its end goes on to the nex
   const heard = async () => { await page.players.at(-1).end(); await page.settle(); };
   // Off by default: a read heard to its end reads nothing after it. Message 2 is read now.
   assert.equal(page.el("read-autoplay").getAttribute("aria-pressed"), "false", "Autoplay is on by default");
-  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay");
+  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay: off");
   await rows[1].dispatch("click", {});
   await page.settle();
   await heard();
@@ -537,7 +537,7 @@ test("`#886 voice-page-autoplay`: on, a read heard to its end goes on to the nex
   await page.settle();
   assert.equal(page.el("action-menu").hidden, true, "choosing Autoplay left the menu open");
   assert.equal(page.el("read-autoplay").getAttribute("aria-pressed"), "true", "the strip's toggle does not say Autoplay is on");
-  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay");
+  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay: on");
   assert.equal(page.storage.get("vibe-talk.voice.autoplay"), "1", "Autoplay on is not kept");
   // 1 goes on past the read 2 to 3, and 3 to 4; after 4 nothing is unread below, and nothing more is read.
   await page.el("discord-log").children[0].dispatch("click", {});
@@ -554,11 +554,11 @@ test("`#886 voice-page-autoplay`: on, a read heard to its end goes on to the nex
   const again = newPage(page.storage);
   await signIn(again);
   assert.equal(again.el("read-autoplay").getAttribute("aria-pressed"), "true", "a reload forgot Autoplay");
-  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay");
+  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay: on");
   // Off from the strip's own toggle.
   await again.el("read-autoplay").click();
   assert.equal(again.storage.get("vibe-talk.voice.autoplay"), "0");
-  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay");
+  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay: off");
 });
 
 test("`#886 voice-page-autoplay`: Stop ends the going on, and a read the reader starts goes on from where it is", async () => {
@@ -2684,21 +2684,21 @@ test("...and they are kept out of the queue, and turning the setting off leaves 
     message({ id: "1000000000000000002", ...CODER }),
   ];
   await showDiscord(page, page.messages);
-  await chooseReadMode(page, "Fold read");
+  await turnTodoOn(page);
 
   assert.equal(
     page.el("discord-log").children.length,
-    2,
-    "Fold read took the reader's own words out of the list"
+    1,
+    "the queue still holds the reader's own words"
   );
-  assert.equal(row(page, 0).getAttribute("data-archived"), "true", "the reader's own words are not drawn read");
+  assert.equal(row(page, 0).getAttribute("data-id"), "1000000000000000002");
 
   // `#549 own-read-stored`: the setting decides where a message STARTS. Turned off, what was already
   // seen keeps its read state, and nothing is read again for it.
   const reads = page.todoReads;
   await page.el("mark-own-read").setChecked(false);
   await page.settle();
-  assert.equal(page.el("discord-log").children.length, 2, "turning the setting off changed the list");
+  assert.equal(page.el("discord-log").children.length, 1, "turning the setting off brought a read message back");
   assert.equal(page.todoReads, reads, "turning the setting off read the queue again");
 });
 
@@ -3927,6 +3927,30 @@ test("THE BOOKMARK DOES NOT SLIDE PAST A ROW THAT IS ONLY HALF DEALT WITH, and n
   assert.equal(page.bookmark.anchor.message_id, "1000000000000000003");
 });
 
+test("THE BULK CLEAR'S BOUNDARY IS THE NEWEST MESSAGE ON SCREEN, not the last row's identity", async () => {
+  // `through` is resolved by the server against its own ordering, and the boundary is INCLUDED.
+  // Sending a combined bottom row's identity stops the sweep one message short and leaves the
+  // trailing overflow in the queue — which is the one thing bankruptcy must not do.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, splitPost());
+  await turnTodoOn(page);
+
+  await page.el("clear-backlog").click();
+  // The count it warns with is in MESSAGES, because that is what is about to be cleared.
+  assert.match(page.el("status").textContent, /clear 2\b/, "the warning counted rows, not messages");
+  await page.el("clear-backlog").click();
+  await page.settle();
+
+  assert.equal(page.dismissCalls.length, 1);
+  assert.equal(
+    page.dismissCalls[0].through,
+    "1000000000000000002",
+    "the sweep stopped short of the trailing half of the bottom row"
+  );
+  assert.equal(shownIds(page).length, 0, "something was left in the queue");
+});
+
 test("PRESS AND HOLD ON A COMBINED ROW NAMES EVERY ID IT IS SHOWING", async () => {
   // The sheet is the answer to "does that message really exist", and this view exists because the
   // agent has described messages that did not. A combined row naming only its first constituent
@@ -4602,6 +4626,53 @@ test("A PLACEHOLDER THE SERVER READS AUTOMATICALLY IS DIMMED, NOT HIDDEN, AND NO
   assert.equal(plain.getAttribute("data-noise"), "false", "the page matched text on its own");
 });
 
+test("Hide read leaves a placeholder out of the to-do list, and an arriving one never joins it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, placeholderChannel());
+  await turnTodoOn(page);
+  assert.deepStrictEqual(
+    shownIds(page),
+    ["9400000000000000001", "9400000000000000003"],
+    "a placeholder is in the list of things to deal with"
+  );
+  // A placeholder arriving on the stream while the filter is on is already read.
+  await deliver(page, page.stream(), sseMessage(message({ id: "9400000000000000004", content: "Working...", noise: true })));
+  assert.deepStrictEqual(
+    shownIds(page),
+    ["9400000000000000001", "9400000000000000003"],
+    "an arriving placeholder joined the to-do list"
+  );
+  assert.match(page.el("clear-backlog").textContent, /\(2\)/, "the backlog count includes a placeholder");
+  // ...while a real arrival does, so the guard is about the verdict and not about arriving.
+  await deliver(page, page.stream(), sseMessage(message({ id: "9400000000000000005", content: "One more question." })));
+  assert.deepStrictEqual(shownIds(page).slice(-1), ["9400000000000000005"]);
+});
+
+test("Clear the backlog clears exactly the messages it counted, and never records a placeholder", async () => {
+  // The control counts the rows the to-do list shows, which leave the placeholder out; the server
+  // resolves `through` against its whole window, which holds it. When the server swept it up too,
+  // the page asked "clear 2" and reported 3, the undo restored 3, and the placeholder was recorded
+  // as dealt with — a record that outlives the rule and would hide it if it were edited into the
+  // answer.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, placeholderChannel());
+  await turnTodoOn(page);
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.match(page.el("status").textContent, /clear 2 /, "the premise is a confirmation of two");
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.equal(page.dismissCalls[0].through, "9400000000000000003", "the clear stopped short");
+  assert.match(
+    page.el("status").textContent,
+    /^2 messages marked as dealt with/,
+    `asked to clear 2, the page reported "${page.el("status").textContent}"`
+  );
+  assert.ok(!page.dealtWith.has("9400000000000000002"), "a placeholder was recorded as dealt with");
+});
+
 test("a threaded channel hides placeholders under Hide read and dims them otherwise", async () => {
   const page = newPage();
   page.threadingSupported = true;
@@ -4609,13 +4680,15 @@ test("a threaded channel hides placeholders under Hide read and dims them otherw
   await showDiscord(page, placeholderChannel());
   assert.equal(shownIds(page).length, 3, "the threaded channel view dropped a placeholder");
   assert.equal(page.el("discord-log").children[1].getAttribute("data-noise"), "true");
-  await chooseReadMode(page, "Fold read");
-  assert.equal(shownIds(page).length, 3, "Fold read took a placeholder out of a threaded channel");
-  assert.equal(page.el("discord-log").children[1].getAttribute("data-noise"), "true",
-    "Fold read did not dim the placeholder");
+  await turnTodoOn(page);
+  assert.deepStrictEqual(
+    shownIds(page),
+    ["9400000000000000001", "9400000000000000003"],
+    "Hide read kept a placeholder in a threaded channel"
+  );
   await page.el("todo-filter").click();
   await page.settle();
-  assert.equal(shownIds(page).length, 3, "turning Fold read off changed the placeholders shown");
+  assert.equal(shownIds(page).length, 3, "turning Hide read off did not bring the placeholder back");
 });
 
 test("a placeholder arriving during a call is shown but never relayed to the agent", async () => {
@@ -4708,7 +4781,7 @@ test("NOT NOISE RESCUES ONE MESSAGE: THE SERVER IS TOLD, AND THE ROW IS ORDINARY
   await reReadChannel(page);
   assert.equal(page.el("discord-log").children[1].getAttribute("data-noise"), "false");
   // With Hide read on it is now something to deal with.
-  await chooseReadMode(page, "Fold read");
+  await turnTodoOn(page);
   assert.ok(shownIds(page).includes("9400000000000000002"), "the rescued message is still hidden");
 });
 

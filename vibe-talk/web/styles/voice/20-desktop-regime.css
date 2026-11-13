@@ -19,12 +19,6 @@
  * so that the phone declaration is still the first one `cssBlock()` finds.
  */
 @media (min-width: 900px) and (pointer: fine) {
-  /* `#1399 toggle-labels-active-style`: on a desk there is no separate reader row to hide,
-     so the Reader box holds Autoplay alone — no Hide reader button is drawn. */
-  #reader-toggle {
-    display: none;
-  }
-
   /* `#345 settings-multi-column`. Settings' sections in columns, as many as the window has room for at
      24rem or more each: two at 900px, three at 1280, four at 1920, and no more than the 125rem the
      screen is held to. Each section is kept whole (`break-inside: avoid`) and the columns are balanced,

@@ -538,7 +538,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     },
     {
       group: KEYS_VIEW, chords: [{ key: "h" }],
-      does: "Show read and Fold read, in turn",
+      does: "Show read, Fold read, Hide read, in turn",
       controls: ["todo-filter"],
       run: () => readModeFromKeyboard(),
     },

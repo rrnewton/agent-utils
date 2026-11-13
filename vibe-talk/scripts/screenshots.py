@@ -2271,6 +2271,70 @@ def _act_summary_failed(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _choose_hide_read(driver: Driver) -> None:
+    """Tap the read-mode button on to Hide read: `#221 read-modes` put Fold read before it."""
+    for _tap in range(3):
+        if driver.js("document.getElementById('todo-filter').getAttribute('aria-pressed')") == "true":
+            return
+        driver.click("action-menu-open")
+        driver.settle(150)
+        driver.click("todo-filter")
+        driver.settle(150)
+
+
+def _act_todo_view(driver: Driver) -> None:
+    """`#50 todo-view`: the channel filtered down to what has not been dealt with."""
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { window.__beforeTodo = "
+        "document.querySelectorAll('#discord-log > li').length; return window.__beforeTodo; })()"
+    )
+    _choose_hide_read(driver)
+    driver.page.wait_for_function(
+        "() => document.getElementById('todo-filter').getAttribute('aria-pressed') === 'true' "
+        "&& (window.__text('inbox-note') || '').length > 0",
+        timeout=15_000,
+    )
+    # Deal with the oldest one, so the picture is of a list somebody has WORKED rather than of a
+    # filter that has been switched on and has done nothing yet. Through the DOM, because a real
+    # click would scroll the row into view and this frame is about the list at rest.
+    driver.js(
+        "(() => { const row = document.querySelector('#discord-log > li'); "
+        "window.__dealtWith = row.getAttribute('data-id'); "
+        "row.querySelector('.done-button').click(); return window.__dealtWith; })()"
+    )
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li').length < window.__beforeTodo "
+        "&& !document.getElementById('undo-dismiss').hidden",
+        timeout=15_000,
+    )
+    driver.settle(300)
+    driver.js(
+        "(() => { window.__afterTodo = "
+        "document.querySelectorAll('#discord-log > li').length; return window.__afterTodo; })()"
+    )
+
+
+def _act_bankruptcy_armed(driver: Driver) -> None:
+    """The bulk clear with one tap on it: saying how many, before it has done anything."""
+    _act_open_channel(driver)
+    _choose_hide_read(driver)
+    driver.page.wait_for_function(
+        "() => !document.getElementById('clear-backlog').hidden", timeout=15_000
+    )
+    driver.js(
+        "(() => { window.__backlog = "
+        "document.querySelectorAll('#discord-log > li').length; return window.__backlog; })()"
+    )
+    driver.js("(() => { document.getElementById('clear-backlog').click(); })()")
+    driver.page.wait_for_function(
+        "() => (window.__text('clear-backlog') || '').trim().endsWith('?')", timeout=5_000
+    )
+    # Promptly: the arming lapses after a few seconds, and a picture taken after that would be of
+    # a control at rest filed under a name that says armed.
+    driver.settle(150)
+
+
 def _act_message_search(driver: Driver) -> None:
     """`#129 message-search`: the glass open over the channel, with a quoted phrase in it.
 
@@ -5202,6 +5266,71 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
+        name="33-todo-view",
+        what="the channel filtered to what you have not dealt with, one message already cleared",
+        act=_act_todo_view,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the filter says it is on",
+                "document.getElementById('todo-filter').getAttribute('aria-pressed') === 'true'",
+            ),
+            (
+                "a message the reader dealt with really left the list",
+                "window.__afterTodo > 0 && window.__afterTodo < window.__beforeTodo && "
+                "![...document.querySelectorAll('#discord-log > li')]"
+                ".some((n) => n.getAttribute('data-id') === window.__dealtWith)",
+            ),
+            (
+                # THE thing this frame exists to settle, and the reason it is a picture rather
+                # than an assertion: `#61 unread-status` says this has to be said in the
+                # interface, and whether a sentence is legible on a 375px phone above a list is
+                # not a question any fixture can answer.
+                # Matched on what the sentence CLAIMS, not on the vendor's name. The server's
+                # notice stopped naming the service -- it says "the source chat service" now,
+                # because the bridge is no longer written against exactly one of them -- and a
+                # regex for the old name failed while the sentence it was checking for was on
+                # screen, correct, and legible. The two halves below are the claim itself.
+                "the page says on screen that this read state is its own, not the source's",
+                "/vibe-talk's own/.test(window.__text('inbox-note') || '') && "
+                "/source/.test(window.__text('inbox-note') || '') && "
+                "window.__visible('inbox-note')",
+            ),
+            ("there is a way back from the dismissal", "window.__visible('undo-dismiss')"),
+            (
+                "every remaining row offers the act, and none of them is clipped past the edge",
+                "(() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
+                "const pane = document.getElementById('pane-discord').getBoundingClientRect(); "
+                "return rows.length > 0 && rows.every((n) => { "
+                "const b = n.querySelector('.done-button'); "
+                "return b && b.getBoundingClientRect().right <= pane.right + 1; }); })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="34-bankruptcy-armed",
+        what="the bulk clear with one tap on it: saying how many it is about to take, before it does",
+        act=_act_bankruptcy_armed,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                # The whole content of this frame. A bulk destructive control that did not say
+                # how much it was about to take is the defect; one that says it only AFTER acting
+                # is the same defect with a receipt.
+                "the armed control names the number it is about to clear",
+                "(window.__text('clear-backlog') || '').includes(window.__backlog + '?')",
+            ),
+            (
+                "nothing has been cleared yet: the backlog is all still there",
+                "document.querySelectorAll('#discord-log > li').length === window.__backlog",
+            ),
+            (
+                "and it is drawn as armed rather than merely relabelled",
+                "document.getElementById('clear-backlog').className.includes('armed')",
+            ),
+        ),
+    ),
+    Scene(
         name="35-message-search",
         what="the search glass open over the channel, a quoted phrase typed, the list filtered down",
         act=_act_message_search,
@@ -7478,7 +7607,13 @@ def check_state_controls() -> list[str]:
         # on screen" and is the exact wrong implementation, and a page that named a summariser
         # from a constant of its own would satisfy any check that only looked for words.
         "32-channel-summarised": ("__summarisedHeight", "Summaries by"),
-        # Scenes 33 (to-do view) and 34 (bulk clear) retired with Hide read in #1168.
+        # `#50 todo-view`. 33 is pinned BOTH to a message really leaving the list and to the
+        # read-state statement being on screen: the second is the whole of `#61 unread-status`,
+        # and a scene pinned only to the filter being on would be satisfied with it deleted. 34 is
+        # pinned to the NUMBER, because "the control is armed" is satisfied by a control that
+        # relabels itself and still does not say how much it is about to take.
+        "33-todo-view": ("__dealtWith", "inbox-note"),
+        "34-bankruptcy-armed": ("__backlog", "armed"),
         # `#129 message-search`. Pinned to THREE things, because each is separately deletable and
         # each on its own is satisfied by a search that does not work:
         #   `search-hidden`   — a filtered row is really gone from the layout. A state pinned to

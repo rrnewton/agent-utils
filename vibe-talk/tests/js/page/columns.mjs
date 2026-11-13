@@ -590,14 +590,14 @@ test("`#229 desktop-two-column`: one read mode for both columns, and Done in one
   assert.equal(rowWithId(page, "201").getAttribute("data-archived"), "true", "Done on the right did not reach Main's row");
   assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages), [["201"]]);
   // Hide read takes the read messages out of both columns.
-  await chooseReadMode(page, "Fold read");
-  assert.ok(shownIds(page).includes("201"), "Fold read took a read root with unread replies out of Main");
-  assert.ok(sideIds(page).includes("201"), "Fold read did not reach the right column");
-  assert.ok(sideIds(page).includes("202"), "Fold read hid the unread reply");
+  await turnTodoOn(page);
+  assert.ok(!shownIds(page).includes("201") || unreadChip(page, "201"), "Hide read kept a read root with nothing unread");
+  assert.ok(!sideIds(page).includes("201"), "Hide read did not reach the right column");
+  assert.ok(sideIds(page).includes("202"), "Hide read hid the unread reply");
   // Done on the reply, on the right: the root's count of unread replies on Main goes.
   await doneButton(sideRow(page, "202")).click();
   await page.settle();
-  assert.equal(sideRow(page, "202").getAttribute("data-archived"), "true");
+  assert.ok(!sideIds(page).includes("202"));
   assert.equal(unreadChip(page, "201"), null, "Main still counts an unread reply that is Done on the right");
 });
 
@@ -1604,6 +1604,47 @@ test("`#432 read-mode-unify`: Unread only is gone from the cards' heading, whose
   assert.doesNotMatch(SCRIPT, /side-unread-only|SIDE_UNREAD_KEY|sideUnreadOnly/, "voice.js still keeps Unread only");
 });
 
+test("`#432 read-mode-unify`: Hide read keeps exactly the threads with an unread message — a reply or the root — and Show read every card; one unread reply makes a thread unread", async () => {
+  const { page, server, data: held } = await wholeReadColumns(6, [0, 2, 3]);
+  assert.deepStrictEqual(shownCardIds(page).length, 6, "Show read hides a card");
+  await readModeTo(page, "Hide read");
+  const unread = ["spaces/A/threads/t1", "spaces/A/threads/t4", "spaces/A/threads/t5"];
+  assert.deepStrictEqual(shownCardIds(page), unread, "Hide read did not keep exactly the threads with an unread message");
+  assert.equal(page.el("side-list-state").hidden, true, "a list with cards in it says it is empty");
+  // A reply arriving in a read thread makes it unread: its card comes back, at the foot.
+  await liveReply(page, server, held.messages[0], "400");
+  assert.deepStrictEqual(shownCardIds(page), [...unread, "spaces/A/threads/t0"],
+    "a read thread one reply came into is not unread under Hide read");
+  await readModeTo(page, "Show read");
+  assert.equal(shownCardIds(page).length, 6, "back to Show read, every card did not come back");
+  // A thread whose replies are all read but whose root is not is unread too (the root is one of its messages).
+  const rootOnly = await readThreadColumns(2, [0, 1]);
+  await readModeTo(rootOnly.page, "Hide read");
+  assert.deepStrictEqual(unreadCardIds(rootOnly.page), [], "the premise is no unread reply");
+  assert.deepStrictEqual(shownCardIds(rootOnly.page), ["spaces/A/threads/t0", "spaces/A/threads/t1"],
+    "a thread with its root unread was taken for read");
+});
+
+test("`#432 read-mode-unify`: under Hide read with nothing unread the cards say so, and with the search open Hide read steps aside as it does for messages", async () => {
+  const { page } = await wholeReadColumns(4, [0, 1, 2, 3]);
+  await readModeTo(page, "Hide read");
+  assert.deepStrictEqual(shownCardIds(page), []);
+  assert.equal(page.el("side-list-state").hidden, false, "an emptied list says nothing");
+  assert.equal(page.el("side-list-state").textContent, "No unread threads.");
+  await readModeTo(page, "Show read");
+  assert.equal(page.el("side-list-state").hidden, true, "the empty state stayed with the cards back");
+  const searched = (await wholeReadColumns(5, [0, 2])).page;
+  await readModeTo(searched, "Hide read");
+  await searched.el("search-toggle").click();
+  await searched.el("search-field").setValue("thread 2");
+  await searched.settle();
+  // `#262 search-load-older`: a filter choosing rows lifts Hide read, so a read thread the search finds shows.
+  assert.deepStrictEqual(shownCardIds(searched), ["spaces/A/threads/t2"], "the search did not find a read thread under Hide read");
+  await searched.el("search-field").setValue("nothing like this");
+  await searched.settle();
+  assert.equal(searched.el("side-list-state").textContent, "No threads match that search — all of this channel is loaded.");
+});
+
 test("`#432 read-mode-unify` x `#243 filter-keeps-selection`: the card selected stays where it was as Hide read goes on and off", async () => {
   const run = async (script) => {
     // Every other thread read, so the cards left still run past the column's foot.
@@ -1620,7 +1661,7 @@ test("`#432 read-mode-unify` x `#243 filter-keeps-selection`: the card selected 
     const id = card.getAttribute("data-id");
     const top = () => cardRow(page, id).getBoundingClientRect().top;
     const at = top();
-    await readModeTo(page, "Fold read");
+    await readModeTo(page, "Hide read");
     const on = top() - at;
     await readModeTo(page, "Show read");
     return { on, off: top() - at };
@@ -1659,7 +1700,7 @@ test("`#432 read-mode-unify`: h is the button's own act in All, Main, a thread a
   for (const view of ["flat", "main", "thread", "threads"]) {
     const page = await readModePage(view);
     const target = view === "threads" ? page.el("side-scroll") : page.el("scroll-area");
-    for (const [mode, label, pressed] of [["fold", "Fold read", "true"], ["show", "Fold read", "false"], ["fold", "Fold read", "true"]]) {
+    for (const [mode, label, pressed] of [["fold", "Fold read", "mixed"], ["hide", "Hide read", "true"], ["show", "Show read", "false"]]) {
       await press(page, target, "h");
       assert.deepStrictEqual(readModeSaid(page), [label, pressed, mode], `${view}: h did not move the button to ${label}`);
       assert.equal(page.el("status").textContent, READ_MODE_STATUS[mode], `${view}: h did not say ${label}`);
@@ -1777,7 +1818,7 @@ test("`#432 read-mode-unify`: a record that says Collapse read, from before Fold
   page.storage.set(UI_STATE_KEY, JSON.stringify({ ...savedUiState(page), read: "collapse" }));
   const older = reloadWith(page.storage, backlog());
   await reopenedChannel(older);
-  assert.deepStrictEqual(readModeSaid(older), ["Fold read", "true", "fold"], "a saved Collapse read did not open as Fold read");
+  assert.deepStrictEqual(readModeSaid(older), ["Fold read", "mixed", "fold"], "a saved Collapse read did not open as Fold read");
   assert.equal(savedUiState(older).read, "fold", "the record was not saved again under the new name");
 });
 
@@ -2035,6 +2076,52 @@ test("`#261 two-column-connectors`: a thread opened on the right instead of the 
   }
 });
 
+test("`#280 scroll-stability` x `#261`: a selection a redraw hands on, its card gone under Hide read, glides nothing", async () => {
+  const restore = layColumnsOut();
+  try {
+    const run = async () => {
+      // The fixture's own timeline, kept from before the change record replaces it: its newest page of
+      // Main says which replies are Done (`reply_dismissals`), which is how a Done made on another device
+      // reaches this one.
+      const { page } = await linkedColumns(16, (p) => { p.plainTimeline = p.timeline; });
+      // `#432 read-mode-unify`: Hide read, which took over from Unread only, filters the cards.
+      await readModeTo(page, "Hide read");
+      const left = page.el("scroll-area");
+      const right = page.el("side-scroll");
+      left.scrollTop = 0;
+      await left.dispatch("scroll");
+      right.scrollTop = 0;
+      await right.dispatch("scroll");
+      await page.nextFrame();
+      // The reader's choice: the first card, its root on screen at Main's head, so nothing glides.
+      await mouseTo(page, threadCard(page, 0), 900, 60);
+      assert.deepStrictEqual(litRows(page), ["side-cards:spaces/A/threads/t0"]);
+      assert.equal(left.glides, undefined, "a card whose root was on screen glided Main");
+      // The reader goes down Main to its foot, and the first thread is read on another device: its card
+      // goes under Hide read, and the selection is handed to the card now first, whose root is far
+      // above Main's foot.
+      left.scrollTop = left.scrollHeight;
+      await left.dispatch("scroll");
+      await page.nextFrame();
+      page.dealtWith.add("300");
+      page.dealtWith.add("301");
+      page.timeline = page.plainTimeline;
+      await reReadChannel(page);
+      await page.nextFrame();
+      const handed = litRows(page);
+      assert.ok(!shownCardIds(page).includes("spaces/A/threads/t0"), "the read card is still shown, so this proves nothing");
+      return { handed, glides: left.glides, at: left.scrollTop, foot: left.scrollHeight - left.clientHeight };
+    };
+    const kept = await run();
+    assert.deepStrictEqual(kept.handed, ["side-cards:spaces/A/threads/t1"], "the selection was not handed to the next card");
+    assert.equal(kept.glides, undefined, "a selection nobody chose glided Main away from the reader");
+    assert.equal(kept.at, kept.foot, "Main moved from where the reader put it");
+  } finally {
+    restore();
+  }
+});
+
+/** The mouse leaving the window: nothing under it, and the root element's `pointerleave`. */
 async function mouseOutOfWindow(page) {
   FakeElement.hovered = null;
   await page.documentElement.dispatch("pointerleave", { pointerType: "mouse", target: page.documentElement, relatedTarget: null });

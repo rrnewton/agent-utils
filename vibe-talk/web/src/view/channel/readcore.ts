@@ -292,6 +292,7 @@ export interface TimelineViewDependencies {
   notePinsRevision(revision: unknown): void;
   noteBookmark(payload: unknown): void;
   plainReach: { noteNewest(saved: boolean, kept: number, before: number, messages: number, at: string | undefined): void; gapFrom(): number | null; restore(gap: number | null): void };
+  todoView: { note(payload: unknown): void; state(): { left: number; window: number; complete: boolean; channelId: string }; arrived(): void };
   noiseRenderCount(): void;
   foldedOneIds(key: string): Set<string>;
   foldedOnes: Map<string, Set<string>>;
@@ -343,6 +344,7 @@ export interface TimelineView {
   foldLiveMessage(message: Message, live?: boolean, replayed?: boolean, read?: unknown): Message;
   loadDiscord(options?: TimelineReadOptions): Promise<void>;
   placeReplyTarget(entry: { replyTo?: unknown; channel?: string }): Promise<string | null>;
+  loadTodo(options?: TimelineReadOptions): Promise<void>;
   loadOlder(signal?: CancelSignal): Promise<void> | null;
   maybeLoadOlder(): void;
   takeDeferredOlder(): void;
@@ -358,6 +360,7 @@ export interface TimelineView {
   channelReadPosition(area: HTMLElement): { wasAtNewest: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null };
   settleAfterRead(messages: readonly Message[], how: { area: HTMLElement; keepPosition: boolean; ownAct?: boolean; wasAtNewest: boolean; previousTop: number; anchorId?: string | null; anchorTop?: number; around?: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null; heldPlaceAt?: number }): void;
   landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewest: boolean): { wasAtNewest: boolean; keepPosition: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null };
+  todoSummary(): string;
   rowIsRead(row: Element): boolean;
   cycleReadMode(): void;
   inView(message: Message, view: string, thread: string | null, scope?: string | null): boolean;
@@ -523,6 +526,7 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const notePinsRevision = deps.notePinsRevision;
   const noteBookmark = deps.noteBookmark;
   const plainReach = deps.plainReach;
+  const todoView = deps.todoView;
   const foldedOneIds = deps.foldedOneIds;
   const foldedOnes = deps.foldedOnes;
   const readRuns = deps.readRuns;
@@ -2035,6 +2039,13 @@ function heldRowAfter(position: { anchorId?: string | null; anchorTop?: number; 
 async function loadDiscord(options?: TimelineReadOptions): Promise<void> {
   screenBelongsToToken();
   if (providerFacts.threading()) return loadTimeline(options);
+  // `#50 todo-view`. Every path that re-reads the channel comes through here — the background
+  // poll, Refresh, entering the view, changing channel — so the mode is honoured HERE rather than
+  // at four call sites, one of which would eventually be forgotten and overwrite the filtered
+  // list with the unfiltered one.
+  if (readModes.hiding()) {
+    return loadTodo(options);
+  }
   // `remote-ops-audit` W7. As for a timeline read (`loadTimeline`).
   const holdKey = abandonedReads.holdKey();
   if (abandonedReads.held(holdKey, options)) return;
@@ -2156,6 +2167,118 @@ function drawChannelPage(payload: TimelineResponse, area: HTMLElement, at: Retur
 // cycle (`nextReadMode`) are web/src/present/rows' (`createReadMode`, `#624 voice-page-modularity`):
 // `readModes.mode()` is the mode, and `readModes.hiding()` this question.
 
+async function loadTodo(options?: TimelineReadOptions): Promise<void> {
+  if (providerFacts.threading()) return loadTimeline(options);
+  const generation = ++loadState().generation;
+  const keepPosition = Boolean(options && options.keepPosition);
+  const channel = selectedChannelId();
+  if (!channel) {
+    setStatus(deps.noChannelWords);
+    return;
+  }
+  // Not a timeline read: no view's read is out (`channelReads.readContext`).
+  if (!channelReads.claim(null)) {
+    queueDiscordLoad(options);
+    return;
+  }
+  const area = el("scroll-area");
+  const position = channelReadPosition(area);
+  renderChannelLoading(true);
+  try {
+    // The SAME window the unfiltered read uses, and it is sent rather than left to the server's
+    // default because the bulk clear has to send it back: `{through}` is resolved against a window
+    // on the server, and a boundary resolved against a WIDER window than the one this page
+    // displayed would clear messages the reader never saw. See `clearBacklog`.
+    const sent = readLedger.epoch();
+    const payload = await api(
+      timelineReader.withReadReason(`/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`, options)
+    );
+    // When it was sent, for `noteBookmark`: a bookmark write settled since speaks over it.
+    if (payload && typeof payload === "object") readLedger.noteSent(payload, sent);
+    if (!currentDiscordLoad(generation, channel, true)) {
+      return;
+    }
+    renderChannelLoading(false);
+    // Where the reader is now, not where they were when the read went out. `#280 scroll-stability`.
+    const at = landedReadPosition(area, keepPosition, position.wasAtNewest);
+    // THE QUEUE, as the server keeps it: the reader's own words in it only where their read state
+    // says so, like anyone's (`#549 own-read-stored`).
+    const served = payload.messages || [];
+    // And the window's messages the list leaves out as Done, the reader's own just sent among them:
+    // the provider has them, so a sent receipt waiting to see one may go (`#549 own-read-stored`).
+    const done = (Array.isArray((payload as unknown as { done?: unknown }).done) ? (payload as unknown as { done: unknown[] }).done : [])
+      .map((id) => ({ id: String(id), channel_id: String(channel) }));
+    observeOutgoingMessages([...served, ...done] as Message[]);
+    // Minus empty messages, while the reader hides those (`#386 hide-empty-messages`). Filtered
+    // BEFORE the count, because a backlog number that includes rows nobody can see is the kind of
+    // number a reader stops believing.
+    const messages = served.filter((m) => !hiddenEmpty(m));
+    const list = el("discord-log");
+    // The rebuild takes the reader's text selection with the rows: kept, and put back after
+    // (`#1209 selection-survives-updates`).
+    const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
+    patchRows(list, glom(messages), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+    renderChannelRows();
+    if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
+    // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a
+    // scroll to the top prepend unfiltered rows into a filtered list.
+    olderPages().moreAbove = false;
+    olderPages().cursor = null;
+    channelReads.payCursor();
+    renderOlderControl();
+    listState().backlog = messages.length;
+    // Quoted, never rewritten: `#61 unread-status` is one posture and it is stated on the server.
+    el("inbox-note").textContent = (payload as { read_state_notice?: string }).read_state_notice || "";
+    noteTodoRead(payload);
+    notePinsRevision(payload.pins_revision);
+    noteBookmark(payload);
+    renderChannelSeam(todoSummary());
+    renderTodoControls();
+    settleAfterRead(messages, {
+      area,
+      ...at,
+      ownAct: Boolean(options && options.ownAct),
+    });
+    renderScrollTools();
+    requestVisibleSummaries();
+  } finally {
+    await finishDiscordLoad();
+  }
+}
+
+/**
+ * What the last `/todo` read said, held so that anything which changes the list can RESTATE it.
+ *
+ * Kept rather than recomputed from the payload at the call site, because the payload is not the
+ * only thing that changes the list: a message arriving on the live stream adds a row without any
+ * read at all, and the head of the list, the backlog count and the bulk control all have to move
+ * with it or the view contradicts itself. One owner in web/src/core/channels (`createTodoView`, `#624
+ * voice-page-modularity`).
+ */
+
+function noteTodoRead(payload: unknown): void {
+  todoView.note(payload);
+  noiseSettings.renderCount();
+}
+
+/**
+ * What the head of the to-do list says about itself.
+ *
+ * "9 of 30" rather than "9 messages": the second reads as the size of the channel, and the whole
+ * point of this view is that it is a SUBSET. `complete` is `#62 message-count-accuracy` again —
+ * the window is the channel's own only when the server says the set is whole.
+ */
+
+function todoSummary(): string {
+  const { left, window, complete, channelId } = todoView.state();
+  const label = channelName(knownChannel(channelId));
+  if (left === 0) {
+    return `nothing left to deal with in ${label}`;
+  }
+  const of = complete ? `of ${window}` : `of the ${window} most recent`;
+  return `${left} ${of} in ${label} still want attention`;
+}
+
 /**
  * Put one row at the end of the channel list, and keep everything that DESCRIBES the list in step.
  *
@@ -2236,6 +2359,14 @@ function appendChannelRow(arriving: Message, live = false, folded = false): void
   else append();
   // A live arrival and an acknowledged send are both what a reload should show next.
   save();
+  if (!readModes.hiding()) {
+    return;
+  }
+  // The channel gained a message too, so the SUBSET and the window it is a subset of both grow.
+  todoView.arrived();
+  listState().backlog += 1;
+  renderChannelSeam(todoSummary());
+  renderTodoControls();
 }
 
 /**
@@ -2366,8 +2497,7 @@ function openReadRun(row: Element): void {
 
 function renderReadModeControl() {
   const button = el("todo-filter");
-  // `#1399 toggle-labels-active-style`: the label is fixed ("Fold read"); on/off is aria-pressed and the shared active style.
-  const label = READ_MODE_LABELS.fold;
+  const label = READ_MODE_LABELS[readModes.mode()];
   // Two words in two spans, so a desk can stack them; made here when the markup's are absent.
   const words = el("todo-filter-label");
   let verb = childByClass(words, "read-mode-verb");
@@ -2379,7 +2509,7 @@ function renderReadModeControl() {
     noun.textContent = " read";
     words.replaceChildren(verb, noun);
   }
-  if (verb.textContent !== READ_MODE_VERBS.fold) verb.textContent = READ_MODE_VERBS.fold as string;
+  if (verb.textContent !== READ_MODE_VERBS[readModes.mode()]) verb.textContent = READ_MODE_VERBS[readModes.mode()] as string;
   // The mode's own icon, and only it, by `hidden`: an icon is something a test of the dock can ask
   // for by that attribute, as it asks of every other control's.
   for (const icon of [...button.children]) {
@@ -2390,8 +2520,8 @@ function renderReadModeControl() {
   // Written only when they change: this runs with every redraw of the controls.
   const said = {
     "data-read-mode": readModes.mode(),
-    "aria-pressed": readModes.mode() === "fold" ? "true" : "false",
-    "aria-label": label,
+    "aria-pressed": readModes.mode() === "hide" ? "true" : readModes.mode() === "fold" ? "mixed" : "false",
+    "aria-label": `${label}. Tap for ${READ_MODE_LABELS[nextReadMode(readModes.mode())]}`,
     title: READ_MODE_TITLES[readModes.mode()],
   };
   for (const [name, value] of Object.entries(said)) {
@@ -2492,7 +2622,7 @@ function readRunsSuspended() {
     queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage,
     renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage,
     loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta,
-    loadDiscord, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition,
+    loadDiscord, loadTodo, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition, todoSummary,
     dispose() { disposed = true; },
   };
 }
