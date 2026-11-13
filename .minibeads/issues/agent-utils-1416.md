@@ -32,3 +32,5 @@ Each failed check names the agent or unit, the evidence, and the fix the core sk
 # Notes
 
 Numbered from devbig030's interim block (1400-1469). Part of the team-restore workstream; see the team-restore protocol plan (harness repo, `ai_docs/plans/2026-11-12-team-restore-protocol.md`, approved by the lead 2026-11-12).
+
+[watermelon-full-preview] 2026-11-13: standalone `agentctl team verify` landed on main (`ca722ef5ca`) with all six checks, turnover-pin `held` rows, and backend-first pane classification. This issue stays open for precisely: (1) the driver's VERIFY state running the same checks inside recovery (the driver work), including HANDOFF entry on failed rows with the checklist quoted from them; and (2) the timeout transitions around it — coordinator-ack deadline expiry moving VERIFY to HANDOFF/ESCALATE, HANDOFF's own deadline moving to ESCALATE, and each deadline's wake/re-entry — as modelled in the model-check work and proven against the real driver by replaying its traces. Nothing else in the acceptance criteria remains.

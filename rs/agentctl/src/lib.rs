@@ -58,6 +58,7 @@ pub mod stuck;
 pub mod subagents;
 pub mod submission;
 pub(crate) mod tab_order;
+pub mod team_model;
 pub mod team_verify;
 pub mod term;
 pub mod tui_prompts;
