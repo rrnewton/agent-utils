@@ -264,6 +264,7 @@ fn a_root_does_not_wait_for_a_withdrawn_batch_it_jumped_over() {
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config["roots"] = serde_json::json!(2);
+    config["speculative_stacking"] = serde_json::json!(false);
     std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
     let before = fx.remote_main();
     fx.branch("a", &[("tests/a", "ok\n")]);

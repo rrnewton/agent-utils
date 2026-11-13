@@ -52,6 +52,7 @@ exit $rc"#,
     std::fs::write(&script, validator).unwrap();
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",

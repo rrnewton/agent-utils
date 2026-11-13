@@ -228,6 +228,7 @@ fn a_stale_cancelled_root_is_recomposed_on_the_new_base_not_retried() {
     set_config(&fx, |config| {
         config["depth"] = serde_json::json!(3);
         config["roots"] = serde_json::json!(3);
+        config["speculative_stacking"] = serde_json::json!(false);
         config["keep_stale_roots"] = serde_json::json!(true);
         config["max_batch"] = serde_json::json!(1);
     });

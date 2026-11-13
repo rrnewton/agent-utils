@@ -402,6 +402,7 @@ fn a_mid_run_root_donor_job_records_the_base_it_was_planned_on() {
     ]);
     set_config(&fx, |config| {
         config["roots"] = serde_json::json!(3);
+        config["speculative_stacking"] = serde_json::json!(false);
     });
     fx.branch("a", &[("tests/a", "ok\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
@@ -2565,6 +2566,7 @@ fn kept_stale_roots_keep_their_donor_jobs_and_decide_after_a_landing() {
     set_config(&fx, |config| {
         config["depth"] = serde_json::json!(3);
         config["roots"] = serde_json::json!(3);
+        config["speculative_stacking"] = serde_json::json!(false);
         config["keep_stale_roots"] = serde_json::json!(true);
         config["max_batch"] = serde_json::json!(1);
     });
@@ -2709,6 +2711,7 @@ fn kept_stale_roots_keep_only_running_roots_and_rebuild_unstarted_ones_on_the_ne
     set_config(&fx, |config| {
         config["depth"] = serde_json::json!(3);
         config["roots"] = serde_json::json!(3);
+        config["speculative_stacking"] = serde_json::json!(false);
         config["keep_stale_roots"] = serde_json::json!(true);
         config["max_batch"] = serde_json::json!(1);
     });

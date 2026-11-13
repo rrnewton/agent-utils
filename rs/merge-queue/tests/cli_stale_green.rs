@@ -89,6 +89,7 @@ fn seeded(tag: &str) -> Fixture {
             ("depth", serde_json::json!(3)),
             ("roots", serde_json::json!(3)),
             ("stack_min_pass_percent", serde_json::json!(80)),
+            ("speculative_stacking", serde_json::json!(false)),
             ("keep_stale_roots", serde_json::json!(true)),
         ],
     );
@@ -196,6 +197,7 @@ fn a_red_stacked_validation_falls_back_without_an_extra_strike() {
             ("depth", serde_json::json!(3)),
             ("roots", serde_json::json!(3)),
             ("stack_min_pass_percent", serde_json::json!(80)),
+            ("speculative_stacking", serde_json::json!(false)),
             ("keep_stale_roots", serde_json::json!(true)),
         ],
     );

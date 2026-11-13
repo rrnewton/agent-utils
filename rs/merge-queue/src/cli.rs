@@ -1293,6 +1293,12 @@ enum Command {
         /// decided as usual.
         #[arg(long)]
         keep_stale_roots: bool,
+        /// Turn off speculative stacking: by default a batch that would
+        /// validate as a disjoint root instead validates stacked on the
+        /// candidates ahead of it, so a landing no longer cancels it. With
+        /// this flag, disjoint roots validate on the base exactly as before.
+        #[arg(long)]
+        no_speculative_stacking: bool,
         /// Stack a would-be disjoint root on a batch it jumps over when
         /// that batch is likely to land first (prioritized, already green,
         /// or predicted to pass at or above this percent), instead of
@@ -2179,6 +2185,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             green_flaky,
             roots,
             keep_stale_roots,
+            no_speculative_stacking,
             root_stack_min_pass_percent,
             stack_min_pass_percent,
             batch_min_pass_percent,
@@ -2377,6 +2384,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 disjoint_root_min_red_percent,
                 roots,
                 keep_stale_roots,
+                speculative_stacking: !no_speculative_stacking,
                 root_stack_min_pass_percent,
                 stack_min_pass_percent,
                 batch_min_pass_percent,

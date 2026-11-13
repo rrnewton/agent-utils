@@ -1273,6 +1273,7 @@ fn roots_three_disjoint_changes_validate_on_the_base_at_once() {
         &[
             ("depth", serde_json::json!(3)),
             ("roots", serde_json::json!(3)),
+            ("speculative_stacking", serde_json::json!(false)),
         ],
     );
     fx.branch("a", &[("tests/a", "ok\n")]);
@@ -1307,6 +1308,7 @@ fn keep_stale_roots_requeues_a_green_stale_root_and_ejects_a_red_one() {
         &[
             ("depth", serde_json::json!(3)),
             ("roots", serde_json::json!(3)),
+            ("speculative_stacking", serde_json::json!(false)),
             ("keep_stale_roots", serde_json::json!(true)),
         ],
     );
@@ -1377,6 +1379,7 @@ fn stack_gate_below_the_rate_builds_a_root_at_the_rate_stacks() {
         &[
             ("depth", serde_json::json!(3)),
             ("roots", serde_json::json!(3)),
+            ("speculative_stacking", serde_json::json!(false)),
             ("stack_min_pass_percent", serde_json::json!(80)),
         ],
     );
@@ -1402,6 +1405,7 @@ fn stack_gate_below_the_rate_builds_a_root_at_the_rate_stacks() {
         &[
             ("depth", serde_json::json!(3)),
             ("roots", serde_json::json!(3)),
+            ("speculative_stacking", serde_json::json!(false)),
             ("stack_min_pass_percent", serde_json::json!(80)),
         ],
     );

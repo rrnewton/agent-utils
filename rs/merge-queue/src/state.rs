@@ -230,6 +230,14 @@ pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 60;
 /// Default wall limit of a suspect-flake rerun.
 pub const DEFAULT_SUSPECT_FLAKE_TIMEOUT_SECS: u64 = 1800;
 
+fn default_speculative_stacking() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_roots() -> usize {
     1
 }
@@ -1284,6 +1292,17 @@ pub struct Config {
     /// red one is decided as usual. Off (the default) cancels it at once.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_stale_roots: bool,
+    /// Speculative stacking (the default): a batch that would validate as a
+    /// disjoint root on the base instead validates stacked on the tip of the
+    /// candidates ahead of it, so a landing no longer cancels the roots
+    /// behind it. Off (`init --no-speculative-stacking`) restores disjoint
+    /// roots exactly as before. Configs written before this field load with
+    /// it on, so the default changes for every queue that does not opt out.
+    #[serde(
+        default = "default_speculative_stacking",
+        skip_serializing_if = "is_true"
+    )]
+    pub speculative_stacking: bool,
     /// Stack a would-be disjoint root on a batch it jumps over when that
     /// batch is likely to land first (prioritized, already green awaiting
     /// decision, or predicted to pass at or above this percent from the
@@ -1442,6 +1461,7 @@ impl Default for Config {
             disjoint_root_min_red_percent: 0,
             roots: 1,
             keep_stale_roots: false,
+            speculative_stacking: true,
             root_stack_min_pass_percent: 0,
             stack_min_pass_percent: 0,
             batch_min_pass_percent: 0,

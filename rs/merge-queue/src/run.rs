@@ -5155,6 +5155,51 @@ impl<'a> Runner<'a> {
         );
     }
 
+    /// Discard a stack whose bottom no longer stands on the refreshed base:
+    /// an external landing moved the base under it, so every stacked flight
+    /// above re-plans onto the new base instead of landing (or waiting to
+    /// land) on a validation that assumed the moved base. Rooted flights
+    /// keep their own stale handling (`cancel_stale_rooted`).
+    fn cancel_stale_stacked(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+    ) {
+        // Only the main stack's bottom stands on the recorded base; a
+        // stacked flight on a disjoint root stands on that root and keeps
+        // the root's own stale handling.
+        let recorded = lock(&self.base).clone();
+        let bottom = flights.iter().find(|flight| {
+            flight.stacked
+                && flight.probe_for.is_none()
+                && flight.red_work.is_none()
+                && flight.candidate.parent == recorded
+        });
+        let Some(bottom) = bottom else {
+            return;
+        };
+        let parent = bottom.candidate.parent.clone();
+        let prs = bottom.candidate.prs.clone();
+        let Ok(fresh) = self.current_base() else {
+            return;
+        };
+        if parent == fresh {
+            return;
+        }
+        *lock(&self.base) = fresh.clone();
+        self.event(
+            "stale-stack",
+            &format!(
+                "the base moved from {} to {} under {}; the stack re-plans onto the new base",
+                short(&parent),
+                short(&fresh),
+                list(&prs)
+            ),
+        );
+        self.discard(flights, rx, pending, "the stack's base moved");
+    }
+
     /// Cancel a rooted flight whose parent is no longer the base: it can never
     /// land as built, so it must not hold its slot or spend the rest of its
     /// validation. A rooted batch only ever lands on its own parent.
@@ -7102,6 +7147,7 @@ impl<'a> Runner<'a> {
                     // or a ruling taken in with intake) moves the base off a
                     // rooted batch's parent: cancel it now, before the window
                     // is filled, so its slot and changes are reused at once.
+                    self.cancel_stale_stacked(&mut flights, &rx, pending);
                     self.cancel_stale_rooted(&mut flights, &rx, pending);
                     // A batch whose change was withdrawn while it validated
                     // leaves the window at once: the roots that jumped over
@@ -7583,6 +7629,13 @@ impl<'a> Runner<'a> {
                         let stale_stack = if stale_rooted { None } else { stale_stack };
                         let mut rooted = dep_tip.is_none()
                             && (stale_rooted || (stale_stack.is_none() && rooted));
+                        // Speculative stacking (the default): a would-be root
+                        // validates stacked on the candidates ahead of it, so a
+                        // landing ahead no longer cancels it. Only the
+                        // prioritized stale-green root exception still roots.
+                        if self.config.speculative_stacking && !stale_rooted {
+                            rooted = false;
+                        }
                         // A root that jumps over a batch likely to land
                         // first stacks on it instead, when configured
                         // (`root_stack_min_pass_percent`): its green would
@@ -9234,14 +9287,21 @@ impl<'a> Runner<'a> {
                 let mut attempt = 0usize;
                 loop {
                     attempt += 1;
+                    // Checked fast-forward: the base moves only when it is
+                    // still exactly the validated parent, compared atomically
+                    // on the side that moves it (old-value `update-ref`
+                    // locally, `--force-with-lease` on the remote), never a
+                    // blind push. A race that moves the base first refuses
+                    // here and re-plans through `BaseMoved` below.
                     let pushed = if self.config.remote.is_empty() {
                         self.git
                             .run(&["update-ref", &base_ref, &candidate.tip, &candidate.parent])
                             .map(drop)
                     } else {
+                        let lease = format!("--force-with-lease={base_ref}:{}", candidate.parent);
                         let spec = format!("{}:{base_ref}", candidate.tip);
                         self.git
-                            .run_net(&["push", "--quiet", &self.config.remote, &spec])
+                            .run_net(&["push", "--quiet", &lease, &self.config.remote, &spec])
                             .map(drop)
                     };
                     let now = self.current_base()?;

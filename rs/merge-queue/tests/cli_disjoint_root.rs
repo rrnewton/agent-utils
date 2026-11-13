@@ -23,6 +23,7 @@ fn a_disjoint_root_survives_a_red_stack_head() {
     let validator = r#"for t in $(ls tests); do o=pass; if [ "$t" = a ] || [ "$t" = b ]; then o=fail; fi; printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"; done; exit 0"#;
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",
@@ -132,6 +133,7 @@ fn a_disjoint_root_lands_once_when_head_and_second_are_red() {
     let validator = r#"for t in $(ls tests); do o=pass; if [ "$t" = a ] || [ "$t" = b ]; then o=fail; fi; printf '{"id":"%s","outcome":"%s"}\n' "$t" "$o" >> "$MQ_RESULTS"; done; exit 0"#;
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",
@@ -221,6 +223,7 @@ exit $rc"#,
     std::fs::write(&script, validator).unwrap();
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",
@@ -326,6 +329,7 @@ fn a_disjoint_root_waits_for_a_likely_red_head_when_gated() {
     let validator = r#"for t in $(ls tests); do printf '{"id":"%s","outcome":"pass"}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#;
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",
@@ -684,6 +688,7 @@ fn a_held_front_item_does_not_block_the_greens_behind_it() {
     let validator = r#"if [ -f tests/a ]; then echo "INFRA-BLOCKED: a"; exit 6; fi; for t in $(ls tests); do printf '{"id":"%s","outcome":"pass"}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#;
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",
@@ -755,6 +760,7 @@ exit 0"#,
     std::fs::write(&script, &validator).unwrap();
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",
@@ -904,6 +910,7 @@ fn an_after_change_is_composed_on_its_dependency_not_the_stack() {
     let validator = r#"ok=1; for f in tests/*; do [ -f "$f" ] || continue; if grep -qx FAIL "$f"; then echo "{\"id\":\"x\",\"outcome\":\"fail\"}" >> "$MQ_RESULTS"; ok=0; fi; done; [ $ok -eq 1 ]"#;
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",
@@ -1205,6 +1212,7 @@ exit 0"#,
     );
     fx.mq_ok(&[
         "init",
+        "--no-speculative-stacking",
         "--remote",
         "origin",
         "--validator",
