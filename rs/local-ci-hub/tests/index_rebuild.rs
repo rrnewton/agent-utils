@@ -179,3 +179,56 @@ fn version_mismatch_discards_and_rebuilds() {
     assert_eq!(other.all_rows().unwrap().len(), 0);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn empty_batches_advance_the_cursor_without_refolding() {
+    // Structural guard for the acceptance blowup: refolds are counted,
+    // never timed, so this test budgets no wall clock.
+    let events = fixture_events(12);
+    let mut single = Index::in_memory("test-store", "/workspace").unwrap();
+    single
+        .apply(&events, &cursor_at(&events, "head-12"))
+        .unwrap();
+    assert_eq!(single.refold_count(), 1);
+
+    // Warm tail with nothing new, three times over: the cursor moves
+    // and the answers stay identical without another refold.
+    let digest = single.dump_digest().unwrap();
+    for head in ["head-12b", "head-12c", "head-12d"] {
+        single.apply(&[], &cursor_at(&events, head)).unwrap();
+        assert_eq!(single.refold_count(), 1);
+    }
+    assert_eq!(single.cursor().unwrap().head, "head-12d");
+    // The dump embeds the cursor, so compare rows, not digests, here.
+    let _ = digest;
+    assert_eq!(single.all_rows().unwrap().len(), 12);
+}
+
+#[test]
+fn refold_count_grows_once_per_nonempty_apply() {
+    let events = fixture_events(12);
+    let mut incremental = Index::in_memory("test-store", "/workspace").unwrap();
+    let mut seen = 0;
+    for batch in [&events[0..4], &events[4..8], &events[8..12]] {
+        seen += batch.len();
+        incremental
+            .apply(batch, &cursor_at(&events[..seen], &format!("head-{seen}")))
+            .unwrap();
+    }
+    assert_eq!(incremental.refold_count(), 3);
+    // ...which is exactly why the CLI accumulates and applies once:
+    // the same history admitted in a single batch refolds once and
+    // answers identically.
+    let mut cold = Index::in_memory("test-store", "/workspace").unwrap();
+    cold.apply(&events, &cursor_at(&events, "head-12")).unwrap();
+    assert_eq!(cold.refold_count(), 1);
+    let dump_rows = |index: &Index| -> Vec<String> {
+        index
+            .all_rows()
+            .unwrap()
+            .iter()
+            .map(local_ci_hub::pyjson::dumps_sorted)
+            .collect()
+    };
+    assert_eq!(dump_rows(&incremental), dump_rows(&cold));
+}

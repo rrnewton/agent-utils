@@ -121,8 +121,12 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
         binding_tree_field: cli.binding_tree_field.clone(),
     };
     let mut cursor = start;
-    // Tail the authority page by page, admitting each page before asking
-    // for the next so a long history never accumulates unboundedly here.
+    // Tail the authority page by page, but admit the whole tail in ONE
+    // apply: Index::apply rematerializes the fold from every admitted
+    // event, so applying per page refolds the full history on each page
+    // of one load. Pages are still expanded and envelope-checked as they
+    // arrive, so refusals surface before anything is stored.
+    let mut pending: Vec<local_ci_hub::event::RawEvent> = Vec::new();
     loop {
         let page = store
             .read_from(&cursor, ReadLimits::default())
@@ -141,19 +145,17 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
             .map_err(|r| format!("{r}"))?;
             expanded.push(event);
         }
-        // Envelope-check the unioned view of this page against what the
-        // index already holds is the fold's job across the whole set;
-        // per-page checking catches malformed envelopes at admission.
         let unioned = union(expanded).map_err(|r| format!("{r}"))?;
         if let Err(refusal) = check_events(&unioned) {
             refusal_exit(&refusal);
         }
+        pending.extend(unioned);
         cursor = page.next_cursor.clone();
-        index.apply(&unioned, &cursor).map_err(|e| format!("{e}"))?;
         if !page.more {
             break;
         }
     }
+    index.apply(&pending, &cursor).map_err(|e| format!("{e}"))?;
     Ok(Loaded {
         index,
         cursor,

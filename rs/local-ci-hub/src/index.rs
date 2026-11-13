@@ -173,6 +173,7 @@ pub struct Index {
     conn: Connection,
     workspace_root: String,
     authority: String,
+    refold_count: u64,
 }
 
 impl Index {
@@ -210,6 +211,7 @@ impl Index {
             conn,
             workspace_root: workspace_root.to_owned(),
             authority: authority.to_owned(),
+            refold_count: 0,
         })
     }
 
@@ -241,7 +243,15 @@ impl Index {
             conn,
             workspace_root: workspace_root.to_owned(),
             authority: authority.to_owned(),
+            refold_count: 0,
         })
+    }
+
+    /// How many committed refolds (full rematerializations of the folded
+    /// rows) this handle has performed. An empty batch never refolds, so a
+    /// caller that admits a whole load in one batch refolds exactly once.
+    pub fn refold_count(&self) -> u64 {
+        self.refold_count
     }
 
     /// Current cursor: stored head plus per-shard positions.
@@ -280,7 +290,10 @@ impl Index {
     /// The batch is applied in one transaction: a conflicting `event_id`
     /// body refuses the whole batch and stores nothing. Folded rows are
     /// then rematerialized from every admitted event, so late arrivals
-    /// (older `emitted_at` in a new suffix) re-fold correctly.
+    /// (older `emitted_at` in a new suffix) re-fold correctly. An empty
+    /// batch only records the new cursor; it never rematerializes, so
+    /// tailing in small pages should accumulate and apply once instead
+    /// of refolding per page.
     pub fn apply(&mut self, batch: &[RawEvent], next_cursor: &Cursor) -> Result<()> {
         let tx = self.conn.transaction()?;
         for event in batch {
@@ -314,6 +327,11 @@ impl Index {
                 "INSERT INTO shards (path, offset, prefix_sha256) VALUES (?1, ?2, ?3)",
                 params![path, pos.offset as i64, pos.prefix_sha256],
             )?;
+        }
+        if batch.is_empty() {
+            // Cursor-only advance: the materialized rows cannot change.
+            tx.commit()?;
+            return Ok(());
         }
         // Rematerialize folded rows from the full admitted set.
         let mut statement = tx.prepare("SELECT line FROM events ORDER BY seq")?;
@@ -349,6 +367,7 @@ impl Index {
             )?;
         }
         tx.commit()?;
+        self.refold_count += 1;
         Ok(())
     }
 

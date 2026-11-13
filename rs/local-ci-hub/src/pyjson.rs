@@ -128,6 +128,29 @@ fn err(reason: impl Into<String>) -> ParseError {
     }
 }
 
+/// Decode the first char of `bytes`, examining at most 4 bytes.
+///
+/// The lead byte fixes the sequence width, and only that bounded slice is
+/// validated, so the cost of a decode never depends on how much input
+/// follows it. Callers may pass a longer slice; bytes beyond the first
+/// char are ignored.
+fn decode_utf8_char(bytes: &[u8]) -> Result<(char, usize), ParseError> {
+    let Some(&lead) = bytes.first() else {
+        return Err(err("unterminated string"));
+    };
+    let width = match lead {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return Err(err("invalid UTF-8")),
+    };
+    let slice = bytes.get(..width).ok_or_else(|| err("invalid UTF-8"))?;
+    let text = std::str::from_utf8(slice).map_err(|_| err("invalid UTF-8"))?;
+    let ch = text.chars().next().ok_or_else(|| err("invalid UTF-8"))?;
+    Ok((ch, width))
+}
+
 /// Parser options mirroring the two ledger parse modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ParseOptions {
@@ -367,14 +390,29 @@ impl Parser<'_> {
                 }
                 0x00..=0x1F => return Err(err("unescaped control character in string")),
                 _ => {
-                    let rest = &self.bytes[self.pos..];
-                    let text = std::str::from_utf8(rest).map_err(|_| err("invalid UTF-8"))?;
-                    let ch = text
-                        .chars()
-                        .next()
-                        .ok_or_else(|| err("unterminated string"))?;
-                    out.push(ch);
-                    self.pos += ch.len_utf8();
+                    // Consume a run of plain ASCII in one slice. The
+                    // delimiter bytes are ASCII, so they cannot occur
+                    // inside a multibyte sequence; validating the whole
+                    // remaining input per character would be quadratic
+                    // on long lines.
+                    let start = self.pos;
+                    while let Some(b) = self.peek() {
+                        if b == b'"' || b == b'\\' || !(0x20..0x80).contains(&b) {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    if self.pos > start {
+                        // The run is pure ASCII, hence valid UTF-8; this
+                        // validates each byte exactly once.
+                        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+                            .map_err(|_| err("invalid UTF-8"))?;
+                        out.push_str(text);
+                    } else {
+                        let (ch, width) = decode_utf8_char(&self.bytes[self.pos..])?;
+                        out.push(ch);
+                        self.pos += width;
+                    }
                 }
             }
         }
@@ -701,4 +739,59 @@ fn py_repr_str(text: &str) -> String {
 /// Deep-copy a value (values are owned; this is `Clone` with intent).
 pub fn deep_copy(value: &PyValue) -> PyValue {
     value.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_utf8_char, parse, PyValue};
+
+    #[test]
+    fn decode_utf8_char_uses_bounded_slices() {
+        assert_eq!(decode_utf8_char(b"a...").unwrap(), ('a', 1));
+        assert_eq!(decode_utf8_char("é...".as_bytes()).unwrap(), ('é', 2));
+        assert_eq!(decode_utf8_char("€...".as_bytes()).unwrap(), ('€', 3));
+        assert_eq!(decode_utf8_char("😀...".as_bytes()).unwrap(), ('😀', 4));
+        assert!(decode_utf8_char(&[]).is_err());
+        assert!(decode_utf8_char(&[0xFF]).is_err());
+        assert!(decode_utf8_char(&[0xC2]).is_err());
+        assert!(decode_utf8_char(&[0xC0, 0xA9]).is_err());
+        assert!(decode_utf8_char(&[0xED, 0xA0, 0x80]).is_err());
+        // Bytes past the first char are never inspected, however invalid.
+        assert_eq!(decode_utf8_char(&[b'a', 0xFF, 0xFF]).unwrap(), ('a', 1));
+    }
+
+    #[test]
+    fn multi_megabyte_string_parses_to_the_same_value() {
+        // A several-MB string (plain run, multibyte char, escaped quote,
+        // more plain run). Under per-character rescans of the remaining
+        // input this parse would outlast any test timeout; here it simply
+        // has to produce the right value.
+        let mut text = String::from("\"");
+        let mut expected = String::new();
+        for chunk in 0..64 {
+            let plain = "a".repeat(64 * 1024);
+            text.push_str(&plain);
+            expected.push_str(&plain);
+            text.push('é');
+            expected.push('é');
+            if chunk == 31 {
+                text.push_str("\\\"\\\\");
+                expected.push_str("\"\\");
+            }
+        }
+        text.push('"');
+        let value = parse(&text).unwrap();
+        assert_eq!(value, PyValue::Str(expected));
+    }
+
+    #[test]
+    fn string_boundaries_still_refuse_bad_input() {
+        assert!(parse("\"\u{1}\"").is_err()); // raw control character
+        assert!(parse("\"\u{10FFFF}\"").is_ok());
+        assert!(parse("\"\\ud800\"").is_err()); // lone surrogate escape
+        assert_eq!(
+            parse("\"/€/😀\"").unwrap(),
+            PyValue::Str("/€/😀".to_owned())
+        );
+    }
 }
