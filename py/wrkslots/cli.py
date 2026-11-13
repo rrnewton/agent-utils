@@ -26909,6 +26909,7 @@ def _sha256_regular_file(path: Path, label: str) -> tuple[str, int]:
 
 
 _PROMISOR_GAP_REASON = "already-incomplete history, promisor gap"
+_MISSING_LOCALLY_REASON = "objects missing locally; content unrecoverable; not on any remote"
 
 
 def _excluded_incomplete_history_entries(
@@ -26917,8 +26918,8 @@ def _excluded_incomplete_history_entries(
     """The receipt entries for the kept commits ``facts`` left out (#1278)."""
 
     return [
-        {"commit": commit, "missing_object": missing, "reason": _PROMISOR_GAP_REASON}
-        for commit, missing in facts.excluded_incomplete_history
+        {"commit": commit, "missing_object": missing, "reason": reason}
+        for commit, missing, reason in facts.excluded_incomplete_history
     ]
 
 
@@ -27025,17 +27026,35 @@ def _unbundleable_refusal(
     )
 
 
+def _reflog_reaches(vcs: _GitVcs, path: Path, tip: str) -> bool:
+    """Whether any reflog entry's history reaches ``tip`` (#1481)."""
+
+    listed = vcs._run(
+        path, ["rev-list", "--reflog", "--all"], check=False
+    )
+    return tip in listed.stdout.split()
+
+
 def _partition_kept_commits(
-    vcs: _GitVcs, path: Path, checkout_name: str, tips: Sequence[str]
-) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
-    """Split kept private-history ``tips`` into bundleable and promisor-gap commits.
+    vcs: _GitVcs,
+    path: Path,
+    checkout_name: str,
+    tips: Sequence[str],
+    *,
+    protected: AbstractSet[str] = frozenset(),
+) -> tuple[tuple[str, ...], tuple[tuple[str, str, str], ...]]:
+    """Split kept private-history ``tips`` into bundleable and excluded commits.
 
     A tip is bundleable when every object it reaches is held by one of the
     stores a salvage bundle may read (_salvage_bundle_object_env). A tip
     whose missing objects are all promisor gaps (Git's
     ``--missing=allow-promisor`` tolerates every one, with lazy fetching
     off) was already incomplete in every store, so it is excluded and
-    recorded, never silently dropped. Any other missing object refuses,
+    recorded, never silently dropped. A tip whose objects are missing
+    locally for any other reason is excluded the same way when nothing
+    the slot would lose reaches it (#1481: a dangling commit whose tree
+    no store holds is unrecoverable, and refusing parks the slot); a
+    ``protected`` tip (reachable from a ref or a reflog) refuses instead,
     naming the kept commit, the object, and every store searched (#1278).
     """
 
@@ -27059,11 +27078,11 @@ def _partition_kept_commits(
             f"keeping {len(tips)}/0",
             f"wrkslots: checkout {checkout_name}: keeping {len(tips)} kept "
             "commit(s); excluded 0 already-incomplete kept commit(s) "
-            "(promisor gap); recorded in the salvage receipt",
+            "(promisor gap or missing locally); recorded in the salvage receipt",
         )
         return tuple(tips), ()
     kept: list[str] = []
-    excluded: list[tuple[str, str]] = []
+    excluded: list[tuple[str, str, str]] = []
     verified: list[str] = []
     for tip in tips:
         stdin = f"{tip}\n" + "".join(f"^{item}\n" for item in verified)
@@ -27093,7 +27112,10 @@ def _partition_kept_commits(
                 env_overrides=env,
             )
             if tolerated.returncode == 0:
-                excluded.append((tip, missing[0]))
+                excluded.append((tip, missing[0], _PROMISOR_GAP_REASON))
+                continue
+            if tip not in protected:
+                excluded.append((tip, missing[0], _MISSING_LOCALLY_REASON))
                 continue
             searched = ", ".join(str(store) for store in stores)
             raise Refusal(
@@ -27103,6 +27125,9 @@ def _partition_kept_commits(
             )
         # The tip's own commit object is unreadable; the bundle stage would
         # refuse it, so name it here instead of keeping it blindly.
+        if tip not in protected:
+            excluded.append((tip, tip, _MISSING_LOCALLY_REASON))
+            continue
         searched = ", ".join(str(store) for store in stores)
         raise Refusal(
             f"salvage of checkout {checkout_name} cannot bundle kept commit "
@@ -27114,7 +27139,7 @@ def _partition_kept_commits(
         f"keeping {len(kept)}/{len(excluded)}",
         f"wrkslots: checkout {checkout_name}: keeping {len(kept)} kept "
         f"commit(s); excluded {len(excluded)} already-incomplete kept "
-        "commit(s) (promisor gap); recorded in the salvage receipt",
+        "commit(s) (promisor gap or missing locally); recorded in the salvage receipt",
     )
     return tuple(kept), tuple(excluded)
 
@@ -28005,7 +28030,7 @@ class _SalvageCandidate:
     # gap (#1278): each is (commit, first missing object). They were
     # already incomplete in every store removal may read, so the bundle
     # keeps everything complete without pretending to keep them.
-    excluded_incomplete_history: tuple[tuple[str, str], ...] = ()
+    excluded_incomplete_history: tuple[tuple[str, str, str], ...] = ()
     # Kept-commit counts by root type from the private-history scan that
     # produced this candidate (#1280), kept and reported-not-kept, as
     # (category, count) in _PRIVATE_HISTORY_COUNT_KEYS order.
@@ -29669,7 +29694,18 @@ def _salvage_candidate_uncached(
         tips = () if history is None else history.tips
     else:
         tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
-    kept_tips, excluded = _partition_kept_commits(vcs, path, checkout.name, tips)
+    if history is not None:
+        protected: set[str] = {commit for _ref, commit in history.refs}
+        protected.update(
+            tip
+            for tip in tips
+            if tip not in protected and _reflog_reaches(vcs, path, tip)
+        )
+    else:
+        protected = set(tips)
+    kept_tips, excluded = _partition_kept_commits(
+        vcs, path, checkout.name, tips, protected=protected
+    )
     extra.extend(tip for tip in kept_tips if tip not in extra)
     history_counts = () if history is None else history.counts
     kept_history = history if history is not None and history.tips else None

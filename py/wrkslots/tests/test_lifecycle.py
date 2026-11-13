@@ -62613,6 +62613,60 @@ def test_archive_private_history_excludes_a_promisor_gap_kept_commit(
     assert git(restored, "show", f"{complete_commit}:complete.txt").stdout == "complete\n"
 
 
+def _delete_loose_object(repo: Path, sha: str) -> None:
+    common = Path(
+        git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    )
+    (common / "objects" / sha[:2] / sha[2:]).unlink()
+
+
+def test_archive_private_history_excludes_a_dangling_commit_missing_its_tree(
+    tmp_path: Path,
+) -> None:
+    """#1481: a dangling kept commit whose tree no store holds is excluded, not parked on."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    base = git(component, "rev-parse", "HEAD").stdout.strip()
+    dangling = _dangling_commit(component, base, "lost", "lost\n")
+    dangling_tree = git(component, "rev-parse", f"{dangling}^{{tree}}").stdout.strip()
+    _delete_loose_object(component, dangling_tree)
+    assert git(component, "cat-file", "-e", dangling_tree, check=False).returncode != 0
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component"]
+    assert receipt["disposition"] == "already-published", receipt
+    assert receipt["excluded_incomplete_history"] == [
+        {
+            "commit": dangling,
+            "missing_object": dangling_tree,
+            "reason": "objects missing locally; content unrecoverable; not on any remote",
+        }
+    ]
+
+
+def test_archive_private_history_refuses_a_ref_kept_commit_missing_its_tree(
+    tmp_path: Path,
+) -> None:
+    """#1481: a ref-reachable commit with a missing object still refuses."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    base = git(component, "rev-parse", "HEAD").stdout.strip()
+    git(component, "checkout", "-q", "-b", "side")
+    kept = commit_local(component, "kept.txt", "kept\n", "kept work")
+    git(component, "checkout", "-q", "--detach", base)
+    kept_tree = git(component, "rev-parse", f"{kept}^{{tree}}").stdout.strip()
+    _delete_loose_object(component, kept_tree)
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert tree.is_dir()
+    assert kept in removed.stderr
+    assert kept_tree in removed.stderr
+    assert "missing from every object store searched" in removed.stderr
+
+
 def test_archive_private_history_refuses_a_blob_missing_from_every_store(
     tmp_path: Path,
 ) -> None:
