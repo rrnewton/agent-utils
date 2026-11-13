@@ -512,6 +512,7 @@
         "py/wrkslots/tests/test_validation_run_liveness.py",
         "py/wrkslots/tests/test_worktrees_image.py",
         "py/wrkslots/tests/test_worktrees_image_status_rust.py",
+        "py/wrkslots/tests/test_worktrees_image_writers_rust.py",
         "py/wrkslots/tests/test_yamlconfig.py",
         "py/wrkslots/tests/test_yamlconfig_rust.py"
       ]

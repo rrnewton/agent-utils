@@ -921,6 +921,158 @@ fn wt_lock_missing(
     }
 }
 
+/// Shared worktrees-image inputs: validated config, parsed
+/// settings (None when unconfigured), and the live mount table.
+struct WtInputs {
+    config: Value,
+    settings: Option<WorktreesImageSettings>,
+    project_root: PathBuf,
+    control: PathBuf,
+    worktrees: PathBuf,
+    entries: Vec<MountEntry>,
+}
+
+impl WtInputs {
+    fn load(root: Option<&Path>, machine: Option<&str>) -> Result<Self> {
+        let config = crate::config_validate::load_config(root, machine)?;
+        let settings = match config.get("worktrees_image") {
+            Some(section) if !section.is_null() => Some(settings_from_obj(section)?),
+            _ => None,
+        };
+        Ok(Self {
+            project_root: config_path(&config, "root"),
+            control: config_path(&config, "control"),
+            worktrees: config_path(&config, "worktrees"),
+            entries: mount_entries(),
+            config,
+            settings,
+        })
+    }
+
+    fn ctx(&self) -> WtCtx<'_> {
+        WtCtx {
+            root: &self.project_root,
+            control: &self.control,
+            worktrees: &self.worktrees,
+            entries: &self.entries,
+            skipped: self
+                .config
+                .get("worktrees_image_skipped")
+                .and_then(Value::as_str),
+        }
+    }
+}
+
+/// `wrkslots worktrees-image create` (writer): with `--path` and
+/// `--size-bytes` together the pair is validated as a section and
+/// no configured section is read, as Python does before enabling.
+pub(crate) fn wt_create_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    path: Option<&str>,
+    size_bytes: Option<i64>,
+) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let inputs = WtInputs::load(root, machine)?;
+    let ctx = inputs.ctx();
+    if let (Some(path), Some(size)) = (path, size_bytes) {
+        let settings = settings_from_obj(&json!({"path": path, "size_bytes": size}))?;
+        return Ok(crate::worktrees_image::wt_create(
+            &ctx,
+            Some(settings),
+            &SubprocessRunner,
+        ));
+    }
+    if path.is_some() != size_bytes.is_some() {
+        return Ok(HandlerOutcome {
+            exit: 3,
+            stdout: String::new(),
+            stderr: "REFUSED: --path and --size-bytes must be given together\nREMEDY: run 'wrkslots worktrees-image --help', correct the named condition, then rerun 'wrkslots worktrees-image' with the required arguments\n".to_string(),
+        });
+    }
+    Ok(crate::worktrees_image::wt_create(
+        &ctx,
+        inputs.settings.clone(),
+        &SubprocessRunner,
+    ))
+}
+
+/// `wrkslots worktrees-image mount` (writer).
+pub(crate) fn wt_mount_cli(root: Option<&Path>, machine: Option<&str>) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let inputs = WtInputs::load(root, machine)?;
+    let ctx = inputs.ctx();
+    let mount_id = |target: &Path| -> Option<i64> {
+        let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        let target = target.to_string_lossy();
+        let mut found = None;
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 5 && fields[4].replace("\\040", " ") == target {
+                found = fields[0].parse::<i64>().ok();
+            }
+        }
+        found
+    };
+    Ok(crate::worktrees_image::wt_mount(
+        &ctx,
+        inputs.settings.clone(),
+        &mount_id,
+        &SubprocessRunner,
+    ))
+}
+
+/// `wrkslots worktrees-image unmount` (writer): the direct layout
+/// refuses before anything runs, as Python does.
+pub(crate) fn wt_unmount_cli(root: Option<&Path>, machine: Option<&str>) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let inputs = WtInputs::load(root, machine)?;
+    if let Some(settings) = &inputs.settings {
+        if settings.direct() {
+            return Ok(HandlerOutcome {
+                exit: 3,
+                stdout: String::new(),
+                stderr: "REFUSED: in mount_at: worktrees_dir layout the image mounts at the slots directory and every wrkslots command remounts it; unmount it outside wrkslots only when no slot is in use, or switch layout with 'wrkslots worktrees-image migrate-layout --to binds' first\nREMEDY: run 'wrkslots worktrees-image --help', correct the named condition, then rerun 'wrkslots worktrees-image' with the required arguments\n".to_string(),
+            });
+        }
+    }
+    let ctx = inputs.ctx();
+    Ok(crate::worktrees_image::wt_unmount(
+        &ctx,
+        inputs.settings.clone(),
+        &SubprocessRunner,
+    ))
+}
+
+/// `wrkslots worktrees-image grow` (writer).
+pub(crate) fn wt_grow_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    to_size_bytes: i64,
+) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let inputs = WtInputs::load(root, machine)?;
+    let ctx = inputs.ctx();
+    Ok(crate::worktrees_image::wt_grow(
+        &ctx,
+        inputs.settings.clone(),
+        to_size_bytes,
+        &SubprocessRunner,
+    ))
+}
+
+/// `wrkslots worktrees-image trim` (writer).
+pub(crate) fn wt_trim_cli(root: Option<&Path>, machine: Option<&str>) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let inputs = WtInputs::load(root, machine)?;
+    let ctx = inputs.ctx();
+    Ok(crate::worktrees_image::wt_trim(
+        &ctx,
+        inputs.settings.clone(),
+        &SubprocessRunner,
+    ))
+}
+
 /// `wrkslots worktrees-image status`: build the full report
 /// (quota when mounted, lock check) and render it.
 pub(crate) fn wt_status_cli(

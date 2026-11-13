@@ -110,6 +110,60 @@ pub(crate) enum Writers {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Create the worktrees image file (Python `worktrees-image create`; writer, fixture registries only until cutover)
+    WorktreesImageCreate {
+        /// Project-relative backing file path; must be given with --size-bytes
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Image size in bytes; must be given with --path
+        #[arg(long, value_name = "BYTES")]
+        size_bytes: Option<i64>,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Mount the worktrees image and re-establish binds (Python `worktrees-image mount`; writer, fixture registries only until cutover)
+    WorktreesImageMount {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Unmount the worktrees image (Python `worktrees-image unmount`; writer, fixture registries only until cutover)
+    WorktreesImageUnmount {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Grow the worktrees image online (Python `worktrees-image grow`; writer, fixture registries only until cutover)
+    WorktreesImageGrow {
+        /// New apparent size in bytes
+        #[arg(long, value_name = "BYTES", required = true)]
+        to_size_bytes: i64,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Return freed guest blocks to the host (Python `worktrees-image trim`; writer, fixture registries only until cutover)
+    WorktreesImageTrim {
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Remove and archive one slot (writer; fixture registries only until cutover)
     Remove {
         /// Active slot to remove
@@ -1860,9 +1914,9 @@ fn translate_python_argv_routed(
     // migrate/convert stay Python for now.
     if cmd == "worktrees-image" {
         return match rest.get(1).map(String::as_str) {
-            Some("status") => {
+            Some(action @ ("status" | "create" | "mount" | "unmount" | "grow" | "trim")) => {
                 let mut out: Vec<String> =
-                    vec![args[0].clone(), "worktrees-image-status".to_string()];
+                    vec![args[0].clone(), format!("worktrees-image-{action}")];
                 out.extend(rest[2..].iter().cloned());
                 if let Some(root) = project_root {
                     out.push("--root".to_string());
@@ -2179,6 +2233,85 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
+            Writers::WorktreesImageCreate {
+                path,
+                size_bytes,
+                root,
+                machine,
+            } => match crate::image_dispatch::wt_create_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                path.as_deref(),
+                size_bytes,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Writers::WorktreesImageMount { root, machine } => {
+                match crate::image_dispatch::wt_mount_cli(root.as_deref(), machine.as_deref()) {
+                    Ok(outcome) => {
+                        print!("{}", outcome.stdout);
+                        eprint!("{}", outcome.stderr);
+                        return u8::try_from(outcome.exit).unwrap_or(1);
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            Writers::WorktreesImageUnmount { root, machine } => {
+                match crate::image_dispatch::wt_unmount_cli(root.as_deref(), machine.as_deref()) {
+                    Ok(outcome) => {
+                        print!("{}", outcome.stdout);
+                        eprint!("{}", outcome.stderr);
+                        return u8::try_from(outcome.exit).unwrap_or(1);
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            Writers::WorktreesImageGrow {
+                to_size_bytes,
+                root,
+                machine,
+            } => match crate::image_dispatch::wt_grow_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                to_size_bytes,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Writers::WorktreesImageTrim { root, machine } => {
+                match crate::image_dispatch::wt_trim_cli(root.as_deref(), machine.as_deref()) {
+                    Ok(outcome) => {
+                        print!("{}", outcome.stdout);
+                        eprint!("{}", outcome.stderr);
+                        return u8::try_from(outcome.exit).unwrap_or(1);
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
             Writers::ImageMount {
                 coordinator_authorized,
                 root,

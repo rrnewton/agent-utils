@@ -1228,7 +1228,7 @@ pub(crate) fn wt_mount(
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
-    let mount_dir = image_mount_dir(ctx.control);
+    let mount_dir = settings.mount_point(ctx.control, ctx.worktrees);
     let _ = std::fs::create_dir_all(&mount_dir);
     let (exists, empty) = dir_facts(&mount_dir);
     let state = classify_mount(&mount_dir, ctx.entries, exists, empty);
@@ -1310,9 +1310,14 @@ pub(crate) fn wt_mount(
     HandlerOutcome {
         exit: 0,
         stdout: format!(
-            "mounted {} at {} (binds re-established)\n",
+            "mounted {} at {}{}\n",
             settings.image_file(ctx.root).display(),
-            mount_dir.display()
+            mount_dir.display(),
+            if settings.direct() {
+                ""
+            } else {
+                " (binds re-established)"
+            }
         ),
         stderr: String::new(),
     }
@@ -1328,8 +1333,7 @@ pub(crate) fn wt_unmount(
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
-    let _ = &settings;
-    let mount_dir = image_mount_dir(ctx.control);
+    let mount_dir = settings.mount_point(ctx.control, ctx.worktrees);
     for spec in unmount_plan(&mount_dir) {
         if let Err(outcome) = run_one(runner, &spec) {
             return outcome;
@@ -1372,7 +1376,7 @@ pub(crate) fn wt_grow(
         Ok(outcome) => losetup_devices(&outcome.stdout),
         Err(outcome) => return outcome,
     };
-    for spec_item in grow_plan(&devices, &image_mount_dir(ctx.control)) {
+    for spec_item in grow_plan(&devices, &settings.mount_point(ctx.control, ctx.worktrees)) {
         if let Err(outcome) = run_one(runner, &spec_item) {
             return outcome;
         }
@@ -1394,8 +1398,7 @@ pub(crate) fn wt_trim(
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
-    let _ = &settings;
-    let plan = trim_plan(&image_mount_dir(ctx.control));
+    let plan = trim_plan(&settings.mount_point(ctx.control, ctx.worktrees));
     match run_one(runner, &plan[0]) {
         Ok(outcome) => {
             let text = outcome.stdout.trim();
