@@ -1,10 +1,11 @@
 ---
 title: 'agentctl-queue-one-item-per-turn: deliver the whole queue at a turn boundary'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-13T11:24:51.871919871+00:00
-updated_at: 2026-11-13T11:24:51.871919871+00:00
+updated_at: 2026-11-13T17:17:40.778051517+00:00
+closed_at: 2026-11-13T17:17:40.778051407+00:00
 ---
 
 # Description
@@ -23,3 +24,7 @@ A queue of N turn-boundary items at an idle boundary is delivered in one turn (o
 
 Evidence: headless coordinator session, ~35 short turns each started by one queue item, 67 queued 30-90 min late; cross-host relays accepted then queued 7-11 min later (five message IDs timed), surfacing one per turn over ~30 min. Earlier decision #698 (owner messages never batched) bounds the design.
 Split: the cross-host accepted-to-queue delay (7-11 min) is #1490 agent-teams-relay-to-queue-delay; this issue covers the one-per-turn surfacing, status age and manager alarm.
+
+## Resolution
+
+Landed as dbb34919 with a5e35efd (handoffs and slash commands always go alone) and e06615ec (formatting). The headless wrapper delivers the whole turn-boundary queue as one input, owner first, size-split without truncation; status and the watcher expose and alarm on the oldest queued age. TUI drains and agentcloud showed no one-per-turn pattern; the relay delay is #1490.

@@ -1,10 +1,11 @@
 ---
 title: 'agentctl-drain-holds-queue-lock-across-delivery: claim under the queue lock, deliver without it'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-13T11:24:51.869593512+00:00
-updated_at: 2026-11-13T11:24:51.869593512+00:00
+updated_at: 2026-11-13T17:17:40.774744328+00:00
+closed_at: 2026-11-13T17:17:40.774744088+00:00
 ---
 
 # Description
@@ -22,3 +23,7 @@ A test that kills the drain between claim and type recovers the item as pending 
 # Notes
 
 Evidence: saturation-scope differential (Rust rc 75 pending vs Python rc 76 possibly_submitted); second site in adopt/muse native-session yolo-delivery with the same signature. Coordinate the injectable-root need with the cross-robustness lane.
+
+## Resolution
+
+Landed as ef485584 (plus the Python dispatch typing fix in f79da5e1). The drain holds the queue lock only to claim and commit; per-item claim flocks keep crash semantics exact (kill-between-claim-and-type covered in both editions). AGENTCTL_TARGET_LOCK_ROOT injects the target-lock root in both editions.
