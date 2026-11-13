@@ -1981,7 +1981,12 @@ fn collect_ignored_files(
         }
         // HANDOFF* files are the handoff contract's, never salvage
         // evidence (the Python edition's `_collect_ignored_files`).
-        if name.rsplit('/').next().unwrap_or(name).starts_with("HANDOFF") {
+        if name
+            .rsplit('/')
+            .next()
+            .unwrap_or(name)
+            .starts_with("HANDOFF")
+        {
             continue;
         }
         let relative = format!("{prefix}{name}");
