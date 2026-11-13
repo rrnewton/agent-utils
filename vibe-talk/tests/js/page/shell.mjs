@@ -1142,10 +1142,15 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   assert.ok(channel.cost <= budget, report("the channel view", channel));
   // `#1355 phone-bar-discuss-slot`: Discuss is the pack's last shown member, right of the
   // thread picker and just left of the hamburger; audio and Show/Fold left the strip.
-  assert.ok(channel.shown.includes("discuss-open"), "Discuss is not on the channel view's bar");
+  // `#1470 toolbar-dynamic-promotion`: Discuss lives on the bar while it fits and in the
+  // menu when it does not — exactly one home, reachable either way, never both.
+  assert.ok(channel.shown.includes("discuss-open") || page.el("discuss-menu-open").hidden === false,
+    "Discuss is neither on the channel view's bar nor in its menu");
   assert.ok(!channel.shown.includes("audio-source"), "the audio toggle is still on the bar");
-  assert.equal(channel.shown[channel.shown.indexOf("action-menu-open") - 1], "discuss-open",
-    "Discuss is not just left of the hamburger");
+  if (channel.shown.includes("discuss-open")) {
+    assert.equal(channel.shown[channel.shown.indexOf("action-menu-open") - 1], "discuss-open",
+      "Discuss is not just left of the hamburger");
+  }
   assert.ok(HTML_CODE.indexOf('id="thread-select"') < HTML_CODE.indexOf('id="discuss-open"') &&
     HTML_CODE.indexOf('id="discuss-open"') < HTML_CODE.indexOf('id="action-menu-open"'),
     "Discuss is not right of the thread picker, left of the hamburger, in the markup");
