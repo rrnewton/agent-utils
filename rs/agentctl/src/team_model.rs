@@ -76,6 +76,9 @@ pub enum Event {
     VerifyFailLead,
     /// Verify failed and no lead can take it.
     VerifyFailNoLead,
+    /// Verify's only failure is a coordinator notice awaiting delivery
+    /// before its acknowledgement deadline.
+    VerifyAckPending,
     /// A HANDOFF re-probe finds the team fixed.
     Progress,
     /// A persisted deadline (handoff, backoff, reminder) is reached.
@@ -177,6 +180,20 @@ pub fn transitions() -> Vec<Transition> {
         Transition {
             from: Restore,
             event: RestoreDone,
+            to: Verify,
+            mode: Running,
+            effects: &[RunVerify],
+        },
+        Transition {
+            from: Verify,
+            event: VerifyAckPending,
+            to: Verify,
+            mode: Dormant,
+            effects: &[ArmWake, Exit],
+        },
+        Transition {
+            from: Verify,
+            event: WakeFired,
             to: Verify,
             mode: Running,
             effects: &[RunVerify],
@@ -365,6 +382,7 @@ fn event_enabled(state: &Abstract, event: Event) -> bool {
         VerifyPass => matches!(state.driver, Verify | Escalate) && state.env.fixed,
         VerifyFailLead => state.driver == Verify && !state.env.fixed && state.env.lead_up,
         VerifyFailNoLead => state.driver == Verify && !state.env.fixed && !state.env.lead_up,
+        VerifyAckPending => state.driver == Verify && !state.deadline_expired,
         Progress => state.driver == Handoff && state.env.fixed,
         DeadlineReached => matches!(state.driver, Handoff | Escalate) && state.deadline_expired,
         LeadGone => state.driver == Handoff && !state.env.lead_up,
@@ -420,7 +438,10 @@ pub fn step(
         }
         Event::WakeFired => {
             next.wake_armed = false;
-            next.deadline_expired = matches!(state.driver, State::Handoff | State::Escalate);
+            next.deadline_expired = matches!(
+                state.driver,
+                State::Verify | State::Handoff | State::Escalate
+            );
         }
         Event::RestoreDone => next.restore_in_flight = false,
         Event::EscalateDelivered => {
@@ -516,7 +537,7 @@ fn apply(table: &[Transition], state: &Abstract, input: Input) -> Option<(Abstra
     }
 }
 
-const ALL_EVENTS: [Event; 15] = [
+const ALL_EVENTS: [Event; 16] = [
     Event::Kick,
     Event::WakeFired,
     Event::NewEpoch,
@@ -526,6 +547,7 @@ const ALL_EVENTS: [Event; 15] = [
     Event::VerifyPass,
     Event::VerifyFailLead,
     Event::VerifyFailNoLead,
+    Event::VerifyAckPending,
     Event::Progress,
     Event::DeadlineReached,
     Event::LeadGone,
@@ -815,11 +837,11 @@ mod tests {
         let table = transitions();
         let report = check(&table).expect("real table must pass");
         assert!(report.states > 100, "{report:?}");
-        // The sixteen core rows all fire somewhere in the exploration: a
+        // The eighteen core rows all fire somewhere in the exploration: a
         // dead row would be a transition the design claims but the
         // machine can never take. (Kick, epoch, and crash rows repeat per
         // state and are counted once per (state, event) that occurs.)
-        assert!(report.rows_fired >= 16, "{report:?}");
+        assert!(report.rows_fired >= 18, "{report:?}");
         // The launch effect lives on exactly the DETECT-missing row, so
         // nothing parked or already-live can ever be (re)launched.
         let launches: Vec<&Transition> = table
@@ -838,6 +860,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn verify_wake_rechecks_then_can_hand_off() {
+        // A sole not-yet-expired coordinator-ack failure waits in VERIFY:
+        // the wake re-runs the checks with the ack deadline reached, after
+        // which the existing fail rows classify it.
+        let table = transitions();
+        let running = Abstract {
+            driver: State::Verify,
+            mode: Mode::Running,
+            ..Abstract::initial(env(false, true, true, false))
+        };
+        let (waiting, pending_effects) =
+            step(&table, &running, Event::VerifyAckPending).expect("VERIFY pending row");
+        assert_eq!(waiting.mode, Mode::Dormant);
+        assert!(waiting.wake_armed);
+        assert_eq!(pending_effects, [Effect::ArmWake, Effect::Exit]);
+        let (next, effects) = step(&table, &waiting, Event::WakeFired).expect("VERIFY wake row");
+        assert_eq!(next.driver, State::Verify);
+        assert_eq!(next.mode, Mode::Running);
+        assert!(!next.wake_armed);
+        assert!(next.deadline_expired);
+        assert_eq!(effects, [Effect::RunVerify]);
+        let (handoff, _) =
+            step(&table, &next, Event::VerifyFailLead).expect("expired ack hands off");
+        assert_eq!(handoff.driver, State::Handoff);
+        assert_eq!(handoff.mode, Mode::Dormant);
+        assert!(handoff.wake_armed);
     }
 
     #[test]
