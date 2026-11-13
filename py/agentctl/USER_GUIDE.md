@@ -1335,7 +1335,8 @@ process when no timer can be armed), and refuses to run outside the
 host PID namespace. Kick exits 0 healthy or delivered, 75 while
 recovery is pending, 1 refused, and prints schema
 `agentctl-team-kick/v1`. Escalation routes are plain commands in
-`~/.config/agent-utils/escalation.toml` (`[[route]]` entries with an
+`escalation.toml` in the synced configuration directory — the exact
+default is in `team restore-driver --help` (`[[route]]` entries with an
 `argv` list and optional `timeout_seconds`), tried in order with the
 incident text on stdin and `{host}`, `{team}`, and `{incident}`
 substituted in argv; the first exit 0 delivers, every route failing

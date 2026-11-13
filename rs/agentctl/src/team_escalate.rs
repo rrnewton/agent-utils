@@ -9,8 +9,8 @@
 //! fields, so one shared route file can name the team it pages about
 //! without this module knowing any team, host, or person.
 //!
-//! Routes live in an operator-owned file, by default
-//! `~/.config/agent-utils/escalation.toml` (see
+//! Routes live in an operator-owned file in the synced configuration
+//! directory, by default its `escalation.toml` (see
 //! [`default_escalation_config_path`]). There is no TOML parser in the
 //! workspace, so the file is a deliberately small frozen subset, refused
 //! rather than misread when it steps outside it:
@@ -127,9 +127,10 @@ pub enum Delivery {
     Unconfigured,
 }
 
-/// The default escalation route file: `$XDG_CONFIG_HOME/agent-utils/escalation.toml`
-/// when `XDG_CONFIG_HOME` is set to a non-empty absolute path, else
-/// `$HOME/.config/agent-utils/escalation.toml`. `None` when neither is set.
+/// The default escalation route file: `escalation.toml` in the synced
+/// configuration directory under `$XDG_CONFIG_HOME` when that is set to a
+/// non-empty absolute path, else under `$HOME/.config`. `None` when
+/// neither is set.
 #[must_use]
 pub fn default_escalation_config_path() -> Option<PathBuf> {
     escalation_config_path_from(

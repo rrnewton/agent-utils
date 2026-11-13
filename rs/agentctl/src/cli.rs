@@ -616,7 +616,7 @@ struct TeamDriverFlags {
     /// Seconds a sole unprocessed coordinator notice may stay pending in VERIFY before it counts as failed, from 0 to 86400 (default: 1800)
     #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
     ack_timeout_seconds: u64,
-    /// Escalation route file (default: $XDG_CONFIG_HOME/agent-utils/escalation.toml, else ~/.config/agent-utils/escalation.toml; an absent file means no routes)
+    /// Escalation route file (default: escalation.toml in the synced configuration directory under $XDG_CONFIG_HOME, else under ~/.config; an absent file means no routes)
     #[arg(long, value_name = "PATH")]
     escalation_config: Option<PathBuf>,
 }
