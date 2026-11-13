@@ -20,7 +20,7 @@ use crate::global_state::{event_log_status, load_event_chain, EventLogStatus};
 use crate::handoff_state::{parse_handoff, sidecar_path};
 use crate::handoff_write::{committed_project_file, publication, validate_publication};
 use crate::heartbeat_write::{
-    assert_caller, identity_value, refuse_seal_overlap_action, release_in_effect, seal_paths,
+    assert_caller, refuse_seal_overlap_action, release_in_effect, seal_paths,
 };
 use crate::hold_write::{
     acquire_mutation_locks, active_document, current_hold, refuse_target_storage, validate_global,

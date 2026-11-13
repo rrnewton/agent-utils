@@ -33,14 +33,18 @@ test created.
 
 # Design
 
-`capture_process_snapshot` delegates to an internal capture that takes the
-process listing as a parameter; production passes the `/proc` listing. Tests
-pass a listing of the test process and its descendants (`children` files), so
-every process they assert about is one they spawned, and no host process can
-enter the snapshot.
+Reuse the seam landed for the sibling gone-on-each-read test:
+`capture_process_snapshot_at(proc_root, ..)` reads the listing, stat, thread
+and link evidence under a caller-supplied proc root, and its test builds a
+fake root holding only its fixture children. Convert the remaining census
+tests to that same seam rather than building a second mechanism: each builds
+a fake root aliasing only the processes it spawned, with fault injection
+keyed at the fake paths.
 
 ## Resolution
 
-[watermelon-full-preview] Fixed with #1300 team-pid-namespaces Phase 2a:
-`capture_snapshot_listing` takes the listing source; tests use
-`capture_test_snapshot`. Product behaviour unchanged.
+[watermelon-full-preview] Fixed with #1300 team-pid-namespaces Phase 2a by
+converting `a_mapping_is_a_use_and_unreadable_maps_follow_the_owner_rule`,
+the processes-exiting churn test, and `link_tests::shared_snapshot_*` to
+`capture_process_snapshot_at` over fake proc roots. Product behaviour
+unchanged.

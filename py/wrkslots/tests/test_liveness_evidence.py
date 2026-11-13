@@ -61,9 +61,14 @@ def test_live_owner_answers_via_pidfd_without_listing_proc(
     listings: list[object] = []
     real_listdir = os.listdir
 
-    def counting_listdir(path: object = ".", *args: object, **kwargs: object) -> object:
+    def counting_listdir(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | int = ".",
+        *args: object,
+        **kwargs: object,
+    ) -> list[str]:
         listings.append(path)
-        return real_listdir(path, *args, **kwargs)  # type: ignore[arg-type]
+        result = real_listdir(path)
+        return [str(item) for item in result]
 
     monkeypatch.setattr(os, "listdir", counting_listdir)
     state, _detail, source = cli._process_state_with_evidence(identity)
@@ -133,9 +138,7 @@ def test_scoped_census_sees_only_cgroup_members(
     record_owner = _identity(os.getpid(), cgroup_path="/team")
     record = object.__new__(cli.ActiveRecord)
     object.__setattr__(record, "owner", record_owner)
-    users = cli._scoped_cgroup_slot_users(
-        slot, record, cgroup_root=tmp_path  # type: ignore[arg-type]
-    )
+    users = cli._scoped_cgroup_slot_users(slot, record, cgroup_root=tmp_path)
     assert users is not None
     assert any(pid == os.getpid() for pid, _kind, _detail in users)
 
@@ -149,7 +152,5 @@ def test_scoped_census_clean_when_member_does_not_use_slot(
     record_owner = _identity(os.getpid(), cgroup_path="/team")
     record = object.__new__(cli.ActiveRecord)
     object.__setattr__(record, "owner", record_owner)
-    users = cli._scoped_cgroup_slot_users(
-        slot, record, cgroup_root=tmp_path  # type: ignore[arg-type]
-    )
+    users = cli._scoped_cgroup_slot_users(slot, record, cgroup_root=tmp_path)
     assert users == ()
