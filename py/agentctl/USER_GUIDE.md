@@ -1311,6 +1311,38 @@ the coordinator's queue). A check that cannot apply is `skipped` and says
 why; missing evidence fails. Apart from that one dialog dismiss it writes
 nothing. The team driver runs the same checks as its VERIFY state.
 
+`agentctl team kick` starts or reports that driver, and
+`agentctl team restore-driver` runs it in the foreground:
+
+```sh
+agentctl --registry ~/project/.agentctl team kick
+agentctl team kick --all --config ~/.config/agentctl/teams.json
+agentctl --registry ~/project/.agentctl team restore-driver
+```
+
+One driver per registry runs DETECT (desired agents and units), restore
+with the recorded launch specs, VERIFY (the checks above), then HANDOFF
+(one durable checklist to the lead until `--handoff-timeout-seconds`,
+default 1800) or ESCALATE. A lone unprocessed coordinator notice waits
+in VERIFY until `--ack-timeout-seconds` (default 1800) from the restore
+report, then counts as failed. State (schema `agentctl-team-driver/v1`)
+lives at `<state root>/team-drivers/<key>/state.json` under its own lock
+and is written before every effect, so a crash repeats at most one
+idempotent step; readers need its uppercase `state`, `incident`, and
+`held` fields. The driver exits only healthy, with an escalation
+delivered, or with a wake armed to re-enter it at the deadline (in
+process when no timer can be armed), and refuses to run outside the
+host PID namespace. Kick exits 0 healthy or delivered, 75 while
+recovery is pending, 1 refused, and prints schema
+`agentctl-team-kick/v1`. Escalation routes are plain commands in
+`~/.config/agent-utils/escalation.toml` (`[[route]]` entries with an
+`argv` list and optional `timeout_seconds`), tried in order with the
+incident text on stdin and `{host}`, `{team}`, and `{incident}`
+substituted in argv; the first exit 0 delivers, every route failing
+writes `alarm.json` beside the state and retries on backoff
+(60/300/900 seconds), reminders are at most hourly, and one resolved
+notice follows a delivered incident that later verifies healthy.
+
 `agentctl watch` runs as a service and, every `--interval` seconds (default 60),
 checks and repairs:
 

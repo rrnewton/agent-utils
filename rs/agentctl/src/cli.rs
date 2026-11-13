@@ -577,6 +577,16 @@ enum TeamCommand {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team verify\n  agentctl --registry ~/project/.agentctl team verify --check-only\n\nChecks, each reported by name with subject, evidence, and fix: desired-live (the restore desired set: coordinator plus the pinned agents list when restore.json has one, else every record running at shutdown; exclude always wins), units-bridges (systemctl --user is-active per restore.json unit, plus chat health per REGISTRY/bridges state directory, target agent included; a unit held by a turnover pin — REGISTRY/turnover.pin, REGISTRY/turnover-pins/<unit>.pin, or the services global.pin — reports held with its reason, never unhealthy), queued-not-archived (status queued_archived_undelivered plus this boot's restore-report queued counts; anything archived undelivered fails), watcher-dead-agents (watch health.json fresh, this boot, and ok), pane-at-prompt (an allowlisted dialog is dismissed and re-read, anything else blocking fails; --check-only reports instead; agentcloud and headless agents are skipped by record backend, viewer pane or not), coordinator-ack (this boot's restore notice processed in the coordinator's queue). A check that cannot apply is skipped and says why; missing evidence fails. An active driver alarm is reported under alarm."
     )]
     Verify(TeamVerify),
+    /// Run this registry's deterministic restore driver until its next exit point: DETECT, restore when something is missing, VERIFY with the same checks as team verify, then HANDOFF or ESCALATE with armed deadlines. One driver per team under its state flock; a second invocation only reports state. Prints the persisted agentctl-team-driver/v1 record; exit 0 verified healthy or escalation delivered, 75 recovery pending, 1 refused. Refuses outside the host PID namespace
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team restore-driver\n  agentctl --registry ~/project/.agentctl team restore-driver --handoff-timeout-seconds 900\n\nState lives at <state root>/team-drivers/<key>/state.json (key: first 16 hex of the canonical registry path hash) beside driver.lock and alarm.json. The driver persists before every effect, so a crash repeats at most one idempotent effect. It exits only healthy, with a delivered escalation, or with a wake armed for its deadline (waiting in-process when no timer can be armed). Escalation routes come from --escalation-config or ~/.config/agent-utils/escalation.toml: ordered plain commands read the incident on stdin, with {host}, {team} and {incident} substituted in argv; the first exit 0 delivers."
+    )]
+    RestoreDriver(TeamRestoreDriver),
+    /// Start or report this registry's team driver: through its agentctl-team@<key>.service when a user manager answers and starts it, in the foreground otherwise. Idempotent — safe for anyone to fire after an outage. Prints schema agentctl-team-kick/v1; exit 0 healthy or escalation delivered, 75 recovery pending, 1 refused. Refuses outside the host PID namespace
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl team kick\n  agentctl team kick --all --config ~/.config/agentctl/teams.json\n\nWith --all, --config names a teams file (schema agentctl-restore-teams/v1) and every registry it lists is kicked in order; the report wraps one kick object per registry under kicks and the exit is 1 when any registry refused, else 75 when any is pending, else 0. A kick to a running driver changes nothing and reports its state."
+    )]
+    Kick(TeamKick),
 }
 
 #[derive(Args)]
@@ -590,6 +600,43 @@ struct TeamVerify {
     /// Seconds an unprocessed outage notice may wait before coordinator-ack calls it overdue in its evidence, from 0 to 86400 (default: 1800); only a processed notice passes either way
     #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
     ack_timeout_seconds: u64,
+}
+
+#[derive(Args)]
+struct TeamDriverFlags {
+    /// Agentctl state root holding team-drivers/ (default: $XDG_STATE_HOME/agentctl, else ~/.local/state/agentctl)
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+    /// Startup-readiness deadline for each revived harness in seconds, greater than 0 and at most 300 (default: 30)
+    #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
+    startup_timeout: f64,
+    /// Seconds HANDOFF gets before ESCALATE, from 1 to 86400 (default: 1800)
+    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=86400), value_name = "SECONDS")]
+    handoff_timeout_seconds: u64,
+    /// Seconds a sole unprocessed coordinator notice may stay pending in VERIFY before it counts as failed, from 0 to 86400 (default: 1800)
+    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
+    ack_timeout_seconds: u64,
+    /// Escalation route file (default: $XDG_CONFIG_HOME/agent-utils/escalation.toml, else ~/.config/agent-utils/escalation.toml; an absent file means no routes)
+    #[arg(long, value_name = "PATH")]
+    escalation_config: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct TeamRestoreDriver {
+    #[command(flatten)]
+    driver: TeamDriverFlags,
+}
+
+#[derive(Args)]
+struct TeamKick {
+    #[command(flatten)]
+    driver: TeamDriverFlags,
+    /// Kick every registry the teams file at --config names, in order
+    #[arg(long)]
+    all: bool,
+    /// Teams file for --all (JSON schema agentctl-restore-teams/v1, absolute registry paths)
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -3744,6 +3791,7 @@ fn writes_registry(command: &Commands) -> bool {
         Commands::Revive(value) => !value.dry_run,
         Commands::RetireStaleRegistration(value) => !value.dry_run,
         Commands::Coordinator(value) => !matches!(value.command, CoordinatorCommand::Show),
+        Commands::Team(value) => !matches!(value.command, TeamCommand::Verify(_)),
         Commands::Start(_)
         | Commands::Console(_)
         | Commands::Adopt(_)
@@ -4148,6 +4196,115 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 let ok = crate::team_verify::verify_ok(&report);
                 write_json(&report).map_err(Failure::Output)?;
                 return Ok(if ok { 0 } else { 1 });
+            }
+            TeamCommand::RestoreDriver(driver) => {
+                let (client, inputs, options, designation_problem) =
+                    team_driver_prep(&args.registry, &args.herdr_bin, &driver.driver)?;
+                if let Some(problem) = designation_problem {
+                    eprintln!("agentctl team restore-driver: {problem}");
+                }
+                let (record, _action) = crate::team_driver::run_driver(
+                    &client,
+                    &args.registry,
+                    &crate::restore::SystemHost,
+                    &inputs,
+                    &options,
+                )?;
+                write_json(
+                    &serde_json::to_value(&record)
+                        .map_err(|error| Failure::Usage(error.to_string()))?,
+                )
+                .map_err(Failure::Output)?;
+                return Ok(crate::team_driver::exit_code(&record));
+            }
+            TeamCommand::Kick(kick) => {
+                if kick.all != kick.config.is_some() {
+                    return Err(Failure::Usage(
+                        "team kick --all requires --config PATH, and --config is only for --all"
+                            .to_owned(),
+                    ));
+                }
+                if !kick.all {
+                    let (client, inputs, options, designation_problem) =
+                        team_driver_prep(&args.registry, &args.herdr_bin, &kick.driver)?;
+                    let (mut report, code) = crate::team_driver::kick(
+                        &client,
+                        &args.registry,
+                        &crate::restore::SystemHost,
+                        &inputs,
+                        &options,
+                    )?;
+                    if let Some(problem) = designation_problem {
+                        report["designation_problem"] = json!(problem);
+                    }
+                    write_json(&report).map_err(Failure::Output)?;
+                    return Ok(code);
+                }
+                let teams =
+                    crate::restore_teams::TeamsConfig::load(kick.config.as_deref().unwrap())
+                        .map_err(|error| Failure::Usage(error.to_string()))?;
+                let entries = crate::restore_teams::resolve_entries(Some(&teams), &[])
+                    .map_err(|error| Failure::Usage(error.to_string()))?;
+                let mut kicks = Vec::new();
+                let mut aggregate = 0;
+                for entry in &entries {
+                    if let Some(notice) =
+                        crate::registry_layout::auto_migrate(&entry.registry, environment)
+                    {
+                        eprintln!("{notice}");
+                    }
+                    let herdr = entry.herdr_bin.as_deref().unwrap_or(&args.herdr_bin);
+                    let outcome = team_driver_prep(&entry.registry, herdr, &kick.driver).and_then(
+                        |(client, inputs, options, designation_problem)| {
+                            let (mut report, code) = crate::team_driver::kick(
+                                &client,
+                                &entry.registry,
+                                &crate::restore::SystemHost,
+                                &inputs,
+                                &options,
+                            )?;
+                            if let Some(problem) = designation_problem {
+                                report["designation_problem"] = json!(problem);
+                            }
+                            Ok((report, code))
+                        },
+                    );
+                    match outcome {
+                        Ok((report, code)) => {
+                            aggregate = if code == 1 {
+                                1
+                            } else if code == 75 && aggregate == 0 {
+                                75
+                            } else {
+                                aggregate
+                            };
+                            kicks.push(report);
+                        }
+                        Err(error) => {
+                            aggregate = 1;
+                            let message = match error {
+                                Failure::Agent(error) => error.to_string(),
+                                Failure::Stop(error) => error.to_string(),
+                                Failure::Usage(message) => message,
+                                Failure::Output(error) => error.to_string(),
+                                Failure::Chat(error) => error.to_string(),
+                                Failure::Inbox(error) => error.to_string(),
+                            };
+                            kicks.push(json!({
+                                "registry": entry.registry,
+                                "error": message,
+                                "exit_code": 1,
+                            }));
+                        }
+                    }
+                }
+                write_json(&json!({
+                    "schema": crate::team_driver::KICK_SCHEMA,
+                    "kicks": kicks,
+                    "exit_code": aggregate,
+                }))
+                .map_err(Failure::Output)?;
+                return Ok(aggregate);
             }
         },
         Commands::Watch(value) => {
@@ -5780,6 +5937,75 @@ fn queued_warning(name: &str, turn: &Value) -> Option<String> {
     Some(text)
 }
 
+/// Gather one production driver run for a registry: designated config,
+/// resolved binaries, escalation routes, and the wake argv that
+/// re-enters through `team kick` itself.
+fn team_driver_prep(
+    registry: &Path,
+    herdr_global: &Path,
+    flags: &TeamDriverFlags,
+) -> Result<
+    (
+        HerdrClient,
+        crate::team_driver::ProductionInputs,
+        crate::team_driver::DriverOptions,
+        Option<String>,
+    ),
+    Failure,
+> {
+    let herdr_bin = resolve_herdr_bin(registry, herdr_global);
+    let client = HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
+    let mut config = crate::restore::RestoreConfig::load(registry)?;
+    let designation_problem = designation_problem(&client, registry, &mut config);
+    let escalation = match &flags.escalation_config {
+        Some(path) => crate::team_escalate::load_escalation_config(path)?,
+        None => match crate::team_escalate::default_escalation_config_path() {
+            Some(path) => crate::team_escalate::load_escalation_config(&path)?,
+            None => crate::team_escalate::EscalationConfig::default(),
+        },
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agentctl"));
+    let mut wake_argv = vec![
+        exe.display().to_string(),
+        "--registry".to_owned(),
+        registry.display().to_string(),
+        "--herdr-bin".to_owned(),
+        herdr_bin.display().to_string(),
+        "team".to_owned(),
+        "kick".to_owned(),
+        "--startup-timeout".to_owned(),
+        flags.startup_timeout.to_string(),
+        "--handoff-timeout-seconds".to_owned(),
+        flags.handoff_timeout_seconds.to_string(),
+        "--ack-timeout-seconds".to_owned(),
+        flags.ack_timeout_seconds.to_string(),
+    ];
+    if let Some(dir) = &flags.state_dir {
+        wake_argv.push("--state-dir".to_owned());
+        wake_argv.push(dir.display().to_string());
+    }
+    if let Some(path) = &flags.escalation_config {
+        wake_argv.push("--escalation-config".to_owned());
+        wake_argv.push(path.display().to_string());
+    }
+    let options = crate::team_driver::DriverOptions {
+        state_dir: flags.state_dir.clone(),
+        handoff_timeout: Duration::from_secs(flags.handoff_timeout_seconds),
+        ack_timeout: Duration::from_secs(flags.ack_timeout_seconds),
+        lead: config.coordinator.clone(),
+        hostname: crate::subagents::local_hostname().unwrap_or_else(|| "unknown".to_owned()),
+        wake_argv,
+    };
+    let inputs = crate::team_driver::ProductionInputs {
+        config,
+        startup_timeout: Duration::from_secs_f64(flags.startup_timeout),
+        wrkslots: crate::subagents::project_wrkslots(registry),
+        herdr_bin,
+        escalation,
+    };
+    Ok((client, inputs, options, designation_problem))
+}
+
 /// Make `config` follow the registry's coordinator designation, or say why it cannot. A
 /// designation that cannot be read, or that disagrees with `restore.json`, never stops `restore`
 /// or `watch`: they go on with `restore.json`'s own coordinator and report the problem.
@@ -7360,7 +7586,9 @@ mod tests {
         let Some(Commands::Team(value)) = parsed.command else {
             panic!("team command");
         };
-        let TeamCommand::Verify(check) = value.command;
+        let TeamCommand::Verify(check) = value.command else {
+            panic!("verify command");
+        };
         assert!(check.check_only);
         assert_eq!(check.state_dir, None);
         assert_eq!(check.ack_timeout_seconds, 1800);
@@ -7377,6 +7605,64 @@ mod tests {
             "coordinator-ack",
         ] {
             assert!(help.contains(option), "{option} missing from help");
+        }
+    }
+
+    #[test]
+    fn team_driver_and_kick_flags_parse_with_documented_defaults() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "--registry",
+            "/home/owner/project/.agentctl",
+            "team",
+            "restore-driver",
+        ])
+        .unwrap();
+        let Some(Commands::Team(value)) = parsed.command else {
+            panic!("team command");
+        };
+        let TeamCommand::RestoreDriver(driver) = value.command else {
+            panic!("restore-driver command");
+        };
+        assert_eq!(driver.driver.state_dir, None);
+        assert_eq!(driver.driver.handoff_timeout_seconds, 1800);
+        assert_eq!(driver.driver.ack_timeout_seconds, 1800);
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "team",
+            "kick",
+            "--all",
+            "--config",
+            "/home/owner/.config/agentctl/teams.json",
+        ])
+        .unwrap();
+        let Some(Commands::Team(value)) = parsed.command else {
+            panic!("team command");
+        };
+        let TeamCommand::Kick(kick) = value.command else {
+            panic!("kick command");
+        };
+        assert!(kick.all);
+        assert!(kick.config.is_some());
+        for (argv, options) in [
+            (
+                vec!["agentctl", "team", "restore-driver", "--help"],
+                vec![
+                    "--state-dir",
+                    "--handoff-timeout-seconds",
+                    "--escalation-config",
+                    "agentctl-team-driver/v1",
+                ],
+            ),
+            (
+                vec!["agentctl", "team", "kick", "--help"],
+                vec!["--all", "--config", "agentctl-team-kick/v1"],
+            ),
+        ] {
+            let help = Cli::try_parse_from(argv).err().unwrap().to_string();
+            for option in options {
+                assert!(help.contains(option), "{option} missing from help: {help}");
+            }
         }
     }
 

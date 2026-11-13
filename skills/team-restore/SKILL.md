@@ -60,6 +60,18 @@ agentctl --registry R --herdr-bin H restore [--force]
 
 Run it under nohup or with a generous timeout (it can take minutes), and keep its JSON report.
 
+On a host and build with the deterministic driver, prefer
+`agentctl --registry R team kick` for the whole recovery: it detects,
+restores with the replay guard bypassed for that detection, verifies,
+hands the remaining checklist to the lead on a deadline, and escalates
+through the configured commands — one driver per team under its state
+lock, so it is also the one-restorer guard above. It prints its
+persisted state (schema `agentctl-team-driver/v1`, under
+`<state root>/team-drivers/<key>/`); exit 75 means recovery is pending
+with a wake armed, not failed. Kick only from the host PID namespace:
+inside a team namespace it refuses rather than half-restoring. The
+manual steps below remain the fallback and the meaning of its checks.
+
 ## 4. Verify: a restore isn't done until all of these hold
 
 1. Every desired agent is live in Herdr, with the right profile, effort and launch environment. Look at the
