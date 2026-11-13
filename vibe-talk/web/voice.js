@@ -2750,85 +2750,9 @@ const {
   setLinkKindShown, setLinksRaw, renderLinkKinds, renderLinkKindCounts, hiddenKindNames,
 } = rowLinksOwner;
 
-/**
- * Bring the whole of `box` into the view of `area`, the list it is in, as `keepComposerInView` says:
- * the box whole, or its top where the list is shorter than it. `#340 composer-grow-box` made it any
- * composer's, for a box growing under the reader's typing.
- *
- * @param {HTMLElement} box
- * @param {HTMLElement} area
- */
-function keepBoxInView(box, area) {
-  const rect = box.getBoundingClientRect();
-  const top = rect.top - area.getBoundingClientRect().top + area.scrollTop;
-  const bottom = top + rect.height;
-  const view = area.clientHeight || 0;
-  if (top >= area.scrollTop && bottom <= area.scrollTop + view) return;
-  scrollKeeping.toPosition(area, rect.height <= view ? bottom - view : top);
-}
-
-/**
- * `#429 keyboard-hides-bar`. The boxes in the lists a reader writes in, each field with the box it is in:
- * the channel's (in Main's list, or among the cards since `#419 threads-view-main-messages`), the right
- * column's, and a reply open in the stream (`#410 inline-reply-editor`), in whichever list holds it. The
- * call's is `writingToAgent`'s.
- */
-const LIST_BOXES = [
-  ["channel-compose-text", "channel-composer"],
-  ["side-compose-text", "side-composer"],
-  ["reply-text", "column-reply"],
-  ["reply-text", "side-reply"],
-];
-
-/**
- * The box in `area` the reader is writing in, or null. `#429 keyboard-hides-bar`: the on-screen keyboard
- * takes its height from the list, and a list that shrinks keeps its scroll position, so the channel's box
- * at its foot, or a reply's under its message, went below the window, Send with it, as the call's had
- * before `#241 voice-composer` kept it in view. The keepers of the two lists bring this box into view
- * whole as their list shrinks, if it was in view before (`boxWasInView`): a reader who scrolled up to read
- * the message being answered is left there.
- *
- * @param {HTMLElement} area
- * @returns {HTMLElement | null}
- */
-function boxBeingWritten(area) {
-  if (screens.screen() !== "main") return null;
-  const held = document.activeElement;
-  for (const [field, box] of LIST_BOXES) {
-    if (held === leftEl(field) && nodeWithin(area, leftEl(box))) return leftEl(box);
-  }
-  return null;
-}
-
-/**
- * Whether any of `box` was in the view of `area` while the list was `height` tall. The list shrinks from
- * its foot with its scroll position kept, so where the box stands below the list's top is where it stood.
- *
- * @param {HTMLElement} box
- * @param {HTMLElement} area
- * @param {number} height
- */
-function boxWasInView(box, area, height) {
-  const rect = box.getBoundingClientRect();
-  const top = rect.top - area.getBoundingClientRect().top;
-  return top < height && top + rect.height > 0;
-}
-
-/**
- * `#429 keyboard-hides-bar`. Keep the box being written in `area` in view as the list shrinks from
- * `seen.list` to `now.list`, if it was in view; whether it did.
- *
- * @param {HTMLElement} area
- * @param {{list: number} | null} seen
- * @param {{list: number}} now
- */
-function keepWrittenBox(area, seen, now) {
-  if (seen === null || seen.list <= 0 || now.list >= seen.list) return false;
-  const box = boxBeingWritten(area);
-  if (box === null || !boxWasInView(box, area, seen.list)) return false;
-  keepBoxInView(box, area);
-  return true;
-}
+// Bringing a composer box whole into its list, the box being written in, and keeping it in view as
+// the list shrinks: web/src/view/composer's (`createComposerGrow`/`createComposerBoxes`, `#624`),
+// destructured as `keepBoxInView`, `boxBeingWritten` and `keepWrittenBox` below.
 
 // --- the box that grows -------------------------------------------------------------------------
 //
@@ -2926,7 +2850,7 @@ const composerBoxes = createComposerBoxes({
   followFoot: (area) => followFoot(area),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
-  keepBoxInView: (box, area) => keepBoxInView(box, area),
+  screen: () => screens.screen(),
   activeElement: () => document.activeElement,
   bottomSlack: BOTTOM_SLACK_PX,
   fieldSizing: FIELD_SIZING,
@@ -2936,7 +2860,7 @@ const composerBoxes = createComposerBoxes({
   platform: () => (navigator && navigator.platform) || "",
   noteInsertion: (box, event) => composerKeys.noteInsertion(box, event),
 });
-const { composerGrowth, storedComposerGrow, applyComposerGrow, renderComposerGrow, growShown, growingBoxList, fitGrowingBox, fitGrowingBoxes, keepGrowingBoxInView, modKeyName, sendChordName, renderEnterSends, noteBoxInsertion, watchBoxInsertions } = composerBoxes;
+const { composerGrowth, storedComposerGrow, applyComposerGrow, renderComposerGrow, growShown, growingBoxList, fitGrowingBox, fitGrowingBoxes, keepGrowingBoxInView, modKeyName, sendChordName, renderEnterSends, noteBoxInsertion, watchBoxInsertions, keepBoxInView, boxBeingWritten, keepWrittenBox } = composerBoxes;
 
 /**
  * What a keystroke in a message box does: send, or leave the box to handle it.

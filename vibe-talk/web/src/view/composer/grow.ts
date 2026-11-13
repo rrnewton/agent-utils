@@ -27,8 +27,6 @@ export interface ComposerGrowDependencies {
   /** Move `area` by a measured delta, and put it back at a measured place, through the scroll owner (`#1251`). */
   nudge(area: HTMLElement, delta: number): void;
   toPosition(area: HTMLElement, top: number): void;
-  /** Bring `box` into `area` whole (`keepBoxInView`). */
-  keepBoxInView(box: HTMLElement, area: HTMLElement): void;
   /** The element with the focus. */
   activeElement(): Element | null;
   /** How far above its foot a list still counts as at its foot (`BOTTOM_SLACK_PX`). */
@@ -55,6 +53,12 @@ export interface ComposerGrow {
   fitAll(): void;
   /** A growing box changed size: with the reader typing in it, its whole composer brought into its list. */
   keepInView(field: HTMLElement): void;
+  /**
+   * Bring the whole of `box` into the view of `area`, the list it is in, as `keepComposerInView` says:
+   * the box whole, or its top where the list is shorter than it. `#340 composer-grow-box` made it any
+   * composer's, for a box growing under the reader's typing.
+   */
+  keepBoxInView(box: HTMLElement, area: HTMLElement): void;
 }
 
 /** Grow off; nothing measured yet. */
@@ -77,6 +81,20 @@ export function createComposerGrow(deps: ComposerGrowDependencies): ComposerGrow
     if (rect.bottom <= top || rect.top >= top + (area.clientHeight || 0)) return null;
     return { grow, area, top: rect.top };
   };
+
+  /**
+   * Bring the whole of `box` into the view of `area`, the list it is in, as `keepComposerInView` says:
+   * the box whole, or its top where the list is shorter than it. `#340 composer-grow-box` made it any
+   * composer's, for a box growing under the reader's typing.
+   */
+  function keepBoxInView(box: HTMLElement, area: HTMLElement): void {
+    const rect = box.getBoundingClientRect();
+    const top = rect.top - area.getBoundingClientRect().top + area.scrollTop;
+    const bottom = top + rect.height;
+    const view = area.clientHeight || 0;
+    if (top >= area.scrollTop && bottom <= area.scrollTop + view) return;
+    deps.toPosition(area, rect.height <= view ? bottom - view : top);
+  }
 
   const owner: ComposerGrow = {
     on: () => composerGrow,
@@ -125,6 +143,7 @@ export function createComposerGrow(deps: ComposerGrowDependencies): ComposerGrow
     fitAll() {
       for (const id of COMPOSER_GROW_BOXES) owner.fit(deps.lookup(id));
     },
+    keepBoxInView,
     keepInView(field) {
       const height = field.getBoundingClientRect().height;
       const seen = growingHeights.get(field.id);
@@ -138,7 +157,7 @@ export function createComposerGrow(deps: ComposerGrowDependencies): ComposerGrow
       }
       const composer = ({ "compose-text": "voice-composer", "channel-compose-text": "channel-composer",
         "reply-text": "reply-compose" } as { readonly [id: string]: string | undefined })[field.id] || "side-composer";
-      deps.keepBoxInView(deps.lookup(composer), area);
+      keepBoxInView(deps.lookup(composer), area);
     },
   };
   return owner;

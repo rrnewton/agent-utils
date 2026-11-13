@@ -52,18 +52,18 @@ test("`#624 voice-page-modularity`: the boxes that grow, on stand-in elements, f
       made.set(id, { id, checked: false, scrollTop: 0, clientHeight: 400, drawn: true, removed: [],
         setAttribute: (name) => attributes.add(name), removeAttribute: (name) => attributes.delete(name),
         hasAttribute: (name) => attributes.has(name), getClientRects() { return this.drawn ? [{}] : []; },
-        getBoundingClientRect: () => ({ top: 0, bottom: 20, height: 20 }),
+        getBoundingClientRect: () => (id === "side-composer" ? { top: 500, bottom: 520, height: 20 } : id === "side-scroll" ? { top: 10, bottom: 410, height: 400 } : { top: 0, bottom: 20, height: 20 }),
         style: { removeProperty(name) { made.get(id).removed.push(name); } } });
     }
     return made.get(id);
   };
-  const record = { kept: [], followed: [], kept_in_view: [] };
+  const record = { kept: [], followed: [], positioned: [] };
   let focused = null;
   let atFoot = false;
   const grow = createComposerGrow({
     lookup: element, listOf: (field) => element(field.id === "side-compose-text" ? "side-scroll" : "scroll-area"),
-    atBottom: () => atFoot, followFoot: (area) => record.followed.push(area.id), nudge: (area, delta) => { area.scrollTop += delta; }, toPosition: (area, top) => { area.scrollTop = top; },
-    keepBoxInView: (box, area) => record.kept_in_view.push([box.id, area.id]), activeElement: () => focused,
+    atBottom: () => atFoot, followFoot: (area) => record.followed.push(area.id), nudge: (area, delta) => { area.scrollTop += delta; }, toPosition: (area, top) => { record.positioned.push([area.id, top]); area.scrollTop = top; },
+    activeElement: () => focused,
     bottomSlack: 24, fieldSizing: true, keep: (on) => { if (on === "refuse") throw new Error("refused"); record.kept.push(on); },
   });
   assert.equal(grow.on(), false, "the boxes grew before Grow was ticked");
@@ -82,11 +82,16 @@ test("`#624 voice-page-modularity`: the boxes that grow, on stand-in elements, f
   // Only the box with the focus is kept in view as it grows.
   grow.render(true);
   grow.keepInView(element("side-compose-text"));
-  assert.deepStrictEqual(record.kept_in_view, [], "a box without the focus moved its list");
+  assert.deepStrictEqual(record.positioned, [], "a box without the focus moved its list");
   focused = element("side-compose-text");
   atFoot = false;
+  element("side-scroll").scrollTop = 30;
   grow.keepInView(element("side-compose-text"));
-  assert.deepStrictEqual(record.kept_in_view, [["side-composer", "side-scroll"]]);
+  assert.deepStrictEqual(record.positioned, [["side-scroll", 140]], "the focused growing box was not brought whole into its list");
+  grow.keepBoxInView(element("channel-composer"), element("scroll-area"));
+  assert.deepStrictEqual(record.positioned, [["side-scroll", 140]], "a box already in view moved its list");
+  grow.keepBoxInView({ getBoundingClientRect: () => ({ top: 600, bottom: 1100, height: 500 }) }, element("scroll-area"));
+  assert.deepStrictEqual(record.positioned.at(-1), ["scroll-area", 600], "a box taller than the list was not put at its top");
 });
 
 test("`#624 voice-page-modularity`: a focused field with the visual viewport a keyboard short is a keyboard, and the stylesheet is told", () => {
@@ -680,14 +685,17 @@ test("`#624 voice-page-modularity`: the boxes' Enter is said in Settings and on 
     return els.get(id);
   };
   let sends = false;
+  let active = null;
   const boxes = createComposerBoxes({
     el,
     leftEl: (id) => el(id),
     replyScroller: () => el("reply-scroller"),
     atBottom: () => true,
     followFoot: () => {},
-    keepBoxInView: () => {},
-    activeElement: () => null,
+    activeElement: () => active,
+    screen: () => "main",
+    nudge: (area, delta) => { area.scrollTop += delta; },
+    toPosition: (area, top) => { area.scrollTop = top; },
     bottomSlack: 24,
     fieldSizing: false,
     keepGrow: () => {},
@@ -706,6 +714,18 @@ test("`#624 voice-page-modularity`: the boxes' Enter is said in Settings and on 
   assert.equal(boxes.growingBoxList({ id: "reply-text" }), el("reply-scroller"), "the reply box did not grow in its own list");
   assert.equal(boxes.growingBoxList({ id: "side-compose-text" }), el("side-scroll"));
   assert.equal(boxes.modKeyName(), "Cmd");
+  const writtenArea = el("scroll-area");
+  writtenArea.clientHeight = 400;
+  writtenArea.scrollTop = 0;
+  writtenArea.getBoundingClientRect = () => ({ top: 0 });
+  const writtenBox = el("channel-composer");
+  writtenBox.parentNode = writtenArea;
+  writtenBox.getBoundingClientRect = () => ({ top: 500, bottom: 520, height: 20 });
+  active = el("channel-compose-text");
+  assert.equal(boxes.boxBeingWritten(writtenArea), writtenBox, "the box being written in was not found");
+  assert.equal(boxes.keepWrittenBox(writtenArea, { list: 600 }, { list: 400 }), true, "the written box was not kept in view as the list shrank");
+  assert.equal(writtenArea.scrollTop, 120, "the written box was not brought whole into the shrunken list");
+  assert.equal(boxes.keepWrittenBox(writtenArea, { list: 400 }, { list: 400 }), false, "a list that did not shrink moved its reader");
 });
 
 test("the keyboard debug choice is kept on this device, absent off, and shown either way", () => {
@@ -752,7 +772,7 @@ test("ios-keyboard-send: the return key and input mode say what Enter does, in e
   const boxes = createComposerBoxes({
     el, leftEl: (id) => el(id), replyScroller: () => el("reply-scroller"),
     atBottom: () => true, followFoot: () => {}, nudge: () => {}, toPosition: () => {},
-    keepBoxInView: () => {}, activeElement: () => null, bottomSlack: 24, fieldSizing: false,
+    activeElement: () => null, screen: () => "main", bottomSlack: 24, fieldSizing: false,
     keepGrow: () => {}, storedGrow: () => false, enterSendsCurrent: () => sends,
     platform: () => "iPhone", noteInsertion: () => {},
   });
