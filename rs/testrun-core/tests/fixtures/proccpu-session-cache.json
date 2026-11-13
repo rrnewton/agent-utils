@@ -145,6 +145,24 @@
     ]
   },
   {
+    "name": "host-forks-without-a-namespace-allocation-do-not-drop-the-cache",
+    "pid_max": 4194304,
+    "steps": [
+      {
+        "allocator": {"last_pid": 5000, "tasks": 400, "forks": 90000},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 700, "session": 700}, {"pid": 800, "session": 800}],
+        "read": [100, 700, 800]
+      },
+      {
+        "allocator": {"last_pid": 5000, "tasks": 402, "forks": 90050},
+        "group_sessions": [100],
+        "processes": [{"pid": 100, "session": 100}, {"pid": 700, "session": 700}, {"pid": 800, "session": 800}],
+        "read": [100]
+      }
+    ]
+  },
+  {
     "name": "an-unknown-allocator-position-reads-every-pid",
     "pid_max": 4194304,
     "steps": [

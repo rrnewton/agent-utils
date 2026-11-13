@@ -1,13 +1,14 @@
 ---
 title: 'proccpu-pidns-cache: the proccpu session cache is dropped wholesale in a PID namespace, and its test fails there'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - testrun
 - dagrun
 created_at: 2026-11-12T00:33:35+00:00
-updated_at: 2026-11-12T00:33:35+00:00
+updated_at: 2026-11-13T20:41:11+00:00
+closed_at: 2026-11-13T20:41:11+00:00
 ---
 
 # Description
@@ -34,3 +35,18 @@ Two causes; each alone gives exactly 94/94:
 # Notes
 
 The consumer bumps its agent-utils pin once this lands. Numbered from devbig030's interim block (1400-1469).
+
+## Resolution
+
+[watermelon-full-preview mu-pidnscache] Fixed both causes in both editions, and made the live test prove its own preconditions instead of assuming the host's session layout.
+
+- `rs/testrun-core/src/proccpu.rs` and `py/dagrun/proccpu.py`: `reallocated()` / `_reallocated()` now returns false when `start == end`, after the existing `created == 0` early return, with a comment explaining that `/proc/loadavg`'s last_pid is per PID namespace while `/proc/stat`'s fork counter is host-wide. A shared corpus case (`host-forks-without-a-namespace-allocation-do-not-drop-the-cache`) and a direct unit case in each edition cover `start == end` with `created > 0` below the lap.
+- Test helpers now call setsid: the Rust `Native` fixture leads its own session, and each edition's `native_second_snapshot_skips_other_sessions` spawns 32 additional setsid helpers, then asserts the warm scan read none of the foreign-session helpers (tracked per PID, not by the old host-dependent `warm * 4 < cold` ratio). The `PROCCPU_SESSION_CACHE` diagnostic now reports the registered session, foreign-helper count, warm foreign reads and a `cause` of `H2-helpers-not-in-foreign-sessions`, `H1-cache-dropped-or-pid-reallocated`, or `none`, and the assertion messages name the same causes. No wall-clock assertions were added.
+- A gated Python case reruns the live test under `unshare --user --map-root-user --pid --fork --mount-proc`, probing unshare first and skipping cleanly where user namespaces are unavailable.
+
+Evidence (no sudo):
+
+- Plain host, Python: `PROCCPU_SESSION_CACHE {"edition": "python", "cold_reads": 3949, "warm_reads": 3, "foreign_helpers": 32, "warm_foreign_reads": 0, "cause": "none"}`; full `py/tests/test_proccpu.py`: 32 passed.
+- Plain host, Rust: `PROCCPU_SESSION_CACHE {"edition": "rust", "cold_reads": 3961, "warm_reads": 5, "foreign_helpers": 32, "warm_foreign_reads": 0, "cause": "none"}`; full testrun-core suite passed and `scripts/check_testrun_core_deps.py` reports the fixed 8-package set unchanged.
+- Inside `unshare --user --map-root-user --pid --fork --mount-proc`, Rust test binary: `cold_reads: 35, warm_reads: 2, warm_foreign_reads: 0` (passed), and the gated Python namespace case passed.
+- Gate: cpuset local validate (48 cores) and `GATE_SLOTS=3 python3 scripts/gate.py -- python3 scripts/validate.py --base github/main --keep-going` both passed; validate reports PARTIAL only for 7 delegated-live-scope cross checks skipped as UNVERIFIED, with every selected node passing.

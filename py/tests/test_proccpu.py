@@ -6,7 +6,9 @@ import json
 import os
 import resource
 import select
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -740,14 +742,32 @@ def test_allocator_records_parse_and_refuse_ambiguity() -> None:
     assert cpu._parse_forks("processes 1\nprocesses 2\n") is None
 
 
+def test_reallocated_with_unchanged_last_pid_and_host_forks_is_not_reallocated() -> None:
+    # Inside a PID namespace the host-wide fork counter advances while this
+    # namespace allocates nothing: start == end with created > 0, below any
+    # full lap, so no PID counts as reallocated.
+    start = cpu._Allocator(last_pid=5000, tasks=400, forks=90000)
+    end = cpu._Allocator(last_pid=5000, tasks=402, forks=90050)
+    for pid in (1, 4999, 5000, 5001, 4194303):
+        assert not cpu._reallocated(start, end, 4194304, pid), pid
+
+
 def test_native_second_snapshot_skips_other_sessions(native_helper: Path) -> None:
-    """On the live host a second snapshot reads only the PIDs it could not skip, and
-    measures the same members."""
+    """On the live host a second snapshot reads none of the PIDs in foreign
+    sessions, and measures the same members. The foreign sessions are spawned
+    here, so the result does not depend on how the host groups its processes."""
     with subprocess.Popen([str(native_helper), "zombie"], start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
         assert child.stdin is not None and child.stdout is not None
         _line(child)
+        helpers = [subprocess.Popen(["/bin/sleep", "30"], start_new_session=True) for _ in range(32)]
         reader = cpu.ProcessGroupCpu(child.pid)
         try:
+            foreign = [
+                helper.pid
+                for helper in helpers
+                if cpu._stat(Path(f"/proc/{helper.pid}/stat").read_text()).session == helper.pid
+                and cpu._stat(Path(f"/proc/{helper.pid}/stat").read_text()).session != reader.session
+            ]
             with cpu._lock:
                 cpu._snapshot_at = float("-inf")
                 cpu._census.begin(None, None)
@@ -757,12 +777,78 @@ def test_native_second_snapshot_skips_other_sessions(native_helper: Path) -> Non
                 cpu._snapshot_at = float("-inf")
             second = reader.seconds()
             warm = cpu._snapshot_reads
-            print("PROCCPU_SESSION_CACHE", json.dumps({"edition": "python", "cold_reads": cold, "warm_reads": warm}))
+            warm_foreign = [pid for pid in foreign if pid in set(cpu._snapshot_read_pids)]
+            cause = (
+                "H2-helpers-not-in-foreign-sessions"
+                if len(foreign) != len(helpers)
+                else "H1-cache-dropped-or-pid-reallocated"
+                if warm_foreign
+                else "none"
+            )
+            print(
+                "PROCCPU_SESSION_CACHE",
+                json.dumps(
+                    {
+                        "edition": "python",
+                        "cold_reads": cold,
+                        "warm_reads": warm,
+                        "registered_session": reader.session,
+                        "helpers": len(helpers),
+                        "foreign_helpers": len(foreign),
+                        "warm_foreign_reads": len(warm_foreign),
+                        "cause": cause,
+                    }
+                ),
+            )
             assert first > 0 and second >= first
-            assert warm * 4 < cold, f"the second snapshot read {warm} stat files of the {cold} the first read"
+            assert len(foreign) == len(helpers), (
+                f"H2: {len(helpers) - len(foreign)} of {len(helpers)} setsid helpers were not "
+                "in a foreign session; the environment did not isolate them, so nothing was skippable"
+            )
+            assert not warm_foreign, (
+                f"H1: the second snapshot re-read {len(warm_foreign)} foreign-session helpers "
+                f"{warm_foreign} of {cold} cold reads; the session cache was dropped or a PID "
+                "was judged reallocated"
+            )
         finally:
             reader.close()
+            for helper in helpers:
+                helper.kill()
+                helper.wait(timeout=5)
             child.stdin.write("r"); child.stdin.flush()
             assert _line(child) == "reaped"
             child.stdin.write("x"); child.stdin.flush()
             assert child.wait(5) == 0
+
+
+def test_native_second_snapshot_skips_other_sessions_in_pid_namespace() -> None:
+    """The same live test inside a child PID namespace, where the host-wide
+    fork counter and the per-namespace last PID disagree. Skips where user
+    namespaces are unavailable."""
+    unshare = shutil.which("unshare")
+    if unshare is None:
+        pytest.skip("unshare is unavailable")
+    flags = ["--user", "--map-root-user", "--pid", "--fork", "--mount-proc"]
+    probe = subprocess.run([unshare, *flags, "true"], capture_output=True, text=True, timeout=10)
+    if probe.returncode != 0:
+        pytest.skip(f"PID namespaces unavailable: {probe.stderr.strip()}")
+    result = subprocess.run(
+        [
+            unshare,
+            *flags,
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/test_proccpu.py::test_native_second_snapshot_skips_other_sessions",
+            "-x",
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        cwd=Path(__file__).parents[1],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

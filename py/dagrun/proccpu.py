@@ -265,6 +265,12 @@ def _reallocated(start: _Allocator, end: _Allocator, pid_max: int, pid: int) -> 
         return True
     if created == 0:
         return False
+    # /proc/loadavg's last_pid is per PID namespace while /proc/stat's fork
+    # counter is host-wide, so inside a PID namespace host forks alone leave
+    # start == end with created > 0: no PID was allocated in this namespace,
+    # so none can have been reallocated.
+    if start.last_pid == end.last_pid:
+        return False
     first, last = start.last_pid, end.last_pid
     if first < last:
         return first < pid <= last
@@ -473,10 +479,12 @@ class _KernelSource:
         self.sessions = set() if sessions is None else sessions
         self.cache = _SessionCache() if cache is None else cache
         self.reads = 0
+        self.read_pids: list[int] = []
 
     def _consider(self, pid: int, groups: set[int], rows: list[_Observation], deadline: _Deadline) -> None:
         """Read pid's stat, cache its session and, if it is in one of groups, pair it."""
         self.reads += 1
+        self.read_pids.append(pid)
         try:
             fd = self.proc.open(f"{pid}/stat", deadline)
             try:
@@ -565,6 +573,7 @@ _snapshot_error: str | None = None
 _snapshot_spent = 0.0
 _snapshot_took = 0.0
 _snapshot_reads = 0
+_snapshot_read_pids: list[int] = []
 _census = _SessionCache()
 
 
@@ -642,7 +651,7 @@ class ProcessGroupCpu:
 
     def seconds(self) -> float:
         """Return checked own+waited CPU seconds from one authenticated observation."""
-        global _snapshot_at, _snapshot, _snapshot_keys, _snapshot_error, _snapshot_spent, _snapshot_took, _snapshot_reads
+        global _snapshot_at, _snapshot, _snapshot_keys, _snapshot_error, _snapshot_spent, _snapshot_took, _snapshot_reads, _snapshot_read_pids
         try:
             with _lock:
                 deadline = _deadline()
@@ -684,6 +693,7 @@ class ProcessGroupCpu:
                         _snapshot = values
                         _snapshot_error = None
                     _snapshot_reads = source.reads
+                    _snapshot_read_pids = list(source.read_pids)
                     _snapshot_spent = time.thread_time() - started
                     _snapshot_at = time.monotonic()
                     _snapshot_took = _snapshot_at - started_wall

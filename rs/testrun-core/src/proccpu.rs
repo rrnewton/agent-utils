@@ -288,6 +288,13 @@ fn reallocated(from: Allocator, to: Allocator, pid_max: u32, pid: u32) -> bool {
     if created == 0 {
         return false;
     }
+    // /proc/loadavg's last_pid is per PID namespace while /proc/stat's fork
+    // counter is host-wide, so inside a PID namespace host forks alone leave
+    // start == end with created > 0: no PID was allocated in this namespace,
+    // so none can have been reallocated.
+    if start == end {
+        return false;
+    }
     if start < end {
         start < pid && pid <= end
     } else {
@@ -597,6 +604,9 @@ struct KernelSource<'a> {
     cache: std::cell::RefCell<&'a mut SessionCache>,
     /// How many stat files this snapshot read.
     reads: std::cell::Cell<usize>,
+    /// The PIDs this snapshot read, so a test can say which PIDs a warm scan read.
+    #[cfg(test)]
+    read_pids: std::cell::RefCell<Vec<u32>>,
 }
 impl KernelSource<'_> {
     /// Read `pid`'s stat, cache its session and, if it is in one of `groups`, pair it.
@@ -608,6 +618,8 @@ impl KernelSource<'_> {
         deadline: Deadline,
     ) -> Result<(), Unavailable> {
         self.reads.set(self.reads.get() + 1);
+        #[cfg(test)]
+        self.read_pids.borrow_mut().push(pid);
         let hint = match self
             .proc
             .open(&format!("{pid}/stat"), deadline)
@@ -745,6 +757,9 @@ struct Snapshot {
     /// Stat files the snapshot read, of the PIDs it walked.
     #[cfg(test)]
     reads: usize,
+    /// The PIDs the snapshot read, so a test can say which PIDs a warm scan read.
+    #[cfg(test)]
+    read_pids: Vec<u32>,
     keys: HashSet<u64>,
     values: Result<HashMap<u64, u64>, Unavailable>,
 }
@@ -833,6 +848,8 @@ impl Registry {
                 sessions: active.iter().map(|entry| entry.session).collect(),
                 cache: std::cell::RefCell::new(&mut self.census),
                 reads: std::cell::Cell::new(0),
+                #[cfg(test)]
+                read_pids: std::cell::RefCell::new(Vec::new()),
             };
             let started = thread_cpu();
             let started_wall = Instant::now();
@@ -850,6 +867,8 @@ impl Registry {
             });
             #[cfg(test)]
             let reads = source.reads.get();
+            #[cfg(test)]
+            let read_pids = source.read_pids.borrow().clone();
             let spent = thread_cpu().saturating_sub(started);
             let captured = Instant::now();
             self.snapshot = Some(Snapshot {
@@ -858,6 +877,8 @@ impl Registry {
                 captured,
                 #[cfg(test)]
                 reads,
+                #[cfg(test)]
+                read_pids,
                 keys: owners.iter().map(|entry| entry.key).collect(),
                 values,
             });
@@ -1247,13 +1268,25 @@ mod tests {
                 .status()
                 .unwrap()
                 .success());
-            let mut child = Command::new(binary)
+            let mut command = Command::new(binary);
+            command
                 .arg(mode)
-                .process_group(0)
                 .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
+                .stdout(Stdio::piped());
+            // setsid, not just a new process group: the helper leads its own
+            // session, so a registered group's session is distinct from the
+            // test process's session however the host groups its processes.
+            // SAFETY: the closure runs in the child after fork and only calls
+            // setsid before exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
             let output = std::io::BufReader::new(child.stdout.take().unwrap());
             Self {
                 child,
@@ -1481,6 +1514,7 @@ mod tests {
                         // however long a loaded host delays this thread.
                         captured: Instant::now() + Duration::from_secs(3600),
                         reads: 0,
+                        read_pids: Vec::new(),
                         keys: HashSet::from([owner.key]),
                         values: Ok(HashMap::from([(owner.key, 0)])),
                     });
@@ -1517,6 +1551,7 @@ mod tests {
                 sessions: HashSet::from([owner.session]),
                 cache: RefCell::new(&mut cache),
                 reads: std::cell::Cell::new(0),
+                read_pids: RefCell::new(Vec::new()),
             },
             &HashSet::from([owner.pgid]),
             Deadline::scan(),
@@ -1531,6 +1566,7 @@ mod tests {
             // delays this thread.
             captured: Instant::now() + Duration::from_secs(3600),
             reads: 0,
+            read_pids: Vec::new(),
             keys: HashSet::from([owner.key]),
             values: Err(unavailable("injected scanner EACCES")),
         });
@@ -2006,29 +2042,131 @@ mod tests {
         assert_eq!(parse_forks("processes 1\nprocesses 2\n"), None);
     }
 
-    /// On the live host a second snapshot reads only the PIDs it could not skip, and
-    /// measures the same members.
+    #[test]
+    fn reallocated_with_unchanged_last_pid_and_host_forks_is_not_reallocated() {
+        // Inside a PID namespace the host-wide fork counter advances while
+        // this namespace allocates nothing: start == end with created > 0,
+        // below any full lap, so no PID counts as reallocated.
+        let from = Allocator {
+            last_pid: 5000,
+            tasks: 400,
+            forks: 90000,
+        };
+        let to = Allocator {
+            last_pid: 5000,
+            tasks: 402,
+            forks: 90050,
+        };
+        for pid in [1, 4999, 5000, 5001, 4_194_303] {
+            assert!(!reallocated(from, to, 4_194_304, pid), "pid {pid}");
+        }
+    }
+
+    /// Helpers in their own sessions, killed and reaped on drop however the test ends.
+    struct ForeignSessions(Vec<std::process::Child>);
+    impl ForeignSessions {
+        fn spawn(count: usize) -> Self {
+            use std::os::unix::process::CommandExt;
+            use std::process::{Command, Stdio};
+            let mut children = Vec::new();
+            for _ in 0..count {
+                let mut command = Command::new("/bin/sleep");
+                command
+                    .arg("30")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                // SAFETY: the closure runs in the child after fork and only
+                // calls setsid before exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setsid() == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                children.push(command.spawn().unwrap());
+            }
+            Self(children)
+        }
+        fn pids(&self) -> Vec<u32> {
+            self.0.iter().map(|child| child.id()).collect()
+        }
+    }
+    impl Drop for ForeignSessions {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    /// On the live host a second snapshot reads none of the PIDs in foreign
+    /// sessions, and measures the same members. The foreign sessions are
+    /// spawned here, so the result does not depend on how the host groups
+    /// its own processes.
     #[test]
     fn native_second_snapshot_skips_other_sessions() {
         let mut child = Native::start("zombie");
         let _ = child.line();
+        let helpers = ForeignSessions::spawn(32);
+        let helper_pids = helpers.pids();
         let mut registry = Registry::default();
         let owner = registry
             .create(child.child.id(), Path::new("/proc"))
             .unwrap();
+        // A helper counts as foreign only in a session of its own, distinct
+        // from the registered group's session.
+        let foreign: Vec<u32> = helper_pids
+            .iter()
+            .copied()
+            .filter(|pid| {
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|text| stat(&text).ok())
+                    .is_some_and(|row| row.session == *pid && row.session != owner.session)
+            })
+            .collect();
         let first = registry.seconds(&owner).unwrap();
         let cold = registry.snapshot.as_ref().unwrap().reads;
         registry.snapshot = None;
         let second = registry.seconds(&owner).unwrap();
-        let warm = registry.snapshot.as_ref().unwrap().reads;
+        let snapshot = registry.snapshot.as_ref().unwrap();
+        let warm = snapshot.reads;
+        let warm_read_pids: HashSet<u32> = snapshot.read_pids.iter().copied().collect();
+        let warm_foreign: Vec<u32> = foreign
+            .iter()
+            .copied()
+            .filter(|pid| warm_read_pids.contains(pid))
+            .collect();
+        let cause = if foreign.len() != helper_pids.len() {
+            "H2-helpers-not-in-foreign-sessions"
+        } else if !warm_foreign.is_empty() {
+            "H1-cache-dropped-or-pid-reallocated"
+        } else {
+            "none"
+        };
         println!(
             "PROCCPU_SESSION_CACHE {}",
-            serde_json::json!({"cold_reads": cold, "warm_reads": warm, "cached_sessions": registry.census.sessions.len()})
+            serde_json::json!({"edition": "rust", "cold_reads": cold, "warm_reads": warm, "cached_sessions": registry.census.sessions.len(), "registered_session": owner.session, "helpers": helper_pids.len(), "foreign_helpers": foreign.len(), "warm_foreign_reads": warm_foreign.len(), "cause": cause})
         );
         assert!(first > 0.0 && second >= first);
+        assert_eq!(
+            foreign.len(),
+            helper_pids.len(),
+            "H2: {} of {} setsid helpers were not in a foreign session; \
+             the environment did not isolate them, so nothing was skippable",
+            helper_pids.len() - foreign.len(),
+            helper_pids.len()
+        );
         assert!(
-            warm * 4 < cold,
-            "the second snapshot read {warm} stat files of the {cold} the first read"
+            warm_foreign.is_empty(),
+            "H1: the second snapshot re-read {} foreign-session helpers {warm_foreign:?} \
+             of {cold} cold reads; the session cache was dropped or a PID was \
+             judged reallocated",
+            warm_foreign.len()
         );
         child.send(b'r');
         assert_eq!(child.line(), "reaped");
