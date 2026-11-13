@@ -24,7 +24,7 @@ export interface ListControlsDependencies {
   loadOlderTurns(): unknown;
   /** Fold every long message, or open every one. */
   setAllFolded(folded: boolean): unknown;
-  /** Show read and Fold read, in turn (`#1168 read-toggle-two-way`). */
+  /** Show read, Fold read, Hide read, in turn. */
   cycleReadMode(): unknown;
   /** Mark the backlog read, and undo a dismissal. */
   clearBacklog(): unknown;

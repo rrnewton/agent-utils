@@ -25,7 +25,7 @@ export { mountSignInControls } from "./signincontrols.ts";
 export type { SignInControls, SignInControlsDependencies } from "./signincontrols.ts";
 export { mountPreferenceSwitches } from "./preferenceswitches.ts";
 export type { PreferenceSwitches, PreferenceSwitchesDependencies } from "./preferenceswitches.ts";
-export { READING_GRIP_THRESHOLD_CH, effectiveReadingWidth, mountReadingWidth, mountTextSize, readingGripLeft, readingGripShown } from "./screen.ts";
+export { mountReadingWidth, mountTextSize } from "./screen.ts";
 export type { ReadingWidth, ScreenSettingDependencies, TextSize } from "./screen.ts";
 export { mountScreenControls } from "./screencontrols.ts";
 export type { ScreenControls, ScreenControlsDependencies } from "./screencontrols.ts";

@@ -4,6 +4,8 @@
 // order and timing are as they were in the script; the Undo offer and the inbox ledger are made in
 // the script and handed in, as their factories live in layers this one may not import.
 
+import { createTodoView } from "../../core/channels/index.ts";
+import type { TodoView } from "../../core/channels/index.ts";
 import { createSerialQueue } from "../../foundation/index.ts";
 import { createArming } from "./arming.ts";
 import { DISMISS_BATCH } from "./channelrows.ts";
@@ -63,6 +65,7 @@ export interface DoneActDependencies {
   inOtherColumn(act: () => void): void;
   listState(): { backlog: number; rowsGathered: boolean };
   listedMessages(): { id: unknown }[];
+  loadTodo(options: unknown): Promise<void>;
   markHeldDone(ids: string[], done: boolean, settles?: unknown): unknown;
   messageText(message: unknown): string;
   nextUndoAt(): unknown;
@@ -90,6 +93,7 @@ export interface DoneActDependencies {
   syncUnreadReplies(): void;
   threadForMessageId(id: unknown): string | null;
   timeOf(message: unknown, field: string): number;
+  todoSummary(): unknown;
   token(): string;
   tokenFingerprint(token: string): string;
   undoLabel(dismissal: Dismissal | null): string;
@@ -117,6 +121,7 @@ export interface DoneAct {
   backlogIsArmed(): boolean;
   disarmBacklog(): void;
   armBacklog(): void;
+  todoView: TodoView;
   toggleArchived(ids: Ids, row?: Row | null): Promise<void>;
   markRowDone(ids: Ids, row?: Row | null): Promise<void>;
   forgetDoneFlash(ids: Ids): boolean;
@@ -319,6 +324,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
    * with it or the view contradicts itself. One owner in web/src/core/channels (`createTodoView`, `#624
    * voice-page-modularity`).
    */
+  const todoView = createTodoView();
 
 
 
@@ -556,6 +562,8 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       if (deps.listState().rowsGathered) deps.renderChannelRows();
       else deps.renderReplyLinks();
       deps.listState().backlog = deps.el("discord-log").children.length;
+      todoView.setLeft(deps.listState().backlog);
+      deps.renderChannelSeam(deps.todoSummary());
       renderTodoControls();
       // The Pinned filter's rows are drawn from the archive too: a pin dealt with there greys there.
       if (deps.pinsView().only) deps.renderChannelRows();
@@ -1122,6 +1130,9 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       settled = true;
       // Saved: what waits on it need not wait for the read below as well.
       saving();
+      if (deps.readModes().hiding() && !deps.providerFacts.threading()) {
+        await deps.loadTodo({ keepPosition: true, ownAct: true, readAs: "mutation" });
+      }
     } catch (error) {
       // `#892 voice-page-optimistic-done`. What was said at once is taken back, if nothing was said since.
       if (deps.statusSays(saidBack)) deps.dismissStatus();
@@ -1197,7 +1208,7 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
 
   return {
     freshDoneState, doneState, noteArchived, dismissalName, drawUndoLabel, renderTodoControls,
-    backlogIsArmed, disarmBacklog, armBacklog, toggleArchived, markRowDone,
+    backlogIsArmed, disarmBacklog, armBacklog, todoView, toggleArchived, markRowDone,
     forgetDoneFlash, drawDoneFlash, drawDoneFlashes, unflashIds, unflashDone, flashDone,
     refreshAfterInboxChange, renderDoneChange, putBackRowsOff, queueInboxWrite, inboxWriteOwner,
     inboxPost, sendLeftOverInboxWrites, noteInboxWrite, settleInboxWrite, noteDoneSaving,

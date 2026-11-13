@@ -77,8 +77,7 @@ export function mountSettingsSyncView(deps: SettingsSyncViewDependencies) {
       switch (key) {
         case deps.keys.READ_MODE_KEY: {
           // None kept is the shipped default's turn, as everywhere: Show read.
-          const keptMode = deps.sync().local(key) || "show";
-          deps.readMode(keptMode === "hide" ? "fold" : keptMode);
+          deps.readMode(deps.sync().local(key) || "show");
           break;
         }
         // `#549 own-read-stored`. Only the switch: nothing drawn depends on it.

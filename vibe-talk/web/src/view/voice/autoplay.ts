@@ -9,7 +9,7 @@ import { cardRootOf } from "../channel/index.ts";
 import type { ElementById } from "../dom/index.ts";
 
 /** The menu item's word for each state. */
-const AUTOPLAY_WORDS = Object.freeze({ on: "Autoplay", off: "Autoplay" } as const);
+const AUTOPLAY_WORDS = Object.freeze({ on: "Autoplay: on", off: "Autoplay: off" } as const);
 
 export interface AutoplayDependencies<Pane> {
   byId<K extends keyof ElementById>(id: K): ElementById[K];
@@ -62,8 +62,6 @@ export function createAutoplay<Pane>(deps: AutoplayDependencies<Pane>): Autoplay
     const toggle = deps.byId("read-autoplay");
     if (toggle.getAttribute("aria-pressed") !== pressed) toggle.setAttribute("aria-pressed", pressed);
     deps.byId("autoplay-toggle-label").textContent = on() ? AUTOPLAY_WORDS.on : AUTOPLAY_WORDS.off;
-    const menuToggle = deps.byId("autoplay-toggle");
-    if (menuToggle && menuToggle.getAttribute("aria-pressed") !== pressed) menuToggle.setAttribute("aria-pressed", pressed);
   }
 
   /**

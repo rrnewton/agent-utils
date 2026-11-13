@@ -319,9 +319,11 @@
   -webkit-tap-highlight-color: transparent;
 }
 
-/* The toggle reads as thrown, drawn from the SAME attribute that says so to a screen reader:
-   `true` for Fold read on. `#221 read-modes`, `#1399 toggle-labels-active-style`. */
-#todo-filter[aria-pressed="true"] {
+/* The filter reads as thrown, drawn from the SAME attribute that says so to a screen reader:
+   `true` for Hide read and `mixed` for Fold read, the two modes that take read messages out of
+   the way. `#221 read-modes`. */
+#todo-filter[aria-pressed="true"],
+#todo-filter[aria-pressed="mixed"] {
   border-color: var(--accent);
   color: var(--ink);
 }

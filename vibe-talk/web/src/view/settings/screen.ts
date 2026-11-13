@@ -11,9 +11,7 @@
 // fine)` at the foot of web/voice.css. Nothing here asks `matchMedia`, and nothing here looks at a
 // user-agent string: this code only ever sets a number, and the stylesheet decides whether that number
 // means anything. That is what keeps one regime rather than two that can disagree, and it is why the
-// handle can be wired unconditionally. (`#1398 reading-width-handle-gate` adds one measured
-// exception, below: whether the message column itself is wide enough to offer narrowing is a
-// fact about that column's rendered box, which only a measurement of the column can say.)
+// handle can be wired unconditionally.
 //
 // The unit is CHARACTERS, not pixels. What makes a line hard to read is how many characters are on it,
 // so that is what the reader is choosing and what gets stored. The type size is a PERCENTAGE of the
@@ -21,7 +19,7 @@
 // readable at arm's length on a phone, and over about a hundred and fifty the fold control and the row's
 // own controls no longer line up with the words they belong to.
 
-import { DEFAULT_READING_CH, MAX_MSG_SCALE, MAX_READING_CH, MIN_MSG_SCALE, clampMsgScale, clampReadingWidth } from "../../core/settings/index.ts";
+import { DEFAULT_READING_CH, MAX_MSG_SCALE, MIN_MSG_SCALE, clampMsgScale, clampReadingWidth } from "../../core/settings/index.ts";
 import { gripKeysFor, msgScaleStepTarget, msgScaleWords, readingWidthWords } from "../../present/settings/index.ts";
 
 /** What a setting's control asks of the page: the element by id, and the device's copy of the value. */
@@ -134,61 +132,12 @@ export interface ReadingWidth {
   gripKey(event: KeyboardEvent | undefined): void;
 }
 
-/**
- * `#1398 reading-width-handle-gate`. The column width past which the handle is offered at
- * all, in characters: the widest width the setting itself allows (`MAX_READING_CH`, 120ch).
- * A column no wider than that has nothing to gain from being artificially narrowed — it
- * reads best at full width — so below this width there is no handle and the remembered
- * narrower width is kept on the device but not applied. Only a column measured wider
- * than this (a wide monitor, or a wide column beside a second column or a docked panel)
- * earns the choice. The comparison is against the message column's own rendered width,
- * never the viewport's: docking a panel or splitting the screen squeezes the column
- * without moving the window.
- */
-export const READING_GRIP_THRESHOLD_CH = MAX_READING_CH;
-
-/**
- * Whether the handle shows for a column `columnWidthPx` wide at `pxPerCh` pixels per
- * character. An unmeasured column (nothing laid out yet, or a width that is not a
- * number) keeps the handle: hiding a control on a guess is worse than showing one
- * that a measurement a frame later will place.
- */
-export function readingGripShown(columnWidthPx: number, pxPerCh: number): boolean {
-  if (!Number.isFinite(columnWidthPx) || !Number.isFinite(pxPerCh) || columnWidthPx <= 0 || pxPerCh <= 0) {
-    return true;
-  }
-  return columnWidthPx > READING_GRIP_THRESHOLD_CH * pxPerCh;
-}
-
-/** The width actually applied for a remembered one: full width while the handle is gated off. */
-export function effectiveReadingWidth(rememberedCh: number, shown: boolean): number {
-  return shown ? rememberedCh : MAX_READING_CH;
-}
-
-/**
- * Where the handle stands, in pixels from the main screen's left edge: on the message
- * column's own right edge (`column`), never at the screen's middle, so a docked panel
- * or a second column beside it is never stood over.
- */
-export function readingGripLeft(column: { right: number }, screen: { left: number }): number {
-  return column.right - screen.left;
-}
-
 /** The default width in force, and no drag. Made where the page kept the width. */
 export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth {
   // The width currently in force, kept here rather than read back out of the DOM: reading a custom
   // property back gives you the string that was written, and a drag would then be parsing its own
   // output forty times a second.
   let readingWidth = DEFAULT_READING_CH;
-  // The width actually on the page: the remembered one while the handle is shown, full
-  // width (the widest allowed, which cannot cap a column under the threshold) while it
-  // is not. The slider and the handle keep saying the remembered one throughout.
-  let appliedWidth = DEFAULT_READING_CH;
-  // Whether the measured column earns the handle. Unmeasured until the first layout
-  // says otherwise, and shown until then, as `readingGripShown` keeps it.
-  let gripShown = true;
-  // Pixels per character, last measured off the column on screen (see `pixelsPerCh`).
-  let perCh = 8;
   // A drag, in three events. Pointer events rather than mouse events so a trackpad, a pen and a
   // desktop touchscreen all work through one path; the regime that shows the handle at all is the
   // stylesheet's business, not this code's.
@@ -203,102 +152,11 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
    */
   function apply(value: unknown): number {
     readingWidth = clampReadingWidth(value);
-    appliedWidth = effectiveReadingWidth(readingWidth, gripShown);
-    document.documentElement.style.setProperty("--reading-width", `${appliedWidth}ch`);
+    document.documentElement.style.setProperty("--reading-width", `${readingWidth}ch`);
     (deps.lookup("reading-width") as HTMLInputElement).value = String(readingWidth);
     deps.lookup("width-grip").setAttribute("aria-valuenow", String(readingWidth));
     deps.lookup("width-grip").setAttribute("aria-valuetext", `${readingWidth} characters`);
-    placeGrip();
     return readingWidth;
-  }
-
-  /**
-   * Measure the message column and put the handle where the measurement says: on the
-   * column's (`#pane-voice`, inside `#scroll-area`) own right edge, shown only while
-   * that column is wider than the threshold. Called on every apply and again whenever
-   * the column changes size — a resize, a dock or undock, a second column coming or
-   * going all change the column's box without asking this code — so the decision is
-   * always the current layout's. A column that cannot be measured yet leaves the
-   * handle as it stands.
-   */
-  /**
-   * How many pixels one character is, measured from the font itself: ten zeros in the
-   * shown pane's own font, laid out hidden and taken away again. `1ch` is the advance
-   * of a zero, so this is the conversion whatever the font and size — and, unlike the
-   * pane's own width, it stays true while the pane spans its column uncapped (two
-   * columns, `#373`) or stands at full width under the gate. 0 when it cannot be
-   * measured here, and the caller keeps its last figure.
-   */
-  function measurePerCh(): number {
-    try {
-      if (typeof getComputedStyle !== "function") return 0;
-      const paneEl = deps.lookup("pane-voice");
-      const style = getComputedStyle(paneEl);
-      const probe = document.createElement("span");
-      probe.textContent = "0000000000";
-      probe.style.position = "absolute";
-      probe.style.visibility = "hidden";
-      probe.style.whiteSpace = "pre";
-      probe.style.padding = "0";
-      probe.style.border = "0";
-      probe.style.fontFamily = style.fontFamily;
-      probe.style.fontSize = style.fontSize;
-      probe.style.fontWeight = style.fontWeight;
-      probe.style.letterSpacing = style.letterSpacing;
-      document.body.appendChild(probe);
-      const width = probe.getBoundingClientRect().width;
-      probe.remove();
-      return width > 0 ? width / 10 : 0;
-    } catch (_error) {
-      return 0;
-    }
-  }
-
-  /** The pane on screen now: the transcript's or the channel's, whichever has a box. Both are
-   * held to the reading width, and the handle belongs to the one being read. */
-  function shownPane(): { rect: DOMRect } | null {
-    for (const id of ["pane-voice", "pane-discord"]) {
-      try {
-        const rect = deps.lookup(id).getBoundingClientRect();
-        if (rect.width > 0) return { rect };
-      } catch (_error) { /* not on this page: the other pane may be */ }
-    }
-    return null;
-  }
-
-  function placeGrip(): void {
-    let area: DOMRect | undefined;
-    let screen: DOMRect | undefined;
-    const paneBox = shownPane();
-    try {
-      area = deps.lookup("scroll-area").getBoundingClientRect();
-      screen = deps.lookup("screen-main").getBoundingClientRect();
-    } catch (_error) {
-      return; // Nothing laid out to measure: the handle keeps its last place.
-    }
-    const pane = paneBox?.rect;
-    if (!area || !pane || !screen || !(area.width > 0) || !(pane.width > 0)) return;
-    const measuredCh = measurePerCh();
-    if (measuredCh > 0) perCh = measuredCh;
-    const screenEl = deps.lookup("screen-main");
-    const maximized = screenEl.getAttribute("data-discuss") === "maximized";
-    const shown = !maximized && readingGripShown(area.width, perCh);
-    const grip = deps.lookup("width-grip") as HTMLElement;
-    grip.style.left = `${readingGripLeft(pane, screen)}px`;
-    // Said on the screen as well as on the handle: in two columns the stylesheet
-    // re-caps the main pane only while this says "shown" (`#373` spans it otherwise).
-    screenEl.setAttribute("data-reading-grip", shown ? "shown" : "hidden");
-    if (shown === gripShown) {
-      grip.hidden = !shown;
-      return;
-    }
-    gripShown = shown;
-    grip.hidden = !shown;
-    // The gate flipped: re-apply so a squeezed column goes full width at once and a
-    // widened one takes its remembered width back. The remembered value itself is
-    // untouched either way, and nothing is stored for a change of room.
-    appliedWidth = effectiveReadingWidth(readingWidth, gripShown);
-    document.documentElement.style.setProperty("--reading-width", `${appliedWidth}ch`);
   }
 
   /**
@@ -320,49 +178,27 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
     deps.lookup("reading-width-state").textContent = readingWidthWords(ch, persist(ch));
   }
 
-  /** The conversion a drag moves by: the font's own measure, kept current. */
+  /**
+   * How many pixels one character is, measured from the column that is actually on screen rather
+   * than assumed. `1ch` is the width of a zero in the current font, which is neither a constant nor
+   * knowable from here — but the pane IS `max-width: var(--reading-width)`, so its rendered width
+   * divided by the width in force is the conversion factor, whatever the font turns out to be.
+   */
   function pixelsPerCh(): number {
-    const measured = measurePerCh();
-    if (measured > 0) perCh = measured;
-    return perCh; // nothing laid out yet; the last measure (or a plausible 8) beats dividing by zero.
+    const measured = deps.lookup("pane-voice").getBoundingClientRect().width;
+    if (measured > 0 && readingWidth > 0) {
+      return measured / readingWidth;
+    }
+    return 8; // nothing laid out yet; a plausible figure beats dividing by zero.
   }
-
-  // Re-place the handle whenever the column's box changes or the layout around it is
-  // re-decided: a window resize, Discuss docking, undocking or maximizing, and a
-  // second column coming or going all reach the column through one of these two.
-  // Neither observer exists in every test double, and neither is needed for the
-  // width itself — the stylesheet and `apply` carry that — so both are best-effort.
-  try {
-    if (typeof ResizeObserver === "function") {
-      const watcher = new ResizeObserver(() => placeGrip());
-      watcher.observe(deps.lookup("scroll-area"));
-      watcher.observe(deps.lookup("pane-voice"));
-      watcher.observe(deps.lookup("pane-discord"));
-    }
-  } catch (_error) { /* no observer: applies still place the handle */ }
-  try {
-    if (typeof MutationObserver === "function") {
-      const layoutWatcher = new MutationObserver(() => placeGrip());
-      layoutWatcher.observe(deps.lookup("screen-main"), { attributes: true, attributeFilter: ["data-discuss", "data-columns"] });
-    }
-  } catch (_error) { /* no observer: applies still place the handle */ }
 
   return {
     apply,
     changed,
     gripDown(event) {
-      // The column, not the screen: its box is the drag's frame, so a docked panel or a
-      // second column beside it cannot pull the width being set. The column is centred
-      // in its area, so the handle's distance from the area's middle is HALF the width.
-      // Captured once at the start of the drag: re-measuring mid-drag would feed the
-      // drag its own output.
-      let box: DOMRect | undefined;
-      try {
-        box = deps.lookup("scroll-area").getBoundingClientRect();
-        if (!(box.width > 0)) box = deps.lookup("screen-main").getBoundingClientRect();
-      } catch (_error) {
-        box = deps.lookup("screen-main").getBoundingClientRect();
-      }
+      const box = deps.lookup("screen-main").getBoundingClientRect();
+      // The column is centred, so the handle's distance from the middle is HALF the width. Captured
+      // once at the start of the drag: re-measuring mid-drag would feed the drag its own output.
       widthDrag = { centre: box.left + box.width / 2, perCh: pixelsPerCh() };
       const grip = deps.lookup("width-grip");
       if (event && event.pointerId !== undefined && grip.setPointerCapture) {
