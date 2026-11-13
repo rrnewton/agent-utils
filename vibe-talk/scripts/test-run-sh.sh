@@ -287,6 +287,13 @@ grep -q '(dry run).*build -t '"$TEST_IMAGE_NAME:$TEST_IMAGE_TAG" <<< "$out" || f
 grep -q '(dry run).*run -d .*-p 127.0.0.1:'"$TEST_PORT" <<< "$out" || fail "dry run did not print the run command"
 grep -q 'set: .*VIBE_TALK_DISCORD_BOT_TOKEN' <<< "$out" || fail "dry run does not report which variables are set"
 ok "a valid config reaches build and run (dry run), reporting variables by name"
+# The sibling Rust workspace must be visible to Cargo inside the image build.
+buildline="$(grep '(dry run).*build -t ' <<< "$out")"
+context="${buildline##* }"
+[ "$(cd -- "$context" && pwd)" = "$(cd -- "$SCRIPT_DIR/../.." && pwd)" ] \
+    || fail "build context does not include the sibling Rust workspace: $buildline"
+ok "the build context is the repository root, including path dependencies"
+
 
 # --- 8b. the run command is detached, named, restart-policied, and NOT --rm ------------------
 # --rm is what destroyed the access log of every crash: the container, and its logs with it,
