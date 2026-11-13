@@ -283,11 +283,22 @@ under `ROOT/global-backups/`. `--notify COMMAND` (or a registry's own
 refresh and after each of its units with `TURNOVER_PHASE`,
 `TURNOVER_REGISTRY`, `TURNOVER_UNIT`, `TURNOVER_OLD_SHA`,
 `TURNOVER_NEW_SHA` and `TURNOVER_VERDICT` set; its failure is reported,
-never fatal. `--report` changes nothing and exits 0 when all current,
+never fatal. Unit files keep systemd specifiers (`%h`, `%u`, `%U`, `%t`,
+`%S`, `%C`, `%E`) as written; discovery expands them with the user
+manager's values in `ExecStart`, `Environment`, drop-ins and
+`WorkingDirectory`, so the registry, state directories, binary path and
+pin lookup use the paths the manager runs. Every row names the pin
+files it looked for (`REGISTRY/turnover-pins/<unit>.pin`, then
+`REGISTRY/turnover.pin`) and the one it found, if any. `--report`
+changes nothing and exits 0 when all current,
 74 when some are behind, 75 on errors or unknown commits (a unit whose
 binary reports no commit is named with its remedy); `--dry-run` prints
 the ordered plan including pins and notify calls. A turnover run exits
-0, 1 or 4 with refresh's meanings. Run daily, also by a timer: with no
+0, 1 or 4 with refresh's meanings, except that an unknown unit is
+skipped (never touched) and named with its remedy while every other
+eligible unit is refreshed as usual: such a run exits 75 so the alert
+stays visible (a rollback failure keeps 4), and the `run-failed` notify
+names each skipped unit and why. Run daily, also by a timer: with no
 affecting change it restarts nothing, which is what makes a separate
 global-binary timer redundant on any host running turnover on a timer.
 

@@ -1824,3 +1824,197 @@ fn turnover_refreshes_bridges_last_and_notifies_in_order() {
         .iter()
         .any(|(name, value)| name == "TURNOVER_NEW_SHA" && value == &new)));
 }
+
+#[test]
+fn turnover_expands_percent_h_in_execstart_and_honours_the_pin_it_finds() {
+    // #1493: a unit whose ExecStart and WorkingDirectory use %h, with no
+    // --registry, must resolve its registry under the real home, so the
+    // pin under that registry is found and honoured.
+    let temporary = temporary("percent-h");
+    let base = temporary.0.clone();
+    let home = base.join("home");
+    let registry = home.join("work/team/.agentctl");
+    fs::create_dir_all(registry.join("turnover-pins")).unwrap();
+    fs::write(
+        registry.join("turnover-pins/spec-bridge.service.pin"),
+        "held for the specifier fixture\n",
+    )
+    .unwrap();
+    let fake = Fake::new(base.join("drop-ins"));
+    let root = base.join("root");
+    make_snapshot(&fake, &root, &base);
+    let binary = home.join(".local/bin/agentctl");
+    fake.commits
+        .borrow_mut()
+        .insert(binary.clone(), OLD.to_owned());
+    fake.add_unit_file(
+        "spec-bridge.service",
+        &format!(
+            "[Service]\nEnvironment=\"HOME={}\"\nExecStart=%h/.local/bin/agentctl chat run --state %h/.local/state/bridge\nWorkingDirectory=%h/work/team\n",
+            home.display()
+        ),
+    );
+    let (services, unreadable) = discover_all(&fake, &Tables).unwrap();
+    assert!(unreadable.is_empty(), "{unreadable:?}");
+    let service = services
+        .iter()
+        .find(|service| service.unit == "spec-bridge.service")
+        .expect("specifier bridge discovered");
+    assert_eq!(service.registry, registry, "registry under the real home");
+    assert_eq!(service.binary, binary);
+    assert_eq!(service.bridge_state, Some(home.join(".local/state/bridge")));
+    assert_eq!(service.working_directory, home.join("work/team"));
+    // The pin under the expanded registry is honoured in a report.
+    let (checkout, _old, _new) = turnover_checkout(&base);
+    // The running binary reports OLD; make the candidate differ on an
+    // affecting path so an unpinned unit would refresh.
+    fake.commits.borrow_mut().insert(binary, OLD.to_owned());
+    let options = TurnoverOptions {
+        root: root.clone(),
+        drop_in_dir: fake.drop_in_dir.clone(),
+        checkout,
+        revision: "HEAD".to_owned(),
+        cargo: PathBuf::from("cargo"),
+        work_dir: root,
+        keep_work: false,
+        report_only: true,
+        dry_run: false,
+        health_timeout: Duration::from_secs(60),
+        headless_wait: Duration::from_secs(30),
+        notify: None,
+        global_binary: None,
+        interrupted: None,
+    };
+    let report = turnover(&fake, &Tables, &options).unwrap();
+    let rows = report.document["services"].as_array().unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row["unit"] == "spec-bridge.service")
+        .expect("specifier row");
+    assert_eq!(row["decision"], "pinned", "{}", report.text);
+    assert!(
+        row["detail"]
+            .as_str()
+            .unwrap()
+            .contains("held for the specifier fixture"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report
+            .text
+            .contains("turnover-pins/spec-bridge.service.pin"),
+        "report names where the pin was looked for: {}",
+        report.text
+    );
+}
+
+#[test]
+fn turnover_skips_an_unknown_unit_and_refreshes_the_rest() {
+    // #1493 item 3 (coordinator-amended): one unknown unit is skipped and
+    // named, the two refreshable units are refreshed, exit is 75.
+    let world = world();
+    let (checkout, old, new) = turnover_checkout(&world._temporary.0);
+    // Fabricate a snapshot of the candidate commit, as in
+    // turnover_refreshes_bridges_last_and_notifies_in_order.
+    let destination = world.root.join("snapshots").join(&new[..12]);
+    fs::create_dir_all(destination.join("bin")).unwrap();
+    fs::create_dir_all(destination.join("home/plugins/slack")).unwrap();
+    for relative in [
+        snapshot::AGENTCTL,
+        snapshot::OUTBOUND,
+        snapshot::PLUGIN,
+        snapshot::MANIFEST,
+    ] {
+        fs::copy(
+            world.snapshot.path.join(relative),
+            destination.join(relative),
+        )
+        .unwrap();
+    }
+    let files: serde_json::Map<String, Value> = [
+        snapshot::AGENTCTL,
+        snapshot::OUTBOUND,
+        snapshot::PLUGIN,
+        snapshot::MANIFEST,
+    ]
+    .into_iter()
+    .map(|relative| {
+        (
+            relative.to_owned(),
+            json!({"sha256": world.fake.file_sha256(&destination.join(relative)), "bytes": 1}),
+        )
+    })
+    .collect();
+    fs::write(
+        destination.join("snapshot.json"),
+        json!({
+            "schema": snapshot::SNAPSHOT_SCHEMA,
+            "commit": new,
+            "built_at": 1_800_000_000_u64,
+            "source": {"test": true},
+            "files": files,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(destination.join(snapshot::AGENTCTL), new.clone());
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    // An unknown unit in the same registry: its binary reports no commit.
+    world.fake.add_unit_file(
+        "mystery-watch.service",
+        &format!(
+            "[Service]\nExecStart=/state/bin/agentctl-mystery --registry {} watch-agents\nWorkingDirectory=/tmp\n",
+            world.registry.display()
+        ),
+    );
+    let mystery_before = world.fake.service_text("mystery-watch.service");
+    let mut options = turnover_options(&world, checkout);
+    options.report_only = false;
+    options.notify = Some(vec!["/bin/notify".to_owned()]);
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 75, "{}", report.text);
+    assert!(
+        report.text.contains("mystery-watch.service"),
+        "{}",
+        report.text
+    );
+    assert!(report.text.contains("skipped"), "{}", report.text);
+    // The unknown unit was never touched; the other two were refreshed
+    // (their refresh verdicts are in the combined text).
+    assert_eq!(
+        world.fake.service_text("mystery-watch.service"),
+        mystery_before
+    );
+    let rows = report.document["services"].as_array().unwrap();
+    let mystery = rows
+        .iter()
+        .find(|row| row["unit"] == "mystery-watch.service")
+        .expect("mystery row");
+    assert_eq!(mystery["decision"], "unknown", "{}", report.text);
+    assert!(
+        !world
+            .fake
+            .calls()
+            .iter()
+            .any(|call| call.contains("mystery-watch")),
+        "{:?}",
+        world.fake.calls()
+    );
+    // The run-failed / skipped notice names the unknown unit.
+    let calls = world.fake.notify_calls.borrow();
+    assert!(
+        calls.iter().any(|(_, environment)| environment
+            .iter()
+            .any(|(name, value)| name == "TURNOVER_UNIT" && value == "mystery-watch.service")),
+        "{calls:?}"
+    );
+}

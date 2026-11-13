@@ -75,6 +75,13 @@ pub trait Host {
     ) -> Result<(i32, String), String>;
     /// Ask a headless wrapper's control socket for its status.
     fn headless_status(&self, socket: &Path) -> Result<Value, String>;
+    /// The user manager's specifier values (#1493): what `%h`, `%u`, `%U`,
+    /// `%t`, `%S`, `%C` and `%E` mean for units this host's manager runs.
+    /// The default reads this process's manager environment; a fake host
+    /// inherits it and units may still name their own `HOME`.
+    fn specifier_context(&self) -> super::unit::SpecifierContext {
+        system_specifier_context()
+    }
     /// The current time.
     fn now(&self) -> SystemTime;
     /// Wait.
@@ -379,6 +386,42 @@ impl Host for SystemHost {
 
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+}
+
+/// The running user's specifier values, from the environment the user
+/// manager itself uses (#1493).
+#[must_use]
+pub fn system_specifier_context() -> super::unit::SpecifierContext {
+    let absolute = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let home = absolute("HOME").unwrap_or_else(|| PathBuf::from("/"));
+    let uid = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .and_then(|fields| fields.split_whitespace().next())
+                .and_then(|uid| uid.parse::<u32>().ok())
+        })
+        .unwrap_or(0);
+    let runtime_dir =
+        absolute("XDG_RUNTIME_DIR").unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+    super::unit::SpecifierContext {
+        state_dir: absolute("XDG_STATE_HOME").unwrap_or_else(|| home.join(".local/state")),
+        cache_dir: absolute("XDG_CACHE_HOME").unwrap_or_else(|| home.join(".cache")),
+        config_dir: absolute("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")),
+        home,
+        user: std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_default(),
+        uid,
+        runtime_dir,
     }
 }
 

@@ -228,6 +228,74 @@ pub fn quote_word(word: &str) -> String {
     quoted
 }
 
+/// The user manager's values for the systemd specifiers agentctl units use (#1493).
+/// `systemctl show` already prints a resolved `ExecStart`, but the definition services
+/// derive paths from comes from `systemctl cat`, which keeps specifiers as written;
+/// expansion with these values reproduces the manager's resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpecifierContext {
+    /// `%h`: the user's home directory.
+    pub home: std::path::PathBuf,
+    /// `%u`: the user's name.
+    pub user: String,
+    /// `%U`: the user's numeric id.
+    pub uid: u32,
+    /// `%t`: the runtime directory (`/run/user/UID`).
+    pub runtime_dir: std::path::PathBuf,
+    /// `%S`: the state directory root (`~/.local/state` for a user manager).
+    pub state_dir: std::path::PathBuf,
+    /// `%C`: the cache directory root (`~/.cache`).
+    pub cache_dir: std::path::PathBuf,
+    /// `%E`: the config directory root (`~/.config`).
+    pub config_dir: std::path::PathBuf,
+}
+
+impl SpecifierContext {
+    /// The same context with a different home: state, cache and config roots follow it.
+    #[must_use]
+    pub fn with_home(&self, home: std::path::PathBuf) -> Self {
+        Self {
+            state_dir: home.join(".local/state"),
+            cache_dir: home.join(".cache"),
+            config_dir: home.join(".config"),
+            home,
+            user: self.user.clone(),
+            uid: self.uid,
+            runtime_dir: self.runtime_dir.clone(),
+        }
+    }
+
+    /// Expand the known specifiers in `value`; `%%` is a literal `%`, and an
+    /// unknown specifier (such as `%i`) is left exactly as written.
+    #[must_use]
+    pub fn expand(&self, value: &str) -> String {
+        let mut expanded = String::with_capacity(value.len());
+        let mut characters = value.chars();
+        while let Some(character) = characters.next() {
+            if character != '%' {
+                expanded.push(character);
+                continue;
+            }
+            match characters.next() {
+                Some('%') => expanded.push('%'),
+                Some('h') => expanded.push_str(&self.home.to_string_lossy()),
+                Some('u') => expanded.push_str(&self.user),
+                Some('U') => expanded.push_str(&self.uid.to_string()),
+                Some('t') => expanded.push_str(&self.runtime_dir.to_string_lossy()),
+                Some('S') => expanded.push_str(&self.state_dir.to_string_lossy()),
+                Some('C') => expanded.push_str(&self.cache_dir.to_string_lossy()),
+                Some('E') => expanded.push_str(&self.config_dir.to_string_lossy()),
+                Some(other) => {
+                    expanded.push('%');
+                    expanded.push(other);
+                }
+                None => expanded.push('%'),
+            }
+        }
+        expanded
+    }
+}
+
 /// Undo the `%%` escaping systemd applies when it writes a transient unit file. A lone `%`
 /// would be a specifier, which a transient definition never holds; it is refused.
 pub fn unescape_transient(value: &str) -> Result<String, String> {
@@ -437,6 +505,30 @@ Environment="AGENTCTL_HOME=/state/home-old" "PATH=/usr/bin:/bin" "HOME=/home/u"
 ExecStart=
 ExecStart="/bin/sh" "-c" "exec /state/bin/agentctl-old --registry /work/team/.agentctl chat run --bridge-state /state/bridge 2>>/state/logs/bridge.log"
 "#;
+
+    #[test]
+    fn expands_the_specifiers_agentctl_units_use() {
+        // #1493: %h %u %U %t %S %C %E and %%, with unknown specifiers intact.
+        let context = SpecifierContext {
+            home: std::path::PathBuf::from("/home/u"),
+            user: "u".to_owned(),
+            uid: 1000,
+            runtime_dir: std::path::PathBuf::from("/run/user/1000"),
+            state_dir: std::path::PathBuf::from("/home/u/.local/state"),
+            cache_dir: std::path::PathBuf::from("/home/u/.cache"),
+            config_dir: std::path::PathBuf::from("/home/u/.config"),
+        };
+        assert_eq!(
+            context.expand("%h/bin %u %U %t %S %C %E 100%% %i %"),
+            "/home/u/bin u 1000 /run/user/1000 /home/u/.local/state /home/u/.cache /home/u/.config 100% %i %"
+        );
+        assert_eq!(
+            context
+                .with_home(std::path::PathBuf::from("/other"))
+                .expand("%S"),
+            "/other/.local/state"
+        );
+    }
 
     #[test]
     fn parses_a_transient_unit() {

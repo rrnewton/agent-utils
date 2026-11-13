@@ -226,6 +226,10 @@ struct Row {
     changed_paths: Vec<String>,
     decision: Decision,
     detail: String,
+    /// Pin files looked for this row, in lookup order (#1493).
+    pin_checked: Vec<PathBuf>,
+    /// The pin file found, when one was.
+    pin_path: Option<PathBuf>,
     service: Option<Service>,
 }
 
@@ -317,6 +321,10 @@ fn change_test(
 struct Pins {
     registry: Option<String>,
     units: BTreeMap<String, String>,
+    /// The whole-registry pin file looked for (#1493).
+    registry_path: PathBuf,
+    /// The per-unit pin file looked for, by unit name.
+    unit_paths: BTreeMap<String, PathBuf>,
 }
 
 fn pin_reason(host: &dyn Host, path: &Path) -> Result<Option<String>, String> {
@@ -337,12 +345,13 @@ fn read_pins(host: &dyn Host, registry: &Path, units: &[&str]) -> Result<Pins, S
     let mut pins = Pins {
         registry: pin_reason(host, &registry.join("turnover.pin"))?,
         units: BTreeMap::new(),
+        registry_path: registry.join("turnover.pin"),
+        unit_paths: BTreeMap::new(),
     };
     for unit in units {
-        if let Some(reason) = pin_reason(
-            host,
-            &registry.join("turnover-pins").join(format!("{unit}.pin")),
-        )? {
+        let path = registry.join("turnover-pins").join(format!("{unit}.pin"));
+        pins.unit_paths.insert((*unit).to_owned(), path.clone());
+        if let Some(reason) = pin_reason(host, &path)? {
             pins.units.insert((*unit).to_owned(), reason);
         }
     }
@@ -369,6 +378,24 @@ impl Pins {
             .get(unit)
             .map(String::as_str)
             .or(self.registry.as_deref())
+    }
+
+    /// The files looked for `unit`, and the one found, if any (#1493).
+    fn lookup(&self, unit: &str) -> (Vec<PathBuf>, Option<PathBuf>) {
+        let unit_path = self.unit_paths.get(unit).cloned();
+        let checked: Vec<PathBuf> = unit_path
+            .iter()
+            .cloned()
+            .chain([self.registry_path.clone()])
+            .collect();
+        let found = if self.units.contains_key(unit) {
+            unit_path
+        } else if self.registry.is_some() {
+            Some(self.registry_path.clone())
+        } else {
+            None
+        };
+        (checked, found)
     }
 }
 
@@ -660,7 +687,8 @@ fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
 /// report mode 0 all current, 74 some behind, 75 errors or unknowns;
 /// turnover 0 done, 1 a refresh failed and rolled back, 4 a rollback
 /// failed (the refresh codes), 75 when nothing could move (build or pin
-/// or discovery failure).
+/// or discovery failure) or when an unknown unit was skipped (#1493:
+/// skipped and named, never touched, while the rest refresh as usual).
 #[derive(Debug)]
 pub struct TurnoverReport {
     /// The JSON report (schema agentctl-services-turnover/v1).
@@ -748,6 +776,9 @@ pub fn turnover(
             .collect();
         let (mut decision, changed, mut detail) =
             decide(options, &candidate, &paths, running.as_deref());
+        let (pin_checked, pin_path) = pins
+            .get(&registry)
+            .map_or((Vec::new(), None), |pins| pins.lookup(&service.unit));
         if let Some(reason) = pins
             .get(&registry)
             .and_then(|pins| pins.reason_for(&service.unit))
@@ -767,6 +798,8 @@ pub fn turnover(
             changed_paths: changed,
             decision,
             detail,
+            pin_checked,
+            pin_path,
             service: Some(service.clone()),
         });
     }
@@ -804,6 +837,8 @@ pub fn turnover(
             changed_paths: changed,
             decision,
             detail,
+            pin_checked: Vec::new(),
+            pin_path: None,
             service: None,
         });
     }
@@ -833,6 +868,8 @@ pub fn turnover(
             changed_paths: changed,
             decision,
             detail,
+            pin_checked: vec![options.root.join("global.pin")],
+            pin_path: global_pin.as_ref().map(|_| options.root.join("global.pin")),
             service: None,
         });
     }
@@ -841,6 +878,35 @@ pub fn turnover(
         .iter()
         .map(|(unit, error)| format!("{unit}: runs agentctl but cannot be read: {error}"))
         .collect();
+    // #1493 (coordinator-amended): an unknown unit is skipped, never touched,
+    // and named with its remedy; every other unit proceeds as usual.
+    let skipped_unknown: Vec<&Row> = rows
+        .iter()
+        .chain(global_row.iter())
+        .filter(|row| row.decision == Decision::Unknown)
+        .collect();
+    for row in &skipped_unknown {
+        let why = if row.detail.is_empty() {
+            "the binary reports no commit".to_owned()
+        } else {
+            row.detail.clone()
+        };
+        let pin_hint = row
+            .pin_checked
+            .first()
+            .map(|path| format!(" at {}", path.display()))
+            .unwrap_or_default();
+        notes.push(format!(
+            "skipped unknown unit {}: {why}; it was not touched; remedy: pin it{pin_hint} or move it under services with a snapshot build and refresh",
+            row.unit
+        ));
+    }
+    for (unit, error) in &unreadable {
+        notes.push(format!(
+            "skipped unknown unit {unit}: unreadable unit: {error}; it was not touched; remedy: pin it or move it under services with a snapshot build and refresh"
+        ));
+    }
+    let any_skipped = !skipped_unknown.is_empty() || !unreadable.is_empty();
     // #1289 turnover-downgrade-guard: a candidate that does not descend
     // from a running commit would move that unit backwards. Pinned rows
     // already had their decision replaced, so they are exempt.
@@ -1041,6 +1107,13 @@ pub fn turnover(
         exit_code = 75;
     }
 
+    // #1493: a skipped unknown unit does not stop the rest, but the run
+    // still exits 75 so the alert stays visible (a rollback failure, 4,
+    // is more urgent and keeps its code).
+    if !options.report_only && !options.dry_run && any_skipped && exit_code != 4 {
+        exit_code = 75;
+    }
+
     if options.report_only {
         let errors = !unreadable.is_empty()
             || downgrade_refused
@@ -1077,6 +1150,29 @@ pub fn turnover(
                 None,
                 &candidate,
                 &format!("exit-{exit_code}"),
+                &mut notes,
+            );
+        }
+        // #1493: the alert names each skipped unknown unit and why.
+        for row in &skipped_unknown {
+            let Some(registry) = row.registry.as_deref() else {
+                continue;
+            };
+            let command = notify_command(host, registry, options.notify.as_deref());
+            let why = if row.detail.is_empty() {
+                "the binary reports no commit".to_owned()
+            } else {
+                row.detail.clone()
+            };
+            notify(
+                host,
+                command.as_deref(),
+                "run-failed",
+                registry,
+                &row.unit,
+                row.running.as_deref(),
+                &candidate,
+                &format!("skipped-unknown: {why}"),
                 &mut notes,
             );
         }
@@ -1132,6 +1228,8 @@ fn render(
             "changed_paths_count": row.changed_paths.len(),
             "decision": row.decision.label(),
             "detail": row.detail,
+            "pin_checked": row.pin_checked,
+            "pin_path": row.pin_path,
         })
     };
     let mut services: Vec<Value> = rows.iter().map(row_json).collect();
@@ -1171,6 +1269,30 @@ fn render(
         );
         if !row.detail.is_empty() {
             let _ = writeln!(text, "  {}", row.detail);
+        }
+        if !row.pin_checked.is_empty() {
+            let checked: Vec<String> = row
+                .pin_checked
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            match &row.pin_path {
+                Some(found) => {
+                    let _ = writeln!(
+                        text,
+                        "  pin: found {} (looked for {})",
+                        found.display(),
+                        checked.join(", ")
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        text,
+                        "  pin: none found (looked for {})",
+                        checked.join(", ")
+                    );
+                }
+            }
         }
     }
     for (unit, error) in unreadable {

@@ -246,15 +246,43 @@ pub fn read_service_any(
             *word = super::unit::unescape_transient(word)?;
         }
     }
-    let Some((site, binary_word, args, log)) = locate(&exec)? else {
-        return Ok(None);
-    };
     let mut environment = parsed.environment()?;
     if state.transient {
         for (_, value) in &mut environment {
             *value = super::unit::unescape_transient(value)?;
         }
     }
+    // #1493: a unit file (its drop-ins included, already merged by
+    // `UnitText::parse`) keeps systemd specifiers as written; expand them
+    // with the user manager's values so the registry, state dirs and
+    // binary path are the paths the manager actually runs. A unit that
+    // names its own HOME names its own %h. Transient units carry literal
+    // words the manager already resolved, so they are not expanded.
+    let specifiers = if state.transient {
+        None
+    } else {
+        let manager = host.specifier_context();
+        let own_home = environment
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| manager.expand(value))
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute());
+        let context = match own_home {
+            Some(home) if home != manager.home => manager.with_home(home),
+            _ => manager,
+        };
+        for word in &mut exec.argv {
+            *word = context.expand(word);
+        }
+        for (_, value) in &mut environment {
+            *value = context.expand(value);
+        }
+        Some(context)
+    };
+    let Some((site, binary_word, args, log)) = locate(&exec)? else {
+        return Ok(None);
+    };
     let home = environment
         .iter()
         .find(|(name, _)| name == "HOME")
@@ -264,6 +292,10 @@ pub fn read_service_any(
     let working_directory = match parsed.last("Service", "WorkingDirectory") {
         Some(directory) => {
             let directory = directory.trim_start_matches('-');
+            let directory = match &specifiers {
+                Some(context) => context.expand(directory),
+                None => directory.to_owned(),
+            };
             if directory == "~" {
                 home.clone()
             } else {
