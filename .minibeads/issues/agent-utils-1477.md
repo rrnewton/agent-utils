@@ -57,3 +57,21 @@ https://github.com/rrnewton/dev-agent-utils/blob/main/ai_docs/reports/research/2
 Fixed by making the drill read both queue lanes, resolving the brief
 across lanes, and pinning `HOME` to the scratch root; downgraded
 P1 to P2 as a drill-maintenance bug.
+
+Gate (contained, base `b73d21634f`, 4495.3s): 54 passed, 1 failed step.
+The restore drill passed inside `python.agentctl.shard-1`, and both
+cross differentials passed with zero divergence
+(`cross.agentctl.herdr-agent-differential`: 104 paired checks agree;
+`cross.agentctl.differential-2`: 357 paired checks agree). The only
+red was shard-1's two chat-launch kill-timing tests, waived by the lead
+as known untouched load-sensitive defects (this change touches only
+the drill; it does not touch chat launch):
+
+```text
+[python.agentctl.shard-1] FAILED tests/test_agentctl_chat_launch_rust.py::test_launch_sigterm_exits_within_a_few_seconds
+[python.agentctl.shard-1] FAILED tests/test_agentctl_chat_launch_rust.py::test_killing_outer_pytest_leaves_no_chat_run
+dagrun: FAIL - 54 passed, 1 failed, 0 aborted, 0 intentionally skipped, 0 runtime-skipped, 0 dependency-skipped, 0 not launched in 4495.3s
+```
+
+Standalone contained runs of the drill file: 4 passed in 1647.46s
+(before the rebase) and 4 passed in 1718.41s (after it).
