@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-salvage-kept-commit-missing-objects: a dangling kept commit whose objects are missing locally parks a slot forever'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -27,3 +27,7 @@ Treat a kept commit whose own tree/objects are missing locally (and not promisor
 # Notes
 
 Reported 2026-11-12 from a consumer's batch removal. Extends #1278 wrkslots-salvage-bundle-object-store and #1280 wrkslots-kept-set-over-collection.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 1748e7e5 on github/main: dangling kept commits whose objects no searched store holds are excluded and recorded (objects missing locally; content unrecoverable; not on any remote); ref- or reflog-reachable kept commits still refuse. Rust salvage_gate writes no bundles and keeps the same empty receipt field.
