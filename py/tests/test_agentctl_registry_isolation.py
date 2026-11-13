@@ -82,7 +82,7 @@ def test_cross_adapter_env_never_inherits_a_caller_registry() -> None:
     finally:
         sys.path.remove(str(REPO_ROOT / "cross"))
     assert "AGENTCTL_REGISTRY" not in environment
-    assert environment["AGENTCTL_LAYOUT_AUTO_MIGRATE"] == "0"
+    assert "AGENTCTL_LAYOUT_AUTO_MIGRATE" not in environment
 
 
 def test_gate_child_env_isolates_rust_and_python_registries(
