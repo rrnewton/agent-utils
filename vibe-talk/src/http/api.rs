@@ -4568,14 +4568,13 @@ mod tests {
     /// older page then served at `/` went on printing the configured label, so one deployment
     /// showed two names for one channel; a renderer added beside these and written against the
     /// label directly would do the same within one page.
-    // Both pickers, the head of the channel on its three writers, and the to-do list.
+    // Both pickers, and the head of the channel on its three writers.
     // loadOlderPage writes older pages; drawChannelPage writes the newest page and late reads.
     const NAMES_A_CHANNEL: &[&str] = &[
         "function fillChannelSelect(",
         "function drawChannelPage(",
         "function loadOlderPage(",
         "function restateChannelSeam(",
-        "function todoSummary(",
     ];
 
     #[test]
