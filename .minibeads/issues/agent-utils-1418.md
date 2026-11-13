@@ -30,3 +30,17 @@ updated_at: 2026-11-12T11:38:25+00:00
 # Notes
 
 Numbered from devbig030's interim block (1400-1469). Part of the team-restore workstream; see the team-restore protocol plan (harness repo, `ai_docs/plans/2026-11-12-team-restore-protocol.md`, approved by the lead 2026-11-12).
+
+## Progress (2026-11-12, partially delivered; issue stays open)
+
+Landed on main in 3e646336 (`agent-teams: add topology fragments, checker and watcher decisions`), design in `ai_docs/plans/2026-11-12-team-topology-config.md` (9d7baf61):
+
+- Per-team fragments `~/.config/agent-utils/topology.d/<team>.json` (schema `agent-utils-topology/v1`): identity, `registry`, `lead`/`subordinates` (no `peers` key), `coordinator_kind`; `team_key` computed on the target host as a state-directory name only.
+- Checker: read-time merge of fragments with conflicts reported, never silently merged (duplicate instance, lead/subordinate mismatch, undeclared reference, undeclared `routes_override` route); watcher-own defaults precedence (own fragment, base, built-ins).
+- Watcher decisions: 6 h check-in, probe after 6 h silence or 60 min unanswered, held-vs-unhealthy kick gating, exactly-once kick ledger keyed by `TEAM@HOST`, `PeerIo`/`tick()` seams. 9 fixture tests pass in the gate (`validate: OK`).
+
+Remains:
+
+- The real `PeerIo` adapter (agent-teams check-in send, remote read of the frozen `agentctl-team-driver/v1` state, `agentctl team kick`, lead/owner notify and #1417 escalation), waiting on #1414's driver landing.
+- A CLI surface for the checker if operators need one; today it is the `agent_teams::topology` library API only.
+- Live enablement: each team lands its own fragment from its own harness repo once the adapter lands.
