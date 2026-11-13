@@ -1354,6 +1354,26 @@ fn read_boot_report(
         .find_map(|path| read_report(&path).map(|report| (path, report)))
 }
 
+/// The completed report for `epoch`, scanning every candidate location in
+/// read order: the first report that is complete and belongs to this epoch
+/// wins. Restore's replay and the watch restore check share this pick, so
+/// an incomplete or earlier-epoch report at the current location can never
+/// shadow a completed one at a legacy location (a partial report from a
+/// failed attempt under a new build, the completed one still under
+/// `agents/restore-reports/` from the build that actually restored).
+pub fn completed_boot_report(
+    registry: &Path,
+    config: &RestoreConfig,
+    epoch: &RestoreEpoch,
+) -> Option<(PathBuf, Value)> {
+    candidate_report_paths(registry, config, &epoch.boot_id)
+        .into_iter()
+        .find_map(|path| {
+            let report = read_report(&path)?;
+            (report["complete"] == true && epoch.matches_report(&report)).then_some((path, report))
+        })
+}
+
 /// Move every report at an earlier registry location into the current
 /// report directory (#1359): `agentctl restore --migrate-reports`, dry-run
 /// by default. A report already at the destination is never overwritten;
@@ -2853,8 +2873,13 @@ pub fn restore<A: ManagedApi + ?Sized>(
         .as_ref()
         .is_some_and(|recorded| *recorded != epoch);
     if !options.force && !options.dry_run {
-        if let Some((previous_path, previous)) = &previous {
-            if previous["complete"] == true && epoch.matches_report(previous) {
+        // The replay candidate is the shared completed pick, not merely
+        // the first readable report: a partial report at the current
+        // location must not shadow this epoch's completed legacy one.
+        let completed = completed_boot_report(registry, config, &epoch);
+        if let Some((previous_path, previous)) = &completed {
+            {
+                let previous_epoch = RestoreEpoch::from_report(previous);
                 // #1132: replay the recorded outcomes (rows, refusals and
                 // completion fields) labelled as a replay, so a rerun can
                 // never read as a fresh success for a boot that refused
@@ -4092,10 +4117,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             boot_id: boot_id.clone(),
             user_manager: host.user_manager_id(),
         };
-        let complete =
-            read_boot_report(registry, config, &boot_id).is_some_and(|(_path, report)| {
-                report["complete"] == true && epoch.matches_report(&report)
-            });
+        let complete = completed_boot_report(registry, config, &epoch).is_some();
         let early = host
             .boot_time()
             .is_some_and(|boot| host.now() - (boot as f64) < RESTORE_GRACE_SECONDS as f64);
@@ -4755,6 +4777,69 @@ mod tests {
         let (path, report) = read_boot_report(&registry, &config, boot).unwrap();
         assert_eq!(path, primary);
         assert_eq!(report["where"], "primary");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn completed_boot_report_finds_legacy_only_and_is_never_shadowed() {
+        // The watch restore check and restore's replay share this pick: a
+        // completed report left at either legacy location counts, and an
+        // incomplete or earlier-epoch report at the current location
+        // never shadows it.
+        let directory =
+            std::env::temp_dir().join(format!("restore-completed-{}", std::process::id()));
+        let registry = directory.join("registry");
+        fs::create_dir_all(&registry).unwrap();
+        let config = RestoreConfig::load(&registry).unwrap();
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let epoch = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: Some("invocation:m1".to_owned()),
+        };
+        let complete = format!(
+            "{{\"boot_id\": \"{boot}\", \"epoch\": {}, \"complete\": true}}",
+            epoch.as_json()
+        );
+        let file = format!("{boot}.json");
+        // Only under agents/restore-reports/: found.
+        let agents = registry.join("agents/restore-reports");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join(&file), &complete).unwrap();
+        let (path, _) = completed_boot_report(&registry, &config, &epoch).unwrap();
+        assert_eq!(path, agents.join(&file));
+        // A partial report at the current location does not shadow it.
+        let primary = reports_directory(&registry);
+        fs::create_dir_all(&primary).unwrap();
+        fs::write(
+            primary.join(&file),
+            format!(
+                "{{\"boot_id\": \"{boot}\", \"epoch\": {}, \"complete\": false}}",
+                epoch.as_json()
+            ),
+        )
+        .unwrap();
+        let (path, _) = completed_boot_report(&registry, &config, &epoch).unwrap();
+        assert_eq!(path, agents.join(&file));
+        // Nor does a completed report from an earlier manager epoch: the
+        // current epoch's report under restore-reports/ is the pick.
+        let earlier = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: Some("invocation:m0".to_owned()),
+        };
+        fs::write(
+            primary.join(&file),
+            format!(
+                "{{\"boot_id\": \"{boot}\", \"epoch\": {}, \"complete\": true}}",
+                earlier.as_json()
+            ),
+        )
+        .unwrap();
+        fs::remove_file(agents.join(&file)).unwrap();
+        let middle = registry.join("restore-reports");
+        fs::create_dir_all(&middle).unwrap();
+        fs::write(middle.join(&file), &complete).unwrap();
+        let (path, _) = completed_boot_report(&registry, &config, &epoch).unwrap();
+        assert_eq!(path, middle.join(&file));
         fs::remove_dir_all(&directory).unwrap();
     }
 
