@@ -4384,7 +4384,8 @@ class ManagedAgents:
             "override" if record.model_override is not None
             else "profile" if record.model is not None else "none"
         )
-        result["model_override"] = record.model_override        try:
+        result["model_override"] = record.model_override
+        try:
             destination = self._pending_move_destination(record)
             if destination is not None:
                 result.update({
