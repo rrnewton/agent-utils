@@ -1723,4 +1723,5 @@ def test_status_reports_the_oldest_pending_age_for_any_item(tmp_path: Path) -> N
     artifact.write_text(json.dumps(document))
     result = status(client(FakeAgentHerdr()), target(), str(tmp_path))
     assert result["oldest_pending_queued_at_millis"] == 100_000
-    assert result["oldest_pending_age_seconds"] >= 800
+    age = result["oldest_pending_age_seconds"]
+    assert isinstance(age, int) and age >= 800

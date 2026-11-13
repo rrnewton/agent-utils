@@ -4600,7 +4600,7 @@ fn host_target_lock_roots() -> AgentResult<[PathBuf; 2]> {
 }
 
 /// Test-injectable target-lock roots (#1480): when `AGENTCTL_TARGET_LOCK_ROOT`
-/// names an absolute directory, locks live there and in its `legacy` child, so
+/// names an absolute directory, locks live there and in its second child directory, so
 /// tests and differentials never touch the real account or `/tmp` roots. Unset
 /// (or empty) keeps the production roots. A relative value is refused: senders
 /// started in different directories would lock different files.
