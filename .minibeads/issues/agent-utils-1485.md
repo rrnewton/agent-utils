@@ -1,10 +1,11 @@
 ---
 title: 'agentctl-wake-socket-test-cwd-length: wake-socket test makes its own short temp dir'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-13T11:24:44.717795802+00:00
-updated_at: 2026-11-13T11:24:44.717795802+00:00
+updated_at: 2026-11-13T13:37:08.579438648+00:00
+closed_at: 2026-11-13T13:37:08.579438528+00:00
 ---
 
 # Description
@@ -22,3 +23,7 @@ The named test passes when run from a checkout whose path exceeds 95 bytes (the 
 # Notes
 
 Seen in the 46e6a929 --all follow-up from a long nested-worktree checkout. Warm-up lane for the queue-delivery work (#1479, #1480).
+
+## Resolution
+
+Landed as afb52e98. The test enters a short temporary directory it creates for the relative-name checks and restores the working directory afterwards; verified passing from the long nested-worktree checkout and in the gated validation (only waivable cross-differential CPU-timeouts red).
