@@ -3324,9 +3324,7 @@ mod mapped_paths_tests {
 mod census_gone_tests {
     //! #1173 census-vanished-process: a snapshot read that finds the
     //! process exited is no evidence, and the snapshot completes.
-    use super::{
-        assert_slot_unused_snapshot, capture_process_snapshot, capture_process_snapshot_at,
-    };
+    use super::{assert_slot_unused_snapshot, capture_process_snapshot_at};
     use crate::proc_reads::test_support::{holding_fd, in_cwd, mapping_only, stop, Slot};
     use crate::proc_reads::{inject, reset};
 
@@ -3338,8 +3336,15 @@ mod census_gone_tests {
     /// its real entry: the census reads them and no unrelated host
     /// process mid-exit can enter the snapshot (#1249).
     fn fake_proc_root(children: &[&std::process::Child]) -> std::path::PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("wrkslots-census-gone-{}", std::process::id()));
+        // One root per test: tests in this binary run in parallel
+        // threads, and a shared pid-named root lets one test remove
+        // another's listing mid-census (#1482).
+        let root = std::env::temp_dir().join(format!(
+            "wrkslots-census-gone-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            children.first().map_or(0, |child| child.id())
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         for child in children.iter() {
