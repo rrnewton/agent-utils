@@ -2889,8 +2889,9 @@ test("`#459 pack-keeps-card-still`: a card packed at the foot of the Threads vie
     assert.deepStrictEqual(await run(SCRIPT, way), want, `packed by ${way}`);
   }
   // THE CONTROL. No room past the foot: the browser's clamp takes the card down the screen, as the owner saw.
-  const clamped = await run(brokenScript("  closeOverscroll();\n  sizeOverextend(area, top);\n  scrollKeeping.toPosition(area, top);\n",
-    "  closeOverscroll();\n  scrollKeeping.toPosition(area, top);\n"));
+  const clamped = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
+    find: "    closeOverscroll();\n    sizeOverextend(area, top);\n    deps.toPosition(area, top);\n",
+    replace: "    closeOverscroll();\n    deps.toPosition(area, top);\n" }]));
   assert.ok(clamped.moved > 0, `the control: without the room the packed card did not move (${clamped.moved})`);
   assert.equal(clamped.room, false);
 });
@@ -2997,8 +2998,9 @@ test("`#459 pack-keeps-card-still`: a card partly above the screen is held exact
     return cardRow(page, id).getBoundingClientRect().top - before;
   };
   assert.equal(await partly(SCRIPT), 0, "a card partly above the screen moved as it was packed");
-  const clamped = await partly(brokenScript("  const before = box ? (box.bottom <= stage ? stage : box.top) : null;",
-    "  const before = box ? Math.max(box.top, stage) : null;"));
+  const clamped = await partly(await brokenModule([{ file: "src/view/channel/footroom.ts",
+    find: "    const before = box ? (box.bottom <= stage ? stage : box.top) : null;",
+    replace: "    const before = box ? Math.max(box.top, stage) : null;" }]));
   assert.equal(clamped, 20, "the control: held at the screen's top, the card did not come down by what was above it");
 });
 

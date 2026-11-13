@@ -5,7 +5,8 @@
 // measure of the foot goes through; fitting each again as the rows change; keeping a follower and a reader in
 // the room where they are; and the wheel and scroll events that open and close them. What the column shows,
 // whether it is on screen, its last card and its page step are the page's; why the rooms open and close as
-// they do is told where the legacy script opens its two sections.
+// they do is told where the legacy script opens its two sections. What the column shows, whether it is up,
+// and its last card are read here from the page acts handed in.
 
 import type { ClockPort, TimerHandle } from "../../ports/index.ts";
 
@@ -35,14 +36,43 @@ export interface FootRoomsDependencies {
   overscrollBox(): HTMLElement;
   /** The room past its foot held for a card (`side-overextend`). */
   overextendBox(): HTMLElement;
-  /** What the right column shows, for a room opened over it: the room closes on anything else. */
-  context(): string;
-  /** Whether the reader's room may be open: the right column on screen at a desk, where it has a box. */
-  offered(): boolean;
+  /** The page's element by id, in the column being worked on and in the left one. */
+  el(id: string): HTMLElement;
+  leftEl(id: string): HTMLElement;
+  /** Whether two columns are shown, and whether the thread list is (`layoutShown`). */
+  layoutColumns(): boolean;
+  layoutThreadList(): boolean;
+  /** Which screen and view are up (`screens`). */
+  screens(): { screen(): string; view(): string };
+  /** What the right column shows (`columns.side.mode`). */
+  sideMode(): string;
+  /** The read mode over the right column's rows (`readModes.mode`). */
+  readMode(): string;
+  /**
+   * The right column's own context, read in it: its channel context key, whether only
+   * pinned rows show, and its search key.
+   */
+  sideContext(): readonly unknown[];
+  /** Run `act` in the right column. */
+  inSideColumn<T>(act: () => T): T;
+  /** The list a channel's rows are shown in (`shownChannelList`). */
+  shownChannelList(): HTMLElement;
   /** Whether the right column is on screen (`sideColumnUp`). */
   sideUp(): boolean;
-  /** The last card of the right column that is drawn, or null. */
-  lastCard(): Element | null;
+  /** Put a scroller at a measured position, through the scroll owner (`#1251`). */
+  toPosition(area: Scroller, top: number): void;
+  /** End a pack slide still running (`finishPackSlide`). */
+  finishPackSlide(): void;
+  /** The card drawn for thread `id`, or null (`cardRow`). */
+  cardRow(id: string): HTMLElement | null;
+  /** Whether `row` is shown (`rowShown`). */
+  rowShown(row: HTMLElement): boolean;
+  /** The item after `row`'s block (`itemAfterBlock`). */
+  itemAfterBlock(row: HTMLElement): HTMLElement | null;
+  /** What an item is across a redraw (`slideKey`). */
+  slideKey(item: HTMLElement): string;
+  /** Slide what is below `row` into place from where `was` stood (`slideIntoPlace`). */
+  slideIntoPlace(row: HTMLElement, was: { key: string; top: number }): void;
   /** The scroller's padding under its rows, in px. */
   paddingBottom(area: Scroller): number;
   /** What a page key moves `area` by (`pageStep`). */
@@ -96,6 +126,13 @@ export interface FootRooms {
   wheel(event: Wheel): void;
   /** The right column scrolled (`timeStamp` the event's, or -Infinity with none). */
   scrolled(timeStamp: number): void;
+  /**
+   * Run `change` to the cards with thread `id`'s card held exactly where it is on the screen, past the foot
+   * of the list where that is what it takes. A card wholly above the screen — ^ pressed deep in its
+   * unpacked block — is held at the top of it instead, so what is left is never a screen of blank room. Whether the
+   * card was held: not where it was not drawn before, or is not after.
+   */
+  keepingCardStill(id: string, change: () => void, slide?: boolean): boolean;
 }
 
 /** Both rooms closed. */
@@ -126,7 +163,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
 
   function overscrollRoom(area: Scroller): number {
     if (overscroll === null || area !== deps.side()) return 0;
-    if (overscroll.context !== deps.context() || !deps.offered()) {
+    if (overscroll.context !== overscrollContext() || !overscrollOffered()) {
       closeOverscroll();
       return 0;
     }
@@ -169,7 +206,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
    * and the scroller's padding under them. 0 where the card is already at the middle or above at the foot.
    */
   function overscrollFit(area: Scroller): number {
-    const last = deps.lastCard();
+    const last = lastColumnCard();
     if (!last) return 0;
     const pad = deps.paddingBottom(area);
     const above = deps.overscrollBox().getBoundingClientRect().top - last.getBoundingClientRect().top;
@@ -210,10 +247,10 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
     // `#459 pack-keeps-card-still`. Not over the room a card held where it stood left: the reader is past
     // the foot already, and that room only ever gives way.
     if (overextendRoom(area) > 0) return false;
-    if (!deps.offered() || footGap(area) > 1) return false;
+    if (!overscrollOffered() || footGap(area) > 1) return false;
     const px = overscrollFit(area);
     if (px < 1) return false;
-    overscroll = { px, context: deps.context(), idle: null, reader: null };
+    overscroll = { px, context: overscrollContext(), idle: null, reader: null };
     if (!sizeOverscroll(area, px)) return false;
     waitOverscrollIdle();
     return true;
@@ -231,7 +268,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
 
   function noteOverscrollReader(area: Scroller): void {
     if (overscroll === null || area !== deps.side()) return;
-    const row = area.scrollTop > footTop(area) + 0.5 ? deps.lastCard() : null;
+    const row = area.scrollTop > footTop(area) + 0.5 ? lastColumnCard() : null;
     if (overscroll === null) return;
     const box = row ? row.getBoundingClientRect() : null;
     overscroll.reader = row && box
@@ -244,7 +281,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
     const held = overscroll.reader;
     fitOverscroll(area);
     if (overscroll === null || held === null) return;
-    if (held.row === deps.lastCard()) {
+    if (held.row === lastColumnCard()) {
       const box = held.row.getBoundingClientRect();
       const moved = box.top - area.getBoundingClientRect().top - held.top;
       if (Math.abs(box.height - held.height) > 0.5 && Math.abs(moved) > 0.5) deps.nudge(area, moved);
@@ -276,7 +313,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
 
   function overextendRoom(area: Scroller): number {
     if (overextend === null || area !== deps.side()) return 0;
-    if (overextend.context !== deps.context() || !deps.sideUp()) {
+    if (overextend.context !== overscrollContext() || !deps.sideUp()) {
       closeOverextend();
       return 0;
     }
@@ -311,7 +348,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
       closeOverextend();
       return;
     }
-    if (overextend === null) overextend = { px, context: deps.context() };
+    if (overextend === null) overextend = { px, context: overscrollContext() };
     overextend.px = px;
     const room = deps.overextendBox();
     if (room.style.height !== `${px}px`) room.style.height = `${px}px`;
@@ -319,6 +356,72 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
 
   function fitOverextend(area: Scroller): void {
     if (overextendRoom(area) > 0) sizeOverextend(area, area.scrollTop, true);
+  }
+
+  /**
+   * What the right column shows, for the room opened over it: the room closes on anything else. The search
+   * and the filters over its rows too (`searchKey`): a search typed in the room hides cards under the reader,
+   * and lands them on the foot of what it leaves rather than in blank room fitted to another card.
+   */
+  function overscrollContext(): string {
+    return JSON.stringify([deps.layoutColumns(), deps.layoutThreadList(), deps.screens().screen(), deps.screens().view(), deps.sideMode(),
+      deps.readMode(), deps.sideContext()]);
+  }
+
+  /** Whether the room may be open: the right column on screen at a desk, where web/voice.css gives it a box. */
+  function overscrollOffered(): boolean {
+    const room = deps.overscrollBox();
+    return deps.screens().screen() === "main" && deps.screens().view() === "discord" && deps.sideUp() &&
+      typeof room.getClientRects === "function" && room.getClientRects().length > 0;
+  }
+
+  /**
+   * The last card of the right column that is drawn: its last thread card over the cards, else the last row
+   * of its thread, a reply still in the outbox under it included. Null where none is drawn.
+   */
+  function lastColumnCard(): Element | null {
+    const lists = deps.sideMode() === "thread"
+      ? deps.inSideColumn(() => [deps.el("outgoing-log"), deps.shownChannelList()])
+      : [deps.leftEl("side-cards")];
+    for (const list of lists) {
+      const rows = [...list.children];
+      for (let at = rows.length - 1; at >= 0; at -= 1) {
+        const row = rows[at]!;
+        // `#419 threads-view-main-messages`: over the cards, the last card is a card, not a row among them.
+        if (row.hasAttribute("data-unpack-thread") || row.hasAttribute("data-main-row")) continue;
+        if (row.getBoundingClientRect().height > 0) return row;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Run `change` to the cards with thread `id`'s card held exactly where it is on the screen, past the foot
+   * of the list where that is what it takes. A card wholly above the screen — ^ pressed deep in its
+   * unpacked block — is held at the top of it instead, so what is left is never a screen of blank room. Whether the
+   * card was held: not where it was not drawn before, or is not after.
+   */
+  function keepingCardStill(id: string, change: () => void, slide = false): boolean {
+    const area = deps.side();
+    // A slide still running is ended first: everything is measured where it is laid out.
+    deps.finishPackSlide();
+    const row = deps.cardRow(id);
+    const box = row && deps.rowShown(row) ? row.getBoundingClientRect() : null;
+    const stage = area.getBoundingClientRect().top;
+    const before = box ? (box.bottom <= stage ? stage : box.top) : null;
+    const next = slide && row ? deps.itemAfterBlock(row) : null;
+    const was = next ? { key: deps.slideKey(next), top: next.getBoundingClientRect().top } : null;
+    change();
+    const now = deps.cardRow(id);
+    if (before === null || !now || !deps.rowShown(now)) return false;
+    const top = area.scrollTop + now.getBoundingClientRect().top - before;
+    // The wheel's room past the foot is fitted to the last card and closed above the foot on its own
+    // schedule, either of which would move the card; this room stands in for it.
+    closeOverscroll();
+    sizeOverextend(area, top);
+    deps.toPosition(area, top);
+    if (was) deps.slideIntoPlace(now, was);
+    return true;
   }
 
   return {
@@ -337,6 +440,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
     closeOverextend,
     sizeOverextend,
     fitOverextend,
+    keepingCardStill,
     wheel(event) {
       const rested = event.timeStamp - overscrollWheelAt >= OVERSCROLL_REST_MS;
       overscrollWheelAt = event.timeStamp;

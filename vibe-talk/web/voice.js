@@ -2191,7 +2191,7 @@ function atBottom(area, slack = BOTTOM_SLACK_PX) {
  * The rooms past the foot of the right column — the reader's (`#338 column-overscroll`) and the one held
  * for a card (`#459 pack-keeps-card-still`) — with every measure of the foot, fitting, following, and the
  * wheel's and scroll's part in them: one owner in web/src/view/channel/footroom.ts (`#624
- * voice-page-modularity`). What the column shows, whether it is up, and its last card are here.
+ * voice-page-modularity`). What the column shows and its last card are the owner's, from the page acts handed in below.
  */
 // The keyboard's room in a list, for the foot's measures (`#1144 scrollback-typing-jump`): the
 // keyboard owner is made at the boot below, long after the rooms, so its answer is held here once
@@ -2202,10 +2202,24 @@ const footRooms = createFootRooms({
   side: () => leftEl("side-scroll"),
   overscrollBox: () => leftEl("side-overscroll"),
   overextendBox: () => leftEl("side-overextend"),
-  context: () => overscrollContext(),
-  offered: () => overscrollOffered(),
+  el: (id) => el(id),
+  leftEl: (id) => leftEl(id),
+  layoutColumns: () => layoutShown.columns(),
+  layoutThreadList: () => layoutShown.threadList(),
+  screens: () => screens,
+  sideMode: () => columns.side.mode,
+  readMode: () => readModes.mode(),
+  sideContext: () => inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()]),
+  inSideColumn: (act) => inColumn(columns.side, act),
+  shownChannelList: () => shownChannelList(),
   sideUp: () => sideColumnUp(),
-  lastCard: () => lastColumnCard(),
+  toPosition: (area, top) => scrollKeeping.toPosition(area, top),
+  finishPackSlide: () => finishPackSlide(),
+  cardRow: (id) => cardRow(id),
+  rowShown: (row) => rowShown(row),
+  itemAfterBlock: (row) => itemAfterBlock(row),
+  slideKey: (item) => slideKey(item),
+  slideIntoPlace: (row, was) => slideIntoPlace(row, was),
   paddingBottom: (area) => (typeof window.getComputedStyle === "function"
     ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0),
   pageStep: (area) => pageStep(area),
@@ -2216,44 +2230,11 @@ const footRooms = createFootRooms({
 });
 const {
   overscrollRoom, overextendRoom, footGap, footTop, closeOverscroll, waitOverscrollIdle, openOverscroll, fitOverscroll,
-  noteOverscrollReader, holdOverscrollReader, followFoot, toFoot, closeOverextend, sizeOverextend, fitOverextend,
+  noteOverscrollReader, holdOverscrollReader, followFoot, toFoot, closeOverextend, sizeOverextend, fitOverextend, keepingCardStill,
 } = footRooms;
 
-/**
- * What the right column shows, for the room opened over it: the room closes on anything else. The search
- * and the filters over its rows too (`searchKey`): a search typed in the room hides cards under the reader,
- * and lands them on the foot of what it leaves rather than in blank room fitted to another card.
- */
-function overscrollContext() {
-  return JSON.stringify([layoutShown.columns(), layoutShown.threadList(), screens.screen(), screens.view(), columns.side.mode,
-    readModes.mode(), inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()])]);
-}
 
-/** Whether the room may be open: the right column on screen at a desk, where web/voice.css gives it a box. */
-function overscrollOffered() {
-  const room = leftEl("side-overscroll");
-  return screens.screen() === "main" && screens.view() === "discord" && sideColumnUp() &&
-    typeof room.getClientRects === "function" && room.getClientRects().length > 0;
-}
 
-/**
- * The last card of the right column that is drawn: its last thread card over the cards, else the last row
- * of its thread, a reply still in the outbox under it included. Null where none is drawn.
- */
-function lastColumnCard() {
-  const lists = columns.side.mode === "thread"
-    ? inColumn(columns.side, () => [el("outgoing-log"), shownChannelList()])
-    : [leftEl("side-cards")];
-  for (const list of lists) {
-    const rows = [...list.children];
-    for (let at = rows.length - 1; at >= 0; at -= 1) {
-      // `#419 threads-view-main-messages`: over the cards, the last card is a card, not a row among them.
-      if (rows[at].hasAttribute("data-unpack-thread") || rows[at].hasAttribute("data-main-row")) continue;
-      if (rows[at].getBoundingClientRect().height > 0) return rows[at];
-    }
-  }
-  return null;
-}
 
 // --- room past the foot held for a card packed where it stands -------------------------------------
 //
@@ -2280,37 +2261,6 @@ function lastColumnCard() {
 // The room held for a card, its measure, closing and fitting (`overextendRoom`, `closeOverextend`,
 // `sizeOverextend`, `fitOverextend`) are the foot rooms' owner's, above (`#624 voice-page-modularity`).
 
-/**
- * Run `change` to the cards with thread `id`'s card held exactly where it is on the screen, past the foot
- * of the list where that is what it takes. A card wholly above the screen — ^ pressed deep in its
- * unpacked block — is held at the top of it instead, so what is left is never a screen of blank room. Whether the
- * card was held: not where it was not drawn before, or is not after.
- *
- * @param {string} id
- * @param {() => void} change
- */
-function keepingCardStill(id, change, slide = false) {
-  const area = leftEl("side-scroll");
-  // A slide still running is ended first: everything is measured where it is laid out.
-  finishPackSlide();
-  const row = cardRow(id);
-  const box = row && rowShown(row) ? row.getBoundingClientRect() : null;
-  const stage = area.getBoundingClientRect().top;
-  const before = box ? (box.bottom <= stage ? stage : box.top) : null;
-  const next = slide && row ? itemAfterBlock(row) : null;
-  const was = next ? { key: slideKey(next), top: next.getBoundingClientRect().top } : null;
-  change();
-  const now = cardRow(id);
-  if (before === null || !now || !rowShown(now)) return false;
-  const top = area.scrollTop + now.getBoundingClientRect().top - before;
-  // The wheel's room past the foot is fitted to the last card and closed above the foot on its own
-  // schedule, either of which would move the card; this room stands in for it.
-  closeOverscroll();
-  sizeOverextend(area, top);
-  scrollKeeping.toPosition(area, top);
-  if (was) slideIntoPlace(now, was);
-  return true;
-}
 
 // --- the gap a packed thread leaves, held and then closed (#460 pack-gap-slide) -------------------------
 //

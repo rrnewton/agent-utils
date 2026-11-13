@@ -395,7 +395,7 @@ test("`#624 voice-page-modularity`: pins are read only for a revision not held, 
 
 test("`#624 voice-page-modularity`: the rooms past the right column's foot open from a rested foot, are the foot while open, and close behind the reader", () => {
   const { createFootRooms, OVERSCROLL_REST_MS, OVERSCROLL_IDLE_MS } = CHANNEL_VIEW;
-  const box = (top) => ({ style: { height: "" }, getBoundingClientRect: () => ({ top: top(), height: 0 }) });
+  const box = (top) => ({ style: { height: "" }, getBoundingClientRect: () => ({ top: top(), height: 0 }), getClientRects: () => [{}] });
   const rows = 1000;
   const area = {
     clientHeight: 400, clientTop: 0, scrollTop: 600,
@@ -404,13 +404,26 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
   };
   const overscrollBox = box(() => rows - area.scrollTop);
   const overextendBox = box(() => rows + (Number.parseFloat(overscrollBox.style.height) || 0) - area.scrollTop);
-  const card = { getBoundingClientRect: () => ({ top: rows - 100 - area.scrollTop, height: 100 }) };
+  const card = { hasAttribute: () => false, getBoundingClientRect: () => ({ top: rows - 100 - area.scrollTop, height: 100 }) };
   const timers = [];
   let context = "c1";
+  let heldTop = 100;
+  const heldRow = { getBoundingClientRect: () => ({ top: heldTop, bottom: heldTop + 50, height: 50 }) };
+  const roomDeps = {
+    el: () => ({ children: [] }), leftEl: () => ({ children: [card] }),
+    layoutColumns: () => true, layoutThreadList: () => false,
+    screens: () => ({ screen: () => "main", view: () => "discord" }),
+    sideMode: () => "cards", readMode: () => "show",
+    sideContext: () => [context, false, ""], inSideColumn: (act) => act(),
+    shownChannelList: () => ({ children: [] }),
+    toPosition: (area, top) => { area.scrollTop = top; },
+    finishPackSlide: () => {}, cardRow: () => heldRow, rowShown: () => true,
+    itemAfterBlock: () => null, slideKey: () => "k", slideIntoPlace: () => {},
+  };
   const rooms = createFootRooms({
     clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
     side: () => area, overscrollBox: () => overscrollBox, overextendBox: () => overextendBox,
-    context: () => context, offered: () => true, sideUp: () => true, lastCard: () => card,
+    sideUp: () => true, ...roomDeps,
     paddingBottom: () => 0, pageStep: () => 360,
     toFoot: (area) => { area.scrollTop = area.scrollHeight; }, nudge: (area, delta) => { area.scrollTop += delta; }, wheelBy: (area, px) => { area.scrollTop += px; },
   });
@@ -438,13 +451,18 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
   rooms.toFoot(area);
   assert.equal(rooms.overextendRoom(area), 0);
   assert.equal(area.scrollTop, rows, "to the foot");
+  // A card packed where it stands is held on its screen line, past the foot where
+  // that takes room held for it (`keepingCardStill`, #459).
+  assert.equal(rooms.keepingCardStill("T1", () => { heldTop = 80; }), true, "the card was not held");
+  assert.equal(area.scrollTop, 980, "the reader was not put back with the card on its line");
+  assert.equal(rooms.overextendRoom(area), 380, "the room held for the card is not the room it takes");
   // `#1144 scrollback-typing-jump`: the keyboard's room under a composer at the foot is no part of
   // the rows' foot: resting on the keys is at it, and up from it is measured without the room.
   const mainArea = { clientHeight: 400, clientTop: 0, scrollTop: 880, scrollHeight: 1400, getBoundingClientRect: () => ({ top: 0 }) };
   const mainRooms = createFootRooms({
     clock: { setTimeout: () => 0, clearTimeout: () => {} },
     side: () => area, overscrollBox: () => overscrollBox, overextendBox: () => overextendBox,
-    context: () => context, offered: () => true, sideUp: () => true, lastCard: () => card,
+    sideUp: () => true, ...roomDeps,
     paddingBottom: () => 0, pageStep: () => 360,
     toFoot: (area) => { area.scrollTop = area.scrollHeight; }, nudge: (area, delta) => { area.scrollTop += delta; }, wheelBy: (area, px) => { area.scrollTop += px; },
     keyboardRoom: (one) => (one === mainArea ? 120 : 0),
