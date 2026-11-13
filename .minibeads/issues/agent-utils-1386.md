@@ -1,6 +1,6 @@
 ---
 title: 'discuss-mod8-toggle: Mod+8 toggles Discuss over the current view'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -29,3 +29,7 @@ Owner replies 005/006 (via coordb): Mod+8 (Cmd-8) toggles the Discuss panel open
 # Notes
 
 Owner replies 005/006. Seams agreed with mu-catchup (#1345 restore inside openWith; toggle uses only view open/close/isOpen) and requested from mu-discussbind (#1395 scope binding owned there). Next Discuss batch with #1345, #1387, #1395.
+
+## Resolution
+
+[watermelon-full-preview] Delivered in the evening Discuss batch e7207edb46abd33c2c1a268c7609013f4c4f4c0a (replayed as 687dcd56 with the #1395 binding follow-up 956aa507; integrator-gated, deployed by coordb). Mod+8 toggles Discuss over the current view from anywhere including a message box, restoring the kept layout and transcript with no model call; the shortcuts help lists it from the same keymap. Focused JS tests, typecheck and the Discuss browser walk (including Control+8 close/reopen) passed before the batch gate.
