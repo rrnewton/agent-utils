@@ -465,23 +465,14 @@ def card_fit_walk(walk: Walk) -> None:
     walk.check(member["hidden"], f"the run's second read card still shows under Fold read: {member}")
     walk.shot("5-fold-read")
     cycle_read_mode(page)
-    walk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'hide' "
-                  f"&& !document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')?.getClientRects().length",
-                  "Hide read did not leave the read cards out")
-    walk.settled()
-    walk.check(mode() == "hide", f"the read mode is {mode()}, not hide")
-    walk.check(walk.card(READ_ONE)["hidden"] and walk.card(READ_TWO)["hidden"],
-               "a read card still shows under Hide read")
-    walk.check(not walk.card(LONG_THREAD)["hidden"], "an unread card went with the read ones")
-    cycle_read_mode(page)
     walk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'show' "
                   f"&& Boolean(document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')?.getClientRects().length)",
                   "Show read did not bring the read cards back")
     walk.settled()
     walk.check(mode() == "show" and not walk.card(READ_ONE)["hidden"],
                "Show read did not bring the read cards back")
-    walk.notes.append("Fold read folds the read run behind one full-strength line; Hide read "
-                      "leaves read cards out; Show read returns them dimmed")
+    walk.notes.append("Fold read folds the read run behind one full-strength line; "
+                      "Show read returns the read cards dimmed")
 
     # The heading over the short thread, across the window: one fitted line.
     page.locator(f"#side-cards > li[data-id='{READ_ONE}'] .side-card-open").click()

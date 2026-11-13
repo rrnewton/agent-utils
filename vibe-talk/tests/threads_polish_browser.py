@@ -552,22 +552,22 @@ def sent_walk(desk: Desk) -> None:
     page = desk.page
     to_threads(desk)
     for _ in range(3):
-        if page.get_attribute("#todo-filter", "data-read-mode") == "hide":
+        if page.get_attribute("#todo-filter", "data-read-mode") == "fold":
             break
         cycle_read_mode(page)
         desk.settled()
-    desk.check(page.get_attribute("#todo-filter", "data-read-mode") == "hide", "the read mode button never reached Hide read")
+    desk.check(page.get_attribute("#todo-filter", "data-read-mode") == "fold", "the read mode button never reached Fold read")
     set_chip(desk, "side-main", True)
     words = f"sent from the foot at {desk.width}px"
     page.fill("#channel-compose-text", words)
     page.click("#channel-send")
     desk.wait_for(f"() => [...document.querySelectorAll('#side-cards > li[data-main-row]')].some((li) => li.innerText.includes({words!r}))",
-                  "under Hide read the message just sent is not among the main rows")
+                  "under Fold read the message just sent is not among the main rows")
     found = state(desk)
     desk.check(found["layout"] == "list", f"sending left the Threads view: {found}")
     desk.shot("6-own-sent-hide-read")
     set_chip(desk, "side-main", False)
-    desk.notes.append("under Hide read the message sent from the foot box among the main rows at once")
+    desk.notes.append("under Fold read the message sent from the foot box among the main rows at once")
 
 
 
@@ -652,19 +652,14 @@ def read_mode_walk(desk: Desk, api: PolishApi) -> None:
     desk.check(found["lines"] == [] and found["cards"] == [REPLICA, CANARY, RUNNER], f"a tap on the line did not open it: {found}")
     page.focus("#side-scroll")
     page.keyboard.press("h")
-    desk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'hide' "
-                  f"&& {READ_CARDS_JOIN_JS} === '{RUNNER}'", "Hide read left a read thread's card")
-    found = read_mode(desk)
-    desk.check(found["mode"] == "hide" and found["cards"] == [RUNNER], f"Hide read left a read thread's card: {found}")
-    desk.shot("7-hide-read-threads")
-    page.keyboard.press("h")
     desk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'show' "
                   f"&& {READ_CARDS_JOIN_JS} === '{REPLICA},{CANARY},{RUNNER}'", "Show read did not bring every card back")
     found = read_mode(desk)
     desk.check(found["mode"] == "show" and found["cards"] == [REPLICA, CANARY, RUNNER], f"Show read did not bring every card back: {found}")
+    desk.shot("7-show-read-threads")
     state(desk)
     desk.notes.append("h in All: Fold read said and drawn; Threads view: '… 2 read threads' over the read cards, opened by a tap; "
-                      "Hide read leaves the runner alone; Show read all three")
+                      "Fold read leaves the runner behind its line; Show read all three")
 
 
 

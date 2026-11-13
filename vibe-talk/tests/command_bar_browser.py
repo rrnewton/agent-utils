@@ -299,6 +299,11 @@ def beside(now: Json, where: str) -> None:
 
 def hide_reader(page: Page, where: str, touch: bool, shots: Path | None, width: int, height: int) -> None:
     """`#880 voice-page-menu-placement`: Hide reader, its keys, a reload, and Show reader."""
+    # `#1399`: a desk draws no Hide reader button at all (nothing to hide there).
+    if width >= 1000:
+        check(page.locator("#reader-toggle").first.bounding_box() is None,
+              f"{where}: a desk drew the Hide reader button")
+        return
     before = menu_state(page)
     check(before["pane"] is True and before["reader"] == "Hide reader", f"{where}: the premise, the row shown: {before}")
     press(page, "#action-menu-open", touch)
@@ -307,7 +312,7 @@ def hide_reader(page: Page, where: str, touch: bool, shots: Path | None, width: 
     page.wait_for_timeout(300)
     now = menu_state(page)
     shot(page, shots, f"{width}x{height}-reader-hidden")
-    check(now["pane"] is False and now["reader"] == "Show reader" and now["open"] is False,
+    check(now["pane"] is False and now["reader"] == "Hide reader" and now["open"] is False,
           f"{where}: Hide reader left {now}")
     # No band where the row was: the dock holds only the bar, and the list took the room.
     check(number(now["dock"], "height") - float(now["barHeight"]) <= 14,  # type: ignore[arg-type]
@@ -341,9 +346,8 @@ def hide_reader(page: Page, where: str, touch: bool, shots: Path | None, width: 
     page.wait_for_timeout(200)
     stepped = menu_state(page)["mode"]
     check(stepped != before["mode"], f"{where}: h did nothing with the reader hidden ({stepped})")
-    for _ in range(2):
-        page.keyboard.press("h")
-        page.wait_for_timeout(150)
+    page.keyboard.press("h")
+    page.wait_for_timeout(150)
     check(menu_state(page)["mode"] == before["mode"], f"{where}: h did not come back round")
     # Kept: a reload opens with it hidden.
     page.reload()
@@ -352,13 +356,13 @@ def hide_reader(page: Page, where: str, touch: bool, shots: Path | None, width: 
     page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
     page.wait_for_timeout(300)
     now = menu_state(page)
-    check(now["pane"] is False and now["reader"] == "Show reader", f"{where}: a reload forgot Hide reader: {now}")
+    check(now["pane"] is False and now["reader"] == "Hide reader", f"{where}: a reload forgot Hide reader: {now}")
     press(page, "#action-menu-open", touch)
     page.wait_for_timeout(200)
     press(page, "#reader-toggle", touch)
     page.wait_for_timeout(300)
     now = menu_state(page)
-    check(now["pane"] is True and now["reader"] == "Hide reader", f"{where}: Show reader left {now}")
+    check(now["pane"] is True and now["reader"] == "Hide reader", f"{where}: Hide reader off left {now}")
 
 
 def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool, shots: Path | None,
@@ -389,9 +393,8 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
     check(now["open"] is False and now["mode"] != mode_before,
           f"{where}: Show/Fold read in the menu did not cycle and close it: {now}")
     page.focus("#scroll-area")
-    for _ in range(2):
-        page.keyboard.press("h")
-        page.wait_for_timeout(150)
+    page.keyboard.press("h")
+    page.wait_for_timeout(150)
     check(menu_state(page)["mode"] == mode_before, f"{where}: h did not restore the read mode: {menu_state(page)}")
     press(page, "#action-menu-open", touch)
     page.wait_for_timeout(200)
