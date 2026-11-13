@@ -263,7 +263,7 @@ enum Commands {
     Tail(Tail),
     /// Follow a local headless agent and type to it: the tail --follow rendering above an owner input line, each line queued by the wrapper as a plain user turn with its origin logged
     #[command(
-        after_help = "Examples:\n  agentctl console coordinator\n  agentctl console coordinator --last 50 --types assistant.text,turn.\n\nLocal headless agents only, and only for the owner at a terminal: standard input and output must be terminals in the foreground, AGENTCTL_AGENT must be unset, and no coding-agent harness may be an ancestor; the wrapper re-checks the peer of every line. Enter sends the line as a plain user turn (no sender framing); a bracketed paste is one message; approve aN and deny aN [reason] answer a headless approval and are never sent as messages; /help lists the console commands locally and any other /command is refused locally (neither is ever queued); /interrupt (or Ctrl-C twice on an empty line) interrupts the running turn; Ctrl-D or /quit leaves, printing a disconnected notice. Leaving never touches the agent. `tail` stays the read-only follower."
+        after_help = "Examples:\n  agentctl console coordinator\n  agentctl console coordinator --last 50 --types assistant.text,turn.\n\nLocal headless agents only, and only for the owner at a terminal: standard input and output must be terminals in the foreground, AGENTCTL_AGENT must be unset, and no coding-agent harness may be an ancestor; the wrapper re-checks the peer of every line. Enter sends the line as a plain user turn (no sender framing); a bracketed paste is one message; approve aN and deny aN [reason] answer a headless approval and are never sent as messages; /help lists the console commands locally and any other /command is refused locally (neither is ever queued); /effort LEVEL and /model NAME record the override and relaunch the wrapper at the next turn boundary (bare /effort or /model shows a numbered local menu first); /interrupt (or Ctrl-C twice on an empty line) interrupts the running turn; Ctrl-D or /quit leaves, printing a disconnected notice. Leaving never touches the agent. `tail` stays the read-only follower."
     )]
     Console(Console),
     /// List the harness sessions an agent name has run, oldest first: how each began (start, adopt, resume, fresh, rebound, takeover, handback), how it ended, and its transcript; read-only
@@ -286,6 +286,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl set-effort coordinator high\n  agentctl set-effort coordinator medium --urgent\n\nThe level is validated against the agent's harness (Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh, max, ultra) and recorded in the agent record at once, overriding its profile. Headless agents apply it when their wrapper next launches (restart the unit or the wrapper to apply now); TUI agents apply it at a safe point through the harness control where one exists, otherwise on restart --resume. Without --urgent a mid-turn agent is left alone and the change is reported as recorded, not yet effective. Prints {name, effort, previous_effort, applies}."
     )]
     SetEffort(SetEffort),
+    /// Record a per-agent model override for a live agent (#1396 agentctl-console-effort-model): wins over its launch profile on every relaunch; the running turn is unchanged
+    #[command(
+        after_help = "Examples:\n  agentctl set-model coordinator claude-sonnet-4-5\n\nThe model is validated against the agent's harness (a harness with no structured launch takes no model; otherwise the harness itself accepts the name, so agentctl keeps no model allowlist) and recorded in the agent record at once, overriding its profile. Headless agents apply it when their wrapper next launches; the console's /model applies it at the next turn boundary. Prints {name, model, previous_model, applies}."
+    )]
+    SetModel(SetModel),
     /// Interrupt a headless agent's running turn; queued inputs stay queued and run next
     #[command(after_help = "Example: agentctl interrupt coordinator")]
     Interrupt(Named),
@@ -979,6 +984,15 @@ struct SetEffort {
     /// Allow the change to take effect even while the agent is mid-turn (the running turn itself is never killed; the new level applies from the next turn or launch)
     #[arg(long)]
     urgent: bool,
+}
+
+#[derive(Args)]
+struct SetModel {
+    #[command(flatten)]
+    agent: Named,
+    /// New model name, validated against the agent's harness (the harness itself accepts the name; agentctl keeps no model allowlist)
+    #[arg(value_name = "MODEL")]
+    model: String,
 }
 
 #[derive(Args)]
@@ -3692,6 +3706,7 @@ fn writes_registry(command: &Commands) -> bool {
         | Commands::Failed(_)
         | Commands::RunHeadless(_)
         | Commands::SetEffort(_)
+        | Commands::SetModel(_)
         | Commands::Interrupt(_)
         | Commands::Compact(_)
         | Commands::Cancel(_)
@@ -5226,6 +5241,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::SetEffort(value) => {
             manager.set_effort(&value.agent.name, &value.level, value.urgent)?
         }
+        Commands::SetModel(value) => manager.set_model(&value.agent.name, &value.model)?,
         Commands::Interrupt(value) => manager.headless_control(&value.name, "interrupt")?,
         Commands::Approvals(value) => manager.headless_approvals(&value.name)?,
         Commands::Approve(value) => answer_prompt(

@@ -27,7 +27,7 @@ const SESSION_V2: &str = "agentctl-session/v2";
 const SESSION_V3: &str = "agentctl-session/v3";
 const LAUNCH_SCHEMAS: [&str; 2] = ["agentctl-launch/v1", "agentctl-launch/v2"];
 /// Keys every nested row carries.
-const COMMON_FIELDS: [&str; 18] = [
+const COMMON_FIELDS: [&str; 19] = [
     "schema",
     "name",
     "token",
@@ -40,6 +40,7 @@ const COMMON_FIELDS: [&str; 18] = [
     "startup_warning",
     "effective_reasoning_effort",
     "resolved_model",
+    "model_override",
     "error",
     "paused",
     "pane_reported_by_agentctl",
@@ -256,11 +257,12 @@ fn normalize(
                 || V2_FIELDS.contains(&key)
                 || V3_FIELDS.contains(&key))
     };
-    // `resolved_model` (#1340) is the one common key a row written before it
-    // may lack; every other common key is required as before.
+    // `resolved_model` (#1340) and `model_override` (#1396) are the common
+    // keys a row written before them may lack; every other common key is
+    // required as before.
     if !expected
         .iter()
-        .filter(|key| **key != "resolved_model")
+        .filter(|key| !matches!(**key, "resolved_model" | "model_override"))
         .all(|key| document.contains_key(*key))
         || document.keys().any(|key| second_authority(key))
     {
@@ -578,6 +580,9 @@ impl NestedRecord {
         // row written before #1340 round-trips byte-identically.
         if let Some(resolved) = &record.resolved_model {
             fields.insert("resolved_model".to_owned(), json!(resolved));
+        }
+        if let Some(overridden) = &record.model_override {
+            fields.insert("model_override".to_owned(), json!(overridden));
         }
         if self.schema == SESSION_V2 {
             for (key, value) in [

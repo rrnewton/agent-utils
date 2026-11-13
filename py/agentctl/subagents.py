@@ -259,7 +259,7 @@ def _capture_resolved_model(record: AgentRecord) -> None:
 _NESTED_COMMON_FIELDS = frozenset({
     "schema", "name", "token", "created_at", "lifecycle", "launch",
     "workspace_id", "tab_id", "pane_id", "startup_warning",
-    "effective_reasoning_effort", "resolved_model", "error", "paused",
+    "effective_reasoning_effort", "resolved_model", "model_override", "error", "paused",
     "pane_reported_by_agentctl", "foreign_shell_identity",
     "runner_identity", "extensions",
 })
@@ -584,6 +584,7 @@ class AgentRecord:
     session_agent: str | None = None
     session_value: str | None = None
     model: str | None = None
+    model_override: str | None = None
     resolved_model: str | None = None
     resume: str | None = None
     arguments: list[str] = field(default_factory=list)
@@ -740,6 +741,8 @@ class AgentRecord:
         # row written before #1340 round-trips byte-identically.
         if self.resolved_model is not None:
             document["resolved_model"] = self.resolved_model
+        if self.model_override is not None:
+            document["model_override"] = self.model_override
         custom_identity = (
             None if self.custom_process_identity is None
             else asdict(self.custom_process_identity)
@@ -816,7 +819,7 @@ class AgentRecord:
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
-        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resolved_model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "profile", "reasoning_effort", "slot", "slot_project", "slot_isolation"):
+        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "model_override", "resolved_model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "profile", "reasoning_effort", "slot", "slot_project", "slot_isolation"):
             if document.get(key) is not None and not isinstance(document[key], str):
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
         created = document.get("created_at")
@@ -1009,7 +1012,7 @@ class AgentRecord:
         }
         # `resolved_model` (#1340) is the one common key a row written before
         # it may lack; every other common key is required as before.
-        if not (expected - {"resolved_model"}) <= set(document) or second_authority:
+        if not (expected - {"resolved_model", "model_override"}) <= set(document) or second_authority:
             raise AgentDeliveryError(f"invalid agent record {schema} fields: {path}")
         launch_value = document.get("launch")
         if not isinstance(launch_value, dict):
@@ -4371,7 +4374,17 @@ class ManagedAgents:
         if record.purpose is not None:
             result["purpose"] = record.purpose
         result["queued_archived_undelivered"] = self._queued_archived_undelivered(name)
-        try:
+        declared_model = record.model_override if record.model_override is not None else record.model
+        result["declared_effort"] = record.reasoning_effort
+        result["effective_effort"] = record.effective_reasoning_effort or record.reasoning_effort
+        result["effort_source"] = "override" if record.reasoning_effort is not None else "none"
+        result["declared_model"] = declared_model
+        result["effective_model"] = record.resolved_model or declared_model
+        result["model_source"] = (
+            "override" if record.model_override is not None
+            else "profile" if record.model is not None else "none"
+        )
+        result["model_override"] = record.model_override        try:
             destination = self._pending_move_destination(record)
             if destination is not None:
                 result.update({

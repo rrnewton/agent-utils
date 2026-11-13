@@ -98,6 +98,34 @@ pub(crate) fn with_effort_argument(arguments: &[String], effort: &str) -> Vec<St
     kept
 }
 
+/// `arguments` with any `--model` setting replaced by `model` (#1396).
+pub(crate) fn with_model_argument(arguments: &[String], model: &str) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut iter = arguments.iter();
+    while let Some(argument) = iter.next() {
+        if argument == "--model" {
+            let _ = iter.next();
+        } else if !argument.starts_with("--model=") {
+            kept.push(argument.clone());
+        }
+    }
+    kept.extend(["--model".to_owned(), model.to_owned()]);
+    kept
+}
+
+/// The harness arguments a headless launch of `record` runs: its recorded
+/// arguments with the declared effort and model applied (#1396).
+pub(crate) fn declared_arguments(record: &AgentRecord) -> Vec<String> {
+    let mut arguments = record.arguments.clone();
+    if let Some(effort) = record.reasoning_effort.as_deref() {
+        arguments = with_effort_argument(&arguments, effort);
+    }
+    if let Some(model) = record.declared_model() {
+        arguments = with_model_argument(&arguments, &model);
+    }
+    arguments
+}
+
 /// Records each harness process the wrapper starts as the record's `harness_identity`, the
 /// process whose descendants act for the agent: agentctl's caller-ancestry checks and
 /// agent-teams sender proof find a headless coordinator through it.
@@ -336,6 +364,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             session_agent: None,
             session_value: None,
             model: options.model.clone(),
+            model_override: None,
             resolved_model: None,
             resume: None,
             arguments,
@@ -550,10 +579,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             let launcher = claude::canonical_launcher_path(bin).map_err(fail)?;
             config.command = vec![launcher.display().to_string()];
         }
-        config.arguments = record.arguments.clone();
-        if let Some(effort) = record.reasoning_effort.as_deref() {
-            config.arguments = with_effort_argument(&config.arguments, effort);
-        }
+        config.arguments = declared_arguments(&record);
         // The recorded launch environment, re-read from the launch profile by name
         // (#1412 revive-profile-env); a headless record that names no profile and
         // recorded no names carries none, as its first launch did.
@@ -670,6 +696,100 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             )));
         }
         Ok(json!({"name": agent_name, "op": op, "answer": answer}))
+    }
+
+    /// The console's view of one override (#1396): harness-valid options,
+    /// the declared value and its source, and the effective value the
+    /// harness last reported.
+    pub fn override_options(&self, agent_name: &str, kind: &str) -> Result<Value> {
+        let record = self.load(agent_name)?;
+        let (options, declared, effective, source) = match kind {
+            "effort" => (
+                crate::profiles::effort_levels(&record.harness)
+                    .map(|levels| levels.iter().map(|level| level.to_string()).collect())
+                    .unwrap_or_default(),
+                record.reasoning_effort.clone(),
+                record
+                    .effective_reasoning_effort
+                    .clone()
+                    .or_else(|| record.reasoning_effort.clone()),
+                record.effort_source(),
+            ),
+            "model" => {
+                let mut options: Vec<String> = Vec::new();
+                let mut push = |value: Option<String>| {
+                    if let Some(value) = value {
+                        if !options.contains(&value) {
+                            options.push(value);
+                        }
+                    }
+                };
+                push(record.declared_model());
+                push(record.resolved_model.clone());
+                push(record.model.clone());
+                if let Some(profile_name) = record.profile.as_deref() {
+                    if let Ok(root) = crate::profiles::configuration_root(
+                        Path::new(&record.cwd),
+                        &self.registry,
+                        false,
+                    ) {
+                        if let Ok((_, profiles)) = crate::profiles::load_profiles(&root, false) {
+                            for profile in profiles.values() {
+                                if profile.harness == record.harness {
+                                    push(profile.model.clone());
+                                }
+                            }
+                            if let Some(profile) = profiles.get(profile_name) {
+                                push(profile.model.clone());
+                            }
+                        }
+                    }
+                }
+                (
+                    options,
+                    record.declared_model(),
+                    record
+                        .resolved_model
+                        .clone()
+                        .or_else(|| record.declared_model()),
+                    record.model_source(),
+                )
+            }
+            _ => return Err(fail(format!("unknown override kind {kind:?}"))),
+        };
+        Ok(json!({
+            "name": agent_name,
+            "kind": kind,
+            "harness": record.harness,
+            "options": options,
+            "declared": declared,
+            "effective": effective,
+            "source": source,
+        }))
+    }
+
+    /// Ask the running wrapper to relaunch its harness at the next turn
+    /// boundary with the record's declared arguments (#1396): same session,
+    /// token, queue and slot; a running turn is never cut.
+    pub fn relaunch_headless(&self, agent_name: &str) -> Result<Value> {
+        let record = self.load(agent_name)?;
+        if !record.is_headless() {
+            return Err(fail(format!(
+                "relaunch applies to headless agents; {agent_name:?} has adapter {:?}",
+                record.adapter
+            )));
+        }
+        let socket = hcontrol::socket_path(&self.directory(agent_name)?);
+        let body = json!({"op": "relaunch", "arguments": declared_arguments(&record)});
+        let answer = hcontrol::request(&socket, &body, CONTROL_TIMEOUT)
+            .map_err(|error| fail(format!("{agent_name}: {error}")))?;
+        if answer["ok"] != true {
+            return Err(fail(format!(
+                "{agent_name}: the wrapper refused relaunch: {}",
+                answer["error"].as_str().unwrap_or("no reason given")
+            )));
+        }
+        Ok(json!({"name": agent_name, "answer": answer}))
     }
 
     /// Offer an owner's chat message to a headless agent's approval surface (`#671

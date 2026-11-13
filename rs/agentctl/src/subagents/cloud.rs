@@ -1309,6 +1309,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             session_agent: None,
             session_value: None,
             model: options.model.clone(),
+            model_override: None,
             resolved_model: None,
             resume: None,
             arguments,

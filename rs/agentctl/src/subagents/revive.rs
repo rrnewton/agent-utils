@@ -1350,11 +1350,91 @@ fn spec_arguments(record: &AgentRecord) -> Option<Vec<String>> {
     })
 }
 
+/// `argv` (program first) with the record's declared model and effort
+/// (#1396): a `set-model`/`set-effort` recorded after launch wins over the
+/// arguments the launch spec captured.
+fn with_declared_overrides(record: &AgentRecord, argv: Vec<String>) -> Result<Vec<String>> {
+    // No override recorded after launch: replay the spec exactly.
+    if record.model_override.is_none() && record.reasoning_effort.is_none() {
+        return Ok(argv);
+    }
+    let declared_model = record.declared_model();
+    let effort_args =
+        crate::profiles::reasoning_arguments(&record.harness, record.reasoning_effort.as_deref())?;
+    // Substitute in place, so a replay and its candidate keep one order.
+    let mut out: Vec<String> = Vec::new();
+    let mut model_seen = false;
+    let mut effort_seen = false;
+    let mut iter = argv.into_iter();
+    while let Some(argument) = iter.next() {
+        if argument == "--model" {
+            let _ = iter.next();
+            if let Some(model) = &declared_model {
+                if !model_seen {
+                    out.extend(["--model".to_owned(), model.clone()]);
+                }
+                model_seen = true;
+            }
+        } else if let Some(value) = argument.strip_prefix("--model=") {
+            let _ = value;
+            if let Some(model) = &declared_model {
+                if !model_seen {
+                    out.push(format!("--model={model}"));
+                }
+                model_seen = true;
+            }
+        } else if matches!(argument.as_str(), "--effort" | "--reasoning-effort") {
+            let flag = argument.clone();
+            let _ = iter.next();
+            if !effort_seen && !effort_args.is_empty() {
+                if effort_args.len() == 2 && effort_args[0].starts_with("--") {
+                    out.extend([flag, effort_args[1].clone()]);
+                } else {
+                    out.extend(effort_args.iter().cloned());
+                }
+                effort_seen = true;
+            }
+        } else if argument.starts_with("--effort=") || argument.starts_with("--reasoning-effort=") {
+            if !effort_seen && effort_args.len() == 2 {
+                let flag = argument.split('=').next().unwrap_or("--effort");
+                out.push(format!("{flag}={}", effort_args[1]));
+                effort_seen = true;
+            }
+        } else if argument == "--config" {
+            match iter.next() {
+                Some(value) if value.starts_with("model_reasoning_effort=") => {
+                    if !effort_seen && effort_args.len() == 2 {
+                        out.extend(["--config".to_owned(), effort_args[1].clone()]);
+                        effort_seen = true;
+                    }
+                }
+                Some(value) => {
+                    out.push(argument);
+                    out.push(value);
+                }
+                None => out.push(argument),
+            }
+        } else {
+            out.push(argument);
+        }
+    }
+    if !model_seen {
+        if let Some(model) = &declared_model {
+            out.extend(["--model".to_owned(), model.clone()]);
+        }
+    }
+    if !effort_seen {
+        out.extend(effort_args);
+    }
+    Ok(out)
+}
+
 /// The exact harness arguments a revive of `record` launches.
 fn expected_arguments(record: &AgentRecord) -> Result<Vec<String>> {
     if let Some((session, _)) = fresh_revive(record) {
         if let Some(argv) = spec_arguments(record) {
-            return launch_spec::fresh_arguments(&record.harness, &argv, &session);
+            let argv = launch_spec::fresh_arguments(&record.harness, &argv, &session)?;
+            return with_declared_overrides(record, argv);
         }
         // A fresh Muse with no recorded conversation has no selector to strip (#741).
         let recorded = match recorded_conversation(record) {
@@ -1369,7 +1449,8 @@ fn expected_arguments(record: &AgentRecord) -> Result<Vec<String>> {
     }
     let native = recorded_conversation(record)?;
     if let Some(argv) = spec_arguments(record) {
-        return launch_spec::replay_arguments(&record.harness, &argv, &native.value);
+        let argv = launch_spec::replay_arguments(&record.harness, &argv, &native.value)?;
+        return with_declared_overrides(record, argv);
     }
     let policy = policy_arguments(record, &native)?;
     Ok(if record.harness == "muse" {
@@ -1669,15 +1750,21 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )?;
         let mut structured = effort;
         structured.extend(options.harness_args.iter().cloned());
+        let declared_model = record.declared_model();
         let arguments = match &fresh {
             Some((session, _)) => fresh_selector(
                 &record.harness,
-                harness_arguments(&record.harness, record.model.as_deref(), None, &structured)?,
+                harness_arguments(
+                    &record.harness,
+                    declared_model.as_deref(),
+                    None,
+                    &structured,
+                )?,
                 session,
             )?,
             None => harness_arguments(
                 &record.harness,
-                record.model.as_deref(),
+                declared_model.as_deref(),
                 Some(&native.value),
                 &structured,
             )?,
@@ -1761,6 +1848,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         } else {
             launch_spec::replay_arguments(&record.harness, &argv, &native.value)?
         };
+        let arguments = with_declared_overrides(record, arguments)?;
         self.finish_launch_plan(record, options, arguments, native, cwd)
     }
 
@@ -4664,10 +4752,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             profile.reasoning_effort.is_some(),
             true,
         )?;
-        let mut structured = crate::profiles::reasoning_arguments(
-            &record.harness,
-            profile.reasoning_effort.as_deref(),
-        )?;
+        // Per-agent overrides win over the profile (#1396): the record is
+        // the single source of truth, so a refresh never reverts a level or
+        // model `set-effort`/`set-model` recorded.
+        let declared_effort = record
+            .reasoning_effort
+            .clone()
+            .or_else(|| profile.reasoning_effort.clone());
+        let declared_model = record.declared_model().or_else(|| profile.model.clone());
+        let mut structured =
+            crate::profiles::reasoning_arguments(&record.harness, declared_effort.as_deref())?;
         structured.extend(profile.argv.iter().cloned());
         // As `start` does: a Codex under a launch environment that needs it runs no login shell.
         if record.harness == "codex"
@@ -4682,7 +4776,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         {
             structured.extend(["-c".to_owned(), "allow_login_shell=false".to_owned()]);
         }
-        let argv = harness_arguments(&record.harness, profile.model.as_deref(), None, &structured)?;
+        let argv = harness_arguments(
+            &record.harness,
+            declared_model.as_deref(),
+            None,
+            &structured,
+        )?;
         let mut names = environment_names(&profile.environment);
         // As `start` does (#1216): an ultra Muse profile carries its synthesized gate
         // name, even when the profile's env does not declare it.
@@ -4701,10 +4800,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .or_else(|| record.effective_native_session().map(|native| native.value));
         let old_argv = spec_arguments(record).unwrap_or_else(|| record.arguments.clone());
         let mut changed = Vec::new();
-        if record.model != profile.model {
+        if record.model_override.is_none() && record.model != profile.model {
             changed.push("model");
         }
-        if record.reasoning_effort != profile.reasoning_effort {
+        if record.reasoning_effort.is_none() && record.reasoning_effort != profile.reasoning_effort
+        {
             changed.push("reasoning_effort");
         }
         if record.environment_names != names {
@@ -4717,7 +4817,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }
         let mut refreshed = record.clone();
         refreshed.model = profile.model.clone();
-        refreshed.reasoning_effort = profile.reasoning_effort.clone();
+        refreshed.reasoning_effort = declared_effort;
         refreshed.environment_names = names;
         let label = old_spec.and_then(|spec| spec["workspace_label"].as_str());
         refreshed.launch_spec = Some(launch_spec::build(launch_spec::SpecFields {
@@ -5048,6 +5148,7 @@ mod discovery_tests {
             session_agent: None,
             session_value: None,
             model: None,
+            model_override: None,
             resolved_model: None,
             resume: None,
             arguments: vec![],

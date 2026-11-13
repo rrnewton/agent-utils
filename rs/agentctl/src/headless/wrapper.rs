@@ -336,6 +336,10 @@ struct Wrapper {
     restart_at: Option<Instant>,
     /// The harness died inside a turn: tell the agent once the next harness runs.
     restart_notice: bool,
+    /// Declared arguments waiting for a turn-boundary relaunch (#1396).
+    pending_relaunch: Option<Vec<String>>,
+    /// A relaunch termination is in flight: the exit restarts at once.
+    relaunching: bool,
     /// When the harness last finished a turn or started; the clock for an input that was
     /// queued but never started.
     idle_since: Instant,
@@ -1040,6 +1044,9 @@ impl Wrapper {
                     self.tools.clear();
                     self.set_status("idle")?;
                     self.rescan = true;
+                    if self.pending_relaunch.is_some() && !self.relaunching {
+                        self.begin_relaunch();
+                    }
                 }
                 Signal::CompactStarted => {
                     self.emit("compact.started", causation, json!({}))?;
@@ -1089,6 +1096,28 @@ impl Wrapper {
         Ok(())
     }
 
+    /// Start a turn-boundary relaunch (#1396): end the current harness so
+    /// its exit restarts it at once on the same session with the pending
+    /// declared arguments. Only called while no turn runs.
+    fn begin_relaunch(&mut self) {
+        if self.harness.is_none() {
+            if let Some(arguments) = self.pending_relaunch.take() {
+                self.config.arguments = arguments;
+                let _ = self.emit(
+                    "lifecycle.relaunched",
+                    None,
+                    json!({"session": self.config.session}),
+                );
+            }
+            return;
+        }
+        self.relaunching = true;
+        if let Some(harness) = self.harness.as_mut() {
+            drop(harness.input.take());
+            terminate_group(&mut harness.child);
+        }
+    }
+
     fn control(&mut self, request: control::Request) -> Result<()> {
         let op = request.body["op"].as_str().unwrap_or("").to_owned();
         let answer = match op.as_str() {
@@ -1110,6 +1139,7 @@ impl Wrapper {
                 "stopping": self.stopping,
                 "held": self.held,
                 "approvals_pending": self.approvals.len(),
+                "relaunch_pending": self.pending_relaunch.is_some(),
                 "writer_sweep": WRITER_SWEEP,
             }),
             "approvals" => json!({
@@ -1159,6 +1189,29 @@ impl Wrapper {
                         }
                     }
                     None => json!({"ok": false, "error": "no harness is running"}),
+                }
+            }
+            "relaunch" => {
+                let arguments = request.body["arguments"].as_array().map(|items| {
+                    items
+                        .iter()
+                        .map(|item| item.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<String>>>()
+                });
+                match arguments {
+                    Some(Some(arguments))
+                        if arguments.iter().all(|a| !a.is_empty() && !a.contains('\0')) =>
+                    {
+                        let busy = self.busy;
+                        self.pending_relaunch = Some(arguments);
+                        if !busy {
+                            self.begin_relaunch();
+                        }
+                        json!({"ok": true, "pending": busy, "busy": busy})
+                    }
+                    _ => {
+                        json!({"ok": false, "error": "relaunch needs an arguments array of nonempty strings"})
+                    }
                 }
             }
             "stop" => {
@@ -1718,6 +1771,20 @@ impl Wrapper {
             )?;
             return Ok(Some(0));
         }
+        if self.relaunching {
+            self.relaunching = false;
+            if let Some(arguments) = self.pending_relaunch.take() {
+                self.config.arguments = arguments;
+            }
+            self.emit(
+                "lifecycle.relaunched",
+                None,
+                json!({"session": self.config.session}),
+            )?;
+            self.restart_at = Some(Instant::now());
+            self.set_status("idle")?;
+            return Ok(None);
+        }
         let now = Instant::now();
         self.restarts
             .retain(|at| now.duration_since(*at) < self.config.restart_window);
@@ -2270,6 +2337,8 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
         restarts: Vec::new(),
         restart_at: None,
         restart_notice: false,
+        pending_relaunch: None,
+        relaunching: false,
         idle_since: Instant::now(),
         pin_pid: None,
         pin_identity: None,

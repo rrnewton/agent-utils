@@ -1914,6 +1914,11 @@ struct AgentRecord {
     session_agent: Option<String>,
     session_value: Option<String>,
     model: Option<String>,
+    /// Per-agent model override (#1396 agentctl-console-effort-model): wins
+    /// over the launch profile's model on every relaunch; `None` follows the
+    /// profile. Additive and absent in older records.
+    #[serde(default)]
+    model_override: Option<String>,
     /// The model the harness itself recorded once its session was captured
     /// (#1340 agent-model-unknown); shown as `default (<resolved>)` when no
     /// model was declared.
@@ -2269,6 +2274,10 @@ impl AgentRecord {
                 )
             })
             || self
+                .model_override
+                .as_deref()
+                .is_some_and(|value| !valid_metadata_text(value) || value.len() > 256)
+            || self
                 .environment_names
                 .iter()
                 .any(|value| !valid_environment_name(value))
@@ -2309,6 +2318,35 @@ impl AgentRecord {
             return Err(fail(format!("agent {:?} is paused for human input; run agentctl resume before sending automation input", self.name)));
         }
         Ok(())
+    }
+
+    /// The declared model (#1396): the per-agent override when set, else the
+    /// launch model. The record is the single source of truth; a profile
+    /// never overrides it on a relaunch.
+    pub(super) fn declared_model(&self) -> Option<String> {
+        self.model_override.clone().or_else(|| self.model.clone())
+    }
+
+    /// Where the declared model comes from: `override`, `profile`, or `none`.
+    pub(super) fn model_source(&self) -> &'static str {
+        if self.model_override.is_some() {
+            "override"
+        } else if self.model.is_some() {
+            "profile"
+        } else {
+            "none"
+        }
+    }
+
+    /// Where the declared effort comes from: `override` once `set-effort`
+    /// recorded one (the record's `reasoning_effort`), else `profile`/`none`
+    /// as far as the record alone can tell.
+    pub(super) fn effort_source(&self) -> &'static str {
+        if self.reasoning_effort.is_some() {
+            "override"
+        } else {
+            "none"
+        }
     }
 
     /// The agent kind Herdr must report for the record's pane: its harness, except for a harness
@@ -9601,6 +9639,32 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }))
     }
 
+    /// Record a per-agent model override (#1396): validated against the
+    /// harness adapter, stored at once, and winning over the launch profile
+    /// on every relaunch (revive, restore, restart, wrapper relaunch). The
+    /// running harness is never interrupted; headless agents apply it at the
+    /// next wrapper launch, or promptly through the console's turn-boundary
+    /// relaunch.
+    pub fn set_model(&self, agent_name: &str, model: &str) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        crate::profiles::validate_model(&record.harness, model)?;
+        let previous = record.declared_model();
+        record.model_override = Some(model.to_owned());
+        self.save(&record)?;
+        let applies = if record.is_headless() {
+            "next run-headless launch (restart the wrapper or its unit to apply now); the running turn is unchanged"
+        } else {
+            "on restart --resume; the running agent is unchanged"
+        };
+        Ok(json!({
+            "name": agent_name,
+            "model": model,
+            "previous_model": previous,
+            "applies": applies,
+        }))
+    }
+
     /// Start one fresh tab with an explicit structured reasoning effort.
     pub fn start_with_reasoning_effort(
         &self,
@@ -9971,6 +10035,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             session_agent: None,
             session_value: None,
             model: options.model.clone(),
+            model_override: None,
             resolved_model: None,
             resume: options.resume.clone(),
             arguments,
@@ -10577,6 +10642,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             session_agent: info.session_agent,
             session_value: info.session_value,
             model: None,
+            model_override: None,
             resolved_model: None,
             resume: None,
             arguments: Vec::new(),
@@ -11604,6 +11670,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if let Some(purpose) = record.purpose() {
             result[control::PURPOSE] = json!(purpose);
         }
+        // Declared vs effective (#1396): the record declares, the harness
+        // reports what it actually runs; both overrides ride along.
+        result["declared_effort"] = json!(record.reasoning_effort);
+        result["effective_effort"] = json!(record
+            .effective_reasoning_effort
+            .clone()
+            .or_else(|| record.reasoning_effort.clone()));
+        result["effort_source"] = json!(record.effort_source());
+        result["declared_model"] = json!(record.declared_model());
+        result["effective_model"] = json!(record
+            .resolved_model
+            .clone()
+            .or_else(|| record.declared_model()));
+        result["model_source"] = json!(record.model_source());
+        result["model_override"] = json!(record.model_override);
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
         result["goal_source"] = if record.goal.is_some() {

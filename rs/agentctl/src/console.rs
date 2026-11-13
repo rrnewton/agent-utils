@@ -37,11 +37,21 @@ use crate::subagents::{ManagedAgents, ManagedApi};
 /// Longest a control request may wait for the wrapper's answer.
 const CONTROL_WAIT: Duration = Duration::from_secs(20);
 
+/// A numbered local menu waiting for its pick (#1396): shown by a bare
+/// `/effort` or `/model`, answered by the next submitted line, and never
+/// queued as a turn. The wrapper and its inbox carry on untouched while
+/// it waits.
+struct Menu {
+    kind: String,
+    options: Vec<String>,
+}
+
 /// Shared console output: the event follower and the input line draw on
 /// the same stdout, one locked section at a time.
 struct Shared {
     out: Mutex<io::Stdout>,
     editor: Mutex<LineEditor>,
+    menu: Mutex<Option<Menu>>,
     name: String,
 }
 
@@ -473,6 +483,10 @@ fn submit<A: ManagedApi + ?Sized>(
         editor.take_text()
     };
     let line = line.trim_end().to_owned();
+    // A waiting menu takes even an empty line (its cancel), never a turn.
+    if shared.menu.lock().expect("menu lock poisoned").is_some() {
+        return menu_answer(manager, name, &line, shared);
+    }
     if line.is_empty() {
         return false;
     }
@@ -487,6 +501,8 @@ fn submit<A: ManagedApi + ?Sized>(
         for help in [
             "console commands (handled here, never sent to the agent):",
             "  /help       show this help",
+            "  /effort [LEVEL]  show or set the reasoning effort (menu without LEVEL)",
+            "  /model [NAME]    show or set the model (menu without NAME)",
             "  /interrupt  interrupt the running turn",
             "  /quit       leave the console (the agent keeps running)",
             "  approve aN / deny aN [reason]  answer an approval",
@@ -494,6 +510,18 @@ fn submit<A: ManagedApi + ?Sized>(
         ] {
             shared.print_line(help);
         }
+        return false;
+    }
+    if line == "/effort" || line == "/model" {
+        show_menu(manager, name, &line[1..], shared);
+        return false;
+    }
+    if let Some(level) = line.strip_prefix("/effort ") {
+        apply_override(manager, name, "effort", level.trim(), shared);
+        return false;
+    }
+    if let Some(model) = line.strip_prefix("/model ") {
+        apply_override(manager, name, "model", model.trim(), shared);
         return false;
     }
     if line.starts_with('/') {
@@ -558,6 +586,138 @@ fn submit<A: ManagedApi + ?Sized>(
         }
     }
     false
+}
+
+/// Show the numbered menu of a bare `/effort` or `/model` (#1396): the
+/// current declared and effective setting and its source, the harness's
+/// options with the current one marked, then wait for a number.
+fn show_menu<A: ManagedApi + ?Sized>(
+    manager: &ManagedAgents<'_, A>,
+    name: &str,
+    kind: &str,
+    shared: &Arc<Shared>,
+) {
+    match manager.override_options(name, kind) {
+        Ok(view) => {
+            let options: Vec<String> = view["options"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let declared = view["declared"].as_str().unwrap_or("(none)");
+            let effective = view["effective"].as_str().unwrap_or("(none)");
+            let source = view["source"].as_str().unwrap_or("none");
+            shared.print_line(&format!(
+                "{kind} for {name}: declared {declared} (from {source}), effective {effective}"
+            ));
+            if options.is_empty() {
+                shared.print_line(&format!(
+                    "no {kind} options to list; set one directly: /{kind} VALUE"
+                ));
+                return;
+            }
+            for (index, option) in options.iter().enumerate() {
+                let mark = if view["declared"].as_str() == Some(option.as_str()) {
+                    " *"
+                } else {
+                    ""
+                };
+                shared.print_line(&format!("  {}. {option}{mark}", index + 1));
+            }
+            shared.print_line("pick a number, or Enter/q to cancel");
+            *shared.menu.lock().expect("menu lock poisoned") = Some(Menu {
+                kind: kind.to_owned(),
+                options,
+            });
+        }
+        Err(error) => shared.print_line(&format!("cannot show {kind}: {error}")),
+    }
+}
+
+/// Take one line as the waiting menu's answer: a number picks, Enter or
+/// `q` cancels, anything else re-prompts. Never queued as a turn.
+fn menu_answer<A: ManagedApi + ?Sized>(
+    manager: &ManagedAgents<'_, A>,
+    name: &str,
+    line: &str,
+    shared: &Arc<Shared>,
+) -> bool {
+    let menu = shared.menu.lock().expect("menu lock poisoned").take();
+    let Some(menu) = menu else {
+        return false;
+    };
+    let answer = line.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("q") {
+        shared.print_line("cancelled; nothing changed");
+        return false;
+    }
+    match answer.parse::<usize>() {
+        Ok(pick) if (1..=menu.options.len()).contains(&pick) => {
+            let value = menu.options[pick - 1].clone();
+            apply_override(manager, name, &menu.kind, &value, shared);
+        }
+        _ => {
+            shared.print_line(&format!(
+                "pick a number 1..{}, or Enter/q to cancel",
+                menu.options.len()
+            ));
+            *shared.menu.lock().expect("menu lock poisoned") = Some(menu);
+        }
+    }
+    false
+}
+
+/// Record one override through the shared `set-effort`/`set-model` path
+/// and relaunch the wrapper at the next turn boundary (#1396).
+fn apply_override<A: ManagedApi + ?Sized>(
+    manager: &ManagedAgents<'_, A>,
+    name: &str,
+    kind: &str,
+    value: &str,
+    shared: &Arc<Shared>,
+) {
+    if value.is_empty() {
+        show_menu(manager, name, kind, shared);
+        return;
+    }
+    let recorded = if kind == "effort" {
+        manager.set_effort(name, value, false)
+    } else {
+        manager.set_model(name, value)
+    };
+    match recorded {
+        Ok(result) => {
+            let previous = if kind == "effort" {
+                result["previous_effort"].as_str().unwrap_or("(none)")
+            } else {
+                result["previous_model"].as_str().unwrap_or("(none)")
+            };
+            shared.print_line(&format!(
+                "{kind} declared {value} (was {previous}); relaunching at the next turn boundary"
+            ));
+            match manager.relaunch_headless(name) {
+                Ok(relaunch) => {
+                    if relaunch["answer"]["pending"] == json!(true) {
+                        shared.print_line(
+                            "a turn is running; the relaunch waits for it to end (or /interrupt first)",
+                        );
+                    } else {
+                        shared.print_line(&format!(
+                            "{kind} effective {value} after the resumed relaunch (same session)"
+                        ));
+                    }
+                }
+                Err(error) => shared.print_line(&format!(
+                    "recorded, but the relaunch was refused: {error}; it applies at the next wrapper launch"
+                )),
+            }
+        }
+        Err(error) => shared.print_line(&format!("{kind} not changed: {error}")),
+    }
 }
 
 /// Ask the wrapper to interrupt the running turn (the `/interrupt` line
@@ -628,6 +788,7 @@ pub fn run<A: ManagedApi + ?Sized>(
     let shared = Arc::new(Shared {
         out: Mutex::new(io::stdout()),
         editor: Mutex::new(LineEditor::default()),
+        menu: Mutex::new(None),
         name: name.to_owned(),
     });
     options.follow = true;
@@ -804,5 +965,205 @@ mod tests {
         feed(&mut editor, b"\x01");
         feed(&mut editor, b"Y");
         assert_eq!(editor.display().0, "YabX");
+    }
+}
+
+#[cfg(test)]
+mod console_override_tests {
+    use super::*;
+    use crate::subagents::tests::Fixture;
+    use crate::subagents::HeadlessStart;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+
+    /// A fake headless wrapper on the agent's control socket: records every
+    /// request and answers from its current busy flag. Tests wait on its
+    /// channel, never on time.
+    struct FakeWrapper {
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        relaunched: mpsc::Receiver<serde_json::Value>,
+    }
+
+    fn fake_wrapper(socket: &Path, session: &str) -> FakeWrapper {
+        let listener = UnixListener::bind(socket).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let (send, relaunched) = mpsc::channel();
+        let session = session.to_owned();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut line = String::new();
+                if BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .is_err()
+                {
+                    continue;
+                }
+                let body: serde_json::Value =
+                    serde_json::from_str(line.trim()).unwrap_or(json!(null));
+                recorded.lock().unwrap().push(body.clone());
+                let answer = match body["op"].as_str() {
+                    Some("relaunch") => {
+                        let _ = send.send(body.clone());
+                        json!({"ok": true, "pending": false, "busy": false})
+                    }
+                    Some("console.input") => json!({"ok": true, "queue_id": "q-fake"}),
+                    _ => json!({"ok": true, "status": "idle", "busy": false, "session": session}),
+                };
+                let mut bytes = serde_json::to_vec(&answer).unwrap();
+                bytes.push(b'\n');
+                let _ = stream.write_all(&bytes);
+            }
+        });
+        FakeWrapper {
+            requests,
+            relaunched,
+        }
+    }
+
+    fn shared_for(name: &str) -> Arc<Shared> {
+        Arc::new(Shared {
+            out: Mutex::new(io::stdout()),
+            editor: Mutex::new(LineEditor::default()),
+            menu: Mutex::new(None),
+            name: name.to_owned(),
+        })
+    }
+
+    fn submit_line<A: ManagedApi + ?Sized>(
+        manager: &ManagedAgents<'_, A>,
+        socket: &Path,
+        name: &str,
+        shared: &Arc<Shared>,
+        line: &str,
+    ) {
+        {
+            let mut editor = shared.editor.lock().unwrap();
+            editor.clear();
+            editor.insert_str(line);
+        }
+        submit(manager, socket, name, "owner", "/dev/pts/test", shared);
+    }
+
+    #[test]
+    fn effort_menu_pick_applies_at_the_boundary_and_resumes_the_same_session() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start_headless(
+                "lead",
+                &fixture.root,
+                HeadlessStart {
+                    harness: "claude".to_owned(),
+                    reasoning_effort: Some("xhigh".to_owned()),
+                    launch: false,
+                    ..HeadlessStart::default()
+                },
+            )
+            .unwrap();
+        let before = manager.status("lead").unwrap();
+        let session = before["session"].as_str().unwrap().to_owned();
+        let directory = fixture.root.join("registry").join("agents").join("lead");
+        let socket = hcontrol::socket_path(&directory);
+        let fake = fake_wrapper(&socket, &session);
+        let shared = shared_for("lead");
+
+        // Bare /effort opens the menu with the harness's levels.
+        submit_line(&manager, &socket, "lead", &shared, "/effort");
+        let menu = shared
+            .menu
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|menu| menu.options.clone());
+        assert_eq!(
+            menu,
+            Some(vec![
+                "low".to_owned(),
+                "medium".to_owned(),
+                "high".to_owned(),
+                "xhigh".to_owned(),
+                "max".to_owned()
+            ])
+        );
+        // A message for the agent still delivers while the menu waits.
+        let delivered = hcontrol::request(
+            &socket,
+            &json!({"op": "console.input", "text": "hello", "user": "owner", "tty": "/dev/pts/test"}),
+            CONTROL_WAIT,
+        )
+        .unwrap();
+        assert_eq!(delivered["ok"], json!(true));
+
+        // Pick 3 (high): set-effort path, then a boundary relaunch.
+        submit_line(&manager, &socket, "lead", &shared, "3");
+        let relaunch = fake
+            .relaunched
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the wrapper was asked to relaunch");
+        assert!(relaunch["arguments"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair[0] == "--effort" && pair[1] == "high"));
+        assert_eq!(manager.status("lead").unwrap()["reasoning_effort"], "high");
+        let after = manager.status("lead").unwrap();
+        assert_eq!(after["session"], session, "the same session resumed");
+        assert_eq!(after["declared_effort"], "high");
+        assert_eq!(after["effective_effort"], "high");
+        // Nothing typed at the menu was queued as a turn.
+        assert!(fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body["op"] == "console.input")
+            .all(|body| body["text"] == "hello"));
+    }
+
+    #[test]
+    fn menu_cancel_and_invalid_picks_change_nothing() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        manager
+            .start_headless(
+                "lead",
+                &fixture.root,
+                HeadlessStart {
+                    harness: "claude".to_owned(),
+                    reasoning_effort: Some("high".to_owned()),
+                    launch: false,
+                    ..HeadlessStart::default()
+                },
+            )
+            .unwrap();
+        let directory = fixture.root.join("registry").join("agents").join("lead");
+        let socket = hcontrol::socket_path(&directory);
+        let fake = fake_wrapper(&socket, "session");
+        let shared = shared_for("lead");
+        submit_line(&manager, &socket, "lead", &shared, "/effort");
+        submit_line(&manager, &socket, "lead", &shared, "99");
+        assert!(shared.menu.lock().unwrap().is_some(), "invalid re-prompts");
+        submit_line(&manager, &socket, "lead", &shared, "q");
+        assert!(shared.menu.lock().unwrap().is_none(), "q cancels");
+        assert_eq!(manager.status("lead").unwrap()["reasoning_effort"], "high");
+        assert!(fake
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|body| body["op"] == "status"));
+        // Direct form still works without a menu.
+        submit_line(&manager, &socket, "lead", &shared, "/model claude-direct-1");
+        assert_eq!(
+            manager.status("lead").unwrap()["model_override"],
+            "claude-direct-1"
+        );
+        let _ = fake
+            .relaunched
+            .recv_timeout(Duration::from_secs(10))
+            .expect("direct /model relaunches too");
     }
 }

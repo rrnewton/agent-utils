@@ -3889,6 +3889,22 @@ def _mcp_stdio(harness: Harness, report: Report) -> None:
     _pair(harness, report, live, "mcp/live/stop", ("stop", "worker", *_COMMON))
 
 
+def _model_override_edition(harness: Harness, report: Report) -> None:
+    """`set-model` (#1396) is an intended edition difference: the Rust edition
+    records the per-agent model override, and the Python edition refuses it
+    by name (`_RUST_ONLY`), exactly as `_rust_only` pins for other Rust-only
+    commands. The record field itself is shared: both editions load, keep
+    and status-report `model_override` (see the profiles/nested groups)."""
+    case = harness.case("model-override")
+    rust = _rust_only(harness, report, case, "model-override/set-model",
+                      ("set-model", "nobody", "some-model", *_COMMON))
+    report.require(
+        "model-override/set-model/rust",
+        rust.returncode != 0 and "nobody" in (rust.stdout + rust.stderr),
+        f"the Rust edition did not refuse set-model for a missing agent: {rust!r}",
+    )
+
+
 def _groups() -> list[tuple[str, object]]:
     # Imported here: the group's module imports this one's helpers.
     from agentctl_nested_records import nested_records
@@ -3912,6 +3928,7 @@ def _groups() -> list[tuple[str, object]]:
         ("revive", _revive_interop), ("adoption", _adoption),
         ("identity", _identity_and_rename), ("nested-records", nested_records),
         ("invalid-cli", _invalid_cli), ("watch", _watch_services),
+        ("model-override", _model_override_edition),
         ("restore", _restore_team), ("mcp", _mcp_stdio),
     ]
 

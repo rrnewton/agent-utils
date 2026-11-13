@@ -181,3 +181,121 @@ fn headless_start_refuses_an_unsupported_effort() {
         .unwrap_err();
     assert!(error.to_string().contains("accepted levels"), "{error}");
 }
+
+#[test]
+fn set_model_records_an_override_that_wins_and_refuses_bad_names() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    manager
+        .start_headless(
+            "lead",
+            &fixture.root,
+            HeadlessStart {
+                harness: "claude".to_owned(),
+                model: Some("claude-first-1".to_owned()),
+                reasoning_effort: Some("high".to_owned()),
+                launch: false,
+                ..HeadlessStart::default()
+            },
+        )
+        .unwrap();
+    let switched = manager.set_model("lead", "claude-second-2").unwrap();
+    assert_eq!(switched["model"], "claude-second-2");
+    assert_eq!(switched["previous_model"], "claude-first-1");
+    let record = manager.load("lead").unwrap();
+    assert_eq!(record.model_override.as_deref(), Some("claude-second-2"));
+    assert_eq!(record.declared_model().as_deref(), Some("claude-second-2"));
+    let status = manager.status("lead").unwrap();
+    assert_eq!(status["declared_model"], "claude-second-2");
+    assert_eq!(status["model_source"], "override");
+    assert_eq!(status["declared_effort"], "high");
+    // Bad names are refused and the record is unchanged.
+    for bad in ["", "two words", "-leading-dash"] {
+        assert!(manager.set_model("lead", bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(
+        manager.load("lead").unwrap().model_override.as_deref(),
+        Some("claude-second-2")
+    );
+    // An older record without the field still loads.
+    let mut value = serde_json::to_value(&record).unwrap();
+    value.as_object_mut().unwrap().remove("model_override");
+    let older: AgentRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(older.model_override, None);
+    assert_eq!(older.declared_model().as_deref(), Some("claude-first-1"));
+}
+
+#[test]
+fn overrides_survive_a_profile_refresh_and_status_agrees() {
+    // A profile-backed interactive agent, killed, then switched by
+    // set-effort/set-model: a refresh must not revert either override.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test profile config", false, false).unwrap();
+    agent::atomic_json(
+        &directory.join("profiles.json"),
+        &json!({"schema":"agentctl-profiles/v1","profiles":{
+            "claude-recovery": {"harness":"claude","mode":"interactive","model":"opus","reasoning_effort":"high",
+                "argv":["--allowedTools","Read"], "env":{}}
+        }}),
+    )
+    .unwrap();
+    let manager = fixture.manager();
+    manager
+        .start_with_reasoning_effort(
+            "worker",
+            &fixture.root,
+            "high",
+            StartOptions {
+                harness: "claude".to_owned(),
+                profile: Some("claude-recovery".to_owned()),
+                model: Some("opus".to_owned()),
+                harness_args: vec!["--allowedTools".to_owned(), "Read".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    manager.set_effort("worker", "low", false).unwrap();
+    manager.set_model("worker", "claude-override-3").unwrap();
+    // Kill the harness, then refresh: the profile must not revert either
+    // override, and status shows declared = effective for both.
+    let record = manager.load("worker").unwrap();
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(record.pane_id.clone().unwrap());
+    fixture
+        .client
+        .started
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .client
+        .custom_alive
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    manager.refresh_profile("worker").unwrap();
+    let record = manager.load("worker").unwrap();
+    assert_eq!(record.reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(record.model_override.as_deref(), Some("claude-override-3"));
+    assert_eq!(
+        record.declared_model().as_deref(),
+        Some("claude-override-3")
+    );
+    let status = manager.status("worker").unwrap();
+    assert_eq!(status["declared_effort"], "low");
+    assert_eq!(status["effective_effort"], "low");
+    assert_eq!(status["declared_model"], "claude-override-3");
+    assert_eq!(status["model_override"], "claude-override-3");
+}

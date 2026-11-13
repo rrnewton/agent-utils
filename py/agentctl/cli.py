@@ -304,6 +304,12 @@ def parser() -> argparse.ArgumentParser:
     set_effort.add_argument("--urgent", action="store_true",
         help="allow the change while the agent is mid-turn (the running turn is never killed)")
 
+    set_model = command("set-model", "Record a per-agent model override for a live agent "
+        "(the Rust edition only; this edition refuses it).",
+        "agentctl set-model coordinator claude-sonnet-4-5", named=True)
+    set_model.add_argument("model", metavar="MODEL",
+        help="new model name, validated against the agent's harness")
+
     restart = command("restart", "Restart a live agent with its recorded session: exit the harness "
         "gracefully at an idle turn boundary, relaunch resuming its session, re-pin it, restore "
         "its Herdr name, transfer its slot ownership, and queue a re-arm notice (background shells, monitors and "
@@ -467,8 +473,7 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
 _RUST_ONLY = ("restore", "restore-teams", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "set",
-              "purpose", "tree", "progress", "services")
-
+              "purpose", "tree", "progress", "services", "set-model")
 
 #: Commands that change agents' state, so idle layout-1 agents move to layout 2 first (not before a
 #: dry run). Everything else, reads and the chat services included, leaves the layout alone.
@@ -679,6 +684,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.goal(name, _text(args, optional=True), goal_command=_goal_command(args), **options)
         elif args.command == "set-effort":
             raise ValueError("set-effort is implemented only by the Rust edition")
+        elif args.command == "set-model":
+            raise ValueError("set-model is implemented only by the Rust edition")
         elif args.command == "rename":
             result = sessions.rename(name, args.new_name)
         elif args.command == "revive":

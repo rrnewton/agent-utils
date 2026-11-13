@@ -1680,6 +1680,31 @@ pub(crate) fn validate_effort(harness: &str, effort: &str) -> Result<(), AgentEr
     }
 }
 
+/// Refuse a model a harness cannot take (#1396 agentctl-console-effort-model):
+/// the harness adapter is the only check — a harness with no structured launch
+/// takes no structured model, and a model name is otherwise passed through for
+/// the harness to accept, so agentctl keeps no model allowlist of its own.
+pub(crate) fn validate_model(harness: &str, model: &str) -> Result<(), AgentError> {
+    if model.is_empty()
+        || model.len() > 256
+        || model.contains('\0')
+        || model.chars().any(char::is_whitespace)
+        || model.starts_with('-')
+    {
+        return Err(fail(format!(
+            "invalid model {model:?}: use the harness's model name (no spaces, at most 256 bytes)"
+        )));
+    }
+    let takes_model = harness == "agentcloud"
+        || crate::harness::adapter(harness).is_some_and(|adapter| adapter.structured_launch());
+    if !takes_model {
+        return Err(fail(format!(
+            "model is not supported for harness {harness:?}"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn reasoning_arguments(
     harness: &str,
     effort: Option<&str>,
