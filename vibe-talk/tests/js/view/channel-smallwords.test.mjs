@@ -69,10 +69,9 @@ function makeNoise() {
   const acts = CHANNEL.createNoiseActs({
     providerFacts: { threading: () => state.threading },
     readModes: () => ({ hiding: () => state.hiding }),
-    todoView: () => ({ state: () => ({ noise: 3, window: 9 }) }),
     timelineRows: () => ({ messages: state.rows }),
-    el: () => ({ children: [] }),
-    rowMessages: () => [],
+    el: () => ({ children: state.rows }),
+    rowMessages: (row) => [row],
     selectedChannelId: () => "c1",
     api: async (path, options) => { calls.push(["api", path, options.body.messages]); },
     channelStore: { current: () => canon, open: () => canon },
