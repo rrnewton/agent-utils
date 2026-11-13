@@ -233,9 +233,23 @@ fn view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
     if populated.len() < 2 {
         return None;
     }
-    let footer = populated[populated.len() - 1];
+    let mut footer = populated[populated.len() - 1];
     if !text_of(&rows[footer].0).starts_with("  ") {
         return None;
+    }
+    // Codex v0.169 draws a second footer row under the model/path status row:
+    // "  ← for agents · ? for shortcuts". The status row directly above it is footer, not
+    // composer text, or an empty composer reads as a draft and every submission is refused.
+    if populated.len() >= 3 {
+        let hint = text_of(&rows[footer].0);
+        let above = populated[populated.len() - 2];
+        if above + 1 == footer
+            && (hint.contains("? for shortcuts") || hint.contains("for agents"))
+            && text_of(&rows[above].0).starts_with("  ")
+            && text_of(&rows[above].0).contains('·')
+        {
+            footer = above;
+        }
     }
     let mut start = None;
     for index in (0..footer).rev() {

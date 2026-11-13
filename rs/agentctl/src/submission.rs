@@ -3361,6 +3361,21 @@ mod tests {
     }
 
     #[test]
+    fn codex_0_169_two_row_footer_leaves_the_composer_empty() {
+        // Measured 2026-11-13 on a fresh Codex v0.169.0 pane: the model/path status row now
+        // sits above a second hint row, and an empty composer was refused as a draft.
+        let screen = "  >_ OpenAI Codex (v0.169.0)\n  permissions: YOLO mode\n\n\n\
+                      \u{203a} \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n\
+                      \x20 GPT-6.1-Sol medium \u{b7} /work/slot\n\
+                      \x20 \u{2190} for agents \u{b7} ? for shortcuts      \u{26a0} 1 warning \u{b7} f2 to view\n";
+        let view = composer_view("codex", screen).unwrap_or_else(|| panic!("no composer"));
+        assert_eq!(view.composer_solid.trim(), "", "{view:?}");
+        assert!(view.footer.contains("GPT-6.1-Sol"), "{view:?}");
+        assert!(view.footer.contains("for shortcuts"), "{view:?}");
+        assert!(crate::harness::codex::idle_composer(screen), "{view:?}");
+    }
+
+    #[test]
     fn codex_0_159_1_idle_composer_is_recognised() {
         for screen in [codex_v0_159_1::fresh_idle(), codex_v0_159_1::session_idle()] {
             let view = composer_view("codex", &screen)
