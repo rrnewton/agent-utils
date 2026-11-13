@@ -706,6 +706,26 @@ def _leftover_test_binaries(artifacts: Sequence[tuple[str, str, str]]) -> list[s
     return sorted(leftovers)
 
 
+def _parse_event_line(line: str) -> object:
+    """One libtest JSON event from a streamed line, or None.
+
+    A test that writes terminal output (the console TUI tests) can
+    interleave escape bytes onto an event line; recover the JSON object
+    embedded in it instead of dropping the case from the timing record.
+    """
+    stripped = line.strip()
+    if not stripped.startswith("{"):
+        embedded = stripped.find("{")
+        if embedded < 0:
+            return None
+        stripped = stripped[embedded:]
+    try:
+        parsed, _end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    return parsed
+
+
 def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
     """Run ``cargo test`` with per-case timings; see the module docstring.
 
@@ -794,13 +814,7 @@ def _run_cargo(argv: Sequence[str], *, gate: str | None) -> int:
         )
         events: list[tuple[float, Mapping[str, object]]] = []
         for arrived, line in _stream_lines(process):
-            stripped = line.strip()
-            parsed: object = None
-            if stripped.startswith("{"):
-                try:
-                    parsed = json.loads(stripped)
-                except json.JSONDecodeError:
-                    parsed = None
+            parsed: object = _parse_event_line(line)
             if isinstance(parsed, dict):
                 events.append((arrived, parsed))
                 # Attest progress as it happens (#1051): translate each
@@ -987,6 +1001,12 @@ def _self_test() -> int:
         gate="g",
     )
     assert libtest[0].duration_s == 0.25
+    # Terminal output interleaved onto an event line must not drop the case.
+    interleaved = _parse_event_line(
+        '\x1b[Klead › { "type": "test", "name": "b", "event": "ok" } trailing'
+    )
+    assert isinstance(interleaved, dict) and interleaved.get("name") == "b"
+    assert _parse_event_line("plain test output, no event") is None
     tap = cases_from_node_tap("ok 1 - x\n  duration_ms: 10\n", gate="g")
     assert tap[0].duration_s == 0.01
 
