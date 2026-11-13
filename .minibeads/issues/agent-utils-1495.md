@@ -1,10 +1,11 @@
 ---
 title: 'revive-differential-proc-stat-parse-under-load: revive and restore treat a just-exited process as a stat parse error'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-13T17:20:00.000000000+00:00
-updated_at: 2026-11-13T17:20:00.000000000+00:00
+updated_at: 2026-11-13T21:40:00.000000000+00:00
+closed_at: 2026-11-13T21:40:00.000000000+00:00
 ---
 
 # Description
@@ -61,3 +62,39 @@ Rules: no wall-clock assertions (owner rule 346); the tests must pass at
 
 Filed by the mu-statrace lane from coordinator evidence; the issue file was
 not yet on main when the lane started.
+
+## Resolution
+
+[watermelon-full-preview] Confirmed by reading the read paths and by
+probing real short-lived children under CPU saturation: an exit race
+surfaces as ENOENT/ESRCH at open, and the torn, empty, and
+vanished-on-re-read shapes are what a fixture proc root (and an
+in-flight teardown read) hands the same code. `bounded_file` turned the
+unopenable and empty shapes into hard errors and `read_process_stat`
+retried only parse failures, so the record of a process that had simply
+exited was reported as "cannot parse process stat for pid N" (or an
+unprovable probe), revive refused, and restore exited 75 for that lane;
+the Python liveness twin raised the same shapes to "unknown".
+
+Fix: the stat readers now classify at the read. A record that cannot be
+opened (ENOENT/ESRCH), reads back empty, or vanishes on the bounded
+re-read is "process gone" (not alive, not the recorded identity) in
+`rs/agent-queue/src/identity.rs` (`read_process_stat`, the liveness
+probe, `observe`), `rs/agentctl/src/foreign/ownership.rs`
+(`read_stat_at`), `rs/agentctl/src/subagents/turn_runner.rs`
+(`process_state`), and the Python twins `py/agentctl/client.py`
+(`_liveness_process_stat`, which feeds the same verdict into
+`process_liveness`) and `py/agentctl/foreign/ownership.py` (`read_stat`).
+Liveness still requires the pidfd exit indication under a stable boot
+before calling a vanished record dead. A record that stays readable and
+unparseable still refuses as malformed, in both editions. Each shape has
+a unit case in each edition (scripted readers, fixture proc roots, and a
+reaped-child loop under a condition, never a timer).
+
+Verified: focused Rust and Python suites for every touched reader pass;
+fresh cpuset local validate (`validate: OK`) and a 3-slot gate
+(`gate exit: 0`) pass on the rebased tree, including the restore-drill
+case from the evidence and `cross.agentctl.differential-2`. Landed on
+main as the agentctl commit "read a stat record that vanishes mid-read
+as a process that exited" (see the landing notice to the coordinator
+for the SHA).
