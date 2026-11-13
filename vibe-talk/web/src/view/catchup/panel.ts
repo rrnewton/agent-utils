@@ -138,6 +138,22 @@ export interface DiscussPanelDependencies {
    */
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
+  /**
+   * `#1501 discuss-read-aloud-parity`. Read one summary aloud through the
+   * page's shared read-aloud owner, as the Documents reader does (`#1039`):
+   * one call for the whole summary, its blocks as `texts`, an optional
+   * from-block for a tap, and the owner's block report for the light.
+   * Absent in a host with no owner, where Read and tap-to-read stay inert.
+   */
+  readDocument?(doc: {
+    key: string;
+    title?: string;
+    texts: readonly string[];
+    kinds?: readonly string[];
+    onReadingBlock?: (block: number | null, element?: number | null) => unknown;
+  }, from?: { part: number; block: number | null }): unknown;
+  /** Stop the reading of summary `key`, where that summary's is the one playing; no other. */
+  stopSpeaking?(key: string): unknown;
 }
 
 /**
@@ -148,6 +164,15 @@ export interface DiscussPanelDependencies {
 export interface DiscussFoldState {
   record: string;
   open: string[];
+}
+
+/**
+ * `#1501 discuss-read-aloud-parity`. The shared owner's key for one saved
+ * summary: its record identity (`#1497`, scope plus `created_ms`), named as
+ * a Discuss read so a stop can scope to it alone.
+ */
+export function discussReadKey(scope: DiscussScope, createdMs: number): string {
+  return `discuss:${scope.channelId}|${scope.threadId ?? ""}|${createdMs}`;
 }
 
 /** `#1354 discuss-layout-modes`. How the panel stands: the resizable overlay, a docked
@@ -475,6 +500,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   let foldRecord: string | null = null;
   let foldOpen: ReadonlySet<string> = new Set();
   let lastFoldRecord: string | null = null;
+  // `#1501 discuss-read-aloud-parity`. The read standing: its key, its drawn
+  // blocks' texts, and the block lit now. Generation 0 until the saved
+  // record lands and names the summary's `created_ms`.
+  let readCreatedMs = 0;
+  let readKey: string | null = null;
+  let litElement: HTMLElement | null = null;
 
   /** A saved summary's record: its scope, as the server keys it, plus its generation. */
   function recordKeyFor(scope: DiscussScope, createdMs: number): string {
@@ -490,6 +521,117 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     } catch {
       return new Set();
     }
+  }
+
+  /** The block each drawn piece is, as the Documents reader walks a body. */
+  const READING_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "table"]);
+
+  /**
+   * `#1501`. The answer's drawn blocks in order, walked through folds and
+   * lists as `documentBlocks` walks a document: a fold's heading and each
+   * block under it are blocks; the collapse bar is not.
+   */
+  function discussBlocks(box: HTMLElement): HTMLElement[] {
+    const found: HTMLElement[] = [];
+    const walk = (node: Element): void => {
+      for (const kid of Array.from(node.children ?? [])) {
+        const el = kid as HTMLElement;
+        const tag = String(el.tagName || "").toLowerCase();
+        if (el.className === "discuss-collapse-bar") continue;
+        if (tag === "li") {
+          found.push(el);
+          walk(el);
+          continue;
+        }
+        if (READING_BLOCK_TAGS.has(tag)) {
+          found.push(el);
+          continue;
+        }
+        walk(el);
+      }
+    };
+    walk(box as unknown as Element);
+    return found;
+  }
+
+  /** Take the reading light off whichever block holds it. */
+  function clearReadingLight(): void {
+    if (litElement !== null && typeof litElement.removeAttribute === "function") {
+      litElement.removeAttribute("data-reading-block");
+    }
+    litElement = null;
+  }
+
+  /** The owner's block report: light the block being read, kept in view. */
+  function onReadingBlock(block: number | null, element?: number | null): void {
+    if (block === null) {
+      clearReadingLight();
+      return;
+    }
+    let box: HTMLElement;
+    try {
+      box = deps.byId("discuss-answer");
+    } catch {
+      return;
+    }
+    if (!box) return;
+    const blocks = discussBlocks(box);
+    const named = typeof element === "number" && Number.isInteger(element) ? element : block;
+    const at = block >= 0 && block < blocks.length ? block : named;
+    clearReadingLight();
+    if (at < 0 || at >= blocks.length) return;
+    const target = blocks[at] as HTMLElement;
+    target.setAttribute("data-reading-block", "current");
+    litElement = target;
+    if (typeof target.scrollIntoView === "function") target.scrollIntoView({ block: "center" });
+  }
+
+  /** Stop this summary's own reading, and only its own. */
+  function stopOwnReading(): void {
+    if (readKey !== null) deps.stopSpeaking?.(readKey);
+    clearReadingLight();
+  }
+
+  /**
+   * `#1501`. Hand the summary on screen to the shared owner in one call:
+   * ALL its drawn blocks (the Documents choice — folds never cut a read),
+   * from `fromBlock` where a tap named one.
+   */
+  function readAloud(fromBlock: number | null = null): void {
+    if (!deps.readDocument || lastScope === null || lastAnswer === null) return;
+    let box: HTMLElement;
+    try {
+      box = deps.byId("discuss-answer");
+    } catch {
+      return;
+    }
+    const blocks = discussBlocks(box);
+    // Kept one per drawn block, never filtered: a tap's index and the
+    // light's index are the drawn blocks' own indices.
+    let texts = blocks.map((el) => String(el.textContent ?? "").replace(/\s+/g, " ").trim());
+    if (texts.length === 0 || texts.every((text) => text === "")) {
+      texts = lastAnswer.text.split(/\n\s*\n/).map((chunk) => chunk.replace(/\s+/g, " ").trim()).filter((chunk) => chunk !== "");
+    }
+    if (texts.length === 0) {
+      deps.setStatus?.("Nothing to read yet.");
+      return;
+    }
+    readKey = discussReadKey(lastScope, readCreatedMs);
+    // `#1505`: the drawn blocks' kinds, in the owner's vocabulary, aligned
+    // with `texts` so speak index and highlight index are one index.
+    const kindOf = (el: HTMLElement): string => {
+      const tag = String(el.tagName || "").toLowerCase();
+      if (tag === "li") return "item";
+      if (tag === "blockquote") return "quote";
+      if (tag === "pre") return "code";
+      if (tag === "table") return "table";
+      return tag.startsWith("h") ? "heading" : "paragraph";
+    };
+    const kinds = blocks.length === texts.length ? blocks.map(kindOf) : undefined;
+    const doc = { key: readKey, title: lastScope.label, texts, ...(kinds ? { kinds } : {}), onReadingBlock };
+    void Promise.resolve(
+      fromBlock === null ? deps.readDocument(doc) : deps.readDocument(doc, { part: 0, block: fromBlock }),
+    ).catch(() => undefined);
   }
 
   /** Keep the answer box's open sections for the record they stand in. */
@@ -778,8 +920,35 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         }
         return;
       }
-      if (el === (deps.byId("discuss-answer") as unknown)) return;
+      if (el === (deps.byId("discuss-answer") as unknown)) break;
       node = (el as { parentNode?: unknown }).parentNode;
+    }
+    // `#1501 discuss-read-aloud-parity`. No citation took the tap: a tap on
+    // a drawn block reads from that block. A fold's summary (its tap folds)
+    // and the collapse bar keep their own acts.
+    if (!deps.readDocument || lastScope === null || lastAnswer === null) return;
+    let box: HTMLElement;
+    try {
+      box = deps.byId("discuss-answer");
+    } catch {
+      return;
+    }
+    let nodeUp: unknown = event.target;
+    while (nodeUp !== null && nodeUp !== undefined && nodeUp !== (box as unknown)) {
+      const elUp = nodeUp as HTMLElement;
+      const tagUp = typeof elUp.tagName === "string" ? elUp.tagName.toLowerCase() : "";
+      if (tagUp === "summary" || elUp.className === "discuss-collapse-bar") return;
+      nodeUp = (elUp as { parentNode?: unknown }).parentNode;
+    }
+    const blocks = discussBlocks(box);
+    let tapped: unknown = event.target;
+    while (tapped !== null && tapped !== undefined && tapped !== (box as unknown)) {
+      const at = blocks.indexOf(tapped as HTMLElement);
+      if (at >= 0) {
+        readAloud(at);
+        return;
+      }
+      tapped = (tapped as { parentNode?: unknown }).parentNode;
     }
   }
 
@@ -859,6 +1028,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const shape = asCatchupRecord(value);
         if (shape.summary !== null) {
           lastAnswer = shape.summary;
+          readCreatedMs = shape.created_ms;
           drawAnswer(shape.summary, recordKeyFor(scope, shape.created_ms));
           drawTerms(shape.summary);
           drawFooter(shape.summary, scope);
@@ -983,6 +1153,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   /** One catch-up for `scope` at the chosen bound; nothing starts another meanwhile. */
   function fetchFor(scope: DiscussScope, sinceMs: number | null): void {
     if (pending) return;
+    // `#1501`: a new Summarize stops the summary it replaces, by its key.
+    stopOwnReading();
+    readCreatedMs = 0;
     lastSinceMs = sinceMs;
     generation += 1;
     const asked = generation;
@@ -1077,9 +1250,16 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         }
         listening.listen(deps.byId("discuss-close"), "click", () => {
           generation += 1;
+          stopOwnReading();
           if (pending) setPending(false);
           setOpen(false);
         });
+        // `#1501 discuss-read-aloud-parity`. Read, beside Close where a host
+        // carries it: the shared owner reads the summary on screen.
+        const readButton = maybe("discuss-read");
+        if (readButton) {
+          listening.listen(readButton, "click", () => readAloud());
+        }
         // The main composer's keys (`discuss-followup-composer`): the same Enter.
         const composerKeys = createComposerKeys({
           now: () => Date.now(),
@@ -1142,6 +1322,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           if (event.key !== "Escape") return;
           if (typeof event.preventDefault === "function") event.preventDefault();
           generation += 1;
+          stopOwnReading();
           setOpen(false);
           const opener = maybe("discuss-open") as (HTMLElement & { focus?: (options?: unknown) => void }) | null;
           if (opener && typeof opener.focus === "function") opener.focus({ preventScroll: true });
@@ -1204,6 +1385,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     },
     close() {
       generation += 1;
+      stopOwnReading();
       if (pending) setPending(false);
       setOpen(false);
     },

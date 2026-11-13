@@ -517,7 +517,8 @@
 /* The block being read, inside the row being read: the row's own colour, stronger.
    `#1330 doc-read-highlight`: the same light in the Documents reader's body. */
 .md [data-reading-block="current"],
-#doc-body [data-reading-block="current"] {
+#doc-body [data-reading-block="current"],
+#discuss-answer [data-reading-block="current"] {
   background: color-mix(in srgb, var(--warn) 45%, var(--theirs));
   border-radius: 0.3rem;
   box-shadow: 0 0 0 0.2rem color-mix(in srgb, var(--warn) 45%, var(--theirs));

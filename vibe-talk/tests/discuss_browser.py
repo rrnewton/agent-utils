@@ -18,7 +18,10 @@ see "Reading…" give way to the summary with its covered-messages footer, Mark
 read sending exactly the markable ids, a footer link jumping with the panel
 still open (`#1395 discuss-scope-binding`, `#1345` keep-open), the
 summary's opened section surviving close/reopen and a reload but not a
-new Summarize (`#1497 discuss-fold-state-persist`), and
+new Summarize (`#1497 discuss-fold-state-persist`), the summary reading
+aloud through the shared owner — Read, tap-to-read from a block, the lit
+block, and stop on close (`#1501 discuss-read-aloud-parity`, the
+documents-read harness's fake device voice) — and
 the panel overlaying the list without moving #scroll-area. Condition waits
 only — no fixed sleeps in any assertion.
 """
@@ -61,6 +64,37 @@ CATCHUP_ANSWER = {
               "input_chars": 4200, "output_chars": 48},
     "turns": [],
 }
+
+# `#1501`: the documents-read harness's fake device voice (slow, so no block
+# ends by itself while the walk steps it), recording every utterance.
+DEVICE_VOICE = """(() => {
+  const spoken = [];
+  window.deviceSpeech = spoken;
+  const voice = {name: 'Check voice', lang: 'en-US', localService: true, default: true, voiceURI: 'check'};
+  const engine = {
+    paused: false, speaking: false, pending: false,
+    getVoices: () => [voice], addEventListener() {}, removeEventListener() {},
+    speak(utterance) {
+      const entry = {text: String(utterance.text), started: null, ended: null, cancelled: false};
+      spoken.push(entry);
+      setTimeout(() => {
+        if (entry.cancelled) return;
+        entry.started = performance.now();
+        if (utterance.onstart) utterance.onstart({});
+        setTimeout(() => {
+          if (entry.cancelled) return;
+          entry.ended = performance.now();
+          if (utterance.onend) utterance.onend({});
+        }, 400 * entry.text.length);
+      }, 30);
+    },
+    cancel() { for (const entry of spoken) if (entry.ended === null) entry.cancelled = true; },
+    pause() { this.paused = true; },
+    resume() { this.paused = false; },
+  };
+  Object.defineProperty(window, 'speechSynthesis', {value: engine, configurable: true});
+  window.SpeechSynthesisUtterance = function (text) { this.text = text; };
+})();"""
 
 
 def check(condition: bool, message: str) -> None:
@@ -164,6 +198,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup", catchup)
     page.route(f"**/api/v1/channels/{CHANNEL}/dismiss", dismiss)
     page.route(f"**/api/v1/channels/{CHANNEL}/restore", dismiss)
+    page.add_init_script(DEVICE_VOICE)
     page.add_init_script(
         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
     page.goto(base + "/", wait_until="load")
@@ -234,6 +269,83 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     check(page.locator("#discuss-links .discuss-link").first.text_content() == "09:51", "the footer links are not dense HH:MM")
     stamp = page.locator("#discuss-stamp").text_content() or ""
     check("in 4200 chars" in stamp and "out 48 chars" in stamp, f"the stamp line says {stamp!r}")
+
+    # `#1501 discuss-read-aloud-parity`: the summary reads through the shared
+    # owner on the device voice. Read counts its four blocks on the strip,
+    # Next steps it, closing stops it; a tap on the last block then reads
+    # from that block. The block being read is lit. Condition waits only.
+    def wait_read_count(want: str) -> None:
+        page.wait_for_function(
+            """(want) => {
+              const strip = document.getElementById('read-steer');
+              const count = document.getElementById('read-steer-count');
+              return !!strip && !strip.hidden && !!count && count.textContent.trim() === want;
+            }""", arg=want, timeout=20_000)
+
+    def wait_read_stopped() -> None:
+        page.wait_for_function(
+            """() => {
+              const owner = readAloudOwner();
+              const strip = document.getElementById('read-steer');
+              return owner.nowPlaying === null && owner.pendingRead === null && !!strip && strip.hidden
+                && document.querySelectorAll('#discuss-answer [data-reading-block]').length === 0;
+            }""", timeout=20_000)
+
+    toggle = page.locator("#audio-source")
+    check(toggle.is_visible(), "the audio source toggle is not offered with Discuss open")
+    if toggle.get_attribute("aria-checked") == "true":
+        page.click("#audio-source")
+        page.wait_for_function(
+            "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
+            timeout=20_000)
+    page.click("#discuss-read")
+    wait_read_count("1 of 4")
+    page.wait_for_function("() => window.deviceSpeech.length >= 1", timeout=20_000)
+    said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
+    check(said == ["Progress"], f"Read said {said}, not the first block alone")
+    page.wait_for_function(
+        "() => document.querySelector('#discuss-answer [data-reading-block=\"current\"]')?.textContent.trim() === 'Progress'",
+        timeout=20_000)
+    owner_id = page.evaluate("() => readAloudOwner().nowPlaying?.id || null")
+    check(isinstance(owner_id, str) and owner_id.startswith("doc:discuss:"),
+          f"the playing read is not the Discuss read: {owner_id!r}")
+    page.click("#read-next")
+    wait_read_count("2 of 4")
+    page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=20_000)
+    said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
+    check(said[-1] == "Ada shipped the fix.", f"Next said {said}, not the second block")
+    page.click("#discuss-close")
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    wait_read_stopped()
+    open_discuss()
+    page.wait_for_function(
+        "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
+        timeout=20_000)
+    page.locator("#discuss-answer .discuss-collapse-bar button").first.click()
+    page.wait_for_function(
+        "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => d.open)",
+        timeout=20_000)
+    said_before = page.evaluate("() => window.deviceSpeech.length")
+    page.locator("#discuss-answer p", has_text="Ben is reviewing it.").click()
+    wait_read_count("4 of 4")
+    page.wait_for_function(
+        f"() => window.deviceSpeech.length > {said_before}", timeout=20_000)
+    said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
+    check(said[-1] == "Ben is reviewing it.", f"the tap said {said}, not its own block")
+    page.wait_for_function(
+        "() => document.querySelector('#discuss-answer [data-reading-block=\"current\"]')?.textContent.trim() === 'Ben is reviewing it.'",
+        timeout=20_000)
+    page.click("#discuss-close")
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    wait_read_stopped()
+    open_discuss()
+    page.wait_for_function(
+        "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
+        timeout=20_000)
+    page.locator("#discuss-answer .discuss-collapse-bar button").nth(1).click()
+    page.wait_for_function(
+        "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => !d.open)",
+        timeout=20_000)
 
     # `#1497 discuss-fold-state-persist`: the summary's sections start
     # collapsed; an opened one survives close/reopen and a reload, kept on

@@ -5,7 +5,7 @@
 // Construction is inert: no element is looked up, no listener is added and nothing is
 // fetched until the controls are mounted and the panel opened.
 
-export { DISCUSS_UNAVAILABLE_HINT, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, countSince, createDiscussPanel, formatStampLine, hhmm, isDiscussUnavailable } from "./panel.ts";
+export { DISCUSS_UNAVAILABLE_HINT, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, countSince, createDiscussPanel, discussReadKey, formatStampLine, hhmm, isDiscussUnavailable } from "./panel.ts";
 export type {
   CatchupAnswer,
   CatchupFooterLink,
@@ -129,6 +129,16 @@ export interface DiscussViewDependencies {
   /** `#1497 discuss-fold-state-persist`. The kept Discuss folds, forwarded to the panel. */
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
+  /** `#1501 discuss-read-aloud-parity`. The shared read-aloud owner, forwarded to the panel. */
+  readDocument?(doc: {
+    key: string;
+    title?: string;
+    texts: readonly string[];
+    kinds?: readonly string[];
+    onReadingBlock?: (block: number | null, element?: number | null) => unknown;
+  }, from?: { part: number; block: number | null }): unknown;
+  /** Stop the reading of summary `key`, where that summary's is the one playing; no other. */
+  stopSpeaking?(key: string): unknown;
 }
 
 /** The Discuss view, as the page calls it. */
@@ -348,6 +358,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     keepMode: deps.keepMode,
     storedFolds: deps.storedFolds,
     keepFolds: deps.keepFolds,
+    readDocument: deps.readDocument,
+    stopSpeaking: deps.stopSpeaking,
   });
 
   /** Where Discuss is aimed now: the open thread, else the channel in its current view. */

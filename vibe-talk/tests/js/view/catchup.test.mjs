@@ -103,7 +103,7 @@ const IDS = [
   "discuss-followup", "discuss-send",
   "discuss-actions", "discuss-resize",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
-  "discuss-summarize", "discuss-count", "discuss-since",
+  "discuss-summarize", "discuss-count", "discuss-since", "discuss-read",
 ];
 
 /** Fire a non-click listener with a plain event carrying `props`. */
@@ -1308,6 +1308,117 @@ test("catchup folds: open sections survive close/reopen and a reload; a new summ
     alpha.open = true;
     fire(alpha, "toggle");
     assert.deepEqual(stored.value, { record: "chan-1||2000", open: ["Alpha"] }, "the new summary kept folds under the old record");
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+  }
+});
+
+// ---- #1501 discuss-read-aloud-parity ------------------------------------------------------------
+
+test("catchup read: Read hands the owner all blocks under the record key; tap, highlight, stop (#1501)", async () => {
+  const HTML = "<h2>Alpha</h2><p>first words</p><h2>Beta</h2><p>second words</p>";
+  const scope = { channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" };
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createElement: (tag) => {
+      if (tag !== "template") return foldEl(tag);
+      const template = { _html: "", content: null };
+      Object.defineProperty(template, "innerHTML", {
+        set(value) {
+          template._html = String(value);
+          const nodes = [];
+          for (const match of template._html.matchAll(/<(h[1-6]|p)>([^<]*)<\/\1>/g)) nodes.push(foldEl(match[1], match[2]));
+          template.content = { childNodes: nodes };
+        },
+        get() { return template._html; },
+      });
+      return template;
+    },
+  };
+  try {
+    const els = {};
+    for (const id of IDS) els[id] = foldEl(id.endsWith("open") || id.endsWith("close") || id.includes("mark") || id === "discuss-read" ? "button" : "div");
+    els["discuss-panel"].hidden = true;
+    const reads = [];
+    const stops = [];
+    const panel = createDiscussPanel({
+      byId: (id) => {
+        const found = els[id];
+        if (!found) throw new Error(`no element ${id}`);
+        return found;
+      },
+      catchupPost: () => Promise.resolve({
+        window: { count: 12, unread_count: 2 }, unread_ids: ["m1", "m2"], markable_ids: ["m1", "m2"],
+        cited_ids: [], footer_links: [], text: "Alpha first words. Beta second words.", text_html: HTML,
+        unknown_terms: [], stamp: null,
+      }),
+      catchupPreview: () => Promise.resolve(preview()),
+      catchupRecord: () => Promise.resolve({
+        exists: true,
+        current_summary: {
+          window: { count: 12, unread_count: 2 }, covered_ids: ["m1", "m2"], markable_ids: ["m1", "m2"],
+          cited_ids: [], footer_links: [], text: "Alpha first words. Beta second words.", text_html: HTML,
+          unknown_terms: [], stamp: null, created_ms: 4242,
+        },
+        timeline: [], staleness: null,
+      }),
+      catchupFollowup: () => Promise.resolve({}),
+      serviceName: () => "discord",
+      onJump: () => {},
+      dismissMessages: async () => {},
+      restoreMessages: async () => {},
+      storedFolds: () => null,
+      keepFolds: () => {},
+      readDocument: (doc, from) => { reads.push({ doc, from }); },
+      stopSpeaking: (key) => { stops.push(key); },
+    });
+    panel.mount();
+    panel.openWith(scope);
+    await flush();
+    await flush();
+    // Read: ONE owner call, the record key, ALL blocks (folded sections read whole).
+    click(els["discuss-read"]);
+    assert.equal(reads.length, 1, "Read did not hand the summary to the owner once");
+    assert.equal(reads[0].doc.key, "discuss:chan-1||4242", "the read key is not the saved record identity");
+    assert.deepEqual([...reads[0].doc.texts], ["Alpha", "first words", "Beta", "second words"],
+      "the read texts are not all drawn blocks in order");
+    assert.deepEqual([...reads[0].doc.kinds], ["heading", "paragraph", "heading", "paragraph"],
+      "the read kinds are not the drawn blocks' kinds, aligned with the texts");
+    assert.equal(typeof reads[0].doc.onReadingBlock, "function", "the read carries no block report");
+    // Highlight: the reported block lights, a null report clears it.
+    const blocks = [];
+    const collect = (el) => {
+      for (const kid of el.children || []) {
+        if (["P", "H1", "H2", "H3", "H4", "H5", "H6"].includes(kid.tagName)) blocks.push(kid);
+        collect(kid);
+      }
+    };
+    collect(els["discuss-answer"]);
+    assert.equal(blocks.length, 4, "the drawn blocks were not found for the highlight check");
+    reads[0].doc.onReadingBlock(1, 1);
+    assert.equal(blocks[1].getAttribute("data-reading-block"), "current", "block 1 was not lit");
+    reads[0].doc.onReadingBlock(null);
+    assert.equal(blocks[1].getAttribute("data-reading-block"), null, "the light stayed on after the read stopped");
+    // Tap-to-read: tapping the last block starts from its index.
+    reads.length = 0;
+    const ev = { target: blocks[3], preventDefault() {}, stopPropagation() {} };
+    for (const listener of [...(els["discuss-answer"].listeners.click || [])]) listener(ev);
+    assert.equal(reads.length, 1, "tapping a block started no read");
+    assert.deepEqual(reads[0].from, { part: 0, block: 3 }, "the tap did not name its block index");
+    assert.equal(reads[0].doc.key, "discuss:chan-1||4242", "the tap read under another key");
+    // Stop scoping: closing stops only this key; a new Summarize stops it too.
+    stops.length = 0;
+    click(els["discuss-close"]);
+    assert.deepEqual(stops, ["discuss:chan-1||4242"], "closing did not stop the Discuss read by its key");
+    panel.openWith(scope);
+    await flush();
+    await flush();
+    click(els["discuss-read"]);
+    stops.length = 0;
+    click(els["discuss-summarize"]);
+    await flush();
+    assert.deepEqual(stops, ["discuss:chan-1||4242"], "a new Summarize did not stop the Discuss read by its key");
   } finally {
     if (savedDocument === undefined) delete globalThis.document;
     else globalThis.document = savedDocument;

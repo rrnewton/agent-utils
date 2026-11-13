@@ -133,6 +133,7 @@ export interface ElementById {
   "discuss-menu-open": HTMLButtonElement;
   "discuss-open": HTMLButtonElement;
   "discuss-panel": HTMLDivElement;
+  "discuss-read": HTMLButtonElement;
   "discuss-resize": HTMLDivElement;
   "discuss-retry": HTMLButtonElement;
   "discuss-scope": HTMLParagraphElement;

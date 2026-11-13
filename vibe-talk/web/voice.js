@@ -451,6 +451,7 @@ function voiceCall() {
     get currentScreen() { return screens.screen(); },
     get currentView() { return screens.view(); },
     get docsReaderOpen() { return screens.view() === "docs" && documentsView.reading(); },
+    get discussOpen() { return discussView.isOpen(); },
     get CANNED_PROMPTS() { return /** @type {import("./src/view/settings/index.ts").CannedPrompt[]} */ (CANNED_PROMPTS); },
     get token() { return token; },
     get apiDecoded() { return apiDecoded; },
@@ -1135,6 +1136,18 @@ const discussView = createDiscussView({
   // this device with the rest; a new summary's keep replaces the entry whole.
   storedFolds: () => deviceSettings().get(DEVICE_SETTINGS.discussFolds),
   keepFolds: (state) => deviceSettings().keep(DEVICE_SETTINGS.discussFolds, state),
+  // `#1501 discuss-read-aloud-parity`. The summary read through the shared
+  // owner, as a document is; its stop scopes to its own key alone, as the
+  // Documents stop beside it does.
+  readDocument: (doc, from) => readAloudOwner().readDocument(doc, from),
+  stopSpeaking: (key) => {
+    const owner = readAloudOwner();
+    const id = `doc:${key}`;
+    const playing = owner.nowPlaying;
+    if ((playing && playing.kind === "document" && playing.id === id) || owner.pendingRead === id) {
+      owner.stopReading();
+    }
+  },
 });
 
 /** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */

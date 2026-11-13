@@ -39,6 +39,8 @@ export interface VoiceCallDependencies {
   currentView: string;
   /** `#1039 documents-read-parity`: the Documents reader (not its list) is the view showing. */
   docsReaderOpen: boolean;
+  /** `#1501 discuss-read-aloud-parity`: the Discuss panel stands open. */
+  discussOpen: boolean;
   CANNED_PROMPTS: { key: string; button: string; field: string; title: string; text: string; said: string; }[];
   token: () => string;
   apiDecoded: <K extends keyof VibeTalk.Contract>(type: K, path: string, options?: { method?: string; body?: unknown; signal?: AbortSignal; }) => Promise<VibeTalk.Contract[K]>;
@@ -4617,7 +4619,7 @@ function renderControls() {
   // `#1039 documents-read-parity`: the Documents reader reads through the same owner, so its
   // Read and pace are the channel's too — inert there while the pane itself stays the channel's.
   const channel = deps.currentView === "discord" && !live;
-  const reading = channel || (deps.docsReaderOpen && !live);
+  const reading = channel || ((deps.docsReaderOpen || deps.discussOpen) && !live);
   deps.el("read-aloud").hidden = !reading;
   deps.el("read-speed").hidden = !reading;
   // The archive filter belongs to the CHANNEL, so it appears with the channel and not with a call.

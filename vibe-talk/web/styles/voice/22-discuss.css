@@ -40,6 +40,13 @@
   display: none;
 }
 
+/* `#1501 discuss-read-aloud-parity`: the reading strip steers a Discuss read
+   too, so while the panel stands open it floats above it, as it floats
+   above the list under a message read. */
+body:has(#discuss-panel:not([hidden])) #read-steer {
+  z-index: calc(var(--z-modal) + 1);
+}
+
 @media (min-width: 900px) and (pointer: fine) {
   #discuss-panel {
     position: absolute;

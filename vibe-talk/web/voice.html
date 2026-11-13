@@ -405,6 +405,9 @@
                 <span class="discuss-bound">last <input id="discuss-count" type="number" min="1" step="1" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Number of unread messages"> unread since <input id="discuss-since" type="time" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Since time"></span>
               </div>
               <div id="discuss-actions" class="discuss-actions">
+                <!-- `#1501 discuss-read-aloud-parity`: Read the summary aloud
+                     through the shared owner, as the Documents reader's Read does. -->
+                <button id="discuss-read" type="button">Read</button>
                 <button id="discuss-dock-toggle" class="discuss-icon-button" type="button" aria-pressed="false" aria-label="Dock panel" title="Dock panel">
                   <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></svg>
                 </button>
