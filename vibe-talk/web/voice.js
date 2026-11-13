@@ -9034,63 +9034,17 @@ application.track(mountListWatch({
   renderSideJumpNewest: () => inColumn(columns.side, renderJumpNewest),
 }));
 /**
- * How much stands under the main screen's lists, for the dock-growth keepers below: the dock, and the
- * send card while it is docked under the thread list (`#269 approval-card-inline` x `#281 view-keys`).
- * Off the main screen the card is docked too, but there the lists are not drawn and nothing is kept.
- */
-function heightUnderLists() {
-  const card = leftEl("post-confirm");
-  const docked = screens.screen() === "main" && !card.hidden && card.getAttribute("data-place") === "dock";
-  return (el("dock").offsetHeight || 0) + (docked ? card.offsetHeight || 0 : 0);
-}
-
-/**
  * What the dock-growth keepers of Main's list and of the right column (below) noted at their last reports:
  * each list's height and `heightUnderLists`, and Main's reader's distance from its foot as a send card came
  * up docked under the thread list (`cardCameUnderLists`). One owner in web/src/view/channel/underlists.ts
- * (`#624 voice-page-modularity`).
+ * (`#624 voice-page-modularity`), destructured under their old names.
  */
-const underLists = createUnderLists();
-
-/**
- * `#280 scroll-stability` x `#281 view-keys`. The send card moved into the dock under the thread list
- * or out of it, changing `heightUnderLists` by `px`: told to Main's keeper as no growth at all, since
- * the card left the foot of Main's list, or came back to it, in the same move (`placePostCard`). The
- * right column's keeper is not told: its cards never held the card, and a move into the dock is the
- * dock growing under them, except where the change of layout that moves it puts the cards back where
- * the reader had them in the thread list (`cardsPlacedUnderLists`).
- *
- * @param {number} px
- */
-function cardMovedUnderLists(px) {
-  underLists.cardMoved(px);
-}
-
-/**
- * `#280 scroll-stability` x `#281 view-keys`. The send card came up docked under the thread list, Main's
- * reader `gap` px from the foot of its list just before (`placePostCard`). Told to Main's keeper, which
- * judges whether that reader was at the foot by `gap` at its next report, rather than by how near the
- * foot they are left: the box at the list's foot shrank in the same layout as the dock grew.
- *
- * @param {number} gap
- */
-function cardCameUnderLists(gap) {
-  underLists.cardCame(gap);
-}
-
-/**
- * `#280 scroll-stability` x `#269 approval-card-inline` x `#281 view-keys`. The cards were just put back
- * where the reader had them in the thread list, on the way back to it from two columns (`moveLayout`,
- * `layoutShown.holdListCards`), in their column as it now stands, with everything now under it: told to the right
- * column's keeper, which measures what grows under the cards from there. The send card that change moved
- * into the dock under the list, and the picker's new name if it wrapped the dock, are not the dock growing
- * under a reader at the foot of two columns' cards. Counted as growth, they took anyone within the slack
- * plus the card's height of the list's foot for a reader at it: in Chromium at a desk, the long draft's
- * card 246px tall, a reader put back 160px up the list's cards was pulled to its foot.
- */
-function cardsPlacedUnderLists() {
-  underLists.noteSide({ list: leftEl("side-scroll").clientHeight, dock: heightUnderLists() });
-}
+const underLists = createUnderLists({
+  el,
+  leftEl,
+  screens: () => screens,
+});
+const { heightUnderLists, cardMovedUnderLists, cardCameUnderLists, cardsPlacedUnderLists } = underLists;
 // The keepers of the lists' readers (`#218 desktop-dock`, `#229 desktop-two-column`, `#269 approval-card-inline` x
 // `#281 view-keys`, `#280 scroll-stability`, `#338 column-overscroll`, `#214 reply-arrow`): a reader on the newest
 // line kept on it as the dock grows under Main's list or the right column's, the right column's reader kept on its

@@ -910,7 +910,12 @@ test("`#624 voice-page-modularity`: the cards note when read runs stand suspende
 
 test("`#624 voice-page-modularity`: what stands under the lists, as each keeper noted it, and the send card's moves told to Main's", () => {
   const { createUnderLists } = CHANNEL_VIEW;
-  const under = createUnderLists();
+  const card = { hidden: false, getAttribute: () => "dock", offsetHeight: 30 };
+  const under = createUnderLists({
+    el: () => ({ offsetHeight: 50 }),
+    leftEl: (id) => (id === "post-confirm" ? card : { clientHeight: 500 }),
+    screens: () => ({ screen: () => "main" }),
+  });
   under.cardMoved(40);
   under.cardCame(12);
   assert.deepStrictEqual([under.main(), under.side()], [null, null], "nothing before the first report");
@@ -921,6 +926,13 @@ test("`#624 voice-page-modularity`: what stands under the lists, as each keeper 
   assert.deepStrictEqual(under.main(), { list: 600, dock: 296, gap: 12 });
   under.noteSide({ list: 500, dock: 50 });
   assert.deepStrictEqual(under.side(), { list: 500, dock: 50 }, "the right column's note is its own");
+  under.cardMovedUnderLists(-246);
+  assert.deepStrictEqual(under.main(), { list: 600, dock: 50, gap: 12 }, "the card's move back is no growth either");
+  under.cardCameUnderLists(7);
+  assert.deepStrictEqual(under.main(), { list: 600, dock: 50, gap: 7 }, "the card's coming was not told by its wrapper");
+  assert.equal(under.heightUnderLists(), 80, "the dock and the docked card are not both measured");
+  under.cardsPlacedUnderLists();
+  assert.deepStrictEqual(under.side(), { list: 500, dock: 80 }, "the cards placed were not noted as they stand");
 });
 
 test("`#624 voice-page-modularity`: which rows are being built is said only while they are, and their builder's answer comes back", () => {
@@ -1199,7 +1211,11 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
   const was = globalThis.setTimeout;
   globalThis.setTimeout = (act) => { timers.push(act); return timers.length; };
   try {
-    const underLists = createUnderLists();
+    const underLists = createUnderLists({
+      el: () => ({ offsetHeight: 0 }),
+      leftEl: () => ({ hidden: true, getAttribute: () => null, clientHeight: 0 }),
+      screens: () => ({ screen: () => "main" }),
+    });
     const keepers = mountListKeepers({
       canWatchSizes: () => state.sizes,
       sizeWatcher: (report) => { const watcher = { report, watched: [], stopped: false, observe(target) { this.watched.push(target.id); }, disconnect() { this.stopped = true; } }; watchers.push(watcher); return watcher; },

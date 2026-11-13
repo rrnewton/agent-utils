@@ -6168,9 +6168,9 @@ test("`#269 approval-card-inline` x `#281 view-keys`: a draft arriving under the
   assert.deepStrictEqual(late, { ...real, footAtOnce: false });
   // The keepers told of the dock alone: the card growing leaves both readers above their foot.
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: the growth is more than the slack");
-  const dockOnly = await run(brokenScript(
-    "  return (el(\"dock\").offsetHeight || 0) + (docked ? card.offsetHeight || 0 : 0);",
-    "  return el(\"dock\").offsetHeight || 0;"));
+  const dockOnly = await run(await brokenModule([{ file: "src/view/channel/underlists.ts",
+    find: "    return (deps.el(\"dock\").offsetHeight || 0) + (docked ? card.offsetHeight || 0 : 0);",
+    replace: "    return deps.el(\"dock\").offsetHeight || 0;" }]));
   assert.deepStrictEqual(dockOnly, { ...real, grewFoot: false });
   // The keys given to the box of the list behind the thread list, as on the channel.
   const behind = await run(await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (deps.threadListOnScreen()) {\n    deps.focusList(deps.sidePane);\n    return;\n  }\n", replace: "" }]));
