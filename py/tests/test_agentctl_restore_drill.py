@@ -49,6 +49,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -202,7 +203,9 @@ class Drill:
         self.tools_dir.mkdir()
         (self.root / "xdg-data").mkdir()
         (self.root / "xdg-state").mkdir()
-        (self.root / "home").mkdir()
+        # A short scratch HOME: under the deep pytest root the Herdr
+        # session socket path would exceed the sockaddr_un limit.
+        self.home = Path(tempfile.mkdtemp(prefix="agentctl-drill-home-"))
         self.env_file.write_text("# drill launch env\n", encoding="utf-8")
         subprocess.run(
             ["git", "init", "-q", str(self.project)],
@@ -328,7 +331,7 @@ class Drill:
             env["HERDR_SOCKET_PATH"] = str(self.socket)
         env["AGENTCTL_MUSE_BIN"] = str(self.fake)
         env["AGENTCTL_WRKSLOTS_BIN"] = str(WRKSLOTS_BIN)
-        env["HOME"] = str(self.root / "home")
+        env["HOME"] = str(self.home)
         env["XDG_DATA_HOME"] = str(self.root / "xdg-data")
         env["XDG_STATE_HOME"] = str(self.root / "xdg-state")
         env["FAKE_HARNESS_LOG_DIR"] = str(self.log_dir)
@@ -643,6 +646,7 @@ class Drill:
             while _ps_comm(pid) != "" and time.monotonic() < deadline:
                 time.sleep(0.1)
             assert _ps_comm(pid) == "", (name, pid)
+        shutil.rmtree(self.home, ignore_errors=True)
 
     def __enter__(self) -> Drill:
         return self
