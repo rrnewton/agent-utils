@@ -467,6 +467,38 @@ def test_finish_accounting_open_both_editions(tmp_path: Path) -> None:
     assert _accounting_of(json.loads(result.stdout))["open"] == 1
 
 
+def test_finish_accounting_open_replay_both_editions(tmp_path: Path) -> None:
+    (rust_root, rust_up, rust_co), (oracle_root, oracle_up, oracle_co) = _bare_pair(tmp_path)
+    for upstream, checkout in ((rust_up, rust_co), (oracle_up, oracle_co)):
+        commit = _commit_in(checkout, "open replay")
+        _git(upstream, "cherry-pick", commit)
+        _git(upstream, "commit", "-q", "--amend", "-m", "open replay (replayed)")
+        _git(upstream, "push", "-q", "origin", "HEAD:refs/heads/pr/open-replay")
+        _git(upstream, "reset", "-q", "--hard", "HEAD~1")
+    assert _python_finish(oracle_root) == 0
+    result = _rust_finish(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _accounting_of(json.loads(result.stdout))["open"] == 1
+
+
+def test_finish_accounting_many_remote_refs_both_editions(tmp_path: Path) -> None:
+    (rust_root, rust_up, rust_co), (oracle_root, oracle_up, oracle_co) = _bare_pair(tmp_path)
+    for upstream, checkout in ((rust_up, rust_co), (oracle_up, oracle_co)):
+        commit = _commit_in(checkout, "open replay many")
+        _git(upstream, "cherry-pick", commit)
+        _git(upstream, "commit", "-q", "--amend", "-m", "open replay many (replayed)")
+        _git(upstream, "push", "-q", "origin", "HEAD:refs/heads/pr/open-replay")
+        _git(upstream, "reset", "-q", "--hard", "HEAD~1")
+        base = _git(upstream, "rev-parse", "HEAD")
+        for index in range(300):
+            _git(upstream, "update-ref", f"refs/heads/rescue/r{index:03d}", base)
+        _git(upstream, "push", "-q", "origin", "+refs/heads/rescue/*:refs/heads/rescue/*")
+    assert _python_finish(oracle_root) == 0
+    result = _rust_finish(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _accounting_of(json.loads(result.stdout))["open"] == 1
+
+
 def test_finish_accounting_unaccounted_both_editions(tmp_path: Path) -> None:
     (rust_root, _rust_up, rust_co), (oracle_root, _oracle_up, oracle_co) = _bare_pair(tmp_path)
     for checkout in (rust_co, oracle_co):

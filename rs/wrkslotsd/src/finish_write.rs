@@ -946,6 +946,7 @@ pub(crate) fn fetch_remote(
 }
 
 /// One checkout's (or nested worktree's) commit accounting (#1364).
+#[derive(Clone)]
 pub(crate) struct AccountingEntry {
     pub(crate) checkout: String,
     pub(crate) landed: Vec<(String, String)>,
@@ -980,6 +981,132 @@ fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     Ok(result.code == 0)
 }
 
+/// Run `git patch-id --stable` over one prepared patch stream (#1488).
+fn git_patch_id(path: &Path, input: &str) -> Result<String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-replace-objects",
+            "-c",
+            "core.useReplaceRefs=false",
+            "-C",
+        ])
+        .arg(path)
+        .args(["patch-id", "--stable"])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in std::env::vars() {
+        if !key.starts_with("GIT_") {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot execute Git: {error}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot execute Git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Git refused in {}: git patch-id --stable: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Patch-id by commit for every non-merge commit one log pass names.
+fn patch_ids(
+    path: &Path,
+    log_args: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut args: Vec<String> = vec![
+        "log".to_string(),
+        "-p".to_string(),
+        "--no-merges".to_string(),
+        "--format=commit %H".to_string(),
+    ];
+    args.extend(log_args.iter().cloned());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let logged = git(path, &refs)?;
+    if logged.trim().is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let patched = git_patch_id(path, &logged)?;
+    let mut found = std::collections::HashMap::new();
+    for line in patched.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(patch_id), Some(commit)) = (parts.next(), parts.next()) {
+            if is_sha(commit) {
+                found.insert(commit.to_string(), patch_id.to_string());
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn commit_patch_ids(
+    path: &Path,
+    commits: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    if commits.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut args: Vec<String> = vec!["--no-walk".to_string()];
+    args.extend(commits.iter().cloned());
+    patch_ids(path, &args)
+}
+
+/// Candidates whose patch-id appears on any published ref, in one pass.
+fn published_patch_equivalents(
+    path: &Path,
+    remote: &str,
+    head: &str,
+    landed_ref: &str,
+    candidate_patch_ids: &std::collections::HashMap<String, String>,
+    merge_base: Option<&str>,
+) -> Result<std::collections::HashSet<String>> {
+    if candidate_patch_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mut args: Vec<String> = vec![
+        format!("--remotes={remote}"),
+        "--not".to_string(),
+        head.to_string(),
+        "--not".to_string(),
+        landed_ref.to_string(),
+    ];
+    if let Some(base) = merge_base {
+        if is_sha(base) {
+            args.push("--not".to_string());
+            args.push(base.to_string());
+        }
+    }
+    let remote_ids: std::collections::HashSet<String> =
+        patch_ids(path, &args)?.into_values().collect();
+    Ok(candidate_patch_ids
+        .iter()
+        .filter(|(_, patch_id)| remote_ids.contains(*patch_id))
+        .map(|(commit, _)| commit.clone())
+        .collect())
+}
+
 fn patch_equivalents(
     path: &Path,
     upstream: &str,
@@ -1007,6 +1134,7 @@ fn classify_commits(
     head: &str,
     base: Option<&str>,
 ) -> Result<AccountingEntry> {
+    let mut merge_base_opt: Option<String> = None;
     let candidates: Vec<String> = match base {
         Some(start) if is_sha(start) && is_ancestor(path, start, head)? => {
             git(path, &["rev-list", &format!("{start}..{head}")])?
@@ -1019,6 +1147,7 @@ fn classify_commits(
             let merge_base = git_run(path, &["merge-base", head, landed_ref], false)?;
             let base_sha = merge_base.stdout.trim().to_string();
             if merge_base.code == 0 && is_sha(&base_sha) {
+                merge_base_opt = Some(base_sha.clone());
                 git(path, &["rev-list", &format!("{base_sha}..{head}")])?
                     .lines()
                     .filter(|line| !line.is_empty())
@@ -1033,18 +1162,65 @@ fn classify_commits(
             }
         }
     };
+    // Landed in one cherry pass, then open by exact containment; only
+    // the rest pay for published patch equivalence, in one pass (#1488).
     let landed_eq = patch_equivalents(path, landed_ref, head)?;
-    let published = git(
-        path,
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            &format!("refs/remotes/{remote}/"),
-        ],
-    )?;
-    let mut open_eq = std::collections::HashSet::new();
-    for reference in published.lines().filter(|line| !line.is_empty()) {
-        open_eq.extend(patch_equivalents(path, reference.trim(), head)?);
+    let mut subjects: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut verdict: std::collections::HashMap<String, &'static str> =
+        std::collections::HashMap::new();
+    let mut remaining: Vec<String> = Vec::new();
+    for commit in &candidates {
+        let subject = git(path, &["show", "-s", "--format=%s", commit])?
+            .trim()
+            .to_string();
+        subjects.insert(commit.clone(), subject);
+        if is_ancestor(path, commit, landed_ref)? || landed_eq.contains(commit) {
+            verdict.insert(commit.clone(), "landed");
+            continue;
+        }
+        let containing = git(
+            path,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "--contains",
+                commit,
+                &format!("refs/remotes/{remote}/"),
+            ],
+        )?;
+        if containing.lines().any(|line| !line.is_empty()) {
+            verdict.insert(commit.clone(), "open");
+        } else {
+            remaining.push(commit.clone());
+        }
+    }
+    if !remaining.is_empty() {
+        if merge_base_opt.is_none() {
+            let merge_base = git_run(path, &["merge-base", head, landed_ref], false)?;
+            let base_sha = merge_base.stdout.trim().to_string();
+            if merge_base.code == 0 && is_sha(&base_sha) {
+                merge_base_opt = Some(base_sha);
+            }
+        }
+        let candidate_ids = commit_patch_ids(path, &remaining)?;
+        let open_eq = published_patch_equivalents(
+            path,
+            remote,
+            head,
+            landed_ref,
+            &candidate_ids,
+            merge_base_opt.as_deref(),
+        )?;
+        for commit in &remaining {
+            verdict.insert(
+                commit.clone(),
+                if open_eq.contains(commit) {
+                    "open"
+                } else {
+                    "unaccounted"
+                },
+            );
+        }
     }
     let mut entry = AccountingEntry {
         checkout: name.to_string(),
@@ -1054,25 +1230,11 @@ fn classify_commits(
         bundle_ref: None,
     };
     for commit in candidates {
-        let subject = git(path, &["show", "-s", "--format=%s", &commit])?
-            .trim()
-            .to_string();
-        let containing = git(
-            path,
-            &[
-                "for-each-ref",
-                "--format=%(refname)",
-                "--contains",
-                &commit,
-                &format!("refs/remotes/{remote}/"),
-            ],
-        )?;
-        if is_ancestor(path, &commit, landed_ref)? || landed_eq.contains(&commit) {
-            entry.landed.push((commit, subject));
-        } else if containing.lines().any(|line| !line.is_empty()) || open_eq.contains(&commit) {
-            entry.opened.push((commit, subject));
-        } else {
-            entry.unaccounted.push((commit, subject));
+        let subject = subjects.get(&commit).cloned().unwrap_or_default();
+        match verdict.get(&commit).copied().unwrap_or("unaccounted") {
+            "landed" => entry.landed.push((commit, subject)),
+            "open" => entry.opened.push((commit, subject)),
+            _ => entry.unaccounted.push((commit, subject)),
         }
     }
     Ok(entry)
@@ -1988,6 +2150,183 @@ pub(crate) fn assert_slot_contents(cfg: &Cfg, record: &Value) -> Result<PathBuf>
     Ok(slot_dir)
 }
 
+/// Gather finish accounting for one record (preconditions + classify).
+fn gather_finish_accounting(
+    cfg: &Cfg,
+    config: &Value,
+    record: &Value,
+    slot_path: &Path,
+) -> Result<(Vec<Value>, Vec<AccountingEntry>)> {
+    let mut entries: Vec<AccountingEntry> = Vec::new();
+    let mut final_checkouts: Vec<Value> = Vec::new();
+    let checkouts_now = record
+        .get("checkouts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let recorded_paths: Vec<PathBuf> = checkouts_now
+        .iter()
+        .map(|checkout| {
+            stored_path(
+                cfg,
+                checkout
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "checkout path",
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for checkout in &checkouts_now {
+        let repository_raw = checkout
+            .get("repository")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (_stored, repository) = stored_repository_path(cfg, repository_raw)?;
+        final_checkouts.push(assert_checkout_safe_accounting(
+            cfg,
+            config,
+            checkout,
+            &repository,
+            Some(&mut entries),
+        )?);
+        let remote = checkout
+            .get("remote")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let landed_ref = checkout
+            .get("landed_ref")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let checkout_name = checkout
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        for listed in listed_worktrees(&repository)? {
+            if recorded_paths.contains(&listed) {
+                continue;
+            }
+            if !listed.starts_with(slot_path) {
+                continue;
+            }
+            let head = git(&listed, &["rev-parse", "--verify", "HEAD^{commit}"])?
+                .trim()
+                .to_string();
+            let branch = checkout_branch(&listed).unwrap_or_else(|_| "HEAD".to_string());
+            let mut entry = classify_commits(
+                &format!(
+                    "{}+nested:{}",
+                    checkout_name,
+                    listed.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                &listed,
+                &remote,
+                &landed_ref,
+                &head,
+                None,
+            )?;
+            entry.bundle_ref = Some(if branch == "HEAD" {
+                "HEAD".to_string()
+            } else {
+                format!("refs/heads/{branch}")
+            });
+            entries.push(entry);
+        }
+    }
+    Ok((final_checkouts, entries))
+}
+
+/// (checkout, HEAD, landed tip) for revalidating a lock-free gather.
+fn finish_checkout_tips(cfg: &Cfg, record: &Value) -> Vec<(String, String, String)> {
+    let mut tips = Vec::new();
+    if let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) {
+        for checkout in checkouts {
+            let name = checkout
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let landed_ref = checkout
+                .get("landed_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (head, landed) = match stored_path(
+                cfg,
+                checkout
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "checkout path",
+            ) {
+                Ok(path) => {
+                    let head = git(&path, &["rev-parse", "--verify", "HEAD^{commit}"])
+                        .map(|value| value.trim().to_string())
+                        .unwrap_or_default();
+                    let landed = git(
+                        &path,
+                        &["rev-parse", "--verify", &format!("{landed_ref}^{{commit}}")],
+                    )
+                    .map(|value| value.trim().to_string())
+                    .unwrap_or_default();
+                    (head, landed)
+                }
+                Err(_) => (String::new(), String::new()),
+            };
+            tips.push((name, head, landed));
+        }
+    }
+    tips
+}
+
+/// Finish accounting gathered with no mutation lock held (#1488).
+struct PreparedFinishAccounting {
+    record: Value,
+    tips: Vec<(String, String, String)>,
+    final_checkouts: Vec<Value>,
+    entries: Vec<AccountingEntry>,
+}
+
+fn prepare_finish_accounting(
+    root: Option<&Path>,
+    cfg: &Cfg,
+    selected: &str,
+    config: &Value,
+    slot: &str,
+) -> Option<PreparedFinishAccounting> {
+    let active = active_document(root, cfg, selected).ok()?;
+    let record = active
+        .get("slots")
+        .and_then(Value::as_array)
+        .and_then(|slots| {
+            slots
+                .iter()
+                .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
+        })
+        .cloned()?;
+    if !record
+        .get("handoff")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .is_null()
+    {
+        return None;
+    }
+    assert_record_paths(cfg, &record).ok()?;
+    let slot_path = assert_slot_contents(cfg, &record).ok()?;
+    let (final_checkouts, entries) =
+        gather_finish_accounting(cfg, config, &record, &slot_path).ok()?;
+    let tips = finish_checkout_tips(cfg, &record);
+    Some(PreparedFinishAccounting {
+        record,
+        tips,
+        final_checkouts,
+        entries,
+    })
+}
+
 /// Record the finish handoff for the named slot.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_slot(
@@ -2015,6 +2354,9 @@ pub(crate) fn finish_slot(
     }
     let supplied = read_process_identity(owner_pid)?;
     assert_caller(&supplied, "owner")?;
+    // Accounting gathered with no lock held (#1488); reused under the
+    // lock only while the record and checkout tips still match.
+    let prepared = prepare_finish_accounting(root, &cfg, &selected, &config, slot);
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state_allow_seals(&cfg.control)?;
     validate_global(root, &cfg)?;
@@ -2122,8 +2464,6 @@ pub(crate) fn finish_slot(
     }
     assert_record_paths(&cfg, &record)?;
     let slot_path = assert_slot_contents(&cfg, &record)?;
-    let mut entries: Vec<AccountingEntry> = Vec::new();
-    let mut final_checkouts: Vec<Value> = Vec::new();
     let checkouts_now = record
         .get("checkouts")
         .and_then(Value::as_array)
@@ -2142,66 +2482,15 @@ pub(crate) fn finish_slot(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    for checkout in &checkouts_now {
-        let repository_raw = checkout
-            .get("repository")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let (_stored, repository) = stored_repository_path(&cfg, repository_raw)?;
-        final_checkouts.push(assert_checkout_safe_accounting(
-            &cfg,
-            &config,
-            checkout,
-            &repository,
-            Some(&mut entries),
-        )?);
-        // Nested linked worktrees inside the slot (#1364).
-        let remote = checkout
-            .get("remote")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let landed_ref = checkout
-            .get("landed_ref")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let checkout_name = checkout
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        for listed in listed_worktrees(&repository)? {
-            if recorded_paths.contains(&listed) {
-                continue;
-            }
-            if !listed.starts_with(&slot_path) {
-                continue;
-            }
-            let head = git(&listed, &["rev-parse", "--verify", "HEAD^{commit}"])?
-                .trim()
-                .to_string();
-            let branch = checkout_branch(&listed).unwrap_or_else(|_| "HEAD".to_string());
-            let mut entry = classify_commits(
-                &format!(
-                    "{}+nested:{}",
-                    checkout_name,
-                    listed.file_name().unwrap_or_default().to_string_lossy()
-                ),
-                &listed,
-                &remote,
-                &landed_ref,
-                &head,
-                None,
-            )?;
-            entry.bundle_ref = Some(if branch == "HEAD" {
-                "HEAD".to_string()
-            } else {
-                format!("refs/heads/{branch}")
-            });
-            entries.push(entry);
+    let (final_checkouts, entries) = match &prepared {
+        Some(prepared)
+            if prepared.record == record
+                && finish_checkout_tips(&cfg, &record) == prepared.tips =>
+        {
+            (prepared.final_checkouts.clone(), prepared.entries.clone())
         }
-    }
+        _ => gather_finish_accounting(&cfg, &config, &record, &slot_path)?,
+    };
     let (landed_count, open_count, unaccounted) = accounting_totals(&entries);
     if !unaccounted.is_empty() && !discard_unaccounted {
         return Err(accounting_refusal(slot, &entries));

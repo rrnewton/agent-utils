@@ -207,6 +207,121 @@ def test_discard_unaccounted_finishes_and_records(tmp_path: Path) -> None:
     _git(checkout, "bundle", "verify", str(bundles[0]))
 
 
+def test_open_by_replay_on_published_ref(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root, upstream, checkout = _fixture(tmp_path)
+    commit = _commit(checkout, "a.txt", "a\n", "open replay")
+    _git(upstream, "cherry-pick", commit)
+    _git(upstream, "commit", "-q", "--amend", "-m", "open replay (replayed)")
+    replayed = _git(upstream, "rev-parse", "HEAD")
+    assert replayed != commit
+    _git(upstream, "push", "-q", "origin", "HEAD:refs/heads/pr/open-replay")
+    _git(upstream, "reset", "-q", "--hard", "HEAD~1")
+    assert _finish(root) == 0
+    out = capsys.readouterr().out
+    assert "accounting landed=0 open=1 unaccounted=0" in out
+
+
+def _classify_repo(base: Path) -> tuple[Path, str, str, str]:
+    """(repo, base, candidate, head) with candidate on branch work."""
+    repo = base / "classify-repo"
+    base_sha = _repo(repo)
+    _git(repo, "checkout", "-q", "-b", "work")
+    candidate = _commit(repo, "a.txt", "a\n", "candidate change")
+    return repo, base_sha, candidate, candidate
+
+
+def _checkout_for(base_sha: str, head: str) -> wrkslots_cli.Checkout:
+    return wrkslots_cli.Checkout(
+        name="repo",
+        path="repo",
+        repository="repo",
+        branch="work",
+        start_point=base_sha,
+        remote="origin",
+        remote_url_sha256="0" * 64,
+        landed_ref="refs/remotes/origin/main",
+        head=head,
+    )
+
+
+def _classify(
+    repo: Path, base_sha: str, head: str
+) -> dict[str, object]:
+    return wrkslots_cli._classify_checkout_commits(
+        _checkout_for(base_sha, head), repo, head, wrkslots_cli._GitVcs(), base=base_sha
+    )
+
+
+def _replay_on(base: Path, repo: Path, base_sha: str, candidate: str, ref: str) -> str:
+    _git(repo, "checkout", "-q", "-b", "replay-tmp", base_sha)
+    _git(repo, "cherry-pick", candidate)
+    _git(repo, "commit", "-q", "--amend", "-m", "candidate change (replayed)")
+    replayed = _git(repo, "rev-parse", "HEAD")
+    assert replayed != candidate
+    _git(repo, "update-ref", ref, replayed)
+    _git(repo, "checkout", "-q", "work")
+    _git(repo, "branch", "-q", "-D", "replay-tmp")
+    return replayed
+
+
+def test_classify_published_replay_is_open(tmp_path: Path) -> None:
+    repo, base_sha, candidate, head = _classify_repo(tmp_path)
+    _git(repo, "update-ref", "refs/remotes/origin/main", base_sha)
+    _replay_on(tmp_path, repo, base_sha, candidate, "refs/remotes/origin/pr")
+    entry = _classify(repo, base_sha, head)
+    assert entry["open"] == [(candidate, "candidate change")]
+    assert entry["landed"] == []
+    assert entry["unaccounted"] == []
+
+
+def test_classify_landed_replay_is_landed(tmp_path: Path) -> None:
+    repo, base_sha, candidate, head = _classify_repo(tmp_path)
+    _replay_on(tmp_path, repo, base_sha, candidate, "refs/remotes/origin/main")
+    entry = _classify(repo, base_sha, head)
+    assert entry["landed"] == [(candidate, "candidate change")]
+    assert entry["open"] == []
+    assert entry["unaccounted"] == []
+
+
+def test_classify_no_counterpart_is_unaccounted(tmp_path: Path) -> None:
+    repo, base_sha, candidate, head = _classify_repo(tmp_path)
+    _git(repo, "update-ref", "refs/remotes/origin/main", base_sha)
+    entry = _classify(repo, base_sha, head)
+    assert entry["unaccounted"] == [(candidate, "candidate change")]
+    assert entry["landed"] == []
+    assert entry["open"] == []
+
+
+def test_classify_git_invocations_constant_in_remote_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, base_sha, candidate, head = _classify_repo(tmp_path)
+    _git(repo, "update-ref", "refs/remotes/origin/main", base_sha)
+    _replay_on(tmp_path, repo, base_sha, candidate, "refs/remotes/origin/pr")
+    calls: list[tuple[str, ...]] = []
+    original = wrkslots_cli._GitVcs._run
+
+    def counting(repository: Path, args: object, **kwargs: object) -> object:
+        calls.append(tuple(str(item) for item in args))  # type: ignore[arg-type]
+        return original(repository, args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots_cli._GitVcs, "_run", staticmethod(counting))
+    first = _classify(repo, base_sha, head)
+    first_count = len(calls)
+    assert first["open"] == [(candidate, "candidate change")]
+    # Thousands of extra published refs naming the already-accounted base
+    # must not add a single Git invocation (#1488).
+    for index in range(2000):
+        _git(repo, "update-ref", f"refs/remotes/origin/rescue/r{index:04d}", base_sha)
+    calls.clear()
+    second = _classify(repo, base_sha, head)
+    assert second == first
+    assert len(calls) == first_count
+    assert first_count < 60
+
+
 def test_nested_worktree_unaccounted_refuses(tmp_path: Path) -> None:
     root, _upstream, checkout = _fixture(tmp_path)
     nested = checkout / "nested-wt"

@@ -20902,6 +20902,78 @@ class _GitVcs:
                 equivalents.add(sha)
         return frozenset(equivalents)
 
+    def _patch_ids(
+        self, checkout: Path, log_args: Sequence[str]
+    ) -> dict[str, str]:
+        """Patch-id of every non-merge commit one ``git log -p`` names.
+
+        One log invocation plus one ``git patch-id --stable`` over its
+        whole output (#1488): the count does not grow with the number of
+        commits or refs walked.
+        """
+        result = self._run(
+            checkout,
+            ["log", "-p", "--no-merges", "--format=commit %H", *log_args],
+        )
+        if not result.stdout.strip():
+            return {}
+        patched = self._run(
+            checkout, ["patch-id", "--stable"], input_text=result.stdout
+        )
+        found: dict[str, str] = {}
+        for line in patched.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and SHA_RE.fullmatch(parts[1]):
+                found[parts[1]] = parts[0]
+        return found
+
+    def commit_patch_ids(
+        self, checkout: Path, commits: Sequence[str]
+    ) -> dict[str, str]:
+        """Patch-id by commit for the named commits only (``--no-walk``)."""
+        for commit in commits:
+            if not SHA_RE.fullmatch(commit):
+                raise Refusal(f"cannot read patch-id for invalid commit {commit!r}")
+        if not commits:
+            return {}
+        return self._patch_ids(checkout, ["--no-walk", *commits])
+
+    def published_patch_equivalents(
+        self,
+        checkout: Path,
+        remote: str,
+        head: str,
+        landed_ref: str,
+        candidate_patch_ids: Mapping[str, str],
+        *,
+        merge_base: str | None,
+    ) -> frozenset[str]:
+        """Candidates whose patch-id appears on any published ref (#1488).
+
+        A single bounded pass replaces one ``git cherry`` per published
+        ref: one ``git log -p`` over ``--remotes=<remote> --not <head>``,
+        bounded further by ``--not <landed_ref>`` and, when known, the
+        merge base with the landed ref, piped through ``git patch-id``
+        once. Patches already in the landed ref cannot match a remaining
+        candidate (the landed cherry pass removed those), so excluding
+        the landed history changes no remaining classification.
+        """
+        _validate_remote(remote)
+        if not candidate_patch_ids:
+            return frozenset()
+        log_args: list[str] = [f"--remotes={remote}", "--not", head]
+        log_args.extend(["--not", landed_ref])
+        if merge_base is not None and SHA_RE.fullmatch(merge_base):
+            log_args.extend(["--not", merge_base])
+        remote_patch_ids = set(self._patch_ids(checkout, log_args).values())
+        if not remote_patch_ids:
+            return frozenset()
+        return frozenset(
+            commit
+            for commit, patch_id in candidate_patch_ids.items()
+            if patch_id in remote_patch_ids
+        )
+
     def is_ancestor(self, checkout: Path, ancestor: str, descendant: str) -> bool:
         self.verify_ref(checkout, descendant, "landed ref")
         result = self._run(
@@ -26763,6 +26835,7 @@ def _classify_checkout_commits(
     and unaccounted otherwise.
     """
     landed_ref = checkout.landed_ref
+    merge_base: str | None = None
     if base is not None and SHA_RE.fullmatch(base) and vcs.is_ancestor(path, base, head):
         candidates = vcs.rev_list(path, f"{base}..{head}")
     else:
@@ -26772,30 +26845,47 @@ def _classify_checkout_commits(
             if merge_base is not None
             else vcs.rev_list(path, head)
         )
+    # Landed first, in one cherry pass as before (#1488). Then open by
+    # exact containment. Only the still-unaccounted candidates pay for
+    # patch equivalence against published refs, in a single pass whose
+    # Git-invocation count does not grow with the published-ref count.
     landed_equivalents = vcs.patch_equivalents(path, landed_ref, head)
-    published = vcs._run(
-        path,
-        ["for-each-ref", "--format=%(refname)", f"refs/remotes/{checkout.remote}/"],
-    ).stdout.splitlines()
-    open_equivalents: set[str] = set()
-    for ref in published:
-        ref = ref.strip()
-        if ref:
-            open_equivalents |= vcs.patch_equivalents(path, ref, head)
+    subjects: dict[str, str] = {}
+    verdict: dict[str, str] = {}
+    remaining: list[str] = []
+    for commit in candidates:
+        subjects.setdefault(commit, vcs.commit_subject(path, commit))
+        if vcs.is_ancestor(path, commit, landed_ref) or commit in landed_equivalents:
+            verdict[commit] = "landed"
+        elif vcs.remote_refs_containing(path, checkout.remote, commit):
+            verdict[commit] = "open"
+        else:
+            remaining.append(commit)
+    if remaining:
+        if merge_base is None:
+            merge_base = vcs.merge_base(path, head, landed_ref)
+        candidate_patch_ids = vcs.commit_patch_ids(path, remaining)
+        open_equivalents = vcs.published_patch_equivalents(
+            path,
+            checkout.remote,
+            head,
+            landed_ref,
+            candidate_patch_ids,
+            merge_base=merge_base,
+        )
+        for commit in remaining:
+            verdict[commit] = "open" if commit in open_equivalents else "unaccounted"
     landed: list[tuple[str, str]] = []
     opened: list[tuple[str, str]] = []
     unaccounted: list[tuple[str, str]] = []
-    subjects: dict[str, str] = {}
     for commit in candidates:
-        subject = subjects.setdefault(commit, vcs.commit_subject(path, commit))
-        if vcs.is_ancestor(path, commit, landed_ref) or commit in landed_equivalents:
-            landed.append((commit, subject))
-        elif vcs.remote_refs_containing(path, checkout.remote, commit) or (
-            commit in open_equivalents
-        ):
-            opened.append((commit, subject))
+        pair = (commit, subjects[commit])
+        if verdict[commit] == "landed":
+            landed.append(pair)
+        elif verdict[commit] == "open":
+            opened.append(pair)
         else:
-            unaccounted.append((commit, subject))
+            unaccounted.append(pair)
     return {
         "checkout": checkout.name,
         "head": head,
@@ -53631,6 +53721,77 @@ def _complete_deferred_finish(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _PreparedFinishAccounting:
+    """Finish accounting gathered with no registry lock held (#1488).
+
+    Reused under the lock only while the slot record, the lock-scope
+    fingerprint, and every landed-ref tip still match the gather.
+    """
+
+    record: ActiveRecord
+    fingerprint: _LockScopeFingerprint
+    landed_tips: tuple[tuple[str, str], ...]
+    slot_path: Path
+    final_checkouts: tuple[Checkout, ...]
+    accounting: tuple[dict[str, object], ...]
+
+
+def _finish_landed_tips(
+    config: Config, record: ActiveRecord, vcs: _GitVcs
+) -> tuple[tuple[str, str], ...]:
+    tips: list[tuple[str, str]] = []
+    for checkout in record.checkouts:
+        if checkout.vcs == "eden":
+            tips.append((checkout.name, ""))
+            continue
+        path = _stored_path(config, checkout.path, "checkout path")
+        try:
+            tip = vcs.verify_ref(path, checkout.landed_ref, "landed ref")
+        except Exception:
+            tip = ""
+        tips.append((checkout.name, tip))
+    return tuple(tips)
+
+
+def _prepare_finish_accounting(
+    config: Config, slot: str
+) -> _PreparedFinishAccounting | None:
+    """Gather finish accounting lock-free; None means use the locked path."""
+    try:
+        vcs = _GitVcs()
+        record = _find_record(_load_active(config), slot)
+        if record.handoff is not None:
+            return None
+        sink: list[dict[str, object]] = []
+        slot_path, final_checkouts = _handoff_preconditions(
+            config, record, vcs, accounting=True, accounting_sink=sink
+        )
+        return _PreparedFinishAccounting(
+            record=record,
+            fingerprint=_lock_scope_fingerprint(config, record, vcs),
+            landed_tips=_finish_landed_tips(config, record, vcs),
+            slot_path=slot_path,
+            final_checkouts=final_checkouts,
+            accounting=tuple(sink),
+        )
+    except Exception:
+        return None
+
+
+def _prepared_finish_accounting_current(
+    config: Config,
+    prepared: _PreparedFinishAccounting,
+    record: ActiveRecord,
+    vcs: _GitVcs,
+) -> bool:
+    return (
+        _record_to_obj(prepared.record) == _record_to_obj(record)
+        and _lock_scope_fingerprint(config, record, vcs) == prepared.fingerprint
+        and _finish_landed_tips(config, record, vcs) == prepared.landed_tips
+    )
+
+
 def _cmd_finish(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
@@ -53642,6 +53803,10 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         raise Refusal("finish requires at least one non-empty --validation entry")
     if any(not item.strip() for item in limitations):
         raise Refusal("finish limitations must be non-empty")
+    # Accounting is gathered with no lock held (#1488, pattern of
+    # #1367/#1276); under the lock it is reused only while the record,
+    # fingerprint, and landed tips still match, else it is regathered.
+    prepared_accounting = _prepare_finish_accounting(config, args.slot)
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, archives = _validate_global_state(config)
@@ -53669,9 +53834,16 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         discard = bool(getattr(args, "discard_unaccounted", False))
         accounting_sink: list[dict[str, object]] = []
         vcs = _GitVcs()
-        _slot_path, final_checkouts = _handoff_preconditions(
-            config, record, vcs, accounting=True, accounting_sink=accounting_sink
-        )
+        if prepared_accounting is not None and _prepared_finish_accounting_current(
+            config, prepared_accounting, record, vcs
+        ):
+            accounting_sink = [dict(entry) for entry in prepared_accounting.accounting]
+            _slot_path = prepared_accounting.slot_path
+            final_checkouts = prepared_accounting.final_checkouts
+        else:
+            _slot_path, final_checkouts = _handoff_preconditions(
+                config, record, vcs, accounting=True, accounting_sink=accounting_sink
+            )
         landed_count, open_count, unaccounted = _accounting_totals(accounting_sink)
         discarded: tuple[str, ...] = ()
         bundle_paths: list[str] = []
