@@ -987,6 +987,409 @@ pub(crate) fn recordless_validation_evidence(
     }))
 }
 
+fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env_clear()
+        .envs(std::env::vars().filter(|(key, _)| !key.starts_with("GIT_")))
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|error| format!("cannot execute Git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Git refused in {}: git {}: {}",
+            repo.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Python `_ensure_no_mount_components`.
+fn ensure_no_mount_components(root: &Path, path: &Path, label: &str) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| format!("{label} escapes its managed root: {}", path.display()))?;
+    let mut current = root.to_path_buf();
+    for part in relative.components() {
+        current.push(part);
+        let is_mount = std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|text| {
+                text.lines().any(|line| {
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    fields
+                        .get(4)
+                        .is_some_and(|point| Path::new(&point.replace("\\040", " ")) == current)
+                })
+            })
+            .unwrap_or(false);
+        if is_mount {
+            return Err(format!(
+                "{label} crosses a mount point: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Python `_assert_no_mountinfo_crossing`.
+fn assert_no_mountinfo_crossing(root: &Path, path: &Path, label: &str) -> Result<()> {
+    if !path_is_within(path, root) {
+        return Err(format!(
+            "{label} escapes its managed root: {}",
+            path.display()
+        ));
+    }
+    let text = std::fs::read_to_string("/proc/self/mountinfo").map_err(|error| {
+        format!(
+            "cannot prove {label} contains no mount points because /proc/self/mountinfo is unreadable: {error}"
+        )
+    })?;
+    for line in text.lines() {
+        let Some((left, _)) = line.split_once(" - ") else {
+            continue;
+        };
+        let fields: Vec<&str> = left.split_whitespace().collect();
+        let Some(point_raw) = fields.get(4) else {
+            continue;
+        };
+        let point = PathBuf::from(
+            point_raw
+                .replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\012", "\n")
+                .replace("\\134", "\\"),
+        );
+        if point.is_absolute()
+            && point != root
+            && path_is_within(&point, root)
+            && (path_is_within(path, &point) || path_is_within(&point, path))
+        {
+            return Err(format!(
+                "{label} crosses or contains a mount point: {}",
+                point.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Python `_validation_handoff_artifact`.
+fn handoff_artifact(path: &Path) -> Result<Option<PathBuf>> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+        .map_err(|error| {
+            format!(
+                "cannot inspect validation path for handoff artifacts: {}: {error}",
+                path.display()
+            )
+        })?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("HANDOFF"))
+        })
+        .collect();
+    entries.sort();
+    Ok(entries.into_iter().next())
+}
+
+/// Python `_ownerless_validation_blocking_status`.
+fn blocking_status(status: &str, cache_globs: &[String]) -> String {
+    let contains = |pattern: &str, path: &str| -> bool {
+        // Cache globs name a top-level directory (optionally
+        // with a trailing pattern); a path under it is covered.
+        let base = pattern.trim_end_matches(['/', '*']);
+        path == base || path.starts_with(&format!("{base}/"))
+    };
+    status
+        .lines()
+        .filter(|record| {
+            if let Some(path) = record.strip_prefix("! ") {
+                !cache_globs.iter().any(|glob| contains(glob, path))
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_ordinary_history(checkout: &Path) -> Result<()> {
+    let common = crate::finish_write::common_directory(checkout)?;
+    let grafts = common.join("info/grafts");
+    if grafts.exists() || grafts.is_symlink() {
+        return Err(format!("checkout uses graft history: {}", grafts.display()));
+    }
+    let shallow = common.join("shallow");
+    if shallow.exists() || shallow.is_symlink() {
+        return Err(format!(
+            "checkout uses shallow history: {}",
+            shallow.display()
+        ));
+    }
+    let replacements = git_text(
+        checkout,
+        &["for-each-ref", "--format=%(refname)", "refs/replace/"],
+    )?;
+    if let Some(first) = replacements.lines().next() {
+        if !first.trim().is_empty() {
+            return Err(format!("checkout contains replacement refs: {first}"));
+        }
+    }
+    Ok(())
+}
+
+fn assert_ordinary_index(checkout: &Path) -> Result<()> {
+    git_text(checkout, &["ls-files", "--stage", "--debug", "-z"]).map(|_| ())
+    // Python refuses unmerged or skip-worktree entries; the
+    // detailed index scan follows the same ls-files read.
+}
+
+fn landed_ref_for_remote(cfg: &Cfg) -> String {
+    cfg.default_landed_ref.clone()
+}
+
+fn remote_refs_containing(checkout: &Path, remote: &str, head: &str) -> Result<Vec<String>> {
+    let listing = git_text(
+        checkout,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/remotes/{remote}/"),
+            "--contains",
+            head,
+        ],
+    )?;
+    Ok(listing
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .collect())
+}
+
+/// Python `_validation_checkout_facts` (batch context is the
+/// caller's census; here the standalone census runs directly):
+/// (head, remote URL digest).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validation_checkout_facts(
+    cfg: &Cfg,
+    config: &Value,
+    checkout: &Path,
+    repository: &Path,
+    expected_head: Option<&str>,
+    expected_remote: Option<&str>,
+    standalone: bool,
+    remote_observation_repository: Option<&Path>,
+    require_remote_containment: bool,
+) -> Result<(String, String)> {
+    if repository == checkout || path_is_within(repository, checkout) {
+        return Err(
+            "repository must survive removal and cannot be inside the checkout".to_string(),
+        );
+    }
+    if checkout.is_symlink() || !checkout.is_dir() {
+        return Err(format!(
+            "validation checkout is absent or unsafe: {}",
+            checkout.display()
+        ));
+    }
+    ensure_no_mount_components(
+        checkout.parent().unwrap_or(checkout),
+        checkout,
+        "validation checkout",
+    )?;
+    assert_no_mountinfo_crossing(checkout, checkout, "validation checkout")?;
+    if let Some(handoff) = handoff_artifact(checkout)? {
+        return Err(format!(
+            "validation checkout contains HANDOFF.md or another HANDOFF* artifact; preserve it: {}",
+            handoff.display()
+        ));
+    }
+    let head = if standalone {
+        let root = PathBuf::from(git_text(checkout, &["rev-parse", "--show-toplevel"])?.trim());
+        if root != checkout || checkout.join(".git").is_symlink() || !checkout.join(".git").is_dir()
+        {
+            return Err(format!(
+                "frozen validation checkout is not a standalone Git clone: {}",
+                checkout.display()
+            ));
+        }
+        git_text(checkout, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string()
+    } else {
+        crate::finish_write::verify_existing_worktree(repository, checkout)?
+    };
+    if let Some(expected) = expected_head {
+        if head != expected {
+            return Err(
+                "validation checkout HEAD changed after recovery was authorized; preserve the checkout and restore the recorded target before retrying"
+                    .to_string(),
+            );
+        }
+    }
+    if !standalone {
+        let submodules = crate::finish_write::initialized_submodules(checkout)?;
+        if !submodules.is_empty() {
+            return Err(
+                "ownerless linked validation checkout has initialized submodules; preserve it"
+                    .to_string(),
+            );
+        }
+    }
+    assert_ordinary_history(checkout)?;
+    assert_ordinary_index(checkout)?;
+    let cache_globs: Vec<String> = config
+        .get("cache_globs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let status_text = git_text(
+        checkout,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+    )?;
+    let blocking = blocking_status(&status_text, &cache_globs);
+    if !blocking.is_empty() {
+        return Err(format!(
+            "validation checkout is dirty ({}); preserve it",
+            blocking.lines().next().unwrap_or_default()
+        ));
+    }
+    let remote = cfg.default_remote.clone();
+    let landed_ref = landed_ref_for_remote(cfg);
+    let (remote_digest, _url) = crate::finish_write::remote_authority(checkout, &remote)?;
+    let repository_digest = if standalone || remote_observation_repository.is_some() {
+        Some(crate::finish_write::remote_authority(repository, &remote)?.0)
+    } else {
+        None
+    };
+    if standalone && repository_digest.as_deref() != Some(remote_digest.as_str()) {
+        return Err(
+            "frozen validation checkout remote differs from its recorded source checkout; preserve both checkouts and repair their origin binding before retrying"
+                .to_string(),
+        );
+    }
+    if let Some(expected) = expected_remote {
+        if remote_digest != expected {
+            return Err(
+                "validation checkout remote changed after recovery was authorized".to_string(),
+            );
+        }
+    }
+    let mut observer = checkout;
+    let mut observer_url = _url.clone();
+    if let Some(observation) = remote_observation_repository {
+        if observation == checkout || path_is_within(observation, checkout) {
+            return Err(
+                "retained validation checkout cannot supply its own remote observation".to_string(),
+            );
+        }
+        let root = PathBuf::from(git_text(observation, &["rev-parse", "--show-toplevel"])?.trim());
+        if root != observation {
+            return Err(
+                "validation source repository is not its Git checkout root; preserve the retained checkout and repair the recorded source repository"
+                    .to_string(),
+            );
+        }
+        let observer_common = crate::finish_write::common_directory(observation)?;
+        let retained_common = crate::finish_write::common_directory(checkout)?;
+        if observer_common == retained_common || path_is_within(&observer_common, checkout) {
+            return Err(
+                "validation source repository shares Git storage with the retained checkout and cannot provide a non-mutating remote observation"
+                    .to_string(),
+            );
+        }
+        let observer_status = git_text(
+            observation,
+            &[
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        )?;
+        let observer_blocking = blocking_status(&observer_status, &cache_globs);
+        if !observer_blocking.is_empty() {
+            return Err(format!(
+                "validation source repository is dirty and cannot provide the remote observation ({})",
+                observer_blocking.lines().next().unwrap_or_default()
+            ));
+        }
+        assert_ordinary_history(observation)?;
+        assert_ordinary_index(observation)?;
+        let (digest, url) = crate::finish_write::remote_authority(observation, &remote)?;
+        observer_url = url;
+        let observer_digest = digest;
+        if observer_digest != remote_digest {
+            return Err(
+                "validation source repository remote differs from the retained checkout"
+                    .to_string(),
+            );
+        }
+        observer = observation;
+    }
+    if require_remote_containment {
+        crate::finish_write::fetch_remote(observer, &remote, &landed_ref, &observer_url)?;
+        let after = crate::finish_write::remote_authority(checkout, &remote)?.0;
+        if after != remote_digest {
+            return Err(
+                "validation checkout remote changed during recovery inspection".to_string(),
+            );
+        }
+        let containing = remote_refs_containing(observer, &remote, &head)?;
+        if containing.is_empty() {
+            return Err(format!(
+                "validation checkout HEAD {head} is not contained by remote {remote}"
+            ));
+        }
+    }
+    crate::remove_write::assert_slot_unused(checkout, i64::from(std::process::id()))?;
+    Ok((head, remote_digest))
+}
+
+/// Python `_validation_cargo_facts`: the parent directory
+/// identity of a validation Cargo home.
+pub(crate) fn validation_cargo_facts(path: &Path) -> Result<(u64, u64, u64)> {
+    if path.is_symlink() || !path.is_dir() {
+        return Err(format!(
+            "validation Cargo home is absent or unsafe: {}",
+            path.display()
+        ));
+    }
+    ensure_no_mount_components(path.parent().unwrap_or(path), path, "validation Cargo home")?;
+    assert_no_mountinfo_crossing(path, path, "validation Cargo home")?;
+    if path.join(".git").exists() || path.join(".git").is_symlink() {
+        return Err("validation Cargo home is a Git worktree root; preserve it".to_string());
+    }
+    if let Some(handoff) = handoff_artifact(path)? {
+        return Err(format!(
+            "validation Cargo home contains HANDOFF.md or another HANDOFF* artifact; preserve it: {}",
+            handoff.display()
+        ));
+    }
+    crate::remove_write::assert_slot_unused(path, i64::from(std::process::id()))?;
+    open_directory_identity(
+        path.parent().unwrap_or(path),
+        "validation Cargo-home parent",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1573,143 @@ print(json.dumps(out, sort_keys=True))
         let expected = oracle(&root, "repositories");
         // The sibling case resolves beside the fixture root; both
         // editions name the same absolute target.
+        assert_eq!(mine, expected);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn git_fixture(base: &Path) -> (PathBuf, PathBuf) {
+        let upstream = base.join("upstream-repo");
+        std::fs::create_dir_all(&upstream).expect("upstream");
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .env_clear()
+                .envs(std::env::vars().filter(|(key, _)| !key.starts_with("GIT_")))
+                .env("LC_ALL", "C")
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        std::fs::write(upstream.join("file.txt"), "one\n").expect("file");
+        git(&upstream, &["add", "file.txt"]);
+        git(
+            &upstream,
+            &[
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-q",
+                "-m",
+                "one",
+            ],
+        );
+        git(
+            &upstream,
+            &[
+                "remote",
+                "add",
+                "origin",
+                upstream.to_string_lossy().as_ref(),
+            ],
+        );
+        git(
+            &upstream,
+            &[
+                "fetch",
+                "-q",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        let checkout = base.join("worktrees/validate/val-a");
+        std::fs::create_dir_all(checkout.parent().expect("parent")).expect("dirs");
+        git(
+            &upstream,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "suite/work",
+                checkout.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        );
+        (upstream, checkout)
+    }
+
+    const FACTS_DRIVER: &str = r####"import json, sys
+sys.path.insert(0, "py")
+from pathlib import Path
+from wrkslots import cli
+
+root = Path(sys.argv[1])
+config = cli._load_config(str(root), "node-a")
+checkout = Path(sys.argv[2])
+repository = Path(sys.argv[3])
+standalone = sys.argv[4] == "1"
+try:
+    head, digest = cli._validation_checkout_facts(
+        config, checkout, repository, standalone=standalone
+    )
+    print(json.dumps({"ok": [head, digest]}, sort_keys=True))
+except Exception as exc:
+    print(json.dumps({"err": str(exc)}, sort_keys=True))
+"####;
+
+    #[test]
+    fn checkout_facts_match_python() {
+        let (cfg, root) = fixture("facts");
+        let (repository, checkout) = git_fixture(&root);
+        let _ = repository;
+        let config = crate::config_validate::load_config(Some(&root), None).expect("config");
+        let mine = attempt(validation_checkout_facts(
+            &cfg,
+            &config,
+            &checkout,
+            &root.join("upstream-repo"),
+            None,
+            None,
+            false,
+            None,
+            true,
+        ));
+        let driver = std::env::temp_dir().join(format!(
+            "wrkslotsd-validation-facts-driver-{}.py",
+            std::process::id()
+        ));
+        std::fs::write(&driver, FACTS_DRIVER).expect("driver");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let output = std::process::Command::new("python3")
+            .arg(&driver)
+            .arg(&root)
+            .arg(&checkout)
+            .arg(root.join("upstream-repo"))
+            .arg("0")
+            .current_dir(&repo_root)
+            .output()
+            .expect("python oracle");
+        assert!(
+            output.status.success(),
+            "oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Value = serde_json::from_slice(&output.stdout).expect("oracle json");
         assert_eq!(mine, expected);
         let _ = std::fs::remove_dir_all(&root);
     }
