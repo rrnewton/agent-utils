@@ -1,10 +1,11 @@
 ---
 title: 'services-turnover-unexpanded-specifiers: turnover does not expand systemd specifiers in ExecStart, so the registry and pin lookup miss'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-13T15:36:52.650550835+00:00
-updated_at: 2026-11-13T15:36:52.650550835+00:00
+updated_at: 2026-11-13T17:32:21.515916064+00:00
+closed_at: 2026-11-13T17:32:21.515915963+00:00
 ---
 
 # Description
@@ -30,7 +31,7 @@ Number allocated by the coordinator. Evidence is the read-only report described 
 
 ## Resolution
 
-Implemented on branch `mu-turnspec/1493`:
+Landed on `github/main` as `45a9c2315a9eefb1614376513e0815b5eaa7813b` ("agentctl: expand systemd specifiers in services turnover, skip unknown units"). Implemented on branch `mu-turnspec/1493`:
 
 - `SpecifierContext` in `rs/agentctl/src/services/unit.rs` expands `%h`, `%u`, `%U`, `%t`, `%S`, `%C`, `%E` and `%%` (unknown specifiers left as written), with the user manager's values supplied by `Host::specifier_context` (`rs/agentctl/src/services/host.rs`, from `HOME`/`USER`/uid/`XDG_*`). `systemctl show` already prints a resolved `ExecStart`, but services derive paths from `systemctl cat`, so expansion reproduces the manager's resolution there.
 - `read_service_any` (`discover.rs`) expands, for non-transient units, `ExecStart` words (including a `sh -c` script word), `Environment` values and `WorkingDirectory` — drop-ins are already merged by `UnitText::parse` — before deriving the registry, binary path, bridge state and state dirs. A unit naming its own `HOME` names its own `%h`. Transient units carry literal words and are not expanded. There is no Python equivalent of services turnover; the Rust surface is the only one.
