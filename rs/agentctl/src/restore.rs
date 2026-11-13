@@ -826,6 +826,9 @@ impl RestoreEpoch {
         let Some(recorded) = Self::from_report(report) else {
             return LegacyMatch::Miss;
         };
+        if recorded == *self {
+            return LegacyMatch::Matches;
+        }
         if recorded.boot_id != self.boot_id {
             return LegacyMatch::Miss;
         }
@@ -5020,6 +5023,46 @@ mod tests {
             boot_report_state(&registry, &config, &epoch, Some(1000.0)),
             BootReportState::Missing
         );
+        // Exact managerless equality is still a match without any manager
+        // start proof, in both recorded forms: a current report carrying
+        // `"user_manager": null`, and a report with no epoch object at all.
+        // Restore replay depends on this when manager identity is unknown
+        // on both sides.
+        let managerless = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: None,
+        };
+        fs::write(
+            &file,
+            format!(
+                "{{\"boot_id\": \"{boot}\", \"epoch\": {}, \"complete\": true, \"finished_at\": 2000.0}}",
+                managerless.as_json()
+            ),
+        )
+        .unwrap();
+        let report = read_report(&file).unwrap();
+        assert_eq!(
+            managerless.legacy_match(&report, None),
+            LegacyMatch::Matches
+        );
+        assert!(matches!(
+            boot_report_state(&registry, &config, &managerless, None),
+            BootReportState::Completed(_)
+        ));
+        fs::write(
+            &file,
+            format!("{{\"boot_id\": \"{boot}\", \"complete\": true, \"finished_at\": 2000.0}}"),
+        )
+        .unwrap();
+        let report = read_report(&file).unwrap();
+        assert_eq!(
+            managerless.legacy_match(&report, None),
+            LegacyMatch::Matches
+        );
+        assert!(matches!(
+            boot_report_state(&registry, &config, &managerless, None),
+            BootReportState::Completed(_)
+        ));
         fs::remove_dir_all(&directory).unwrap();
     }
 
