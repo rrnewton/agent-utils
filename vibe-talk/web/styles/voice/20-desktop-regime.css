@@ -636,8 +636,11 @@
      positioned against #screen-main, which already carries `position: relative` for #scroll-tools,
      but PLACED by the script (web/src/view/settings `mountReadingWidth`) on the column's own
      measured right edge — never at the screen's middle, which a docked panel or a second
-     column would leave it standing over (`#1398 reading-width-handle-gate`). The script also
-     hides it (`hidden`) while the measured column is no wider than the widest reading width.
+     column would leave it standing over (`#1398 reading-width-handle-gate`). Its left edge
+     stands on that edge and its body over the margin beside the column, never over the
+     text. The script also
+     hides it (`hidden`) while the measured column has not clearly earned it (72ch, with
+     the gate's 6ch hysteresis).
      Out of flow on purpose: a grid row for a drag handle would change the height of the thing
      being read the moment it appeared. `touch-action: none` so a drag is a drag and not a scroll. */
   #width-grip {
@@ -647,7 +650,6 @@
     top: 0;
     bottom: 0;
     left: 0;
-    transform: translateX(-50%);
     width: 0.9rem;
     padding: 0;
     background: none;
