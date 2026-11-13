@@ -1481,9 +1481,9 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
     keys_row = one_lit(walk, "j off the long message, before the clicks on Show read")
     mode = "() => document.getElementById('todo-filter').getAttribute('aria-pressed')"
     mode_was = walk.page.evaluate(mode)
-    # `#1355 phone-bar-discuss-slot`: Show read lives in the hamburger menu; three menu
-    # choices cycle it back to where it was, and the focus returns to the hamburger.
-    for _ in range(3):
+    # `#1355 phone-bar-discuss-slot`: Show read lives in the hamburger menu; two menu
+    # choices cycle the binary toggle back to where it was, and the focus returns to the hamburger.
+    for _ in range(2):
         walk.page.click("#action-menu-open")
         walk.settled()
         centre = walk.page.evaluate("() => { const r = document.getElementById('todo-filter').getBoundingClientRect();"
@@ -1492,7 +1492,7 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
         mouse_move(walk, float(centre["x"]), float(centre["y"]))
         mouse_click(walk, float(centre["x"]), float(centre["y"]))
         walk.settled()
-    check(walk.page.evaluate(mode) == mode_was, f"three clicks on Show read left it {walk.page.evaluate(mode)!r}, not {mode_was!r}")
+    check(walk.page.evaluate(mode) == mode_was, f"two clicks on Show read left it {walk.page.evaluate(mode)!r}, not {mode_was!r}")
     held = walk.page.evaluate("() => document.activeElement && (document.activeElement.id || document.activeElement.tagName)")
     check(held == "action-menu-open", f"the menu clicks left the focus on {held!r}, not on the hamburger; this step proves nothing")
     walk.page.focus("#scroll-area")

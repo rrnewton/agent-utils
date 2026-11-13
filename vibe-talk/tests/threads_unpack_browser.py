@@ -294,21 +294,14 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     desk.shot("3-unpacked-collapse")
 
     cycle_read_mode(page)
-    desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'hide'",
-                  "Hide read was not reached")
-    desk.wait_for("() => { const ids = (t) => [...document.querySelectorAll('#side-cards > li[data-unpack-thread=\"' + t + '\"]')]"
-                  ".flatMap((li) => (li.getAttribute('data-ids') || '').split(' ').filter(Boolean)); "
-                  f"const r = ids('{RUNNER}'), p = ids('{REPLICA}'); "
-                  "return r[0] === '202' && !r.includes('204') && !r.includes('206') && !p.includes('210') && !p.includes('212'); }",
-                  "Hide read kept a read reply unpacked")
-    desk.check(not set(ids_of(desk, RUNNER)) & {"204", "206"}, "Hide read kept a read reply unpacked")
-    desk.check(ids_of(desk, RUNNER)[0] == "202", "Hide read took the summarised root away")
-    desk.check(not set(ids_of(desk, REPLICA)) & {"210", "212"}, "Hide read kept a raw read reply")
-    desk.shot("4-unpacked-hide")
-
-    cycle_read_mode(page)
     desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'show'",
                   "Show read was not reached")
+    desk.check(set(ids_of(desk, RUNNER)) >= {"204", "206"}, "Show read left a read reply out")
+    desk.check(ids_of(desk, RUNNER)[0] == "202", "Show read took the summarised root away")
+    desk.check(set(ids_of(desk, REPLICA)) >= {"210", "212"}, "Show read left a raw read reply out")
+    desk.shot("4-unpacked-show")
+
+
     toggle.click()
     desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-unpack-thread]').length === 0",
                   "packing away left rows behind")
