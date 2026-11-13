@@ -52,6 +52,7 @@ CRATES: tuple[Crate, ...] = (
     Crate("chat-subscription", (), "chat_subscription", ()),
     Crate("chat-subscription-plugin", (), "chat_subscription_plugin", ()),
     Crate("testrun-core", (), "testrun_core", ()),
+    Crate("dagrun-model", (), "dagrun_model", ()),
     Crate(
         "dagrun",
         ("dagrun", "cpuset-alloc"),
@@ -84,7 +85,8 @@ CRATES: tuple[Crate, ...] = (
 # precedes their registry availability. Dependents are patched to sources extracted from the exact
 # already-inspected dependency archives, never to the live checkout.
 LOCAL_PACKAGE_PATCHES: dict[str, tuple[str, ...]] = {
-    "dagrun": ("testrun-core",),
+    "dagrun": ("dagrun-model", "testrun-core"),
+    "dagrun-model": ("testrun-core",),
     "chat-subscription-plugin": ("chat-subscription",),
     "agentctl": (
         "agent-harness", "agent-queue", "chat-subscription", "chat-subscription-plugin",
@@ -352,6 +354,10 @@ def _doc_violations(crate: Crate, text: str, *, document_name: str | None = None
         )
     elif crate.name == "chat-subscription-plugin":
         machine_values = ("agentctl-chat-subscription",)
+    elif crate.name == "dagrun-model":
+        # The crate's own name contains a sibling's name; remove the complete
+        # machine values only, so a prose mention of either remains a violation.
+        machine_values = ("dagrun-model", "dagrun_model")
     for machine_value in machine_values:
         sibling_text = sibling_text.replace(machine_value, " " * len(machine_value))
     for sibling in CRATES:

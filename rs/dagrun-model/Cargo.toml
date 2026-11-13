@@ -1,0 +1,25 @@
+[package]
+name = "dagrun-model"
+version = "0.1.0"
+description = "DAG model, strict JSON IO, and pure helpers shared by dagrun and its downstream consumers"
+readme = "README.md"
+keywords = ["ci", "dag"]
+categories = ["development-tools"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+testrun-core = { version = "0.1.0", path = "../testrun-core" }
+libc = "0.2"
+
+[lib]
+name = "dagrun_model"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -45,6 +45,7 @@ libc = "0.2"
 # Process-group CPU accounting, structured test results and the shared test-counts
 # environment variable; re-exported under this crate's original module paths.
 testrun-core = { version = "0.1.0", path = "../testrun-core" }
+dagrun-model = { version = "0.1.0", path = "../dagrun-model" }
 
 [[bin]]
 name = "dagrun"

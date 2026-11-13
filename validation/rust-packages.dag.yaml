@@ -31,7 +31,7 @@ steps:
   - group: rust
     job: dagrun
     desc: package and smoke the dagrun Rust crate and the testrun-core library it depends on
-    cmd: python3 scripts/check_rust_packages.py --crate testrun-core --crate dagrun
+    cmd: python3 scripts/check_rust_packages.py --crate testrun-core --crate dagrun-model --crate dagrun
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
     labels: [validation-packages, validation-rust-packages, component-dagrun]
