@@ -1492,8 +1492,29 @@ def _legacy_host_target_lock_root() -> str:
     return os.path.join("/tmp", f"herdr-agent-target-locks-{os.getuid()}")
 
 
+def _env_target_lock_roots() -> tuple[str, str] | None:
+    """Return test-injectable target-lock roots from ``AGENTCTL_TARGET_LOCK_ROOT`` (#1480).
+
+    When the variable names an absolute directory, locks live there and in its
+    ``legacy`` child, so tests never touch the real account or ``/tmp`` roots.
+    Unset or empty keeps the production roots. A relative value is refused:
+    senders started in different directories would lock different files.
+    """
+    root = os.environ.get("AGENTCTL_TARGET_LOCK_ROOT")
+    if not root:
+        return None
+    if not os.path.isabs(root):
+        raise AgentDeliveryError(
+            f"AGENTCTL_TARGET_LOCK_ROOT is not an absolute path: {root}"
+        )
+    return root, os.path.join(root, "legacy")
+
+
 def _host_target_lock_roots() -> tuple[str, str]:
     """Return the roots every agentctl process on the host locks in, in acquisition order."""
+    injected = _env_target_lock_roots()
+    if injected is not None:
+        return injected
     return _host_target_lock_root(), _legacy_host_target_lock_root()
 
 
@@ -2014,17 +2035,64 @@ def _quarantine_raw(
     return basename[:-5] if basename.endswith(".json") else basename
 
 
+def _claim_lock_path(inflight: str, filename: str) -> str:
+    """The per-item claim lock of an inflight item (#1480, Rust parity)."""
+    return os.path.join(inflight, filename + ".claim")
+
+
+def _claim_owner_alive(inflight: str, filename: str) -> bool:
+    """Whether a live drain holds the claim lock of an inflight item."""
+    try:
+        descriptor = os.open(_claim_lock_path(inflight, filename), os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _take_claim_lock(inflight: str, filename: str) -> int | None:
+    """Take the claim lock for an inflight item; ``None`` when a live drain holds it."""
+    descriptor = os.open(
+        _claim_lock_path(inflight, filename),
+        os.O_RDWR | os.O_CREAT, 0o600,
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def _remove_claim_lock(inflight: str, filename: str) -> None:
+    try:
+        os.unlink(_claim_lock_path(inflight, filename))
+    except OSError:
+        pass
+
+
 def _recover_inflight(inflight: str, failed: str, *, max_artifact_bytes: int | None = None) -> list[str]:
     """Never resubmit a prompt whose process died after durable injection intent."""
     recovered: list[str] = []
     for name in sorted(entry for entry in os.listdir(inflight) if entry.endswith(".json")):
         source = os.path.join(inflight, name)
+        if _claim_owner_alive(inflight, name):
+            # A live claim by a concurrent drain (#1480): leave it for its owner.
+            continue
         _quarantine_raw(
             source, failed,
             outcome="possibly_submitted",
             error="recovered an inflight prompt after process restart; refusing automatic resubmission",
             max_artifact_bytes=max_artifact_bytes,
         )
+        _remove_claim_lock(inflight, name)
         recovered.append(name[:-5])
     return recovered
 
@@ -2338,6 +2406,10 @@ def _drain(
             while attempts < max_attempts:
                 # Readiness is entirely pre-injection. Keep the artifact in inbox while the pane
                 # is busy so a process death during an ordinary wait remains safely retryable.
+                # The queue lock is released across the target-lock and readiness
+                # waits (#1480); the item is still pending, so nothing is claimed
+                # yet and a concurrent drain loses nothing.
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
                 try:
                     if target_lock is None:
                         # Resolve before choosing the lock so exact-pane and stable-session
@@ -2362,6 +2434,7 @@ def _drain(
                     )
                     initial_info = None
                 except (AgentDeliveryError, HerdrUnavailable) as exc:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
                     blocked = _bounded_error(str(exc), max_artifact_bytes)
                     if (document.get("delivery_state") != "pending"
                             or document.get("delivery_error") != blocked):
@@ -2369,6 +2442,18 @@ def _drain(
                         document["delivery_error"] = blocked
                         document["delivery_blocked_at"] = time.time()
                         _atomic_json(path, document, max_artifact_bytes=max_artifact_bytes)
+                    break
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                # While the queue lock was released, a concurrent drain may have
+                # claimed or delivered this item; never claim it twice (#1480).
+                if not os.path.exists(path):
+                    break
+                try:
+                    document = _load(path, max_artifact_bytes=max_artifact_bytes)
+                    attempts = _delivery_attempts(document, path)
+                except AgentDeliveryError:
+                    break
+                if attempts >= max_attempts:
                     break
                 # Rendered once before the barrier below, so a failure in it leaves the prompt
                 # pending, and again right before typing, after the durable writes, so the delay
@@ -2389,7 +2474,18 @@ def _drain(
                 _transition(path, inflight_path, max_artifact_bytes=max_artifact_bytes)
                 _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
                 retained_path = inflight_path
+                # Hold the item's claim lock across the unlocked typing below
+                # (#1480). Another live holder means it owns the item.
+                claim_descriptor = _take_claim_lock(inflight, os.path.basename(path))
+                if claim_descriptor is None:
+                    _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
+                    break
                 try:
+                    # Typing runs without the queue lock (#1480); the item is
+                    # claimed in inflight under its claim lock.
+                    # The outcome is captured and committed under the lock.
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    delivery_error: BaseException | None = None
                     try:
                         # Typing into a working pane relies on the agent to queue the prompt; one
                         # it never accepts is taken back out of the composer so it stays pending.
@@ -2399,12 +2495,19 @@ def _drain(
                                 client, info, _typed_text(document),
                                 working_timeout=working_timeout,
                             )
-                    except _NotStaged as exc:
+                    except BaseException as error:  # re-dispatched below, under the lock
+                        delivery_error = error
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    os.close(claim_descriptor)
+                    _remove_claim_lock(inflight, os.path.basename(path))
+                    if isinstance(delivery_error, _NotStaged):
+                        exc = delivery_error
                         # Nothing reached the composer: undo the at-most-once barrier so the
                         # prompt stays pending. A crash before the rename still quarantines it.
                         blocked = _bounded_error(str(exc), max_artifact_bytes)
                         document.pop("possibly_submitted", None)
                         document.pop("inflight_at", None)
+                        document.pop("delivery_claimed_at", None)
                         document["delivery_state"] = "pending"
                         document["delivery_error"] = blocked
                         document["delivery_blocked_at"] = time.time()
@@ -2412,7 +2515,8 @@ def _drain(
                         _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
                         retained_path = path
                         break
-                    except _Misrouted as exc:
+                    elif isinstance(delivery_error, _Misrouted):
+                        exc = delivery_error
                         # The wrong program was interrupted and told to ignore the prompt.
                         # Retry from readiness, which re-resolves and re-verifies the
                         # recipient; quarantine once the same message misroutes again.
@@ -2442,6 +2546,7 @@ def _drain(
                             break
                         document.pop("possibly_submitted", None)
                         document.pop("inflight_at", None)
+                        document.pop("delivery_claimed_at", None)
                         document["delivery_state"] = "pending"
                         document["delivery_error"] = _bounded_error(str(exc), max_artifact_bytes)
                         _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
@@ -2449,7 +2554,8 @@ def _drain(
                         retained_path = path
                         # The retry does not consume an attempt: the misroute count bounds it.
                         continue
-                    except _PossiblySubmitted as exc:
+                    elif isinstance(delivery_error, _PossiblySubmitted):
+                        exc = delivery_error
                         attempts += 1
                         document["delivery_attempts"] = attempts
                         document["tui_delivery_attempts"] = attempts
@@ -2468,7 +2574,8 @@ def _drain(
                         )
                         quarantined.append(identifier)
                         break
-                    else:
+                    elif delivery_error is None:
+                        document.pop("delivery_claimed_at", None)
                         document["delivery_state"] = "processed"
                         document["confirmed_at"] = time.time()
                         _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
@@ -2478,6 +2585,8 @@ def _drain(
                         )
                         delivered.append(identifier)
                         break
+                    else:
+                        raise delivery_error
                 except _ArtifactTooLarge as exc:
                     raise AgentPossiblySubmitted(
                         _bounded_error(

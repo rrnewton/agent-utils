@@ -1276,6 +1276,7 @@ fn strip_paste_stamps(document: &mut Map<String, Value>) {
     document.remove("paste_tracking");
     document.remove("inflight_from");
     document.remove("paste_started_at");
+    document.remove("delivery_claimed_at");
 }
 
 /// Set once the process is asked to terminate (SIGTERM or SIGINT), so every wait that
@@ -1895,21 +1896,25 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             .map_err(lock_limit)?;
     let directories = QueueDirectories::new(root);
     let queue_lock_path = root.join(".delivery.lock");
-    let queue_lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
-    lock_exclusive_with_runtime(
-        &queue_lock,
-        &queue_lock_path,
-        "queue delivery",
-        lock_runtime,
-    )
-    .map_err(lock_limit)?;
-    verify_queue_lock(
-        root,
-        directory_identity,
-        &queue_lock_path,
-        &queue_lock,
-        "queue delivery lock",
-    )?;
+    // The queue lock is held only to claim and commit items (#1480): it is
+    // released across the target-lock wait, readiness waits and typing, so a
+    // concurrent send never waits out a delivery it is not part of. Claimed
+    // items sit in `inflight/` under their per-item claim lock, which
+    // start-of-drain recovery leaves to their owner (see agent-queue).
+    let take_queue_lock = |lock_runtime: &dyn AgentRuntime| -> AgentResult<File> {
+        let lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
+        lock_exclusive_with_runtime(&lock, &queue_lock_path, "queue delivery", lock_runtime)
+            .map_err(lock_limit)?;
+        verify_queue_lock(
+            root,
+            directory_identity,
+            &queue_lock_path,
+            &lock,
+            "queue delivery lock",
+        )?;
+        Ok(lock)
+    };
+    let mut queue_lock = take_queue_lock(lock_runtime)?;
     let mut delivered = Vec::new();
     // An item a previous process may have typed goes back to pending as
     // stranded before anything is quarantined: this drain presses Enter on
@@ -2110,6 +2115,10 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
 
             // A slash command opens a harness menu rather than reaching the composer, so it is
             // never typed into a working pane.
+            // The target-lock and readiness waits run without the queue lock
+            // (#1480); the item is still pending here, so nothing is claimed
+            // yet and a crash or a concurrent drain loses nothing.
+            drop(queue_lock);
             let readiness = (|| -> AgentResult<AgentPaneInfo> {
                 if target_lock.is_none() {
                     let (lock, info) =
@@ -2143,6 +2152,8 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             let info = match readiness {
                 Ok(info) => info,
                 Err(error) => {
+                    queue_lock = take_queue_lock(lock_runtime)?;
+                    let _commit_lock = &queue_lock;
                     // A readiness wait the hard deadline cut short says so (#702
                     // send-hard-timeout): the prompt stays pending and is safe to send again.
                     let detail = if deadline.is_some_and(|deadline| runtime.monotonic() >= deadline)
@@ -2164,6 +2175,24 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     break 'message;
                 }
             };
+            queue_lock = take_queue_lock(lock_runtime)?;
+            // While the queue lock was released, a concurrent drain may have
+            // claimed or delivered this item; never claim it twice (#1480).
+            // A tombstone written during the wait is now set aside by its
+            // writer at once (the lock was free); report it as this drain's
+            // cancellation, as a drain that held the lock would have.
+            if !path.exists() {
+                if let Ok(Some(agent_queue::queue::MessageState::Cancelled)) =
+                    agent_queue::queue::message_state(root, &identifier)
+                {
+                    cancelled.push(identifier.clone());
+                }
+                continue 'message;
+            }
+            match load_message(&path) {
+                Ok(reloaded) => document = reloaded,
+                Err(_) => continue 'message,
+            }
 
             // With the internal batch_working_backlog option (off by default, #698
             // chat-requests-unbatched), backlog into a working pane is typed as one combined
@@ -2254,6 +2283,20 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             let _ = transition(&inflight, &member.0);
                         }
                         return Err(error);
+                    }
+                    // Hold every member's claim lock while the queue lock is
+                    // released for typing (#1480).
+                    let mut _claim_guards = Vec::new();
+                    for (_, inflight) in &staged {
+                        let filename = inflight
+                            .file_name()
+                            .expect("inflight path has a file name")
+                            .to_owned();
+                        if let Some(guard) =
+                            agent_queue::queue::take_claim_lock(&directories, &filename)?
+                        {
+                            _claim_guards.push(guard);
+                        }
                     }
                     let mut active: Vec<(BatchMember, PathBuf)> = Vec::new();
                     for (member, inflight) in staged {
@@ -2346,6 +2389,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                                 document.remove("paste_tracking");
                                 document.remove("inflight_from");
                                 document.remove("paste_started_at");
+                                document.remove("delivery_claimed_at");
                                 document.insert("delivery_state".to_owned(), json!("pending"));
                                 document.insert("delivery_error".to_owned(), json!(detail));
                                 document.insert(
@@ -2357,6 +2401,9 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             }
                             Ok(())
                         };
+                        // Typing runs without the queue lock (#1480); the
+                        // members are claimed in `inflight/` under fresh claims.
+                        drop(queue_lock);
                         let outcome = deliver_one(
                             client,
                             &info,
@@ -2364,6 +2411,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             options.working_timeout,
                             batch_runtime,
                         );
+                        queue_lock = take_queue_lock(lock_runtime)?;
                         // A paste that may have been typed keeps the placeholder it was drawn as.
                         if !matches!(
                             outcome,
@@ -2485,6 +2533,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                                         document.remove("paste_tracking");
                                         document.remove("inflight_from");
                                         document.remove("paste_started_at");
+                                        document.remove("delivery_claimed_at");
                                         document
                                             .insert("delivery_state".to_owned(), json!("pending"));
                                         document.insert("delivery_error".to_owned(), json!(detail));
@@ -2534,6 +2583,12 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                                 }
                             }
                         }
+                        for (_, inflight) in &active {
+                            agent_queue::queue::remove_claim_lock(
+                                &directories,
+                                inflight.file_name().expect("inflight path has a file name"),
+                            );
+                        }
                         break 'retry;
                     }
                     // Every batch member was set aside untyped: move to the next prompt.
@@ -2548,6 +2603,23 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 ))
             })?);
             transition(&path, &inflight_path)?;
+            // Hold this item's claim lock while the queue lock is released
+            // (#1480): recovery by a concurrent drain leaves a live claim
+            // alone, and the flock dies with this drain if it dies.
+            let claim_filename = inflight_path
+                .file_name()
+                .expect("inflight path has a file name")
+                .to_owned();
+            let _claim_guard = match agent_queue::queue::take_claim_lock(
+                &directories,
+                &claim_filename,
+            )? {
+                Some(guard) => guard,
+                None => {
+                    let _ = transition(&inflight_path, &path);
+                    continue 'message;
+                }
+            };
             // The last look before typing comes after the move, so a tombstone written while
             // the prompt was still pending is always seen.
             if let Some((reason, detail)) =
@@ -2636,6 +2708,9 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 stranded,
             };
             let delivery_runtime: &dyn AgentRuntime = &tracking;
+            // Typing runs without the queue lock (#1480); the item is claimed
+            // in `inflight/` under its claim lock.
+            drop(queue_lock);
             let outcome = deliver_one(
                 client,
                 &info,
@@ -2643,6 +2718,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 options.working_timeout,
                 delivery_runtime,
             );
+            queue_lock = take_queue_lock(lock_runtime)?;
             // A paste that may have been typed keeps the placeholder it was drawn as.
             if !matches!(
                 outcome,
@@ -2694,6 +2770,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     document.remove("paste_tracking");
                     document.remove("inflight_from");
                     document.remove("paste_started_at");
+                    document.remove("delivery_claimed_at");
                     document.insert("delivery_state".to_owned(), json!("pending"));
                     document.insert("delivery_error".to_owned(), json!(detail.clone()));
                     document.insert("delivery_blocked_at".to_owned(), json!(unix_seconds()));
@@ -2768,6 +2845,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     document.remove("paste_tracking");
                     document.remove("inflight_from");
                     document.remove("paste_started_at");
+                    document.remove("delivery_claimed_at");
                     document.insert("delivery_state".to_owned(), json!("pending"));
                     document.insert("delivery_error".to_owned(), json!(detail));
                     atomic_json(&inflight_path, &Value::Object(document))?;
@@ -2832,6 +2910,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                     quarantined.push(identifier);
                 }
             }
+            agent_queue::queue::remove_claim_lock(&directories, &claim_filename);
             break 'retry;
         }
     }
@@ -3450,8 +3529,9 @@ pub(crate) fn pending_prompts(root: &Path) -> AgentResult<Vec<(String, Option<u6
 }
 
 /// Take the prompt `message_id` back out of the queue's inbox, untyped, and say whether it was
-/// there to take. It holds the queue's delivery lock, which a drain holds while it types, so a
-/// prompt is either taken out or typed, never both. A prompt in any other phase is left as it is:
+/// there to take. It holds the queue's delivery lock, which a drain holds to claim and commit
+/// each item (#1480), so a prompt still in the inbox is either taken out or claimed, never
+/// both. A prompt in any other phase is left as it is:
 /// one in flight, processed or failed may have been typed. The prompt's file is removed, so its
 /// identifier can be queued again. Waiting for the lock ends when `runtime` is cancelled.
 pub(crate) fn withdraw(
@@ -4504,8 +4584,33 @@ fn host_target_lock_roots() -> AgentResult<[PathBuf; 2]> {
     Ok([host_target_lock_root()?, legacy_host_target_lock_root()])
 }
 
+/// Test-injectable target-lock roots (#1480): when `AGENTCTL_TARGET_LOCK_ROOT`
+/// names an absolute directory, locks live there and in its `legacy` child, so
+/// tests and differentials never touch the real account or `/tmp` roots. Unset
+/// (or empty) keeps the production roots. A relative value is refused: senders
+/// started in different directories would lock different files.
+fn env_target_lock_roots() -> AgentResult<Option<[PathBuf; 2]>> {
+    let Some(root) = std::env::var_os("AGENTCTL_TARGET_LOCK_ROOT") else {
+        return Ok(None);
+    };
+    if root.is_empty() {
+        return Ok(None);
+    }
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err(AgentError::delivery(format!(
+            "AGENTCTL_TARGET_LOCK_ROOT is not an absolute path: {}",
+            root.display()
+        )));
+    }
+    Ok(Some([root.clone(), root.join("legacy")]))
+}
+
 #[cfg(not(test))]
 fn target_lock_roots() -> AgentResult<[PathBuf; 2]> {
+    if let Some(roots) = env_target_lock_roots()? {
+        return Ok(roots);
+    }
     host_target_lock_roots()
 }
 
@@ -4515,6 +4620,9 @@ fn target_lock_roots() -> AgentResult<[PathBuf; 2]> {
 /// share one root, so concurrent senders keep exercising the real cross-queue flock.
 #[cfg(test)]
 fn target_lock_roots() -> AgentResult<[PathBuf; 2]> {
+    if let Some(roots) = env_target_lock_roots()? {
+        return Ok(roots);
+    }
     let root = test_target_lock_root();
     Ok([root.join("account"), root.join("legacy")])
 }
@@ -8132,9 +8240,11 @@ mod tests {
         let runtime = ActOnSleep {
             clock: FakeRuntime::default(),
             on_sleep: Mutex::new(Some(Box::new(move || {
+                // Since #1480 the waiting drain holds no queue lock, so the
+                // tombstone's writer sets the item aside itself at once.
                 assert_eq!(
                     cancel(&tombstone_root, "waiting", "superseded").unwrap(),
-                    CancelOutcome::Pending
+                    CancelOutcome::SetAside
                 );
             }))),
         };

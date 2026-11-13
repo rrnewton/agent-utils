@@ -1631,3 +1631,82 @@ def test_a_prompt_too_large_to_type_is_refused_and_a_long_one_warned_about() -> 
         check("x" * (agent_module.MAX_TYPED_PROMPT_BYTES + 1))
     with pytest.raises(ValueError, match="nothing was queued"):
         check("\u20ac" * 41_000)
+
+
+def test_drain_releases_the_queue_lock_while_typing(tmp_path: Path) -> None:
+    """#1480: typing runs without the queue lock, so a concurrent send never
+    waits out a delivery it is not part of. The fake's prompt blocks on an
+    event (no wall-clock wait); while it blocks, the delivery lock must be
+    free for another holder."""
+    enqueue(str(tmp_path), "hello", message_id="m1")
+    fake = FakeAgentHerdr()
+    fake.run_release = threading.Event()
+    outcome: list[object] = []
+
+    def run() -> None:
+        try:
+            outcome.append(drain(client(fake), target(), str(tmp_path)))
+        except BaseException as error:  # surfaced by the assertions below
+            outcome.append(error)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert fake.run_entered.wait(10)
+        descriptor = os.open(tmp_path / ".delivery.lock", os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+    finally:
+        fake.run_release.set()
+        worker.join(10)
+    assert not worker.is_alive()
+    result = outcome[0]
+    assert isinstance(result, QueueResult), repr(result)
+    assert result.delivered == ("m1",)
+    assert fake.runs == ["hello"]
+
+
+def test_a_fresh_claim_is_left_for_its_owner_and_a_stale_one_recovers(tmp_path: Path) -> None:
+    """#1480 kill-between-claim-and-type: a claimed item whose delivery never
+    completed recovers exactly as before (here: quarantined possibly
+    submitted), never lost and never typed twice; a live claim is left alone."""
+    import time as time_module
+
+    enqueue(str(tmp_path), "claimed", message_id="m1")
+    inbox = tmp_path / "inbox"
+    inflight = tmp_path / "inflight"
+    inflight.mkdir(exist_ok=True)
+    source = inbox / "m1.json"
+    document = json.loads(source.read_text())
+    document.update({
+        "possibly_submitted": True, "delivery_state": "inflight",
+        "inflight_at": time_module.time(), "delivery_claimed_at": time_module.time(),
+        "paste_tracking": True, "inflight_from": "inbox",
+    })
+    claimed_path = inflight / "m1.json"
+    claimed_path.write_text(json.dumps(document))
+    source.unlink()
+    owner = agent_api._take_claim_lock(str(inflight), "m1.json")
+    assert owner is not None
+    try:
+        assert agent_api._recover_inflight(str(inflight), str(tmp_path / "failed")) == []
+        assert claimed_path.exists()
+    finally:
+        os.close(owner)
+    assert agent_api._recover_inflight(str(inflight), str(tmp_path / "failed")) == ["m1"]
+    assert (tmp_path / "failed" / "m1.json").exists()
+
+
+def test_target_lock_root_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1480: AGENTCTL_TARGET_LOCK_ROOT points target locks at an injected
+    root; a relative value is refused (parity with the Rust edition)."""
+    root = tmp_path / "locks"
+    monkeypatch.setenv("AGENTCTL_TARGET_LOCK_ROOT", str(root))
+    assert agent_api._host_target_lock_roots() == (str(root), str(root / "legacy"))
+    monkeypatch.setenv("AGENTCTL_TARGET_LOCK_ROOT", "relative/locks")
+    with pytest.raises(AgentDeliveryError, match="not an absolute path"):
+        agent_api._host_target_lock_roots()
+    monkeypatch.delenv("AGENTCTL_TARGET_LOCK_ROOT")
+    assert agent_api._env_target_lock_roots() is None

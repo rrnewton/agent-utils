@@ -210,6 +210,8 @@ struct Written {
     document: Map<String, Value>,
     written_at: Instant,
     queued_at: Option<Instant>,
+    /// The item's claim lock, held while it is inflight (#1480).
+    _claim: Option<agent_queue::fsio::HeldLock>,
 }
 
 struct Harness {
@@ -697,6 +699,8 @@ impl Wrapper {
         atomic_json(&inflight, &Value::Object(document.clone()))?;
         document.insert("paste_started_at".to_owned(), json!(unix_seconds()));
         atomic_json(&inflight, &Value::Object(document.clone()))?;
+        // Hold the claim lock for as long as the item is inflight (#1480).
+        let claim = queue::take_claim_lock(&self.directories, filename)?;
         drop(lock);
         let text = document
             .get("text")
@@ -725,6 +729,7 @@ impl Wrapper {
             document,
             written_at: Instant::now(),
             queued_at: None,
+            _claim: claim,
         });
         Ok(true)
     }
@@ -782,10 +787,16 @@ impl Wrapper {
                         .file_name()
                         .expect("inflight path has a file name")
                         .to_owned();
+                    let filename_ref = current
+                        .inflight
+                        .file_name()
+                        .expect("inflight path has a file name")
+                        .to_owned();
                     transition(
                         &current.inflight,
                         &self.directories.processed.join(filename),
                     )?;
+                    queue::remove_claim_lock(&self.directories, &filename_ref);
                 }
                 if !self.busy {
                     self.begin_turn("input", Some(current.queue_id.clone()))?;
@@ -811,7 +822,13 @@ impl Wrapper {
                 {
                     let _lock = lock_delivery(&self.queue_root, self.queue_identity, &Blocking)?;
                     atomic_json(&current.inflight, &Value::Object(current.document.clone()))?;
+                    let filename_ref = current
+                        .inflight
+                        .file_name()
+                        .expect("inflight path has a file name")
+                        .to_owned();
                     transition(&current.inflight, &current.lane)?;
+                    queue::remove_claim_lock(&self.directories, &filename_ref);
                 }
                 self.emit(
                     "input.cancelled",
@@ -1910,6 +1927,7 @@ fn strip_stamps(document: &mut Map<String, Value>) {
     document.remove("paste_tracking");
     document.remove("inflight_from");
     document.remove("paste_started_at");
+    document.remove("delivery_claimed_at");
 }
 
 fn wait_bounded(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {

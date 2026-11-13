@@ -16,8 +16,9 @@ use crate::error::{io_error, Error, ErrorKind, Result};
 use crate::fsio::{
     atomic_json, atomic_json_create, create_private_directory, lock_exclusive, open_private_lock,
     read_json, repair_private_directory, sync_directory, transition, validate_private_directory,
-    Waiter,
+    HeldLock, Waiter,
 };
+use fs2::FileExt;
 
 /// Longest message identifier, in bytes.
 pub const MESSAGE_ID_MAX: usize = 255;
@@ -330,6 +331,53 @@ pub fn generated_message_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{nanoseconds:020}-{}", std::process::id())
+}
+
+/// The per-item claim lock of an inflight item (#1480): the drain that claimed
+/// the item holds this file's flock while it waits or types without the queue
+/// lock. The flock dies with its holder, so start-of-drain recovery can tell a
+/// live claim (leave it for its owner — never lost, never typed twice) from a
+/// dead drainer's claim (recover exactly as before), with no wall-clock wait.
+pub fn claim_lock_path(directories: &QueueDirectories, filename: &std::ffi::OsStr) -> PathBuf {
+    directories
+        .inflight
+        .join(format!("{}.claim", filename.to_string_lossy()))
+}
+
+/// Take the claim lock for an inflight item. `Ok(None)` when a live drain
+/// already holds it.
+pub fn take_claim_lock(
+    directories: &QueueDirectories,
+    filename: &std::ffi::OsStr,
+) -> Result<Option<HeldLock>> {
+    let path = claim_lock_path(directories, filename);
+    let file = open_private_lock(&path, "delivery claim lock")?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(HeldLock::new(file))),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(io_error("lock delivery claim", &path, error)),
+    }
+}
+
+/// Whether a live drain holds the claim lock of an inflight item.
+#[must_use]
+pub fn claim_owner_alive(directories: &QueueDirectories, filename: &std::ffi::OsStr) -> bool {
+    let path = claim_lock_path(directories, filename);
+    let Ok(file) = File::open(&path) else {
+        return false;
+    };
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// Remove an inflight item's claim lock file once the item has left `inflight/`.
+pub fn remove_claim_lock(directories: &QueueDirectories, filename: &std::ffi::OsStr) {
+    let _ = fs::remove_file(claim_lock_path(directories, filename));
 }
 
 /// Seconds since the Unix epoch, as the queue's timestamps record them.
@@ -781,6 +829,7 @@ fn repend_never_typed(directories: &QueueDirectories, path: &Path) -> Result<boo
         "inflight_at",
         "paste_tracking",
         "inflight_from",
+        "delivery_claimed_at",
     ] {
         document.remove(field);
     }
@@ -788,6 +837,7 @@ fn repend_never_typed(directories: &QueueDirectories, path: &Path) -> Result<boo
     atomic_json(path, &Value::Object(document))?;
     let filename = path.file_name().expect("listed path has filename");
     transition(path, &lane.join(filename))?;
+    remove_claim_lock(directories, filename);
     Ok(true)
 }
 
@@ -809,6 +859,13 @@ pub fn repend_stranded_inflight(directories: &QueueDirectories) -> Result<Vec<St
         let Ok(mut document) = load_message(&path) else {
             continue;
         };
+        // A live claim by a concurrent drain (#1480): leave it for its owner.
+        if path
+            .file_name()
+            .is_some_and(|filename| claim_owner_alive(directories, filename))
+        {
+            continue;
+        }
         if document.get("paste_tracking") != Some(&Value::Bool(true))
             || !document.contains_key("paste_started_at")
         {
@@ -835,6 +892,7 @@ pub fn repend_stranded_inflight(directories: &QueueDirectories) -> Result<Vec<St
             "paste_tracking",
             "inflight_from",
             "paste_started_at",
+            "delivery_claimed_at",
         ] {
             document.remove(field);
         }
@@ -843,6 +901,7 @@ pub fn repend_stranded_inflight(directories: &QueueDirectories) -> Result<Vec<St
         let filename = path.file_name().expect("listed path has filename");
         let identifier = message_id_from_path(&path)?;
         transition(&path, &lane.join(filename))?;
+        remove_claim_lock(directories, filename);
         repended.push(identifier);
     }
     Ok(repended)
@@ -855,12 +914,20 @@ pub fn repend_stranded_inflight(directories: &QueueDirectories) -> Result<Vec<St
 pub fn recover_inflight(directories: &QueueDirectories) -> Result<Vec<String>> {
     let mut recovered = Vec::new();
     for path in json_paths(&directories.inflight)? {
+        // A live claim by a concurrent drain (#1480): leave it for its owner.
+        if path
+            .file_name()
+            .is_some_and(|filename| claim_owner_alive(directories, filename))
+        {
+            continue;
+        }
         if repend_never_typed(directories, &path)? {
             continue;
         }
         let filename = path.file_name().expect("listed path has filename");
         let destination = directories.failed.join(filename);
         transition(&path, &destination)?;
+        remove_claim_lock(directories, filename);
         failed_metadata(
             &destination,
             "possibly_submitted",
@@ -1103,12 +1170,14 @@ pub fn set_aside(
     document.remove("paste_tracking");
     document.remove("inflight_from");
     document.remove("paste_started_at");
+    document.remove("delivery_claimed_at");
     document.insert("delivery_state".to_owned(), json!("cancelled"));
     document.insert("cancel_reason".to_owned(), json!(reason));
     document.insert("cancel_detail".to_owned(), json!(detail));
     document.insert("cancelled_at".to_owned(), json!(unix_seconds()));
     atomic_json(path, &Value::Object(document))?;
     transition(path, &directories.cancelled.join(filename))?;
+    remove_claim_lock(directories, filename);
     let identifier = message_id_from_path(path)?;
     // The tombstone has done its work: the item it named can never be typed now.
     let tombstone = directories.cancel.join(format!("{identifier}.json"));
@@ -1751,6 +1820,69 @@ mod tests {
         assert_eq!(
             message_state(&queue.0, "pasted").unwrap(),
             Some(MessageState::Failed)
+        );
+    }
+
+    #[test]
+    fn a_fresh_claim_is_left_for_its_owner_and_a_stale_one_recovers() {
+        // #1480: a drain claims an item (inflight + fresh delivery_claimed_at)
+        // then releases the queue lock to type. A concurrent drain's recovery
+        // must leave that live claim alone — never lost, never typed twice —
+        // while a stale claim (its drainer died between claim and type)
+        // recovers exactly as before: never-typed back to pending, pasted to
+        // failed as possibly_submitted.
+        let queue = TestQueue::new();
+        let directories = prepare(&queue.0).unwrap();
+        let claim = |id: &str, claimed_at: f64, pasted: bool| {
+            put(&queue.0, id, true).unwrap();
+            let path = directories.inbox.join(format!("{id}.json"));
+            let mut document = load_message(&path).unwrap();
+            document.insert("possibly_submitted".to_owned(), json!(true));
+            document.insert("paste_tracking".to_owned(), json!(true));
+            document.insert("inflight_from".to_owned(), json!("inbox"));
+            document.insert("inflight_at".to_owned(), json!(claimed_at));
+            document.insert("delivery_claimed_at".to_owned(), json!(claimed_at));
+            if pasted {
+                document.insert("paste_started_at".to_owned(), json!(claimed_at));
+            }
+            atomic_json(&path, &Value::Object(document)).unwrap();
+            transition(&path, &directories.inflight.join(format!("{id}.json"))).unwrap();
+        };
+        let now = unix_seconds();
+        claim("fresh", now, false);
+        // The live owner holds the fresh item's claim lock; stale claims have none.
+        let _fresh_owner = take_claim_lock(
+            &directories,
+            directories.inflight.join("fresh.json").file_name().unwrap(),
+        )
+        .unwrap()
+        .expect("the fresh claim lock is free to take for its owner");
+        claim("stale-new", now - 3600.0, false);
+        claim("stale-pasted", now - 3600.0, true);
+        assert_eq!(recover_inflight(&directories).unwrap(), vec!["stale-pasted"]);
+        assert_eq!(
+            message_state(&queue.0, "fresh").unwrap(),
+            Some(MessageState::Inflight)
+        );
+        assert_eq!(
+            message_state(&queue.0, "stale-new").unwrap(),
+            Some(MessageState::Pending)
+        );
+        assert_eq!(
+            message_state(&queue.0, "stale-pasted").unwrap(),
+            Some(MessageState::Failed)
+        );
+        // The fresh claim is still its owner's to finish: once its owner is
+        // gone (claim lock released) it recovers as never-typed, not as
+        // possibly submitted.
+        drop(_fresh_owner);
+        assert_eq!(
+            recover_inflight(&directories).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            message_state(&queue.0, "fresh").unwrap(),
+            Some(MessageState::Pending)
         );
     }
 
