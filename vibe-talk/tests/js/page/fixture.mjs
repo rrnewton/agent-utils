@@ -5168,12 +5168,6 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // boundary between a judgement and a different behaviour wearing the same name.
 
 const TUNING_BANDS = {
-  // `#1470 toolbar-dynamic-promotion`. Slack between promoting and demoting a toolbar
-  // action: wide enough to settle a boundary resize, narrow enough that a real
-  // overflow still demotes within a drag.
-  PROMOTION_HYSTERESIS_PX: [1, 200, "the slack between promoting and demoting a toolbar action"],
-  // `#1398 width handle per column`. The reading-gate's own slack, in characters.
-  READING_GRIP_HYSTERESIS_CH: [0, 20, "the reading-width gate's hysteresis, in characters"],
   // `#892 voice-page-optimistic-done`. How many keys' timings are kept for a look back from the console:
   // enough for a run of presses to compare, few enough that a page left timing for a day holds nothing much.
   KEY_TIMINGS_KEPT: [20, 1000, "keys timed and kept for the console, while key timing is on"],

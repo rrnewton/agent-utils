@@ -9,13 +9,13 @@ created_at: 2026-11-12T20:10:00+00:00
 updated_at: 2026-11-12T20:10:00+00:00
 ---
 
-# Description
+# Summary
 
 Owner (Slack 020, 3:10 PM ET): "the vertical bar that is supposed to control the WIDTH of the main message view... that is totally messed up. When we go into docked Discuss view it stays hovering OVER the discuss view uselessly. When we have a sufficiently squeezed main column we should NOT show the width adjuster. It should just be fixed at 'full width'. It is only over a certain size that we should show the option of artificially narrowing the text width. If we have a GIANT super wide monitor MAYBE we would still exceed that width threshold in two column view or even two columns PLUS docked discussion side bar (effectively 3 columns)."
 
 The handle (`#width-grip`, `mountReadingWidth`) was positioned against the screen (`left: 50%` of `#screen-main` plus half the reading width), so docking Discuss — which gives the panel its own grid column inside `#screen-main` — left it standing over the panel. It was also hidden by a blanket rule in two columns, whatever the column's actual width.
 
-# Acceptance Criteria
+# Acceptance
 
 - The handle stands on the message column's own right edge in every layout; it never overlaps a docked Discuss panel or the second column.
 - It shows only when the message column's actual rendered width exceeds the threshold (see Design), re-evaluated on resize, on docking/undocking/maximizing Discuss, and on switching between one and two columns. Below the threshold there is no handle and the text is full width; a remembered narrower width is kept on the device but not applied, and returns when the column widens again.
