@@ -25,6 +25,13 @@ export interface PreferenceSwitchesDependencies {
   summariesChanged(): unknown;
   /** `#225 enter-to-send`. Whether Enter sends, as the switch now says. */
   enterSendsChanged(on: boolean): unknown;
+  /** Mark read on reply: the No/Yes choice and each guard below it. */
+  markReadChanged(): unknown;
+  markReadQuoteGuardChanged(): unknown;
+  markReadFoldGuardChanged(): unknown;
+  markReadNonquoteChanged(): unknown;
+  markReadFinalGuardChanged(): unknown;
+  markReadFirstGuardChanged(): unknown;
 }
 
 /** The listeners, mounted. */
@@ -61,5 +68,11 @@ export function mountPreferenceSwitches(deps: PreferenceSwitchesDependencies): P
   // `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the switch changes in
   // place, and the next Enter in any box follows it.
   listen<Event>(el("enter-sends"), "change", () => deps.enterSendsChanged((el("enter-sends") as HTMLInputElement).checked));
+  listen<Event>(el("mark-read-on-reply"), "change", () => deps.markReadChanged());
+  listen<Event>(el("mark-read-quote-guard"), "change", () => deps.markReadQuoteGuardChanged());
+  listen<Event>(el("mark-read-fold-guard"), "change", () => deps.markReadFoldGuardChanged());
+  listen<Event>(el("mark-read-nonquote"), "change", () => deps.markReadNonquoteChanged());
+  listen<Event>(el("mark-read-final-guard"), "change", () => deps.markReadFinalGuardChanged());
+  listen<Event>(el("mark-read-first-guard"), "change", () => deps.markReadFirstGuardChanged());
   return { unmount };
 }

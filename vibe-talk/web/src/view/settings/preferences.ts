@@ -37,6 +37,14 @@ export interface MessagePreferencesDependencies {
   persistCardMaxLines(n: number): boolean;
   changeCardMaxLines(value: number): number;
   applyQuoteReadPercent(value: unknown): number;
+  applyMarkReadOnReply(on: boolean): void;
+  applyMarkReadQuoteGuard(on: boolean): void;
+  applyMarkReadFoldGuard(on: boolean): void;
+  applyMarkReadNonquote(on: boolean): void;
+  applyMarkReadFinalGuard(on: boolean): void;
+  applyMarkReadFirstGuard(on: boolean): void;
+  applyMarkReadFirstPercent(value: unknown): number;
+  applyMarkReadLongWords(value: unknown): number;
   applyInAppLinks(on: boolean): void;
   redrawMessageLinks(): void;
   applySummarizeCollapsed(on: boolean): void;
@@ -72,10 +80,27 @@ export interface QuoteReadPreferenceView {
   step(direction: 1 | -1): void;
 }
 
+export interface MarkReadPreferenceView {
+  render(enabled: boolean, quoteGuard: boolean, foldGuard: boolean, nonquote: boolean, finalGuard: boolean, firstGuard: boolean): void;
+  changed(): void;
+  quoteGuardChanged(): void;
+  foldGuardChanged(): void;
+  nonquoteChanged(): void;
+  finalGuardChanged(): void;
+  firstGuardChanged(): void;
+  renderFirstPercent(n: number): void;
+  firstPercentChanged(value: unknown): number;
+  stepFirstPercent(direction: 1 | -1): void;
+  renderLongWords(n: number): void;
+  longWordsChanged(value: unknown): number;
+  stepLongWords(direction: 1 | -1): void;
+}
+
 export interface MessagePreferences {
   readonly collapsedLines: MessageLimitView;
   readonly cardMaxLines: MessageLimitView;
   readonly quoteReadPercent: QuoteReadPreferenceView;
+  readonly markRead: MarkReadPreferenceView;
   readonly inAppLinks: BooleanPreferenceView;
   readonly summaries: BooleanPreferenceView;
   readonly richHeaders: BooleanPreferenceView;
@@ -157,10 +182,142 @@ export function mountMessagePreferences(deps: MessagePreferencesDependencies): M
     if (held && button.disabled) deps.lookup("quote-read-percent").focus();
   }
 
+  function renderMarkRead(enabled: boolean, quoteGuard: boolean, foldGuard: boolean, nonquote: boolean, finalGuard: boolean, firstGuard: boolean): void {
+    (deps.lookup("mark-read-on-reply") as HTMLSelectElement).value = enabled ? "yes" : "no";
+    deps.lookup("mark-read-options").hidden = !enabled;
+    (deps.lookup("mark-read-quote-guard") as HTMLInputElement).checked = quoteGuard;
+    (deps.lookup("mark-read-fold-guard") as HTMLInputElement).checked = foldGuard;
+    (deps.lookup("mark-read-nonquote") as HTMLInputElement).checked = nonquote;
+    (deps.lookup("mark-read-final-guard") as HTMLInputElement).checked = finalGuard;
+    (deps.lookup("mark-read-first-guard") as HTMLInputElement).checked = firstGuard;
+    (deps.lookup("quote-read-percent") as HTMLInputElement).disabled = !quoteGuard;
+    (deps.lookup("quote-read-percent-smaller") as HTMLButtonElement).disabled = !quoteGuard
+      || clampQuoteReadPercent((deps.lookup("quote-read-percent") as HTMLInputElement).value) <= MIN_QUOTE_READ_PERCENT;
+    (deps.lookup("quote-read-percent-larger") as HTMLButtonElement).disabled = !quoteGuard
+      || clampQuoteReadPercent((deps.lookup("quote-read-percent") as HTMLInputElement).value) >= MAX_QUOTE_READ_PERCENT;
+    (deps.lookup("mark-read-first-percent") as HTMLInputElement).disabled = !firstGuard;
+    (deps.lookup("mark-read-long-words") as HTMLInputElement).disabled = !firstGuard;
+  }
+
+  function markReadSwitches(): [boolean, boolean, boolean, boolean, boolean, boolean] {
+    return [
+      (deps.lookup("mark-read-on-reply") as HTMLSelectElement).value === "yes",
+      (deps.lookup("mark-read-quote-guard") as HTMLInputElement).checked,
+      (deps.lookup("mark-read-fold-guard") as HTMLInputElement).checked,
+      (deps.lookup("mark-read-nonquote") as HTMLInputElement).checked,
+      (deps.lookup("mark-read-final-guard") as HTMLInputElement).checked,
+      (deps.lookup("mark-read-first-guard") as HTMLInputElement).checked,
+    ];
+  }
+
+  function markReadChanged(): void {
+    const enabled = (deps.lookup("mark-read-on-reply") as HTMLSelectElement).value === "yes";
+    deps.applyMarkReadOnReply(enabled);
+    renderMarkRead(...markReadSwitches());
+    deps.lookup("mark-read-state").textContent = enabled
+      ? "Saved \u2014 a sent reply marks the message it answers read, unless a choice below holds it back."
+      : "Saved \u2014 a sent reply leaves the message it answers unread.";
+    deps.status(enabled ? "a sent reply marks what it answers read." : "a sent reply leaves what it answers unread.");
+  }
+
+  function markReadQuoteGuardChanged(): void {
+    const on = (deps.lookup("mark-read-quote-guard") as HTMLInputElement).checked;
+    deps.applyMarkReadQuoteGuard(on);
+    renderMarkRead(...markReadSwitches());
+    deps.status(on ? "a reply quoting too little leaves its message unread." : "a reply marks its message read whatever it quotes.");
+  }
+
+  function markReadFoldGuardChanged(): void {
+    const on = (deps.lookup("mark-read-fold-guard") as HTMLInputElement).checked;
+    deps.applyMarkReadFoldGuard(on);
+    deps.status(on ? "a reply sent in Fold read leaves its message unread." : "a reply sent in Fold read marks its message read.");
+  }
+
+  function markReadNonquoteChanged(): void {
+    const on = (deps.lookup("mark-read-nonquote") as HTMLInputElement).checked;
+    deps.applyMarkReadNonquote(on);
+    deps.status(on ? "a reply that quotes nothing marks its message read." : "a reply that quotes nothing leaves its message unread.");
+  }
+
+  function markReadFinalGuardChanged(): void {
+    const on = (deps.lookup("mark-read-final-guard") as HTMLInputElement).checked;
+    deps.applyMarkReadFinalGuard(on);
+    deps.status(on ? "a quote before the final paragraph leaves its message unread." : "a quote before the final paragraph marks its message read.");
+  }
+
+  function markReadFirstGuardChanged(): void {
+    const on = (deps.lookup("mark-read-first-guard") as HTMLInputElement).checked;
+    deps.applyMarkReadFirstGuard(on);
+    renderMarkRead(...markReadSwitches());
+    deps.status(on ? "a quote in the first share of a long message leaves it unread." : "a quote in the first share of a long message marks it read.");
+  }
+
+  function renderMarkReadFirstPercent(n: number): void {
+    (deps.lookup("mark-read-first-percent") as HTMLInputElement).value = String(n);
+    (deps.lookup("mark-read-first-percent-smaller") as HTMLButtonElement).disabled = n <= 0;
+    (deps.lookup("mark-read-first-percent-larger") as HTMLButtonElement).disabled = n >= 100;
+  }
+
+  function markReadFirstPercentChanged(value: unknown): number {
+    const n = deps.applyMarkReadFirstPercent(value);
+    let kept = false;
+    try {
+      deps.deviceSettings().keep(DEVICE_SETTINGS.markReadFirstPercent, n);
+      kept = deps.deviceSettings().keptAs(DEVICE_SETTINGS.markReadFirstPercent, n);
+    } catch (_error) { kept = false; }
+    deps.lookup("mark-read-first-percent-state").textContent = kept
+      ? `Saved \u2014 the first ${n}% of a long message.`
+      : `This browser refused to store it, so it will be forgotten when you reload. Until then the first ${n}% of a long message.`;
+    return n;
+  }
+
+  function stepMarkReadFirstPercent(direction: 1 | -1): void {
+    const button = deps.lookup(direction > 0 ? "mark-read-first-percent-larger" : "mark-read-first-percent-smaller") as HTMLButtonElement;
+    const held = document.activeElement === button;
+    const now = Number((deps.lookup("mark-read-first-percent") as HTMLInputElement).value) || 0;
+    markReadFirstPercentChanged(now + direction);
+    if (held && button.disabled) deps.lookup("mark-read-first-percent").focus();
+  }
+
+  function renderMarkReadLongWords(n: number): void {
+    (deps.lookup("mark-read-long-words") as HTMLInputElement).value = String(n);
+    (deps.lookup("mark-read-long-words-smaller") as HTMLButtonElement).disabled = n <= 0;
+    (deps.lookup("mark-read-long-words-larger") as HTMLButtonElement).disabled = n >= 5000;
+  }
+
+  function markReadLongWordsChanged(value: unknown): number {
+    const n = deps.applyMarkReadLongWords(value);
+    let kept = false;
+    try {
+      deps.deviceSettings().keep(DEVICE_SETTINGS.markReadLongWords, n);
+      kept = deps.deviceSettings().keptAs(DEVICE_SETTINGS.markReadLongWords, n);
+    } catch (_error) { kept = false; }
+    deps.lookup("mark-read-long-words-state").textContent = kept
+      ? `Saved \u2014 a message over ${n} words is long.`
+      : `This browser refused to store it, so it will be forgotten when you reload. Until then a message over ${n} words is long.`;
+    return n;
+  }
+
+  function stepMarkReadLongWords(direction: 1 | -1): void {
+    const button = deps.lookup(direction > 0 ? "mark-read-long-words-larger" : "mark-read-long-words-smaller") as HTMLButtonElement;
+    const held = document.activeElement === button;
+    const now = Number((deps.lookup("mark-read-long-words") as HTMLInputElement).value) || 0;
+    markReadLongWordsChanged(now + direction * 10);
+    if (held && button.disabled) deps.lookup("mark-read-long-words").focus();
+  }
+
   return {
     collapsedLines: { render: renderCollapsedLines, saved: sayCollapsedLinesSaved, step: stepCollapsedLines },
     cardMaxLines: { render: renderCardMaxLines, saved: sayCardMaxLinesSaved, step: stepCardMaxLines },
     quoteReadPercent: { render: renderQuoteReadPercent, changed: quoteReadPercentChanged, step: stepQuoteReadPercent },
+    markRead: {
+      render: renderMarkRead, changed: markReadChanged, quoteGuardChanged: markReadQuoteGuardChanged,
+      foldGuardChanged: markReadFoldGuardChanged, nonquoteChanged: markReadNonquoteChanged,
+      finalGuardChanged: markReadFinalGuardChanged, firstGuardChanged: markReadFirstGuardChanged,
+      renderFirstPercent: renderMarkReadFirstPercent, firstPercentChanged: markReadFirstPercentChanged,
+      stepFirstPercent: stepMarkReadFirstPercent, renderLongWords: renderMarkReadLongWords,
+      longWordsChanged: markReadLongWordsChanged, stepLongWords: stepMarkReadLongWords,
+    },
     inAppLinks: {
       render(on) { (deps.lookup("in-app-links") as HTMLInputElement).checked = on; },
       changed() {

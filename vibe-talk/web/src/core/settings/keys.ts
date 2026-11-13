@@ -41,6 +41,16 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   "vibe-talk.voice.thread-card-max-lines",
   // `#728 vt-quote-read-threshold`. How much of a message a reply's quote must cover to mark it read.
   "vibe-talk.voice.quote-read-percent",
+  // Mark read on reply: whether a sent reply marks what it answers read at all, and the two
+  // guards that can hold it back (a small quote, Fold read). All on unless turned off.
+  "vibe-talk.voice.mark-read-on-reply",
+  "vibe-talk.voice.mark-read-quote-guard",
+  "vibe-talk.voice.mark-read-fold-guard",
+  "vibe-talk.voice.mark-read-nonquote",
+  "vibe-talk.voice.mark-read-final-guard",
+  "vibe-talk.voice.mark-read-first-guard",
+  "vibe-talk.voice.mark-read-first-percent",
+  "vibe-talk.voice.mark-read-long-words",
   // `#488 slack-app-agents`. Who is who: which account is the owner, the coding agent, a person or
   // another bot, chosen once for every device. The census of who spoke where stays local: a cache.
   "vibe-talk.voice.identities",

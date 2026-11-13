@@ -69,7 +69,7 @@ export {
   underDraft,
   unsentText,
 } from "../core/outbox/index.ts";
-export { DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createQuoteReadPercent, createSettingsSync } from "../core/settings/index.ts";
+export { DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync } from "../core/settings/index.ts";
 export {
   childByClass,
   createOncePerFrame,

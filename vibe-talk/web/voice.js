@@ -917,6 +917,14 @@ const messagePreferences = mountMessagePreferences({
   persistCardMaxLines: (n) => cardMaxLines.persist(n),
   changeCardMaxLines: (value) => cardMaxLinesChanged(value),
   applyQuoteReadPercent: (value) => quoteReadPercent.apply(value),
+  applyMarkReadOnReply: (on) => markReadOnReplySwitch.apply(on),
+  applyMarkReadQuoteGuard: (on) => markReadQuoteGuardSwitch.apply(on),
+  applyMarkReadFoldGuard: (on) => markReadFoldGuardSwitch.apply(on),
+  applyMarkReadNonquote: (on) => markReadNonquoteSwitch.apply(on),
+  applyMarkReadFinalGuard: (on) => markReadFinalGuardSwitch.apply(on),
+  applyMarkReadFirstGuard: (on) => markReadFirstGuardSwitch.apply(on),
+  applyMarkReadFirstPercent: (value) => markReadFirstPercent.apply(value),
+  applyMarkReadLongWords: (value) => markReadLongWords.apply(value),
   applyInAppLinks: (on) => inAppLinks.apply(on),
   redrawMessageLinks: () => redrawMessageLinks(),
   applySummarizeCollapsed: (on) => applySummarizeCollapsed(on),
@@ -3746,6 +3754,54 @@ const quoteReadPercent = createQuoteReadPercent({
   render: (n) => messagePreferences.quoteReadPercent.render(n),
 });
 
+/** Draw every Mark read on reply control as the switches now stand. */
+function renderMarkReadSettings() {
+  messagePreferences.markRead.render(
+    markReadOnReplySwitch.on(), markReadQuoteGuardSwitch.on(), markReadFoldGuardSwitch.on(),
+    markReadNonquoteSwitch.on(), markReadFinalGuardSwitch.on(), markReadFirstGuardSwitch.on());
+}
+
+/** Mark read on reply itself: Yes unless the reader said No. Synced. */
+const markReadOnReplySwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.markReadOnReply, deviceSettings: () => deviceSettings(), initial: true,
+  render: () => renderMarkReadSettings(),
+});
+/** Hold a reply back when its quote covers under the share. Synced. */
+const markReadQuoteGuardSwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.markReadQuoteGuard, deviceSettings: () => deviceSettings(), initial: false,
+  render: () => renderMarkReadSettings(),
+});
+/** Hold a reply back sent in Fold read. Synced. */
+const markReadFoldGuardSwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.markReadFoldGuard, deviceSettings: () => deviceSettings(), initial: true,
+  render: () => renderMarkReadSettings(),
+});
+/** Whether a reply that quotes nothing marks what it answers. Synced. */
+const markReadNonquoteSwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.markReadNonquote, deviceSettings: () => deviceSettings(), initial: true,
+  render: () => renderMarkReadSettings(),
+});
+/** Hold a quoted reply back when its quote ends before the final paragraph. Synced. */
+const markReadFinalGuardSwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.markReadFinalGuard, deviceSettings: () => deviceSettings(), initial: true,
+  render: () => renderMarkReadSettings(),
+});
+/** Hold a quoted reply back when its quote sits in the first share of a long message. Synced. */
+const markReadFirstGuardSwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.markReadFirstGuard, deviceSettings: () => deviceSettings(), initial: true,
+  render: () => renderMarkReadSettings(),
+});
+/** The first share of a long message, in percent (25 until the reader says otherwise). Synced. */
+const markReadFirstPercent = createMarkReadFirstPercent({
+  deviceSettings: () => deviceSettings(),
+  render: (n) => messagePreferences.markRead.renderFirstPercent(n),
+});
+/** How many words make a message long (300 until the reader says otherwise). Synced. */
+const markReadLongWords = createMarkReadLongWords({
+  deviceSettings: () => deviceSettings(),
+  render: (n) => messagePreferences.markRead.renderLongWords(n),
+});
+
 
 /**
  * The card lines' page-side acts: what a read says of the server's page build, a summary landing
@@ -3778,6 +3834,15 @@ const { noteServerPageBuild, summaryWatchFired, collapsedLinesFromKeyboard } = c
 const cardLinesOwner = createCardLines({
   cardMaxLines,
   quoteReadPercent,
+  markReadOnReply: markReadOnReplySwitch,
+  markReadQuoteGuard: markReadQuoteGuardSwitch,
+  markReadFoldGuard: markReadFoldGuardSwitch,
+  markReadNonquote: markReadNonquoteSwitch,
+  markReadFinalGuard: markReadFinalGuardSwitch,
+  markReadFirstGuard: markReadFirstGuardSwitch,
+  markReadFirstPercent,
+  markReadLongWords,
+  readMode: { mode: () => readModes.mode() },
   bodies: () => messageBodies,
   rawTextOf,
   headingOf,
@@ -7467,7 +7532,7 @@ const channelSend = createChannelSend({
   composerState, composerKeys: /** @type {any} */ (composerKeys), el: /** @type {any} */ (el), selectedChannelId, selectionThreadId: () => selection().threadId,
   setHiddenIfChanged: (node, hidden) => setHiddenIfChanged(node, hidden),
   knownWritable: (channel) => knownChannel(channel)?.writable !== false,
-  rootThisStarts, queueOutgoingMessage,
+  rootThisStarts: (channel, threadId) => (markReadOnReplySwitch.on() ? rootThisStarts(channel, threadId) : null), queueOutgoingMessage,
   channelDrafts: { get: (key) => channelDrafts.get(key), set: (key, text) => channelDrafts.set(key, text), delete: (key) => channelDrafts.delete(key), save: () => channelDrafts.save() },
   storageOkay: () => outbox.storageOkay(), noteDraft, fitBox: (box) => fitGrowingBox(box),
   draftRefusedWords: CHANNEL_DRAFT_REFUSED, scrollToNewest, renderChannelNavigation, renderDraftChip,
@@ -7879,6 +7944,14 @@ const settingsSyncGlue = createSettingsSyncGlue({
       get READ_AUDIO_SOURCE_KEY() { return readAloudOwner().READ_AUDIO_SOURCE_KEY; },
       get WIT_VOICE_KEY() { return readAloudOwner().WIT_VOICE_KEY; },
       get QUOTE_READ_PERCENT_KEY() { return QUOTE_READ_PERCENT_KEY; },
+      get MARK_READ_ON_REPLY_KEY() { return DEVICE_SETTINGS.markReadOnReply.key; },
+      get MARK_READ_QUOTE_GUARD_KEY() { return DEVICE_SETTINGS.markReadQuoteGuard.key; },
+      get MARK_READ_FOLD_GUARD_KEY() { return DEVICE_SETTINGS.markReadFoldGuard.key; },
+      get MARK_READ_NONQUOTE_KEY() { return DEVICE_SETTINGS.markReadNonquote.key; },
+      get MARK_READ_FINAL_GUARD_KEY() { return DEVICE_SETTINGS.markReadFinalGuard.key; },
+      get MARK_READ_FIRST_GUARD_KEY() { return DEVICE_SETTINGS.markReadFirstGuard.key; },
+      get MARK_READ_FIRST_PERCENT_KEY() { return DEVICE_SETTINGS.markReadFirstPercent.key; },
+      get MARK_READ_LONG_WORDS_KEY() { return DEVICE_SETTINGS.markReadLongWords.key; },
       get RELAY_KEY() { return RELAY_KEY; },
       get LINK_KINDS_KEY() { return LINK_KINDS_KEY; },
       get LINK_RAW_KEY() { return LINK_RAW_KEY; },
@@ -7941,6 +8014,16 @@ const settingsSyncGlue = createSettingsSyncGlue({
     },
     quoteReadPercent: () => {
       quoteReadPercent.apply(quoteReadPercent.stored());
+    },
+    markRead: () => {
+      markReadOnReplySwitch.apply(markReadOnReplySwitch.stored());
+      markReadQuoteGuardSwitch.apply(markReadQuoteGuardSwitch.stored());
+      markReadFoldGuardSwitch.apply(markReadFoldGuardSwitch.stored());
+      markReadNonquoteSwitch.apply(markReadNonquoteSwitch.stored());
+      markReadFinalGuardSwitch.apply(markReadFinalGuardSwitch.stored());
+      markReadFirstGuardSwitch.apply(markReadFirstGuardSwitch.stored());
+      markReadFirstPercent.apply(markReadFirstPercent.stored());
+      markReadLongWords.apply(markReadLongWords.stored());
     },
     relay: () => {
       renderReadNew();
@@ -8136,6 +8219,17 @@ restoreStoredSettings({
   collapsedLines: () => collapsedLines.apply(collapsedLines.stored()),
   cardMaxLines: () => cardMaxLines.apply(cardMaxLines.stored(), false),
   quoteReadPercent: () => quoteReadPercent.apply(quoteReadPercent.stored()),
+  markRead: () => {
+    markReadOnReplySwitch.apply(markReadOnReplySwitch.stored());
+    markReadQuoteGuardSwitch.apply(markReadQuoteGuardSwitch.stored());
+    markReadFoldGuardSwitch.apply(markReadFoldGuardSwitch.stored());
+    markReadNonquoteSwitch.apply(markReadNonquoteSwitch.stored());
+    markReadFinalGuardSwitch.apply(markReadFinalGuardSwitch.stored());
+    markReadFirstGuardSwitch.apply(markReadFirstGuardSwitch.stored());
+    markReadFirstPercent.apply(markReadFirstPercent.stored());
+    markReadLongWords.apply(markReadLongWords.stored());
+    renderMarkReadSettings();
+  },
   readSpeed: () => readAloudOwner().applyReadSpeed(readAloudOwner().storedReadSpeed()),
   ownRead: () => ownReadSwitch.apply(ownReadSwitch.stored()),
   combine: () => combineSwitch.apply(combineSwitch.stored()),
@@ -8175,6 +8269,10 @@ application.track(mountScreenControls({
   showPageBuild: () => settingsReadouts.pageBuild(),
   quoteReadPercentChanged: (value) => quoteReadPercentChanged(value),
   stepQuoteReadPercent: (direction) => stepQuoteReadPercent(direction),
+  markReadFirstPercentChanged: (value) => messagePreferences.markRead.firstPercentChanged(value),
+  stepMarkReadFirstPercent: (direction) => messagePreferences.markRead.stepFirstPercent(direction),
+  markReadLongWordsChanged: (value) => messagePreferences.markRead.longWordsChanged(value),
+  stepMarkReadLongWords: (direction) => messagePreferences.markRead.stepLongWords(direction),
   gripDown: (event) => readingWidthControl.gripDown(event),
   gripMove: (event) => readingWidthControl.gripMove(event),
   gripUp: () => readingWidthControl.gripUp(),
@@ -8314,6 +8412,12 @@ application.track(mountPreferenceSwitches({
   afterDoneChanged: messagePreferences.afterDone.changed,
   summariesChanged: messagePreferences.summaries.changed,
   enterSendsChanged: (on) => enterSends.apply(on),
+  markReadChanged: messagePreferences.markRead.changed,
+  markReadQuoteGuardChanged: messagePreferences.markRead.quoteGuardChanged,
+  markReadFoldGuardChanged: messagePreferences.markRead.foldGuardChanged,
+  markReadNonquoteChanged: messagePreferences.markRead.nonquoteChanged,
+  markReadFinalGuardChanged: messagePreferences.markRead.finalGuardChanged,
+  markReadFirstGuardChanged: messagePreferences.markRead.firstGuardChanged,
 }));
 
 // `#240 reading-bookmark`. The ways back: to the bookmark, to where the reader was reading (the left column's chip, as

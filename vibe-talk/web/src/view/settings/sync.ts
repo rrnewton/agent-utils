@@ -27,6 +27,14 @@ export interface SettingsSyncViewDependencies {
     readonly READ_AUDIO_SOURCE_KEY: string;
     readonly WIT_VOICE_KEY: string;
     readonly QUOTE_READ_PERCENT_KEY: string;
+    readonly MARK_READ_ON_REPLY_KEY: string;
+    readonly MARK_READ_QUOTE_GUARD_KEY: string;
+    readonly MARK_READ_FOLD_GUARD_KEY: string;
+    readonly MARK_READ_NONQUOTE_KEY: string;
+    readonly MARK_READ_FINAL_GUARD_KEY: string;
+    readonly MARK_READ_FIRST_GUARD_KEY: string;
+    readonly MARK_READ_FIRST_PERCENT_KEY: string;
+    readonly MARK_READ_LONG_WORDS_KEY: string;
     readonly RELAY_KEY: string;
     readonly LINK_KINDS_KEY: string;
     readonly LINK_RAW_KEY: string;
@@ -59,6 +67,7 @@ export interface SettingsSyncViewDependencies {
   readAudioSource(): void;
   witVoice(): void;
   quoteReadPercent(): void;
+  markRead(): void;
   relay(): void;
   linkKinds(): void;
   linkRaw(): void;
@@ -123,6 +132,16 @@ export function mountSettingsSyncView(deps: SettingsSyncViewDependencies) {
           break;
         case deps.keys.QUOTE_READ_PERCENT_KEY:
           deps.quoteReadPercent();
+          break;
+        case deps.keys.MARK_READ_ON_REPLY_KEY:
+        case deps.keys.MARK_READ_QUOTE_GUARD_KEY:
+        case deps.keys.MARK_READ_FOLD_GUARD_KEY:
+        case deps.keys.MARK_READ_NONQUOTE_KEY:
+        case deps.keys.MARK_READ_FINAL_GUARD_KEY:
+        case deps.keys.MARK_READ_FIRST_GUARD_KEY:
+        case deps.keys.MARK_READ_FIRST_PERCENT_KEY:
+        case deps.keys.MARK_READ_LONG_WORDS_KEY:
+          deps.markRead();
           break;
         case MIC_SETTINGS_KEY: {
           const held = deps.microphone.stored();

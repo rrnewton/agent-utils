@@ -14,6 +14,7 @@ export interface StoredSettingsDependencies {
   /** Before the first card is drawn: nothing to draw again yet. */
   cardMaxLines(): unknown;
   quoteReadPercent(): unknown;
+  markRead(): unknown;
   readSpeed(): unknown;
   ownRead(): unknown;
   combine(): unknown;
@@ -33,6 +34,7 @@ export function restoreStoredSettings(deps: StoredSettingsDependencies): void {
   deps.collapsedLines();
   deps.cardMaxLines();
   deps.quoteReadPercent();
+  deps.markRead();
   deps.readSpeed();
   deps.ownRead();
   deps.combine();

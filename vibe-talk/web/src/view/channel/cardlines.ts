@@ -7,7 +7,7 @@
 import type { Message } from "../../contract/index.ts";
 import { cardProxyLines, foldedCardText, proxyLinesOf } from "../../present/rows/index.ts";
 import { cardStubText, cardUnits, keepCardUnits } from "./cardtext.ts";
-import { quoteMarksRead, quoteShare } from "../../present/rows/index.ts";
+import { quotePosition, quoteShare, replyShouldMarkRead } from "../../present/rows/index.ts";
 import type { MessageBodies } from "./body.ts";
 import { createSummaryWatch } from "./summarywatch.ts";
 import type { CardChoice } from "./packcontrols.ts";
@@ -23,6 +23,16 @@ export interface QuoteReadPercentLike {
   current(): number;
 }
 
+/** The Mark read on reply switches, as far as a reply reads them (core/settings owns them). */
+export interface ReplyMarkSwitchesLike {
+  on(): boolean;
+}
+
+/** The read mode in force, as far as a reply reads it: `readModes.mode()` (`show` or `fold`). */
+export interface ReadModeLike {
+  mode(): string;
+}
+
 
 /** A card's cut: after its first `head` units, or the whole root clamped, or a stub. */
 export interface CardCut {
@@ -35,6 +45,15 @@ export interface CardCut {
 export interface CardLinesDependencies {
   readonly cardMaxLines: CardMaxLinesLike;
   readonly quoteReadPercent: QuoteReadPercentLike;
+  readonly markReadOnReply: ReplyMarkSwitchesLike;
+  readonly markReadQuoteGuard: ReplyMarkSwitchesLike;
+  readonly markReadFoldGuard: ReplyMarkSwitchesLike;
+  readonly markReadNonquote: ReplyMarkSwitchesLike;
+  readonly markReadFinalGuard: ReplyMarkSwitchesLike;
+  readonly markReadFirstGuard: ReplyMarkSwitchesLike;
+  readonly markReadFirstPercent: QuoteReadPercentLike;
+  readonly markReadLongWords: QuoteReadPercentLike;
+  readonly readMode: ReadModeLike;
   bodies(): MessageBodies;
   rawTextOf(message: Message): string;
   headingOf(message: Message): { cut: number } | null;
@@ -109,7 +128,19 @@ export function createCardLines(deps: CardLinesDependencies): CardLines {
   }
 
   function replyMarksRead(target: { id: unknown; content: string }, text: string): string | null {
-    return quoteMarksRead(quoteShare(text, deps.rawTextOf(target as Message)) as never, deps.quoteReadPercent.current()) ? String(target.id) : null;
+    const whole = deps.rawTextOf(target as Message);
+    const choices = {
+      enabled: deps.markReadOnReply.on(),
+      quoteGuard: deps.markReadQuoteGuard.on(),
+      foldGuard: deps.markReadFoldGuard.on(),
+      inFold: deps.readMode.mode() === "fold",
+      markNonQuote: deps.markReadNonquote.on(),
+      finalGuard: deps.markReadFinalGuard.on(),
+      firstGuard: deps.markReadFirstGuard.on(),
+      firstPercent: deps.markReadFirstPercent.current(),
+      longWords: deps.markReadLongWords.current(),
+    };
+    return replyShouldMarkRead(choices, quoteShare(text, whole) as never, deps.quoteReadPercent.current(), quotePosition(text, whole) as never) ? String(target.id) : null;
   }
 
   function rootOverflowsCard(root: Message | null | undefined): boolean {

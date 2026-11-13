@@ -1412,10 +1412,10 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // it decides how much of a message is shown, so the server keeps it for every device,
   // and Screen and keys is the one per-device section. `#543 in-app-message-links` put Message links
   // after Rich headers: whether a link to a message opens it here is a choice about drawing messages.
-  // `#728 vt-quote-read-threshold` put Quoted replies under Your own messages: both say what marks read.
+  // Mark read on reply sits under Your own messages: both say what marks read.
   // `#1321 after-done-setting` put After Done after Message links: what e does after marking
   // is a choice about marking messages, and it syncs as the choices beside it do.
-  assert.deepStrictEqual(messages, ["Your own messages", "Quoted replies", "Mark-read automatically", "Empty messages", "Combining messages",
+  assert.deepStrictEqual(messages, ["Your own messages", "Mark read on reply", "Mark-read automatically", "Empty messages", "Combining messages",
     "Rich headers", "Message links", "After Done", "Summaries", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {

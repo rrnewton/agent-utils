@@ -6,6 +6,8 @@
 import type { StoragePort } from "../../ports/index.ts";
 import {
   DEFAULT_CARD_MAX_LINES,
+  DEFAULT_MARK_READ_FIRST_PERCENT,
+  DEFAULT_MARK_READ_LONG_WORDS,
   DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_COLLAPSED_LINES,
   DEFAULT_DISCUSS_WIDTH,
@@ -13,6 +15,8 @@ import {
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
+  clampMarkReadFirstPercent,
+  clampMarkReadLongWords,
   clampQuoteReadPercent,
   clampCollapsedLines,
   clampDiscussWidth,
@@ -224,6 +228,33 @@ export const DEVICE_SETTINGS = Object.freeze({
     read: (raw: string | null) => clampCardMaxLines(raw === null ? DEFAULT_CARD_MAX_LINES : raw),
     write: (n: number) => String(n),
     refused: { value: DEFAULT_CARD_MAX_LINES },
+  } satisfies DeviceSetting<number>,
+  /** Mark read on reply itself: No means a sent reply never marks what it answers. On unless off. Synced. */
+  markReadOnReply: onUnlessOff("vibe-talk.voice.mark-read-on-reply"),
+  /** Hold a reply back when its quote covers under the share. Off unless on: the size rule is
+   * the older heuristic, so a kept percent alone never turns it on. Synced. */
+  markReadQuoteGuard: offUnlessOn("vibe-talk.voice.mark-read-quote-guard", false),
+  /** Hold a reply back sent in Fold read. On unless off. Synced. */
+  markReadFoldGuard: onUnlessOff("vibe-talk.voice.mark-read-fold-guard"),
+  /** Whether an unquoted reply marks what it answers. On unless off. Synced. */
+  markReadNonquote: onUnlessOff("vibe-talk.voice.mark-read-nonquote"),
+  /** Hold a quoted reply back when its quote ends before the final paragraph. On unless off. Synced. */
+  markReadFinalGuard: onUnlessOff("vibe-talk.voice.mark-read-final-guard"),
+  /** Hold a quoted reply back when its quote sits in the first share of a long message. On unless off. Synced. */
+  markReadFirstGuard: onUnlessOff("vibe-talk.voice.mark-read-first-guard"),
+  /** The first share, in percent, for the long-message guard. Synced. */
+  markReadFirstPercent: {
+    key: "vibe-talk.voice.mark-read-first-percent",
+    read: (raw: string | null) => clampMarkReadFirstPercent(raw === null ? DEFAULT_MARK_READ_FIRST_PERCENT : raw),
+    write: (pct: number) => String(pct),
+    refused: { value: DEFAULT_MARK_READ_FIRST_PERCENT },
+  } satisfies DeviceSetting<number>,
+  /** How many words make a message long, for the first-share guard. Synced. */
+  markReadLongWords: {
+    key: "vibe-talk.voice.mark-read-long-words",
+    read: (raw: string | null) => clampMarkReadLongWords(raw === null ? DEFAULT_MARK_READ_LONG_WORDS : raw),
+    write: (n: number) => String(n),
+    refused: { value: DEFAULT_MARK_READ_LONG_WORDS },
   } satisfies DeviceSetting<number>,
   /** `#728 vt-quote-read-threshold`. How much a reply's quote must cover to mark read, clamped. Synced. */
   quoteReadPercent: {

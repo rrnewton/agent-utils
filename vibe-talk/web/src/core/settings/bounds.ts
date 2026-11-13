@@ -89,6 +89,32 @@ function clampQuoteReadPercent(value: unknown): number {
   return Math.min(MAX_QUOTE_READ_PERCENT, Math.max(MIN_QUOTE_READ_PERCENT, Math.round(n)));
 }
 
+/** Where a quote sits in a long message: the first share of it, and how long is long, in words. */
+const MIN_MARK_READ_FIRST_PERCENT = 0;
+const MAX_MARK_READ_FIRST_PERCENT = 100;
+const DEFAULT_MARK_READ_FIRST_PERCENT = 50;
+const MIN_MARK_READ_LONG_WORDS = 0;
+const MAX_MARK_READ_LONG_WORDS = 5000;
+const DEFAULT_MARK_READ_LONG_WORDS = 0;
+
+/** A first-share percentage this page will apply: whole numbers from 0 to 100, 50 for anything else. */
+function clampMarkReadFirstPercent(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) return DEFAULT_MARK_READ_FIRST_PERCENT;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return DEFAULT_MARK_READ_FIRST_PERCENT;
+  return Math.min(MAX_MARK_READ_FIRST_PERCENT, Math.max(MIN_MARK_READ_FIRST_PERCENT, Math.round(n)));
+}
+
+/** A long-message word count this page will apply: 0 to 5000, 0 for anything else; over 0 is every message. */
+function clampMarkReadLongWords(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) return DEFAULT_MARK_READ_LONG_WORDS;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return DEFAULT_MARK_READ_LONG_WORDS;
+  return Math.min(MAX_MARK_READ_LONG_WORDS, Math.max(MIN_MARK_READ_LONG_WORDS, Math.round(n)));
+}
+
 /** The reading column's width, in characters. */
 const MIN_READING_CH = 45;
 const MAX_READING_CH = 120;
@@ -183,6 +209,8 @@ export {
   DEFAULT_COLLAPSED_LINES,
   DEFAULT_DISCUSS_WIDTH,
   DEFAULT_MSG_SCALE,
+  DEFAULT_MARK_READ_FIRST_PERCENT,
+  DEFAULT_MARK_READ_LONG_WORDS,
   DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
@@ -190,6 +218,8 @@ export {
   MAX_COLLAPSED_LINES,
   MAX_DISCUSS_WIDTH,
   MAX_MSG_SCALE,
+  MAX_MARK_READ_FIRST_PERCENT,
+  MAX_MARK_READ_LONG_WORDS,
   MAX_QUOTE_READ_PERCENT,
   MAX_READING_CH,
   MAX_READ_SPEED,
@@ -198,6 +228,8 @@ export {
   MIN_COLLAPSED_LINES,
   MIN_DISCUSS_WIDTH,
   MIN_MSG_SCALE,
+  MIN_MARK_READ_FIRST_PERCENT,
+  MIN_MARK_READ_LONG_WORDS,
   MIN_QUOTE_READ_PERCENT,
   MIN_READING_CH,
   MIN_READ_SPEED,
@@ -206,6 +238,8 @@ export {
   clampCollapsedLines,
   clampDiscussWidth,
   clampMsgScale,
+  clampMarkReadFirstPercent,
+  clampMarkReadLongWords,
   clampQuoteReadPercent,
   clampReadSpeed,
   clampReadingWidth,

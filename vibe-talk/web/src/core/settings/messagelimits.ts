@@ -7,9 +7,13 @@
 import {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_COLLAPSED_LINES,
+  DEFAULT_MARK_READ_FIRST_PERCENT,
+  DEFAULT_MARK_READ_LONG_WORDS,
   DEFAULT_QUOTE_READ_PERCENT,
   clampCardMaxLines,
   clampCollapsedLines,
+  clampMarkReadFirstPercent,
+  clampMarkReadLongWords,
   clampQuoteReadPercent,
 } from "./bounds.ts";
 import { DEVICE_SETTINGS } from "./device.ts";
@@ -132,6 +136,43 @@ export function createQuoteReadPercent(deps: MessageLimitDependencies): QuoteRea
     apply(value) {
       const n = clampQuoteReadPercent(value);
       quoteReadPercent = n;
+      deps.render(n);
+      return n;
+    },
+  };
+}
+
+/** A Mark read on reply number in force, and the device's copy of it, as `QuoteReadPercent` is. */
+export interface MarkReadNumber {
+  current(): number;
+  stored(): number;
+  apply(value: unknown): number;
+}
+
+/** The first-share percentage in force (50 until the reader says otherwise). */
+export function createMarkReadFirstPercent(deps: MessageLimitDependencies): MarkReadNumber {
+  let value = DEFAULT_MARK_READ_FIRST_PERCENT;
+  return {
+    current: () => value,
+    stored: () => deps.deviceSettings().get(DEVICE_SETTINGS.markReadFirstPercent),
+    apply(next) {
+      const n = clampMarkReadFirstPercent(next);
+      value = n;
+      deps.render(n);
+      return n;
+    },
+  };
+}
+
+/** The long-message word count in force (0, every message, until the reader says otherwise). */
+export function createMarkReadLongWords(deps: MessageLimitDependencies): MarkReadNumber {
+  let value = DEFAULT_MARK_READ_LONG_WORDS;
+  return {
+    current: () => value,
+    stored: () => deps.deviceSettings().get(DEVICE_SETTINGS.markReadLongWords),
+    apply(next) {
+      const n = clampMarkReadLongWords(next);
+      value = n;
       deps.render(n);
       return n;
     },

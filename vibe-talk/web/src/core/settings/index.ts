@@ -10,6 +10,8 @@ export { DEVICE_SETTINGS, createDeviceSettings } from "./device.ts";
 export type { AfterDone, DeviceSetting, DeviceSettings, ReadAudioSource, SteerOffset } from "./device.ts";
 export {
   DEFAULT_CARD_MAX_LINES,
+  DEFAULT_MARK_READ_FIRST_PERCENT,
+  DEFAULT_MARK_READ_LONG_WORDS,
   DEFAULT_COLLAPSED_LINES,
   DEFAULT_DISCUSS_WIDTH,
   DEFAULT_MSG_SCALE,
@@ -17,6 +19,8 @@ export {
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   MAX_CARD_MAX_LINES,
+  MAX_MARK_READ_FIRST_PERCENT,
+  MAX_MARK_READ_LONG_WORDS,
   MAX_COLLAPSED_LINES,
   MAX_DISCUSS_WIDTH,
   MAX_MSG_SCALE,
@@ -25,6 +29,8 @@ export {
   MAX_READ_SPEED,
   MAX_TWO_COLUMN_SPLIT,
   MIN_CARD_MAX_LINES,
+  MIN_MARK_READ_FIRST_PERCENT,
+  MIN_MARK_READ_LONG_WORDS,
   MIN_COLLAPSED_LINES,
   MIN_DISCUSS_WIDTH,
   MIN_MSG_SCALE,
@@ -33,6 +39,8 @@ export {
   MIN_READ_SPEED,
   MIN_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
+  clampMarkReadFirstPercent,
+  clampMarkReadLongWords,
   clampCollapsedLines,
   clampDiscussWidth,
   clampMsgScale,
@@ -41,8 +49,8 @@ export {
   clampReadingWidth,
   clampTwoColumnSplit,
 } from "./bounds.ts";
-export { createCardMaxLines, createCollapsedLines, createQuoteReadPercent } from "./messagelimits.ts";
-export type { CardMaxLines, CardMaxLinesDependencies, CollapsedLines, MessageLimitDependencies, QuoteReadPercent } from "./messagelimits.ts";
+export { createCardMaxLines, createCollapsedLines, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent } from "./messagelimits.ts";
+export type { CardMaxLines, CardMaxLinesDependencies, CollapsedLines, MarkReadNumber, MessageLimitDependencies, QuoteReadPercent } from "./messagelimits.ts";
 export { createInAppLinks } from "./inapplinks.ts";
 export type { InAppLinks, InAppLinksDependencies } from "./inapplinks.ts";
 export { createEnterSends, createSingleKeys } from "./keychoices.ts";

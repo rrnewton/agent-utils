@@ -59,4 +59,110 @@ function quoteShare(replyText: unknown, whole: unknown): number | null {
  */
 const quoteMarksRead = (share: number | null, percent: number): boolean => share === null || share * 100 >= percent;
 
-export { QUOTE_MAX_CHARS, quoteBlock, quoteMarksRead, quoteShare, quotedHead };
+/** Where a reply's quote sits in the message it answers, counted in words. */
+export interface QuotePosition {
+  /** Words from the message's start to the quote's end: the quote covers words up to here. */
+  readonly endWord: number;
+  /** The message's words in all. */
+  readonly totalWords: number;
+  /** The quote ends at or before the final paragraph begins. */
+  readonly beforeFinalParagraph: boolean;
+}
+
+/** A text's words: each run of white space is a break, as `wordsLine` joins them. */
+const wordList = (text: string): string[] => wordsLine(text).split(" ").filter((word) => word !== "");
+
+/**
+ * A message as the blocks it is drawn in, each as its words: a paragraph, every bullet or
+ * numbered item, a heading, a code block and a quoted block each count as one. A one-block
+ * message is all final block, so a quote in it is never before the final paragraph.
+ */
+function renderedBlocks(text: string): string[][] {
+  const blocks: string[][] = [];
+  let current: string[] = [];
+  let kind = "";
+  let inCode = false;
+  const flush = (): void => { if (current.length > 0) blocks.push(current); current = []; kind = ""; };
+  const startBlock = (next: string): void => { flush(); kind = next; };
+  for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      if (!inCode) { startBlock("code"); inCode = true; current.push(...wordList(line)); }
+      else { current.push(...wordList(line)); inCode = false; flush(); }
+      continue;
+    }
+    if (inCode) { current.push(...wordList(line)); continue; }
+    if (trimmed === "") { flush(); continue; }
+    if (/^#{1,6}\s/.test(trimmed)) startBlock("heading");
+    else if (/^\s*>/.test(line)) { if (kind !== "quote") startBlock("quote"); }
+    else if (/^\s*(?:[-*+]\s|\d+[.)]\s)/.test(line)) startBlock("item");
+    else if (kind === "heading" || kind === "quote") startBlock("para");
+    current.push(...wordList(line));
+  }
+  flush();
+  return blocks.filter((words) => words.length > 0);
+}
+
+/**
+ * Where the quote `replyText` opens with sits in `whole`: the first place its words appear in
+ * the message's, in order. Null where the reply quotes nothing, the message has no words, or
+ * the quoted words are not found in it (a quote cut or reworded past finding fails open: the
+ * position guards below then hold nothing back).
+ */
+function quotePosition(replyText: unknown, whole: unknown): QuotePosition | null {
+  const quoted = wordList(quotedHead(replyText));
+  const all = wordList(String(whole ?? ""));
+  if (quoted.length === 0 || all.length === 0) return null;
+  let at = -1;
+  for (let start = 0; start + quoted.length <= all.length; start += 1) {
+    if (quoted.every((word, offset) => all[start + offset] === word)) { at = start; break; }
+  }
+  if (at < 0) return null;
+  const blocks = renderedBlocks(String(whole ?? ""));
+  const lastWords = blocks.length > 0 ? (blocks[blocks.length - 1] as string[]).length : 0;
+  return { endWord: at + quoted.length, totalWords: all.length, beforeFinalParagraph: at + quoted.length <= all.length - lastWords };
+}
+
+/** The reader's Mark read on reply choices, as a reply reads them at send time. */
+export interface ReplyMarkChoices {
+  /** Mark read on reply itself: No holds every reply back. */
+  readonly enabled: boolean;
+  /** Hold a reply back when its quote covers under the share. */
+  readonly quoteGuard: boolean;
+  /** Hold a reply back sent while the list is in Fold read. */
+  readonly foldGuard: boolean;
+  /** Whether the list is in Fold read as the reply is sent. */
+  readonly inFold: boolean;
+  /** Whether a reply that quotes nothing marks what it answers. */
+  readonly markNonQuote: boolean;
+  /** Hold a quoted reply back when its quote ends before the final paragraph. */
+  readonly finalGuard: boolean;
+  /** Hold a quoted reply back when its quote sits in the first share of a long message. */
+  readonly firstGuard: boolean;
+  /** The first share, in percent, and how many words make a message long. */
+  readonly firstPercent: number;
+  readonly longWords: number;
+}
+
+/**
+ * Whether a reply marks the message it answers read, by the reader's choices: No never does;
+ * in Fold read it does not while that guard is on, because Fold read folds what was just
+ * answered out of sight. A reply that quotes nothing marks only while non-quote replies do.
+ * A quoted reply is held back by any quoted-reply guard it trips: too small a quote, a quote
+ * ending before the final paragraph, or a quote sitting in the first share of a long message.
+ * With every guard off, Yes marks as `#300 reply-marks-read` always did.
+ */
+function replyShouldMarkRead(choices: ReplyMarkChoices, share: number | null, percent: number, position: QuotePosition | null): boolean {
+  if (!choices.enabled) return false;
+  if (choices.foldGuard && choices.inFold) return false;
+  if (share === null) return choices.markNonQuote;
+  if (choices.quoteGuard && !quoteMarksRead(share, percent)) return false;
+  if (position !== null) {
+    if (choices.finalGuard && position.beforeFinalParagraph) return false;
+    if (choices.firstGuard && position.totalWords > choices.longWords
+      && position.endWord * 100 <= position.totalWords * choices.firstPercent) return false;
+  }
+  return true;
+}
+
+export { QUOTE_MAX_CHARS, quoteBlock, quoteMarksRead, quotePosition, quoteShare, quotedHead, replyShouldMarkRead };

@@ -219,6 +219,64 @@ test("`#728 vt-quote-read-threshold`: how much of a message a reply's opening qu
   assert.equal(quoteMarksRead(0, 0), true, "at 0% a reply left its message unread");
 });
 
+test("mark read on reply: each choice holds a reply back on its own, for long and short messages alike", () => {
+  const { quotePosition, replyShouldMarkRead, quoteShare } = ROWS;
+  const base = { enabled: true, quoteGuard: false, foldGuard: true, inFold: false, markNonQuote: true,
+    finalGuard: true, firstGuard: true, firstPercent: 50, longWords: 0 };
+  const paras = (n, words) => Array.from({ length: n }, (_, p) => Array.from({ length: words }, (_, w) => `p${p}w${w}`).join(" ")).join("\n\n");
+  const long = paras(4, 100); // 400 words, four paragraphs.
+  const replyTo = (text, whole) => replyShouldMarkRead(base, quoteShare(text, whole), 5, quotePosition(text, whole));
+  // No: nothing marks, quoted or not, long or short.
+  assert.equal(replyShouldMarkRead({ ...base, enabled: false }, null, 5, null), false);
+  assert.equal(replyTo(`> ${"p0w0 p0w1"}\n\nyes`, long), false, "premise: an early quote in a long message marks by default in this test");
+  // Fold read holds every reply back while its box is ticked, and only then.
+  assert.equal(replyShouldMarkRead({ ...base, inFold: true }, null, 5, null), false);
+  assert.equal(replyShouldMarkRead({ ...base, inFold: true, foldGuard: false }, null, 5, null), true);
+  // A reply that quotes nothing is governed by the non-quote box alone.
+  assert.equal(replyShouldMarkRead(base, null, 5, null), true);
+  assert.equal(replyShouldMarkRead({ ...base, markNonQuote: false }, null, 5, null), false);
+  // Size: under the share holds back only while its box is ticked (it starts unticked).
+  assert.equal(replyShouldMarkRead({ ...base, quoteGuard: true }, 0.04, 5, null), false);
+  assert.equal(replyShouldMarkRead(base, 0.04, 5, null), true, "size guard on by default in code: the device setting keeps it off");
+  // Final paragraph: a quote ending before the last paragraph holds back; one reaching it marks.
+  assert.equal(replyTo(`> p0w0 p0w1 p0w2\n\nyes`, long), false);
+  assert.equal(replyTo(`> p3w0 p3w1 p3w2\n\nyes`, long), true);
+  assert.equal(replyShouldMarkRead({ ...base, finalGuard: false, firstGuard: false },
+    quoteShare(`> p0w0\n\nyes`, long), 5, quotePosition(`> p0w0\n\nyes`, long)), true);
+  // First share of a long message: a quote ending in the first 25% holds back; past it marks.
+  const early = `> ${Array.from({ length: 50 }, (_, w) => `p0w${w}`).join(" ")}\n\nyes`;
+  const late = `> ${Array.from({ length: 50 }, (_, w) => `p2w${w}`).join(" ")}\n\nyes`;
+  assert.equal(replyTo(early, long), false);
+  // Past the first share but still before the final paragraph: the final-paragraph guard holds
+  // it; with that guard off, the first-share guard alone lets it mark.
+  assert.equal(replyTo(late, long), false);
+  assert.equal(replyShouldMarkRead({ ...base, finalGuard: false },
+    quoteShare(late, long), 5, quotePosition(late, long)), true);
+  assert.equal(replyTo(`> p3w0 p3w1\n\nyes`, long), true, "a quote in the final paragraph marks");
+  // Over the reader's word count a message counts as long; under it it does not, however
+  // early its quote sits (at the default of over 0 words, every message counts).
+  const short = paras(2, 10);
+  assert.equal(replyShouldMarkRead({ ...base, finalGuard: false, longWords: 300 },
+    quoteShare(`> p0w0\n\nyes`, short), 5, quotePosition(`> p0w0\n\nyes`, short)), true);
+  assert.equal(replyShouldMarkRead({ ...base, finalGuard: false },
+    quoteShare(`> p0w0\n\nyes`, short), 5, quotePosition(`> p0w0\n\nyes`, short)), false,
+    "at over 0 words the first-share guard holds even a short message's early quote back");
+  // Position itself: word counts, and a quote that is not found fails open.
+  assert.deepStrictEqual(quotePosition(`> p1w0 p1w1\n\nyes`, long), { endWord: 102, totalWords: 400, beforeFinalParagraph: true });
+  assert.equal(quotePosition("> words not in it\n\nyes", long), null);
+  assert.equal(quotePosition("no quote", long), null);
+  // Rendered blocks, not blank lines alone: a one-block message always marks on a quoted reply.
+  const oneBlock = "just one paragraph with several words in it";
+  assert.equal(replyTo("> just one paragraph with several words\n\nyes", oneBlock), true,
+    "a one-block message did not mark: its only block is its final block");
+  const bullets = "- first bullet words here\n- second bullet words here\n- third bullet words here";
+  assert.equal(replyTo("> first bullet words\n\nyes", bullets), false, "a quote from an early bullet marked read");
+  assert.equal(replyTo("> third bullet words\n\nyes", bullets), true, "a quote from the last bullet left it unread");
+  const headed = "# A heading here\n\nSome body words follow on.\n\n```\ncode words inside\n```";
+  assert.equal(replyTo("> A heading here\n\nyes", headed), false, "a quote from the heading marked read");
+  assert.equal(replyTo("> code words inside\n\nyes", headed), true, "a quote from the final code block left it unread");
+});
+
 test("`#624 voice-page-modularity`: the lines between rows — a day rule, a run's days, an unmatched gap and one after the last row — from the module alone", () => {
   const { seamPlan } = ROWS;
   const clock = { now: new Date(2026, 9, 12, 15), today: 20261012, yesterday: 20261011, year: 2026 };

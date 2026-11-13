@@ -107,6 +107,16 @@ pub const SYNCED_KEYS: &[&str] = &[
     // How much of a message a reply's quote must cover for the reply to mark it read
     // (`#728 vt-quote-read-threshold`).
     "vibe-talk.voice.quote-read-percent",
+    // Mark read on reply: whether a sent reply marks what it answers read at all, and the
+    // guards that can hold it back (a small quote, Fold read). All on unless turned off.
+    "vibe-talk.voice.mark-read-on-reply",
+    "vibe-talk.voice.mark-read-quote-guard",
+    "vibe-talk.voice.mark-read-fold-guard",
+    "vibe-talk.voice.mark-read-nonquote",
+    "vibe-talk.voice.mark-read-final-guard",
+    "vibe-talk.voice.mark-read-first-guard",
+    "vibe-talk.voice.mark-read-first-percent",
+    "vibe-talk.voice.mark-read-long-words",
     // Channels: who is who, the owner's choice of which account is him, the coding agent,
     // a person or another bot. `#488 slack-app-agents`.
     "vibe-talk.voice.identities",

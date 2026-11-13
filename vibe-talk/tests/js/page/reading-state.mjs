@@ -5385,9 +5385,18 @@ async function longMessagePage(storage = new Map(), script = undefined) {
   return page;
 }
 
+/** Tick the size rule and untick the two location rules, so a walk sees the size rule alone. */
+async function sizeRuleOnly(page) {
+  await page.el("mark-read-quote-guard").setChecked(true);
+  await page.el("mark-read-final-guard").setChecked(false);
+  await page.el("mark-read-first-guard").setChecked(false);
+  await page.settle();
+}
+
 test("`#728 vt-quote-read-threshold`: a reply quoting under 5% of a message leaves it unread; one quoting more, or nothing, marks it read as before", async () => {
   const one = `> ${LONG_SENTENCES[3]}\n\nwhich runner?`;
   const page = await longMessagePage();
+  await sizeRuleOnly(page);
   await replyAndSend(page, LONG_ID, one);
   assert.equal(page.repliesPosted.at(-1).body.reply_to, LONG_ID, "the premise is a reply to the long message");
   assert.match(page.repliesPosted.at(-1).body.text, /^> Sentence 04/, "the premise is a quoted reply");
@@ -5396,6 +5405,7 @@ test("`#728 vt-quote-read-threshold`: a reply quoting under 5% of a message leav
 
   // Two sentences of twenty are 10%: the message is marked, as #300 always did.
   const two = await longMessagePage();
+  await sizeRuleOnly(two);
   await replyAndSend(two, LONG_ID, `> ${LONG_SENTENCES[3]}\n> ${LONG_SENTENCES[4]}\n\nboth of these`);
   assert.deepStrictEqual(two.dismissCalls, [{ messages: [LONG_ID] }]);
   assert.deepStrictEqual(two.upstreamReadCalls, [{ message_id: LONG_ID, after_reply: true }]);
@@ -5407,25 +5417,30 @@ test("`#728 vt-quote-read-threshold`: a reply quoting under 5% of a message leav
 
   // A whole short message quoted is all of it.
   const short = await quotePage();
+  await sizeRuleOnly(short);
   await replyAndSend(short, "1000000000000000001", "> the first message, about the runner\n\nyes");
   assert.deepStrictEqual(short.dismissCalls, [{ messages: ["1000000000000000001"] }]);
 
   // THE CONTROL: every reply marking what it answers, the one-sentence quote marks the message.
   const control = await longMessagePage(new Map(), await brokenModule([{ file: "src/view/channel/cardlines.ts",
-    find: "    return quoteMarksRead(quoteShare(text, deps.rawTextOf(target as Message)) as never, deps.quoteReadPercent.current()) ? String(target.id) : null;",
+    find: "    return replyShouldMarkRead(choices, quoteShare(text, whole) as never, deps.quoteReadPercent.current(), quotePosition(text, whole) as never) ? String(target.id) : null;",
     replace: "    return String(target.id);" }]));
   await replyAndSend(control, LONG_ID, one);
   assert.deepStrictEqual(control.dismissCalls, [{ messages: [LONG_ID] }],
     "with the share ignored the reply still left the message unread, so this test cannot see it");
 });
 
-test("`#728 vt-quote-read-threshold`: the share is Quoted replies in Settings, 0 to 100 and 5 by default, synced, and the next reply follows it", async () => {
-  assertMarkupContains("fold-quote-read-body", "quote-read-percent");
+test("`#728 vt-quote-read-threshold`: the share is in Mark read on reply in Settings, 0 to 100 and 5 by default, synced, and the next reply follows it", async () => {
+  assertMarkupContains("fold-mark-read-body", "quote-read-percent");
   assert.match(/<input\s+id="quote-read-percent"[^>]*>/.exec(HTML_CODE.replace(/\n\s*/g, " "))[0], /min="0" max="100"/);
   assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(QUOTE_READ_STORAGE), "the share is not kept on the server");
   const storage = new Map();
   const page = await longMessagePage(storage);
   assert.equal(page.el("quote-read-percent").value, "5", "the default is not 5%");
+  // The size rule starts unticked, so its slider is inert until the reader ticks it; the
+  // location rules beside it start ticked, so this walk turns them off to see size alone.
+  assert.equal(page.el("mark-read-quote-guard").checked, false, "the size rule is on before anyone ticked it");
+  await sizeRuleOnly(page);
   // 0: every reply marks what it answers, whatever it quotes.
   await page.el("quote-read-percent").setValue("0");
   await page.settle();
@@ -5446,6 +5461,93 @@ test("`#728 vt-quote-read-threshold`: the share is Quoted replies in Settings, 0
   await again.settle();
   assert.equal(storage.get(QUOTE_READ_STORAGE), "99");
   assert.match(again.el("quote-read-percent-state").textContent, /quotes less than 99% of a message leaves it unread/);
+});
+
+test("mark read on reply: No hides the choices and holds every reply back; Yes reveals them under a Quoted replies group", async () => {
+  for (const key of ["vibe-talk.voice.mark-read-on-reply", "vibe-talk.voice.mark-read-quote-guard",
+    "vibe-talk.voice.mark-read-fold-guard", "vibe-talk.voice.mark-read-nonquote",
+    "vibe-talk.voice.mark-read-final-guard", "vibe-talk.voice.mark-read-first-guard",
+    "vibe-talk.voice.mark-read-first-percent", "vibe-talk.voice.mark-read-long-words"]) {
+    assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(key), `${key} is not kept on the server`);
+  }
+  assertMarkupContains("fold-mark-read-body", "mark-read-options");
+  const storage = new Map();
+  const page = await longMessagePage(storage);
+  assert.equal(page.el("mark-read-on-reply").value, "yes", "Mark read on reply does not start at Yes");
+  assert.equal(page.el("mark-read-options").hidden, false, "the choices are hidden while Yes");
+  assertMarkupContains("mark-read-quoted", "mark-read-quote-guard");
+  page.el("mark-read-on-reply").value = "no";
+  await page.el("mark-read-on-reply").dispatch("change");
+  await page.settle();
+  assert.equal(page.el("mark-read-options").hidden, true, "the choices stayed up under No");
+  assert.equal(storage.get("vibe-talk.voice.mark-read-on-reply"), "0", "No was not kept");
+  await replyAndSend(page, LONG_ID, "on it");
+  assert.deepStrictEqual(page.dismissCalls, [], "a reply under No marked its message read");
+  page.el("mark-read-on-reply").value = "yes";
+  await page.el("mark-read-on-reply").dispatch("change");
+  await page.settle();
+  assert.equal(page.el("mark-read-options").hidden, false, "the choices did not come back under Yes");
+  await replyAndSend(page, LONG_ID, "on it again");
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [LONG_ID] }], "a reply under Yes left its message unread");
+});
+
+test("mark read on reply: Fold read, non-quote, final-block and first-share choices each hold a reply back on their own", async () => {
+  // Fold read: a plain reply sent folded marks nothing until the box is unticked.
+  const folded = await longMessagePage();
+  await chooseReadMode(folded, "Fold read");
+  await replyAndSend(folded, LONG_ID, "on it");
+  assert.deepStrictEqual(folded.dismissCalls, [], "a reply sent in Fold read marked its message read");
+  const unticked = await longMessagePage();
+  await unticked.el("mark-read-fold-guard").setChecked(false);
+  await unticked.settle();
+  await chooseReadMode(unticked, "Fold read");
+  await replyAndSend(unticked, LONG_ID, "on it");
+  assert.deepStrictEqual(unticked.dismissCalls, [{ messages: [LONG_ID] }], "with the Fold read box unticked a folded reply left its message unread");
+  // Non-quote replies: unticked, a plain reply marks nothing; a quoted one still can.
+  const plain = await longMessagePage();
+  await plain.el("mark-read-nonquote").setChecked(false);
+  await plain.settle();
+  await replyAndSend(plain, LONG_ID, "on it");
+  assert.deepStrictEqual(plain.dismissCalls, [], "an unquoted reply marked read with the non-quote box unticked");
+  // Final block: a quote from an early bullet holds back; one from the last bullet marks.
+  const bullets = ["- first bullet words here", "- second bullet words here", "- third bullet words here"].join("\n");
+  const early = newPage(new Map(), undefined, (p) => { p.upstreamReadMarkSupported = true; });
+  await signIn(early);
+  await showDiscord(early, [message({ id: LONG_ID, content: bullets })]);
+  await replyAndSend(early, LONG_ID, "> first bullet words\n\nyes");
+  assert.deepStrictEqual(early.dismissCalls, [], "a quote from an early bullet marked its message read");
+  const last = newPage(new Map(), undefined, (p) => { p.upstreamReadMarkSupported = true; });
+  await signIn(last);
+  await showDiscord(last, [message({ id: LONG_ID, content: bullets })]);
+  await replyAndSend(last, LONG_ID, "> third bullet words\n\nyes");
+  assert.deepStrictEqual(last.dismissCalls, [{ messages: [LONG_ID] }], "a quote from the last bullet left its message unread");
+  // First share: at 50% of every message, a quote ending in the first half holds back.
+  const firstHalf = await longMessagePage();
+  await firstHalf.el("mark-read-final-guard").setChecked(false);
+  await firstHalf.settle();
+  await replyAndSend(firstHalf, LONG_ID, `> ${LONG_SENTENCES[0]}\n\nyes`);
+  assert.deepStrictEqual(firstHalf.dismissCalls, [], "a quote in the first half marked its message read");
+});
+
+test("mark read on reply: with nothing saved anywhere the guards stand as the owner set them", async () => {
+  const assertDefaults = (page, where) => {
+    assert.equal(page.el("mark-read-on-reply").value, "yes", `${where}: not Yes`);
+    assert.equal(page.el("mark-read-fold-guard").checked, true, `${where}: Fold read box off`);
+    assert.equal(page.el("mark-read-nonquote").checked, true, `${where}: non-quote box off`);
+    assert.equal(page.el("mark-read-quote-guard").checked, false, `${where}: size box on`);
+    assert.equal(page.el("mark-read-final-guard").checked, true, `${where}: final-block box off`);
+    assert.equal(page.el("mark-read-first-guard").checked, true, `${where}: first-share box off`);
+    assert.equal(page.el("mark-read-first-percent").value, "50", `${where}: first share not 50%`);
+    assert.equal(page.el("mark-read-long-words").value, "0", `${where}: long threshold not over 0 words`);
+  };
+  // A fresh client: nothing on the device, nothing from the server.
+  assertDefaults(await longMessagePage(new Map()), "fresh client");
+  // A fresh server behind a device that holds only device-local state: no synced value held.
+  assertDefaults(await longMessagePage(new Map([["vibe-talk.voice.width", "90"]])), "fresh server");
+  // An existing user with only the old share saved: the percent is kept, the size rule stays off.
+  const existing = await longMessagePage(new Map([[QUOTE_READ_STORAGE, "40"]]));
+  assertDefaults(existing, "old share only");
+  assert.equal(existing.el("quote-read-percent").value, "40", "the saved share was not kept as the percent");
 });
 
 test("`#300 reply-marks-read`: an outbox entry saved by an earlier page marks what it answers once sent; one saved marking nothing marks nothing", async () => {

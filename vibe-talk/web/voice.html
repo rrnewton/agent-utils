@@ -1791,43 +1791,129 @@
 
                   <section class="settings-group">
                     <div class="group-head">
-                      <h3 title="How much of a message a reply must quote to mark it read."><button class="fold-toggle" id="fold-quote-read" type="button" aria-expanded="false" aria-controls="fold-quote-read-body">Quoted replies</button></h3>
-                      <button class="help-link" id="help-link-quote-read" type="button" data-help="quote-read" aria-label="About quoted replies marking read" title="How much of a message a reply must quote to mark it read.">?</button>
+                      <h3 title="Whether a sent reply marks the message it answers read."><button class="fold-toggle" id="fold-mark-read" type="button" aria-expanded="false" aria-controls="fold-mark-read-body">Mark read on reply</button></h3>
+                      <button class="help-link" id="help-link-mark-read" type="button" data-help="mark-read" aria-label="About marking read on reply" title="Whether a sent reply marks the message it answers read.">?</button>
                     </div>
-                    <div class="fold-body" id="fold-quote-read-body" hidden="until-found">
+                    <div class="fold-body" id="fold-mark-read-body" hidden="until-found">
                       <!--
-                        `#728 vt-quote-read-threshold`. A reply marks the message it answers read (`#300
-                        reply-marks-read`) unless its quote covers less than this share of the message's
-                        words: 5% until the owner says otherwise, 0 to 100. Kept on the server for every
-                        device (`#457 settings-server-side`).
+                        A sent reply marks the message it answers read (`#300 reply-marks-read`),
+                        unless the reader says No here, or a choice below holds it back. Every
+                        choice is kept on the server for every device (`#457 settings-server-side`).
+                        The share a quote must cover is `#728 vt-quote-read-threshold`: 5% until
+                        the owner says otherwise, 0 to 100, under its existing key.
                       -->
-                      <div class="msg-scale-row">
-                        <button
-                          id="quote-read-percent-smaller"
-                          class="secondary step-button"
-                          type="button"
-                          aria-label="A smaller share"
-                          aria-controls="quote-read-percent"
-                          title="A smaller share"
-                        >−</button>
-                        <input
-                          id="quote-read-percent"
-                          type="range"
-                          min="0"
-                          max="100"
-                          step="1"
-                          aria-label="percent of a message a reply's quote must cover to mark it read"
-                        />
-                        <button
-                          id="quote-read-percent-larger"
-                          class="secondary step-button"
-                          type="button"
-                          aria-label="A larger share"
-                          aria-controls="quote-read-percent"
-                          title="A larger share"
-                        >+</button>
+                      <label for="mark-read-on-reply">Mark read on reply</label>
+                      <select id="mark-read-on-reply" aria-describedby="mark-read-state">
+                        <option value="no">No</option>
+                        <option value="yes">Yes</option>
+                      </select>
+                      <p id="mark-read-state" class="hint" aria-live="polite"></p>
+                      <div id="mark-read-options">
+                        <label class="toggle">
+                          <input id="mark-read-fold-guard" type="checkbox" checked />
+                          Not in Fold read mode
+                        </label>
+                        <label class="toggle">
+                          <input id="mark-read-nonquote" type="checkbox" checked />
+                          Mark non-quote replies as read
+                        </label>
+                        <div id="mark-read-quoted">
+                          <p class="hint"><strong>Quoted replies</strong></p>
+                          <label class="toggle">
+                            <input id="mark-read-quote-guard" type="checkbox" />
+                            Not when the quote covers under this share of the message
+                          </label>
+                          <div class="msg-scale-row">
+                            <button
+                              id="quote-read-percent-smaller"
+                              class="secondary step-button"
+                              type="button"
+                              aria-label="A smaller share"
+                              aria-controls="quote-read-percent"
+                              title="A smaller share"
+                            >−</button>
+                            <input
+                              id="quote-read-percent"
+                              type="range"
+                              min="0"
+                              max="100"
+                              step="1"
+                              aria-label="percent of a message a reply's quote must cover to mark it read"
+                            />
+                            <button
+                              id="quote-read-percent-larger"
+                              class="secondary step-button"
+                              type="button"
+                              aria-label="A larger share"
+                              aria-controls="quote-read-percent"
+                              title="A larger share"
+                            >+</button>
+                          </div>
+                          <p id="quote-read-percent-state" class="hint" aria-live="polite"></p>
+                          <label class="toggle">
+                            <input id="mark-read-final-guard" type="checkbox" checked />
+                            Not when the quote is before the final paragraph
+                          </label>
+                          <label class="toggle">
+                            <input id="mark-read-first-guard" type="checkbox" checked />
+                            Not in the first share of a long message
+                          </label>
+                          <div class="msg-scale-row">
+                            <button
+                              id="mark-read-first-percent-smaller"
+                              class="secondary step-button"
+                              type="button"
+                              aria-label="A smaller first share"
+                              aria-controls="mark-read-first-percent"
+                              title="A smaller first share"
+                            >−</button>
+                            <input
+                              id="mark-read-first-percent"
+                              type="range"
+                              min="0"
+                              max="100"
+                              step="1"
+                              aria-label="percent of a long message that counts as its first share"
+                            />
+                            <button
+                              id="mark-read-first-percent-larger"
+                              class="secondary step-button"
+                              type="button"
+                              aria-label="A larger first share"
+                              aria-controls="mark-read-first-percent"
+                              title="A larger first share"
+                            >+</button>
+                          </div>
+                          <p id="mark-read-first-percent-state" class="hint" aria-live="polite"></p>
+                          <div class="msg-scale-row">
+                            <button
+                              id="mark-read-long-words-smaller"
+                              class="secondary step-button"
+                              type="button"
+                              aria-label="Fewer words count as long"
+                              aria-controls="mark-read-long-words"
+                              title="Fewer words count as long"
+                            >−</button>
+                            <input
+                              id="mark-read-long-words"
+                              type="range"
+                              min="0"
+                              max="5000"
+                              step="1"
+                              aria-label="words that make a message long"
+                            />
+                            <button
+                              id="mark-read-long-words-larger"
+                              class="secondary step-button"
+                              type="button"
+                              aria-label="More words count as long"
+                              aria-controls="mark-read-long-words"
+                              title="More words count as long"
+                            >+</button>
+                          </div>
+                          <p id="mark-read-long-words-state" class="hint" aria-live="polite"></p>
+                        </div>
                       </div>
-                      <p id="quote-read-percent-state" class="hint" aria-live="polite"></p>
                     </div>
                   </section>
 
@@ -3109,7 +3195,7 @@
                 <strong>A reply marks read what it answers</strong>, whichever way you started it.
                 <strong>Reply</strong> and <strong>Quote reply</strong> mark the message they answer,
                 on Main or in a thread, unless the quote covers only a little of it (see
-                <strong>Quoted replies</strong>). The first reply you write in a thread nobody has answered,
+                <strong>Mark read on reply</strong>). The first reply you write in a thread nobody has answered,
                 opened from its grey <strong>Thread</strong>, marks the thread's first message, as
                 Reply on it would; later messages in a thread's box, and the main channel's box, mark
                 nothing. Marking read is the message's <strong>Done</strong>, with
@@ -3587,15 +3673,29 @@
               </p>
             </details>
 
-            <details id="help-quote-read" class="help-entry">
-              <summary><h2>Quoted replies</h2></summary>
+            <details id="help-mark-read" class="help-entry">
+              <summary><h2>Mark read on reply</h2></summary>
               <p class="hint">
-                A reply marks the message it answers read, as though you had pressed Done on it. A
-                <strong>quoted reply</strong> that quotes only a little of the message answers that
-                part, not the whole, so the message stays unread for the rest: when the quote covers
-                less than <strong>5% of the message's words</strong> (the share you set in Settings
-                under Messages, kept on the server for every device), nothing is marked. 0 marks the
-                message read whatever the reply quotes; a reply that quotes nothing always marks it.
+                When you send a reply, the message it answers is marked read, as though you had
+                pressed Done on it. In Settings under Messages, <strong>Mark read on reply</strong>
+                says No or Yes. No means a reply never marks anything. Yes marks it, unless a
+                choice below holds it back. Every choice is kept on the server for every device.
+              </p>
+              <p class="hint">
+                <strong>Not in Fold read mode</strong> holds every reply back while the list folds
+                read messages into one line, because the message you just answered would be folded
+                out of sight. <strong>Mark non-quote replies as read</strong> is about replies that
+                quote nothing: on, they mark as they always have; off, they never mark.
+              </p>
+              <p class="hint">
+                Under <strong>Quoted replies</strong>, a quoted reply can be held back three ways,
+                each with its own box. The first is the older way, by size: it can quote too little
+                of the message, under the share you set (5% until you say otherwise; 0 marks
+                whatever is quoted). That box starts unticked. Its quote can sit
+                before the final paragraph, so the end of the message is still unread. Or, in a
+                long message (over 0 words until you say otherwise, so every message), its quote
+                can sit in the first share of it (the first 50% until you say otherwise), so most of the message
+                is still ahead of you. Where a quote sits is where its words are in the message.
               </p>
             </details>
 
