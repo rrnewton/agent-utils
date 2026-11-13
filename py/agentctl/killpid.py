@@ -151,6 +151,7 @@ class RealProcView:
         self._root = root
 
     def process(self, pid: int) -> ProcessInfo | None:
+        """The process at `pid` under the procfs root, or None when unreadable."""
         base = os.path.join(self._root, str(pid))
         try:
             with open(os.path.join(base, "stat"), "rb") as stream:
@@ -199,6 +200,7 @@ class RealUnitView:
         self._systemctl = systemctl
 
     def units(self) -> tuple[UnitInfo, ...]:
+        """Every loaded user service with its main PID, or none when systemctl fails."""
         try:
             completed = subprocess.run(
                 [self._systemctl, "--user", "show", "--all",
@@ -233,6 +235,7 @@ class RealKiller:
     """Signal through a pidfd pinned before the identity recheck, when able."""
 
     def send(self, pid: int, signum: int, view: ProcView, expected: ProcessInfo) -> None:
+        """Signal `pid` after re-verifying it still is `expected`, through its pidfd when able."""
         descriptor: int | None = None
         if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
             try:
