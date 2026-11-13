@@ -216,6 +216,42 @@ pub fn parse_fragment(text: &str, file_stem: &str) -> DataResult<Fragment> {
     })
 }
 
+/// Read every `*.json` fragment in `dir`, in file-name order. Parse and
+/// read failures are returned as problem strings naming the file, so a
+/// check can report them alongside merge conflicts.
+pub fn load_fragments(dir: &std::path::Path) -> (Vec<Fragment>, Vec<String>) {
+    let mut fragments = Vec::new();
+    let mut problems = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return (
+                fragments,
+                vec![format!("topology dir {}: {e}", dir.display())],
+            );
+        }
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match parse_fragment(&text, &stem) {
+                Ok(fragment) => fragments.push(fragment),
+                Err(e) => problems.push(format!("{}: {e}", path.display())),
+            },
+            Err(e) => problems.push(format!("{}: {e}", path.display())),
+        }
+    }
+    (fragments, problems)
+}
+
 /// Merge fragments (and an optional base's defaults) at read time.
 /// Conflicting instance declarations are returned as conflict strings and
 /// never silently merged; defaults are per-watcher policy and are never

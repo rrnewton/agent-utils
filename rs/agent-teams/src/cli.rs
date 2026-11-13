@@ -47,6 +47,7 @@ READ-ONLY MODEL
                                        (pinned, missing, archived, not live,
                                        child, wrong root) with their fixes.
   probe [--json]                       What this host's own tools say (for peers).
+  topology check [--dir DIR] [--json]  Merge topology.d fragments, report conflicts.
   import --coordinators-file FILE --team NAME [--json]
                                        Convert a per-host coordinators file; prints only.
   coordinators [--json]                Designated coordinators on this host, plus remote entries.
@@ -252,6 +253,7 @@ fn run_inner(args: &[String]) -> Result<i32, DataError> {
         "join" => cmd_join(&globals, cmd_args),
         "check" => cmd_check(&globals, cmd_args),
         "probe" => cmd_probe(&globals),
+        "topology" => cmd_topology(&globals, cmd_args),
         "import" => cmd_import(&globals, cmd_args),
         "init" => cmd_init(&globals, cmd_args),
         "send" => cmd_send(&globals, cmd_args),
@@ -491,6 +493,111 @@ fn synced_state_warning(state: &Path, config: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+const TOPOLOGY_HELP: &str = "\
+agent-teams topology check [--dir DIR] [--json]
+
+Merge the per-team topology fragments in DIR, validate them, and report
+conflicts as a list. Conflicts are never silently merged.
+
+ARGUMENTS
+  --dir DIR    Fragment directory. Default: $XDG_CONFIG_HOME/agent-utils/topology.d,
+               else ~/.config/agent-utils/topology.d. Tests and fixtures pass a
+               temp directory here; the default tree is never required to exist
+               for --dir runs.
+  --json       Print one JSON object ({\"ok\", \"dir\", \"instances\", \"conflicts\"})
+               instead of text lines. Also honoured as the global --json.
+
+INPUT
+  One JSON file per team, <team>.json with schema agent-utils-topology/v1
+  (see ai_docs/plans/2026-11-12-team-topology-config.md). The global --teams
+  FILE supplies the declared routes used to validate routes_override entries.
+
+WRITERS (dotsync)
+  The default directory is dotsynced across hosts, and dotsync is
+  last-writer-wins: each team's fragment has exactly one writer host. Edit
+  <team>.json only on that team's writer host (normally where its lead
+  lands it from its own harness repo); other hosts only read and check.
+
+EXIT STATUS
+  0 clean · 1 any conflict (including unparseable fragments) · 2 usage.
+
+EXAMPLE
+  agent-teams topology check --dir /tmp/fixture-topology.d --json
+";
+
+fn cmd_topology(globals: &Globals, args: &[String]) -> Result<i32, DataError> {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print!("{TOPOLOGY_HELP}");
+        return Ok(0);
+    }
+    match args.first().map(String::as_str) {
+        Some("check") => {}
+        _ => {
+            print!("{TOPOLOGY_HELP}");
+            return Ok(2);
+        }
+    }
+    let rest = &args[1..];
+    let dir = match flag_value(rest, "--dir") {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(xdg) => PathBuf::from(xdg).join("agent-utils/topology.d"),
+            None => crate::jsonfile::expand_home("~/.config/agent-utils/topology.d"),
+        },
+    };
+    let json_out = globals.json || has_flag(rest, "--json");
+    let (fragments, mut problems) = crate::topology::load_fragments(&dir);
+    let instance_count;
+    match crate::topology::merge(fragments.clone(), None) {
+        Ok(topology) => {
+            instance_count = topology.instances.len();
+            if problems.is_empty() {
+                let teams = globals.load_teams()?;
+                let declared = |host: &str| -> std::collections::BTreeSet<String> {
+                    teams
+                        .hosts
+                        .get(host)
+                        .map(|h| h.routes.iter().cloned().collect())
+                        .unwrap_or_default()
+                };
+                problems.extend(crate::topology::validate_routes(&topology, &declared));
+            }
+        }
+        Err(conflicts) => {
+            instance_count = fragments.iter().map(|f| f.instances.len()).sum();
+            problems.extend(conflicts);
+        }
+    }
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": problems.is_empty(),
+                "dir": dir.display().to_string(),
+                "instances": instance_count,
+                "conflicts": problems,
+            }))
+            .unwrap_or_default()
+        );
+    } else if problems.is_empty() {
+        println!(
+            "topology: clean ({} instance(s) in {})",
+            instance_count,
+            dir.display()
+        );
+    } else {
+        println!(
+            "topology: {} conflict(s) in {}:",
+            problems.len(),
+            dir.display()
+        );
+        for problem in &problems {
+            println!("- {problem}");
+        }
+    }
+    Ok(if problems.is_empty() { 0 } else { 1 })
 }
 
 fn cmd_check(globals: &Globals, args: &[String]) -> Result<i32, DataError> {

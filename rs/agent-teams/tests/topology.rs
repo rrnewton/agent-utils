@@ -304,6 +304,102 @@ fn tick_kicks_an_unreachable_peer_once_per_silence() {
     assert_eq!(io.kicks, 1);
 }
 
+/// Write fixture fragments to a fresh temp dir and run
+/// `agent-teams topology check --dir DIR` against a fixture teams file.
+/// Tests never read the real ~/.config: --dir and --teams always point
+/// into the temp dir.
+fn run_topology_check(files: &[(&str, &str)], extra: &[&str]) -> (i32, String) {
+    use std::io::Write as _;
+    let dir = std::env::temp_dir().join(format!(
+        "agent-teams-topology-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let fragments = dir.join("topology.d");
+    std::fs::create_dir_all(&fragments).expect("fixture dir");
+    for (name, text) in files {
+        std::fs::write(fragments.join(name), text).expect("fixture fragment");
+    }
+    let teams = dir.join("teams.json");
+    std::fs::write(
+        &teams,
+        r#"{"schema":"agent-teams-teams/v1","hosts":{"host-1":{"routes":["local"]},"host-2":{"routes":["local"]}},"teams":{}}"#,
+    )
+    .expect("fixture teams");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_agent-teams"));
+    cmd.arg("--teams")
+        .arg(&teams)
+        .args(["topology", "check", "--dir"])
+        .arg(&fragments)
+        .args(extra)
+        .env("XDG_CONFIG_HOME", dir.join("no-real-config"));
+    let out = cmd.output().expect("run agent-teams");
+    let _ = std::io::stderr().write_all(&out.stderr);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+    )
+}
+
+#[test]
+fn topology_check_clean_fixture_exits_zero() {
+    let (code, stdout) =
+        run_topology_check(&[("team-a.json", TEAM_A), ("team-b.json", TEAM_B)], &[]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("clean"), "{stdout}");
+    let (code, stdout) = run_topology_check(
+        &[("team-a.json", TEAM_A), ("team-b.json", TEAM_B)],
+        &["--json"],
+    );
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("\"ok\": true"), "{stdout}");
+}
+
+#[test]
+fn topology_check_reports_duplicate_and_mismatch() {
+    let (code, stdout) = run_topology_check(
+        &[
+            ("team-a.json", TEAM_A),
+            ("team-b.json", TEAM_B),
+            ("team-a2.json", TEAM_A),
+        ],
+        &[],
+    );
+    assert_eq!(code, 1, "{stdout}");
+    assert!(
+        stdout.contains("declared twice") || stdout.contains("does not match"),
+        "{stdout}"
+    );
+    let drifting = TEAM_B.replace("\"team-a@host-1\"", "null");
+    let (code, stdout) =
+        run_topology_check(&[("team-a.json", TEAM_A), ("team-b.json", &drifting)], &[]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("subordinate"), "{stdout}");
+}
+
+#[test]
+fn topology_check_reports_bad_route_and_unparseable() {
+    let with_override = TEAM_A.replace(
+        "\"instances\"",
+        "\"routes_override\": {\"host-1->host-2\": {\"kick\": \"no-such-route\"}}, \"instances\"",
+    );
+    let (code, stdout) = run_topology_check(
+        &[("team-a.json", &with_override), ("team-b.json", TEAM_B)],
+        &[],
+    );
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("no-such-route"), "{stdout}");
+    let (code, stdout) = run_topology_check(
+        &[("team-a.json", "{not json"), ("team-b.json", TEAM_B)],
+        &[],
+    );
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("team-a"), "{stdout}");
+}
+
 #[test]
 fn routes_override_must_name_declared_routes() {
     let with_override = TEAM_A.replace(
