@@ -36,3 +36,9 @@ The lead's ruling (2026-11-11):
 # Notes
 
 Related: #1302 wrkslots-ignored-evidence-salvage (same remove path). Numbered from devbig030's interim block (1400-1469).
+
+Observed 2026-11-12 on devbig030: `wrkslots heartbeat` refuses the same way for a slot holding a nested worktree (there, mu-ignsalv's own `.muse/worktrees/ign1400` design worktree inside slot ignsalv):
+
+    wrkslotsd: source repository /home/newton/work/dev-agent-utils/agent-utils (Git common directory /home/newton/work/dev-agent-utils/agent-utils/.git) registers /home/newton/work/dev-agent-utils/worktrees/slots/ignsalv/.muse/worktrees/ign1400 inside the managed agent root, but no active checkout row for that repository names it
+
+So heartbeat is a fourth surface of this gap: the fix should make heartbeat tolerate (and note) an undeclared nested checkout like write-handoff, or accept it once adopt-checkout declares it. The slot was left as it is; nothing was moved or forced.
