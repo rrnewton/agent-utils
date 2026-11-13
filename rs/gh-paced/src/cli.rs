@@ -54,7 +54,7 @@ delivered by a separate `gh-paced --drain` process, so gh-paced exits when gh
 does. `--edit-guard` and `--drain` are run by gh and gh-paced themselves.
 
 USAGE
-  gh-paced [--account NAME] [--real-gh PATH] -- <gh arguments...>
+  gh-paced [--account NAME] [--real-gh PATH] [--admin-allow-file PATH] -- <gh arguments...>
   gh-paced status [--account NAME | --all] [--json]
   gh-paced classify [--json] -- <gh arguments...>
   gh-paced quickstart | userguide | help | --help | -h | --version
@@ -65,6 +65,14 @@ PASS-THROUGH OPTIONS (before the required `--`)
   --real-gh PATH   Absolute path of the real gh. Default: $GH_PACED_REAL_GH,
                    else /usr/bin/gh, else /usr/local/bin/gh. PATH is never
                    searched, and a path that resolves to gh-paced is refused.
+  --admin-allow-file PATH
+                   Host-local admin allowlist file. Default:
+                   $GH_PACED_ADMIN_ALLOW_FILE, else
+                   ~/.local/etc/gh-paced/admin-allow when it exists. Each line
+                   is `METHOD PATH [fields=a,b]` naming one exact admin call
+                   the guard may admit (see userguide); anything else stays
+                   refused. The file must be mode 0600 or 0644 and owned by
+                   the current user.
 
 SUBCOMMANDS
   status           Show budgets, in-flight writes, cooldown, the cached GitHub
@@ -106,7 +114,10 @@ GITHUB PUSHBACK
   call; INT, TERM, HUP or QUIT ends the wait). `gh api` calls to endpoints that need admin rights
   (webhooks, Actions permissions, rulesets, branch protection and collaborator
   changes, repository or organization settings) are refused before they reach
-  GitHub (exit 64) unless GH_PACED_ALLOW_ADMIN_API=1.
+  GitHub (exit 64) unless GH_PACED_ALLOW_ADMIN_API=1 or the exact method, path
+  (and, when the entry names fields=, body fields) match the host-local admin
+  allowlist. An admitted allowlisted call prints one GH-PACED ADMIN-ALLOW line
+  and is recorded in the audit log.
 
 ENVIRONMENT
   GH_PACED_ACCOUNT           default for --account
@@ -136,6 +147,9 @@ ENVIRONMENT
   GH_PACED_ALLOW_FAST_WATCH  1 = allow watch intervals under 30 s
   GH_PACED_ALLOW_ADMIN_API   1 = send `gh api` calls to admin-only endpoints
                              (for an account with admin rights there)
+  GH_PACED_ADMIN_ALLOW_FILE  admin allowlist file (default
+                             ~/.local/etc/gh-paced/admin-allow when it exists);
+                             see --admin-allow-file
   GH_PACED_EDITOR            set by gh-paced for gh's editor guard: the
                              editor you would have had (GH_EDITOR, gh's
                              `editor` setting, GIT_EDITOR, VISUAL, EDITOR,
@@ -160,7 +174,8 @@ EXIT STATUS
   64  usage error, or a refused command shape (a watch without
       GH_PACED_ALLOW_WATCH=1, a watch interval under 30 s, or one that is not
       a plain positive whole number of seconds, or an admin-only `gh api`
-      endpoint without GH_PACED_ALLOW_ADMIN_API=1)
+      endpoint with neither GH_PACED_ALLOW_ADMIN_API=1 nor an exact
+      admin-allowlist match)
   70  internal error: pacing state cannot be read or written, or its lock was
       not obtained within GH_PACED_LOCK_WAIT (within what is left of
       GH_PACED_GIT_MAX_WAIT for GIT_CREDENTIAL)
@@ -201,10 +216,14 @@ const CLASSIFY_HELP: &str = "\
 gh-paced classify: show how a gh command line would be paced
 
 USAGE
-  gh-paced classify [--json] -- <gh arguments...>
+  gh-paced classify [--json] [--admin-allow-file PATH] -- <gh arguments...>
 
 OPTIONS
-  --json  Print JSON (class, cost, command, reason, warnings, refusal).
+  --json  Print JSON (class, cost, command, reason, warnings, refusal,
+          admin_allow).
+  --admin-allow-file PATH  Admin allowlist file (default
+          $GH_PACED_ADMIN_ALLOW_FILE, else
+          ~/.local/etc/gh-paced/admin-allow when it exists).
 
 Runs nothing and touches no state or network. Classification depends only on
 the arguments, the configuration (for --paginate and watch costs) and gh's own
@@ -245,16 +264,19 @@ fn to_strings(args: impl Iterator<Item = OsString>) -> Result<Vec<String>, Strin
     .collect()
 }
 
-fn load_config() -> Result<Config, i32> {
+fn load_config(admin_allow_file: Option<&str>) -> Result<Config, i32> {
     let path = config_path(&env_var);
     let (path, explicit) = match &path {
         Some((p, e)) => (Some(p.as_path()), *e),
         None => (None, false),
     };
     match Config::load(path, explicit, &env_var) {
-        Ok((cfg, warnings)) => {
+        Ok((mut cfg, warnings)) => {
             for w in warnings {
                 eprintln!("GH-PACED WARNING {w}");
+            }
+            if let Some(f) = admin_allow_file.filter(|f| !f.is_empty()) {
+                cfg.override_admin_allow_file(Path::new(f));
             }
             Ok(cfg)
         }
@@ -363,13 +385,25 @@ fn read_stdin_capped(limit: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<String>) -> i32 {
+fn run_paced(
+    account: Option<String>,
+    real_gh: Option<String>,
+    admin_allow_file: Option<String>,
+    gh_args: Vec<String>,
+) -> i32 {
     // Recognised before anything can refuse it. Only a command line naming `git-credential` is
     // classified this early, so no other command is inspected twice.
     let mut credential = gh_args.iter().any(|a| a == "git-credential")
         && classify(&gh_args, &Config::default()).class == crate::classify::Class::GitCredential;
     let mut gh_started = false;
-    let outcome = paced_outcome(account, real_gh, &gh_args, &mut credential, &mut gh_started);
+    let outcome = paced_outcome(
+        account,
+        real_gh,
+        admin_allow_file,
+        &gh_args,
+        &mut credential,
+        &mut gh_started,
+    );
     if answers_quit(credential, gh_started, outcome) {
         // git then stops at once instead of trying another helper or prompting on a terminal
         // while it holds its caller's locks.
@@ -387,6 +421,7 @@ fn run_paced(account: Option<String>, real_gh: Option<String>, gh_args: Vec<Stri
 fn paced_outcome(
     account: Option<String>,
     real_gh: Option<String>,
+    admin_allow_file: Option<String>,
     gh_args: &[String],
     credential: &mut bool,
     gh_started: &mut bool,
@@ -413,7 +448,7 @@ fn paced_outcome(
             return Outcome::Exit(code);
         }
     };
-    let cfg = match load_config() {
+    let cfg = match load_config(admin_allow_file.as_deref()) {
         Ok(c) => c,
         Err(code) => return Outcome::Exit(code),
     };
@@ -572,7 +607,7 @@ fn run_status(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    let cfg = match load_config() {
+    let cfg = match load_config(None) {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -629,6 +664,7 @@ fn run_status(args: &[String]) -> i32 {
 
 fn run_classify(args: &[String]) -> i32 {
     let mut json = false;
+    let mut admin_allow_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -637,12 +673,24 @@ fn run_classify(args: &[String]) -> i32 {
                 return 0;
             }
             "--json" => json = true,
+            "--admin-allow-file" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    loud_error("--admin-allow-file needs a value");
+                    return EXIT_USAGE;
+                };
+                admin_allow_file = Some(v.clone());
+            }
             "--" => break,
             other => {
-                loud_error(&format!(
-                    "classify: unknown argument {other:?}; put gh arguments after `--`"
-                ));
-                return EXIT_USAGE;
+                if let Some(v) = other.strip_prefix("--admin-allow-file=") {
+                    admin_allow_file = Some(v.to_string());
+                } else {
+                    loud_error(&format!(
+                        "classify: unknown argument {other:?}; put gh arguments after `--`"
+                    ));
+                    return EXIT_USAGE;
+                }
             }
         }
         i += 1;
@@ -651,7 +699,7 @@ fn run_classify(args: &[String]) -> i32 {
         loud_error("classify: missing `--` before the gh arguments");
         return EXIT_USAGE;
     }
-    let cfg = match load_config() {
+    let cfg = match load_config(admin_allow_file.as_deref()) {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -690,6 +738,7 @@ fn run_classify(args: &[String]) -> i32 {
             "warnings": c.warnings,
             "refusal": c.refusal,
             "alias": alias_note,
+            "admin_allow": c.admin_allow,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else {
@@ -702,6 +751,14 @@ fn run_classify(args: &[String]) -> i32 {
         }
         for w in &c.warnings {
             println!("warning: {w}");
+        }
+        if let Some(a) = &c.admin_allow {
+            let fields = if a.fields.is_empty() {
+                "-".to_string()
+            } else {
+                a.fields.join(",")
+            };
+            println!("admin-allow: {} {} fields={}", a.method, a.path, fields);
         }
         if let Some(r) = &c.refusal {
             println!("REFUSED: {r}");
@@ -738,7 +795,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> i32 {
         }
         Some("status") => return run_status(&args[1..]),
         Some(crate::editor::EDIT_GUARD_FLAG) => {
-            let cfg = match load_config() {
+            let cfg = match load_config(None) {
                 Ok(c) => c,
                 Err(code) => return code,
             };
@@ -750,14 +807,15 @@ pub fn main(args: impl Iterator<Item = OsString>) -> i32 {
     }
     let mut account = None;
     let mut real_gh = None;
+    let mut admin_allow_file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
             "--" => {
-                return run_paced(account, real_gh, args[i + 1..].to_vec());
+                return run_paced(account, real_gh, admin_allow_file, args[i + 1..].to_vec());
             }
-            "--account" | "--real-gh" => {
+            "--account" | "--real-gh" | "--admin-allow-file" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
                     loud_error(&format!("{a} needs a value"));
@@ -765,8 +823,10 @@ pub fn main(args: impl Iterator<Item = OsString>) -> i32 {
                 };
                 if a == "--account" {
                     account = Some(v.clone());
-                } else {
+                } else if a == "--real-gh" {
                     real_gh = Some(v.clone());
+                } else {
+                    admin_allow_file = Some(v.clone());
                 }
             }
             _ => {
@@ -774,6 +834,8 @@ pub fn main(args: impl Iterator<Item = OsString>) -> i32 {
                     account = Some(v.to_string());
                 } else if let Some(v) = a.strip_prefix("--real-gh=") {
                     real_gh = Some(v.to_string());
+                } else if let Some(v) = a.strip_prefix("--admin-allow-file=") {
+                    admin_allow_file = Some(v.to_string());
                 } else {
                     loud_error(&format!(
                         "unknown argument {a:?}; gh arguments go after `--` (gh-paced --account NAME -- <gh args>)"

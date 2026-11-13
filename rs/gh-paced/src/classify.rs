@@ -89,6 +89,9 @@ pub struct Classification {
     /// (`issue publish`), or an unrecognised flag before the command was complete. Every later
     /// argument is opaque: inspected as possible body text and redacted in the audit.
     pub opaque: bool,
+    /// Set when an admin-only `gh api` call is admitted by the host-local allowlist
+    /// (see [`crate::admin_allow`]); the wrapper logs it and prints a one-line notice.
+    pub admin_allow: Option<crate::admin_allow::AdminAllow>,
 }
 
 /// READ tokens charged for `gh status`: the default READ burst, the most one call may cost.
@@ -903,6 +906,7 @@ fn local(family: &str, sub: Option<String>, command: String, reason: &str) -> Cl
         rest_start: 0,
         deadline_secs: None,
         opaque: false,
+        admin_allow: None,
     }
 }
 
@@ -1193,6 +1197,7 @@ fn paced(
         rest_start: 0,
         deadline_secs: None,
         opaque: false,
+        admin_allow: None,
     }
 }
 
@@ -1642,13 +1647,37 @@ fn classify_api(rest: &[String], cfg: &Config) -> Classification {
     charge_pagination(&mut c, paginate, cfg);
     if !cfg.allow_admin_api {
         if let Some(what) = admin_only(&method, &endpoint) {
-            c.refusal = Some(format!(
-                "{} calls {what}, which GitHub serves only to an account with admin rights; \
-                 without them GitHub answers HTTP 403 or 404, so gh-paced does not send it. If \
-                 this account has admin rights there, set GH_PACED_ALLOW_ADMIN_API=1 for this \
-                 call",
-                c.command
-            ));
+            let fields = crate::admin_allow::extract_fields(&a);
+            match crate::admin_allow::check(
+                &cfg.admin_allow_entries,
+                cfg.admin_allow_error.as_deref(),
+                &method,
+                &endpoint,
+                &fields,
+            ) {
+                Ok(allowed) => {
+                    c.reason = format!("{} (admin allowlist entry `{}`)", c.reason, allowed.entry);
+                    c.admin_allow = Some(allowed);
+                }
+                Err(detail) => {
+                    let allow_hint = match &cfg.admin_allow_path {
+                        Some(p) => format!(
+                            "the host-local allowlist {} admits only the exact method and path it names; {detail}",
+                            p.display()
+                        ),
+                        None => format!(
+                            "no host-local admin allowlist file is in use; {detail}"
+                        ),
+                    };
+                    c.refusal = Some(format!(
+                        "{} calls {what}, which GitHub serves only to an account with admin rights; \
+                         without them GitHub answers HTTP 403 or 404, so gh-paced does not send it. {allow_hint} If \
+                         this account has admin rights there, set GH_PACED_ALLOW_ADMIN_API=1 for this \
+                         call",
+                        c.command
+                    ));
+                }
+            }
         }
     }
     c
@@ -2491,5 +2520,105 @@ mod tests {
         ] {
             assert!(cls(line).refusal.is_none(), "{line:?} must not be refused");
         }
+    }
+
+    fn cfg_allow(text: &str) -> Config {
+        Config {
+            admin_allow_entries: crate::admin_allow::parse_contents(text, "test-allow").unwrap(),
+            admin_allow_path: Some(std::path::PathBuf::from("test-allow")),
+            ..Config::default()
+        }
+    }
+
+    fn cls_allow(line: &str, cfg: &Config) -> Classification {
+        let args: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        classify(&args, cfg)
+    }
+
+    /// #1476 gh-paced-admin-allowlist: an exact allowlist entry admits only its own
+    /// method, path and (for `fields=`) body fields; everything else stays refused.
+    #[test]
+    fn admin_allowlist_admits_only_exact_matches() {
+        let cfg = cfg_allow(
+            "PATCH repos/OWNER/REPO fields=default_branch,allow_merge_commit\n\
+             POST repos/OWNER/REPO/rulesets\n\
+             PUT repos/OWNER/REPO/rulesets/{id}\n\
+             DELETE repos/OWNER/REPO/rulesets/{id}\n",
+        );
+        // Allowed PATCH with allowed fields passes and is marked.
+        let c = cls_allow("api -X PATCH repos/OWNER/REPO -f default_branch=main", &cfg);
+        assert!(c.refusal.is_none(), "{c:?}");
+        let allowed = c.admin_allow.expect("allowlisted call is marked");
+        assert_eq!(allowed.method, "PATCH");
+        assert_eq!(allowed.fields, ["default_branch"]);
+        let c = cls_allow(
+            "api -X PATCH repos/OWNER/REPO -F allow_merge_commit=true -f default_branch=dev",
+            &cfg,
+        );
+        assert!(c.refusal.is_none(), "{c:?}");
+        // The same PATCH with an extra field is refused, naming the field.
+        let c = cls_allow(
+            "api -X PATCH repos/OWNER/REPO -f default_branch=main -f description=x",
+            &cfg,
+        );
+        let refusal = c.refusal.expect("extra field must be refused");
+        assert!(refusal.contains("description"), "{refusal}");
+        assert!(refusal.contains("GH_PACED_ALLOW_ADMIN_API=1"), "{refusal}");
+        assert!(c.admin_allow.is_none());
+        // Non-listed admin paths stay refused (the mutant-sensitive cases).
+        for line in [
+            "api -X DELETE repos/OWNER/REPO",
+            "api -X PUT repos/OWNER/REPO/branches/main/protection --input p.json",
+            "api -X PATCH repos/OWNER/OTHER -f default_branch=main",
+            "api -X POST repos/OWNER/REPO/rulesets/9 -f name=x",
+            "api -X GET repos/OWNER/REPO/rulesets/9",
+        ] {
+            // GET rulesets/9 is a read, not admin-only: it must not be refused at all.
+            if line.starts_with("api -X GET") {
+                assert!(cls_allow(line, &cfg).refusal.is_none(), "{line:?}");
+                continue;
+            }
+            let c = cls_allow(line, &cfg);
+            assert!(c.refusal.is_some(), "{line:?} must stay refused: {c:?}");
+            assert!(c.admin_allow.is_none(), "{line:?}");
+        }
+        // Ruleset id placeholder: exact id passes, missing/extra segments refuse.
+        assert!(cls_allow(
+            "api -X PUT repos/OWNER/REPO/rulesets/42 --input r.json",
+            &cfg
+        )
+        .refusal
+        .is_none());
+        assert!(
+            cls_allow("api -X DELETE repos/OWNER/REPO/rulesets/42", &cfg)
+                .refusal
+                .is_none()
+        );
+        assert!(cls_allow("api -X PUT repos/OWNER/REPO/rulesets", &cfg)
+            .refusal
+            .is_some());
+        assert!(
+            cls_allow("api -X PUT repos/OWNER/REPO/rulesets/42/extra", &cfg)
+                .refusal
+                .is_some()
+        );
+        // A load error refuses even a listed call.
+        let bad = Config {
+            admin_allow_error: Some("test load error".into()),
+            ..cfg_allow("PATCH repos/OWNER/REPO fields=default_branch\n")
+        };
+        assert!(
+            cls_allow("api -X PATCH repos/OWNER/REPO -f default_branch=main", &bad)
+                .refusal
+                .is_some()
+        );
+        // The boolean override is unchanged: it admits without any allowlist.
+        let over = Config {
+            allow_admin_api: true,
+            ..Config::default()
+        };
+        let c = cls_allow("api -X PATCH repos/OWNER/REPO -f anything=1", &over);
+        assert!(c.refusal.is_none());
+        assert!(c.admin_allow.is_none());
     }
 }

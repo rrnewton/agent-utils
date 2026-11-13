@@ -584,6 +584,44 @@ admin rights there sets `GH_PACED_ALLOW_ADMIN_API=1` for that one call:
 GH_PACED_ALLOW_ADMIN_API=1 gh api repos/o/r/actions/permissions
 ```
 
+#### The host-local admin allowlist (scoped alternative)
+
+Where only a few exact admin calls should ever pass — for example flipping a
+repository's default branch or editing its rulesets — prefer the host-local
+allowlist over the blanket boolean. The file is consumer data and never lives
+in the checkout: by default `~/.local/etc/gh-paced/admin-allow`, overridden by
+`$GH_PACED_ADMIN_ALLOW_FILE` or `--admin-allow-file PATH` (the flag wins). It
+must be a regular file, not a symlink, owned by the current user, with mode
+`0600` or `0644`; anything else, and any malformed line, makes the file
+unusable and every admin call is refused (non-admin calls are unaffected).
+
+One entry per line; blank lines and `#` comments are ignored:
+
+```text
+PATCH repos/OWNER/REPO fields=default_branch,allow_merge_commit
+POST repos/OWNER/REPO/rulesets
+PUT repos/OWNER/REPO/rulesets/{id}
+DELETE repos/OWNER/REPO/rulesets/{id}
+```
+
+* The method and the exact path must both match (the path is normalised like a
+  request: scheme, host, leading slash, query and any `api/v3/` prefix
+  dropped). There are no globs: `*`, `?` and any `{...}` other than the single
+  form below are malformed.
+* `/{id}` is allowed only as the final segment of a `PUT` or `DELETE` on a
+  `.../rulesets` path, and matches exactly one further non-empty segment.
+* `fields=a,b` (at most one third token) restricts the request body: every
+  field the call sends — `-f`/`-F`/`--raw-field`/`--field` keys and top-level
+  `--input` JSON keys — must be listed, and a call whose body cannot be
+  inspected (for example `--input -`) is refused (fail closed).
+
+An admitted call is still charged as a `WRITE`, prints one
+`GH-PACED ADMIN-ALLOW [account] METHOD path fields=...` line on stderr, and
+is recorded in the audit log as an `admin-allow` event with the method, path,
+fields and time. `GH_PACED_ALLOW_ADMIN_API=1` is unchanged and admits any
+admin call without the allowlist. See `admin-allow.example` beside the crate
+for the format with placeholder names.
+
 ### Ending a cooldown by hand
 
 A cooldown with an end time ends by itself; wait for it. A cooldown with no end
@@ -1100,6 +1138,7 @@ Environment variables:
 | `GH_PACED_ALLOW_WATCH` | `1` runs watch loops at their estimated charge (refused with exit 64 otherwise) |
 | `GH_PACED_ALLOW_FAST_WATCH` | `1` allows watch intervals under 30 s |
 | `GH_PACED_ALLOW_ADMIN_API` | `1` sends `gh api` calls to [endpoints that need admin rights](#endpoints-that-need-admin-rights) (refused with exit 64 otherwise) |
+| `GH_PACED_ADMIN_ALLOW_FILE` | admin allowlist file (default `~/.local/etc/gh-paced/admin-allow` when it exists); `--admin-allow-file` overrides it. See [the host-local admin allowlist](#the-host-local-admin-allowlist-scoped-alternative) |
 | `GH_PACED_EDITOR` | set by gh-paced for its own editor guard: the editor gh would otherwise have used. Do not set it yourself |
 | `GH_PACED_STATE_DIR` | state directory (default `$XDG_STATE_HOME/gh-paced` or `~/.local/state/gh-paced`) |
 | `GH_PACED_CONFIG` | config file path |
@@ -1160,7 +1199,7 @@ after an hour; do not delete state files to get around it.
 
 Each audit line records the UTC and US Eastern time, host, PID, event
 (`admit`, `throttle`, `refuse`, `pushback`, `forbidden`, `deadline`, `exit`,
-`refresh`),
+`refresh`, `admin-allow`),
 class, cost, command, a redacted argument summary, exit status, seconds waited,
 and a short detail. In the argument summary, inline bodies are replaced by
 `<N bytes>`, header values are redacted, and a `gh api` endpoint loses its host,
@@ -1194,7 +1233,7 @@ other process is stuck.
 | gh's own | the call ran; gh-paced returns gh's status, or dies by gh's signal |
 | 75 | refused: the wait would exceed `GH_PACED_MAX_WAIT` (`GH_PACED_GIT_MAX_WAIT` for GIT_CREDENTIAL, which then also prints `quit=1` on stdout, as it does when the call became admissible only after that bound), a GIT_CREDENTIAL call arrived during a cooldown, the cost is above the class's burst (not for a watch) or can never fit under the hourly cap, a watch ran past the deadline its cost paid for, or gh-paced is nested too deep |
 | 65 | refused by the write content guard: body too large, base64-looking content (in an argument, a file, stdin, or one of gh's alias expansions), a body gh would compose itself, or a body file that cannot be copied for inspection. Text refused by the editor guard makes the editor fail instead, so gh exits with its own status (usually 1) and sends nothing |
-| 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number, one of gh's aliases gh-paced cannot resolve for certain (see [gh's own aliases](#ghs-own-aliases)), or a `gh api` call to an [endpoint that needs admin rights](#endpoints-that-need-admin-rights) without `GH_PACED_ALLOW_ADMIN_API=1`) |
+| 64 | usage error, or a refused command shape (a watch without `GH_PACED_ALLOW_WATCH=1`, a watch interval under 30 s, or one that is not a positive whole number, one of gh's aliases gh-paced cannot resolve for certain (see [gh's own aliases](#ghs-own-aliases)), or a `gh api` call to an [endpoint that needs admin rights](#endpoints-that-need-admin-rights) with neither `GH_PACED_ALLOW_ADMIN_API=1` nor an exact admin-allowlist match) |
 | 70 | internal error: the pacing state cannot be read or written, or its lock was not obtained within `GH_PACED_LOCK_WAIT` (within what is left of `GH_PACED_GIT_MAX_WAIT` for a GIT_CREDENTIAL call, which then also prints `quit=1` on stdout), or a GIT_CREDENTIAL call could not set the timer for its sleep |
 | 78 | configuration error, `--real-gh` resolves to gh-paced, or gh's `config.yml` cannot be read and the command line names a command |
 | 127 | the real gh cannot be found or run (a GIT_CREDENTIAL call whose gh never started then also prints `quit=1` on stdout) |

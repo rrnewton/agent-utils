@@ -3814,3 +3814,205 @@ fn the_unknown_403_wait_is_bounded_and_interruptible() {
     );
     assert!(!has_cooldown(&sb));
 }
+
+/// #1476 gh-paced-admin-allowlist: end-to-end checks against the fake gh.
+/// No network: every call goes to the sandbox fake, and refusals must not reach it.
+fn write_allow(sb: &Sandbox, name: &str, contents: &str, mode: u32) -> String {
+    let path = sb.path(name);
+    std::fs::write(&path, contents).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path.display().to_string()
+}
+
+const ALLOWLIST: &str = "PATCH repos/OWNER/REPO fields=default_branch,allow_merge_commit\nPOST repos/OWNER/REPO/rulesets\nPUT repos/OWNER/REPO/rulesets/{id}\nDELETE repos/OWNER/REPO/rulesets/{id}\n";
+
+#[test]
+fn admin_allowlist_admits_exact_patch_and_logs_it() {
+    let sb = Sandbox::new("allow-ok", FAST);
+    let allow = write_allow(&sb, "admin-allow", ALLOWLIST, 0o600);
+    let o = sb.run(
+        &[
+            "api",
+            "-X",
+            "PATCH",
+            "repos/OWNER/REPO",
+            "-f",
+            "default_branch=main",
+        ],
+        &[("GH_PACED_ADMIN_ALLOW_FILE", &allow)],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(sb.starts().len(), 1, "fake gh log: {:?}", sb.log());
+    assert!(
+        stderr(&o).contains("GH-PACED ADMIN-ALLOW"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        stderr(&o).contains("PATCH repos/OWNER/REPO"),
+        "{}",
+        stderr(&o)
+    );
+    let audit = std::fs::read_to_string(sb.path("state/test.audit.jsonl")).unwrap();
+    assert!(audit.contains("\"admin-allow\""), "{audit}");
+    assert!(audit.contains("default_branch"), "{audit}");
+}
+
+#[test]
+fn admin_allowlist_refuses_extra_field_and_nonlisted_paths() {
+    let sb = Sandbox::new("allow-refuse", FAST);
+    let allow = write_allow(&sb, "admin-allow", ALLOWLIST, 0o644);
+    // Extra body field: refused before gh runs.
+    let o = sb.run(
+        &[
+            "api",
+            "-X",
+            "PATCH",
+            "repos/OWNER/REPO",
+            "-f",
+            "default_branch=main",
+            "-f",
+            "description=x",
+        ],
+        &[("GH_PACED_ADMIN_ALLOW_FILE", &allow)],
+    );
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    assert!(stderr(&o).contains("description"), "{}", stderr(&o));
+    assert!(sb.starts().is_empty(), "gh must not run: {:?}", sb.log());
+    // Non-listed admin paths stay refused, including a path that only extends a
+    // listed one (a prefix matcher would wrongly admit the last case).
+    for args in [
+        vec!["api", "-X", "DELETE", "repos/OWNER/REPO"],
+        vec![
+            "api",
+            "-X",
+            "PUT",
+            "repos/OWNER/REPO/branches/main/protection",
+            "-f",
+            "required_status_checks=null",
+        ],
+        vec![
+            "api",
+            "-X",
+            "POST",
+            "repos/OWNER/REPO/rulesets/9",
+            "-f",
+            "name=x",
+        ],
+    ] {
+        let o = sb.run(&args, &[("GH_PACED_ADMIN_ALLOW_FILE", &allow)]);
+        assert_eq!(o.status.code(), Some(64), "{args:?}: {}", stderr(&o));
+        assert!(
+            stderr(&o).contains("GH_PACED_ALLOW_ADMIN_API=1"),
+            "{}",
+            stderr(&o)
+        );
+    }
+    assert!(sb.starts().is_empty(), "gh must not run: {:?}", sb.log());
+}
+
+#[test]
+fn admin_allowlist_ruleset_id_and_flag_form() {
+    let sb = Sandbox::new("allow-ruleset", FAST);
+    let allow = write_allow(&sb, "admin-allow", ALLOWLIST, 0o600);
+    let o = sb.run(
+        &[
+            "api",
+            "-X",
+            "PUT",
+            "repos/OWNER/REPO/rulesets/42",
+            "-f",
+            "name=x",
+        ],
+        &[("GH_PACED_ADMIN_ALLOW_FILE", &allow)],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // The --admin-allow-file flag selects the same file.
+    let mut c = Command::new(BIN);
+    c.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", sb.path("home"))
+        .env("GH_PACED_REAL_GH", sb.path("gh"))
+        .env("GH_PACED_STATE_DIR", sb.path("state"))
+        .env("GH_PACED_CONFIG", sb.path("config.json"))
+        .env("FAKE_GH_LOG", sb.path("gh.log"))
+        .args(["--account", "test", "--admin-allow-file", &allow, "--"])
+        .args(["api", "-X", "DELETE", "repos/OWNER/REPO/rulesets/7"])
+        .stdin(Stdio::null());
+    let o = c.output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+}
+
+#[test]
+fn admin_allowlist_malformed_or_world_writable_is_refused() {
+    let sb = Sandbox::new("allow-bad", FAST);
+    let patch = [
+        "api",
+        "-X",
+        "PATCH",
+        "repos/OWNER/REPO",
+        "-f",
+        "default_branch=main",
+    ];
+    // Malformed contents.
+    let bad = write_allow(
+        &sb,
+        "admin-allow-bad",
+        "PATCH repos/OWNER/REPO bogus=1\n",
+        0o600,
+    );
+    let o = sb.run(&patch, &[("GH_PACED_ADMIN_ALLOW_FILE", &bad)]);
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    // World-writable file.
+    let ww = write_allow(&sb, "admin-allow-ww", ALLOWLIST, 0o666);
+    let o = sb.run(&patch, &[("GH_PACED_ADMIN_ALLOW_FILE", &ww)]);
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    assert!(sb.starts().is_empty(), "gh must not run: {:?}", sb.log());
+    // A non-admin call is unaffected by the bad file.
+    let o = sb.run(&["pr", "view", "5"], &[("GH_PACED_ADMIN_ALLOW_FILE", &bad)]);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+}
+
+#[test]
+fn admin_allow_env_override_unchanged_without_allowlist() {
+    let sb = Sandbox::new("allow-env", FAST);
+    // Without any allowlist the PATCH is refused; with the boolean it passes.
+    let o = sb.run(
+        &["api", "-X", "PATCH", "repos/OWNER/REPO", "-f", "anything=1"],
+        &[],
+    );
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    let o = sb.run(
+        &["api", "-X", "PATCH", "repos/OWNER/REPO", "-f", "anything=1"],
+        &[("GH_PACED_ALLOW_ADMIN_API", "1")],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(
+        !stderr(&o).contains("GH-PACED ADMIN-ALLOW"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn admin_allowlist_input_json_fields_are_checked() {
+    let sb = Sandbox::new("allow-input", FAST);
+    let allow = write_allow(&sb, "admin-allow", ALLOWLIST, 0o600);
+    let good = sb.path("good.json");
+    std::fs::write(&good, r#"{"default_branch":"main"}"#).unwrap();
+    let good_s = good.display().to_string();
+    let o = sb.run(
+        &["api", "-X", "PATCH", "repos/OWNER/REPO", "--input", &good_s],
+        &[("GH_PACED_ADMIN_ALLOW_FILE", &allow)],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let bad = sb.path("bad.json");
+    std::fs::write(&bad, r#"{"default_branch":"main","description":"x"}"#).unwrap();
+    let bad_s = bad.display().to_string();
+    let o = sb.run(
+        &["api", "-X", "PATCH", "repos/OWNER/REPO", "--input", &bad_s],
+        &[("GH_PACED_ADMIN_ALLOW_FILE", &allow)],
+    );
+    assert_eq!(o.status.code(), Some(64), "{}", stderr(&o));
+    assert!(stderr(&o).contains("description"), "{}", stderr(&o));
+}

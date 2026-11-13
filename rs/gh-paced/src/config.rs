@@ -5,6 +5,7 @@
 //! `gh-paced` state. Every per-host number is chosen so that four hosts together stay well under
 //! GitHub's documented limits; see the user guide for the arithmetic.
 
+use crate::admin_allow::{self, AllowEntry};
 use crate::classify::Class;
 use crate::timefmt::DisplayTz;
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,13 @@ pub struct Config {
     /// (webhooks, Actions permissions, rulesets and branch protection changes, ...), which are
     /// otherwise refused before they reach GitHub.
     pub allow_admin_api: bool,
+    /// Host-local admin allowlist file in use (`--admin-allow-file`, `$GH_PACED_ADMIN_ALLOW_FILE`,
+    /// else `~/.local/etc/gh-paced/admin-allow` when it exists); `None` = no file.
+    pub admin_allow_path: Option<PathBuf>,
+    /// Entries parsed from that file; empty when there is no usable file.
+    pub admin_allow_entries: Vec<AllowEntry>,
+    /// Why the allowlist file cannot be used; when set, every admin call is refused with it.
+    pub admin_allow_error: Option<String>,
 }
 
 impl Default for Config {
@@ -133,6 +141,9 @@ impl Default for Config {
             allow_fast_watch: false,
             allow_watch: false,
             allow_admin_api: false,
+            admin_allow_path: None,
+            admin_allow_entries: Vec::new(),
+            admin_allow_error: None,
         }
     }
 }
@@ -208,7 +219,41 @@ impl Config {
             }
         }
         apply_env(&mut config, env, &mut warnings)?;
+        load_admin_allow(&mut config, env);
         Ok((config, warnings))
+    }
+
+    /// Point the allowlist at `path` (the `--admin-allow-file` flag), replacing whatever
+    /// the environment and the default location selected. A file that cannot be used
+    /// leaves no entries and records why, so admin calls are refused (fail closed).
+    pub fn override_admin_allow_file(&mut self, path: &Path) {
+        self.admin_allow_path = Some(path.to_path_buf());
+        match admin_allow::load_file(path) {
+            Ok(entries) => {
+                self.admin_allow_entries = entries;
+                self.admin_allow_error = None;
+            }
+            Err(e) => {
+                self.admin_allow_entries = Vec::new();
+                self.admin_allow_error = Some(e);
+            }
+        }
+    }
+}
+
+/// Resolve the admin allowlist: `$GH_PACED_ADMIN_ALLOW_FILE` when set, else the default
+/// `~/.local/etc/gh-paced/admin-allow` when it exists. A file that cannot be used
+/// leaves no entries and records why; non-admin calls are unaffected.
+fn load_admin_allow(c: &mut Config, env: &dyn Fn(&str) -> Option<String>) {
+    if let Some(raw) = env(admin_allow::ENV_VAR).filter(|p| !p.trim().is_empty()) {
+        c.override_admin_allow_file(Path::new(raw.trim()));
+        return;
+    }
+    if let Some(home) = env("HOME").filter(|h| h.starts_with('/')) {
+        let default = admin_allow::default_path(&home);
+        if default.exists() {
+            c.override_admin_allow_file(&default);
+        }
     }
 }
 

@@ -13,6 +13,7 @@
 //! The pacing engine ([`wrapper::Wrapper`]) takes its clock and process runner as trait objects
 //! so the whole decision path can be driven deterministically in tests.
 
+pub mod admin_allow;
 pub mod alias;
 pub mod audit;
 pub mod budget;

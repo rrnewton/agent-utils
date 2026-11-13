@@ -578,6 +578,27 @@ impl Wrapper<'_> {
             }
             return Outcome::Exit(EXIT_USAGE);
         }
+        if let Some(allowed) = c.admin_allow.clone() {
+            let fields = if allowed.fields.is_empty() {
+                "-".to_string()
+            } else {
+                allowed.fields.join(",")
+            };
+            let notice = format!(
+                "{} {} fields={} via `{}`",
+                allowed.method, allowed.path, fields, allowed.entry
+            );
+            self.loud("ADMIN-ALLOW", &notice);
+            let mut r = self.record("admin-allow", &c, &summary);
+            r.detail = format!(
+                "{} {} fields={} entry={}",
+                allowed.method, allowed.path, fields, allowed.entry
+            );
+            if let Err(e) = self.audit_locked(&r) {
+                return self.internal_error("cannot record admin-allow", &e);
+            }
+            self.flush();
+        }
         let stdin = match self.content_guard(&c, rest, &summary) {
             Ok(s) => s,
             Err(code) => return Outcome::Exit(code),
@@ -931,6 +952,7 @@ impl Wrapper<'_> {
             rest_start: 1,
             deadline_secs: None,
             opaque: false,
+            admin_allow: None,
         };
         let mut r = self.record("refresh", &rc_class, "api rate_limit");
         match result {

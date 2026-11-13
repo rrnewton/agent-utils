@@ -20,7 +20,11 @@ budget is used up, printing a loud warning line on stderr. It also:
   stops other agents' calls or git's credential helper;
 - refuses `gh api` calls to endpoints that need admin rights (webhooks,
   Actions permissions, ruleset and branch protection changes, ...) before they
-  reach GitHub, unless `GH_PACED_ALLOW_ADMIN_API=1`;
+  reach GitHub, unless `GH_PACED_ALLOW_ADMIN_API=1` or the exact method, path
+  and (when named) body fields match the host-local admin allowlist
+  (`~/.local/etc/gh-paced/admin-allow`, or `$GH_PACED_ADMIN_ALLOW_FILE` /
+  `--admin-allow-file`); an admitted allowlisted call prints one
+  `GH-PACED ADMIN-ALLOW` line and is recorded in the audit log;
 - refuses write bodies larger than 8 KiB or containing long base64 runs,
   whether they come from an argument, a file, stdin, one of gh's ordinary
   aliases (which gh-paced expands itself, so gh never sees the alias name, as

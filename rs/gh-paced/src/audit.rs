@@ -28,7 +28,7 @@ pub struct Record {
     pub host: String,
     /// gh-paced process ID.
     pub pid: u32,
-    /// `admit`, `throttle`, `refuse`, `pushback`, `exit`, `refresh`, `guard`.
+    /// `admit`, `throttle`, `refuse`, `pushback`, `exit`, `refresh`, `guard`, `admin-allow`.
     pub event: String,
     /// Request class.
     pub class: String,

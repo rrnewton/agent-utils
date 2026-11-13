@@ -1,0 +1,23 @@
+# Example host-local admin allowlist for gh-paced.
+#
+# Copy to ~/.local/etc/gh-paced/admin-allow (or point
+# GH_PACED_ADMIN_ALLOW_FILE / --admin-allow-file at your copy), replace the
+# placeholder OWNER and REPO names with the real ones on that host, and set
+# mode 0600 or 0644 owned by the current user:
+#
+#   install -m 0600 admin-allow.example ~/.local/etc/gh-paced/admin-allow
+#
+# This file is an example only: gh-paced never reads it from the checkout.
+# The live file is consumer data and must never be committed.
+#
+# Format, one entry per line; blank lines and # comments are ignored:
+#   METHOD PATH [fields=a,b]
+# METHOD and PATH must match exactly (no globs). /{id} is allowed only as
+# the final segment of a PUT or DELETE on a .../rulesets path. fields=
+# restricts the request body to the named fields (fail closed when the
+# body cannot be inspected).
+
+PATCH repos/OWNER/REPO fields=default_branch,allow_merge_commit
+POST repos/OWNER/REPO/rulesets
+PUT repos/OWNER/REPO/rulesets/{id}
+DELETE repos/OWNER/REPO/rulesets/{id}
