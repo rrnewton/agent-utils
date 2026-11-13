@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-finish-accounting-per-ref-cherry: finish accounting runs one git cherry per remote ref'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -31,4 +31,4 @@ Related: #1364 finish accounting, #1367 / #1276 lock-free gather patterns. Scrat
 
 ## Resolution
 
-Pending.
+[watermelon-full-preview] Landed in f9ac26d1 (tip dfa27a59). Finish accounting now runs landed by one cherry, open by exact containment, and published patch equivalence in a single bounded patch-id pass for only the remaining candidates, in both Python and Rust; accounting is gathered lock-free and revalidated under the lock. Tests: `test_finish_accounting.py` counts Git invocations with 2,000 remote refs (constant, <60) and covers published/landed replay equivalence; `test_finish_write_rust.py` adds open-replay and 300-ref parity for both editions. Both validate gates passed.
