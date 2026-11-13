@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-fence-rename-breaks-linked-worktrees: remove renames the slot before salvage finishes its git reads, so a linked worktree submodule status fails and removal refuses mid-way'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -29,3 +29,5 @@ Decide and implement one of: gather salvage facts before the fence rename (the l
 Reported 2026-11-12 from a consuming project's dead slots. Shape B (2026-11-13): a nested checkout under `ignored/` with a submodule hits the same refusal; both shapes are at their normal path with no journal left. Related: #1367 wrkslots-salvage-thin-bundle-fast (lock-free pregather), #1481 wrkslots-salvage-kept-commit-missing-objects (pending, same code).
 
 ## Resolution
+
+[watermelon-full-preview] Landed in a24582b3. `_GitVcs.status` now falls back to per-invocation submodule overrides when a fence rename leaves a submodule's recorded `core.worktree` stale: the superproject is read without recursing, each initialized gitlink is read at its current path, and the exact `porcelain=v2` lines Git would have printed are synthesized (verified byte-identical). No on-disk Git file is rewritten, so a refused or aborted removal leaves shared repository metadata untouched (asserted in tests). Covers linked worktrees under `temp/` and nested checkouts under `ignored/`. Rust defers submodule salvage to Python, so no Rust change. Tests: `py/wrkslots/tests/test_fence_salvage_recovery.py`.
