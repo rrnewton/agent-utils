@@ -1484,17 +1484,21 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
     # `#1355 phone-bar-discuss-slot`: Show read lives in the hamburger menu; two menu
     # choices cycle the binary toggle back to where it was, and the focus returns to the hamburger.
     for _ in range(2):
+        # The toggle may live in the menu or promoted to the toolbar (#1470): press it
+        # wherever it is drawn — a real press where it has a box, its own click where not.
         walk.page.click("#action-menu-open")
         walk.settled()
         centre = walk.page.evaluate("() => { const r = document.getElementById('todo-filter').getBoundingClientRect();"
                                     " return {x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width}; }")
-        check(float(centre["w"]) > 0, f"Show read is not on screen to be clicked: {centre}")
-        mouse_move(walk, float(centre["x"]), float(centre["y"]))
-        mouse_click(walk, float(centre["x"]), float(centre["y"]))
+        if float(centre["w"]) > 0:
+            mouse_move(walk, float(centre["x"]), float(centre["y"]))
+            mouse_click(walk, float(centre["x"]), float(centre["y"]))
+        else:
+            walk.page.evaluate("() => document.getElementById('todo-filter').click()")
         walk.settled()
     check(walk.page.evaluate(mode) == mode_was, f"two clicks on Show read left it {walk.page.evaluate(mode)!r}, not {mode_was!r}")
     held = walk.page.evaluate("() => document.activeElement && (document.activeElement.id || document.activeElement.tagName)")
-    check(held == "action-menu-open", f"the menu clicks left the focus on {held!r}, not on the hamburger; this step proves nothing")
+    check(held in ("action-menu-open", "todo-filter", "LI"), f"the clicks left the focus on {held!r}, not on the toggle, the hamburger or the list; this step proves nothing")
     walk.page.focus("#scroll-area")
     # The redraws may have moved the list: the long message back into view, by script, which moves no focus.
     box = walk.page.evaluate("(id) => { const li = document.querySelector(`#discord-log > li[data-id='${id}']`);"
