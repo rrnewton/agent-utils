@@ -239,15 +239,19 @@ test("`#821 voice-page-read-aloud-react`: dictation writes unsure then settled w
   });
   const dictation = createDictation(deps(Fake));
   assert.equal(dictation.start(), true);
-  assert.deepStrictEqual([made.started, made.lang, made.interimResults, made.continuous], [true, "en-GB", true, false]);
+  assert.deepStrictEqual([made.started, made.lang, made.interimResults, made.continuous], [true, "en-GB", true, true]);
   assert.deepStrictEqual([said.at(-1), heard.at(-1), dictation.active()], [DICTATION_LISTENING, true, true]);
   const result = (words, isFinal) => ({ resultIndex: 0, results: [Object.assign([{ transcript: words }], { isFinal })] });
   made.onresult(result("the replica", false));
   assert.deepStrictEqual([box.value, settled], ["Yes, the replica", 0], "unsure words show, and are not kept yet");
   made.onresult(result("the replica is done", true));
   assert.deepStrictEqual([box.value, settled], ["Yes, the replica is done", 1], "settled words are kept as the draft");
-  made.onend();
-  assert.deepStrictEqual([heard.at(-1), said.at(-1), dictation.active()], [false, "", false]);
+  // `#1503 react-dictation-keeps-listening`: a session that ends restarts while the box stays open.
+  const first = made;
+  first.onend();
+  assert.deepStrictEqual([heard.at(-1), said.at(-1), dictation.active()], [true, DICTATION_LISTENING, true],
+    "the recognition ending stopped listening instead of restarting");
+  assert.notEqual(made, first, "the ended session was not restarted with a fresh recognition");
   // Refused (no microphone, no permission): the line says to use the keyboard's.
   dictation.start();
   made.onerror({ error: "not-allowed" });
@@ -295,14 +299,21 @@ test("`#829 voice-page-dictation-polish`: the keyboard stays down while dictatio
   assert.equal(mode(), "none", "the keyboard comes up while dictation listens");
   dictation.showKeyboard();
   assert.deepStrictEqual([mode(), dictation.active()], [null, true], "a tap in the box did not bring the keyboard back alone");
+  // `#1503 react-dictation-keeps-listening`: a session ending restarts; the keyboard stays as the tap left it.
   made.onend();
+  assert.deepStrictEqual([mode(), dictation.active()], [null, true], "a restarted session stopped listening");
+  dictation.stop();
   dictation.start();
   assert.equal(mode(), "none");
+  made.onerror({ error: "not-allowed" });
   made.onend();
-  assert.equal(mode(), null, "the keyboard stays down after the recognition ended");
+  assert.equal(mode(), null, "the keyboard stays down after the recognition ended for good");
   dictation.start();
   made.onerror({ error: "network" });
-  assert.equal(mode(), null, "the keyboard stays down after the recognition failed");
+  assert.equal(mode(), "none", "a network blip gave the keyboard back instead of riding it out");
+  made.onend();
+  assert.equal(mode(), "none", "a network blip let the keyboard up instead of restarting");
+  dictation.stop();
   // A second reply opened while one listens: that listening stopped first, the keyboard is down before the
   // box takes the focus again.
   dictation.start();
@@ -327,6 +338,80 @@ test("`#829 voice-page-dictation-polish`: the keyboard stays down while dictatio
   refused.quietKeyboard();
   assert.equal(refused.start(), false);
   assert.equal(mode(), null, "a start that failed left the keyboard down");
+});
+
+test("`#1503 react-dictation-keeps-listening`: listening restarts across sessions until stop, send or a permission error, keeps settled words once, replaces unsure words, and stops after empty sessions", () => {
+  const { createDictation, DICTATION_LISTENING, DICTATION_STOPPED, DICTATION_UNAVAILABLE, DICTATION_EMPTY_SESSION_LIMIT } = VIEW_COMPOSER;
+  const box = { value: "", getAttribute: () => null, setAttribute: () => {}, removeAttribute: () => {} };
+  const said = [];
+  const heard = [];
+  const made = [];
+  let settled = 0;
+  class Fake {
+    constructor() { made.push(this); this.aborted = false; }
+    start() {}
+    abort() { this.aborted = true; }
+  }
+  const dictation = createDictation({
+    recognition: () => Fake, lang: () => "en-GB", box: () => box,
+    say: (text) => said.push(text), listening: (on) => heard.push(on), settled: () => { settled += 1; },
+  });
+  const result = (words, isFinal) => ({ resultIndex: 0, results: [Object.assign([{ transcript: words }], { isFinal })] });
+  const endEmpty = () => made.at(-1).onend();
+  // Settled words survive a restart exactly once; unsure words are replaced, never appended.
+  assert.equal(dictation.start(), true);
+  made.at(-1).onresult(result("hello", true));
+  made.at(-1).onend();
+  assert.equal(made.length, 2, "the ended session did not restart");
+  assert.deepStrictEqual([dictation.active(), heard.at(-1), said.at(-1)], [true, true, DICTATION_LISTENING]);
+  made.at(-1).onresult(result(" wor", false));
+  assert.equal(box.value, "hello wor");
+  made.at(-1).onresult(result(" world", false));
+  assert.equal(box.value, "hello world", "unsure words were appended instead of replaced");
+  made.at(-1).onresult(result(" world", true));
+  assert.deepStrictEqual([box.value, settled], ["hello world", 2]);
+  made.at(-1).onend();
+  assert.equal(made.length, 3);
+  made.at(-1).onresult(result(" again", true));
+  assert.equal(box.value, "hello world again", "settled words were lost or duplicated across a restart");
+  // A no-speech or network end restarts too; the error alone ends nothing.
+  made.at(-1).onerror({ error: "no-speech" });
+  assert.equal(dictation.active(), true, "no-speech ended listening before its session ended");
+  made.at(-1).onend();
+  assert.equal(made.length, 4, "a no-speech end did not restart");
+  made.at(-1).onerror({ error: "network" });
+  made.at(-1).onend();
+  assert.equal(made.length, 5, "a network end did not restart");
+  assert.equal(dictation.active(), true);
+  // An explicit stop (the badge, Send and the box closing all stop the same way) never restarts.
+  const stoppedAt = made.at(-1);
+  dictation.stop();
+  assert.deepStrictEqual([stoppedAt.aborted, dictation.active(), heard.at(-1), said.at(-1)], [true, false, false, DICTATION_STOPPED]);
+  stoppedAt.onerror({ error: "aborted" });
+  stoppedAt.onend();
+  assert.equal(made.length, 5, "listening restarted after an explicit stop");
+  // A permission error never restarts.
+  assert.equal(dictation.start(), true);
+  const refusedAt = made.at(-1);
+  refusedAt.onerror({ error: "not-allowed" });
+  assert.deepStrictEqual([dictation.active(), said.at(-1)], [false, DICTATION_UNAVAILABLE]);
+  refusedAt.onend();
+  assert.equal(made.length, 6, "listening restarted after a permission error");
+  // Empty sessions are capped on their count: speech in between starts the count again.
+  box.value = "";
+  assert.equal(dictation.start(), true);
+  for (let n = 1; n < DICTATION_EMPTY_SESSION_LIMIT; n += 1) endEmpty();
+  assert.equal(dictation.active(), true, "listening stopped before the empty-session cap");
+  made.at(-1).onresult(result("hi", true));
+  made.at(-1).onend();
+  for (let n = 1; n < DICTATION_EMPTY_SESSION_LIMIT; n += 1) endEmpty();
+  assert.equal(dictation.active(), true, "a session with speech did not start the empty count again");
+  endEmpty();
+  assert.deepStrictEqual([dictation.active(), heard.at(-1), said.at(-1)], [false, false, DICTATION_STOPPED],
+    "empty sessions past the cap did not stop with a tap-to-listen-again state");
+  const count = made.length;
+  made.at(-1).onend();
+  assert.equal(made.length, count, "listening restarted after the empty-session cap");
 });
 
 test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's listeners mount in the page's order, reach what each names, and come down again", () => {

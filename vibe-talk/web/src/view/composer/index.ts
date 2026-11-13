@@ -23,7 +23,7 @@ export {
 export type { ComposerKeyEvent, ComposerKeys, ComposerKeysDependencies } from "./keys.ts";
 export { KEYBOARD_FIT_PARTS, KEYBOARD_MIN_PX, KEYBOARD_MIN_SHARE, KEYBOARD_SETTLE_MS, createOnScreenKeyboard } from "./keyboard.ts";
 export type { OnScreenKeyboard, OnScreenKeyboardDependencies } from "./keyboard.ts";
-export { DICTATION_LISTENING, DICTATION_UNAVAILABLE, createDictation } from "./dictation.ts";
+export { DICTATION_EMPTY_SESSION_LIMIT, DICTATION_LISTENING, DICTATION_STOPPED, DICTATION_UNAVAILABLE, createDictation } from "./dictation.ts";
 export type { Dictation, DictationDependencies, Recognition, RecognitionResultEvent } from "./dictation.ts";
 export { mountKeyboardListeners } from "./keyboardlisteners.ts";
 export type { KeyboardListeners, KeyboardListenersDependencies } from "./keyboardlisteners.ts";

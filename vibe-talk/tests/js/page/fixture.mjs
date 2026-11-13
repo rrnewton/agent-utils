@@ -5172,6 +5172,10 @@ const TUNING_BANDS = {
   // action: wide enough to settle a boundary resize, narrow enough that a real
   // overflow still demotes within a drag.
   PROMOTION_HYSTERESIS_PX: [1, 200, "the slack between promoting and demoting a toolbar action"],
+  // `#1503 react-dictation-keeps-listening`. Empty recognition sessions in a row before dictation
+  // stops restarting: one would give up at the first silent pause it exists to ride out, and a
+  // far larger count lets a recognition that ends at once spin restarts against the server.
+  DICTATION_EMPTY_SESSION_LIMIT: [2, 20, "empty dictation sessions in a row before listening stops and says to tap again"],
   // `#1398 width handle per column`. The reading-gate's own slack, in characters.
   READING_GRIP_HYSTERESIS_CH: [0, 20, "the reading-width gate's hysteresis, in characters"],
   // `#892 voice-page-optimistic-done`. How many keys' timings are kept for a look back from the console:

@@ -558,6 +558,9 @@ FAKE_RECOGNITION = """(() => {
     constructor() { this.lang = ''; this.continuous = true; this.interimResults = false; this.onresult = null; this.onerror = null; this.onend = null; }
     start() {
       window.recognitionStarts += 1;
+      // `#1503 react-dictation-keeps-listening`: only the first session speaks and ends; the session the
+      // page restarts after it stays open and silent, as a live microphone would, until it is stopped.
+      if (window.recognitionStarts > 1) return;
       const say = (words, isFinal) => this.onresult && this.onresult({resultIndex: 0, results: [Object.assign([{transcript: words}], {isFinal})]});
       setTimeout(() => say('please check', false), 150);
       setTimeout(() => say('please check the replica', true), 450);
@@ -783,11 +786,15 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
                       "react: the box shows no listening state")
         desk.wait_for("() => document.getElementById('quick-reply-text').value.endsWith('please check the replica')",
                       "react: the settled words did not land in the box", 5)
-        desk.wait_for("() => !document.getElementById('quick-reply').hasAttribute('data-listening')",
-                      "react: the box still listens after the recognition ended", 5)
-        ended = page.evaluate(MIC_JS)
-        desk.check(not ended["shown"] and ended["inputmode"] is None,
-                   f"react: the badge or the kept-down keyboard outlived the recognition: {ended}")
+        # `#1503 react-dictation-keeps-listening`: that session ending restarts listening instead of
+        # ending it: a fresh recognition, the badge and kept-down keyboard still up, the words kept once.
+        desk.wait_for("() => window.recognitionStarts >= 2", "react: the ended session was not restarted", 5)
+        desk.check(page.evaluate("() => document.getElementById('quick-reply').hasAttribute('data-listening')") is True,
+                   "react: the box stopped listening when its first session ended")
+        check_listening(desk, "react, listening after a restart")
+        desk.check(page.evaluate("() => document.getElementById('quick-reply-text').value"
+                                 ".split('please check the replica').length - 1") == 1,
+                   "react: the settled words were duplicated across the restart")
         desk.shot("react-dictated")
         page.keyboard.press("Escape")
         desk.wait_for("() => document.getElementById('quick-reply').hidden", "react: Esc left the quick reply up")
@@ -818,7 +825,8 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         desk.shot("react-playing")
         if recognition:
             # `#829`: a tap in the box brings the keyboard back and listens on; a tap on the badge stops it.
-            desk.wait_for("() => window.recognitionStarts === 2", "react, playing: React started no recognition")
+            # (`#1503`: the first React's restarted session already took the count to 2.)
+            desk.wait_for("() => window.recognitionStarts >= 3", "react, playing: React started no recognition")
             check_listening(desk, "react, playing, listening")
             press(page, "#quick-reply-text", touch)
             tapped = page.evaluate(MIC_JS)
@@ -834,6 +842,9 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
                                     " inputmode: document.getElementById('quick-reply-text').getAttribute('inputmode')})")
             desk.check(stopped["aborts"] >= 1 and stopped["open"] and stopped["focused"] and stopped["inputmode"] is None,
                        f"react: the badge's tap did not stop only the listening, the box focused: {stopped}")
+            # `#1503 react-dictation-keeps-listening`: a real stop says so on the still-open box.
+            desk.check("Stopped listening" in str(page.evaluate("() => document.getElementById('quick-reply-state').textContent")),
+                       "react: the badge's tap left no stopped state on the open box")
             desk.notes.append("listening kept the keyboard down under a corner badge that stopped it")
         page.keyboard.press("Escape")
         desk.notes.append(f"React while playing paused and quoted {str(lit)[:30]!r}")
