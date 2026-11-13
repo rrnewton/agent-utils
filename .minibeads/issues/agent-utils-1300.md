@@ -1,10 +1,10 @@
 ---
 title: 'team-pid-namespaces: slot liveness from the team namespace instead of host-wide scans'
 status: open
-priority: 1
+priority: 3
 issue_type: feature
 created_at: 2026-11-11T14:48:05.733093506+00:00
-updated_at: 2026-11-11T14:48:14.575375611+00:00
+updated_at: 2026-11-13T00:00:00+00:00
 ---
 
 # Description
@@ -26,3 +26,5 @@ Give each team its own PID namespace and stop deriving slot liveness from host-w
 # Notes
 
 Owner design point Slack 6231 (2026-11-11), filed issue-only on coordinator instruction. Linked to the proc-scan P0 filed separately by its owner lane (the refusal/scan-cost issue): that issue owns the immediate scan bound, this one owns the namespace end state that removes the scan. Census time-bound failures under gate load are the motivating symptom class.
+
+Phase 2b parked (2026-11-13, coordinator decision after the Phase 2a landing). Phase 1 design and Phase 2a (dual owner identity fields, pidfd-first liveness with the evidence source named in status, slot-cgroup census with the legacy-scan fallback, and the hermetic census tests of agent-utils-1482) landed; the namespace keeper and the join did not. The Phase 2b step-1 launcher matrix, run from a scratch keeper's user+PID namespace, is recorded at https://github.com/rrnewton/dev-agent-utils/blob/main/ai_docs/reports/research/2026-11-13-team-pidns-launcher-matrix.md : gate and wrkslots systemd scopes cannot be created inside the namespace (the user manager is unreachable there), and sudo fails its setuid owner check under an identity uid mapping. With rows 1-3 failing, every lane that runs a gate, a wrkslots create/remove, or a sudo image mount would need those steps proxied to the host namespace (or stay unjoined) — a cross-tool redesign for little gain now that Phase 2a already removed host-wide scans from the hot paths. This issue stays open at P3 for the namespace end state. Two follow-ups are worth keeping if namespaces are ever revisited: (1) agentctl's Git-executable ownership check refuses inside an identity-mapped user namespace (`refusing unsafe Git executable`), so agentctl send from a joined process needs that check to understand the mapping; (2) a host-side broker for systemd scopes (creating the scope outside the namespace and joining inside its exec) is the unblocking shape for gate/wrkslots containment.
