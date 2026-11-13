@@ -105,6 +105,31 @@ validation whoever asked for the gate — unless the host file sets
 like a malformed blackout file; if systemctl itself cannot be run, the gate
 warns and proceeds rather than wait forever on a broken probe.
 
+Patterns, exclusions and observe mode (#1489 gate-defer-patterns-and-observe):
+`defer_unit_pattern` also accepts a list of globs
+(`defer_unit_pattern = ["<glob>", ...]`); a gate defers while any listed
+glob matches an active user unit, exactly as with the single-string form.
+`defer_unit_exclude = ["<glob>", ...]` names units a broad glob would catch
+that must never defer — always-active or failed units, for example a
+worker unit that is always running: an excluded name is removed from the
+matches before anything defers, so excluded names never defer. Matching
+stays against active user units only (the per-pattern
+`systemctl --user list-units ... --state=active` probe). `defer_mode` is
+`"enforce"` by default; with `defer_mode = "observe"` the gate never waits
+on deferral: at each point where enforce mode would wait (before the
+preflight and before the grant) it checks once, and when a signal would
+have deferred it appends one JSON line — UTC time, gate id, and which
+signal fired (unit names, hold labels, the quiet-command result) — to the
+observe log (default ~/.local/state/agent-utils/gate-defer-observe.jsonl,
+override with `defer_observe_log` in the host file or
+$GATE_DEFER_OBSERVE_LOG; $GATE_DEFER_MODE likewise overrides the mode),
+then proceeds at once. A host can therefore watch what would defer before
+enforcing it. `gate.py status` and `gate.py queue` show the defer mode,
+and in observe mode the log path. Malformed new keys (a non-string list
+element, a non-list `defer_unit_exclude`, a `defer_mode` other than
+"enforce"/"observe", a non-string `defer_observe_log`) refuse the start
+with exit 2, like every other malformed defer key.
+
 Rerun tickets: --rerun marks a short solo rerun of a few already-run steps
 (at most RERUN_MAX_STEPS `--selected` steps). Since #1260 it runs in the
 shared class unless a selected step is declared timing-sensitive in the
@@ -246,6 +271,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import fcntl
+import fnmatch
 import json
 import os
 import re
@@ -375,7 +401,8 @@ def host_slot_cap(path: Path | None = None) -> tuple[int | None, str | None]:
         return 1, f"gate slots config {path} is not TOML ({exc}); capping at 1"
     value = raw.get("slots")
     if (
-        not set(raw) <= {"slots", "cpu_quota_cpus", "defer_unit_pattern", "owner_defers",
+        not set(raw) <= {"slots", "cpu_quota_cpus", "defer_unit_pattern", "defer_unit_exclude",
+                         "defer_mode", "defer_observe_log", "owner_defers",
                          "defer_holds_dir", "defer_holds_root", "defer_quiet_command"}
         or isinstance(value, bool) or not isinstance(value, int) or value < 1
     ):
@@ -951,6 +978,9 @@ def _is_interleave_marked(data: dict[str, object]) -> bool:
 #: caps at 1 on unknown gate-slots.toml keys.
 DEFAULT_DEFER_CONFIG = Path("~/.local/etc/agent-utils/gate-defer.toml")
 
+#: Where observe mode records would-have-deferred checks (#1489).
+DEFAULT_DEFER_OBSERVE_LOG = Path("~/.local/state/agent-utils/gate-defer-observe.jsonl")
+
 #: How often a deferred gate re-checks the protected units (#1406).
 DEFER_POLL_DEFAULT_S = 1.0
 
@@ -961,37 +991,77 @@ class DeferConfigError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class DeferSettings:
-    """Host deferral settings (#1406): the protected unit glob (empty means
-    no unit deferral), the measurement-holds directory (empty means none),
-    the quiet command (empty means none), whether owner-priority gates
-    defer, and what decided it."""
+    """Host deferral settings (#1406, #1489): the protected unit globs
+    (none means no unit deferral) and the globs excluded from them, the
+    measurement-holds directory (empty means none), the quiet command
+    (empty means none), whether owner-priority gates defer, the mode
+    ("enforce" waits, "observe" only records), the observe log path, and
+    what decided it."""
 
-    pattern: str
+    patterns: tuple[str, ...]
     owner_defers: bool
     source: str
     holds_dir: str = ""
     quiet_command: str = ""
     holds_root: str = ""
+    excludes: tuple[str, ...] = ()
+    mode: str = "enforce"
+    observe_log: str = ""
 
 
 def defer_config_path() -> Path:
     return Path(os.environ.get("GATE_DEFER_CONFIG") or DEFAULT_DEFER_CONFIG).expanduser()
 
 
-_DEFER_KEYS = {"defer_unit_pattern", "owner_defers", "defer_holds_dir", "defer_quiet_command",
-               "defer_holds_root"}
+_DEFER_KEYS = {"defer_unit_pattern", "defer_unit_exclude", "defer_mode", "defer_observe_log",
+               "owner_defers", "defer_holds_dir", "defer_quiet_command", "defer_holds_root"}
+
+
+def _glob_list(value: object, key: str, source: str, *, list_required: bool = False) -> tuple[str, ...]:
+    """One glob setting as a tuple (#1489): a single string, or a list of
+    strings when the host names several. Anything else is malformed."""
+    if isinstance(value, str):
+        if list_required:
+            raise DeferConfigError(
+                f"gate defer config {source}: {key} must be a list of strings, not {value!r}"
+            )
+        return (value.strip(),) if value.strip() else ()
+    if isinstance(value, list):
+        globs: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise DeferConfigError(
+                    f"gate defer config {source}: {key} must hold only non-empty strings, "
+                    f"not {item!r}"
+                )
+            globs.append(item.strip())
+        return tuple(globs)
+    raise DeferConfigError(
+        f"gate defer config {source}: {key} must be a string or a list of strings, not {value!r}"
+    )
 
 
 def _defer_from_mapping(raw: dict[str, object], source: str) -> DeferSettings:
     if not set(raw) <= _DEFER_KEYS:
         raise DeferConfigError(
-            f"gate defer config {source} may only set defer_unit_pattern, owner_defers, "
-            "defer_holds_dir, defer_holds_root and defer_quiet_command"
+            f"gate defer config {source} may only set defer_unit_pattern, defer_unit_exclude, "
+            "defer_mode, defer_observe_log, owner_defers, defer_holds_dir, defer_holds_root "
+            "and defer_quiet_command"
         )
-    pattern = raw.get("defer_unit_pattern", "")
-    if not isinstance(pattern, str):
+    patterns = _glob_list(raw.get("defer_unit_pattern", ""), "defer_unit_pattern", source)
+    excludes = _glob_list(raw.get("defer_unit_exclude", []), "defer_unit_exclude", source,
+                          list_required=True)
+    mode = raw.get("defer_mode", "enforce")
+    if mode not in ("enforce", "observe"):
         raise DeferConfigError(
-            f"gate defer config {source}: defer_unit_pattern must be a string, not {pattern!r}"
+            f"gate defer config {source}: defer_mode must be \"enforce\" or \"observe\", "
+            f"not {mode!r}"
+        )
+    observe_log = raw.get("defer_observe_log", "")
+    if not isinstance(observe_log, str):
+        raise DeferConfigError(
+            f"gate defer config {source}: defer_observe_log must be a string, "
+            f"not {observe_log!r}"
         )
     owner_defers = raw.get("owner_defers", True)
     if not isinstance(owner_defers, bool):
@@ -1016,8 +1086,8 @@ def _defer_from_mapping(raw: dict[str, object], source: str) -> DeferSettings:
             f"not {holds_root!r}"
         )
     return DeferSettings(
-        pattern.strip(), owner_defers, source, holds_dir.strip(), quiet_command.strip(),
-        holds_root.strip(),
+        patterns, owner_defers, source, holds_dir.strip(), quiet_command.strip(),
+        holds_root.strip(), excludes, mode, observe_log.strip(),
     )
 
 
@@ -1058,12 +1128,24 @@ def defer_settings() -> DeferSettings:
             subset = {key: parsed_slots[key] for key in _DEFER_KEYS & set(parsed_slots)}
             settings = _defer_from_mapping(subset, str(slots))
         else:
-            settings = DeferSettings("", True, f"no defer settings; {path} absent")
+            settings = DeferSettings((), True, f"no defer settings; {path} absent")
     env_pattern = os.environ.get("GATE_DEFER_UNIT_PATTERN")
     if env_pattern is not None:
+        stripped = env_pattern.strip()
         settings = dataclasses.replace(
-            settings, pattern=env_pattern.strip(), source="env GATE_DEFER_UNIT_PATTERN"
+            settings, patterns=(stripped,) if stripped else (),
+            source="env GATE_DEFER_UNIT_PATTERN"
         )
+    env_mode = os.environ.get("GATE_DEFER_MODE")
+    if env_mode is not None:
+        if env_mode.strip() not in ("enforce", "observe"):
+            raise DeferConfigError(
+                f"GATE_DEFER_MODE must be \"enforce\" or \"observe\", not {env_mode!r}"
+            )
+        settings = dataclasses.replace(settings, mode=env_mode.strip())
+    env_log = os.environ.get("GATE_DEFER_OBSERVE_LOG")
+    if env_log is not None:
+        settings = dataclasses.replace(settings, observe_log=env_log.strip())
     env_holds = os.environ.get("GATE_DEFER_HOLDS_DIR")
     if env_holds is not None:
         settings = dataclasses.replace(settings, holds_dir=env_holds.strip())
@@ -1092,37 +1174,46 @@ def defer_poll_s() -> float:
     return DEFER_POLL_DEFAULT_S
 
 
-def active_defer_units(pattern: str) -> tuple[list[str], str | None]:
-    """User units matching `pattern` that are active right now, and a
-    problem string when the probe itself failed (#1406). The probe is the
-    manual check this feature automates, resolved on PATH so tests stub it:
-    `systemctl --user list-units --no-legend '<pattern>' --state=active`.
-    A failed probe reports no units with the problem, so the caller warns
-    and proceeds rather than wait forever on a broken probe."""
+def active_defer_units(
+    patterns: tuple[str, ...], excludes: tuple[str, ...] = ()
+) -> tuple[list[str], str | None]:
+    """User units matching any of `patterns` that are active right now,
+    minus any name matching `excludes`, and a problem string when the
+    probe itself failed (#1406, #1489). The probe is the manual check
+    this feature automates, resolved on PATH so tests stub it, once per
+    pattern: `systemctl --user list-units --no-legend '<pattern>'
+    --state=active` — so matching is against active user units only, and
+    an excluded name never defers even when a broad pattern catches it.
+    A failed probe reports no units with the problem, so the caller
+    warns and proceeds rather than wait forever on a broken probe."""
 
-    if not pattern:
+    if not patterns:
         return [], None
     systemctl = shutil.which("systemctl")
     if systemctl is None:
         return [], "systemctl not found on PATH; cannot check defer units"
-    try:
-        done = subprocess.run(
-            [systemctl, "--user", "list-units", "--no-legend", pattern, "--state=active"],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return [], f"systemctl defer probe failed: {exc}"
-    if done.returncode != 0:
-        detail = (done.stderr or done.stdout).strip().splitlines()
-        return [], f"systemctl defer probe exited {done.returncode}" + (
-            f": {detail[0]}" if detail else ""
-        )
-    units: list[str] = []
-    for line in done.stdout.splitlines():
-        fields = line.split()
-        if fields:
-            units.append(fields[0].lstrip("●").strip())
-    return sorted(set(units)), None
+    found: set[str] = set()
+    for pattern in patterns:
+        try:
+            done = subprocess.run(
+                [systemctl, "--user", "list-units", "--no-legend", pattern, "--state=active"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return [], f"systemctl defer probe failed: {exc}"
+        if done.returncode != 0:
+            detail = (done.stderr or done.stdout).strip().splitlines()
+            return [], f"systemctl defer probe exited {done.returncode}" + (
+                f": {detail[0]}" if detail else ""
+            )
+        for line in done.stdout.splitlines():
+            fields = line.split()
+            if fields:
+                found.add(fields[0].lstrip("●").strip())
+    return sorted(
+        unit for unit in found
+        if not any(fnmatch.fnmatchcase(unit, glob) for glob in excludes)
+    ), None
 
 
 def defer_now() -> dt.datetime:
@@ -1237,6 +1328,20 @@ def quiet_command_blocker(command: str) -> str | None:
     return f"quiet command {command!r} exited {done.returncode}"
 
 
+def defer_signals(
+    settings: DeferSettings, now: dt.datetime
+) -> tuple[list[str], list[str], str | None, str | None]:
+    """The three deferral signals under `settings`, kept apart (#1489):
+    active unit names, measurement-hold labels, the quiet-command label
+    (which names its exit code), and a probe problem when systemctl
+    itself failed (reported, not a blocker)."""
+
+    units, problem = active_defer_units(settings.patterns, settings.excludes)
+    holds = measurement_hold_blockers(settings.holds_dir, now, settings.holds_root)
+    quiet = quiet_command_blocker(settings.quiet_command)
+    return units, holds, quiet, problem
+
+
 def defer_blockers(
     settings: DeferSettings, now: dt.datetime
 ) -> tuple[list[str], str | None]:
@@ -1245,12 +1350,52 @@ def defer_blockers(
     the gate warns and proceeds rather than wait forever on a broken
     probe). Labels are what `status` and the ticket record."""
 
-    units, problem = active_defer_units(settings.pattern)
-    blockers = list(units)
-    blockers += measurement_hold_blockers(settings.holds_dir, now, settings.holds_root)
-    quiet = quiet_command_blocker(settings.quiet_command)
+    units, holds, quiet, problem = defer_signals(settings, now)
+    blockers = list(units) + holds
     if quiet is not None:
         blockers.append(quiet)
+    return blockers, problem
+
+
+def observe_log_path(settings: DeferSettings) -> Path:
+    """Where observe mode records would-have-deferred checks (#1489):
+    `defer_observe_log` in the host file, else the per-user state log."""
+    if settings.observe_log:
+        return Path(settings.observe_log).expanduser()
+    return DEFAULT_DEFER_OBSERVE_LOG.expanduser()
+
+
+def record_observe(
+    settings: DeferSettings, gate_id: str, now: dt.datetime
+) -> tuple[list[str], str | None]:
+    """One observe-mode check (#1489): evaluate the signals once, and
+    when any would defer in enforce mode append one JSON line naming
+    the time (UTC), the gate, and which signal fired (unit names, hold
+    labels, the quiet-command result). Returns the blockers and a probe
+    problem, like `defer_blockers`. A log that cannot be written warns
+    on stdout and never blocks the gate: observe mode must not become a
+    new way to stop work."""
+
+    units, holds, quiet, problem = defer_signals(settings, now)
+    blockers = list(units) + holds + ([quiet] if quiet is not None else [])
+    if not blockers:
+        return blockers, problem
+    record = {
+        "time": now.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "gate_id": gate_id,
+        "mode": "observe",
+        "units": units,
+        "holds": holds,
+        "quiet": quiet,
+        "blockers": blockers,
+    }
+    path = observe_log_path(settings)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"gate: warning: cannot write defer observe log {path}: {exc}", flush=True)
     return blockers, problem
 
 
@@ -1259,7 +1404,7 @@ def _defer_applies(settings: DeferSettings, priority: str | None) -> bool:
     any configured signal applies, and owner priority defers too, unless
     the host file sets owner_defers = false."""
 
-    configured = bool(settings.pattern or settings.holds_dir or settings.quiet_command)
+    configured = bool(settings.patterns or settings.holds_dir or settings.quiet_command)
     return configured and (priority != "owner" or settings.owner_defers)
 
 
@@ -1929,11 +2074,26 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     defer_ever: list[str] = []
     defer_wait_s = 0.0
     defer_poll = defer_poll_s()
+    # #1489 observe mode: never wait — check once here (and once before
+    # the grant below), record each would-have-deferred check in the
+    # observe log, and proceed. Enforce mode waits as before.
+    if defer.mode == "observe" and _defer_applies(defer, priority):
+        observed, observe_problem = record_observe(defer, defer_id, defer_now())
+        if observe_problem is not None:
+            print(f"gate: warning: {observe_problem}; proceeding without the unit check",
+                  flush=True)
+        if observed:
+            print(f"gate: observe: would defer on {', '.join(observed)} ({defer.source}); "
+                  f"recorded in {observe_log_path(defer)}; not waiting "
+                  "(#1489 gate-defer-patterns-and-observe)", flush=True)
+            for blocker in observed:
+                if blocker not in defer_ever:
+                    defer_ever.append(blocker)
     try:
         defer_noted: tuple[str, ...] = ()
         defer_problem: str | None = None
         defer_began = time.time()
-        while _defer_applies(defer, priority):
+        while defer.mode != "observe" and _defer_applies(defer, priority):
             blockers, problem = defer_blockers(defer, defer_now())
             if problem is not None and problem != defer_problem:
                 print(f"gate: warning: {problem}; proceeding without the unit check",
@@ -2014,12 +2174,26 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     blackout_noted: BlackoutWindow | None = None
     queue_defer_noted: tuple[str, ...] = ()
     queue_defer_began: float | None = None
+    # #1489 observe: one would-have-deferred check before the grant, then
+    # the queue proceeds without ever waiting on deferral.
+    if defer.mode == "observe" and _defer_applies(defer, priority):
+        observed, observe_problem = record_observe(defer, run_id, defer_now())
+        if observe_problem is not None:
+            print(f"gate: warning: {observe_problem}; proceeding without the unit check",
+                  flush=True)
+        if observed:
+            print(f"gate: observe: would defer on {', '.join(observed)} ({defer.source}); "
+                  f"recorded in {observe_log_path(defer)}; not waiting "
+                  "(#1489 gate-defer-patterns-and-observe)", flush=True)
+            for blocker in observed:
+                if blocker not in defer_ever:
+                    defer_ever.append(blocker)
     while True:
         # #1406: a signal that began during the preflight still defers the
         # start — the grant is the start. Deferral time never counts
         # against --wait-timeout (owner rule 346), so this check runs, and
         # can wait, before the timeout check below.
-        if _defer_applies(defer, priority):
+        if defer.mode != "observe" and _defer_applies(defer, priority):
             blockers, problem = defer_blockers(defer, defer_now())
             if problem is not None and problem != defer_problem:
                 print(f"gate: warning: {problem}; proceeding without the unit check",
@@ -2308,22 +2482,27 @@ def _defer_status_lines(prefix: str) -> list[str]:
         settings = defer_settings()
     except DeferConfigError as exc:
         return [f"{prefix}: defer config unusable: {exc}; a new gate would refuse (exit 2)"]
-    if not (settings.pattern or settings.holds_dir or settings.quiet_command):
-        return [f"{prefix}: no deferral configured ({settings.source})"]
+    if not (settings.patterns or settings.holds_dir or settings.quiet_command):
+        return [f"{prefix}: no deferral configured ({settings.source}); "
+                f"defer mode: {settings.mode}"]
     try:
         blockers, problem = defer_blockers(settings, defer_now())
     except DeferConfigError as exc:
         return [f"{prefix}: defer config unusable: {exc}; a new gate would refuse (exit 2)"]
     signals = []
-    if settings.pattern:
-        signals.append(f"unit pattern {settings.pattern!r}")
+    if settings.patterns:
+        signals.append(f"unit patterns {list(settings.patterns)!r}")
+    if settings.excludes:
+        signals.append(f"excluded {list(settings.excludes)!r}")
     if settings.holds_dir:
         signals.append(f"holds dir {settings.holds_dir}")
     if settings.quiet_command:
         signals.append(f"quiet command {settings.quiet_command!r}")
     lines = [
         f"{prefix}: deferral ({settings.source}): {', '.join(signals)}; "
+        f"mode: {settings.mode}; "
         f"owner defers: {settings.owner_defers}; "
+        + (f"observe log: {observe_log_path(settings)}; " if settings.mode == "observe" else "")
         + (f"{len(blockers)} blocker(s) in force: {', '.join(blockers)}"
            if blockers else "no blocker in force")
     ]
@@ -3130,11 +3309,16 @@ def main(argv: list[str] | None = None) -> int:
             "host-protected validation is running. Host configuration only, in "
             "~/.local/etc/agent-utils/gate-defer.toml (override $GATE_DEFER_CONFIG; "
             "the same keys in the gate-slots file are a fallback):\n"
-            '  defer_unit_pattern = "protected-*"   # user units that defer a start\n'
+            '  defer_unit_pattern = "protected-*"   # user units that defer a start;\n'
+            '    # or a list: defer_unit_pattern = ["protected-*", "other-*"]\n'
+            '  defer_unit_exclude = ["*-worker.service"]  # never defer (#1489)\n'
+            '  defer_mode = "enforce"                # or "observe": log, never wait\n'
+            '  defer_observe_log = "~/.local/state/agent-utils/gate-defer-observe.jsonl"\n'
             '  defer_holds_dir = "/host/path/holds"  # measurement-hold declarations\n'
             '  defer_quiet_command = "host-quiet"    # exit 0 means OK to run\n'
             "  owner_defers = true                   # owner priority defers too (default)\n"
-            "$GATE_DEFER_UNIT_PATTERN, $GATE_DEFER_HOLDS_DIR and "
+            "$GATE_DEFER_UNIT_PATTERN, $GATE_DEFER_HOLDS_DIR, $GATE_DEFER_MODE, "
+            "$GATE_DEFER_OBSERVE_LOG and "
             "$GATE_DEFER_QUIET_COMMAND override per key (empty disables that "
             "signal); an empty or unset unit pattern means no unit deferral, and "
             "no configuration at all means no deferral. While a unit matching the "
@@ -3148,7 +3332,12 @@ def main(argv: list[str] | None = None) -> int:
             "waits before its preflight and again before its grant, poll-driven "
             "($GATE_DEFER_POLL_S) with no deadline, and deferral time never "
             "counts against --wait-timeout. `gate status` and `gate queue` show "
-            "a deferred gate and what it waits on. A gate already running is "
+            "a deferred gate and what it waits on, and the defer mode. With "
+            "defer_mode = \"observe\" (#1489) the gate never waits: each check "
+            "that would have deferred appends one JSON line (UTC time, gate id, "
+            "unit names / hold labels / quiet-command result) to the observe "
+            "log and the gate proceeds. Units matching defer_unit_exclude "
+            "never defer. A gate already running is "
             "never paused. A malformed defer file refuses a start (exit 2)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

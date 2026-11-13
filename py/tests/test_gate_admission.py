@@ -38,6 +38,8 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("GATE_DEFER_POLL_S", "0.05")
     monkeypatch.delenv("GATE_INTERLEAVE_AFTER", raising=False)
     monkeypatch.delenv("GATE_DEFER_UNIT_PATTERN", raising=False)
+    monkeypatch.delenv("GATE_DEFER_MODE", raising=False)
+    monkeypatch.delenv("GATE_DEFER_OBSERVE_LOG", raising=False)
     monkeypatch.delenv("GATE_DEFER_HOLDS_DIR", raising=False)
     monkeypatch.delenv("GATE_DEFER_QUIET_COMMAND", raising=False)
     monkeypatch.delenv("GATE_DEFER_NOW", raising=False)
@@ -54,7 +56,8 @@ def _env(tmp_path: Path) -> dict[str, str]:
     base = {key: value for key, value in os.environ.items()
             if key not in ("GATE_PHASE_PRIORITY", "GATE_PRIORITY", "GATE_PRIORITY_REASON",
                            "GATE_INTERLEAVE_AFTER", "GATE_INTERLEAVE_CONFIG",
-                           "GATE_DEFER_UNIT_PATTERN", "GATE_DEFER_HOLDS_DIR",
+                           "GATE_DEFER_UNIT_PATTERN", "GATE_DEFER_MODE",
+                           "GATE_DEFER_OBSERVE_LOG", "GATE_DEFER_HOLDS_DIR",
                            "GATE_DEFER_QUIET_COMMAND", "GATE_DEFER_NOW")}
     return {**base, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
             "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
@@ -2090,3 +2093,124 @@ def test_defer_help_documents_the_host_file(tmp_path: Path) -> None:
     assert "defer_unit_pattern" in result.stdout
     assert "owner_defers" in result.stdout
     assert "never paused" in result.stdout
+
+
+# --------------------------------- defer patterns and observe (#1489)
+
+
+def _multi_unit_systemctl(tmp_path: Path) -> Path:
+    """A stubbed systemctl reporting a fixed active set, filtered by the
+    glob argument the way the real command filters, so include and
+    exclude matching in gate.py is what the test exercises."""
+    bindir = tmp_path / "multibin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "systemctl"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import fnmatch, sys\n"
+        "units = ['protected-alpha.service', 'protected-worker.service',\n"
+        "         'other-queue.service']\n"
+        "pattern = sys.argv[4] if len(sys.argv) > 4 else '*'\n"
+        "for unit in units:\n"
+        "    if fnmatch.fnmatchcase(unit, pattern):\n"
+        "        print(unit + ' loaded active running stub')\n"
+    )
+    stub.chmod(0o755)
+    return bindir
+
+
+def test_defer_list_pattern_and_exclude_matching(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1489: a list of include globs defers on any of them, and an
+    excluded name never defers even when an include glob catches it."""
+    gate = _gate_module()
+    bindir = _multi_unit_systemctl(tmp_path)
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ.get("PATH", ""))
+    units, problem = gate.active_defer_units(("protected-*",), ("*-worker.service",))
+    assert problem is None
+    assert units == ["protected-alpha.service"], units
+    units, problem = gate.active_defer_units(
+        ("protected-*", "other-*"), ("*-worker.service",))
+    assert problem is None
+    assert units == ["other-queue.service", "protected-alpha.service"], units
+    units, _problem = gate.active_defer_units(("protected-*",), ())
+    assert units == ["protected-alpha.service", "protected-worker.service"], units
+
+
+def test_defer_config_accepts_a_list_and_validates_the_new_keys() -> None:
+    """#1489: defer_unit_pattern takes a string or a list of strings;
+    the new keys refuse malformed values instead of ignoring them."""
+    gate = _gate_module()
+    single = gate._defer_from_mapping({"defer_unit_pattern": "protected-*"}, "t")
+    assert single.patterns == ("protected-*",)
+    listed = gate._defer_from_mapping(
+        {"defer_unit_pattern": ["a-*", "b-*"], "defer_unit_exclude": ["*-worker.service"],
+         "defer_mode": "observe", "defer_observe_log": "/tmp/observe.jsonl"}, "t")
+    assert listed.patterns == ("a-*", "b-*")
+    assert listed.excludes == ("*-worker.service",)
+    assert listed.mode == "observe"
+    assert listed.observe_log == "/tmp/observe.jsonl"
+    assert gate._defer_from_mapping({}, "t").mode == "enforce"
+    for raw in ({"defer_unit_pattern": ["a-*", 3]},
+                {"defer_unit_pattern": [3]},
+                {"defer_unit_exclude": "*-worker.service"},
+                {"defer_unit_exclude": [3]},
+                {"defer_mode": "sometimes"},
+                {"defer_mode": 3},
+                {"defer_observe_log": 3},
+                {"defer_observe_log": ["/tmp/x"]}):
+        with pytest.raises(gate.DeferConfigError):
+            gate._defer_from_mapping(raw, "t")
+
+
+def test_observe_mode_logs_and_never_waits(tmp_path: Path) -> None:
+    """#1489 observe: with a protected unit permanently active the gate
+    still runs at once, one JSON line per would-have-deferred check names
+    the units (excluded ones absent), and status shows the mode."""
+    bindir = _multi_unit_systemctl(tmp_path)
+    observe_log = tmp_path / "observe.jsonl"
+    (tmp_path / "gate-defer.toml").write_text(
+        'defer_unit_pattern = ["protected-*", "other-*"]\n'
+        'defer_unit_exclude = ["*-worker.service"]\n'
+        'defer_mode = "observe"\n'
+        f'defer_observe_log = "{observe_log}"\n')
+    env = _env(tmp_path)
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    marker = tmp_path / "ran"
+    result = subprocess.run(
+        [PY, str(GATE), "--", PY, "-c", f"open({str(marker)!r}, 'w').close()"],
+        env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout
+    assert marker.exists()
+    assert "deferred: waiting" not in result.stdout
+    lines = [json.loads(line) for line in observe_log.read_text().splitlines() if line.strip()]
+    assert lines, "observe mode recorded nothing"
+    for line in lines:
+        assert line["mode"] == "observe"
+        assert line["units"] == ["other-queue.service", "protected-alpha.service"], line
+        assert line["gate_id"]
+        assert line["time"].endswith("Z")
+    status = subprocess.run([PY, str(GATE), "status"], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert status.returncode == 0, status.stdout
+    assert "observe" in status.stdout
+
+
+def test_enforce_with_a_list_pattern_still_defers(tmp_path: Path) -> None:
+    """#1489: enforce is unchanged apart from the list form — the gate
+    waits while a listed pattern matches and starts when it clears."""
+    bindir, flag, _calls = _stub_systemctl(tmp_path)
+    flag.touch()
+    (tmp_path / "gate-defer.toml").write_text('defer_unit_pattern = ["protected-*"]\n')
+    env = _env(tmp_path)
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    gate = subprocess.Popen([PY, str(GATE), "--", "/bin/true"], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        _wait_for_deferred(tmp_path)
+        assert gate.poll() is None
+    finally:
+        flag.unlink(missing_ok=True)
+    out, _ = gate.communicate(timeout=30)
+    assert gate.returncode == 0, out
+    assert f"deferred: waiting on {_STUB_UNIT}" in out
