@@ -82155,13 +82155,6 @@ whole project root), with no slot. Image slots it creates are mounted on the hos
      wrkslots box --isolation root --cwd worktrees -- HARNESS ...
      wrkslots shell-command --box --cwd worktrees --format json   # for agent launchers
 
-Layouts and harness mode (#1299): single-repo projects use the one-level-in layout
-(primary checkout beside worktrees/); config inside a product checkout is supported
-but discouraged. A harness repo that pins product repos as submodules declares
-`harness_repo`/`product_repos` in .wrkslots.yml (or init --harness-repo/--product-repo);
-create then refuses harness checkouts by default and prints the product-only command
-instead. See `wrkslots --userguide`, section "Harness layout mode".
-
 Use `wrkslots COMMAND --help` for the exact effects and inputs of one command.
 """
 

@@ -379,6 +379,21 @@ pub(crate) fn status_records(
                 "storage_inconsistencies".to_string(),
                 Value::Array(Vec::new()),
             );
+            let harness_checkout = cfg.harness_repo.as_ref().is_some_and(|harness| {
+                object
+                    .get("checkouts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|checkouts| {
+                        checkouts.iter().any(|checkout| {
+                            checkout.get("name").and_then(Value::as_str)
+                                == Some(harness.as_str())
+                        })
+                    })
+            });
+            object.insert("harness_checkout".to_string(), json!(harness_checkout));
+            if !object.contains_key("harness_checkout_reason") {
+                object.insert("harness_checkout_reason".to_string(), Value::Null);
+            }
             records.push(value);
         }
     }
@@ -578,6 +593,7 @@ fn status_cli_once(
             "journals": journals,
             "registry_storage_state": if inconsistencies.is_empty() { "consistent" } else { "inconsistent" },
             "registry_storage_inconsistencies": inconsistencies,
+            "harness_checkouts": records.iter().filter(|r| r.get("harness_checkout").and_then(Value::as_bool) == Some(true)).filter_map(|r| r.get("slot").cloned()).collect::<Vec<_>>(),
         });
         return Ok(format!(
             "{}\n",
@@ -649,6 +665,27 @@ fn status_cli_once(
                     .and_then(Value::as_i64)
                     .unwrap_or(0),
             ));
+        }
+    }
+    {
+        let harness_rows: Vec<&Value> = records
+            .iter()
+            .filter(|r| r.get("harness_checkout").and_then(Value::as_bool) == Some(true))
+            .collect();
+        if !harness_rows.is_empty() {
+            out.push_str(&format!(
+                "harness-checkouts: {} slot(s) include harness repo {:?}\n",
+                harness_rows.len(),
+                cfg.harness_repo.clone().unwrap_or_default()
+            ));
+            for value in harness_rows {
+                out.push_str(&format!(
+                    "  HARNESS-CHECKOUT {}/{}: reason={:?} retire: publish work, wrkslots finish, normal remove, then recreate product-only\n",
+                    value.get("machine").and_then(Value::as_str).unwrap_or_default(),
+                    value.get("slot").and_then(Value::as_str).unwrap_or_default(),
+                    value.get("harness_checkout_reason").and_then(Value::as_str),
+                ));
+            }
         }
     }
     for item in &inconsistencies {

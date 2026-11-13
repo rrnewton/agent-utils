@@ -6110,6 +6110,53 @@ fn seal_evidence(cfg: &Cfg) -> (Vec<SealTarget>, SealErrors) {
 
 /// The audit payload (`{"schema": 2, ...}`), minus the metrics phase
 /// timings the oracle measures live.
+pub(crate) fn harness_unpushed_state(cfg: &Cfg, record: &Value) -> Value {
+    let mut checkouts: Vec<Value> = Vec::new();
+    let mut any_unpushed = false;
+    let mut any_unknown = false;
+    if let Some(items) = record.get("checkouts").and_then(Value::as_array) {
+        for checkout in items {
+            let name = checkout.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+            let result: std::result::Result<(String, Vec<String>), String> = (|| {
+                let raw_path = checkout.get("path").and_then(Value::as_str).unwrap_or_default();
+                let path = stored_path(cfg, raw_path, "checkout path").map_err(|e| e.to_string())?;
+                let raw_repo = checkout.get("repository").and_then(Value::as_str).unwrap_or_default();
+                let (_rel, repo) = stored_repository_path(cfg, raw_repo).map_err(|e| e.to_string())?;
+                let head = verify_existing_worktree(&repo, &path).map_err(|e| e.to_string())?;
+                let remote = checkout.get("remote").and_then(Value::as_str).unwrap_or_default();
+                let out = std::process::Command::new("git")
+                    .arg("-C").arg(&path)
+                    .args(["for-each-ref", "--format=%(refname)", "--contains", &head])
+                    .arg(format!("refs/remotes/{remote}/"))
+                    .output().map_err(|e| e.to_string())?;
+                if !out.status.success() {
+                    return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+                }
+                let refs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                    .lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+                Ok((head, refs))
+            })();
+            match result {
+                Ok((head, containing)) => {
+                    let state = if containing.is_empty() { "UNPUSHED-OR-STALE" } else { "PUBLISHED" };
+                    if containing.is_empty() { any_unpushed = true; }
+                    checkouts.push(json!({"name": name, "head": head, "state": state, "containing_remote_refs": containing}));
+                }
+                Err(detail) => {
+                    any_unknown = true;
+                    checkouts.push(json!({"name": name, "head": Value::Null, "state": "UNKNOWN", "detail": detail, "containing_remote_refs": []}));
+                }
+            }
+        }
+    }
+    json!({
+        "slot": record.get("slot").cloned().unwrap_or(Value::Null),
+        "harness_checkout_reason": record.get("harness_checkout_reason").cloned().unwrap_or(Value::Null),
+        "has_unpushed_work": if any_unknown && !any_unpushed { Value::Null } else { json!(any_unpushed) },
+        "checkouts": checkouts,
+    })
+}
+
 pub(crate) fn parse_audit(
     root: Option<&Path>,
     machine_override: Option<&str>,
@@ -7411,6 +7458,13 @@ pub(crate) fn parse_audit(
     };
     Ok(json!({
         "schema": 2,
+        "harness_checkouts": if cfg.harness_repo.is_none() { Vec::new() } else {
+            records.iter().filter(|r| {
+                r.get("checkouts").and_then(Value::as_array).is_some_and(|cs| {
+                    cs.iter().any(|c| c.get("name").and_then(Value::as_str) == cfg.harness_repo.as_deref())
+                })
+            }).map(|r| harness_unpushed_state(&cfg, r)).collect::<Vec<_>>()
+        },
         "worktree_count": worktree_count,
         "running_agent_count": running_agent_count,
         "leak": worktree_count as i64 > running_agent_count,
@@ -7586,6 +7640,28 @@ pub(crate) fn audit_cli(
                 ));
             }
             out.push_str(&format!("{label}: {}: {}\n", field("slot"), detail));
+        }
+    }
+    if let Some(items) = payload
+        .get("harness_checkouts")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+    {
+        out.push_str(&format!(
+            "harness-checkouts: {} slot(s) include harness repo (separate listing; verdicts above unchanged; unpushed uses stored remote refs, no fetch)\n",
+            items.len()
+        ));
+        for item in items {
+            let label = match item.get("has_unpushed_work") {
+                Some(Value::Bool(true)) => "yes",
+                Some(Value::Bool(false)) => "no",
+                _ => "unknown",
+            };
+            out.push_str(&format!(
+                "  HARNESS-CHECKOUT {}: reason={:?} has_unpushed_work={label} retire-clean-first: publish any unpushed work, wrkslots finish, normal remove, then recreate product-only\n",
+                item.get("slot").and_then(Value::as_str).unwrap_or_default(),
+                item.get("harness_checkout_reason").and_then(Value::as_str),
+            ));
         }
     }
     if let Some(entries) = payload

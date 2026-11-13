@@ -21,6 +21,37 @@ type Result<T> = std::result::Result<T, String>;
 
 const REMEDY: &str = "inspect the named condition; diagnosis alone authorizes no mutation";
 
+fn harness_findings(
+    cfg: &crate::active_state::Cfg,
+    records: &[Value],
+) -> Vec<Value> {
+    let Some(harness) = cfg.harness_repo.as_deref() else {
+        return Vec::new();
+    };
+    let mut findings = Vec::new();
+    for record in records {
+        if record.get("harness_checkout").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let info = crate::audit_state::harness_unpushed_state(cfg, record);
+        let label = match info.get("has_unpushed_work") {
+            Some(Value::Bool(true)) => "yes",
+            Some(Value::Bool(false)) => "no",
+            _ => "unknown",
+        };
+        findings.push(note(
+            "harness-checkout-slot",
+            record.get("slot").and_then(Value::as_str),
+            record.get("machine").and_then(Value::as_str),
+            format!(
+                "slot includes harness repo {harness:?} reason={:?} has_unpushed_work={label} (stored refs, no fetch); retire clean ones first: publish work, wrkslots finish, normal remove, then recreate product-only; never delete work by hand",
+                record.get("harness_checkout_reason").and_then(Value::as_str)
+            ),
+        ));
+    }
+    findings
+}
+
 fn note(kind: &str, slot: Option<&str>, machine: Option<&str>, detail: String) -> Value {
     json!({
         "kind": kind,
@@ -237,6 +268,7 @@ pub(crate) fn parse_doctor(
             ));
         }
     }
+    findings.extend(harness_findings(&cfg, &records));
     Ok(json!({
         "machines": machines,
         "active": records,
@@ -463,6 +495,7 @@ fn doctor_cli_once(
             ));
         }
     }
+    findings.extend(harness_findings(&cfg, &records_all));
     if !all_machines {
         findings.retain(|item| {
             item.get("machine").is_none_or(|machine| {

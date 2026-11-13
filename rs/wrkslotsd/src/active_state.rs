@@ -38,6 +38,8 @@ pub(crate) struct Cfg {
     pub(crate) default_landed_ref: String,
     /// The selected local machine; event appends may only target it (#876).
     pub(crate) machine: String,
+    pub(crate) harness_repo: Option<String>,
+    pub(crate) product_repos: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -1216,6 +1218,20 @@ pub(crate) fn load_cfg(
         default_remote: text("default_remote")?,
         default_landed_ref: text("default_landed_ref")?,
         machine: selected.clone(),
+        harness_repo: config
+            .get("harness_repo")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        product_repos: config
+            .get("product_repos")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     Ok((cfg, selected))
 }
