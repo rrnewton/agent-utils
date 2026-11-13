@@ -9,7 +9,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::active_state::Cfg;
@@ -825,6 +825,756 @@ fn os_error_text(error: &std::io::Error, path: &Path) -> String {
     )
 }
 
+fn service_result_fields(schema: i64) -> Option<Vec<&'static str>> {
+    let base = [
+        "schema_version",
+        "commit",
+        "profile",
+        "final_validate_status",
+        "exit_code",
+        "executed_nodes",
+        "executed_tests",
+    ];
+    let fields: Vec<&str> = match schema {
+        1 => base.to_vec(),
+        2 => [base.as_slice(), &["scorecard_writeback"]].concat(),
+        3 => [
+            &base[..4],
+            &["selection_mode"],
+            &base[4..],
+            &["scorecard_writeback"],
+        ]
+        .concat(),
+        4 => [
+            &base[..4],
+            &["selection_mode"],
+            &base[4..],
+            &["passed_tests", "scorecard_writeback"],
+        ]
+        .concat(),
+        5 | 6 => [
+            &base[..4],
+            &["selection_mode", "detail"],
+            &base[4..],
+            &["passed_tests", "scorecard_writeback"],
+        ]
+        .concat(),
+        7 => [
+            &base[..4],
+            &["selection_mode", "detail"],
+            &base[4..],
+            &[
+                "passed_tests",
+                "diagnostic_failed_tests",
+                "scorecard_writeback",
+            ],
+        ]
+        .concat(),
+        8 => [
+            &base[..4],
+            &["selection_mode", "detail"],
+            &base[4..],
+            &[
+                "passed_tests",
+                "diagnostic_failed_tests",
+                "skipped_tests",
+                "scorecard_writeback",
+            ],
+        ]
+        .concat(),
+        _ => return None,
+    };
+    Some(fields)
+}
+
+fn strict_json_object(contents: &[u8], label: &str) -> Result<serde_json::Map<String, Value>> {
+    let value: Value = serde_json::from_slice(contents)
+        .map_err(|error| format!("{label} is malformed JSON: {error}"))?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| format!("{label} must be a JSON object"))
+}
+
+/// Python `_validation_service_result_schema`: the declared
+/// fields when the producer schema matches, else a refusal.
+fn service_result_schema(contents: &[u8], schema: i64) -> Result<Vec<&'static str>> {
+    let producer = strict_json_object(contents, "validation removal producer-schema")?;
+    let fields = service_result_fields(schema).ok_or_else(|| {
+        "validation removal producer-schema does not match the run-record schema".to_string()
+    })?;
+    let mut expected_keys: Vec<&str> = vec!["schema_version", "fields", "outcomes"];
+    if schema >= 2 {
+        expected_keys.push("scorecard_writeback");
+    }
+    let exit_field = if schema == 1 {
+        "exit_code"
+    } else {
+        "validation_exit_code"
+    };
+    let outcome =
+        |exit: i64, result: &str| json!({exit_field: exit, "state": "completed", "result": result});
+    let mut outcomes = json!({
+        "PASSED": outcome(0, "success"),
+        "FAILED": outcome(1, "failure"),
+        "COULD_NOT_RUN": outcome(75, "no-result"),
+    });
+    if schema >= 7 {
+        outcomes
+            .as_object_mut()
+            .expect("object")
+            .insert("GREEN_FLAKY".to_string(), outcome(0, "success"));
+    }
+    let base_writeback = json!({
+        "nullable": true,
+        "variants": {"completed": ["status"], "failed": ["status", "error"]},
+    });
+    let expected_writeback = if schema >= 6 {
+        json!({
+            "nullable": true,
+            "variants": {
+                "completed": ["status"],
+                "delegated": ["status"],
+                "failed": ["status", "error"],
+            },
+        })
+    } else {
+        base_writeback
+    };
+    let keys: Vec<&str> = producer.keys().map(String::as_str).collect();
+    let fields_match = producer
+        .get("fields")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .map(|item| item.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                == fields
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+        });
+    if keys.len() != expected_keys.len()
+        || !expected_keys.iter().all(|key| keys.contains(key))
+        || !is_int(producer.get("schema_version"))
+        || int_value(producer.get("schema_version")) != Some(schema)
+        || !fields_match
+        || producer.get("outcomes") != Some(&outcomes)
+        || (schema >= 2 && producer.get("scorecard_writeback") != Some(&expected_writeback))
+    {
+        return Err(
+            "validation removal producer-schema does not match the run-record schema".to_string(),
+        );
+    }
+    Ok(fields)
+}
+
+fn scorecard_writeback(value: Option<&Value>, label: &str) -> Result<Option<Value>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(format!("{label} must be an object or null"));
+    };
+    let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    if object.get("status").and_then(Value::as_str) == Some("completed") && keys == ["status"] {
+        return Ok(Some(value.clone()));
+    }
+    let error = object.get("error").and_then(Value::as_str);
+    if object.get("status").and_then(Value::as_str) == Some("failed")
+        && keys.len() == 2
+        && keys.contains(&"status")
+        && keys.contains(&"error")
+        && error.is_some_and(|text| !text.trim().is_empty())
+    {
+        return Ok(Some(value.clone()));
+    }
+    Err(format!(
+        "{label} must be null, completed, or failed with a nonempty error"
+    ))
+}
+
+fn optional_count(value: Option<&Value>, label: &str) -> Result<Option<i64>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(other) => {
+            if is_int(Some(other)) && int_value(Some(other)).is_some_and(|n| n >= 0) {
+                Ok(int_value(Some(other)))
+            } else {
+                Err(format!("{label} must be a non-negative integer or null"))
+            }
+        }
+    }
+}
+
+/// Python `_validation_service_result_projection`.
+fn service_result_projection(
+    contents: &[u8],
+    schema: i64,
+    schema_fields: &[&str],
+    expected_commit: Option<&Value>,
+) -> Result<serde_json::Map<String, Value>> {
+    let result = strict_json_object(contents, "validation removal service-result")?;
+    let mut allowed: Vec<&str> = schema_fields.to_vec();
+    if schema >= 8 {
+        allowed.push("test_cases");
+        if let Some(cases) = result.get("test_cases") {
+            if !cases.is_null() && !cases.is_array() {
+                return Err(
+                    "validation removal service-result test_cases must be a list or null"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let present: Vec<&str> = result.keys().map(String::as_str).collect();
+    if !schema_fields.iter().all(|field| present.contains(field))
+        || !present.iter().all(|field| allowed.contains(field))
+    {
+        return Err(
+            "validation removal service-result fields do not match the producer schema".to_string(),
+        );
+    }
+    if !is_int(result.get("schema_version"))
+        || int_value(result.get("schema_version")) != Some(schema)
+    {
+        return Err(
+            "validation removal service-result schema differs from the run-record".to_string(),
+        );
+    }
+    if result.get("commit") != expected_commit {
+        return Err(
+            "validation removal service-result commit differs from the run-record".to_string(),
+        );
+    }
+    let profile = result.get("profile").and_then(Value::as_str);
+    if profile.is_none_or(|text| text.trim().is_empty()) {
+        return Err("validation removal service-result profile must be nonempty text".to_string());
+    }
+    let status = result.get("final_validate_status").and_then(Value::as_str);
+    let (result_name, mut expected_exit) = match status {
+        Some("PASSED") => ("success", 0),
+        Some("FAILED") => ("failure", 1),
+        Some("COULD_NOT_RUN") => ("no-result", 75),
+        _ => {
+            return Err("validation removal service-result final status is unsupported".to_string())
+        }
+    };
+    let mut writeback: Option<Value> = None;
+    if schema >= 2 {
+        writeback = scorecard_writeback(
+            result.get("scorecard_writeback"),
+            "validation removal service-result scorecard_writeback",
+        )?;
+        if status == Some("PASSED")
+            && writeback
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                == Some("failed")
+        {
+            expected_exit = 75;
+        }
+    }
+    let exit_code = int_value(result.get("exit_code"));
+    if !is_int(result.get("exit_code")) || exit_code != Some(expected_exit) {
+        return Err(
+            "validation removal service-result exit_code disagrees with its outcome".to_string(),
+        );
+    }
+    let executed_nodes =
+        match int_value(result.get("executed_nodes")) {
+            Some(number) if number >= 0 && is_int(result.get("executed_nodes")) => number,
+            _ => return Err(
+                "validation removal service-result executed_nodes must be a non-negative integer"
+                    .to_string(),
+            ),
+        };
+    let executed_tests = optional_count(
+        result.get("executed_tests"),
+        "validation removal service-result executed_tests",
+    )?;
+    let historical = (1..=3).contains(&schema);
+    let mut projection = json_object(&[
+        (
+            "state",
+            Value::String(if historical { "unknown" } else { "completed" }.to_string()),
+        ),
+        (
+            "result",
+            Value::String(if historical { "unknown" } else { result_name }.to_string()),
+        ),
+        (
+            "result_source",
+            Value::String(
+                if historical {
+                    "historical-validation-service-result"
+                } else {
+                    "validation-service-result"
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "final_validate_status",
+            Value::String(status.unwrap_or_default().to_string()),
+        ),
+        ("exit_code", json!(exit_code.unwrap_or_default())),
+        ("executed_nodes", json!(executed_nodes)),
+        (
+            "executed_tests",
+            executed_tests.map_or(Value::Null, |n| json!(n)),
+        ),
+    ]);
+    if historical {
+        projection.insert("passed_tests".to_string(), Value::Null);
+        projection.insert(
+            "detail".to_string(),
+            Value::String(historical_detail(schema)),
+        );
+    }
+    if schema >= 2 {
+        projection.insert(
+            "scorecard_writeback".to_string(),
+            writeback.clone().unwrap_or(Value::Null),
+        );
+    }
+    if schema >= 3 {
+        let selection = result.get("selection_mode");
+        if selection.is_some_and(|value| {
+            !value.is_null() && value.as_str().is_none_or(|text| text.trim().is_empty())
+        }) {
+            return Err(
+                "validation removal service-result selection_mode must be nonempty text or null"
+                    .to_string(),
+            );
+        }
+        projection.insert(
+            "selection_mode".to_string(),
+            selection.cloned().unwrap_or(Value::Null),
+        );
+    }
+    if schema >= 4 {
+        let passed_tests = optional_count(
+            result.get("passed_tests"),
+            "validation removal service-result passed_tests",
+        )?;
+        if executed_tests.is_none() != passed_tests.is_none() {
+            return Err("validation removal service-result test counts are incomplete".to_string());
+        }
+        if let (Some(executed), Some(passed)) = (executed_tests, passed_tests) {
+            if passed > executed {
+                return Err(
+                    "validation removal service-result passed_tests exceeds executed_tests"
+                        .to_string(),
+                );
+            }
+        }
+        if status == Some("PASSED") && (passed_tests.is_none() || passed_tests != executed_tests) {
+            return Err("validation removal service-result PASSED counts disagree".to_string());
+        }
+        projection.insert(
+            "passed_tests".to_string(),
+            passed_tests.map_or(Value::Null, |n| json!(n)),
+        );
+    }
+    if schema >= 8 {
+        let skipped = optional_count(
+            result.get("skipped_tests"),
+            "validation removal service-result skipped_tests",
+        )?;
+        if executed_tests.is_none() != skipped.is_none() {
+            return Err("validation removal service-result test counts are incomplete".to_string());
+        }
+        projection.insert(
+            "skipped_tests".to_string(),
+            skipped.map_or(Value::Null, |n| json!(n)),
+        );
+    }
+    if schema == 5 {
+        match result.get("detail") {
+            Some(Value::Array(lines)) => {
+                if lines.is_empty()
+                    || lines
+                        .iter()
+                        .any(|line| line.as_str().is_none_or(|text| text.trim().is_empty()))
+                    || status != Some("COULD_NOT_RUN")
+                {
+                    return Err(
+                        "validation removal service-result detail violates its schema".to_string(),
+                    );
+                }
+                let joined = lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                projection.insert("detail".to_string(), Value::String(joined));
+            }
+            Some(_) => {
+                return Err(
+                    "validation removal service-result detail violates its schema".to_string(),
+                )
+            }
+            None => {
+                if status == Some("COULD_NOT_RUN") {
+                    projection.insert(
+                        "detail".to_string(),
+                        Value::String(
+                            "validation reported COULD_NOT_RUN without detail".to_string(),
+                        ),
+                    );
+                } else {
+                    projection.insert("detail".to_string(), Value::Null);
+                }
+            }
+        }
+    }
+    Ok(projection)
+}
+
+/// Python `_frozen_result_evidence_from_obj` (target-checked).
+pub(crate) fn frozen_result_evidence(
+    value: &Value,
+    target: Option<&str>,
+) -> Result<(String, u64, u64, u64, String)> {
+    let Some(object) = value.as_object() else {
+        return Err("durable frozen validation result evidence is incomplete".to_string());
+    };
+    let keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    let sha = object
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let valid = keys.len() == 5
+        && ["path", "device", "inode", "size", "sha256"]
+            .iter()
+            .all(|key| keys.contains(key))
+        && target.is_some()
+        && sha.len() == 64
+        && sha
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if !valid {
+        return Err("durable frozen validation result evidence is incomplete".to_string());
+    }
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "durable frozen validation result evidence is incomplete".to_string())
+    };
+    let number = |key: &str| {
+        int_value(object.get(key))
+            .filter(|_| is_int(object.get(key)))
+            .ok_or_else(|| "durable frozen validation result evidence is incomplete".to_string())
+            .map(|n| n as u64)
+    };
+    Ok((
+        text("path")?,
+        number("device")?,
+        number("inode")?,
+        number("size")?,
+        sha.to_string(),
+    ))
+}
+
+/// Python `_current_incomplete_frozen_result`.
+fn current_incomplete_frozen_result(record: &serde_json::Map<String, Value>) -> bool {
+    let schema = int_value(record.get("service_result_schema"));
+    if !is_int(record.get("service_result_schema")) || !matches!(schema, Some(5..=8)) {
+        return false;
+    }
+    let expected: Vec<(&str, Value)> = vec![
+        ("result_source", json!("validation-service-result")),
+        ("state", json!("completed")),
+        ("result", json!("no-result")),
+        ("final_validate_status", json!("COULD_NOT_RUN")),
+        ("exit_code", json!(75)),
+        ("temporary_checkout", json!(true)),
+        ("materialized_target", json!(false)),
+        ("qualifying_receipt", json!(false)),
+        ("executed_nodes", json!(0)),
+        ("executed_tests", Value::Null),
+        ("passed_tests", Value::Null),
+        ("selection_mode", Value::Null),
+        ("scorecard_writeback", Value::Null),
+    ];
+    expected
+        .iter()
+        .all(|(key, value)| record.get(*key) == Some(value))
+        && !record.contains_key("scorecard_handoff")
+        && !record.contains_key("scorecard_writeback_files")
+        && has_typed_admission(record)
+        && record
+            .get("admission_result")
+            .and_then(Value::as_object)
+            .and_then(|admission| admission.get("state"))
+            .and_then(Value::as_str)
+            == Some("admitted")
+}
+
+/// Python `_current_frozen_service_result`.
+fn current_frozen_service_result(record: &serde_json::Map<String, Value>) -> bool {
+    let schema = int_value(record.get("service_result_schema"));
+    is_int(record.get("service_result_schema"))
+        && matches!(schema, Some(4..=8))
+        && record.get("result_source").and_then(Value::as_str) == Some("validation-service-result")
+        && record.get("state").and_then(Value::as_str) == Some("completed")
+        && validation_record_is_terminal(record, "frozen-checkout", false)
+}
+
+/// Python `_durable_frozen_result`: the recorded target commit.
+fn durable_frozen_result(
+    cfg: &Cfg,
+    record_path: &Path,
+    record: &serde_json::Map<String, Value>,
+    target: &str,
+) -> Result<String> {
+    if current_incomplete_frozen_result(record) {
+        return Err(
+            "current incomplete frozen validation is retained, never removed by its durable result"
+                .to_string(),
+        );
+    }
+    if !current_frozen_service_result(record) {
+        return Err("frozen validation has no current service-result terminal result".to_string());
+    }
+    if !record_process_is_dead(record) {
+        return Err("frozen validation process state is live or uncertain".to_string());
+    }
+    let label = "durable frozen validation result";
+    let stem = record_path
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let path = cfg
+        .root
+        .join(format!("ignored/validate/frozen/{stem}.jsonl"));
+    ensure_no_symlink_components(&cfg.root, &path, label)?;
+    if !path.exists() {
+        return Err(format!("{label} does not exist: {}", path.display()));
+    }
+    if record.get("result_record").and_then(Value::as_str) != Some(path.to_string_lossy().as_ref())
+    {
+        return Err(format!(
+            "frozen validation run-record does not name this {label}"
+        ));
+    }
+    let contents = std::fs::read(&path)
+        .map_err(|error| format!("cannot read {label} {}: {error}", path.display()))?;
+    if contents.len() > 16 * 1024 * 1024 {
+        return Err(format!(
+            "{label} exceeds the safety bound: {}",
+            path.display()
+        ));
+    }
+    let text = String::from_utf8_lossy(&contents);
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let Some(last) = rows.last() else {
+        return Err(format!("{label} is empty: {}", path.display()));
+    };
+    let final_row = strict_json_object(last.as_bytes(), &format!("{label} final row"))?;
+    if final_row.get("commit").and_then(Value::as_str) != Some(target) {
+        return Err(format!(
+            "{label} final row does not name the recorded target commit"
+        ));
+    }
+    let checkout = record.get("checkout");
+    if checkout.is_none() || final_row.get("cwd") != checkout {
+        return Err(format!(
+            "{label} final row was not measured in the recorded checkout"
+        ));
+    }
+    Ok(target.to_string())
+}
+
+/// The frozen no-proof dispositions (Python `_FrozenNoProofDisposition`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrozenDisposition {
+    BlocksEntry,
+    CurrentIncompleteRetained,
+    CurrentTerminalRemovable,
+    HistoricalNonblocking,
+    LegacyRecovery,
+}
+
+impl FrozenDisposition {
+    /// The Python enum's wire value.
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            FrozenDisposition::BlocksEntry => "blocks-entry",
+            FrozenDisposition::CurrentIncompleteRetained => "current-incomplete-retained",
+            FrozenDisposition::CurrentTerminalRemovable => "current-terminal-removable",
+            FrozenDisposition::HistoricalNonblocking => "historical-nonblocking",
+            FrozenDisposition::LegacyRecovery => "legacy-recovery",
+        }
+    }
+}
+
+/// Python's historical producer-schema location inside the checkout:
+/// `_VALIDATION_SERVICE_RESULT_SCHEMA_PATH`.
+fn historical_producer_path(checkout: &Path) -> PathBuf {
+    checkout.join("ci/manifest-plan/validation-service-result-schema.json")
+}
+
+/// Python's historical sidecar location: beside the run-record, named
+/// `{record stem}{_VALIDATION_SERVICE_RESULT_SUFFIX}`.
+fn historical_sidecar_path(record_path: &Path) -> PathBuf {
+    let stem = record_path
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    record_path.with_file_name(format!("{stem}.service-result.json"))
+}
+
+/// The historical producer-schema + sidecar projection binding shared
+/// by `_frozen_no_proof_disposition` and the historical branch of
+/// `_terminal_validation_record`. `expected_commit` is the recorded
+/// target commit (the run-record's `target`, not a `commit` field).
+fn historical_projection_binding(
+    record_path: &Path,
+    checkout: &Path,
+    record: &serde_json::Map<String, Value>,
+    schema: i64,
+    expected_commit: &str,
+) -> Result<()> {
+    let producer_path = historical_producer_path(checkout);
+    let sidecar_path = historical_sidecar_path(record_path);
+    ensure_no_symlink_components(
+        checkout,
+        &producer_path,
+        "historical frozen validation producer schema",
+    )?;
+    let producer = std::fs::read(&producer_path).map_err(|error| {
+        format!(
+            "cannot read historical frozen validation producer schema {}: {error}",
+            producer_path.display()
+        )
+    })?;
+    let sidecar = std::fs::read(&sidecar_path).map_err(|error| {
+        format!(
+            "cannot read historical frozen validation service-result {}: {error}",
+            sidecar_path.display()
+        )
+    })?;
+    let fields = service_result_schema(&producer, schema)?;
+    let expected = Value::String(expected_commit.to_string());
+    let projection = service_result_projection(&sidecar, schema, &fields, Some(&expected))?;
+    for (field, expected_value) in &projection {
+        if record.get(field) != Some(expected_value) {
+            return Err(format!(
+                "historical frozen validation service-result {field} differs from the run-record"
+            ));
+        }
+    }
+    if projection.get("scorecard_writeback") != Some(&json!({"status": "completed"})) {
+        return Err(
+            "historical frozen validation has no completed scorecard writeback".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Python `_frozen_no_proof_disposition`; the census is injected.
+/// Returns (disposition, historical schema when historical).
+pub(crate) fn frozen_no_proof_disposition(
+    cfg: &Cfg,
+    record_path: &Path,
+    checkout: &Path,
+    repository: &Path,
+    record_digest: &str,
+    record_target: &str,
+    census_unused: &dyn Fn(&Path) -> Result<()>,
+) -> Result<(FrozenDisposition, Option<i64>)> {
+    let contents = std::fs::read(record_path).map_err(|error| {
+        format!(
+            "cannot read frozen validation run-record {}: {error}",
+            record_path.display()
+        )
+    })?;
+    let record = strict_json_object(&contents, "frozen validation run-record")?;
+    let schema = int_value(record.get("service_result_schema"));
+    let source = record.get("result_source").and_then(Value::as_str);
+    if record.contains_key("result_source")
+        && source != Some("validation-service-result")
+        && !(matches!(schema, Some(1..=3))
+            && source == Some("historical-validation-service-result"))
+    {
+        return Ok((FrozenDisposition::LegacyRecovery, None));
+    }
+    if matches!(schema, Some(4..=8)) && source == Some("validation-service-result") {
+        if current_incomplete_frozen_result(&record) {
+            return Ok((FrozenDisposition::CurrentIncompleteRetained, None));
+        }
+        if current_frozen_service_result(&record) {
+            if !record_process_is_dead(&record) {
+                return Ok((FrozenDisposition::BlocksEntry, None));
+            }
+            durable_frozen_result(cfg, record_path, &record, record_target)?;
+            return Ok((FrozenDisposition::CurrentTerminalRemovable, None));
+        }
+        return Ok((FrozenDisposition::BlocksEntry, None));
+    }
+    // Historical schemas: producer-schema + sidecar projection.
+    if matches!(schema, Some(2..=3))
+        && record.get("result_source").and_then(Value::as_str)
+            == Some("historical-validation-service-result")
+    {
+        let schema = schema.unwrap_or_default();
+        if record.get("kind").and_then(Value::as_str) != Some("frozen-validate")
+            || record.get("materialized_target") != Some(&Value::Bool(false))
+            || record.contains_key("scorecard_handoff")
+            || record.contains_key("scorecard_writeback_files")
+        {
+            return Err(
+                "historical frozen validation without a removal proof does not match the pre-proof non-materialized shape"
+                    .to_string(),
+            );
+        }
+        if !record_process_is_dead(&record) {
+            return Err(
+                "historical frozen validation process state is live or uncertain".to_string(),
+            );
+        }
+        historical_projection_binding(record_path, checkout, &record, schema, record_target)?;
+        census_unused(checkout)?;
+        // Re-read and re-bind before deciding.
+        let rebound = std::fs::read(record_path).map_err(|error| {
+            format!(
+                "cannot read frozen validation run-record {}: {error}",
+                record_path.display()
+            )
+        })?;
+        if rebound != contents {
+            return Err(
+                "historical frozen validation evidence changed during entry classification"
+                    .to_string(),
+            );
+        }
+        let _ = (cfg, repository, record_digest);
+        let head = git_text(checkout, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        if head != record_target {
+            return Err(
+                "historical frozen validation checkout HEAD changed during entry classification"
+                    .to_string(),
+            );
+        }
+        return Ok((FrozenDisposition::HistoricalNonblocking, Some(schema)));
+    }
+    Ok((FrozenDisposition::BlocksEntry, None))
+}
+
 /// Python `_terminal_validation_record` for the non-frozen
 /// kinds: (relative, sha256, recorded target). Frozen records
 /// stop at their authority pre-checks; the frozen binding itself
@@ -879,21 +1629,7 @@ pub(crate) fn terminal_validation_record(
         return Err("terminal validation record must be a JSON object".to_string());
     };
     if target_kind == "frozen-checkout" {
-        // Authority pre-checks that precede the frozen binding.
-        let schema_ok = matches!(
-            record.get("service_result_schema").and_then(Value::as_i64),
-            Some(1..=3)
-        ) && record.get("result_source").and_then(Value::as_str)
-            == Some("validation-service-result");
-        if !schema_ok {
-            return Err(
-                "direct frozen validation recovery requires --validation-proof-manifest for current or historical-projection records; use the bounded batch command to classify a pre-proof historical checkout without removing it"
-                    .to_string(),
-            );
-        }
-        return Err(
-            "frozen validation record binding stays with the Python edition for now".to_string(),
-        );
+        return terminal_frozen_record(cfg, &path, record, target);
     }
     let field = if target_kind == "cargo-home" {
         "cargo_home"
@@ -916,6 +1652,73 @@ pub(crate) fn terminal_validation_record(
         );
     }
     Ok((relative, digest, None))
+}
+
+/// The frozen branch of `_terminal_validation_record`:
+/// (relative, sha256, recorded target commit).
+fn terminal_frozen_record(
+    cfg: &Cfg,
+    path: &Path,
+    record: &serde_json::Map<String, Value>,
+    target: &Path,
+) -> Result<(String, String, Option<String>)> {
+    let relative = path
+        .strip_prefix(&cfg.root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+    let contents = std::fs::read(path).unwrap_or_default();
+    let digest = format!("{:x}", Sha256::digest(&contents));
+    let recorded_checkout = record.get("checkout").and_then(Value::as_str);
+    if recorded_checkout != Some(target.to_string_lossy().as_ref()) {
+        return Err("terminal validation record does not name this exact checkout".to_string());
+    }
+    if record.get("temporary_checkout") == Some(&Value::Bool(false)) {
+        return Err("terminal validation record says the checkout is not temporary".to_string());
+    }
+    if record
+        .get("admission_result")
+        .and_then(Value::as_object)
+        .and_then(|admission| admission.get("state"))
+        .and_then(Value::as_str)
+        == Some("refused")
+    {
+        return Err(
+            "legacy frozen validation record records a refused admission and is not removal evidence"
+                .to_string(),
+        );
+    }
+    let schema = int_value(record.get("service_result_schema"));
+    let source = record.get("result_source").and_then(Value::as_str);
+    // Current schemas: durable-result authority.
+    if matches!(schema, Some(4..=8)) && source == Some("validation-service-result") {
+        if current_incomplete_frozen_result(record) {
+            return Err(
+                "current incomplete frozen validation is retained, never removed".to_string(),
+            );
+        }
+        let target_commit = record
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        durable_frozen_result(cfg, path, record, &target_commit)?;
+        return Ok((relative, digest, Some(target_commit)));
+    }
+    // Historical schemas: producer-schema projection binding.
+    if matches!(schema, Some(1..=3)) && is_int(record.get("service_result_schema")) {
+        let schema = schema.unwrap_or_default();
+        let target_commit = record
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        historical_projection_binding(path, target, record, schema, &target_commit)?;
+        return Ok((relative, digest, Some(target_commit)));
+    }
+    Err(
+        "direct frozen validation recovery requires --validation-proof-manifest for current or historical-projection records; use the bounded batch command to classify a pre-proof historical checkout without removing it"
+            .to_string(),
+    )
 }
 
 /// Python `_recordless_validation_evidence`.
@@ -1711,6 +2514,302 @@ except Exception as exc:
         );
         let expected: Value = serde_json::from_slice(&output.stdout).expect("oracle json");
         assert_eq!(mine, expected);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const DISPOSITION_DRIVER: &str = r####"import json, sys
+sys.path.insert(0, "py")
+from pathlib import Path
+from wrkslots import cli
+
+root = Path(sys.argv[1])
+config = cli._load_config(str(root), "node-a")
+checkout = Path(sys.argv[2])
+repository = Path(sys.argv[3])
+record_path = Path(sys.argv[4])
+target = sys.argv[5]
+out = {}
+record = json.loads(record_path.read_text())
+census = cli._ProcessPathCensus((), (), owner_cgroup_complete=False)
+budget = cli._ReadOnlyCommandBudget.start(
+    timeout_seconds=600.0,
+    stdout_limit=16 * 1024 * 1024,
+    stderr_limit=16 * 1024 * 1024,
+    input_limit=16 * 1024 * 1024,
+)
+identity = cli._private_cleanup_path_identity(
+    config, checkout, allowed_modes={0o700}, managed_root=None
+)
+batch = cli._OwnerlessValidationBatchContext(
+    {identity: checkout}, census, budget
+)
+
+def canonical(_config, _path, contents):
+    parsed = cli._strict_json_object(contents, "frozen fixture")
+    return (
+        {
+            "schema_version": parsed["schema_version"],
+            "kind": parsed["kind"],
+            "state": parsed["state"],
+            "target": parsed["target"],
+            "repo": parsed["repo"],
+        },
+        parsed,
+    )
+
+cli._canonical_frozen_validation_record = canonical
+# The batch fresh-census is injected evidence on the Rust side too
+# (assert_slot_unused on an unused clone); stub it as Python's own
+# lifecycle fixtures do, so host process churn cannot close it.
+cli._capture_same_uid_process_path_census = (
+    lambda _paths, budget=None: cli._ProcessPathCensus((), ())
+)
+raw_record = "ignored/validate/runs/run-frozen.json"
+try:
+    classification = cli._frozen_no_proof_disposition(
+        config,
+        checkout,
+        raw_record,
+        "upstream-repo",
+        batch_cleanup=batch,
+    )
+    out["ok"] = classification.disposition.value
+except Exception as exc:
+    out["err"] = str(exc)
+print(json.dumps(out, sort_keys=True))
+"####;
+
+    fn test_schema() -> i64 {
+        2
+    }
+
+    fn test_stride() -> i64 {
+        2
+    }
+
+    #[test]
+    fn frozen_disposition_historical_schema2_matches_python() {
+        let (cfg, root) = fixture("frozen-disposition");
+        // Build the run-1773 shape Python's own lifecycle fixtures use:
+        // the producer schema is committed in the source repository, the
+        // checkout is a standalone clone detached at the recorded
+        // target, and the service-result sidecar sits beside the record.
+        let upstream = root.join("upstream-repo");
+        let producer = json!({
+            "schema_version": test_schema(),
+            "fields": [
+                "schema_version", "commit", "profile", "final_validate_status",
+                "exit_code", "executed_nodes", "executed_tests", "scorecard_writeback"
+            ],
+            "outcomes": {
+                "PASSED": {"validation_exit_code": 0, "state": "completed", "result": "success"},
+                "FAILED": {"validation_exit_code": 1, "state": "completed", "result": "failure"},
+                "COULD_NOT_RUN": {"validation_exit_code": 75, "state": "completed", "result": "no-result"}
+            },
+            "scorecard_writeback": {"nullable": true, "variants": {"completed": ["status"], "failed": ["status", "error"]}}
+        });
+        let schema_path = upstream.join("ci/manifest-plan/validation-service-result-schema.json");
+        std::fs::create_dir_all(schema_path.parent().expect("parent")).expect("dirs");
+        std::fs::write(&schema_path, producer.to_string()).expect("producer");
+        std::fs::write(upstream.join("file.txt"), "one\n").expect("file");
+        git_text(&upstream, &["init", "-q", "-b", "main"]).expect("init");
+        git_text(&upstream, &["add", "."]).expect("add");
+        git_text(
+            &upstream,
+            &[
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-q",
+                "-m",
+                "one",
+            ],
+        )
+        .expect("commit");
+        git_text(
+            &upstream,
+            &[
+                "remote",
+                "add",
+                "origin",
+                upstream.to_string_lossy().as_ref(),
+            ],
+        )
+        .expect("remote");
+        git_text(
+            &upstream,
+            &[
+                "fetch",
+                "-q",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        )
+        .expect("fetch");
+        let record_target = git_text(&upstream, &["rev-parse", "HEAD"])
+            .expect("head")
+            .trim()
+            .to_owned();
+        let checkout = root.join("worktrees/validate/val-a");
+        std::fs::create_dir_all(checkout.parent().expect("parent")).expect("dirs");
+        git_text(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--no-checkout",
+                "--no-tags",
+                upstream.to_string_lossy().as_ref(),
+                checkout.to_string_lossy().as_ref(),
+            ],
+        )
+        .expect("clone");
+        git_text(&checkout, &["checkout", "-q", "--detach", &record_target]).expect("detach");
+        std::fs::set_permissions(
+            &checkout,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("checkout mode");
+        let sidecar = json!({
+            "schema_version": test_schema(),
+            "commit": record_target,
+            "profile": "only-portable",
+            "final_validate_status": "FAILED",
+            "exit_code": 1,
+            "executed_nodes": 14,
+            "executed_tests": null,
+            "scorecard_writeback": {"status": "completed"}
+        });
+        std::fs::write(
+            root.join("ignored/validate/runs/run-frozen.service-result.json"),
+            sidecar.to_string(),
+        )
+        .expect("sidecar");
+        let record = serde_json::json!({
+            "schema_version": 1,
+            "kind": "frozen-validate",
+            "producer": "ci-hub/validate/run_registry.py",
+            "admission": "frozen-validate",
+            "validation_kind": "frozen-validate",
+            "service_result_schema": test_stride(),
+            "result_source": "historical-validation-service-result",
+            "materialized_target": false,
+            "qualifying_receipt": false,
+            "state": "unknown",
+            "result": "unknown",
+            "final_validate_status": "FAILED",
+            "exit_code": 1,
+            "executed_nodes": 14,
+            "executed_tests": null,
+            "passed_tests": null,
+            "detail": "validation-service-result-schema_version: historical schema 2 is readable but has no current authority",
+            "scorecard_writeback": {"status": "completed"},
+            "process_identity": {"pid": 999999, "start_ticks": 1, "boot_id": "historical-boot"},
+            "checkout": checkout.to_string_lossy(),
+            "source_checkout": upstream.to_string_lossy(),
+            "target": record_target,
+            "repo": "consumer-a/project",
+            "temporary_checkout": true
+        });
+        let record_path = root.join("ignored/validate/runs/run-frozen.json");
+        std::fs::write(&record_path, record.to_string()).expect("record");
+
+        let mine = frozen_no_proof_disposition(
+            &cfg,
+            &record_path,
+            &checkout,
+            &root.join("upstream-repo"),
+            &"0".repeat(64),
+            &record_target,
+            &|path| crate::remove_write::assert_slot_unused(path, i64::from(std::process::id())),
+        );
+        let driver = std::env::temp_dir().join(format!(
+            "wrkslotsd-validation-disposition-driver-{}.py",
+            std::process::id()
+        ));
+        std::fs::write(&driver, DISPOSITION_DRIVER).expect("driver");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf();
+        let output = std::process::Command::new("python3")
+            .arg(&driver)
+            .arg(&root)
+            .arg(&checkout)
+            .arg(root.join("upstream-repo"))
+            .arg(&record_path)
+            .arg(&record_target)
+            .current_dir(&repo_root)
+            .output()
+            .expect("python oracle");
+        assert!(
+            output.status.success(),
+            "oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Value = serde_json::from_slice(&output.stdout).expect("oracle json");
+        match (&mine, expected.get("ok").and_then(Value::as_str)) {
+            (Ok((disp, _)), Some(value)) => {
+                let mine_value = match disp {
+                    FrozenDisposition::HistoricalNonblocking => "historical-nonblocking",
+                    FrozenDisposition::CurrentTerminalRemovable => "current-terminal-removable",
+                    FrozenDisposition::BlocksEntry => "blocks-entry",
+                    FrozenDisposition::CurrentIncompleteRetained => "current-incomplete-retained",
+                    FrozenDisposition::LegacyRecovery => "legacy-recovery",
+                };
+                assert_eq!(mine_value, value);
+            }
+            (Err(error), None) => {
+                assert_eq!(
+                    expected.get("err").and_then(Value::as_str),
+                    Some(error.as_str())
+                );
+            }
+            other => panic!("mismatch: {other:?} vs oracle {expected}"),
+        }
+        // Negative: dropping materialized_target breaks the pre-proof
+        // shape, and both editions refuse with the same line.
+        let mut broken: Value = serde_json::from_str(&record.to_string()).expect("record json");
+        broken
+            .as_object_mut()
+            .expect("record object")
+            .remove("materialized_target");
+        std::fs::write(&record_path, broken.to_string()).expect("broken record");
+        let mine = frozen_no_proof_disposition(
+            &cfg,
+            &record_path,
+            &checkout,
+            &root.join("upstream-repo"),
+            &"0".repeat(64),
+            &record_target,
+            &|path| crate::remove_write::assert_slot_unused(path, i64::from(std::process::id())),
+        );
+        let output = std::process::Command::new("python3")
+            .arg(&driver)
+            .arg(&root)
+            .arg(&checkout)
+            .arg(root.join("upstream-repo"))
+            .arg(&record_path)
+            .arg(&record_target)
+            .current_dir(&repo_root)
+            .output()
+            .expect("python oracle");
+        assert!(
+            output.status.success(),
+            "oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: Value = serde_json::from_slice(&output.stdout).expect("oracle json");
+        let Err(error) = mine else {
+            panic!("expected shape refusal, got {mine:?} vs oracle {expected}");
+        };
+        assert_eq!(
+            expected.get("err").and_then(Value::as_str),
+            Some(error.as_str())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
