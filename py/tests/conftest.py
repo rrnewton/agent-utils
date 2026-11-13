@@ -23,6 +23,10 @@ live agent or another checkout's validation holding the same pane (or the subage
 allocation lock) would otherwise stall an unrelated test. In-process code only; a test that runs
 agentctl as a subprocess still reaches the host root.
 
+A session-wide guard (hooks at the bottom of this file) redirects global git
+config to a per-session temp file and fails the session if the real
+``~/.gitconfig`` changes content mid-run (#1474).
+
 A fifth removes ``AGENT_UTILS_CROSS_COVERAGE_DIR`` and the per-case timing variables.
 ``scripts/validate.py`` exports them to every node of the graph it runs, this suite included, and
 ``cross/differential.py`` writes one coverage record there per verdict while timing-capable
@@ -41,6 +45,7 @@ import pytest
 from agentctl import agent as agentctl_agent
 from dagrun.cli import PROFILE_DIR_ENV
 from dagrun.sizing import BUILD_JOBS_ENV, OPERATOR_BUILD_JOBS_ENV
+from gitconfig_guard import GlobalGitConfigGuard
 
 
 _RUNNER_AUTHORITY_ENV = (
@@ -185,7 +190,41 @@ def pytest_collection_modifyitems(
     config._quarantined_nodeids = [item.nodeid for item in quarantined]  # type: ignore[attr-defined]
 
 
+#: Session-wide guard against tests writing the real global git config
+#: (#1474 tests-rewrite-global-gitconfig). Started before collection so
+#: subprocesses spawned by any test inherit the redirect.
+_gitconfig_guard: GlobalGitConfigGuard | None = None
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    global _gitconfig_guard
+    _gitconfig_guard = GlobalGitConfigGuard.start()
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    del exitstatus
+    if _gitconfig_guard is None:
+        return
+    status, message = _gitconfig_guard.check()
+    session.config._gitconfig_guard_result = (status, message)  # type: ignore[attr-defined]
+    session.config._gitconfig_guard_sentinel_note = (  # type: ignore[attr-defined]
+        _gitconfig_guard.sentinel_note()
+    )
+    if status == "fail":
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    guard_result = getattr(terminalreporter.config, "_gitconfig_guard_result", None)
+    if guard_result is not None:
+        status, message = guard_result
+        if status != "ok":
+            terminalreporter.write_sep("=", "global git config guard (#1474)")
+            terminalreporter.write_line(f"  {status}: {message}")
+    sentinel_note = getattr(terminalreporter.config, "_gitconfig_guard_sentinel_note", "")
+    if sentinel_note:
+        terminalreporter.write_sep("=", "global git config guard (#1474)")
+        terminalreporter.write_line(f"  note: {sentinel_note}")
     nodeids = getattr(terminalreporter.config, "_quarantined_nodeids", [])
     if nodeids:
         terminalreporter.write_sep(

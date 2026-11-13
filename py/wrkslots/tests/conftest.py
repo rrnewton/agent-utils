@@ -21,6 +21,8 @@ os.environ.setdefault("WRKSLOTS_INIT_REPRESENTATION", "worktree")
 
 import pytest  # noqa: E402
 
+from gitconfig_guard import GlobalGitConfigGuard  # noqa: E402
+
 # After each test, unmount any slot image it left mounted in its tmp_path
 # (#1064 test-temp-and-mount-leaks).
 from wrkslots.tests.image_teardown import pytest_runtest_teardown  # noqa: E402,F401
@@ -158,7 +160,43 @@ def pytest_collection_modifyitems(
     config._quarantined_nodeids = [item.nodeid for item in quarantined]  # type: ignore[attr-defined]
 
 
+#: Session-wide guard against tests writing the real global git config
+#: (#1474 tests-rewrite-global-gitconfig). Started before collection so
+#: subprocesses spawned by any test inherit the redirect.
+_gitconfig_guard: GlobalGitConfigGuard | None = None
+
+
+_gitconfig_guard = GlobalGitConfigGuard.start()
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    pass
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    del exitstatus
+    if _gitconfig_guard is None:
+        return
+    status, message = _gitconfig_guard.check()
+    session.config._gitconfig_guard_result = (status, message)  # type: ignore[attr-defined]
+    session.config._gitconfig_guard_sentinel_note = (  # type: ignore[attr-defined]
+        _gitconfig_guard.sentinel_note()
+    )
+    if status == "fail":
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    guard_result = getattr(terminalreporter.config, "_gitconfig_guard_result", None)
+    if guard_result is not None:
+        status, message = guard_result
+        if status != "ok":
+            terminalreporter.write_sep("=", "global git config guard (#1474)")
+            terminalreporter.write_line(f"  {status}: {message}")
+    sentinel_note = getattr(terminalreporter.config, "_gitconfig_guard_sentinel_note", "")
+    if sentinel_note:
+        terminalreporter.write_sep("=", "global git config guard (#1474)")
+        terminalreporter.write_line(f"  note: {sentinel_note}")
     nodeids = getattr(terminalreporter.config, "_quarantined_nodeids", [])
     if nodeids:
         terminalreporter.write_sep(

@@ -656,7 +656,12 @@ def _run_supervised(
         ]
         # The worker holds the owner lock too, so a worker that outlives a killed wrapper keeps
         # its basetemp from the sweep.
-        process = subprocess.Popen(command, start_new_session=True, pass_fds=(owner,))
+        process = subprocess.Popen(
+            command,
+            env=_guarded_environment(dict(os.environ), temp_root),
+            start_new_session=True,
+            pass_fds=(owner,),
+        )
         shutdown_started: float | None = None
         hard_killed = False
         while True:
@@ -891,6 +896,31 @@ def _self_test_mounts_under() -> None:
         _remove_temp_root(fixture_root)
 
 
+def _guarded_environment(base: dict[str, str], directory: Path) -> dict[str, str]:
+    """Copy ``base`` with global git config redirected into ``directory`` (#1474).
+
+    The pytest conftest guard installs the same redirect at session start;
+    setting it here covers collection-time and fixture subprocesses that run
+    before (or without) that conftest, so no git invocation in a shard can
+    write the operator's real ``~/.gitconfig``. A caller-provided
+    ``GIT_CONFIG_GLOBAL`` is kept.
+    """
+
+    environment = dict(base)
+    if "GIT_CONFIG_GLOBAL" not in environment:
+        sentinel = directory / "global-gitconfig"
+        if not sentinel.exists():
+            sentinel.write_bytes(
+                b"[user]\n\tname = Agent Utils Tests\n"
+                b"\temail = agent-utils-tests@example.invalid\n"
+                b"[uploadpack]\n\tallowfilter = true\n"
+            )
+            sentinel.chmod(0o600)
+        environment["GIT_CONFIG_GLOBAL"] = str(sentinel)
+    environment.setdefault("GIT_CONFIG_NOSYSTEM", "1")
+    return environment
+
+
 def _fixture_environment(tmp: Path) -> dict[str, str]:
     """The environment for a fixture run of this wrapper: a private TMPDIR, no timing records.
 
@@ -899,7 +929,7 @@ def _fixture_environment(tmp: Path) -> dict[str, str]:
     """
     import case_timings
 
-    environment = {**os.environ, "TMPDIR": str(tmp)}
+    environment = _guarded_environment({**os.environ, "TMPDIR": str(tmp)}, tmp)
     environment.pop(case_timings.TIMING_DIR_ENV, None)
     return environment
 
@@ -1088,6 +1118,14 @@ def _self_test() -> int:
     _self_test_mounts_under()
     _self_test_keep_on_failure()
     _self_test_capped_memory_cgroup()
+    # The guarded worker environment redirects global git config (#1474) and
+    # keeps a caller-provided redirect.
+    with tempfile.TemporaryDirectory() as scratch:
+        guarded = _guarded_environment({}, Path(scratch))
+        assert Path(guarded["GIT_CONFIG_GLOBAL"]).is_file()
+        assert guarded["GIT_CONFIG_NOSYSTEM"] == "1"
+        kept = _guarded_environment({"GIT_CONFIG_GLOBAL": "/caller/sentinel"}, Path(scratch))
+        assert kept["GIT_CONFIG_GLOBAL"] == "/caller/sentinel"
     print("run_pytest_shard --self-test: PASSED")
     return 0
 

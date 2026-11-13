@@ -1040,6 +1040,23 @@ def run(
     extra = os.environ.get("VALIDATE_DAGRUN_FLAGS", os.environ.get("BOX_FLAGS", ""))
     env = dict(os.environ)
     env.update(host or {})
+    # Every step in the graph -- pytest shards and the Rust test harnesses
+    # alike -- inherits a throwaway global git config, so no test can write
+    # the operator's real ~/.gitconfig (#1474 tests-rewrite-global-gitconfig).
+    # The pytest conftest guard installs the same redirect per session and
+    # fails the session if the real file's content changes. A caller-provided
+    # GIT_CONFIG_GLOBAL is kept.
+    if "GIT_CONFIG_GLOBAL" not in env:
+        gitconfig_dir = Path(tempfile.mkdtemp(prefix="agent-utils-validate-gitconfig-"))
+        gitconfig_sentinel = gitconfig_dir / "gitconfig"
+        gitconfig_sentinel.write_bytes(
+            b"[user]\n\tname = Agent Utils Tests\n"
+            b"\temail = agent-utils-tests@example.invalid\n"
+            b"[uploadpack]\n\tallowfilter = true\n"
+        )
+        gitconfig_sentinel.chmod(0o600)
+        env["GIT_CONFIG_GLOBAL"] = str(gitconfig_sentinel)
+    env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
     if coverage_dir is not None:
         env[CROSS_COVERAGE_ENV] = str(coverage_dir)
     if pytest_root is not None:
