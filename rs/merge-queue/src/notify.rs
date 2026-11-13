@@ -174,6 +174,17 @@ pub fn resolve_registry(
     (!configured.is_empty()).then(|| PathBuf::from(configured))
 }
 
+/// The nearest `.agentctl` registry at or above `anchor`, if one exists:
+/// how a send finds the project registry from the queue's own location
+/// (its repository or state directory) instead of the caller's working
+/// directory (#1472 mq-notice-registry-from-cwd).
+pub fn registry_above(anchor: &std::path::Path) -> Option<PathBuf> {
+    anchor
+        .ancestors()
+        .map(|ancestor| ancestor.join(".agentctl"))
+        .find(|candidate| candidate.is_dir())
+}
+
 /// The configured agentctl-compatible sender.
 #[derive(Clone, Debug)]
 pub struct Notifier {
@@ -555,7 +566,15 @@ pub fn sweep_locked(
 /// submitter only when that run ends. The caller holds the writer lock, as for [`sweep_locked`]
 /// (a submission is only ever applied under it). Returns whether it delivered one.
 pub fn deliver_now(state: &State, config: &Config, pr: i64) -> bool {
-    deliver_one(state, config, &Notifier::resolve(None, None, config), pr)
+    let mut notifier = Notifier::resolve(None, None, config);
+    // A submit can run from any working directory (a slot, say), where
+    // agentctl's own `.agentctl`-in-cwd default names no registry
+    // (#1472). With nothing configured, address the project registry
+    // above the queue's repository or state directory instead.
+    if notifier.registry.is_none() {
+        notifier.registry = registry_above(&config.repo).or_else(|| registry_above(&state.root));
+    }
+    deliver_one(state, config, &notifier, pr)
 }
 
 /// Handle item `pr` as [`sweep_locked`] handles each item. Returns whether it delivered a
@@ -842,6 +861,28 @@ mod unit {
         );
         // Nothing set: no --registry, so agentctl keeps its own default.
         assert_eq!(resolve_registry(None, None, &Config::default()), None);
+    }
+
+    #[test]
+    fn registry_above_finds_the_nearest_registry() {
+        // #1472 mq-notice-registry-from-cwd.
+        let root =
+            std::env::temp_dir().join(format!("merge-queue-registry-above-{}", std::process::id()));
+        let deep = root.join("worktrees/slots/one/queue");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(root.join("worktrees/.agentctl")).unwrap();
+        assert_eq!(
+            registry_above(&deep),
+            Some(root.join("worktrees/.agentctl"))
+        );
+        // A registry beside the anchor itself wins over a higher one.
+        std::fs::create_dir_all(deep.join(".agentctl")).unwrap();
+        assert_eq!(registry_above(&deep), Some(deep.join(".agentctl")));
+        // No registry anywhere above: none.
+        let bare = root.join("elsewhere/queue");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(registry_above(&root.join("elsewhere")), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

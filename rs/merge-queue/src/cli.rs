@@ -1390,9 +1390,10 @@ enum Command {
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
         agentctl: Vec<String>,
         /// agentctl registry the notifications address: the daemon runs
-        /// `<command> --registry PATH send ...`. Stored as an absolute path. Default: none,
-        /// leaving agentctl's own `.agentctl` in the daemon's working directory, which for a
-        /// daemon started in a bare queue repository is no registry.
+        /// `<command> --registry PATH send ...`. Stored as an absolute path. Default: the
+        /// nearest `.agentctl` above the init working directory, recorded absolute, so
+        /// sends from any working directory address the project registry; without one
+        /// anywhere above, agentctl's own `.agentctl`-in-cwd default applies.
         #[arg(long, value_name = "PATH")]
         agentctl_registry: Option<PathBuf>,
         /// How event hooks and built-in `--notify` delivery divide reports
@@ -2418,7 +2419,15 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                             })?
                             .to_string_lossy()
                             .into_owned(),
-                        None => String::new(),
+                        // Record the project registry beside the queue
+                        // (nearest `.agentctl` above the init working
+                        // directory), so later sends from any working
+                        // directory address it explicitly (#1472).
+                        None => std::env::current_dir()
+                            .ok()
+                            .and_then(|cwd| crate::notify::registry_above(&cwd))
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
                     },
                 },
                 ..Config::default()

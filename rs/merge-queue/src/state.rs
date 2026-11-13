@@ -1119,9 +1119,10 @@ pub struct NotifyConfig {
     /// runs `<command> send <name> --deliver-while-working --file <report>`.
     pub agentctl: Vec<String>,
     /// agentctl registry the sends address, passed as `--registry PATH`
-    /// before `send`. Empty leaves agentctl's own default, `.agentctl` in the
-    /// daemon's working directory (the queue repository when the daemon was
-    /// started there). Omitted from config.json when empty, so a config that
+    /// before `send`. `init` records the nearest `.agentctl` above its
+    /// working directory when no path is given (#1472). Empty leaves
+    /// agentctl's own default, `.agentctl` in the caller's working
+    /// directory. Omitted from config.json when empty, so a config that
     /// does not set it still loads on builds that predate it.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub registry: String,
