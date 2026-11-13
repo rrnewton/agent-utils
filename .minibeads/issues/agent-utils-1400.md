@@ -41,4 +41,4 @@ Observed 2026-11-12 on devbig030: `wrkslots heartbeat` refuses the same way for 
 
     wrkslotsd: source repository /home/newton/work/dev-agent-utils/agent-utils (Git common directory /home/newton/work/dev-agent-utils/agent-utils/.git) registers /home/newton/work/dev-agent-utils/worktrees/slots/ignsalv/.muse/worktrees/ign1400 inside the managed agent root, but no active checkout row for that repository names it
 
-So heartbeat is a fourth surface of this gap: the fix should make heartbeat tolerate (and note) an undeclared nested checkout like write-handoff, or accept it once adopt-checkout declares it. The slot was left as it is; nothing was moved or forced.
+Heartbeat is the same gap on another surface, but it is **out of scope here**: #1492 wrkslots-heartbeat-refuses-nested-worktree (with P0 #1491) makes heartbeat warn and record instead of refusing. This note stays only as a cross-reference to #1492; #1400 covers remove, retire and write-handoff. The slot was left as it is; nothing was moved or forced.
