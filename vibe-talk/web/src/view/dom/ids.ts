@@ -395,6 +395,7 @@ export interface ElementById {
   "mark-read-options": HTMLDivElement;
   "mark-read-quote-guard": HTMLInputElement;
   "mark-read-quoted": HTMLDivElement;
+  "mark-read-quoted-label": HTMLParagraphElement;
   "mark-read-state": HTMLParagraphElement;
   "message-cache-confirm": HTMLDivElement;
   "message-cache-confirm-no": HTMLButtonElement;
