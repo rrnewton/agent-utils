@@ -201,9 +201,27 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
    * the panes inside #screen-main and the control pane inside the dock — have no common ancestor
    * below the root.
    */
+  /**
+   * The width to put on the page for the gate's answer in the layout in force. The
+   * gate's full-width answer is written only where the pane is held by the variable
+   * itself — one message column, docked or not. In two columns the stylesheet spans
+   * the pane (`#373`) and re-caps it only while the gate says "shown", and in the
+   * thread list the list follows the remembered width as it always has: in both, the
+   * variable keeps the remembered value, so entering or leaving them never reflows
+   * the lists drawn beside or instead of the message column.
+   */
+  function appliedFor(shown: boolean): number {
+    let layout: string | null = null;
+    try {
+      layout = deps.lookup("screen-main").getAttribute("data-columns");
+    } catch (_error) { /* no screen to ask: the one-column answer */ }
+    if (layout === "two" || layout === "list") return readingWidth;
+    return effectiveReadingWidth(readingWidth, shown);
+  }
+
   function apply(value: unknown): number {
     readingWidth = clampReadingWidth(value);
-    appliedWidth = effectiveReadingWidth(readingWidth, gripShown);
+    appliedWidth = appliedFor(gripShown);
     document.documentElement.style.setProperty("--reading-width", `${appliedWidth}ch`);
     (deps.lookup("reading-width") as HTMLInputElement).value = String(readingWidth);
     deps.lookup("width-grip").setAttribute("aria-valuenow", String(readingWidth));
@@ -212,15 +230,6 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
     return readingWidth;
   }
 
-  /**
-   * Measure the message column and put the handle where the measurement says: on the
-   * column's (`#pane-voice`, inside `#scroll-area`) own right edge, shown only while
-   * that column is wider than the threshold. Called on every apply and again whenever
-   * the column changes size — a resize, a dock or undock, a second column coming or
-   * going all change the column's box without asking this code — so the decision is
-   * always the current layout's. A column that cannot be measured yet leaves the
-   * handle as it stands.
-   */
   /**
    * How many pixels one character is, measured from the font itself: ten zeros in the
    * shown pane's own font, laid out hidden and taken away again. `1ch` is the advance
@@ -266,6 +275,14 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
     return null;
   }
 
+  /**
+   * Measure the message column and put the handle where the measurement says: on the
+   * shown pane's own right edge, shown only while that column is wider than the
+   * threshold. Called on every apply and again whenever the column changes size — a
+   * resize, a dock or undock, a second column coming or going all change the
+   * column's box without asking this code — so the decision is always the current
+   * layout's. A column that cannot be measured yet leaves the handle as it stands.
+   */
   function placeGrip(): void {
     let area: DOMRect | undefined;
     let screen: DOMRect | undefined;
@@ -297,7 +314,7 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
     // The gate flipped: re-apply so a squeezed column goes full width at once and a
     // widened one takes its remembered width back. The remembered value itself is
     // untouched either way, and nothing is stored for a change of room.
-    appliedWidth = effectiveReadingWidth(readingWidth, gripShown);
+    appliedWidth = appliedFor(gripShown);
     document.documentElement.style.setProperty("--reading-width", `${appliedWidth}ch`);
   }
 
