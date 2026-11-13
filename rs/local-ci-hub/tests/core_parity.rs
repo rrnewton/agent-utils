@@ -2,9 +2,12 @@
 //! All data is invented for this crate; no downstream corpus lives here.
 
 use local_ci_hub::digest::{event_digest, receipt_canonical_json, receipt_digest};
-use local_ci_hub::event::{check_events, parse_line, union, Refusal};
+use local_ci_hub::event::{
+    check_events, is_fixture_event, parse_line, producer_tool, union, Refusal,
+};
 use local_ci_hub::fold::{fold_rows, terminal_lines_sorted};
 use local_ci_hub::pyjson::{dumps_pairs, dumps_sorted, parse, py_float_repr, PyValue};
+use std::collections::BTreeSet;
 
 fn event(line: &str) -> local_ci_hub::event::RawEvent {
     parse_line(line).expect("fixture line parses")
@@ -207,4 +210,31 @@ fn receipt_canonical_uses_struct_order() {
     let stamped = parse("{\"build_mode\":null}").unwrap();
     let canonical = receipt_canonical_json(&stamped).unwrap();
     assert!(canonical.contains("\"build_mode\":null"), "{canonical}");
+}
+
+#[test]
+fn fixture_events_match_by_envelope_or_row_producer() {
+    let producers: BTreeSet<String> = ["live-sync-check".to_owned()].into();
+    let ordinary = result_event("e1", "r1", "2026-11-01T00:00:00Z", "{}");
+    assert!(!is_fixture_event(&event(&ordinary), &producers));
+
+    let envelope = ordinary.replace("\"tool\":\"fixture\"", "\"tool\":\"live-sync-check\"");
+    assert!(is_fixture_event(&event(&envelope), &producers));
+
+    let row_only = result_event(
+        "e2",
+        "r2",
+        "2026-11-01T00:00:00Z",
+        "{\"producer\":{\"tool\":\"live-sync-check\"}}",
+    );
+    assert!(is_fixture_event(&event(&row_only), &producers));
+
+    let legacy_string_producer = parse("{\"producer\":\"live-sync-check\"}").unwrap();
+    assert_eq!(
+        producer_tool(legacy_string_producer.get("producer")),
+        "live-sync-check"
+    );
+
+    let no_filters: BTreeSet<String> = BTreeSet::new();
+    assert!(!is_fixture_event(&event(&envelope), &no_filters));
 }

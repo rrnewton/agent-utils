@@ -229,6 +229,36 @@ const ANNOTATE_FORBIDDEN: [&str; 10] = [
     "corrects",
 ];
 
+/// Tool named by a `producer` value: its `tool` field when it is an
+/// object, the string itself when it is one, otherwise empty.
+pub fn producer_tool(value: Option<&PyValue>) -> &str {
+    match value {
+        Some(object @ PyValue::Object(_)) => {
+            object.get("tool").and_then(PyValue::as_str).unwrap_or("")
+        }
+        Some(PyValue::Str(text)) => text,
+        _ => "",
+    }
+}
+
+/// Whether an event was produced by a fixture tool, by its own producer
+/// or by its folded row's producer. Fixture producer names are deployment
+/// policy data, never hardcoded here; an empty set retains everything.
+/// This mirrors how an admission history excludes acceptance fixtures
+/// after the union and before envelope checks and the fold.
+pub fn is_fixture_event(
+    event: &RawEvent,
+    fixture_producers: &std::collections::BTreeSet<String>,
+) -> bool {
+    if fixture_producers.is_empty() {
+        return false;
+    }
+    fixture_producers.contains(producer_tool(event.get("producer")))
+        || fixture_producers.contains(producer_tool(
+            event.get("legacy_row").and_then(|row| row.get("producer")),
+        ))
+}
+
 /// Validate one annotate event as metadata-only.
 fn check_annotate(event: &RawEvent) -> Result<(), Refusal> {
     for field in ANNOTATE_FORBIDDEN {

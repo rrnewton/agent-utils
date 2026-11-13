@@ -9,13 +9,14 @@
 
 use clap::{Parser, Subcommand};
 use local_ci_hub::digest::receipt_digest;
-use local_ci_hub::event::{check_events, union, Refusal};
+use local_ci_hub::event::{check_events, is_fixture_event, union, Refusal};
 use local_ci_hub::expand::{expand_line_with, ExpandConfig, FileEvidence, NoEvidence};
 use local_ci_hub::fold::{rows_by_commit, terminal_lines_sorted};
 use local_ci_hub::index::{Cursor, Index};
 use local_ci_hub::pyjson::{dumps_sorted, PyValue};
 use local_ci_hub::store::{GitStore, ReadLimits, Role, Store};
 use local_ci_hub::verdict::{assess, Policy, Verdict};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command as ProcCommand;
 
@@ -40,6 +41,10 @@ struct Cli {
     /// schema 5 on (repeatable).
     #[arg(long, global = true)]
     base_field: Vec<String>,
+    /// Producer tool names whose events are admission fixtures and are
+    /// excluded after the union (repeatable).
+    #[arg(long, global = true)]
+    fixture_producer: Vec<String>,
     /// Index file path (default: ephemeral in-memory index).
     #[arg(long, global = true)]
     index: Option<PathBuf>,
@@ -120,6 +125,8 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
     let config = ExpandConfig {
         binding_tree_field: cli.binding_tree_field.clone(),
     };
+    let fixture_producers: BTreeSet<String> = cli.fixture_producer.iter().cloned().collect();
+    let mut filtered_fixtures: usize = 0;
     let mut cursor = start;
     // Tail the authority page by page, but admit the whole tail in ONE
     // apply: Index::apply rematerializes the fold from every admitted
@@ -145,7 +152,12 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
             .map_err(|r| format!("{r}"))?;
             expanded.push(event);
         }
-        let unioned = union(expanded).map_err(|r| format!("{r}"))?;
+        let mut unioned = union(expanded).map_err(|r| format!("{r}"))?;
+        if !fixture_producers.is_empty() {
+            let before = unioned.len();
+            unioned.retain(|event| !is_fixture_event(event, &fixture_producers));
+            filtered_fixtures += before - unioned.len();
+        }
         if let Err(refusal) = check_events(&unioned) {
             refusal_exit(&refusal);
         }
@@ -154,6 +166,9 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
         if !page.more {
             break;
         }
+    }
+    if filtered_fixtures > 0 {
+        eprintln!("local-ci-hub: filtered {filtered_fixtures} fixture events");
     }
     index.apply(&pending, &cursor).map_err(|e| format!("{e}"))?;
     Ok(Loaded {
