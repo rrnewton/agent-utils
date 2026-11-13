@@ -19673,8 +19673,13 @@ request. No open chat request has been sent to you."]
         let room = MAX_SOCKET_PATH_BYTES - 1 - REPLY_WAKE_SOCKET.len();
         assert_eq!(room, 96);
         // A relative name is measured by the absolute path it names, so one whose absolute path
-        // is too long is refused however short it is.
-        let cwd = std::env::current_dir().expect("working directory");
+        // is too long is refused however short it is. Run that part from a short temporary
+        // directory this test made, never from the checkout: a long checkout path (a nested
+        // worktree) leaves no relative name that fits (#1485).
+        let short_root = wake_root();
+        let saved_cwd = std::env::current_dir().expect("working directory");
+        std::env::set_current_dir(&short_root).expect("enter short temporary directory");
+        let cwd = short_root.clone();
         let fits = (room - 1)
             .checked_sub(cwd.as_os_str().len())
             .filter(|name| *name > 0)
@@ -19691,6 +19696,8 @@ request. No open chat request has been sent to you."]
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+        std::env::set_current_dir(&saved_cwd).expect("restore working directory");
+        fs::remove_dir_all(&short_root).expect("cleanup short directory");
         // Every spelling of a directory of 96 bytes names the same socket of 107 bytes, though
         // two of them are longer than 96 bytes as written.
         let root = wake_root();
