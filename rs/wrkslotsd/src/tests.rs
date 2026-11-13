@@ -5091,6 +5091,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "image-unmount",
             "limits-show",
             "sandbox-show-config",
+            "worktrees-image-status",
             "shell-command",
             "unpushed-text",
             "status",

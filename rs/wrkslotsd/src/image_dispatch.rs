@@ -759,6 +759,245 @@ pub(crate) fn image_set_default_cli(
     Ok(outcome)
 }
 
+/// One checkout's Git worktree lock state, mirroring Python
+/// `worktree_lock_state`: `(locked, reason)`, or None when the
+/// checkout is not a registered worktree of the repository.
+fn worktree_lock_state(
+    repository: &Path,
+    checkout: &Path,
+) -> Result<Option<(bool, Option<String>)>> {
+    let spec = CommandSpec::new(
+        vec![
+            "git".to_string(),
+            "-C".to_string(),
+            repository.to_string_lossy().into_owned(),
+            "worktree".to_string(),
+            "list".to_string(),
+            "--porcelain".to_string(),
+            "-z".to_string(),
+        ],
+        Duration::from_secs(30),
+    );
+    let outcome = SubprocessRunner.run(&spec)?;
+    if outcome.returncode != 0 {
+        return Err(format!(
+            "git worktree list failed in {}: {}",
+            repository.display(),
+            outcome.stderr.trim()
+        ));
+    }
+    let target = crate::image_mounts::normalize_absolute(checkout);
+    let mut found: Option<Vec<(String, Option<String>)>> = None;
+    let mut current: Vec<(String, Option<String>)> = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    for field in outcome.stdout.split('\0') {
+        if field.is_empty() {
+            continue;
+        }
+        let (key, value) = match field.split_once(' ') {
+            Some((key, value)) => (key, Some(value.to_string())),
+            None => (field, None),
+        };
+        if key == "worktree" {
+            if current_path.as_deref() == Some(target.as_path()) {
+                found = Some(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+            current_path = Some(crate::image_mounts::normalize_absolute(Path::new(
+                value.as_deref().unwrap_or_default(),
+            )));
+            continue;
+        }
+        current.push((key.to_string(), value));
+    }
+    if current_path.as_deref() == Some(target.as_path()) {
+        found = Some(current);
+    }
+    let Some(fields) = found else {
+        return Ok(None);
+    };
+    let locked = fields
+        .iter()
+        .find(|(key, _)| key == "locked")
+        .map(|(_, reason)| (true, reason.clone()))
+        .unwrap_or((false, None));
+    Ok(Some(locked))
+}
+
+/// Python `_image_slots_missing_lock` for the selected machine:
+/// `(missing, lock_check_error)`.
+fn wt_lock_missing(
+    config: &Value,
+    root: Option<&Path>,
+    machine: Option<&str>,
+    settings: &WorktreesImageSettings,
+    entries: &[MountEntry],
+) -> (Vec<String>, Option<String>) {
+    let run = || -> Result<Vec<String>> {
+        let state = crate::active_state::parse_state(root, machine)?;
+        let project_root = config_path(config, "root");
+        let control = config_path(config, "control");
+        let worktrees = config_path(config, "worktrees");
+        let mount_dir = if settings.direct() {
+            worktrees.clone()
+        } else {
+            worktrees
+                .parent()
+                .map(|parent| parent.join(crate::worktrees_image::IMAGE_MOUNT_NAME))
+                .unwrap_or_default()
+        };
+        let (exists, empty) = dir_facts(&mount_dir);
+        if classify_mount(&mount_dir, entries, exists, empty) != MOUNTED {
+            return Ok(Vec::new());
+        }
+        let bind_slots: std::collections::BTreeMap<String, crate::worktrees_image::BindRecord> =
+            if settings.direct() {
+                Default::default()
+            } else {
+                crate::worktrees_image::load_bind_records(&control).unwrap_or_default()
+            };
+        let mut missing = Vec::new();
+        let Some(records) = state.get("slots").and_then(Value::as_array) else {
+            return Ok(missing);
+        };
+        for record in records {
+            let slot = record
+                .get("slot")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let slot_type = record
+                .get("slot_type")
+                .and_then(Value::as_str)
+                .unwrap_or("agent");
+            let slot_path = worktrees.join(slot);
+            let in_image = if settings.direct() {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::metadata(&slot_path)
+                    .map(|meta| meta.ino() == 256)
+                    .unwrap_or(false)
+            } else {
+                bind_slots.contains_key(slot)
+            };
+            if !in_image {
+                continue;
+            }
+            let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) else {
+                continue;
+            };
+            for checkout in checkouts {
+                let name = checkout
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let path = crate::image_mounts::normalize_absolute(
+                    &project_root.join(
+                        checkout
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                );
+                let repository = crate::image_mounts::normalize_absolute(
+                    &project_root.join(
+                        checkout
+                            .get("repository")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                );
+                if let Some(lock) = worktree_lock_state(&repository, &path)? {
+                    if lock != (true, Some("in worktrees image".to_string())) {
+                        missing.push(format!("{slot_type}/{slot}/{name}"));
+                    }
+                }
+            }
+        }
+        Ok(missing)
+    };
+    match run() {
+        Ok(missing) => (missing, None),
+        Err(error) => (Vec::new(), Some(error)),
+    }
+}
+
+/// `wrkslots worktrees-image status`: build the full report
+/// (quota when mounted, lock check) and render it.
+pub(crate) fn wt_status_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    format: &str,
+) -> Result<HandlerOutcome> {
+    let config = crate::config_validate::load_config(root, machine)?;
+    let Some(section) = config
+        .get("worktrees_image")
+        .filter(|value| !value.is_null())
+    else {
+        let reason = config
+            .get("worktrees_image_skipped")
+            .and_then(Value::as_str)
+            .map(|reason| {
+                format!("worktrees_image does not apply on this host: {reason}")
+            })
+            .unwrap_or_else(|| {
+                "no worktrees_image configured; add a worktrees_image section (path, size_bytes, fs: btrfs, mount: kernel) to enable it".to_string()
+            });
+        return Ok(HandlerOutcome {
+            exit: 3,
+            stdout: String::new(),
+            stderr: format!(
+                "REFUSED: {reason}\nREMEDY: run 'wrkslots worktrees-image --help', correct the named condition, then rerun 'wrkslots worktrees-image' with the required arguments\n"
+            ),
+        });
+    };
+    let settings = settings_from_obj(section)?;
+    let project_root = config_path(&config, "root");
+    let control = config_path(&config, "control");
+    let worktrees = config_path(&config, "worktrees");
+    let skipped = config
+        .get("worktrees_image_skipped")
+        .and_then(Value::as_str);
+    let entries = mount_entries();
+    let ctx = WtCtx {
+        root: &project_root,
+        control: &control,
+        worktrees: &worktrees,
+        entries: &entries,
+        skipped,
+    };
+    let mount_dir = if settings.direct() {
+        worktrees.clone()
+    } else {
+        worktrees
+            .parent()
+            .map(|parent| parent.join(crate::worktrees_image::IMAGE_MOUNT_NAME))
+            .unwrap_or_default()
+    };
+    let (exists, empty) = dir_facts(&mount_dir);
+    let quota = if classify_mount(&mount_dir, &entries, exists, empty) == MOUNTED {
+        Some(quota_mode_at(
+            &SubprocessRunner,
+            &mount_dir,
+            &settings.image_file(&project_root),
+        ))
+    } else {
+        None
+    };
+    let mut report = status_report_with_quota(&ctx, &settings, quota);
+    let (missing, lock_error) = wt_lock_missing(&config, root, machine, &settings, &entries);
+    if let Some(object) = report.as_object_mut() {
+        object.insert("lock_missing".to_string(), json!(missing));
+        if let Some(error) = lock_error {
+            object.insert("lock_check_error".to_string(), json!(error));
+        }
+    }
+    Ok(HandlerOutcome {
+        exit: 0,
+        stdout: crate::worktrees_image::render_wt_status(&report, format),
+        stderr: String::new(),
+    })
+}
+
 /// `wrkslots image status`: load the config, derive live mount
 /// facts, and run the pure handler. Config errors use the native
 /// error form, like the other reader commands.

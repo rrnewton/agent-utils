@@ -898,6 +898,70 @@ fn dir_facts(path: &Path) -> (bool, bool) {
     (exists, empty)
 }
 
+/// Where validation slots surface, mirroring Python
+/// `validate_external_dir`: beside a slots directory named
+/// `slots`, else inside it.
+pub(crate) fn validate_external_dir(slots_dir: &Path) -> PathBuf {
+    let managed = if slots_dir.file_name().is_some_and(|name| name == "slots") {
+        slots_dir.parent().unwrap_or(slots_dir)
+    } else {
+        slots_dir
+    };
+    managed.join("validate")
+}
+
+/// Render one worktrees-image status report (human or JSON) the
+/// way Python `_cmd_wt_image_status` does, including the validate
+/// surface and lock-check fields when present.
+pub(crate) fn render_wt_status(report: &Value, format: &str) -> String {
+    if format == "json" {
+        return format!("{}\n", render_report_json(report));
+    }
+    let text = |key: &str| report.get(key).and_then(Value::as_str).unwrap_or_default();
+    let mut out = format!(
+        "image: {} (exists={})\n",
+        text("image_file"),
+        if report["image_exists"].as_bool().unwrap_or(false) {
+            "True"
+        } else {
+            "False"
+        }
+    );
+    out.push_str(&format!(
+        "mount point: {} state={} mount_at={} quota={}\n",
+        text("mount_point"),
+        text("state"),
+        text("mount_at"),
+        text("quota_mode"),
+    ));
+    out.push_str(&format!(
+        "validate: {} bind={}\n",
+        text("validate_dir"),
+        text("validate_bind")
+    ));
+    if report["image_exists"].as_bool().unwrap_or(false) {
+        out.push_str(&format!(
+            "apparent={} allocated={}\n",
+            report["apparent_bytes"], report["allocated_bytes"]
+        ));
+    }
+    if let Some(missing) = report.get("lock_missing").and_then(Value::as_array) {
+        for entry in missing {
+            out.push_str(&format!(
+                "lock missing: {}\n",
+                entry.as_str().unwrap_or_default()
+            ));
+        }
+    }
+    if let Some(error) = report.get("lock_check_error").and_then(Value::as_str) {
+        out.push_str(&format!("lock check unavailable: {error}\n"));
+    }
+    if text("state") != MOUNTED {
+        out.push_str("remedy: wrkslots worktrees-image mount\n");
+    }
+    out
+}
+
 /// The status report value, mirroring Python `status_report`.
 pub(crate) fn status_report(
     ctx: &WtCtx<'_>,
@@ -955,6 +1019,22 @@ pub(crate) fn status_report_with_quota(
             .collect()
     };
     report.insert("binds".into(), Value::Object(binds));
+    let validate_dir = validate_external_dir(ctx.worktrees);
+    report.insert("validate_dir".into(), json!(validate_dir.to_string_lossy()));
+    let validate_mounted = ctx.entries.iter().any(|entry| {
+        crate::image_mounts::normalize_absolute(&entry.mount_point)
+            == crate::image_mounts::normalize_absolute(&validate_dir)
+    });
+    report.insert(
+        "validate_bind".into(),
+        json!(if settings.direct() && validate_mounted {
+            "mounted"
+        } else if settings.direct() {
+            "not-mounted"
+        } else {
+            "n/a"
+        }),
+    );
     if is_file {
         if let Ok(meta) = std::fs::metadata(&image_file) {
             report.insert("apparent_bytes".into(), json!(meta.len()));
@@ -999,39 +1079,9 @@ pub(crate) fn wt_status(
         Err(outcome) => return outcome,
     };
     let report = status_report(ctx, &settings);
-    if format == "json" {
-        return HandlerOutcome {
-            exit: 0,
-            stdout: format!("{}\n", render_report_json(&report)),
-            stderr: String::new(),
-        };
-    }
-    let mut out = format!(
-        "image: {} (exists={})\n",
-        report["image_file"].as_str().unwrap_or_default(),
-        if report["image_exists"].as_bool().unwrap_or(false) {
-            "True"
-        } else {
-            "False"
-        }
-    );
-    out.push_str(&format!(
-        "mount point: {} state={}\n",
-        report["mount_point"].as_str().unwrap_or_default(),
-        report["state"].as_str().unwrap_or_default()
-    ));
-    if report["image_exists"].as_bool().unwrap_or(false) {
-        out.push_str(&format!(
-            "apparent={} allocated={}\n",
-            report["apparent_bytes"], report["allocated_bytes"]
-        ));
-    }
-    if report["state"].as_str() != Some(MOUNTED) {
-        out.push_str("remedy: wrkslots worktrees-image mount\n");
-    }
     HandlerOutcome {
         exit: 0,
-        stdout: out,
+        stdout: render_wt_status(&report, format),
         stderr: String::new(),
     }
 }
@@ -1047,18 +1097,20 @@ fn render_report_json(report: &Value) -> String {
         "quota_mode",
         "configured_quota_mode",
         "binds",
+        "validate_dir",
+        "validate_bind",
         "apparent_bytes",
         "allocated_bytes",
+        "lock_missing",
+        "lock_check_error",
     ];
     let parts: Vec<String> = keys
         .iter()
         .filter_map(|key| {
             report.get(key).map(|value| {
                 let rendered = match value {
+                    Value::Object(map) if map.is_empty() => "{}".to_string(),
                     Value::Object(map) => {
-                        if map.is_empty() {
-                            return "{}".to_string();
-                        }
                         let inner: Vec<String> = map
                             .iter()
                             .map(|(k, v)| {
@@ -1072,6 +1124,16 @@ fn render_report_json(report: &Value) -> String {
                         format!("{{\n{}\n  }}", inner.join(",\n"))
                     }
                     Value::String(text) => py_str(text),
+                    Value::Array(items) if items.is_empty() => "[]".to_string(),
+                    Value::Array(items) => {
+                        let inner: Vec<String> = items
+                            .iter()
+                            .map(|item| {
+                                format!("    {}", py_str(item.as_str().unwrap_or_default()))
+                            })
+                            .collect();
+                        format!("[\n{}\n  ]", inner.join(",\n"))
+                    }
                     other => other.to_string(),
                 };
                 format!("  {}: {}", py_str(key), rendered)

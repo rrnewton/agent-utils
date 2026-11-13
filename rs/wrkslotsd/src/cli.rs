@@ -320,6 +320,18 @@ pub(crate) enum Readers {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Print the worktrees-image status report (Python `worktrees-image status`)
+    WorktreesImageStatus {
+        /// Output format: json or human
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Print the Python `audit` command's payload (JSON) or human form
     AuditText {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -1678,7 +1690,7 @@ fn py_compat_triggered(rest: &[String], leading_globals: bool, routed: bool) -> 
         return false;
     };
     match cmd {
-        "doctor" | "audit" | "image" | "sandbox" | "limits" => true,
+        "doctor" | "audit" | "image" | "sandbox" | "limits" | "worktrees-image" => true,
         "status" => !py_flag_present(rest, "--index"),
         "create"
         | "unpushed"
@@ -1842,6 +1854,27 @@ fn translate_python_argv_routed(
                 Ok(Some((out, wait_lock)))
             }
             _ => Err("'limits' stays with the Python edition in this slice".to_string()),
+        };
+    }
+    // `worktrees-image status` is wired (#1141); its writers and
+    // migrate/convert stay Python for now.
+    if cmd == "worktrees-image" {
+        return match rest.get(1).map(String::as_str) {
+            Some("status") => {
+                let mut out: Vec<String> =
+                    vec![args[0].clone(), "worktrees-image-status".to_string()];
+                out.extend(rest[2..].iter().cloned());
+                if let Some(root) = project_root {
+                    out.push("--root".to_string());
+                    out.push(root);
+                }
+                if let Some(machine) = machine {
+                    out.push("--machine".to_string());
+                    out.push(machine);
+                }
+                Ok(Some((out, wait_lock)))
+            }
+            _ => Err("'worktrees-image' stays with the Python edition in this slice".to_string()),
         };
     }
     if PY_ONLY.contains(&cmd.as_str()) {
@@ -2306,6 +2339,25 @@ pub fn run() -> u8 {
                     }
                 }
             }
+            Readers::WorktreesImageStatus {
+                format,
+                root,
+                machine,
+            } => match crate::image_dispatch::wt_status_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                &format,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
             Readers::ImageStatus {
                 format,
                 root,
