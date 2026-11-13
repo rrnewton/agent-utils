@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-finish-provisioned-files: finish tolerates unchanged provisioning output'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-12T13:00:00.000000000+00:00
@@ -47,3 +47,7 @@ right cannot finish, so the mandatory wind-down never ends in a removed slot.
 
 [watermelon-full-preview] Follow-on to #1364 wrkslots-finish-commit-accounting, same finish
 surface. Number reserved by coordb (fetch-then-land numbering).
+
+## Resolution
+
+[watermelon-full-preview] Landed as fe29e325 on github/main.
