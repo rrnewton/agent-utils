@@ -505,7 +505,7 @@ fn parse_storage_git_inner(root: Option<&Path>, tolerate_unavailable: bool) -> R
                 )
             } else {
                 format!(
-                    "inspect 'git -C {} worktree list --porcelain'; restore and register the live slot or remove the stale Git registration before reusing any overlapping path",
+                    "inspect 'git -C {} worktree list --porcelain'; declare the worktree with 'wrkslots adopt-checkout SLOT --repo <name>=<path> --coordinator-pid PID --expected-generation N', move it out of the slot with 'git worktree move', or remove the stale Git registration before reusing any overlapping path",
                     source.display()
                 )
             };

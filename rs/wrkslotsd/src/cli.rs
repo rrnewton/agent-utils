@@ -198,6 +198,26 @@ pub(crate) enum Writers {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Declare a nested linked worktree into a slot record (Python edition only for now)
+    AdoptCheckout {
+        /// Active agent slot name
+        slot: String,
+        /// Checkout name and path inside the slot, as NAME=PATH
+        #[arg(long, value_name = "NAME=PATH")]
+        repo: String,
+        /// Live coordinator PID authorizing the declaration
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// Current slot generation; refuses stale callers
+        #[arg(long, value_name = "N")]
+        expected_generation: i64,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Remove and archive one slot (writer; fixture registries only until cutover)
     Remove {
         /// Active slot to remove
@@ -2495,6 +2515,10 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
+            Writers::AdoptCheckout { .. } => {
+                eprintln!("wrkslotsd: adopt-checkout stays with the Python edition for now");
+                return 1;
+            }
             Writers::Remove {
                 slot,
                 coordinator_pid,

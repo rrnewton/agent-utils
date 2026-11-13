@@ -6,7 +6,7 @@
 //! atomic HOLD record write. Fixture registries only until the
 //! edition cutover (see `ensure_states::require_fixture`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -139,16 +139,214 @@ pub(crate) fn acquire_mutation_locks(
     })
 }
 
+/// A finding as a refusal message: its detail plus its remedy, the
+/// way the Python edition prints REFUSED and REMEDY together.
+fn finding_error(finding: &Value) -> String {
+    let detail = finding
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let remedy = finding
+        .get("remedy")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if remedy.is_empty() {
+        detail.to_string()
+    } else {
+        format!("{detail}\nremedy: {remedy}")
+    }
+}
+
 pub(crate) fn refuse_target_storage(root: Option<&Path>, slot: &str) -> Result<()> {
     for value in [parse_storage(root)?, parse_storage_git(root)?] {
         if let Some(findings) = value.get("findings").and_then(Value::as_array) {
             for finding in findings {
                 if finding.get("slot").and_then(Value::as_str) == Some(slot) {
+                    return Err(finding_error(finding));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Undeclared linked worktrees of other repositories inside a slot
+/// (#1400), mirroring the Python edition's `_foreign_checkouts_in_slot`:
+/// `(repository, project-relative path)` pairs from top-level slot
+/// entries no checkout names, plus worktrees a declared repository
+/// registers inside the slot that this record does not explain.
+pub(crate) fn foreign_checkouts(
+    cfg: &crate::active_state::Cfg,
+    active: &Value,
+    record: &Value,
+) -> Vec<(String, String)> {
+    use std::collections::BTreeMap;
+    let slot = record
+        .get("slot")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let slot_type = record
+        .get("slot_type")
+        .and_then(Value::as_str)
+        .unwrap_or("agent");
+    let Ok(slot_directory) = crate::active_state::slot_directory(cfg, slot, slot_type) else {
+        return Vec::new();
+    };
+    let mut foreign: BTreeMap<String, String> = BTreeMap::new();
+    let mut note = |repository: &Path, path: &Path| {
+        let relative = path
+            .strip_prefix(&cfg.root)
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.display().to_string());
+        foreign.insert(relative.clone(), repository.display().to_string());
+    };
+    let named: Vec<String> = record
+        .get("checkouts")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir(&slot_directory) {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if named.contains(&name) || name == "HANDOFF.md" {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            if !path.join(".git").exists() {
+                continue;
+            }
+            if let Ok(common_raw) =
+                crate::git_storage_state::git_run(&path, &["rev-parse", "--git-common-dir"])
+            {
+                let common = {
+                    let raw = common_raw.trim();
+                    if Path::new(raw).is_absolute() {
+                        PathBuf::from(raw)
+                    } else {
+                        path.join(raw)
+                    }
+                };
+                let repository = if common.file_name().is_some_and(|part| part == ".git") {
+                    common
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or(common.clone())
+                } else {
+                    common
+                };
+                note(&repository, &path);
+            }
+        }
+    }
+    // Worktrees a declared repository registers inside this slot.
+    let mut repositories: Vec<PathBuf> = Vec::new();
+    if let Some(slots) = active.get("slots").and_then(Value::as_array) {
+        for item in slots {
+            if let Some(checkouts) = item.get("checkouts").and_then(Value::as_array) {
+                for checkout in checkouts {
+                    if let Ok((_, repository)) = crate::finish_write::stored_repository_path(
+                        cfg,
+                        checkout
+                            .get("repository")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ) {
+                        if !repositories.contains(&repository) {
+                            repositories.push(repository);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for repository in &repositories {
+        let Ok(listing) =
+            crate::git_storage_state::git_run(repository, &["worktree", "list", "--porcelain"])
+        else {
+            continue;
+        };
+        for line in listing.lines() {
+            let Some(raw) = line.strip_prefix("worktree ") else {
+                continue;
+            };
+            let registered = PathBuf::from(raw.trim());
+            if !registered.starts_with(&slot_directory) {
+                continue;
+            }
+            let explained = record
+                .get("checkouts")
+                .and_then(Value::as_array)
+                .is_some_and(|checkouts| {
+                    checkouts.iter().any(|checkout| {
+                        cfg.root.join(
+                            checkout
+                                .get("path")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ) == registered
+                    })
+                });
+            if !explained {
+                note(repository, &registered);
+            }
+        }
+    }
+    foreign
+        .into_iter()
+        .map(|(path, repository)| (repository, path))
+        .collect()
+}
+
+/// Like `refuse_target_storage`, but findings that only report a
+/// foreign nested checkout from `foreign_checkouts` are tolerated:
+/// write-handoff warns and records them instead of refusing (#1400).
+pub(crate) fn refuse_target_storage_tolerating_foreign(
+    root: Option<&Path>,
+    slot: &str,
+    foreign: &[(String, String)],
+) -> Result<()> {
+    let foreign_names: Vec<String> = foreign
+        .iter()
+        .map(|(_, path)| path.rsplit('/').next().unwrap_or(path.as_str()).to_string())
+        .collect();
+    for value in [parse_storage(root)?, parse_storage_git(root)?] {
+        if let Some(findings) = value.get("findings").and_then(Value::as_array) {
+            for finding in findings {
+                if finding.get("slot").and_then(Value::as_str) == Some(slot) {
+                    let kind = finding
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     let detail = finding
                         .get("detail")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    return Err(detail.to_string());
+                    let tolerated = (kind == "unexpected-entry"
+                        && finding
+                            .get("checkout")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| foreign_names.iter().any(|item| item == name)))
+                        || (kind == "git-registration-without-row"
+                            && foreign
+                                .iter()
+                                .any(|(_, path)| detail.contains(path.as_str())));
+                    if tolerated {
+                        continue;
+                    }
+                    return Err(finding_error(finding));
                 }
             }
         }

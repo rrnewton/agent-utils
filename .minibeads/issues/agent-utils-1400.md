@@ -1,6 +1,6 @@
 ---
 title: 'nested-foreign-checkout: wrkslots adopts an undeclared nested linked worktree of another repository instead of refusing write-handoff'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -42,3 +42,7 @@ Observed 2026-11-12 on devbig030: `wrkslots heartbeat` refuses the same way for 
     wrkslotsd: source repository /home/newton/work/dev-agent-utils/agent-utils (Git common directory /home/newton/work/dev-agent-utils/agent-utils/.git) registers /home/newton/work/dev-agent-utils/worktrees/slots/ignsalv/.muse/worktrees/ign1400 inside the managed agent root, but no active checkout row for that repository names it
 
 Heartbeat is the same gap on another surface, but it is **out of scope here**: #1492 wrkslots-heartbeat-refuses-nested-worktree (with P0 #1491) makes heartbeat warn and record instead of refusing. This note stays only as a cross-reference to #1492; #1400 covers remove, retire and write-handoff. The slot was left as it is; nothing was moved or forced.
+
+## Resolution
+
+`write-handoff` no longer refuses a slot holding an undeclared nested linked worktree: `_foreign_checkouts_in_slot` finds it (a top-level slot entry no checkout names, or a worktree a declared repository registers inside the slot), `_assert_target_record_storage_consistent` tolerates exactly those findings for write-handoff, the command warns loudly naming repository and path, and the schema-2 handoff sidecar records `foreign_checkouts` (the Rust `handoff_write` mirrors all three). `remove` and `retire` still refuse, and the `unexpected-entry`, `git-registration-without-row` and cross-repository remedies now name `wrkslots adopt-checkout SLOT --repo <name>=<path> --coordinator-pid PID --expected-generation N` and `git worktree move` (Rust refusals surface detail plus remedy the same way). The new `adopt-checkout` verifies, under the mutation locks, that the path inside the slot is a clean linked worktree of a known repository (registered by it, default remote with a URL, HEAD on a branch) and appends the `Checkout` to the slot record; a later remove salvages and archives it like any declared checkout, including #1302's ignored-file handling. `adopt-checkout` itself stays with the Python edition; the Rust CLI refuses it explicitly. Heartbeat is unchanged (see #1492).

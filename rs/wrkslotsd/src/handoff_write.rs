@@ -145,6 +145,7 @@ fn canonical_source(path: &Path, contents: &[u8], identity: &FileIdentity) -> Re
     Ok(canonical)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn artifact_obj(
     machine: &str,
     slot: &str,
@@ -153,8 +154,9 @@ fn artifact_obj(
     source_path: &Path,
     identity: &FileIdentity,
     contents: &[u8],
+    foreign: &[(String, String)],
 ) -> Value {
-    json!({
+    let mut value = json!({
         "schema": 2,
         "machine": machine,
         "slot": slot,
@@ -165,7 +167,22 @@ fn artifact_obj(
         "source_identity": identity_to_obj(identity),
         "contents_utf8": String::from_utf8_lossy(contents),
         "sha256": format!("{:x}", Sha256::digest(contents)),
-    })
+    });
+    if !foreign.is_empty() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "foreign_checkouts".to_string(),
+                json!(foreign
+                    .iter()
+                    .map(|(repository, path)| json!({
+                        "repository": repository,
+                        "path": path,
+                    }))
+                    .collect::<Vec<_>>()),
+            );
+        }
+    }
+    value
 }
 
 fn validate_intent(payload: &Value, slot: &str, generation: i64) -> Result<()> {
@@ -175,19 +192,26 @@ fn validate_intent(payload: &Value, slot: &str, generation: i64) -> Result<()> {
         .map(|object| object.keys().map(String::as_str).collect())
         .unwrap_or_default();
     keys.sort();
-    if keys
-        != [
-            "contents_utf8",
-            "generation",
-            "machine",
-            "recorded_at",
-            "schema",
-            "sha256",
-            "slot",
-            "source",
-            "source_identity",
-            "source_path",
-        ]
+    let mut required = vec![
+        "contents_utf8",
+        "generation",
+        "machine",
+        "recorded_at",
+        "schema",
+        "sha256",
+        "slot",
+        "source",
+        "source_identity",
+        "source_path",
+    ];
+    required.sort();
+    if keys != required
+        && keys != {
+            let mut with_foreign = required.clone();
+            with_foreign.push("foreign_checkouts");
+            with_foreign.sort();
+            with_foreign
+        }
     {
         return Err("handoff write intent has an invalid artifact identity".to_string());
     }
@@ -591,7 +615,16 @@ pub(crate) fn write_handoff(
             "slot {slot} already has a recorded finish; its handoff is immutable"
         ));
     }
-    crate::hold_write::refuse_target_storage(root, slot)?;
+    // An undeclared nested linked worktree of another repository does
+    // not stop a handoff (#1400): warn loudly and record it in the
+    // sidecar; remove and retire still refuse it.
+    let foreign = crate::hold_write::foreign_checkouts(&cfg, &active, &record);
+    crate::hold_write::refuse_target_storage_tolerating_foreign(root, slot, &foreign)?;
+    for (repository, path) in &foreign {
+        eprintln!(
+            "WARNING: slot {slot} holds an undeclared nested checkout of repository {repository} at {path}; the handoff records it, and removal still refuses until it is declared with 'wrkslots adopt-checkout' or moved out with 'git worktree move'"
+        );
+    }
     let slot_type = record
         .get("slot_type")
         .and_then(Value::as_str)
@@ -636,7 +669,12 @@ pub(crate) fn write_handoff(
                 "source_identity",
             ]
         };
-        if keys != expected {
+        let keys_match = keys == expected
+            || (schema == 2
+                && keys.len() == expected.len() + 1
+                && keys.contains(&"foreign_checkouts")
+                && expected.iter().all(|key| keys.contains(key)));
+        if !keys_match {
             return Err(format!(
                 "handoff sidecar {} has the wrong keys",
                 path.display()
@@ -748,6 +786,7 @@ pub(crate) fn write_handoff(
         &source,
         &source_identity,
         &contents,
+        &foreign,
     );
     let intent_sequence: i64;
     if existing.is_none() {
@@ -785,6 +824,7 @@ pub(crate) fn write_handoff(
                     &source,
                     &source_identity,
                     &contents,
+                    &foreign,
                 );
                 if intended != artifact {
                     return Err(format!(

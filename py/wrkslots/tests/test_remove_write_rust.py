@@ -863,7 +863,7 @@ def test_write_handoff_warns_and_records_foreign_checkout(
     assert _write_handoff(root, source) == 0
     captured = capsys.readouterr()
     assert "WARNING" in captured.err
-    assert str(nested) in captured.err
+    assert "worktrees/slot-a/foreign" in captured.err
     assert "foreign-repo" in captured.err
     sidecars = list((root / "worktrees").glob("HANDOFF.*.slot-a.1.json"))
     assert len(sidecars) == 1
@@ -878,7 +878,7 @@ def test_remove_refuses_foreign_checkout_naming_adopt(tmp_path: Path) -> None:
     _add_foreign_worktree(root)
     with pytest.raises(Exception) as caught:
         _python_remove(root)
-    message = str(caught.value)
+    message = str(caught.value) + str(getattr(caught.value, "remedy", ""))
     assert "adopt-checkout" in message
     assert "git worktree move" in message
     assert (root / "worktrees" / "slot-a" / "foreign").exists()
@@ -906,6 +906,76 @@ def test_adopt_checkout_refuses_unknown_repository(tmp_path: Path) -> None:
     _git(nested, "remote", "remove", "origin")
     with pytest.raises(Exception, match="unknown repository|remote"):
         _adopt_checkout(root, "foreign", nested)
+
+
+def _rust_write_handoff(root: Path, source: Path) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
+    return subprocess.run(
+        [str(rust_wrkslotsd()), "write-handoff", "slot-a", "--agent", "agent-slot-a",
+         "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+         "--from-file", str(source), "--root", str(root)],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
+    )
+
+
+def _sidecar_foreign(root: Path) -> list[dict[str, object]]:
+    sidecars = list((root / "worktrees").glob("HANDOFF.*.slot-a.1.json"))
+    assert len(sidecars) == 1
+    doc: dict[str, object] = json.loads(sidecars[0].read_text())
+    foreign = cast(list[dict[str, object]], doc["foreign_checkouts"])
+    return [
+        {
+            "repository": Path(str(item["repository"])).name,
+            "path": item["path"],
+        }
+        for item in foreign
+    ]
+
+
+def test_write_handoff_foreign_matches_python(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        for root in (rust_root, oracle_root):
+            _add_foreign_worktree(root)
+            _bind_live_owner(root)
+        source = base / "handoff.md"
+        source.write_text("ready\n")
+        assert _write_handoff(oracle_root, source) == 0
+        result = _rust_write_handoff(rust_root, source)
+        assert result.returncode == 0, result.stderr
+        assert "WARNING" in result.stderr
+        assert "worktrees/slot-a/foreign" in result.stderr
+        assert _sidecar_foreign(rust_root) == _sidecar_foreign(oracle_root)
+        assert _sidecar_foreign(rust_root) == [
+            {"repository": "foreign-repo", "path": "worktrees/slot-a/foreign"}
+        ]
+
+
+def test_remove_foreign_refuses_in_rust_too(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        rust_root = _fixture(base / "rust")
+        _add_foreign_worktree(rust_root)
+        result = _rust_remove(rust_root)
+        assert result.returncode == 1, result.stderr
+        assert "adopt-checkout" in result.stderr
+        assert "git worktree move" in result.stderr
+        assert (rust_root / "worktrees" / "slot-a" / "foreign").exists()
+
+
+def test_adopt_checkout_stays_python_in_rust(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    nested = _add_foreign_worktree(root)
+    env = dict(os.environ)
+    env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
+    result = subprocess.run(
+        [str(rust_wrkslotsd()), "adopt-checkout", "slot-a",
+         "--repo", f"foreign={nested}", "--coordinator-pid", str(os.getpid()),
+         "--expected-generation", "1", "--root", str(root)],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
+    )
+    assert result.returncode == 1
+    assert "stays with the Python edition" in result.stderr
 
 
 def test_adopt_checkout_then_remove_salvages_it(tmp_path: Path) -> None:

@@ -1821,6 +1821,9 @@ class _HandoffArtifact:
     source_identity: _RegularFileIdentity | None
     provenance_complete: bool
     storage_identity: _RegularFileIdentity
+    #: Undeclared nested linked worktrees write-handoff tolerated and
+    #: recorded instead of refusing (#1400): (repository, path) pairs.
+    foreign_checkouts: tuple[tuple[str, str], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7464,6 +7467,16 @@ def _handoff_artifact_to_obj(artifact: _HandoffArtifact) -> dict[str, object]:
         "source_identity": _regular_file_identity_to_obj(artifact.source_identity),
         "contents_utf8": contents,
         "sha256": artifact.sha256,
+        **(
+            {}
+            if not artifact.foreign_checkouts
+            else {
+                "foreign_checkouts": [
+                    {"repository": repository, "path": path}
+                    for repository, path in artifact.foreign_checkouts
+                ]
+            }
+        ),
     }
 
 
@@ -7492,7 +7505,29 @@ def _handoff_artifact_from_obj(
         fields.add("source_path")
     elif schema != HANDOFF_SIDECAR_LEGACY_SCHEMA:
         raise StateError(f"unsupported handoff sidecar schema in {path}")
-    _exact_keys(raw, fields, set(), label)
+    _exact_keys(
+        raw,
+        fields,
+        {"foreign_checkouts"} if schema == HANDOFF_SIDECAR_SCHEMA else set(),
+        label,
+    )
+    foreign_checkouts: tuple[tuple[str, str], ...] = ()
+    if "foreign_checkouts" in raw:
+        foreign_checkouts = tuple(
+            (
+                _as_str(
+                    _as_mapping(entry, f"{label}.foreign_checkouts entry").get(
+                        "repository"
+                    ),
+                    f"{label}.foreign_checkouts.repository",
+                ),
+                _as_str(
+                    _as_mapping(entry, f"{label}.foreign_checkouts entry").get("path"),
+                    f"{label}.foreign_checkouts.path",
+                ),
+            )
+            for entry in _as_list(raw["foreign_checkouts"], f"{label}.foreign_checkouts")
+        )
     machine = _as_str(raw["machine"], f"{label}.machine")
     slot = _as_str(raw["slot"], f"{label}.slot")
     generation = _as_int(raw["generation"], f"{label}.generation", minimum=1)
@@ -7561,6 +7596,7 @@ def _handoff_artifact_from_obj(
         source_identity=source_identity,
         provenance_complete=provenance_complete,
         storage_identity=storage_identity,
+        foreign_checkouts=foreign_checkouts,
     )
 
 
@@ -11641,7 +11677,10 @@ def _registry_storage_inconsistencies(
                         "unexpected-entry",
                         "row",
                         f"slot holds {name!r}, which its record does not name",
-                        "inspect and register or relocate the unexpected entry; do not delete it "
+                        "inspect the unexpected entry; if it is a linked worktree of another "
+                        "repository, declare it with 'wrkslots adopt-checkout SLOT "
+                        "--repo <name>=<path> --coordinator-pid PID --expected-generation N' "
+                        "or move it out of the slot with 'git worktree move'; do not delete it "
                         "to make the registry look consistent",
                         slot=record.slot,
                         slot_type=record.slot_type,
@@ -11808,9 +11847,11 @@ def _registry_storage_inconsistencies(
                     "import-existing only for a demonstrably live owner, and repair a "
                     "missing stale registration before reusing any overlapping path"
                     if slot_type == "validate"
-                    else f"inspect 'git -C {source} worktree list --porcelain'; restore and "
-                    "register the live slot or remove the stale Git registration before "
-                    "reusing any overlapping path"
+                    else f"inspect 'git -C {source} worktree list --porcelain'; declare the "
+                    "worktree with 'wrkslots adopt-checkout SLOT --repo <name>=<path> "
+                    "--coordinator-pid PID --expected-generation N', move it out of the "
+                    "slot with 'git worktree move', or remove the stale Git registration "
+                    "before reusing any overlapping path"
                 ),
                 slot=slot,
                 slot_type=slot_type,
@@ -14500,6 +14541,85 @@ def _target_storage_refusal(
     return StateError(message, remedy=remedy)
 
 
+def _foreign_checkouts_in_slot(
+    config: Config, states: Sequence[ActiveState], record: ActiveRecord
+) -> tuple[dict[str, str], ...]:
+    """Undeclared linked worktrees of other repositories inside the slot (#1400).
+
+    Two shapes: a top-level slot entry no checkout names that is itself a
+    linked worktree, and a worktree a declared repository registers
+    inside the slot that this record's checkouts do not explain. Each is
+    ``{"repository": ..., "path": ...}`` with a project-relative path.
+    """
+
+    vcs = _GitVcs()
+    slot_directory = _slot_directory(config, record.slot, record.slot_type)
+    foreign: dict[str, dict[str, str]] = {}
+
+    def note(repository: Path, path: Path) -> None:
+        try:
+            relative = path.absolute().relative_to(config.root.absolute()).as_posix()
+        except ValueError:
+            relative = str(path.absolute())
+        foreign[relative] = {"repository": str(repository), "path": relative}
+
+    named = {checkout.name for checkout in record.checkouts}
+    if slot_directory.is_dir():
+        for entry in sorted(slot_directory.iterdir()):
+            if entry.name in named or entry.name == "HANDOFF.md":
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if not (entry / ".git").exists() and not (entry / ".git").is_symlink():
+                continue
+            try:
+                common = vcs.common_directory(entry)
+            except Refusal:
+                continue
+            repository = common.parent if common.name == ".git" else common
+            note(repository, entry)
+
+    expected_common_by_path: dict[Path, Path] = {}
+    for checkout in record.checkouts:
+        if checkout.vcs == "eden":
+            continue
+        path = _stored_path(config, checkout.path, "checkout path").absolute()
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        try:
+            expected_common_by_path[path] = vcs.common_directory(repository)
+        except Refusal:
+            continue
+    repository_paths: set[Path] = set()
+    for state in states:
+        for active_record in state.slots:
+            for checkout in active_record.checkouts:
+                try:
+                    _relative, repository = _stored_repository_path(
+                        config, checkout.repository
+                    )
+                except Refusal:
+                    continue
+                repository_paths.add(repository)
+    inspected_common: set[Path] = set()
+    for repository in sorted(repository_paths):
+        try:
+            common = vcs.common_directory(repository)
+            if common in inspected_common:
+                continue
+            registered_paths = vcs.listed_worktrees(repository)
+        except Refusal:
+            continue
+        inspected_common.add(common)
+        for registered_path in registered_paths:
+            registered = registered_path.absolute()
+            if not _path_is_within(registered, slot_directory.absolute()):
+                continue
+            if expected_common_by_path.get(registered) == common:
+                continue
+            note(repository, registered)
+    return tuple(foreign[key] for key in sorted(foreign))
+
+
 def _assert_target_record_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
@@ -14507,6 +14627,7 @@ def _assert_target_record_storage_consistent(
     *,
     before_any_change: bool = False,
     tolerate_absent_slot_directory: bool = False,
+    tolerate_foreign_registrations: tuple[dict[str, str], ...] = (),
 ) -> bool:
     """Refuse physical or Git drift attributable to one requested record.
 
@@ -14539,6 +14660,10 @@ def _assert_target_record_storage_consistent(
         (dataclasses.replace(authoritative_state, slots=(record,)),),
     )
     absent_tolerated = False
+    foreign_names = {
+        Path(item["path"]).name for item in tolerate_foreign_registrations
+    }
+    foreign_paths = {item["path"] for item in tolerate_foreign_registrations}
     for finding in findings:
         if (
             finding.slot == record.slot
@@ -14551,6 +14676,19 @@ def _assert_target_record_storage_consistent(
             ):
                 absent_tolerated = True
                 continue
+            if tolerate_foreign_registrations and (
+                (
+                    finding.kind == "unexpected-entry"
+                    and finding.checkout in foreign_names
+                )
+                or (
+                    finding.kind == "git-registration-without-row"
+                    and any(path in finding.detail for path in foreign_paths)
+                )
+            ):
+                # write-handoff tolerates a foreign nested checkout and
+                # records it instead of refusing (#1400).
+                continue
             raise _target_storage_refusal(
                 finding.detail,
                 finding.remedy,
@@ -14558,7 +14696,13 @@ def _assert_target_record_storage_consistent(
                 before_any_change=before_any_change,
             )
     _assert_no_cross_repository_target_registrations(
-        config, states, record, before_any_change=before_any_change
+        config,
+        states,
+        record,
+        before_any_change=before_any_change,
+        tolerated_paths={
+            (config.root / path).absolute() for path in foreign_paths
+        },
     )
     return absent_tolerated
 
@@ -14569,6 +14713,7 @@ def _assert_no_cross_repository_target_registrations(
     record: ActiveRecord,
     *,
     before_any_change: bool = False,
+    tolerated_paths: AbstractSet[Path] = frozenset(),
 ) -> None:
     """Reject any available repository registration entering the target slot."""
 
@@ -14611,13 +14756,16 @@ def _assert_no_cross_repository_target_registrations(
                 continue
             if expected_common_by_path.get(registered) == common:
                 continue
+            if registered in tolerated_paths:
+                continue
             raise _target_storage_refusal(
                 f"source repository {repository} (Git common directory {common}) "
                 f"registers unexpected path {registered} inside target slot "
                 f"{record.slot}",
-                "inspect every recorded repository's 'git worktree list "
-                "--porcelain' output and remove the unexpected target-slot "
-                "registration before retrying removal",
+                "declare the worktree with 'wrkslots adopt-checkout SLOT "
+                "--repo <name>=<path> --coordinator-pid PID "
+                "--expected-generation N' or move it out of the slot with "
+                "'git worktree move' before retrying removal",
                 record,
                 before_any_change=before_any_change,
             )
@@ -40691,6 +40839,124 @@ def _refuse_absent_slot_without_sidecar(
     )
 
 
+def _cmd_adopt_checkout(args: argparse.Namespace) -> int:
+    """Declare a nested linked worktree of another repository (#1400)."""
+
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    name, separator, raw_path = str(args.repo).partition("=")
+    if not separator or not raw_path:
+        raise Refusal("--repo must use NAME=PATH")
+    _validate_name(name, "checkout name")
+    _capture_caller_process(args.coordinator_pid, "coordinator")
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = config.root / candidate
+    candidate = Path(os.path.normpath(str(candidate)))
+    try:
+        relative = candidate.relative_to(config.root).as_posix()
+    except ValueError:
+        raise Refusal(
+            f"adopt-checkout path must lie inside the project: {raw_path!r}"
+        ) from None
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        states, _archives = _validate_global_state(config, require_repository=False)
+        state = _load_active(config, require_repository=False)
+        record = _find_record(state, args.slot)
+        _expected_generation(record, args.expected_generation)
+        if record.slot_type != "agent":
+            raise Refusal("--repo applies only to an agent slot")
+        if any(checkout.name == name for checkout in record.checkouts):
+            raise Refusal(f"slot {record.slot} already declares checkout {name!r}")
+        slot_directory = _slot_directory(config, record.slot, record.slot_type)
+        _relative, path = _relative_inside(config.root, relative, "adopt-checkout path")
+        if not _path_is_within(path, slot_directory) or path == slot_directory:
+            raise Refusal(
+                f"adopt-checkout path must lie inside slot {record.slot}: {relative}"
+            )
+        vcs = _GitVcs()
+        if path.is_symlink() or not path.is_dir():
+            raise Refusal(f"adopt-checkout path is not a real directory: {relative}")
+        git_marker = path / ".git"
+        if not git_marker.exists() and not git_marker.is_symlink():
+            raise Refusal(
+                f"{relative} is not a linked worktree: it has no .git marker; "
+                "declare only a linked worktree of another repository"
+            )
+        git_dir = Path(
+            vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+        )
+        common = vcs.common_directory(path)
+        if git_dir.absolute() == common.absolute():
+            raise Refusal(
+                f"{relative} is not a linked worktree: it is its repository's "
+                "main worktree"
+            )
+        repository = common.parent if common.name == ".git" else common
+        if path.absolute() not in vcs.listed_worktrees(repository):
+            raise Refusal(
+                f"Git does not register {relative} as a worktree of {repository}"
+            )
+        branch = vcs.branch(path)
+        head = vcs.head(path)
+        remote = config.default_remote
+        try:
+            remote_url_sha256 = vcs.remote_url_sha256(path, remote)
+        except Refusal:
+            raise Refusal(
+                f"unknown repository at {relative}: it has no remote {remote!r} "
+                "with a URL, so its publication cannot be recorded; add the "
+                "remote or move the worktree out with 'git worktree move'"
+            ) from None
+        vcs.assert_ordinary_history(path)
+        vcs.assert_ordinary_index(path)
+        status = vcs.status(
+            path, _cache_globs_for(config, name), include_ignored=False
+        )
+        if status:
+            first = status.splitlines()[0]
+            raise Refusal(
+                f"checkout {name} is not clean ({first}); commit or publish "
+                "its work before adopting it"
+            )
+        repository_relative = Path(
+            os.path.relpath(repository, config.root)
+        ).as_posix()
+        checkout = Checkout(
+            name=name,
+            path=relative,
+            repository=repository_relative,
+            branch=branch,
+            start_point=head,
+            remote=remote,
+            remote_url_sha256=remote_url_sha256,
+            landed_ref=config.default_landed_ref,
+            head=head,
+        )
+        updated = dataclasses.replace(
+            record, checkouts=(*record.checkouts, checkout)
+        )
+        _write_active_state(
+            config,
+            _replace_record(state, updated),
+            action="checkout-adopted",
+            slot=record.slot,
+            evidence={
+                "checkout": name,
+                "path": relative,
+                "repository": repository_relative,
+            },
+            require_repository=False,
+        )
+        print(
+            f"adopted checkout {name} at {relative} (repository "
+            f"{repository_relative}, branch {branch}) into slot {record.slot}"
+        )
+        return 0
+
+
 def _cmd_read_handoff(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
@@ -40957,7 +41223,25 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
             raise Refusal(
                 f"slot {record.slot} already has a recorded finish; its handoff is immutable"
             )
-        _assert_target_record_storage_consistent(config, states, record)
+        # An undeclared nested linked worktree of another repository
+        # does not stop a handoff (#1400): it is warned about loudly and
+        # recorded in the sidecar; remove and retire still refuse it.
+        foreign_checkouts = _foreign_checkouts_in_slot(config, states, record)
+        _assert_target_record_storage_consistent(
+            config,
+            states,
+            record,
+            tolerate_foreign_registrations=foreign_checkouts,
+        )
+        for foreign in foreign_checkouts:
+            print(
+                f"WARNING: slot {record.slot} holds an undeclared nested "
+                f"checkout of repository {foreign['repository']} at "
+                f"{foreign['path']}; the handoff records it, and removal "
+                "still refuses until it is declared with 'wrkslots "
+                "adopt-checkout' or moved out with 'git worktree move'",
+                file=sys.stderr,
+            )
         existing = _load_handoff_sidecar(config, record)
         legacy = _legacy_handoff_artifact(
             config,
@@ -40985,6 +41269,9 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
             source_identity=_source_identity,
             provenance_complete=True,
             storage_identity=_source_identity,
+            foreign_checkouts=tuple(
+                (item["repository"], item["path"]) for item in foreign_checkouts
+            ),
         )
         if existing is not None and not existing.provenance_complete:
             raise Refusal(
@@ -85342,6 +85629,44 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "it is copied, never moved",
     )
     write_handoff.set_defaults(handler=_cmd_write_handoff)
+
+    adopt_checkout = subparsers.add_parser(
+        "adopt-checkout",
+        help="declare a nested linked worktree of another repository into a slot record",
+        description=(
+            "Declare an undeclared linked worktree of another repository that sits "
+            "inside an agent slot's directory, so removal salvages and archives it "
+            "like any declared checkout. Verifies that the path is a clean linked "
+            "worktree of a known repository (it registers the path, has the "
+            "configured default remote with a URL, and its HEAD is on a branch). "
+            "Without this, remove and retire refuse the slot; the manual "
+            "alternative is 'git worktree move' out of the slot."
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    adopt_checkout.add_argument("slot", help="active agent slot name")
+    adopt_checkout.add_argument(
+        "--repo",
+        required=True,
+        metavar="NAME=PATH",
+        help="checkout name to declare and its path inside the slot directory "
+        "(project-relative or absolute), e.g. --repo foreign=worktrees/slot-a/foreign",
+    )
+    adopt_checkout.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live current coordinator PID recorded with the operation",
+    )
+    adopt_checkout.add_argument(
+        "--expected-generation",
+        type=int,
+        required=True,
+        metavar="N",
+        help="current slot generation",
+    )
+    adopt_checkout.set_defaults(handler=_cmd_adopt_checkout)
 
     read_handoff = subparsers.add_parser(
         "read-handoff",

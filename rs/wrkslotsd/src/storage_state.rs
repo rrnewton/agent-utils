@@ -1150,7 +1150,7 @@ pub(crate) fn parse_storage(root: Option<&Path>) -> Result<Value> {
                                 "slot holds {}, which its record does not name",
                                 py_repr(name)
                             ),
-                            "inspect and register or relocate the unexpected entry; do not delete it to make the registry look consistent",
+                            "inspect the unexpected entry; if it is a linked worktree of another repository, declare it with 'wrkslots adopt-checkout SLOT --repo <name>=<path> --coordinator-pid PID --expected-generation N' or move it out of the slot with 'git worktree move'; do not delete it to make the registry look consistent",
                         ));
                     }
                 }

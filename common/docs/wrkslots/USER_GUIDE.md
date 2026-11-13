@@ -1104,6 +1104,14 @@ both events match it. The sidecar is immutable once published; `finish` still re
 untracked, or ignored checkout change. In particular, it does not exempt a pre-sidecar `HANDOFF.md`
 inside a flat-layout checkout.
 
+A linked worktree of another repository nested inside the slot directory does not stop
+`write-handoff`: it warns loudly, naming the repository and path, and records both in the
+sidecar's `foreign_checkouts`. Removal and retirement still refuse such a slot. Declare the
+worktree with `wrkslots adopt-checkout SLOT --repo <name>=<path> --coordinator-pid PID
+--expected-generation N` — it verifies a clean linked worktree of a known repository and adds
+it to the slot record, after which removal salvages and archives it like any declared
+checkout — or move it out of the slot with `git worktree move`.
+
 `wrkslots read-handoff SLOT --coordinator-pid PID` prints the exact sidecar contents and durably
 enqueues that slot generation for later retirement. Reading never removes the sidecar, an existing
 checkout file, or the slot. If no sidecar exists, the command copies a direct-child `HANDOFF.md` into
