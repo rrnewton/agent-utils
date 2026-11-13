@@ -199,6 +199,20 @@ fn is_owner_item(path: &Path, document: &Map<String, Value>) -> bool {
         || document.get("from").and_then(Value::as_str) == Some("owner")
 }
 
+/// Whether an item may join a combined turn-boundary prompt (#1479). A
+/// turnover handoff must reach the new session as its own first input, and a
+/// slash command opens a harness menu: both always go alone.
+fn is_batchable(document: &Map<String, Value>) -> bool {
+    let from = document.get("from").and_then(Value::as_str).unwrap_or_default();
+    let text = document.get("text").and_then(Value::as_str).unwrap_or_default();
+    let sender = crate::sender_header::parse(text.lines().next().unwrap_or_default())
+        .map(|header| header.sender)
+        .unwrap_or_default();
+    !from.contains("turnover")
+        && !sender.contains("turnover")
+        && !text.trim_start().starts_with('/')
+}
+
 /// One item's section of a combined turn-boundary prompt: its stored text,
 /// headed by its sender header when the text does not already open with one,
 /// so every item stays individually marked (#1479, #698).
@@ -741,6 +755,20 @@ impl Wrapper {
         // item; later groups wait for the next boundary.
         let mut items = pending;
         items.sort_by_key(|(path, document)| !is_owner_item(path, document));
+        // A special item (a turnover handoff, a slash command) always goes
+        // alone, in order, ahead of any batch behind it.
+        if items.first().is_some_and(|(_, document)| !is_batchable(document)) {
+            let (path, document) = items.into_iter().next().expect("first item");
+            self.deliver(&path, document)?;
+            return Ok(());
+        }
+        // Batch only the batchable prefix; a special item behind it waits
+        // for its own delivery at the next boundary.
+        let prefix_len = items
+            .iter()
+            .take_while(|(_, document)| is_batchable(document))
+            .count();
+        let _rest = items.split_off(prefix_len);
         let Some(group) = batch_groups(items).into_iter().next() else {
             return Ok(());
         };
