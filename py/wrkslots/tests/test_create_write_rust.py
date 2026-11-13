@@ -349,6 +349,119 @@ def test_create_hook_failure_records_journal(tmp_path: Path) -> None:
     )
 
 
+def _harness_fixture(base: Path) -> Path:
+    root = _empty_fixture(base)
+    config = root / ".wrkslots.yml"
+    config.write_text(
+        config.read_text()
+        + "layout: nested\nharness_repo: app\nproduct_repos: [repo]\n"
+    )
+    return root
+
+
+def _rust_create_harness(
+    root: Path,
+    *,
+    repos: list[str],
+    branches: list[str] | None = None,
+    include: bool = False,
+    reason: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
+    args = [
+        str(rust_wrkslotsd()), "create", "slot-b", "--slot-type", "agent",
+        "--coordinator-authorized",
+        "--agent", "agent-new", "--task", "task-1", "--purpose", "testing",
+        "--owner-pid", str(os.getpid()), "--coordinator-pid", str(os.getpid()),
+        "--machine", "node-a", "--root", str(root),
+    ]
+    for item in repos:
+        args += ["--repo", item]
+    for item in branches or []:
+        args += ["--branch", item]
+    if include:
+        args.append("--include-harness-checkout-i-know-this-is-heavy")
+    if reason is not None:
+        args += ["--harness-checkout-reason", reason]
+    return subprocess.run(
+        args, cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env
+    )
+
+
+def _python_create_harness(
+    root: Path,
+    *,
+    repos: list[str],
+    branches: list[str] | None = None,
+    include: bool = False,
+    reason: str | None = None,
+) -> int:
+    args = argparse.Namespace(
+        project_root=str(root), machine="node-a", slot="slot-b", slot_type="agent",
+        coordinator_authorized=True, agent="agent-new", task="task-1",
+        purpose="testing", owner_pid=os.getpid(), coordinator_pid=os.getpid(),
+        task_scope_unit=None, task_scope_invocation_id=None,
+        repo=repos, remote=[], remote_url=[],
+        branch=branches or [], start=[], override_disk_floor=False,
+        representation="config", format="human", wait_lock=0.0,
+        include_harness_checkout=include, harness_checkout_reason=reason,
+    )
+    return wrkslots_cli._cmd_create(args)
+
+
+def test_create_harness_repo_refuses_without_heavy_opt_in(tmp_path: Path) -> None:
+    rust_root = _harness_fixture(tmp_path / "rust")
+    oracle_root = _harness_fixture(tmp_path / "oracle")
+    with pytest.raises(Exception) as caught:
+        _python_create_harness(oracle_root, repos=["app=../upstream-repo"])
+    result = _rust_create_harness(rust_root, repos=["app=../upstream-repo"])
+    assert result.returncode == 1
+    assert str(caught.value) in result.stderr
+    _assert_no_create_side_effects(rust_root)
+
+
+def test_create_harness_flags_validate_like_python(tmp_path: Path) -> None:
+    rust_root = _harness_fixture(tmp_path / "rust")
+    oracle_root = _harness_fixture(tmp_path / "oracle")
+    cases = [
+        (["app=../upstream-repo"], True, None,
+         "--include-harness-checkout-i-know-this-is-heavy requires"),
+        (["app=../upstream-repo"], False, "needed",
+         "--harness-checkout-reason requires"),
+        (["zzz=../upstream-repo"], False, None,
+         "not declared as product repos in harness mode"),
+    ]
+    for repos, include, reason, needle in cases:
+        with pytest.raises(Exception) as caught:
+            _python_create_harness(oracle_root, repos=repos, include=include, reason=reason)
+        result = _rust_create_harness(rust_root, repos=repos, include=include, reason=reason)
+        assert result.returncode == 1
+        assert needle in str(caught.value)
+        assert needle in result.stderr
+        _assert_no_create_side_effects(rust_root)
+
+
+def test_create_harness_checkout_with_flags_matches_python(tmp_path: Path) -> None:
+    rust_root = _harness_fixture(tmp_path / "rust")
+    oracle_root = _harness_fixture(tmp_path / "oracle")
+    assert _python_create_harness(
+        oracle_root,
+        repos=["app=../upstream-repo"], branches=["app=suite/new"],
+        include=True, reason="suite setup",
+    ) == 0
+    result = _rust_create_harness(
+        rust_root,
+        repos=["app=../upstream-repo"], branches=["app=suite/new"],
+        include=True, reason="suite setup",
+    )
+    assert result.returncode == 0, result.stderr
+    assert _active_doc(rust_root) == _active_doc(oracle_root)
+    record = _active_doc(rust_root)["slots"][0]  # type: ignore[index]
+    assert isinstance(record, dict)
+    assert record["harness_checkout_reason"] == "suite setup"
+
+
 def test_create_refuses_without_fixture_attestation(tmp_path: Path) -> None:
     rust_root = _empty_fixture(tmp_path / "plain")
     result = _rust_create(rust_root, fixture=False)

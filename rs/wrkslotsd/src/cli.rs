@@ -1281,6 +1281,12 @@ pub(crate) enum Lifecycle {
         /// Lowercase 32-hex systemd InvocationID for --task-scope-unit
         #[arg(long, value_name = "HEX32")]
         task_scope_invocation_id: Option<String>,
+        /// Include the declared harness repo in this slot (heavy; needs --harness-checkout-reason)
+        #[arg(long = "include-harness-checkout-i-know-this-is-heavy")]
+        include_harness_checkout: bool,
+        /// Why a harness checkout is needed; recorded on the slot
+        #[arg(long, value_name = "TEXT")]
+        harness_checkout_reason: Option<String>,
         /// Storage representation: config, worktree, or image
         #[arg(long, value_name = "KIND", default_value = "config")]
         representation: String,
@@ -1340,6 +1346,12 @@ pub(crate) enum Lifecycle {
         /// Lowercase 32-hex systemd InvocationID for --task-scope-unit
         #[arg(long, value_name = "HEX32")]
         task_scope_invocation_id: Option<String>,
+        /// Include the declared harness repo in this slot (heavy; needs --harness-checkout-reason)
+        #[arg(long = "include-harness-checkout-i-know-this-is-heavy")]
+        include_harness_checkout: bool,
+        /// Why a harness checkout is needed; recorded on the slot
+        #[arg(long, value_name = "TEXT")]
+        harness_checkout_reason: Option<String>,
         /// Storage representation: config, worktree, or image
         #[arg(long, value_name = "KIND", default_value = "config")]
         representation: String,
@@ -3809,6 +3821,8 @@ pub fn run() -> u8 {
                 override_disk_floor,
                 task_scope_unit,
                 task_scope_invocation_id,
+                include_harness_checkout,
+                harness_checkout_reason,
                 representation,
                 root,
                 machine,
@@ -3833,6 +3847,8 @@ pub fn run() -> u8 {
                     &representation,
                     task_scope_unit.as_deref(),
                     task_scope_invocation_id.as_deref(),
+                    include_harness_checkout,
+                    harness_checkout_reason.as_deref(),
                 ) {
                     Ok(value) => {
                         println!(
@@ -3864,6 +3880,8 @@ pub fn run() -> u8 {
                 override_disk_floor,
                 task_scope_unit,
                 task_scope_invocation_id,
+                include_harness_checkout,
+                harness_checkout_reason,
                 representation,
                 format,
                 root,
@@ -3888,6 +3906,8 @@ pub fn run() -> u8 {
                 &representation,
                 task_scope_unit.as_deref(),
                 task_scope_invocation_id.as_deref(),
+                include_harness_checkout,
+                harness_checkout_reason.as_deref(),
                 format == "json",
             ) {
                 Ok(text) => {

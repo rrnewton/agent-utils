@@ -571,6 +571,143 @@ fn warn_retained(findings: &[Value]) {
     }
 }
 
+/// shlex.join-style quoting for the suggested product-only
+/// command in the harness refusal.
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-')
+        })
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Python `_assert_harness_create_allowed` (#1299): refuse a
+/// harness-repo create in harness mode without the heavy opt-in.
+#[allow(clippy::too_many_arguments)]
+fn assert_harness_create_allowed(
+    config: &Value,
+    slot: &str,
+    slot_type: &str,
+    agent: &str,
+    task: &str,
+    purpose: &str,
+    owner_pid: Option<i64>,
+    coordinator_pid: i64,
+    repos_in: &[String],
+    branches_in: &[String],
+    include: bool,
+    reason: Option<&str>,
+) -> Result<()> {
+    let has_reason = reason.is_some_and(|text| !text.is_empty());
+    if include && !reason.is_some_and(|text| !text.trim().is_empty()) {
+        return Err("--include-harness-checkout-i-know-this-is-heavy requires --harness-checkout-reason TEXT naming why a harness checkout is needed".to_string());
+    }
+    if has_reason && !include {
+        return Err(
+            "--harness-checkout-reason requires --include-harness-checkout-i-know-this-is-heavy"
+                .to_string(),
+        );
+    }
+    let Some(harness_repo) = config.get("harness_repo").and_then(Value::as_str) else {
+        if include || has_reason {
+            return Err(
+                "harness checkout flags require harness_repo/product_repos in configuration"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    };
+    let products: Vec<String> = config
+        .get("product_repos")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Ok(repositories) = assignments(repos_in, "repository") else {
+        return Ok(()); // the plan path reports malformed assignments itself
+    };
+    let mut unknown: Vec<&String> = repositories
+        .keys()
+        .filter(|name| name.as_str() != harness_repo && !products.iter().any(|p| p == *name))
+        .collect();
+    unknown.sort();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "create names repo(s) not declared as product repos in harness mode: {}; declared products are {}",
+            unknown
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            products.join(", ")
+        ));
+    }
+    if !repositories.contains_key(harness_repo) || (include && has_reason) {
+        return Ok(());
+    }
+    let branches = assignments(branches_in, "branch").unwrap_or_default();
+    let mut parts: Vec<String> = [
+        "wrkslots",
+        "create",
+        slot,
+        "--slot-type",
+        slot_type,
+        "--coordinator-authorized",
+        "--agent",
+        agent,
+        "--task",
+        task,
+        "--purpose",
+        purpose,
+        "--coordinator-pid",
+    ]
+    .iter()
+    .map(|part| part.to_string())
+    .collect();
+    parts.push(coordinator_pid.to_string());
+    if let Some(owner) = owner_pid {
+        parts.push("--owner-pid".to_string());
+        parts.push(owner.to_string());
+    }
+    let product_names: Vec<&String> = repositories
+        .keys()
+        .filter(|name| name.as_str() != harness_repo)
+        .collect();
+    if product_names.is_empty() {
+        for name in &products {
+            parts.push("--repo".to_string());
+            parts.push(format!("{name}=<{name}-checkout>"));
+            parts.push("--branch".to_string());
+            parts.push(format!("{name}=<new-branch>"));
+        }
+    } else {
+        for name in product_names {
+            parts.push("--repo".to_string());
+            parts.push(format!("{name}={}", repositories[name.as_str()]));
+            if let Some(branch) = branches.get(name.as_str()) {
+                parts.push("--branch".to_string());
+                parts.push(format!("{name}={branch}"));
+            }
+        }
+    }
+    let command = parts
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(format!(
+        "create refuses a slot including harness repo '{harness_repo}' in harness mode: a harness checkout copies every product submodule instead of one product. Create the slot from the product repo the task touches instead:\n  {command}\nIf a harness checkout is genuinely required, pass --include-harness-checkout-i-know-this-is-heavy together with --harness-checkout-reason TEXT; the reason is recorded on the slot."
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_slot(
     root: Option<&Path>,
@@ -592,6 +729,8 @@ pub(crate) fn create_slot(
     representation: &str,
     task_scope_unit: Option<&str>,
     task_scope_invocation_id: Option<&str>,
+    include_harness_checkout: bool,
+    harness_checkout_reason: Option<&str>,
 ) -> Result<Value> {
     create_slot_inner(
         root,
@@ -613,6 +752,8 @@ pub(crate) fn create_slot(
         representation,
         task_scope_unit,
         task_scope_invocation_id,
+        include_harness_checkout,
+        harness_checkout_reason,
         false,
     )
 }
@@ -641,6 +782,8 @@ pub(crate) fn create_slot_text(
     representation: &str,
     task_scope_unit: Option<&str>,
     task_scope_invocation_id: Option<&str>,
+    include_harness_checkout: bool,
+    harness_checkout_reason: Option<&str>,
 ) -> Result<Value> {
     create_slot_inner(
         root,
@@ -662,6 +805,8 @@ pub(crate) fn create_slot_text(
         representation,
         task_scope_unit,
         task_scope_invocation_id,
+        include_harness_checkout,
+        harness_checkout_reason,
         true,
     )
 }
@@ -687,6 +832,8 @@ fn create_slot_inner(
     representation: &str,
     task_scope_unit: Option<&str>,
     task_scope_invocation_id: Option<&str>,
+    include_harness_checkout: bool,
+    harness_checkout_reason: Option<&str>,
     collect_text: bool,
 ) -> Result<Value> {
     require_fixture()?;
@@ -694,6 +841,20 @@ fn create_slot_inner(
         return Err("worktree creation requires a coordinator assignment. state: REFUSED -- no worktree or lifecycle record was changed. remedy: ask the coordinator to assign the slot; an assigned agent may rerun with --coordinator-authorized and its own --owner-pid".to_string());
     }
     let config = load_config(root, machine_override)?;
+    assert_harness_create_allowed(
+        &config,
+        slot,
+        slot_type,
+        agent,
+        task,
+        purpose,
+        owner_pid,
+        coordinator_pid,
+        repos,
+        branches_in,
+        include_harness_checkout,
+        harness_checkout_reason,
+    )?;
     // Resolve like Python `_requested_representation` before any
     // provisioning side effect, so config -> image refuses here.
     let config_representation = config
@@ -1107,7 +1268,7 @@ fn create_slot_inner(
                         hook_progress: i64,
                         hook_failure: &Value|
      -> Value {
-        json!({
+        let mut journal = json!({
             "schema": 2,
             "kind": "create",
             "machine": selected,
@@ -1129,7 +1290,16 @@ fn create_slot_inner(
             "task_scope": task_scope.clone().unwrap_or(Value::Null),
             "failure_policy": "leave-for-inspection",
             "operation_id": op_id,
-        })
+        });
+        if let Some(reason) = harness_checkout_reason.filter(|text| !text.is_empty()) {
+            if let Some(object) = journal.as_object_mut() {
+                object.insert(
+                    "harness_checkout_reason".to_string(),
+                    Value::String(reason.to_string()),
+                );
+            }
+        }
+        journal
     };
     ensure_event_log(root, &cfg, &selected)?;
     let write_journal = |cfg: &Cfg, payload: &Value| -> Result<()> {
@@ -1367,15 +1537,21 @@ fn create_slot_inner(
         "handoff": Value::Null,
         "checkouts": created,
     });
-    let record = if let Some(scope) = &task_scope {
-        let mut record = record;
+    let mut record = record;
+    if let Some(scope) = &task_scope {
         if let Some(object) = record.as_object_mut() {
             object.insert("task_scope".to_string(), scope.clone());
         }
-        record
-    } else {
-        record
-    };
+    }
+    if let Some(reason) = harness_checkout_reason {
+        if let Some(object) = record.as_object_mut() {
+            object.insert(
+                "harness_checkout_reason".to_string(),
+                Value::String(reason.to_string()),
+            );
+        }
+    }
+    let record = record;
     let mut slots: Vec<Value> = state
         .get("slots")
         .and_then(Value::as_array)

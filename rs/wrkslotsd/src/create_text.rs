@@ -530,6 +530,8 @@ pub(crate) fn create_text(
     representation: &str,
     task_scope_unit: Option<&str>,
     task_scope_invocation_id: Option<&str>,
+    include_harness_checkout: bool,
+    harness_checkout_reason: Option<&str>,
     format_json: bool,
 ) -> Result<String> {
     let value = crate::create_write::create_slot_text(
@@ -552,6 +554,8 @@ pub(crate) fn create_text(
         representation,
         task_scope_unit,
         task_scope_invocation_id,
+        include_harness_checkout,
+        harness_checkout_reason,
     )?;
     let (cfg, _selected) = load_cfg(root, machine_override)?;
     let checkouts = value
