@@ -317,7 +317,11 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
         arg=blocks[0][:20],
         timeout=20_000)
-    check(page.locator("#control-pane").is_hidden(), "the call controls show over the reader")
+    # `#1505 documents-read-controls-highlight-tap`: the pane stands with the
+    # reader open — its Read is the document read's Pause, its pace the
+    # read's — where it used to leave with the reader and take play/pause
+    # with it.
+    check(page.locator("#control-pane").is_visible(), "the call controls leave with the reader open")
 
     # The device/cloud toggle is the Documents view's too now, starting on the
     # server voice; one tap picks the device for the read that follows.
@@ -347,6 +351,23 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         "() => Object.keys(window.mediaProbe.handlers).filter((k) => window.mediaProbe.handlers[k]).sort()")
     check(handlers == ["nexttrack", "pause", "play", "previoustrack", "stop"],
           f"the document read holds media handlers {handlers}")
+
+    # Pause and Resume from the pane, over the reader (`#1505`): the button
+    # says the act, the read holds, and the strip says it is held.
+    check(page.locator("#read-aloud-label").inner_text().strip() == "Pause",
+          "the pane's Read does not say Pause over the document read")
+    act("#read-aloud")
+    page.wait_for_function(
+        "() => readAloudOwner().nowPlaying && readAloudOwner().nowPlaying.paused === true",
+        timeout=20_000)
+    check(page.evaluate("() => document.getElementById('read-steer').getAttribute('data-paused')") == "true",
+          "the strip does not say the document read is held")
+    act("#read-aloud")
+    page.wait_for_function(
+        "() => readAloudOwner().nowPlaying && readAloudOwner().nowPlaying.paused === false",
+        timeout=20_000)
+    check(page.locator("#read-aloud-label").inner_text().strip() == "Pause",
+          "the resumed document read does not say Pause again")
 
     act("#read-next")
     wait_count(page, f"2 of {count}")
@@ -457,6 +478,95 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
 
+# The list document (`#1505`): a heading, an intro, a long bulleted list
+# with a nested item, a code fence and a closing paragraph — the shape the
+# highlight drift was reported on. Spoken (device) a block at a time, each
+# block one short utterance, so the lit block and the spoken block can be
+# compared at every step.
+LIST_ITEMS = [f"List item {number} carries plain words" for number in range(1, 11)]
+LIST_DOC = (
+    "# List notes\n\nIntro paragraph before the list.\n\n"
+    + "\n".join(f"- {item}" for item in LIST_ITEMS[:5])
+    + "\n  - nested item under five\n"
+    + "\n".join(f"- {item}" for item in LIST_ITEMS[5:])
+    + "\n\n```\nconst answer = 42;\n```\n\nClosing paragraph after the code.\n"
+)
+LIST_BLOCKS = (
+    ["List notes", "Intro paragraph before the list."]
+    + LIST_ITEMS[:5] + ["nested item under five"] + LIST_ITEMS[5:]
+    + ["const answer = 42;", "Closing paragraph after the code."]
+)
+
+
+def lit_words(page: Page) -> str:
+    """The lit block's words, whitespace flattened, as the model speaks them."""
+    words: str = page.evaluate(
+        """() => {
+          const lit = document.querySelector('#doc-body [data-reading-block="current"]');
+          return lit ? lit.textContent.replace(/\\s+/g, ' ').trim() : '';
+        }""")
+    return words
+
+
+def walk_list(page: Page, base: str) -> None:
+    """The list document by touch: lit == spoken through the list, tap-to-read."""
+    page.goto(base + "/?v=docs", wait_until="load")
+    page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+    page.locator("#documents-list .doc-card", has_text="list-doc").tap()
+    page.wait_for_function(
+        "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
+        arg="nested item under five", timeout=20_000)
+    toggle = page.locator("#audio-source")
+    if toggle.get_attribute("aria-checked") == "true":
+        page.tap("#audio-source")
+        page.wait_for_function(
+            "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
+            timeout=20_000)
+    count = len(LIST_BLOCKS)
+    page.tap("#doc-read")
+    wait_count(page, f"1 of {count}")
+    # Step the whole list: at every block the voice's latest words are the
+    # lit block's words — asserted on the read's own state, never on time.
+    for at in range(count):
+        page.wait_for_function(
+            """(words) => {
+              const said = window.deviceSpeech;
+              return said.length > 0 && said[said.length - 1].text === words;
+            }""",
+            arg=LIST_BLOCKS[at], timeout=20_000)
+        said = utterances(page)
+        check(said[-1] == LIST_BLOCKS[at],
+              f"block {at + 1}: the voice said {said[-1]!r}, not {LIST_BLOCKS[at]!r}")
+        check(lit_words(page) == LIST_BLOCKS[at],
+              f"block {at + 1}: the light is on {lit_words(page)!r} while the voice says {LIST_BLOCKS[at]!r}")
+        if at + 1 < count:
+            page.tap("#read-next")
+            wait_count(page, f"{at + 2} of {count}")
+    page.evaluate("() => readAloudOwner().stopReading()")
+    wait_stopped(page)
+    wait_unlit(page)
+    # Tap-to-read (`#1505`): a tap on the closing paragraph starts there,
+    # and a tap on a list item starts at that item.
+    said_before = len(utterances(page))
+    page.locator("#doc-body > p", has_text="Closing paragraph").tap()
+    wait_count(page, f"{count} of {count}")
+    page.wait_for_function(
+        "(n) => window.deviceSpeech.length > n", arg=said_before, timeout=20_000)
+    check(utterances(page)[-1] == LIST_BLOCKS[-1],
+          f"a tap on the closing paragraph said {utterances(page)[-1]!r}")
+    check(lit_words(page) == LIST_BLOCKS[-1], "the tapped paragraph is not the lit block")
+    page.locator("#doc-body li", has_text="List item 3").tap()
+    wait_count(page, "5 of " + str(count))
+    page.wait_for_function(
+        "(words) => window.deviceSpeech.some((u) => u.text === words)",
+        arg="List item 3 carries plain words", timeout=20_000)
+    check(lit_words(page) == "List item 3 carries plain words",
+          "the tapped list item is not the lit block")
+    page.tap("#doc-back")
+    wait_stopped(page)
+    page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+
+
 def main() -> int:
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -467,6 +577,7 @@ def main() -> int:
         work = Path(tmp)
         for doc_name, doc_blocks in DOCS:
             (work / doc_name).write_text("\n\n".join(doc_blocks) + "\n")
+        (work / "list-doc").write_text(LIST_DOC)
         (work / "vibe-talk.toml").write_text(
             f'[server]\nbind = "127.0.0.1:{port}"\n'
             '[discord]\nbot_token = "documents-read-check-bot-token-never-sent"\n'
@@ -495,17 +606,18 @@ def main() -> int:
                     check(time.time() < deadline, "the server did not come up")
                     time.sleep(0.25)
             call(base, "POST", f"/api/v1/channels/{CHANNEL}/reply", WRITE_TOKEN,
-                 {"text": "Notes: https://paste.example/read-doc and https://paste.example/desk-doc"})
+                 {"text": "Notes: https://paste.example/read-doc and https://paste.example/desk-doc"
+                          " and https://paste.example/list-doc"})
             docs = []
             deadline = time.time() + 30
             while time.time() < deadline:
                 call(base, "GET", f"/api/v1/channels/{CHANNEL}/page?limit=10&render=html", WRITE_TOKEN)
                 answer = call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)
                 docs = cast(list[dict[str, object]], answer["documents"])
-                if len(docs) == 2:
+                if len(docs) == 3:
                     break
                 time.sleep(0.5)
-            check(len(docs) == 2, f"the fold registered {len(docs)} documents, not 2: {docs}")
+            check(len(docs) == 3, f"the fold registered {len(docs)} documents, not 3: {docs}")
 
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(args=CHROMIUM_AUDIO_ARGS)
@@ -522,10 +634,21 @@ def main() -> int:
                     page.add_init_script(MEDIA_PROBE)
                     walk(page, base, touch, doc_name, doc_blocks)
                     ctx.close()
+                # The list document by touch (`#1505`): lit == spoken through
+                # the list, pause from the pane, and tap-to-read.
+                ctx = browser.new_context(
+                    viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
+                page = ctx.new_page()
+                page.add_init_script(
+                    f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+                page.add_init_script(DEVICE_VOICE)
+                page.add_init_script(MEDIA_PROBE)
+                walk_list(page, base)
+                ctx.close()
                 browser.close()
             print("documents read browser check: strip, device blocks, Next/Prev, media next, "
-                  "finish-on-last, device/cloud toggle, Back-stop and the reading light lit, "
-                  "followed and cleared all seen at 393x852 and 1280x800")
+                  "finish-on-last, device/cloud toggle, Back-stop, pause from the pane, "
+                  "lit == spoken through the list and tap-to-read all seen at 393x852 and 1280x800")
             return 0
         finally:
             server.terminate()

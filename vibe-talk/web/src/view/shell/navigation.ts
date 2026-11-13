@@ -1750,7 +1750,10 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     // `#245 done-feedback`. The chips stand on the channel's message box, which only the channel has.
     deps.placeChipsOverComposer();
     // The call's controls (Sound, Clear, Talk) are not the Documents view's.
-    if (deps.screens().screen() === "main") el("control-pane").hidden = name === "docs";
+    // `#1505 documents-read-controls-highlight-tap`: while a document read
+    // stands (playing or pending) the pane stays, so its Read is the read's
+    // Pause and its pace the read's — the strip steers but cannot pause.
+    if (deps.screens().screen() === "main") el("control-pane").hidden = name === "docs" && !documentReading;
     deps.saveUiState();
     // `#224 keyboard-shortcuts`. The list on screen takes the focus, so that the scroll keys move it.
     // Above all off the view switch: left holding the focus from the click that pressed it, it took

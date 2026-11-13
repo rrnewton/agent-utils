@@ -1075,7 +1075,7 @@ const documentsView = createDocumentsView({
   // device storage under a synced key, so the settings sync mirrors it.
   storage: () => deviceStorageOnUse(),
   closeActionMenu: () => setActionMenuOpen(false),
-  readDocument: (doc) => readAloudOwner().readDocument(doc),
+  readDocument: (doc, from) => readAloudOwner().readDocument(doc, from),
   // Page-side kind-and-id awareness (`#1039` stage 3): the reader names only its
   // own document's key; whether that document's is the read playing (or pending)
   // is read off the owner's surface here, so no other read is ever stopped.
@@ -1088,7 +1088,9 @@ const documentsView = createDocumentsView({
     }
   },
   onStatus: (text) => setStatus(text),
-  onLevelChange: () => shellNavigation.scheduleBackSync(),
+  // `#1505`: the reader opening or closing re-decides the control pane,
+  // which is the document read's transport while the reader stands.
+  onLevelChange: () => { shellNavigation.scheduleBackSync(); voiceCall().renderControls(); },
   onBack: () => shellNavigation.documentBack(),
   onJumpToMention: (mention) => {
     void shellNavigation.jumpToSentMessage({

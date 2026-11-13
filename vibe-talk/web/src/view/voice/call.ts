@@ -4620,6 +4620,16 @@ function renderControls() {
   // Read and pace are the channel's too — inert there while the pane itself stays the channel's.
   const channel = deps.currentView === "discord" && !live;
   const reading = channel || ((deps.docsReaderOpen || deps.discussOpen) && !live);
+  // `#1505 documents-read-controls-highlight-tap`: in Documents the pane is
+  // the reader's transport while a document read stands (playing, held or
+  // being fetched) — Read is its Pause, Stop and pace beside it (the strip
+  // steers but cannot pause). With no read standing the pane leaves with
+  // the reader as it did, so the reader keeps its full height. Synced here
+  // because a read's start and end are no view switch: the owner's state
+  // changes (`setReadState`) redraw these controls.
+  if (deps.currentScreen === "main" && deps.currentView === "docs") {
+    deps.el("control-pane").hidden = !(deps.docsReaderOpen && (deps.readInProgress() || deps.pendingRead !== null));
+  }
   deps.el("read-aloud").hidden = !reading;
   deps.el("read-speed").hidden = !reading;
   // The archive filter belongs to the CHANNEL, so it appears with the channel and not with a call.

@@ -1035,6 +1035,7 @@ async function withReader(options, run) {
     outline: options.outline ?? [],
   });
   const reads = [];
+  const readFroms = [];
   const stops = [];
   const backs = [];
   const statuses = [];
@@ -1045,7 +1046,7 @@ async function withReader(options, run) {
       assert.ok(id in els, `reader looked up an element the test did not provide: ${id}`);
       return els[id];
     },
-    readDocument: (doc) => { reads.push(doc); },
+    readDocument: (doc, from) => { reads.push(doc); readFroms.push(from ?? null); },
     stopSpeaking: (key) => { stops.push(key); },
     onBack: () => { backs.push("back"); },
     onStatus: (text) => { statuses.push(text); },
@@ -1055,7 +1056,7 @@ async function withReader(options, run) {
   try {
     await reader.open("demo-doc");
     const buttons = els["doc-outline"].children.map((item) => item.children[0]);
-    await run({ reader, els, headings, buttons, reads, stops, backs, statuses });
+    await run({ reader, els, headings, buttons, reads, readFroms, stops, backs, statuses });
   } finally {
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
   }
@@ -1907,6 +1908,77 @@ test("documents reader: Read hands the owner the retained document in one call (
       assert.deepEqual(reads[1], reads[0]);
     },
   );
+});
+
+// ---- 7b. one block model: kinds, the light, tap-to-read (`#1505`) --------------------------------
+//
+// The reader hands the owner the block model's texts AND kinds (one per
+// drawn block); the owner's block report lights that same drawn block by
+// index; a tap on a drawn block starts the read there.
+
+const LIST_DOC = "# Notes\n\n- first item\n- second item\n- third item\n\nClosing words.\n";
+
+function drawnListBody(els) {
+  const body = els["doc-body"];
+  const heading = readerEl("h2");
+  heading.textContent = "Notes";
+  body.appendChild(heading);
+  const list = readerEl("ul");
+  const items = ["first item", "second item", "third item"].map((words) => {
+    const item = readerEl("li");
+    item.textContent = words;
+    list.appendChild(item);
+    return item;
+  });
+  body.appendChild(list);
+  const closing = readerEl("p");
+  closing.textContent = "Closing words.";
+  body.appendChild(closing);
+  return { heading, items, closing };
+}
+
+test("documents reader: Read hands the block model — kinds aligned with texts (#1505)", async () => {
+  await withReader({ content: LIST_DOC, outline: [] }, async ({ els, reads }) => {
+    dispatchClick(els["doc-read"]);
+    assert.equal(reads.length, 1);
+    assert.deepEqual(reads[0].texts, ["Notes", "first item", "second item", "third item", "Closing words."],
+      "a bulleted list was handed over as one chunk, not a block an item");
+    assert.deepEqual(reads[0].kinds, ["heading", "item", "item", "item", "paragraph"],
+      "the kinds do not walk with the texts");
+  });
+});
+
+test("documents reader: the reading light is the reported block itself (#1505)", async () => {
+  await withReader({ content: LIST_DOC, outline: [] }, async ({ els, reads }) => {
+    const { items, closing } = drawnListBody(els);
+    dispatchClick(els["doc-read"]);
+    const report = reads[0].onReadingBlock;
+    report(3);
+    assert.equal(items[2].getAttribute("data-reading-block"), "current", "block 3 did not light the third item");
+    assert.equal(closing.getAttribute("data-reading-block"), null, "a later block carries the light");
+    report(4);
+    assert.equal(closing.getAttribute("data-reading-block"), "current", "block 4 did not light the closing paragraph");
+    assert.equal(items[2].getAttribute("data-reading-block"), null, "the light stayed on the earlier block");
+    report(99);
+    assert.equal(closing.getAttribute("data-reading-block"), null, "an unknown block lit something");
+    report(null);
+    assert.equal(els["doc-body"].children.length > 0, true);
+  });
+});
+
+test("documents reader: a tap on a block reads from that block (#1505)", async () => {
+  await withReader({ content: LIST_DOC, outline: [] }, async ({ els, reads, readFroms }) => {
+    const { items } = drawnListBody(els);
+    const label = readerEl("span");
+    label.textContent = "second item";
+    items[1].appendChild(label);
+    await flush(dispatchClick(els["doc-body"], { target: label }));
+    assert.equal(reads.length, 1, "a tap on a list item read nothing");
+    assert.deepEqual(readFroms[0], { part: 0, block: 2 }, "the tap did not name its block");
+    // A tap off any block (the body's own padding) reads nothing new.
+    await flush(dispatchClick(els["doc-body"], { target: els["doc-body"] }));
+    assert.equal(reads.length, 1, "a tap off any block started a read");
+  });
 });
 
 test("documents reader: with nothing open to say, Read says so and hands the owner nothing (#1039 stage 3)", async () => {

@@ -62,6 +62,8 @@ interface DocumentPayload {
   title?: string;
   entry: PreparedEntry | null;
   texts: readonly string[];
+  /** `#1505`: the block model's kind of each of `texts`, in the same order, where the caller cut one. */
+  kinds?: readonly string[];
   /** `#1330 doc-read-highlight`: where this read is, for the surface that drew it. */
   onReadingBlock?: DocumentReadingBlock;
 }
@@ -651,7 +653,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (docPayload !== null) {
       listed = docPayload.entry && docPayload.entry.blocks && docPayload.entry.blocks.length > 0
         ? docPayload.entry.blocks
-        : docPayload.texts.map((said) => ({ kind: "paragraph", spoken: true, chars: said.length }));
+        : docPayload.texts.map((said, at) => ({
+            kind: docPayload.kinds && docPayload.kinds[at] ? docPayload.kinds[at] as string : "paragraph",
+            spoken: true, chars: said.length, element: at, piece: 0, pieces: 1,
+          }));
       segments = speechSegments([{ blocks: listed }]);
       flat = [];
       segments.forEach((segment, at) => {
@@ -2336,9 +2341,47 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       tell(null);
       return;
     }
-    const listed = playing.blocks && playing.blocks[segment.part] ? playing.blocks[segment.part]![segment.block] : undefined;
-    const element = listed && Number.isInteger(listed.element) ? listed.element as number : segment.block;
-    tell(segment.block, element);
+    // `#1505 documents-read-controls-highlight-tap`: report in the caller's
+    // block-model index space (`texts`/`kinds`), never the prepared list's
+    // own. A cloud read's server blocks are aligned onto the model (its
+    // pieces of one drawn block land on that block); where the two cuts
+    // do not align, nothing is reported rather than a wrong block. A
+    // caller that cut no model (no `kinds`) is reported as it was.
+    const payload = playing.document;
+    if (!payload.kinds || payload.kinds.length === 0) {
+      tell(segment.block, segment.block);
+      return;
+    }
+    const listed = playing.blocks && playing.blocks[segment.part]
+      ? playing.blocks[segment.part]! : null;
+    if (!listed) {
+      tell(null);
+      return;
+    }
+    const groups: { kind: string; members: number[] }[] = [];
+    listed.forEach((block, index) => {
+      const element = block && Number.isInteger(block.element) ? block.element as number : null;
+      const last = groups[groups.length - 1];
+      if (last && element !== null && (last as { element?: number }).element === element) {
+        last.members.push(index);
+      } else {
+        groups.push({ kind: String(block && block.kind || ""), members: [index], ...(element !== null ? { element } : {}) } as { kind: string; members: number[] });
+      }
+    });
+    if (groups.length !== payload.kinds.length) {
+      tell(null);
+      return;
+    }
+    const mapped = new Map<number, number>();
+    for (let at = 0; at < groups.length; at += 1) {
+      if (groups[at]!.kind !== payload.kinds[at]) {
+        tell(null);
+        return;
+      }
+      for (const member of groups[at]!.members) mapped.set(member, at);
+    }
+    const model = mapped.get(segment.block);
+    tell(model === undefined ? null : model, model === undefined ? null : model);
   }
 
   /**
@@ -3557,7 +3600,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * read alone. Nothing calls this yet: the documents view wires it in a later stage.
    */
   async function readDocument(
-    doc: { key: string; title?: string; texts: readonly string[]; entry?: PreparedEntry | null; onReadingBlock?: DocumentReadingBlock },
+    doc: { key: string; title?: string; texts: readonly string[]; kinds?: readonly string[]; entry?: PreparedEntry | null; onReadingBlock?: DocumentReadingBlock },
     from: ReadFrom | null = null
   ) {
     const tapBegan = speechTimingNow();
@@ -3573,6 +3616,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     pendingRead = id;
     setReadState("working");
     const payload: DocumentPayload = { key, title: doc.title, entry: doc.entry ?? null, texts: doc.texts,
+      ...(doc.kinds ? { kinds: doc.kinds } : {}),
       ...(doc.onReadingBlock ? { onReadingBlock: doc.onReadingBlock } : {}) };
     if (readAloudPlayback !== "audio") {
       try {

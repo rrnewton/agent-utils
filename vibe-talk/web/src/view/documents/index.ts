@@ -10,6 +10,8 @@ export { createDocumentsSearch } from "./search.ts";
 export type { DocumentsSearch, DocumentsSearchDependencies, DocumentSearchHit } from "./search.ts";
 export type { DocumentsReader, DocumentsReaderDependencies, OpenDocument } from "./reader.ts";
 export { renderDocumentMarkdown, documentHeadingId } from "./render.ts";
+export { documentReadBlocks } from "./blocks.ts";
+export type { DocumentReadBlock } from "./blocks.ts";
 export { createViewSelector, nextView, otherViews, VIEW_CARDS_SETTLE_MS, VIEW_LABELS, VIEW_ORDER } from "./selector.ts";
 export type { DocViewName, ViewSelector, ViewSelectorDependencies } from "./selector.ts";
 export type { DocumentMention, DocumentRow, DocumentsListAnswer } from "./types.ts";
@@ -34,7 +36,11 @@ export interface DocumentsViewDependencies {
   toFoot(scroller: HTMLElement): void;
   byId(id: string): HTMLElement;
   /** Read one document aloud through the page's shared read-aloud owner (`#1039`). */
-  readDocument(doc: { key: string; title?: string; texts: readonly string[] }): unknown;
+  readDocument(doc: {
+    key: string; title?: string; texts: readonly string[];
+    kinds?: readonly string[];
+    onReadingBlock?: (block: number | null, element?: number | null) => unknown;
+  }, from?: { part: number; block: number | null }): unknown;
   /** Stop the reading of document `key`, where that document's is the one playing; no other. */
   stopSpeaking?(key: string): unknown;
   onStatus?(text: string): unknown;
