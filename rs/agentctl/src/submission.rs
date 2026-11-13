@@ -3376,6 +3376,19 @@ mod tests {
     }
 
     #[test]
+    fn codex_0_169_idle_staged_text_with_only_a_warning_hint_row() {
+        // Measured 2026-11-13: idle, text staged, the hint row holds only the right-aligned
+        // warning notice; the status row above it is still footer.
+        let screen = "\u{2022} Done\n\n\
+                      \u{203a} Coordinator note for the lane\n\n\
+                      \x20 GPT-6.1-Sol medium \u{b7} /work/slot \u{b7} Raise coverage\n\
+                      \x20                                                    \u{26a0} 1 warning \u{b7} f2 to view\n";
+        let view = composer_view("codex", screen).unwrap_or_else(|| panic!("no composer"));
+        assert_eq!(view.composer_solid.trim(), "Coordinator note for the lane", "{view:?}");
+        assert!(view.footer.contains("GPT-6.1-Sol"), "{view:?}");
+    }
+
+    #[test]
     fn codex_0_169_busy_staged_text_keeps_the_status_row_in_the_footer() {
         // Measured 2026-11-13: with a turn running and text staged, v0.169 swaps its hint row
         // for "tab to queue message"; the status row above it must stay footer, or the staged
