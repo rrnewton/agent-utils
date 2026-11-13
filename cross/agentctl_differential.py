@@ -9,6 +9,7 @@ are advertised separately and are not treated as shared capabilities.
 from __future__ import annotations
 
 import json
+import fcntl
 import hashlib
 import os
 import re
@@ -105,6 +106,49 @@ def _valid_foreign_shell_identity(value: object) -> bool:
         and all(isinstance(item, int) and not isinstance(item, bool) and item > 0
                 for item in positive_fields)
     )
+
+
+def _queue_quiet(root: Path) -> bool:
+    """Whether no drain holds this case's worker queue.
+
+    Quiescence is probed from the filesystem: nothing waits in the queue
+    inbox or in flight, and the queue delivery lock can be taken without
+    blocking. Never a wall-clock judgement.
+    """
+    queue = root / "registry/agents/worker/queue"
+    for stage in ("inbox", "inflight"):
+        stage_dir = queue / stage
+        if stage_dir.is_dir() and any(stage_dir.iterdir()):
+            return False
+    delivery_lock = queue / ".delivery.lock"
+    if delivery_lock.exists():
+        try:
+            fd = os.open(delivery_lock, os.O_RDWR)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+    return True
+
+
+def _wait_for_queue_quiescence(case: PairCase, report: Report, label: str) -> None:
+    """Wait until both editions' queues are quiet (an event, not a sleep).
+
+    A repeated send issued while the first send's drain still holds the
+    queue lock can exhaust the 600 s send deadline and split the editions
+    (rc 75 pending vs rc 76 refused) under load; the drain's lock release
+    is the event this waits for, bounded by the shared hang guard.
+    """
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if all(_queue_quiet(root) for root in (case.python_root, case.rust_root)):
+            return
+        time.sleep(0.05)
+    report.require(label, False, "queue never became quiescent before the repeated send")
 
 
 def _json(outcome: Outcome) -> object:
@@ -852,6 +896,8 @@ def _profiles(harness: Harness, report: Report) -> None:
             })
             # Same split as redraw-refusal just above: rc 76 from both
             # editions, no exact failure-stdout comparison (#1067).
+            _wait_for_queue_quiescence(case, report,
+                                       "primary/profile/watermelon/repeated-quiescence")
             repeated_outcomes = harness.invoke(case, (
                 "send", "worker", prompt, "--message-id", "muse-repeat",
                 "--working-timeout", "0.05", *_COMMON,
@@ -2162,6 +2208,7 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
         paused = harness._invoke_one(consumer, root, ("pause", "worker", *_COMMON))
         refused = harness._invoke_one(producer, root, ("send", "worker", "human owns input", *_COMMON))
         resumed = harness._invoke_one(consumer, root, ("resume", "worker", *_COMMON))
+        _wait_for_queue_quiescence(case, report, f"primary/interop/{label}/quiescence")
         sent = harness._invoke_one(consumer, root, ("send", "worker", "shared primary registry", *_COMMON))
         stopped = harness._invoke_one(producer, root, ("stop", "worker", *_COMMON))
         outcomes = (started, paused, resumed, sent, stopped)
