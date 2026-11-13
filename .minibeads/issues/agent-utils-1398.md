@@ -1,6 +1,6 @@
 ---
 title: 'reading-width-handle-gate: the reading-width handle stands on the message column and only past its widest width'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -32,3 +32,11 @@ The handle (`#width-grip`, `mountReadingWidth`) was positioned against the scree
 # Notes
 
 Reserved as #1398 for the evening Discuss batch. Neighbours: #1397 mu-dockclose (docked-close grid), #1395 mu-discussbind, #1386 mu-discussui — no shared files with this change. Screenshots from the browser walks are linked in the landing report to the coordinator.
+
+## Resolution
+
+[watermelon-full-preview] Landed in the next small batch as `46e6a929` on agent-utils main (head at landing; deployed on landing) and deployed. Final behavior, as landed:
+
+- The handle stands on the message column's measured right edge, body over the margin beside the text; it is shown only while that column is clearly wider than `DEFAULT_READING_CH` (72ch, live-font measure, 6ch hysteresis: hide below 72ch, return past 78ch). Below the gate the text is full width and a remembered narrower width is kept but not applied. Re-evaluated on resize, Discuss dock/undock/maximize, and column switches (`view/settings/screen.ts`, `styles/voice/20-desktop-regime.css`).
+- In two columns there is no handle at any width (`#373` spans Main across its half); the Acceptance line above about a capped main column in two columns was superseded during batch integration and does not describe the landed code.
+- Evidence on the landed tree's branch: settings/channel unit tests (threshold fed measured widths, hysteresis from both states, column-edge positioning), page columns/shell/settings suites, `make typecheck`, and Chromium walks — `two_column_browser`, `scroll_stability_browser`, `column_overscroll_browser`, `two-column-splitter-browser`, `read-modes-browser`, plus a measured grip walk at 1280x800, 1920x1080 and 3440x1440 in one/two columns with Discuss closed, overlaying and docked — all green. Screenshots: pxl.cl/l9xCs, pxl.cl/l9xGh, pxl.cl/l9xGK, pxl.cl/l9xHt, pxl.cl/l9xJ9, pxl.cl/l9xJF.
