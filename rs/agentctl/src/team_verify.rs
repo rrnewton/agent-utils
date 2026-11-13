@@ -10,7 +10,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -32,8 +32,6 @@ const WATCH_FRESH_SECONDS: f64 = 900.0;
 pub const TEACH_AUTO_MODE_DIALOG: &str = "Teach auto mode about your environment?";
 /// Screen rows read per pane for `pane-at-prompt`.
 const PANE_LINES: usize = 60;
-/// Most archived-inbox rows one report carries before summarizing the rest.
-const MAX_ARCHIVED_ROWS: usize = 20;
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -215,12 +213,23 @@ pub(crate) fn desired_live_rows(
                         )
                     } else {
                         let profile = value["profile"].as_str().unwrap_or("its recorded profile");
+                        // Names only, as status prints them: the recorded
+                        // launch environment revive now replays.
+                        let env_keys = value["launch_env_keys"]
+                            .as_array()
+                            .map(Vec::len)
+                            .unwrap_or_default();
+                        let env_note = if env_keys > 0 {
+                            format!(", {env_keys} launch env key(s) recorded")
+                        } else {
+                            String::new()
+                        };
                         row(
                             "desired-live",
                             "pass",
                             Some(name),
                             format!(
-                                "{name} live ({}) as {profile}, no profile drift",
+                                "{name} live ({}) as {profile}, no profile drift{env_note}",
                                 if cloud {
                                     "agentcloud session"
                                 } else {
@@ -488,102 +497,115 @@ pub(crate) fn ack_row(
     }
 }
 
-/// Archived inbox evidence for `queued-not-archived`: a desired agent's
-/// archived generation holding inbox files archived at or after this boot.
-/// Archive generations are `archive/<name>` or `archive/<name>-<digits...>`.
-pub(crate) fn archived_rows(
-    registry: &Path,
+/// `queued-not-archived` from the fields revive itself records: status
+/// carries `queued_archived_undelivered` per agent (cancelled plus
+/// revive-quarantined failed items), and this boot's restore report rows
+/// carry per-agent `queued_delivered`/`queued_archived`/
+/// `queued_uncertain`/`queued_pending` counts. Status is primary (it
+/// survives later restarts); the report catches agents whose queues were
+/// since cleaned. Pure over collected statuses and the parsed report.
+pub(crate) fn queued_rows(
     desired: &[String],
-    boot_time: Option<u64>,
+    statuses: &[(String, std::result::Result<Value, String>)],
+    report: Option<&Value>,
 ) -> Vec<Value> {
-    let archive = registry.join("archive");
-    let boundary = boot_time.unwrap_or_default();
-    let mut found: Vec<(String, PathBuf, u64)> = Vec::new();
-    if let Ok(entries) = fs::read_dir(&archive) {
-        let mut generations: Vec<PathBuf> = entries
-            .filter_map(|entry| entry.ok().map(|found| found.path()))
-            .filter(|path| path.is_dir())
-            .collect();
-        generations.sort();
-        for generation in generations {
-            let Some(dir_name) = generation.file_name().and_then(|name| name.to_str()) else {
+    let mut fails: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut failed_agents: Vec<&str> = Vec::new();
+    let mut sourced = false;
+    for name in desired {
+        let status = statuses
+            .iter()
+            .find(|(known, _)| known == name)
+            .and_then(|(_, found)| found.as_ref().ok());
+        match status.and_then(|value| value["queued_archived_undelivered"].as_u64()) {
+            Some(0) => sourced = true,
+            Some(count) => {
+                sourced = true;
+                failed_agents.push(name);
+                fails.push(row(
+                    "queued-not-archived",
+                    "fail",
+                    Some(name),
+                    format!(
+                        "{name}: {count} queued item(s) archived undelivered by revive (status queued_archived_undelivered)"
+                    ),
+                    Some(format!(
+                        "recover them from the queue of {name} (cancelled/ and failed/) and send again"
+                    )),
+                ));
+            }
+            None => skipped.push(row(
+                "queued-not-archived",
+                "skipped",
+                Some(name),
+                format!("{name} status carries no queued_archived_undelivered"),
+                None,
+            )),
+        }
+    }
+    let mut delivered = 0_u64;
+    if let Some(report) = report {
+        sourced = true;
+        let mut report_rows: Vec<&Value> = report["agents"]
+            .as_array()
+            .map(|rows| rows.iter().collect())
+            .unwrap_or_default();
+        if report["coordinator"].is_object() {
+            report_rows.push(&report["coordinator"]);
+        }
+        for found in report_rows {
+            let Some(name) = found["name"].as_str() else {
                 continue;
             };
-            let Some(owner) = desired.iter().find(|name| {
-                dir_name == name.as_str()
-                    || dir_name
-                        .strip_prefix(name.as_str())
-                        .and_then(|rest| rest.strip_prefix('-'))
-                        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
-            }) else {
+            if !desired.iter().any(|wanted| wanted == name) {
                 continue;
-            };
-            let inbox = generation.join("queue/inbox");
-            let Ok(files) = fs::read_dir(&inbox) else {
-                continue;
-            };
-            let mut paths: Vec<PathBuf> = files
-                .filter_map(|entry| entry.ok().map(|found| found.path()))
-                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-                .collect();
-            paths.sort();
-            for path in paths {
-                let modified = fs::metadata(&path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
-                    .map(|elapsed| elapsed.as_secs())
-                    .unwrap_or_default();
-                // A missing mtime (0) predates any boot boundary, so an
-                // unreadable stamp never invents an outage loss.
-                if modified >= boundary && (boundary > 0 || modified > 0) {
-                    found.push((owner.clone(), path, modified));
-                }
+            }
+            delivered += found["queued_delivered"].as_u64().unwrap_or_default();
+            let archived = found["queued_archived"].as_u64().unwrap_or_default();
+            let uncertain = found["queued_uncertain"].as_u64().unwrap_or_default();
+            if (archived > 0 || uncertain > 0) && !failed_agents.contains(&name) {
+                fails.push(row(
+                    "queued-not-archived",
+                    "fail",
+                    Some(name),
+                    format!(
+                        "{name}: restore report counts {archived} queued archived, {uncertain} uncertain ({} delivered, {} pending)",
+                        found["queued_delivered"].as_u64().unwrap_or_default(),
+                        found["queued_pending"].as_u64().unwrap_or_default()
+                    ),
+                    Some(format!(
+                        "recover them from the queue of {name} (cancelled/ and failed/) and send again"
+                    )),
+                ));
             }
         }
     }
-    if found.is_empty() {
-        return vec![row(
-            "queued-not-archived",
-            "pass",
-            None,
-            "no desired agent has inbox files archived this boot".to_owned(),
-            None,
-        )];
+    if !fails.is_empty() {
+        fails.extend(skipped);
+        return fails;
     }
-    let total = found.len();
-    let mut rows: Vec<Value> = found
-        .into_iter()
-        .take(MAX_ARCHIVED_ROWS)
-        .map(|(owner, path, modified)| {
-            row(
-                "queued-not-archived",
-                "fail",
-                Some(&owner),
-                format!(
-                    "{} archived at unix {modified} ({}); queued prompts must be delivered, never archived",
-                    owner,
-                    path.display()
-                ),
-                Some(format!(
-                    "recover the prompt from {} and send it to {owner} again",
-                    path.display()
-                )),
-            )
-        })
-        .collect();
-    if total > MAX_ARCHIVED_ROWS {
-        rows.push(row(
+    if !sourced {
+        return vec![row(
             "queued-not-archived",
             "fail",
             None,
-            format!(
-                "and {} more archived inbox files this boot",
-                total - MAX_ARCHIVED_ROWS
-            ),
-            Some(format!("list {}", archive.display())),
-        ));
+            "no queued evidence: no status counts and no restore report this boot".to_owned(),
+            Some("read `agentctl status NAME` for queued_archived_undelivered".to_owned()),
+        )];
     }
+    let mut rows = vec![row(
+        "queued-not-archived",
+        "pass",
+        None,
+        if delivered > 0 {
+            format!("no queued items archived undelivered; restore report delivered {delivered}")
+        } else {
+            "no queued items archived undelivered".to_owned()
+        },
+        None,
+    )];
+    rows.extend(skipped);
     rows
 }
 
@@ -755,8 +777,13 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
     options: &VerifyOptions,
 ) -> Result<Value> {
     let epoch = host.epoch()?;
-    let boot_id = host.boot_id()?;
+    let boot_id = epoch.boot_id.clone();
     let now = host.now();
+    // This boot's restore report, through restore's own candidate order
+    // (current restore/reports/ first, earlier locations after).
+    let boot_report = crate::restore::candidate_report_paths(registry, config, &boot_id)
+        .into_iter()
+        .find_map(|path| crate::restore::read_report(&path));
     let manager = ManagedAgents::new(client, registry)?;
     let desired = desired_set(registry, config)?;
     let statuses: Vec<(String, std::result::Result<Value, String>)> = desired
@@ -817,7 +844,7 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
         ));
     }
     checks.extend(bridge_rows(client, registry, &pins));
-    checks.extend(archived_rows(registry, &desired.names, host.boot_time()));
+    checks.extend(queued_rows(&desired.names, &statuses, boot_report.as_ref()));
     let health_path = watch_health_path(options.state_dir.as_deref());
     let health = health_path.as_deref().and_then(crate::restore::read_report);
     checks.push(watcher_row(
@@ -907,11 +934,8 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
         )),
         Some(coordinator) => {
             let notice_id = format!("restore-{}", &boot_id[..8.min(boot_id.len())]);
-            let report_dir = config
-                .report_dir
-                .clone()
-                .unwrap_or_else(|| registry.join("restore-reports"));
-            let finished = crate::restore::read_report(&report_dir.join(format!("{boot_id}.json")))
+            let finished = boot_report
+                .as_ref()
                 .and_then(|found| found["finished_at"].as_f64());
             let age = finished.map(|when| (now - when).max(0.0));
             match manager.message_state(coordinator, &notice_id) {
@@ -935,7 +959,7 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
     Ok(json!({
         "schema": VERIFY_SCHEMA,
         "registry": registry,
-        "epoch": epoch,
+        "epoch": epoch.as_json(),
         "boot_id": boot_id,
         "checked_at": now,
         "ok": ok,
@@ -954,8 +978,6 @@ pub fn verify_ok(report: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::SystemTime;
-
     fn temp_registry(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("team-verify-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1162,24 +1184,72 @@ mod tests {
     }
 
     #[test]
-    fn archived_inbox_this_boot_fails_older_does_not() {
-        let registry = temp_registry("archive");
-        let inbox = registry.join("archive/lane-a-20261112/queue/inbox");
-        fs::create_dir_all(&inbox).unwrap();
-        let lost = inbox.join("m1.json");
-        fs::write(&lost, "{}").unwrap();
-        let file = fs::File::open(&lost).unwrap();
-        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2000))
-            .unwrap();
-        let desired = vec!["lane-a".to_owned()];
-        let rows = archived_rows(&registry, &desired, Some(1000));
+    fn queued_rows_read_status_counts_then_report_counts() {
+        let desired = vec![
+            "lane-a".to_owned(),
+            "lane-b".to_owned(),
+            "lane-c".to_owned(),
+        ];
+        // lane-a is clean in status but archived in the report (queue since
+        // cleaned); lane-b archived in both (one row, status wins); lane-c
+        // clean everywhere with deliveries counted.
+        let statuses = vec![
+            (
+                "lane-a".to_owned(),
+                Ok(json!({"queued_archived_undelivered": 0})),
+            ),
+            (
+                "lane-b".to_owned(),
+                Ok(json!({"queued_archived_undelivered": 2})),
+            ),
+            (
+                "lane-c".to_owned(),
+                Ok(json!({"queued_archived_undelivered": 0})),
+            ),
+        ];
+        let report = json!({"agents": [
+            {"name": "lane-a", "queued_delivered": 3, "queued_archived": 1, "queued_uncertain": 0, "queued_pending": 0},
+            {"name": "lane-b", "queued_delivered": 0, "queued_archived": 2, "queued_uncertain": 1, "queued_pending": 0},
+            {"name": "lane-c", "queued_delivered": 5, "queued_archived": 0, "queued_uncertain": 0, "queued_pending": 1},
+        ]});
+        let rows = queued_rows(&desired, &statuses, Some(&report));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|found| found["status"] == "fail"));
+        assert!(rows[0]["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("queued_archived_undelivered"));
+        // Clean everywhere passes once, deliveries named.
+        let clean = vec![
+            (
+                "lane-a".to_owned(),
+                Ok(json!({"queued_archived_undelivered": 0})),
+            ),
+            (
+                "lane-b".to_owned(),
+                Ok(json!({"queued_archived_undelivered": 0})),
+            ),
+            (
+                "lane-c".to_owned(),
+                Ok(json!({"queued_archived_undelivered": 0})),
+            ),
+        ];
+        let rows = queued_rows(
+            &desired,
+            &clean,
+            Some(&json!({"agents": [
+                {"name": "lane-c", "queued_delivered": 5, "queued_archived": 0, "queued_uncertain": 0, "queued_pending": 1},
+            ]})),
+        );
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["status"], "fail");
-        assert_eq!(rows[0]["subject"], "lane-a");
-        // Archived before this boot is history, not an outage loss.
-        let rows = archived_rows(&registry, &desired, Some(3000));
         assert_eq!(rows[0]["status"], "pass");
-        let _ = fs::remove_dir_all(&registry);
+        assert!(rows[0]["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("delivered 5"));
+        // No evidence at all never passes.
+        let rows = queued_rows(&desired, &[], None);
+        assert_eq!(rows[0]["status"], "fail");
     }
 
     #[test]
