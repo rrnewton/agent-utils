@@ -19350,14 +19350,108 @@ class _GitVcs:
         if include_ignored:
             arguments.append("--ignored=matching")
         arguments.extend(("--", *pathspecs))
-        result = self._run(
-            checkout,
-            arguments,
-            env_overrides=(
-                None if refresh_index else {"GIT_OPTIONAL_LOCKS": "0"}
-            ),
-        )
+        try:
+            result = self._run(
+                checkout,
+                arguments,
+                env_overrides=(
+                    None if refresh_index else {"GIT_OPTIONAL_LOCKS": "0"}
+                ),
+            )
+        except Refusal as exc:
+            if "failed in submodule" not in str(exc):
+                raise
+            # A fence rename leaves a submodule's recorded core.worktree
+            # naming the original slot path, so Git cannot chdir into it
+            # (#1483). Rewrite no on-disk Git file: read the superproject
+            # without recursing, read each submodule at its current path,
+            # and synthesize the lines Git would have printed.
+            return self._status_via_submodule_overrides(
+                checkout, pathspecs, include_ignored=include_ignored
+            )
         return result.stdout
+
+    def _status_via_submodule_overrides(
+        self, checkout: Path, pathspecs: Sequence[str], *, include_ignored: bool
+    ) -> str:
+        """`status` when a submodule's recorded worktree is stale (#1483).
+
+        Per-invocation only: the superproject is read with
+        ``--ignore-submodules=all`` and every initialized gitlink is read
+        at its current path, whose `.git` file still resolves. No Git
+        configuration file is rewritten, so a refused or aborted removal
+        leaves the shared repository metadata exactly as it was.
+        """
+        arguments = ["status", "--porcelain=v2", "--untracked-files=all"]
+        if include_ignored:
+            arguments.append("--ignored=matching")
+        arguments.extend(("--ignore-submodules=all", "--", *pathspecs))
+        lines = self._run(checkout, arguments).stdout.splitlines()
+        staged = self._run(
+            checkout, ["ls-files", "--stage", "-z", "--", *pathspecs]
+        ).stdout
+        head_tree = self._run(
+            checkout, ["ls-tree", "-z", "HEAD", "--", *pathspecs], check=False
+        ).stdout
+        head_links: dict[str, str] = {}
+        for entry in head_tree.split("\0"):
+            meta, _tab, name = entry.partition("\t")
+            fields = meta.split()
+            if len(fields) == 3 and fields[0] == "160000" and name:
+                head_links[name] = fields[2]
+        synthesized: list[str] = []
+        for entry in staged.split("\0"):
+            meta, _tab, name = entry.partition("\t")
+            fields = meta.split()
+            if len(fields) != 3 or fields[0] != "160000" or not name:
+                continue
+            index_link = fields[1]
+            submodule = checkout / name
+            if not (submodule / ".git").exists():
+                continue
+            try:
+                sub_output = self.status(
+                    submodule, (), include_ignored=False, refresh_index=False
+                )
+            except Refusal as exc:
+                raise Refusal(
+                    f"Git refused in {checkout}: git status failed in submodule "
+                    f"{name}: {exc}"
+                ) from exc
+            sub_head = self._run(
+                submodule, ["rev-parse", "--verify", "HEAD^{commit}"], check=False
+            ).stdout.strip()
+            if not SHA_RE.fullmatch(sub_head):
+                continue
+            modified = any(
+                not line.startswith(("?", "!"))
+                for line in sub_output.splitlines()
+                if line
+            )
+            untracked = any(
+                line.startswith("?") for line in sub_output.splitlines()
+            )
+            head_link = head_links.get(name, "0" * 40)
+            commit_changed = sub_head != index_link
+            if not (commit_changed or modified or untracked or index_link != head_link):
+                continue
+            x = "M" if index_link != head_link else "."
+            score = (
+                "S"
+                + ("C" if commit_changed else ".")
+                + ("M" if modified else ".")
+                + ("U" if untracked else ".")
+            )
+            synthesized.append(
+                f"1 {x}M {score} 160000 160000 160000 {head_link} {index_link} {name}"
+            )
+
+        def path_of(line: str) -> str:
+            parts = line.split(" ", 8)
+            return parts[-1].split("\t")[0] if parts else line
+
+        merged = sorted([*lines, *synthesized], key=path_of)
+        return "".join(f"{line}\n" for line in merged)
 
     def uncommitted_handoff_paths(
         self, checkout: Path, cache_globs: Sequence[str] = ()
@@ -27474,10 +27568,13 @@ def _local_salvage_receipt_payload(
     drift: _CheckoutDrift | None = None,
     shared: bool = False,
     thin_proof: tuple[tuple[str, str], ...] = (),
+    superseded: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     extra: dict[str, object] = (
         {} if drift is None else {_CHECKOUT_DRIFT_RECEIPT_KEY: drift.to_obj()}
     )
+    if superseded is not None:
+        extra["superseded_archive"] = dict(superseded)
     if shared:
         extra["shared_bundle"] = True
     if thin_proof:
@@ -27929,17 +28026,151 @@ def _archive_salvage_locally(
         shared=shared,
         thin_proof=thin_proof,
     )
+    superseded_record: dict[str, object] | None = None
     if receipt_path.exists() or receipt_path.is_symlink():
         contents = _read_bounded_regular_file(
             receipt_path,
             "local salvage archive receipt",
             _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
         )
-        observed = _strict_json_object(contents, "local salvage archive receipt")
-        if not _json_equal(observed, expected_receipt):
-            raise Refusal(
-                f"local salvage archive receipt disagrees with the current checkout: {receipt_path}"
+        try:
+            observed: object = _strict_json_object(
+                contents, "local salvage archive receipt"
             )
+        except StateError:
+            observed = None
+        if not _json_equal(observed, expected_receipt):
+            # A receipt from an interrupted or earlier removal is partial
+            # evidence, not a permanent wedge (#1484): keep the whole old
+            # archive directory aside with its reason, then archive the
+            # current checkout afresh and record the supersede. Only an
+            # internally intact archive may be superseded: a bundle that
+            # no longer matches its own receipt is tampered evidence and
+            # still refuses, exactly as before.
+            observed_map = observed if isinstance(observed, Mapping) else {}
+            actual_digest, actual_size = _sha256_regular_file(
+                bundle, "local salvage bundle"
+            )
+            intact = (
+                observed_map.get("bundle_sha256") == actual_digest
+                and observed_map.get("bundle_bytes") == actual_size
+            )
+            if intact:
+                try:
+                    _verify_local_salvage_bundle(
+                        bundle,
+                        actual_digest,
+                        actual_size,
+                        archive_ref,
+                        facts.commit,
+                        vcs,
+                        prerequisites=tuple(
+                            commit for _ref, commit in thin_proof
+                        ),
+                        prerequisite_stores=_salvage_bundle_object_env(
+                            vcs, path
+                        )[0],
+                    )
+                except Refusal:
+                    intact = False
+            if not intact:
+                raise Refusal(
+                    f"local salvage archive receipt disagrees with the current checkout: {receipt_path}"
+                )
+            old_sha256 = hashlib.sha256(contents).hexdigest()
+            supersede_reason = (
+                "stale or partial salvage receipt from an interrupted or "
+                "earlier removal disagreed with the current checkout"
+            )
+            aside = receipt_path.parent.with_name(
+                f"{receipt_path.parent.name}.superseded-{old_sha256[:12]}"
+            )
+            counter = 2
+            while aside.exists() or aside.is_symlink():
+                aside = receipt_path.parent.with_name(
+                    f"{receipt_path.parent.name}.superseded-{old_sha256[:12]}-{counter}"
+                )
+                counter += 1
+            os.rename(receipt_path.parent, aside)
+            _atomic_write_json(
+                aside / "superseded.json",
+                {
+                    "reason": supersede_reason,
+                    "receipt_sha256": old_sha256,
+                    "superseded_by_commit": facts.commit,
+                },
+            )
+            print(
+                f"WARNING: {supersede_reason}: {receipt_path}; "
+                f"previous archive kept at {aside}",
+                file=sys.stderr,
+            )
+            superseded_record = {
+                "directory": str(aside),
+                "receipt_sha256": old_sha256,
+                "reason": supersede_reason,
+            }
+            _prepare_local_salvage_directory(checked_root, receipt_path.parent)
+            _ensure_no_symlink_components(
+                checked_root, receipt_path.parent, "local salvage archive"
+            )
+            if not shared:
+                checked_root, bundle, receipt_path, archive_ref = (
+                    _ensure_local_salvage_bundle(
+                        config,
+                        machine,
+                        slot,
+                        generation,
+                        checkout,
+                        path,
+                        facts,
+                        archive_root,
+                        vcs,
+                        thin_proof=thin_proof,
+                    )
+                )
+                bundle_digest, bundle_size = _sha256_regular_file(
+                    bundle, "local salvage bundle"
+                )
+                _verify_local_salvage_bundle(
+                    bundle,
+                    bundle_digest,
+                    bundle_size,
+                    archive_ref,
+                    facts.commit,
+                    vcs,
+                    prerequisites=tuple(commit for _ref, commit in thin_proof),
+                    prerequisite_stores=_salvage_bundle_object_env(vcs, path)[0],
+                )
+            expected_receipt = _local_salvage_receipt_payload(
+                checked_root,
+                bundle,
+                archive_ref,
+                machine,
+                slot,
+                generation,
+                checkout,
+                facts,
+                bundle_digest,
+                bundle_size,
+                drift=drift,
+                shared=shared,
+                thin_proof=thin_proof,
+                superseded=superseded_record,
+            )
+            _atomic_write_json(receipt_path, expected_receipt)
+            contents = _read_bounded_regular_file(
+                receipt_path,
+                "local salvage archive receipt",
+                _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT,
+            )
+            if not _json_equal(
+                _strict_json_object(contents, "local salvage archive receipt"),
+                expected_receipt,
+            ):
+                raise Refusal(
+                    f"local salvage archive receipt readback failed: {receipt_path}"
+                )
     else:
         _atomic_write_json(receipt_path, expected_receipt)
         contents = _read_bounded_regular_file(
@@ -28034,6 +28265,11 @@ def _archive_salvage_locally(
             else {_CHECKOUT_DRIFT_RECEIPT_KEY: drift.to_obj()}
         ),
         **({"shared_bundle": True, "bundle_reused": reused} if shared else {}),
+        **(
+            {}
+            if superseded_record is None
+            else {"superseded_archive": superseded_record}
+        ),
     }
 
 
@@ -28115,6 +28351,7 @@ def _assert_local_salvage_receipt(
         "salvage receipt.archive_bundle_bytes",
         minimum=1,
     )
+    superseded_value = salvage.get("superseded_archive")
     expected_receipt = _local_salvage_receipt_payload(
         root,
         bundle,
@@ -28129,6 +28366,11 @@ def _assert_local_salvage_receipt(
         drift=_checkout_drift_from_receipt(salvage),
         shared=shared,
         thin_proof=thin_proof,
+        superseded=(
+            cast("Mapping[str, object]", superseded_value)
+            if isinstance(superseded_value, Mapping)
+            else None
+        ),
     )
     observed_receipt = _strict_json_object(
         receipt_contents, "local salvage archive receipt"
