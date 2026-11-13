@@ -1608,6 +1608,40 @@ def test_process_liveness_refuses_malformed_stat_reads(
     assert client.process_liveness(identity) == "unknown"
 
 
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_process_liveness_reads_a_vanished_record_as_death_only_with_exit_proof(
+    liveness_probe: _LivenessFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, identity, _observed = liveness_probe
+
+    def gone(_pid: int) -> ProcessStat:
+        raise client_module._ProcessGoneError(_pid)
+
+    monkeypatch.setattr(client, "_liveness_process_stat", gone)
+    monkeypatch.setattr(client, "_pidfd_exited", lambda _descriptor: True)
+    assert client.process_liveness(identity) == "dead"
+    monkeypatch.setattr(client, "_pidfd_exited", lambda _descriptor: False)
+    assert client.process_liveness(identity) == "unknown"
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
+def test_liveness_process_stat_reads_a_reaped_child_as_gone() -> None:
+    # Read under a condition (the child has been reaped), not a timer:
+    # the dead pid's record classifies as gone, never a parse refusal (#1495).
+    process = subprocess.Popen([os.path.realpath("/usr/bin/sleep"), "30"])
+    try:
+        own = HerdrClient._liveness_process_stat(os.getpid())
+        assert own.pid == os.getpid()
+        process.kill()
+        process.wait(timeout=5)
+        with pytest.raises(client_module._ProcessGoneError):
+            HerdrClient._liveness_process_stat(process.pid)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
 @pytest.mark.parametrize(
     ("flags", "outcome"),
     [(select.POLLIN, "dead"), (select.POLLIN | select.POLLHUP, "dead"),

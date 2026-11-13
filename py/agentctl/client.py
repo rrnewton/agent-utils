@@ -626,6 +626,10 @@ class ProcessInfo:
     foreground: tuple[tuple[int, str, str, str, str | None], ...]
 
 
+class _ProcessGoneError(Exception):
+    """The recorded process exited while its stat record was being read."""
+
+
 @dataclass(frozen=True)
 class CustomProcessIdentity:
     """Kernel identity of one pane-owned process generation."""
@@ -1438,12 +1442,46 @@ class HerdrClient:
 
     @staticmethod
     def _liveness_process_stat(pid: int) -> ProcessStat:
-        with open(f"/proc/{pid}/stat", "rb") as stream:
-            value = stream.read(8193)
-        parsed = parse_process_stat(value)
-        if not value or len(value) > 8192 or parsed is None or parsed.pid != pid or parsed.starttime < 1:
+        # A record that cannot be opened, reads back empty, or vanishes on
+        # the re-read a torn record gets is a process that exited, not a
+        # malformed live process (#1495); only a record that stays readable
+        # and unparseable is an invalid generation.
+        for attempt in range(10):
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as stream:
+                    value = stream.read(8193)
+            except (FileNotFoundError, ProcessLookupError):
+                raise _ProcessGoneError(pid) from None
+            if not value:
+                raise _ProcessGoneError(pid)
+            parsed = parse_process_stat(value)
+            if (
+                len(value) <= 8192
+                and parsed is not None
+                and parsed.pid == pid
+                and parsed.starttime >= 1
+            ):
+                return parsed
+            if attempt < 9:
+                time.sleep(0.05)
+                continue
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as stream:
+                    value = stream.read(8193)
+            except (FileNotFoundError, ProcessLookupError):
+                raise _ProcessGoneError(pid) from None
+            if not value:
+                raise _ProcessGoneError(pid)
+            parsed = parse_process_stat(value)
+            if (
+                len(value) <= 8192
+                and parsed is not None
+                and parsed.pid == pid
+                and parsed.starttime >= 1
+            ):
+                return parsed
             raise ValueError("invalid Linux process generation")
-        return parsed
+        raise AssertionError("unreachable")
 
     @staticmethod
     def _liveness_executable_identity(pid: int) -> tuple[int, int]:
@@ -1474,15 +1512,36 @@ class HerdrClient:
             raise ValueError("invalid pidfd exit indication")
         return True
 
+    def _gone_process_liveness(
+        self, descriptor: int, boot: str,
+    ) -> Literal["alive", "dead", "unknown"]:
+        """Verdict for a stat record that vanished mid-probe (#1495).
+
+        Death still needs the kernel's own exit indication under a stable
+        boot; a vanished record alone proves nothing.
+        """
+        try:
+            stable_boot = self._liveness_boot_identity() == boot
+            exited = self._pidfd_exited(descriptor)
+        except (OSError, UnicodeError, ValueError):
+            return "unknown"
+        return "dead" if stable_boot and exited else "unknown"
+
     def _pinned_process_liveness(
         self, expected: CustomProcessIdentity, descriptor: int, boot: str,
     ) -> Literal["alive", "dead", "unknown"]:
         if self._pidfd_exited(descriptor):
             return "dead" if self._liveness_boot_identity() == boot else "unknown"
-        first = self._liveness_process_stat(expected.pid)
+        try:
+            first = self._liveness_process_stat(expected.pid)
+        except _ProcessGoneError:
+            return self._gone_process_liveness(descriptor, boot)
         dead_states = ("Z", "X", "x")
         if first.starttime != expected.starttime_ticks or first.state in dead_states:
-            second = self._liveness_process_stat(expected.pid)
+            try:
+                second = self._liveness_process_stat(expected.pid)
+            except _ProcessGoneError:
+                return self._gone_process_liveness(descriptor, boot)
             stable_boot = self._liveness_boot_identity() == boot
             self._pidfd_exited(descriptor)
             if (stable_boot and first.starttime == second.starttime
@@ -1491,7 +1550,10 @@ class HerdrClient:
                 return "dead"
             return "unknown"
         image_before = self._liveness_executable_identity(expected.pid)
-        second = self._liveness_process_stat(expected.pid)
+        try:
+            second = self._liveness_process_stat(expected.pid)
+        except _ProcessGoneError:
+            return self._gone_process_liveness(descriptor, boot)
         image_after = self._liveness_executable_identity(expected.pid)
         stable_boot = self._liveness_boot_identity() == boot
         exited = self._pidfd_exited(descriptor)

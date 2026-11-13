@@ -2413,7 +2413,7 @@ pub fn process_chain(pid: u32) -> Vec<u32> {
     let mut chain = vec![pid];
     let mut current = u64::from(pid);
     while chain.len() < 256 {
-        let Ok(stat) = agent_queue::identity::read_process_stat(current) else {
+        let Ok(Some(stat)) = agent_queue::identity::read_process_stat(current) else {
             break;
         };
         let Ok(parent) = u32::try_from(stat.parent_pid) else {
@@ -2494,8 +2494,10 @@ pub fn own_session_writers(session: &str, agent_directory: &Path, own: &str) -> 
         .filter(|pid| {
             !pinned.iter().any(|(pinned, ticks)| {
                 pinned == pid
-                    && agent_queue::identity::read_process_stat(u64::from(*pid))
-                        .is_ok_and(|stat| stat.starttime_ticks == *ticks)
+                    && matches!(
+                        agent_queue::identity::read_process_stat(u64::from(*pid)),
+                        Ok(Some(stat)) if stat.starttime_ticks == *ticks
+                    )
             })
         })
         .collect()

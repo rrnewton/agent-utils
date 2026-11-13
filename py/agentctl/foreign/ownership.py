@@ -137,24 +137,54 @@ def valid_boot_id(value: object) -> bool:
     return isinstance(value, str) and _BOOT_ID.fullmatch(value) is not None
 
 
+def _read_stat_bytes(pid: int) -> bytes:
+    """The raw bytes of one process's stat record."""
+    return (PROC / str(pid) / "stat").read_bytes()
+
+
 def read_stat(pid: int) -> Optional[ProcessStat]:
     """Return one process's identity fields, or ``None`` only for positive disappearance.
 
-    Unreadable or malformed procfs evidence is not a death certificate and must
-    not authorize later process signalling.
+    A record that cannot be opened, reads back empty, or vanishes on the
+    re-read a torn record gets is a process that exited, not malformed
+    evidence (#1495 revive-differential-proc-stat-parse-under-load).
+    Unreadable or stably malformed procfs evidence is not a death certificate
+    and must not authorize later process signalling.
     """
-    try:
-        raw = (PROC / str(pid) / "stat").read_bytes()
-    except (FileNotFoundError, ProcessLookupError):
-        return None
-    except OSError as exc:
-        raise AgentOperationError(
-            "runner_identity_unknown", f"cannot read runner process {pid} identity: {exc}"
-        ) from exc
-    parsed = parse_process_stat(raw)
-    if parsed is None or parsed.pid != pid:
+    for attempt in range(10):
+        try:
+            raw = _read_stat_bytes(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except OSError as exc:
+            raise AgentOperationError(
+                "runner_identity_unknown", f"cannot read runner process {pid} identity: {exc}"
+            ) from exc
+        if not raw:
+            return None
+        parsed = parse_process_stat(raw)
+        if parsed is not None and parsed.pid == pid:
+            return parsed
+        if attempt < 9:
+            time.sleep(0.05)
+            continue
+        # One last read separates a record that vanished mid-exit from a
+        # stable malformed record of a live process.
+        try:
+            raw = _read_stat_bytes(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+        except OSError as exc:
+            raise AgentOperationError(
+                "runner_identity_unknown", f"cannot read runner process {pid} identity: {exc}"
+            ) from exc
+        if not raw:
+            return None
+        parsed = parse_process_stat(raw)
+        if parsed is not None and parsed.pid == pid:
+            return parsed
         raise AgentOperationError("runner_identity_unknown", f"cannot parse runner process {pid} identity")
-    return parsed
+    raise AssertionError("unreachable")
 
 
 def _quiet_stat(pid: int) -> Optional[ProcessStat]:

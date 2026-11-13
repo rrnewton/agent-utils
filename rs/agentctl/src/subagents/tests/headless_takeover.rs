@@ -210,6 +210,7 @@ fn a_stopping_wrapper_ends_only_writers_of_its_own_session_that_no_other_record_
     std::fs::create_dir_all(&other).unwrap();
     let ticks = agent_queue::identity::read_process_stat(u64::from(pinned.id()))
         .unwrap()
+        .unwrap()
         .starttime_ticks;
     std::fs::write(
         other.join("agent.json"),

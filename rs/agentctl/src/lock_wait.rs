@@ -122,7 +122,7 @@ pub fn register(registry: &Path, agent: &str, priority: bool) -> Option<Waiting>
     }
     let pid = u64::from(std::process::id());
     let starttime_ticks = agent_queue::identity::read_process_stat(pid)
-        .ok()?
+        .ok()??
         .starttime_ticks;
     let path = directory.join(format!(
         "{pid}-{}.json",
@@ -145,9 +145,11 @@ fn live_record(path: &Path) -> Option<Value> {
     let record: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     let pid = record.get("pid")?.as_u64()?;
     let ticks = record.get("starttime_ticks")?.as_u64()?;
-    agent_queue::identity::read_process_stat(pid)
-        .is_ok_and(|stat| stat.starttime_ticks == ticks)
-        .then_some(record)
+    matches!(
+        agent_queue::identity::read_process_stat(pid),
+        Ok(Some(stat)) if stat.starttime_ticks == ticks
+    )
+    .then_some(record)
 }
 
 /// The live waiter records for `agent`, the longest waiting first.

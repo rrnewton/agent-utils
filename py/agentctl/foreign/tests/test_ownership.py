@@ -373,6 +373,51 @@ def test_unsupported_pidfds_refuse_rather_than_signal_by_number(
     assert _running(child.pid)
 
 
+def _fake_stat_record(pid: int, starttime: int) -> bytes:
+    tail = ["S", "10", "20", "20", *(["0"] * 15), str(starttime), *(["0"] * 30)]
+    return f"{pid} (fake proc) {' '.join(tail)}\n".encode()
+
+
+def test_read_stat_treats_an_exited_process_record_as_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    fake_proc = tmp_path / "proc"
+    (fake_proc / "4243").mkdir(parents=True)
+    (fake_proc / "4243" / "stat").write_bytes(b"")
+    monkeypatch.setattr(ownership, "PROC", fake_proc)
+    # An empty record is what a teardown read leaves behind (#1495).
+    assert ownership.read_stat(4243) is None
+    # A missing record is positive disappearance.
+    assert ownership.read_stat(7777) is None
+    # A record that stays readable and malformed still refuses.
+    (fake_proc / "5555").mkdir(parents=True)
+    (fake_proc / "5555" / "stat").write_bytes(b"garbage")
+    with pytest.raises(lib.AgentOperationError, match="cannot parse"):
+        ownership.read_stat(5555)
+
+    # A truncated record that vanishes on re-read is a process mid-exit.
+    script: Iterator[bytes | FileNotFoundError] = iter(
+        [b"4244 (fake) S 10", FileNotFoundError("gone")]
+    )
+
+    def vanishing(_pid: int) -> bytes:
+        item = next(script)
+        if isinstance(item, FileNotFoundError):
+            raise item
+        return item
+
+    monkeypatch.setattr(ownership, "_read_stat_bytes", vanishing)
+    assert ownership.read_stat(4244) is None
+
+    # A truncated record that a re-read completes is the live record.
+    reads = iter([b"4245 (fake) S 10", _fake_stat_record(4245, 777)])
+    monkeypatch.setattr(
+        ownership, "_read_stat_bytes", lambda _pid: next(reads),
+    )
+    stat = ownership.read_stat(4245)
+    assert stat is not None and stat.starttime == 777
+
+
 def test_unreadable_boot_identity_is_not_a_death_certificate(
     child: subprocess.Popen[bytes], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

@@ -198,31 +198,95 @@ pub fn parse_process_stat(value: &[u8], expected_pid: u64) -> Result<ProcessStat
     })
 }
 
-/// Read and parse `/proc/PID/stat`.
+/// Whether `error` is the kernel's no-such-process answer (ESRCH).
+#[cfg(target_os = "linux")]
+fn is_no_such_process(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether `error` is the kernel's no-such-process answer (ESRCH).
+#[cfg(not(target_os = "linux"))]
+fn is_no_such_process(_error: &io::Error) -> bool {
+    false
+}
+
+/// One bounded read of a `/proc/PID/stat` record: `Ok(None)` when the
+/// process is gone (its record cannot be opened, or reads back empty), the
+/// record bytes otherwise. An oversize record is malformed evidence.
+fn read_stat_record(path: &Path) -> Result<Option<Vec<u8>>> {
+    let value = match fs::read(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound || is_no_such_process(&error) => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(Error::process(format!(
+                "cannot read process stat {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > PROC_STAT_BYTES {
+        return Err(Error::process(format!(
+            "process stat {} has an invalid length",
+            path.display()
+        )));
+    }
+    Ok(Some(value))
+}
+
+/// Read and parse `/proc/PID/stat`, or `Ok(None)` when the process is gone.
 ///
 /// A process exiting or exec'ing during the read can yield one truncated
 /// generation of the file, which parses as malformed; re-read briefly
-/// before reporting that (#1403). A vanished pid keeps its read error.
-pub fn read_process_stat(pid: u64) -> Result<ProcessStat> {
+/// before reporting that (#1403). A record that cannot be opened, reads
+/// back empty, or vanishes on a re-read is a process that exited, not a
+/// malformed live process (#1495 revive-differential-proc-stat-parse-under-load);
+/// only a record that stays readable and unparseable refuses.
+pub fn read_process_stat(pid: u64) -> Result<Option<ProcessStat>> {
     let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    read_process_stat_with(pid, &mut || read_stat_record(&path))
+}
+
+/// [`read_process_stat`] with its record reads supplied by `read`.
+fn read_process_stat_with(
+    pid: u64,
+    read: &mut dyn FnMut() -> Result<Option<Vec<u8>>>,
+) -> Result<Option<ProcessStat>> {
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let value = bounded_file(&path, PROC_STAT_BYTES, "process stat")?;
+        let Some(value) = read()? else {
+            return Ok(None);
+        };
         match parse_process_stat(&value, pid) {
-            Ok(stat) => return Ok(stat),
+            Ok(stat) => return Ok(Some(stat)),
             Err(error) if attempt < 10 => {
                 let _ = error;
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // One last read separates a record that vanished mid-exit
+                // from a stable malformed record of a live process.
+                return match read()? {
+                    None => Ok(None),
+                    Some(value) => match parse_process_stat(&value, pid) {
+                        Ok(stat) => Ok(Some(stat)),
+                        Err(_) => Err(error),
+                    },
+                };
+            }
         }
     }
 }
 
 /// The process group and start time of a live, non-zombie `pid`.
 fn process_stat(pid: u64) -> Result<(u64, u64)> {
-    let stat = read_process_stat(pid)?;
+    let stat = read_process_stat(pid)?
+        .ok_or_else(|| Error::process(format!("process {pid} exited while its stat was read")))?;
     if stat.state == b'Z' {
         return Err(Error::process(format!(
             "process stat for pid {pid} is incomplete or exited"
@@ -306,7 +370,7 @@ trait ProcessLivenessProbe {
     fn boot_identity(&mut self) -> Result<String>;
     fn pin(&mut self, pid: u64) -> io::Result<Self::Handle>;
     fn exited(&mut self, handle: &Self::Handle) -> Result<bool>;
-    fn process_stat(&mut self, pid: u64) -> Result<ProcessStat>;
+    fn process_stat(&mut self, pid: u64) -> Result<Option<ProcessStat>>;
     fn executable_identity(&mut self, pid: u64) -> Result<(u64, u64)>;
 }
 
@@ -329,15 +393,17 @@ impl ProcessLivenessProbe for KernelProcessLivenessProbe {
         pidfd_exited(handle)
     }
 
-    fn process_stat(&mut self, pid: u64) -> Result<ProcessStat> {
-        let stat = read_process_stat(pid)?;
+    fn process_stat(&mut self, pid: u64) -> Result<Option<ProcessStat>> {
+        let Some(stat) = read_process_stat(pid)? else {
+            return Ok(None);
+        };
         if stat.starttime_ticks == 0
             || stat.parent_pid > i32::MAX as u64
             || stat.process_group_id > i32::MAX as u64
         {
             return Err(Error::process("invalid Linux process generation"));
         }
-        Ok(stat)
+        Ok(Some(stat))
     }
 
     fn executable_identity(&mut self, pid: u64) -> Result<(u64, u64)> {
@@ -406,13 +472,29 @@ fn process_liveness_with_probe<P: ProcessLivenessProbe>(
                 ProcessLiveness::Unknown
             });
         }
-        let first = probe.process_stat(expected.pid)?;
+        // A record that vanished mid-probe means the generation exited
+        // between the pidfd check and this read (#1495); death still needs
+        // the kernel's own exit indication under a stable boot.
+        let gone = |probe: &mut P, handle: &P::Handle| -> Result<ProcessLiveness> {
+            let stable = stable_boot(probe)?;
+            let exited = probe.exited(handle)?;
+            Ok(if stable && exited {
+                ProcessLiveness::Dead
+            } else {
+                ProcessLiveness::Unknown
+            })
+        };
+        let Some(first) = probe.process_stat(expected.pid)? else {
+            return gone(probe, &handle);
+        };
         if first.starttime_ticks == 0 || !linux_process_state(first.state) {
             return Ok(ProcessLiveness::Unknown);
         }
         let dead_state = |state| matches!(state, b'Z' | b'X' | b'x');
         if first.starttime_ticks != expected.starttime_ticks || dead_state(first.state) {
-            let second = probe.process_stat(expected.pid)?;
+            let Some(second) = probe.process_stat(expected.pid)? else {
+                return gone(probe, &handle);
+            };
             if second.starttime_ticks == 0 || !linux_process_state(second.state) {
                 return Ok(ProcessLiveness::Unknown);
             }
@@ -431,7 +513,9 @@ fn process_liveness_with_probe<P: ProcessLivenessProbe>(
             );
         }
         let image_before = probe.executable_identity(expected.pid)?;
-        let second = probe.process_stat(expected.pid)?;
+        let Some(second) = probe.process_stat(expected.pid)? else {
+            return gone(probe, &handle);
+        };
         if second.starttime_ticks == 0 || !linux_process_state(second.state) {
             return Ok(ProcessLiveness::Unknown);
         }
@@ -774,7 +858,14 @@ fn walk(pid: u64) -> Result<Vec<Ancestor>> {
             )));
         }
         let stat = match read_process_stat(current) {
-            Ok(stat) => stat,
+            Ok(Some(stat)) => stat,
+            // The start may itself be gone; a vanished ancestor ends the chain.
+            Ok(None) if links.is_empty() => {
+                return Err(Error::process(format!(
+                    "process {current} exited while its ancestry was read"
+                )));
+            }
+            Ok(None) => break,
             // The start may itself be unreadable; an unreadable ancestor ends the chain.
             Err(error) if links.is_empty() => return Err(error),
             Err(_) => break,
@@ -810,7 +901,7 @@ mod tests {
         Boot(Result<String>),
         Pin(io::Result<()>),
         Exited(Result<bool>),
-        Stat(Result<ProcessStat>),
+        Stat(Result<Option<ProcessStat>>),
         Image(Result<(u64, u64)>),
     }
 
@@ -850,7 +941,7 @@ mod tests {
             }
         }
 
-        fn process_stat(&mut self, pid: u64) -> Result<ProcessStat> {
+        fn process_stat(&mut self, pid: u64) -> Result<Option<ProcessStat>> {
             assert_eq!(pid, 4242);
             match self.next() {
                 LivenessReply::Stat(value) => value,
@@ -900,9 +991,9 @@ mod tests {
             boot_reply(),
             LivenessReply::Pin(Ok(())),
             LivenessReply::Exited(Ok(false)),
-            LivenessReply::Stat(Ok(liveness_stat(b'S', 99))),
+            LivenessReply::Stat(Ok(Some(liveness_stat(b'S', 99)))),
             LivenessReply::Image(Ok((10, 11))),
-            LivenessReply::Stat(Ok(liveness_stat(b'R', 99))),
+            LivenessReply::Stat(Ok(Some(liveness_stat(b'R', 99)))),
             LivenessReply::Image(Ok((10, 11))),
             boot_reply(),
             LivenessReply::Exited(Ok(false)),
@@ -964,8 +1055,8 @@ mod tests {
                         boot_reply(),
                         LivenessReply::Pin(Ok(())),
                         LivenessReply::Exited(Ok(false)),
-                        LivenessReply::Stat(Ok(liveness_stat(state, ticks))),
-                        LivenessReply::Stat(Ok(liveness_stat(state, ticks))),
+                        LivenessReply::Stat(Ok(Some(liveness_stat(state, ticks)))),
+                        LivenessReply::Stat(Ok(Some(liveness_stat(state, ticks)))),
                         boot_reply(),
                         LivenessReply::Exited(Ok(false)),
                     ]
@@ -985,6 +1076,43 @@ mod tests {
                 ProcessLiveness::Unknown
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_liveness_reads_a_vanished_record_as_death_only_with_exit_proof() {
+        let expected = liveness_record();
+        // The record vanished after the pidfd said not-yet-exited; the
+        // recheck finds the kernel's exit indication under a stable boot.
+        assert_eq!(
+            inspect_script(
+                &expected,
+                vec![
+                    boot_reply(),
+                    LivenessReply::Pin(Ok(())),
+                    LivenessReply::Exited(Ok(false)),
+                    LivenessReply::Stat(Ok(None)),
+                    boot_reply(),
+                    LivenessReply::Exited(Ok(true)),
+                ]
+            ),
+            ProcessLiveness::Dead
+        );
+        // Without that exit indication the disappearance proves nothing.
+        assert_eq!(
+            inspect_script(
+                &expected,
+                vec![
+                    boot_reply(),
+                    LivenessReply::Pin(Ok(())),
+                    LivenessReply::Exited(Ok(false)),
+                    LivenessReply::Stat(Ok(None)),
+                    boot_reply(),
+                    LivenessReply::Exited(Ok(false)),
+                ]
+            ),
+            ProcessLiveness::Unknown
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1030,7 +1158,7 @@ mod tests {
         }
         for stat in [liveness_stat(b'S', 0), liveness_stat(b'?', 99)] {
             let mut replies = alive_replies();
-            replies[3] = LivenessReply::Stat(Ok(stat));
+            replies[3] = LivenessReply::Stat(Ok(Some(stat)));
             assert_eq!(inspect_script(&expected, replies), ProcessLiveness::Unknown);
         }
         let mut invalid = expected.clone();
@@ -1047,7 +1175,7 @@ mod tests {
                 7,
                 LivenessReply::Boot(Ok("ffffffff-ffff-ffff-ffff-ffffffffffff".to_owned())),
             ),
-            (5, LivenessReply::Stat(Ok(liveness_stat(b'S', 100)))),
+            (5, LivenessReply::Stat(Ok(Some(liveness_stat(b'S', 100))))),
             (6, LivenessReply::Image(Ok((10, 12)))),
         ] {
             let mut replies = alive_replies();
@@ -1065,8 +1193,8 @@ mod tests {
                         boot_reply(),
                         LivenessReply::Pin(Ok(())),
                         LivenessReply::Exited(Ok(false)),
-                        LivenessReply::Stat(Ok(first)),
-                        LivenessReply::Stat(Ok(second)),
+                        LivenessReply::Stat(Ok(Some(first))),
+                        LivenessReply::Stat(Ok(Some(second))),
                         boot_reply(),
                         LivenessReply::Exited(Ok(false)),
                     ]
@@ -1121,6 +1249,78 @@ mod tests {
             let closing = value.iter().rposition(|byte| *byte == b')').unwrap();
             value[closing + 2] = *state;
             assert!(parse_process_stat(&value, 4242).is_err());
+        }
+    }
+
+    #[test]
+    fn process_stat_reads_classify_an_exited_process_as_gone() {
+        fn scripted(reads: Vec<Result<Option<Vec<u8>>>>) -> Result<Option<ProcessStat>> {
+            let mut reads: std::collections::VecDeque<_> = reads.into();
+            read_process_stat_with(4242, &mut || reads.pop_front().expect("scripted stat read"))
+        }
+        let record =
+            b"4242 (worker) S 7 9 11 0 -1 4194304 1 2 3 4 13 14 15 16 20 0 1 0 22 0 0".to_vec();
+        // Unopenable, empty, and vanished-on-re-read records are all a
+        // process that exited, never a parse refusal (#1495).
+        assert_eq!(scripted(vec![Ok(None)]).unwrap(), None);
+        let dir =
+            std::env::temp_dir().join(format!("agent-queue-stat-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_stat_record(&dir.join("missing")).unwrap(), None);
+        std::fs::write(dir.join("empty"), b"").unwrap();
+        assert_eq!(read_stat_record(&dir.join("empty")).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            scripted(vec![Ok(Some(b"4242 (worker) S 7".to_vec())), Ok(None)]).unwrap(),
+            None
+        );
+        // A torn record a re-read completes is the live record.
+        let stat = scripted(vec![
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(record.clone())),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(stat.starttime_ticks, 22);
+        // A record that stays readable and unparseable still refuses.
+        let error = scripted(vec![
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+            Ok(Some(b"4242 (worker) S 7".to_vec())),
+        ])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot parse process stat for pid 4242"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_stat_read_of_a_reaped_child_is_gone_never_a_parse_error() {
+        // Read in a loop under a condition (the child has been reaped), not
+        // a timer: every read of the dead pid classifies as gone (#1495).
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = u64::from(child.id());
+        assert!(read_process_stat(pid).unwrap().is_some());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        for _ in 0..50 {
+            assert_eq!(read_process_stat(pid).unwrap(), None);
         }
     }
 
@@ -1197,7 +1397,10 @@ mod tests {
         let parent_pid = u64::try_from(unsafe { libc::getppid() }).unwrap();
         let parent = ProcessIdentity {
             pid: parent_pid,
-            starttime_ticks: read_process_stat(parent_pid).unwrap().starttime_ticks,
+            starttime_ticks: read_process_stat(parent_pid)
+                .unwrap()
+                .unwrap()
+                .starttime_ticks,
             ..me.clone()
         };
         let ancestry = Ancestry::of_self().unwrap();

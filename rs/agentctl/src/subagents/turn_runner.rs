@@ -205,20 +205,38 @@ fn read_regular(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
 }
 
 /// Whether `pid` exists and, if so, its start tick. Only positive disappearance counts as gone;
-/// unreadable or malformed evidence is an error.
+/// unreadable or malformed evidence is an error. A record that reads back empty or vanishes on
+/// the re-read a torn record gets is positive disappearance too: the process exited mid-read
+/// (#1495 revive-differential-proc-stat-parse-under-load). A record that stays readable and
+/// unparseable belongs to a live process and refuses.
 fn process_state(proc: &Path, pid: i64) -> std::result::Result<ProcessState, String> {
     let path = proc.join(pid.to_string()).join("stat");
-    match read_regular(&path, MAX_PROCESS_STAT_BYTES) {
-        Ok(None) => Ok(ProcessState::Gone),
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(ProcessState::Gone),
-        Err(error) => Err(format!("cannot read process {pid} identity: {error}")),
-        Ok(Some(raw)) => match parse_process_stat(&raw) {
-            Some(stat) if stat.pid == pid => Ok(ProcessState::Running {
-                starttime: stat.starttime,
-                state: stat.state,
-            }),
-            _ => Err(format!("cannot parse process {pid} identity")),
-        },
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let raw = match read_regular(&path, MAX_PROCESS_STAT_BYTES) {
+            Ok(None) => return Ok(ProcessState::Gone),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                return Ok(ProcessState::Gone);
+            }
+            Err(error) => {
+                return Err(format!("cannot read process {pid} identity: {error}"));
+            }
+            Ok(Some(raw)) => raw,
+        };
+        if raw.is_empty() {
+            return Ok(ProcessState::Gone);
+        }
+        match parse_process_stat(&raw) {
+            Some(stat) if stat.pid == pid => {
+                return Ok(ProcessState::Running {
+                    starttime: stat.starttime,
+                    state: stat.state,
+                });
+            }
+            _ if attempt < 4 => {}
+            _ => return Err(format!("cannot parse process {pid} identity")),
+        }
     }
 }
 
@@ -1043,6 +1061,29 @@ mod tests {
                 "{malformed}"
             );
         }
+    }
+
+    #[test]
+    fn process_state_reads_an_exited_process_record_as_gone() {
+        let root =
+            std::env::temp_dir().join(format!("agentctl-turn-runner-stat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("4242");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing and empty records are a process that exited (#1495).
+        assert!(matches!(process_state(&root, 4242), Ok(ProcessState::Gone)));
+        std::fs::write(dir.join("stat"), b"").unwrap();
+        assert!(matches!(process_state(&root, 4242), Ok(ProcessState::Gone)));
+        // A whole record is the live process.
+        std::fs::write(dir.join("stat"), stat(4242, 555)).unwrap();
+        assert!(matches!(
+            process_state(&root, 4242),
+            Ok(ProcessState::Running { starttime: 555, .. })
+        ));
+        // A record that stays readable and unparseable still refuses.
+        std::fs::write(dir.join("stat"), "4242 (agent) S 1").unwrap();
+        assert!(process_state(&root, 4242).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

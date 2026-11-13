@@ -247,25 +247,66 @@ pub fn read_stat_at(
     proc_root: &Path,
     pid: i64,
 ) -> Result<Option<ProcessStat>, ForeignOwnershipError> {
-    let raw = match std::fs::read(proc_root.join(pid.to_string()).join("stat")) {
-        Ok(raw) => raw,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ESRCH) =>
-        {
+    let path = proc_root.join(pid.to_string()).join("stat");
+    read_stat_with(pid, &mut || std::fs::read(&path))
+}
+
+/// Read one process's identity fields through `read`, or `None` when the
+/// process is gone: its record cannot be opened (ENOENT/ESRCH), reads back
+/// empty, or vanishes on the re-read a torn record gets. A record that stays
+/// readable and malformed belongs to a live process and refuses (#1495).
+fn read_stat_with(
+    pid: i64,
+    read: &mut dyn FnMut() -> std::io::Result<Vec<u8>>,
+) -> Result<Option<ProcessStat>, ForeignOwnershipError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let raw = match read() {
+            Ok(raw) => raw,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(ForeignOwnershipError::runner_identity_unknown(format!(
+                    "cannot read runner process {pid} identity: {error}"
+                )));
+            }
+        };
+        if raw.is_empty() {
             return Ok(None);
         }
-        Err(error) => {
-            return Err(ForeignOwnershipError::runner_identity_unknown(format!(
-                "cannot read runner process {pid} identity: {error}"
-            )));
+        match parse_process_stat(&raw) {
+            Some(parsed) if parsed.pid == pid => return Ok(Some(parsed)),
+            _ if attempt < 10 => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                // One last read separates a record that vanished mid-exit
+                // from a stable malformed record of a live process.
+                return match read() {
+                    Ok(raw) if !raw.is_empty() => match parse_process_stat(&raw) {
+                        Some(parsed) if parsed.pid == pid => Ok(Some(parsed)),
+                        _ => Err(ForeignOwnershipError::runner_identity_unknown(format!(
+                            "cannot parse runner process {pid} identity"
+                        ))),
+                    },
+                    Ok(_) => Ok(None),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            || error.raw_os_error() == Some(libc::ESRCH) =>
+                    {
+                        Ok(None)
+                    }
+                    Err(error) => Err(ForeignOwnershipError::runner_identity_unknown(format!(
+                        "cannot read runner process {pid} identity: {error}"
+                    ))),
+                };
+            }
         }
-    };
-    match parse_process_stat(&raw) {
-        Some(parsed) if parsed.pid == pid => Ok(Some(parsed)),
-        _ => Err(ForeignOwnershipError::runner_identity_unknown(format!(
-            "cannot parse runner process {pid} identity"
-        ))),
     }
 }
 
@@ -3232,6 +3273,38 @@ mod tests {
         // A record naming a different pid is malformed evidence, not `None`.
         write_stat(&root, 6666, &stat_record(9999, 1));
         assert!(read_stat_at(&root, 6666).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_stat_treats_an_exited_process_record_as_gone() {
+        let root = fake_proc("stat-gone");
+        // An empty record is what a teardown read leaves behind; the process
+        // is gone, not malformed (#1495).
+        write_stat(&root, 4243, "");
+        assert_eq!(read_stat_at(&root, 4243).unwrap(), None);
+
+        // A truncated record that vanishes on re-read is a process caught
+        // mid-exit, not a malformed live process.
+        let mut reads: std::collections::VecDeque<std::io::Result<Vec<u8>>> =
+            std::collections::VecDeque::from([
+                Ok(b"4244 (fake) S 10".to_vec()),
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
+            ]);
+        let gone =
+            read_stat_with(4244, &mut || reads.pop_front().expect("scripted stat read")).unwrap();
+        assert_eq!(gone, None);
+
+        // A truncated record that a re-read completes is the live record.
+        let mut reads: std::collections::VecDeque<std::io::Result<Vec<u8>>> =
+            std::collections::VecDeque::from([
+                Ok(b"4245 (fake) S 10".to_vec()),
+                Ok(stat_record(4245, 777).into_bytes()),
+            ]);
+        let stat = read_stat_with(4245, &mut || reads.pop_front().expect("scripted stat read"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stat.starttime, 777);
         let _ = std::fs::remove_dir_all(&root);
     }
 
