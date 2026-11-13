@@ -281,6 +281,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections import Counter
@@ -328,6 +329,14 @@ def _child_environment(**overrides: str) -> dict[str, str]:
         for key, value in os.environ.items()
         if key not in ("GATE_PRIORITY", "GATE_PRIORITY_REASON")
     }
+    # Tests must never resolve the live harness registry (#1499
+    # tests-touch-live-registry): default agentctl to a per-child scratch
+    # with auto-migrate off, unless the caller already chose a registry.
+    if "AGENTCTL_REGISTRY" not in env:
+        env["AGENTCTL_REGISTRY"] = str(
+            Path(tempfile.mkdtemp(prefix="agent-utils-gate-agentctl-")) / "registry"
+        )
+    env.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
     return {
         **env,
         "WRKSLOTS_RUST_READERS": "0",

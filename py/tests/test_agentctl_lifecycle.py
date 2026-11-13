@@ -2475,13 +2475,16 @@ def test_revive_cli_dry_run_and_batch_blocked_exit_are_reviewable_json(
     from agentctl import cli
     manager, fake, _old = prepare_revive(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: manager)
-    assert cli.main(["revive", "worker", "--dry-run"]) == 0
+    # Explicit tmp registry (#1499 tests-touch-live-registry): a bare revive
+    # resolves the nearest ancestor .agentctl, which under a harness is live.
+    root = ["--registry", str(manager.registry)]
+    assert cli.main([*root, "revive", "worker", "--dry-run"]) == 0
     assert json.loads(capsys.readouterr().out)["action"] == "revive"
     monkeypatch.setattr(fake, "process_liveness", lambda _identity: "unknown")
     before = registry_bytes(manager.registry)
-    assert cli.main(["revive", "--all", "--dry-run"]) == 0
+    assert cli.main([*root, "revive", "--all", "--dry-run"]) == 0
     assert json.loads(capsys.readouterr().out)["blocked"] == 1
-    assert cli.main(["revive", "--all"]) == 75
+    assert cli.main([*root, "revive", "--all"]) == 75
     assert json.loads(capsys.readouterr().out)["blocked"] == 1
     assert registry_bytes(manager.registry) == before and len(fake.launched) == 1
 
@@ -2495,7 +2498,7 @@ def test_revive_cli_rejects_invalid_selection_before_persistent_changes(
     manager, fake, _old = prepare_revive(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "Sessions", lambda *_args, **_kwargs: manager)
     before = registry_bytes(manager.registry)
-    assert cli.main(["revive", *arguments]) == 2
+    assert cli.main(["--registry", str(manager.registry), "revive", *arguments]) == 2
     assert capsys.readouterr().err.startswith("agentctl:")
     assert registry_bytes(manager.registry) == before and len(fake.launched) == 1
 

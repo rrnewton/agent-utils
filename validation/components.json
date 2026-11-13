@@ -89,6 +89,7 @@
         "py/tests/test_agentctl_mcp_rust.py",
         "py/tests/test_agentctl_pidns.py",
         "py/tests/test_agentctl_prompt_time.py",
+        "py/tests/test_agentctl_registry_isolation.py",
         "py/tests/test_agentctl_repair_rust.py",
         "py/tests/test_agentctl_reset_rust.py",
         "py/tests/test_agentctl_restore_drill.py",

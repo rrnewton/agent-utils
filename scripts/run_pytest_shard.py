@@ -369,8 +369,21 @@ class _TestTimeoutPlugin:
                 signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
 
 
+def _isolate_agentctl_registry() -> None:
+    """Default agentctl tests to a scratch registry (#1499 tests-touch-live-registry).
+
+    Direct ``-p run_pytest_shard`` runs have no wrapper to set the guarded
+    environment, so the plugin sets the same defaults at configure time. A
+    registry the caller or a test already chose is kept.
+    """
+    if not os.environ.get("AGENTCTL_REGISTRY"):
+        os.environ["AGENTCTL_REGISTRY"] = tempfile.mkdtemp(prefix="agent-utils-agentctl-registry-")
+    os.environ.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Register the timing collector, the per-test timeout and the memory report once each."""
+    _isolate_agentctl_registry()
 
     config.addinivalue_line(
         "markers",
@@ -410,6 +423,7 @@ class _ShardPlugin:
             self.timing = _TimingPlugin()
 
     def pytest_sessionstart(self, session: pytest.Session) -> None:
+        _isolate_agentctl_registry()
         if self.timing is not None:
             self.timing.pytest_sessionstart(session)
 
@@ -907,6 +921,13 @@ def _guarded_environment(base: dict[str, str], directory: Path) -> dict[str, str
     """
 
     environment = dict(base)
+    # Tests must never resolve the live harness registry (#1499
+    # tests-touch-live-registry): a bare agentctl call walks ancestors from
+    # the working directory, and a lane worktree lives under the harness.
+    # Point the default at this shard's scratch and disable auto-migrate,
+    # unless the caller already chose a registry.
+    environment.setdefault("AGENTCTL_REGISTRY", str(directory / "agentctl-registry"))
+    environment.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
     if "GIT_CONFIG_GLOBAL" not in environment:
         sentinel = directory / "global-gitconfig"
         if not sentinel.exists():
@@ -1124,8 +1145,12 @@ def _self_test() -> int:
         guarded = _guarded_environment({}, Path(scratch))
         assert Path(guarded["GIT_CONFIG_GLOBAL"]).is_file()
         assert guarded["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert guarded["AGENTCTL_REGISTRY"] == str(Path(scratch) / "agentctl-registry")
+        assert guarded["AGENTCTL_LAYOUT_AUTO_MIGRATE"] == "0"
         kept = _guarded_environment({"GIT_CONFIG_GLOBAL": "/caller/sentinel"}, Path(scratch))
         assert kept["GIT_CONFIG_GLOBAL"] == "/caller/sentinel"
+        chosen = _guarded_environment({"AGENTCTL_REGISTRY": "/caller/registry"}, Path(scratch))
+        assert chosen["AGENTCTL_REGISTRY"] == "/caller/registry"
     print("run_pytest_shard --self-test: PASSED")
     return 0
 

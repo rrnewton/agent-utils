@@ -950,6 +950,10 @@ def without_ambient_executables(environment: dict[str, str]) -> dict[str, str]:
     """Drop every caller-supplied host executable override from an edition's environment."""
     for variable in AMBIENT_EXECUTABLE_OVERRIDES:
         environment.pop(variable, None)
+    # Cases pass --registry explicitly (#1499 tests-touch-live-registry): never
+    # inherit a caller's registry default, and never auto-migrate a case registry.
+    environment.pop("AGENTCTL_REGISTRY", None)
+    environment["AGENTCTL_LAYOUT_AUTO_MIGRATE"] = "0"
     # The Rust edition's terminal-backend selector: left ambient, it could
     # redirect a case to a real tmux server the harness never stubbed.
     environment.pop("AGENTCTL_TERM_BACKEND", None)

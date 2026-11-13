@@ -593,7 +593,15 @@ def _run_component(
         flush=True,
     )
     print(f"component-tests: {shlex.join(command)}", flush=True)
-    return subprocess.run(command, cwd=PY_ROOT, check=False).returncode
+    # Direct (non-shard) runs have no shard wrapper to isolate agentctl
+    # (#1499 tests-touch-live-registry); apply the same defaults here.
+    environment = dict(os.environ)
+    if not environment.get("AGENTCTL_REGISTRY"):
+        environment["AGENTCTL_REGISTRY"] = tempfile.mkdtemp(
+            prefix="agent-utils-component-agentctl-"
+        )
+    environment.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
+    return subprocess.run(command, cwd=PY_ROOT, check=False, env=environment).returncode
 
 
 def main(argv: Sequence[str] | None = None) -> int:

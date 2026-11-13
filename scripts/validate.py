@@ -1057,6 +1057,14 @@ def run(
         gitconfig_sentinel.chmod(0o600)
         env["GIT_CONFIG_GLOBAL"] = str(gitconfig_sentinel)
     env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
+    # Tests must never resolve the live harness registry (#1499
+    # tests-touch-live-registry): default agentctl to a per-run scratch
+    # with auto-migrate off, unless the caller already chose a registry.
+    if "AGENTCTL_REGISTRY" not in env:
+        env["AGENTCTL_REGISTRY"] = str(
+            Path(tempfile.mkdtemp(prefix="agent-utils-validate-agentctl-")) / "registry"
+        )
+    env.setdefault("AGENTCTL_LAYOUT_AUTO_MIGRATE", "0")
     if coverage_dir is not None:
         env[CROSS_COVERAGE_ENV] = str(coverage_dir)
     if pytest_root is not None:
