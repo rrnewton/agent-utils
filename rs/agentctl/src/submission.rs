@@ -3376,6 +3376,21 @@ mod tests {
     }
 
     #[test]
+    fn codex_0_169_busy_staged_text_keeps_the_status_row_in_the_footer() {
+        // Measured 2026-11-13: with a turn running and text staged, v0.169 swaps its hint row
+        // for "tab to queue message"; the status row above it must stay footer, or the staged
+        // text reads as changed after the paste and delivery is left ambiguous.
+        let screen = "\u{2022} Working (3m 02s \u{2022} esc to interrupt)\n\n\
+                      \u{203a} Coordinator note for the lane\n\n\
+                      \x20 GPT-6-Astra high \u{b7} /work/slot \u{b7} Fix it\n\
+                      \x20 tab to queue message\n";
+        let view = composer_view("codex", screen).unwrap_or_else(|| panic!("no composer"));
+        assert_eq!(view.composer_solid.trim(), "Coordinator note for the lane", "{view:?}");
+        assert!(view.footer.contains("GPT-6-Astra"), "{view:?}");
+        assert!(view.footer.contains("tab to queue message"), "{view:?}");
+    }
+
+    #[test]
     fn codex_0_159_1_idle_composer_is_recognised() {
         for screen in [codex_v0_159_1::fresh_idle(), codex_v0_159_1::session_idle()] {
             let view = composer_view("codex", &screen)
