@@ -409,6 +409,17 @@ pub(crate) fn heartbeat(
     // nested handling (see #1400).
     let _nested_warnings = refuse_target_storage_except_nested(root, slot)?;
     for detail in &_nested_warnings {
+        // Only a PRESENT nested worktree is tolerated; a deleted path is
+        // stale bookkeeping and still refuses (Python parity).
+        if let Some(start) = detail.find(" registers ") {
+            let rest = &detail[start + " registers ".len()..];
+            if let Some(end) = rest.find(" inside") {
+                let registered = &rest[..end];
+                if !Path::new(registered).exists() {
+                    return Err(detail.clone());
+                }
+            }
+        }
         eprintln!(
             "WARNING: slot {slot} has a nested worktree Git registers without a checkout row: {detail}. state: heartbeat recorded anyway; the nested worktree is retained and not inspected"
         );

@@ -40293,6 +40293,20 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             config, states, args, tolerate_target_git_registrations=True
         )
         for _detail in _hb_findings.target_git_registrations:
+            # Only a PRESENT nested worktree is tolerated: a registration
+            # whose path was deleted is stale bookkeeping the owner must
+            # repair, and heartbeat still refuses it (the deliberate
+            # own-slot half of test_status_reports_git_registration...).
+            _marker = " registers "
+            _start = _detail.find(_marker)
+            _end = _detail.find(" inside", _start) if _start >= 0 else -1
+            _registered = (
+                Path(_detail[_start + len(_marker):_end])
+                if _start >= 0 and _end > _start
+                else None
+            )
+            if _registered is not None and not _registered.exists():
+                raise Refusal(_detail)
             print(
                 f"WARNING: slot {record.slot} has a nested worktree Git "
                 f"registers without a checkout row: {_detail}. "
