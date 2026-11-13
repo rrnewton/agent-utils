@@ -6,6 +6,8 @@ judges how fast a child finished (cross-differentials-robust).
 """
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -129,3 +131,32 @@ def test_stdin_child_reads_its_payload_from_a_temp_file_fd() -> None:
         stdin_file.seek(0)
         done = run_tolerant([PY, "-c", child], timeout_s=5, stdin=stdin_file.fileno())
     assert (done.returncode, done.stdout) == (0, "HELLO\nSTDIN\n")
+
+
+def test_sigterm_removes_the_fixture_temp_root(tmp_path: Path) -> None:
+    # A CPU-timeout kill (SIGTERM) must not leak the differential's
+    # fixture tree. Once the temp root appears (a filesystem condition),
+    # terminate and assert nothing remains behind; no wall-clock verdict.
+    cross_dir = Path(__file__).resolve().parents[2] / "cross"
+    script = (
+        f"import sys, time\nsys.path.insert(0, {str(cross_dir)!r})\n"
+        "from herdr_agent_differential import _signal_cleaned_tempdir\n"
+        "with _signal_cleaned_tempdir('agentctl-cross-test-') as root:\n"
+        "    (root / 'marker').write_text('x')\n"
+        "    print(root, flush=True)\n"
+        "    time.sleep(600)\n"
+    )
+    proc = subprocess.Popen(
+        [PY, "-c", script],
+        stdout=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    assert proc.stdout is not None
+    root = Path(proc.stdout.readline().strip())
+    assert (root / "marker").exists()
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=60)
+    assert proc.returncode == 128 + signal.SIGTERM
+    assert not root.exists()
+    assert not list(tmp_path.glob("agentctl-cross-test-*"))

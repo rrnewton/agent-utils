@@ -9,18 +9,20 @@ compares durable queue transitions and crash-sensitive machine outcomes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import hashlib
 import os
 import shlex
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -1274,6 +1276,38 @@ def herdr_refusal(root: Path, arguments: Sequence[str]) -> str | None:
         f"{arguments[index]!r} has no --herdr-bin, so the editions would run the Herdr installed "
         "on this host"
     )
+
+
+@contextlib.contextmanager
+def _signal_cleaned_tempdir(prefix: str) -> Iterator[Path]:
+    """A fixture temp root removed on exit, including on SIGTERM/SIGINT.
+
+    A CPU-timeout kill (SIGTERM) otherwise leaks the whole fixture tree
+    under /tmp (about a gigabyte per step) because the usual context
+    cleanup never runs. The handler removes the tree, then exits with
+    the conventional 128+signal status.
+    """
+    root = Path(tempfile.mkdtemp(prefix=prefix))
+
+    def _terminate(signum: int, _frame: object) -> None:
+        shutil.rmtree(root, ignore_errors=True)
+        os._exit(128 + signum)
+
+    previous: dict[int, object] = {}
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous[sig] = signal.signal(sig, _terminate)
+        except (ValueError, OSError):
+            pass  # Not the main thread: normal cleanup still applies.
+    try:
+        yield root
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)  # type: ignore[arg-type]
+        shutil.rmtree(root, ignore_errors=True)
 
 
 class Harness:
@@ -2704,8 +2738,8 @@ def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> 
     """Run the complete black-box differential."""
 
     report = Report()
-    with tempfile.TemporaryDirectory(prefix="herdr-agent-cross-") as temporary:
-        harness = Harness(Path(temporary), python_command, rust_command)
+    with _signal_cleaned_tempdir("herdr-agent-cross-") as temporary:
+        harness = Harness(temporary, python_command, rust_command)
         try:
             _bootstrap(harness, report)
             _status_and_read(harness, report)

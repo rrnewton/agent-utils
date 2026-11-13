@@ -24,6 +24,7 @@ from pathlib import Path
 
 from herdr_agent_differential import (
     FIXTURE_HERDR, REPO_ROOT, Harness, Outcome, PairCase, Report, _normalize as _normalize_outcome,
+    _signal_cleaned_tempdir,
     _option_values, _queue_snapshot, _revive_interop, _state, _submitted,
     SENDER_HEADER,
     _stop_recovery_arguments,
@@ -3947,8 +3948,8 @@ def build_report(
 ) -> Report:
     """Compare the canonical interface through independent executable clients."""
     report = Report()
-    with tempfile.TemporaryDirectory(prefix="agentctl-cross-") as temporary:
-        harness = Harness(Path(temporary), python_command, rust_command)
+    with _signal_cleaned_tempdir("agentctl-cross-") as temporary:
+        harness = Harness(temporary, python_command, rust_command)
         try:
             for _name, run_group in shard_groups(shard, shards):
                 run_group(harness, report)  # type: ignore[operator]
