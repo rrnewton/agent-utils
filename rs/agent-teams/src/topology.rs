@@ -548,6 +548,163 @@ pub fn tick(
     events
 }
 
+/// Parse a peer's frozen driver state (`agentctl-team-driver/v1`, read
+/// on the target host or fetched remotely) into a probe snapshot.
+/// Unknown v1 fields are ignored, per the freeze.
+pub fn parse_driver_state(text: &str) -> DataResult<DriverSnapshot> {
+    let value: Value = serde_json::from_str(text)?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| err("driver state must be a JSON object"))?;
+    if obj.get("schema").and_then(Value::as_str) != Some("agentctl-team-driver/v1") {
+        return Err(err("driver state schema must be agentctl-team-driver/v1"));
+    }
+    Ok(DriverSnapshot {
+        state: obj
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        incident: obj
+            .get("incident")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        held: obj.get("held").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// Kick argv for one peer registry (frozen `team kick` shape, #1414).
+/// The route that carries this argv to the peer's host is resolved by
+/// agent-teams per host pair; no route name appears here.
+pub fn kick_argv(registry: &str, escalation_config: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "agentctl".to_string(),
+        "--registry".to_string(),
+        registry.to_string(),
+        "team".to_string(),
+        "kick".to_string(),
+    ];
+    if let Some(path) = escalation_config {
+        argv.push("--escalation-config".to_string());
+        argv.push(path.to_string());
+    }
+    argv
+}
+
+/// Check-in argv: one agent-teams message to the peer's coordinator.
+pub fn checkin_argv(peer: &str) -> Vec<String> {
+    vec![
+        "agent-teams".to_string(),
+        "send".to_string(),
+        peer.to_string(),
+        "--text".to_string(),
+        "team check-in: healthy?".to_string(),
+        "--kind".to_string(),
+        "info".to_string(),
+        "--topic".to_string(),
+        "team-checkin".to_string(),
+    ]
+}
+
+/// Runs one argv and returns stdout; the real implementation spawns the
+/// process, fixture tests script it. No live anything is touched in tests.
+pub trait CommandRunner {
+    /// Run argv; `Err` carries one line of detail.
+    fn run(&mut self, argv: &[String]) -> Result<String, String>;
+}
+
+/// The real runner: spawn argv, return stdout on exit 0. A non-zero exit
+/// (for example kick's exit 1 refusal inside a non-initial PID namespace,
+/// whose reason text is preserved) or a spawn failure is `Err` with the
+/// first stderr line.
+pub struct ProcessRunner;
+
+impl CommandRunner for ProcessRunner {
+    fn run(&mut self, argv: &[String]) -> Result<String, String> {
+        let (program, rest) = argv.split_first().ok_or_else(|| "empty argv".to_string())?;
+        let out = std::process::Command::new(program)
+            .args(rest)
+            .output()
+            .map_err(|e| format!("{program}: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr.lines().next().unwrap_or("").trim();
+            Err(if first.is_empty() {
+                format!("{program} exited {}", out.status)
+            } else {
+                first.to_string()
+            })
+        }
+    }
+}
+
+/// One peer as the adapter needs it: where its registry lives, and the
+/// command template (with `{registry}` substituted) that prints its
+/// frozen driver state. The template is configuration, never hard-coded,
+/// because the remote-exec path differs per host pair.
+#[derive(Debug, Clone)]
+pub struct PeerTarget {
+    /// Registry path on the peer's host.
+    pub registry: String,
+    /// Argv template printing the peer's `state.json`; `{registry}` is
+    /// replaced with `registry`.
+    pub read_state_argv: Vec<String>,
+}
+
+/// The real `PeerIo`: check-in through agent-teams, probe by reading the
+/// peer's frozen driver state, kick through the peer's driver, notify as
+/// an agent-teams message to the kicker's own lead (the caller supplies
+/// that argv, since the lead's address is the kicker's own config).
+pub struct CommandPeerIo<'a> {
+    /// Peers by team-instance id.
+    pub targets: &'a BTreeMap<String, PeerTarget>,
+    /// Escalation route file passed to kicks, if configured.
+    pub escalation_config: Option<&'a str>,
+    /// Builds the notify argv for (peer, incident).
+    pub notify_argv: &'a dyn Fn(&str, &str) -> Vec<String>,
+    /// Process runner (real or scripted).
+    pub runner: &'a mut dyn CommandRunner,
+}
+
+impl PeerIo for CommandPeerIo<'_> {
+    fn send_checkin(&mut self, peer: &str) -> Result<(), String> {
+        self.runner.run(&checkin_argv(peer)).map(|_| ())
+    }
+
+    fn probe_driver(&mut self, peer: &str) -> Result<DriverSnapshot, String> {
+        let target = self
+            .targets
+            .get(peer)
+            .ok_or_else(|| format!("no target for peer {peer}"))?;
+        let argv: Vec<String> = target
+            .read_state_argv
+            .iter()
+            .map(|a| a.replace("{registry}", &target.registry))
+            .collect();
+        let text = self.runner.run(&argv)?;
+        parse_driver_state(&text).map_err(|e| e.message)
+    }
+
+    fn kick(&mut self, peer: &str) -> Result<(), String> {
+        let target = self
+            .targets
+            .get(peer)
+            .ok_or_else(|| format!("no target for peer {peer}"))?;
+        self.runner
+            .run(&kick_argv(&target.registry, self.escalation_config))
+            .map(|_| ())
+    }
+
+    fn notify(&mut self, peer: &str, incident: &str) -> Result<(), String> {
+        self.runner
+            .run(&(self.notify_argv)(peer, incident))
+            .map(|_| ())
+    }
+}
+
 /// Kicked-incident memory, keyed by team-instance id (`TEAM@HOST`), never
 /// by `team_key`. Shared by every prober on one host through one state
 /// file, so several probers still produce exactly one kick per incident.

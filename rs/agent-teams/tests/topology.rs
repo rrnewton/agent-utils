@@ -400,6 +400,107 @@ fn topology_check_reports_bad_route_and_unparseable() {
     assert!(stdout.contains("team-a"), "{stdout}");
 }
 
+struct ScriptedRunner {
+    state_text: String,
+    ran: Vec<Vec<String>>,
+}
+
+impl agent_teams::topology::CommandRunner for ScriptedRunner {
+    fn run(&mut self, argv: &[String]) -> Result<String, String> {
+        self.ran.push(argv.to_vec());
+        if argv.iter().any(|a| a.contains("state.json")) {
+            Ok(self.state_text.clone())
+        } else {
+            Ok("{}".to_string())
+        }
+    }
+}
+
+#[test]
+fn adapter_parses_frozen_state_and_builds_frozen_argv() {
+    use agent_teams::topology::{kick_argv, parse_driver_state};
+    let snapshot = parse_driver_state(
+        r#"{"schema":"agentctl-team-driver/v1","state":"HANDOFF","mode":"running","held":true,"incident":"abc123def456","boot_id":"b1","future":1}"#,
+    )
+    .expect("frozen state parses, unknown fields ignored");
+    assert_eq!(snapshot.state, "HANDOFF");
+    assert!(snapshot.held);
+    assert_eq!(snapshot.incident, "abc123def456");
+    assert!(parse_driver_state("{}").is_err());
+    assert_eq!(
+        kick_argv("~/work/team-b/.agentctl", Some("/cfg/escalation.toml"))[..4],
+        ["agentctl", "--registry", "~/work/team-b/.agentctl", "team"]
+    );
+}
+
+#[test]
+fn adapter_tick_kicks_through_runner_exactly_once() {
+    use agent_teams::topology::{CommandPeerIo, PeerTarget};
+    use std::collections::BTreeMap;
+    let topology = merged();
+    let defaults = topology.defaults_for("team-a");
+    let now = 1_000_000;
+    let silent = Watch {
+        last_seen_unix: Some(now - 21_600),
+        unanswered_since_unix: None,
+    };
+    let targets = BTreeMap::from([(
+        "team-b@host-2".to_string(),
+        PeerTarget {
+            registry: "~/work/team-b/.agentctl".to_string(),
+            read_state_argv: vec![
+                "read-state".to_string(),
+                "{registry}/state.json".to_string(),
+            ],
+        },
+    )]);
+    let notify = |peer: &str, incident: &str| {
+        vec!["notify".to_string(), peer.to_string(), incident.to_string()]
+    };
+    let mut runner = ScriptedRunner {
+        state_text: r#"{"schema":"agentctl-team-driver/v1","state":"ESCALATE","held":false,"incident":"inc-7"}"#.to_string(),
+        ran: Vec::new(),
+    };
+    let mut ledger = IncidentLedger::default();
+    {
+        let mut io = CommandPeerIo {
+            targets: &targets,
+            escalation_config: None,
+            notify_argv: &notify,
+            runner: &mut runner,
+        };
+        let events = tick(
+            now,
+            "team-b@host-2",
+            &silent,
+            &defaults,
+            &mut io,
+            &mut ledger,
+        );
+        assert_eq!(events.len(), 4);
+    }
+    let kicks = runner
+        .ran
+        .iter()
+        .filter(|a| a.contains(&"kick".to_string()))
+        .count();
+    assert_eq!(kicks, 1);
+    assert!(runner
+        .ran
+        .iter()
+        .any(|a| a.first().map(String::as_str) == Some("notify")));
+}
+
+#[test]
+fn process_runner_maps_exit_codes() {
+    use agent_teams::topology::{CommandRunner as _, ProcessRunner};
+    let mut runner = ProcessRunner;
+    assert_eq!(runner.run(&["/bin/true".to_string()]), Ok(String::new()));
+    assert!(runner.run(&["/bin/false".to_string()]).is_err());
+    assert!(runner.run(&["/no/such/binary".to_string()]).is_err());
+    assert!(runner.run(&[]).is_err());
+}
+
 #[test]
 fn routes_override_must_name_declared_routes() {
     let with_override = TEAM_A.replace(
