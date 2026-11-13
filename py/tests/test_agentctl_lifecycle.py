@@ -3138,6 +3138,24 @@ def test_layout_migration_moves_idle_agents_once_and_keeps_fixed_items(tmp_path:
     assert registry_layout.auto_migrate(registry) is None
 
 
+def test_layout_migration_never_moves_known_or_unknown_directories(tmp_path: Path) -> None:
+    registry = tmp_path / "registry"
+    _layout_one(registry, "alpha")
+    reports = registry / "restore" / "reports"
+    reports.mkdir(parents=True)
+    (reports / "11111111-2222-3333-4444-555555555555.json").write_text('{"complete": true}', encoding="utf-8")
+    mystery = registry / "mystery"
+    mystery.mkdir(mode=0o700)
+    (mystery / "notes.txt").write_text("not an agent", encoding="utf-8")
+    report = registry_layout.migrate(registry, apply=True, wait=0)
+    assert report["moved"] == ["alpha"] and report["strays"] == ["mystery"]
+    assert (reports / "11111111-2222-3333-4444-555555555555.json").is_file()
+    assert not (registry / "agents/restore").exists()
+    assert (mystery / "notes.txt").is_file() and not (registry / "agents/mystery").exists()
+    assert not registry_layout.is_agent_name("restore")
+    assert not registry_layout.is_agent_name("restore-reports")
+
+
 def test_layout_migration_leaves_busy_self_named_and_conflicting_agents(tmp_path: Path) -> None:
     registry = tmp_path / "registry"
     _layout_one(registry, "busy", "runner", "twice", "idle")

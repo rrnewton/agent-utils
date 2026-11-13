@@ -228,6 +228,13 @@ fn move_agent(
     kept: &mut Vec<Value>,
 ) -> Result<Option<String>> {
     let legacy = registry::legacy_directory(registry, name);
+    // Belt to legacy_agents' braces: never move a directory that is not
+    // positively an agent, whatever a future caller hands us (#1425).
+    if !legacy.join("agent.json").is_file() {
+        return Ok(Some(
+            "no agent record; not positively identified as a legacy agent directory".to_owned(),
+        ));
+    }
     let (legacy_lock_path, legacy_rank_path) =
         registry::lock_paths(registry, name, Location::Legacy);
     let legacy_lock = agent::open_private_lock(&legacy_lock_path, "agent lifecycle lock")?;
@@ -343,12 +350,29 @@ fn layout_of(legacy: usize, current: usize, legacy_locks: usize) -> &'static str
 }
 
 /// The layout-1 names that are agents (not strays) and the strays, both sorted.
+///
+/// Only a directory holding an agent record is positively an agent. A
+/// recordless top-level directory is a stray — reported, never moved —
+/// whether or not a layout-2 agent shares its name, so an unknown
+/// directory a newer build created (`restore/` before it was reserved)
+/// can never be swept into `agents/` as if it were one (#1425).
 fn legacy_agents(registry: &Path) -> Result<(Vec<String>, Vec<String>)> {
-    let strays = registry::stray_names(registry)?;
-    let agents = registry::legacy_names(registry)?
-        .into_iter()
-        .filter(|name| !strays.contains(name))
-        .collect();
+    let mut strays = registry::stray_names(registry)?;
+    let mut agents = Vec::new();
+    for name in registry::legacy_names(registry)? {
+        if strays.contains(&name) {
+            continue;
+        }
+        if registry::legacy_directory(registry, &name)
+            .join("agent.json")
+            .is_file()
+        {
+            agents.push(name);
+        } else {
+            strays.push(name);
+        }
+    }
+    strays.sort();
     Ok((agents, strays))
 }
 
@@ -377,8 +401,9 @@ fn nested_agents_registry(registry: &Path) -> Option<PathBuf> {
 ///
 /// The report: `registry`, `apply`, `layout_before` and `layout` (`empty`, `1`, `2` or `mixed`),
 /// `moved` (or `would_move`), `left` (`[{name, reason}]`), `conflicts` (names with an agent in
-/// both layouts), `strays` (layout-1 directories without a record beside a layout-2 agent, which
-/// an older program writing into a queue by path leaves; never moved), `removed_lock_files`
+/// both layouts), `strays` (top-level directories without an agent record, so never positively
+/// identified as agents: queue-by-path leftovers beside a layout-2 agent and unknown directories
+/// alike; reported, never moved), `removed_lock_files`
 /// (count; `would_remove_lock_files` without `apply`), `kept_lock_files` (`[{path, reason}]`),
 /// `legacy_support_ends` and `removal_issue`.
 ///
@@ -842,6 +867,36 @@ mod tests {
         migrate(&registry, APPLY).unwrap();
         assert!(!lock_still_current(&registry, "alpha", Location::Legacy, &file, &path).unwrap());
         fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn migration_never_moves_known_or_unknown_directories() {
+        // #1425: restore/reports is a known registry directory and an
+        // unknown top-level directory is unidentified: only the directory
+        // positively holding a record moves, the rest stay put.
+        let registry = scratch("known-dirs");
+        legacy_agent(&registry, "alpha");
+        let reports = registry.join("restore/reports");
+        fs::create_dir_all(&reports).unwrap();
+        fs::write(
+            reports.join("11111111-2222-3333-4444-555555555555.json"),
+            "{\"complete\": true}",
+        )
+        .unwrap();
+        let mystery = registry.join("mystery");
+        fs::create_dir(&mystery).unwrap();
+        fs::write(mystery.join("notes.txt"), "not an agent").unwrap();
+
+        let report = migrate(&registry, APPLY).unwrap();
+        assert_eq!(report["moved"], json!(["alpha"]), "{report:#}");
+        assert_eq!(report["strays"], json!(["mystery"]), "{report:#}");
+        assert!(reports
+            .join("11111111-2222-3333-4444-555555555555.json")
+            .exists());
+        assert!(!registry.join("agents/restore").exists());
+        assert!(mystery.join("notes.txt").exists());
+        assert!(!registry.join("agents/mystery").exists());
+        fs::remove_dir_all(&registry).unwrap();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 title: 'layout-migrate-moves-known-dirs: an older agentctl moves REGISTRY/restore/ into agents/ as if it were a legacy agent directory'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -31,3 +31,7 @@ So a registry shared by agentctl builds of different ages can silently move a NE
 # Notes
 
 Numbered from devbig030's interim block (1400-1469). Older builds already deployed can't be fixed retroactively; the version rule is the mitigation.
+
+## Resolution
+
+[watermelon-full-preview] Both editions now share one reserved-names list (`archive`, `agents`, `locks`, `bridges`, `turnover-pins`, `restore`, `restore-reports`) across migration, listing, and doctor, and both migrations move only directories positively holding an agent record: recordless top-level directories are reported under `strays` and left in place, with the record re-checked inside the move itself before any lock is touched. `restore --migrate-reports` help and the guide carry the version warning (only once every build touching the registry is at b73d2163 or later). Tests in both editions (`migration_never_moves_known_or_unknown_directories`) cover `restore/reports/` staying put and an unknown recordless directory reported unmoved; contained clippy/check/fmt, strict mypy, and py_compile clean. The optional layout-version downgrade marker was not built: the tripwires plus the version rule cover deployed older builds, which cannot be fixed retroactively.

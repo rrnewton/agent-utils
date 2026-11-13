@@ -76,7 +76,19 @@ builds older than layout 2 stop at this file; upgrade agentctl. Readers of renam
 pub const BRIDGES: &str = "bridges";
 /// Names no agent may take: each is a directory of the registry itself.
 /// `turnover-pins` holds services-turnover pin files (#1220), not an agent.
-pub const RESERVED_NAMES: [&str; 5] = ["archive", AGENTS, LOCKS, BRIDGES, "turnover-pins"];
+/// `restore` (its `reports/` collection) and the legacy `restore-reports`
+/// joined when an older migration moved the former into `agents/` as if it
+/// were an agent (#1425): every known registry directory belongs here, in
+/// one list shared by migration, listing, and doctor.
+pub const RESERVED_NAMES: [&str; 7] = [
+    "archive",
+    AGENTS,
+    LOCKS,
+    BRIDGES,
+    "turnover-pins",
+    "restore",
+    "restore-reports",
+];
 /// The registry-wide lock files, `REGISTRY/.<stem>.lock`, that are fixed items, not agents'
 /// layout-1 locks. Layout 1 shared `.coordinator.lock` between the designation and an agent
 /// named `coordinator`; it stays, as the designation lock.
@@ -592,6 +604,10 @@ mod tests {
         // #1220: a turnover pin directory is not an agent either.
         fs::create_dir(registry.join("turnover-pins")).unwrap();
         assert!(!is_agent_name("turnover-pins"));
+        // #1425: the restore report collections are registry directories too.
+        assert!(!is_agent_name("restore"));
+        assert!(!is_agent_name("restore-reports"));
+        assert!(locate(&registry, "restore").is_err());
         assert!(names(&registry).unwrap().is_empty());
         assert!(is_tripwire(&registry.join("agents/agent.json")));
         assert!(registry.join(".renames").join(RENAMES_TRIPWIRE).is_file());

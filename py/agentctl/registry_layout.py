@@ -62,7 +62,11 @@ RENAMES_TRIPWIRE_TEXT = (
 )
 #: The directory holding the registry's chat bridges, one entry each.
 BRIDGES = "bridges"
-RESERVED_NAMES = ("archive", AGENTS, LOCKS, BRIDGES)
+#: Every known registry directory, one list shared with the Rust edition:
+#: migration, listing and doctor all refuse these as agent names. ``restore``
+#: and ``restore-reports`` joined after an older migration moved the former
+#: into ``agents/`` as if it were an agent.
+RESERVED_NAMES = ("archive", AGENTS, LOCKS, BRIDGES, "turnover-pins", "restore", "restore-reports")
 #: Registry-wide ``.<stem>.lock`` files that are fixed items, not agents' layout-1 locks.
 FIXED_LOCK_STEMS = ("identity", "coordinator", "restore")
 LEGACY_SUPPORT_ENDS = "2026-11-26"
@@ -465,6 +469,10 @@ def _move_agent(registry: Path, name: str, wait: float,
     from agentctl.subagents import _rename_directory_noreplace_at
 
     legacy = legacy_directory(registry, name)
+    # Belt to _legacy_agents' braces: never move a directory that is not
+    # positively an agent, whatever a future caller hands us.
+    if not (legacy / "agent.json").is_file():
+        return "no agent record; not positively identified as a legacy agent directory"
     legacy_lock_path, legacy_rank_path = lock_paths(registry, name, LEGACY)
     current_lock_path, _ = lock_paths(registry, name, CURRENT)
     descriptors: list[int] = []
@@ -530,9 +538,23 @@ def _layout_of(legacy: int, current: int, legacy_locks: int) -> str:
 
 
 def _legacy_agents(registry: Path) -> tuple[list[str], list[str]]:
-    """The layout-1 names that are agents, and the strays, both sorted."""
+    """The layout-1 names that are agents, and the strays, both sorted.
+
+    Only a directory holding an agent record is positively an agent. A
+    recordless top-level directory is a stray — reported, never moved —
+    whether or not a layout-2 agent shares its name, so an unknown
+    directory a newer build created can never be swept into ``agents/``.
+    """
     strays = stray_names(registry)
-    return [name for name in legacy_names(registry) if name not in strays], strays
+    agents: list[str] = []
+    for name in legacy_names(registry):
+        if name in strays:
+            continue
+        if (legacy_directory(registry, name) / "agent.json").is_file():
+            agents.append(name)
+        else:
+            strays.append(name)
+    return agents, sorted(strays)
 
 
 

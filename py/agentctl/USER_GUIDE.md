@@ -359,10 +359,14 @@ drain), while its record names a path inside that directory (a turn runner's
 runtime home), or while its lock stays busy for `--wait` seconds (default 10);
 a later run moves it. A name with an agent in both layouts is listed under
 `conflicts` and never touched: every command that uses that name refuses it
-until a person keeps one copy and moves the other aside. A layout-1 directory
-without a record beside a layout-2 agent is listed under `strays`: an older
-program that writes into a queue by path (an agent-teams build before layout 2)
-leaves one, and its queued items need moving into the agent's queue by hand.
+until a person keeps one copy and moves the other aside. Only a directory
+holding an agent record ever moves: a top-level directory without one is
+listed under `strays`, reported and left in place — a queue-by-path leftover
+from an older program (an agent-teams build before layout 2) is one, and its
+queued items need moving into the agent's queue by hand; an unknown
+directory a newer build created is another. Known registry directories
+(`restore/`, `locks/`, `archive/`, `bridges/`, ...) are reserved names and
+never agents at all.
 Running the migration again changes nothing.
 
 A build older than layout 2 cannot see moved agents, and two tripwires make it
@@ -1148,7 +1152,10 @@ The report is `REPORT_DIR/BOOT_ID.json` (default
 shared state directory) are still read until 2027-02-12, and
 `agentctl restore --migrate-reports` moves them into the default location
 (it only previews unless `--apply` is also given, and never overwrites a
-report already there). Exit status is 0 when the restore completed
+report already there). Run it only after every agentctl that touches the
+registry is at the build that moved reports (b73d2163) or later: an older
+build's layout migration does not know `restore/` and moves the whole
+directory into `agents/`. Exit status is 0 when the restore completed
 with no refusal, 74 when it completed except for refused lanes (named in
 `refused_lanes`; not a failure a boot unit should retry), 75 otherwise.
 `--boot` marks the report as the boot unit's run.

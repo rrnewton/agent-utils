@@ -433,7 +433,7 @@ def _close_descriptor(
 
 def _name(value: str) -> str:
     if not _NAME.fullmatch(value) or value in registry_layout.RESERVED_NAMES:
-        raise AgentDeliveryError("agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; 'archive', 'agents', 'locks' and 'bridges' are reserved")
+        raise AgentDeliveryError("agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; registry directory names ('archive', 'agents', 'locks', 'bridges', 'turnover-pins', 'restore', 'restore-reports') are reserved")
     return value
 
 
