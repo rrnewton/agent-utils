@@ -2033,6 +2033,49 @@ mod unit {
         }
     }
 
+    /// Write an executable fake dagrun script and return its final path.
+    /// The script is written under a temporary name and renamed into
+    /// place before any exec, so the exec'd path is never the path
+    /// being written (#1471 merge-queue-fake-dagrun-etxtbsy).
+    fn write_fake_dagrun(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let script = dir.join("fake-dagrun");
+        let tmp = dir.join("fake-dagrun.tmp");
+        std::fs::write(&tmp, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::rename(&tmp, &script).unwrap();
+        script
+    }
+
+    /// Run a validator whose program a test just wrote, retrying the
+    /// spawn when it is refused as Text file busy (#1471): a sibling
+    /// thread's forked child can still hold a duplicate of the write
+    /// descriptor at the exec instant on a loaded host. Bounded
+    /// attempts, never a timing assumption.
+    fn run_fake(
+        validator: &dyn Validator,
+        checkout: &std::path::Path,
+        selection: &Selection,
+        out: &std::path::Path,
+        cancel: &AtomicBool,
+    ) -> Ran {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let ran = validator.run(checkout, selection, out, cancel).unwrap();
+            let etxtbsy = ran
+                .cannot_execute
+                .as_deref()
+                .is_some_and(|why| why.contains("Text file busy"));
+            if !etxtbsy || attempt >= 5 {
+                return ran;
+            }
+        }
+    }
+
     #[test]
     fn a_validator_that_cannot_execute_is_refused_naming_the_command_and_path() {
         let tmp = TempDir::new("validate-exec");
@@ -2695,20 +2738,13 @@ mod unit {
     #[test]
     fn a_dagrun_journal_deterministic_failure_stops_the_run_early() {
         let tmp = TempDir::new("validate-early-red-dagrun");
-        let script = tmp.0.join("fake-dagrun");
-        std::fs::write(
-            &script,
+        let script = write_fake_dagrun(
+            &tmp.0,
             "#!/bin/sh\n\
              echo '{\"event\":\"step_end\",\"step\":\"check.unit\",\"ok\":false}' >> \"$DAGRUN_LOG_DIR/journal.jsonl\"\n\
              echo 'RERUN-EXEMPT: check.unit'\n\
              sleep 30\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let cfg = ValidatorConfig {
             kind: "dagrun".into(),
             dagrun: script.display().to_string(),
@@ -2716,14 +2752,13 @@ mod unit {
             ..ValidatorConfig::default()
         };
         let v = from_config(&cfg).unwrap();
-        let ran = v
-            .run(
-                &tmp.0,
-                &Selection::of([TestId::step("check.unit"), TestId::step("slow")]),
-                &tmp.0.join("o"),
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+        let ran = run_fake(
+            &*v,
+            &tmp.0,
+            &Selection::of([TestId::step("check.unit"), TestId::step("slow")]),
+            &tmp.0.join("o"),
+            &AtomicBool::new(false),
+        );
         assert!(ran.early_red, "{ran:?}");
         assert!(ran.deterministic_red(), "{ran:?}");
         assert_eq!(ran.failed(), [TestId::step("check.unit")].into());
@@ -3187,17 +3222,10 @@ dagrun: PASS - 1 passed";
     #[test]
     fn dagrun_records_step_collapsed_effective_selection() {
         let tmp = TempDir::new("validate-dagrun-effective");
-        let script = tmp.0.join("fake-dagrun");
-        std::fs::write(
-            &script,
+        let script = write_fake_dagrun(
+            &tmp.0,
             "#!/bin/sh\necho '[a] ✓ PASS x (1s)'\necho '[b] ✗ FAIL y (2s, exit 1)'\nexit 1\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let cfg = ValidatorConfig {
             kind: "dagrun".into(),
             dag: "dag.toml".into(),
@@ -3209,9 +3237,7 @@ dagrun: PASS - 1 passed";
             TestId::parse("a::case1").unwrap(),
             TestId::parse("b::case2").unwrap(),
         ]);
-        let ran = v
-            .run(&tmp.0, &sel, &tmp.0.join("o"), &AtomicBool::new(false))
-            .unwrap();
+        let ran = run_fake(&*v, &tmp.0, &sel, &tmp.0.join("o"), &AtomicBool::new(false));
         assert_eq!(
             ran.effective_selection,
             Some(Selection::of([TestId::step("a"), TestId::step("b")]))
@@ -3238,21 +3264,14 @@ not json"#;
     /// (the temp dir dies with this call, so the log is read here).
     fn dagrun_ran(name: &str, journal: &str, steps: &[&str]) -> (Ran, String) {
         let tmp = TempDir::new(name);
-        let script = tmp.0.join("fake-dagrun");
         let echoes: Vec<String> = journal
             .lines()
             .map(|line| format!("echo '{line}' >> \"$DAGRUN_LOG_DIR/journal.jsonl\""))
             .collect();
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\n{}\nexit 1\n", echoes.join("\n")),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let script = write_fake_dagrun(
+            &tmp.0,
+            &format!("#!/bin/sh\n{}\nexit 1\n", echoes.join("\n")),
+        );
         let cfg = ValidatorConfig {
             kind: "dagrun".into(),
             dagrun: script.display().to_string(),
@@ -3260,15 +3279,14 @@ not json"#;
             ..ValidatorConfig::default()
         };
         let selection = Selection::of(steps.iter().map(|step| TestId::step(*step)));
-        let ran = from_config(&cfg)
-            .unwrap()
-            .run(
-                &tmp.0,
-                &selection,
-                &tmp.0.join("o"),
-                &AtomicBool::new(false),
-            )
-            .unwrap();
+        let validator = from_config(&cfg).unwrap();
+        let ran = run_fake(
+            &*validator,
+            &tmp.0,
+            &selection,
+            &tmp.0.join("o"),
+            &AtomicBool::new(false),
+        );
         let log = std::fs::read_to_string(&ran.log).unwrap_or_default();
         (ran, log)
     }
