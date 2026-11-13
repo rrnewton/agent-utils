@@ -2596,6 +2596,488 @@ fn archive_ignored_files(
     }))
 }
 
+/// Run Git with extra environment (object alternates for the
+/// private-history coverage reads).
+fn git_with_env(repo: &Path, args: &[&str], extra: &[(&str, String)]) -> Result<String> {
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-replace-objects",
+            "-c",
+            "core.useReplaceRefs=false",
+            "-C",
+        ])
+        .arg(repo)
+        .args(args)
+        .env_clear();
+    for (key, value) in std::env::vars() {
+        if !key.starts_with("GIT_") {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("cannot execute Git: {error}"))?;
+    if output.status.code() != Some(0) {
+        return Err(format!(
+            "Git refused in {}: git {}: {}",
+            repo.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn is_sha(text: &str) -> bool {
+    text.len() == 40
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Declared submodules of one checkout: (name, relative path)
+/// from `.gitmodules`, initialized ones only (a `.git` entry).
+fn declared_submodules(checkout_path: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(listing) = git(
+        checkout_path,
+        &[
+            "config",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for line in listing.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(name) = key
+            .strip_prefix("submodule.")
+            .and_then(|rest| rest.strip_suffix(".path"))
+        else {
+            continue;
+        };
+        let sub_path = checkout_path.join(value.trim());
+        if sub_path.join(".git").exists() {
+            found.push((name.to_string(), sub_path));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Both object names of every reflog entry under `logs`.
+fn reflog_endpoints(logs: &Path) -> std::collections::BTreeSet<String> {
+    let mut endpoints = std::collections::BTreeSet::new();
+    let mut pending = vec![logs.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in text.lines() {
+                let mut fields = line.split_whitespace();
+                for _ in 0..2 {
+                    if let Some(value) = fields.next() {
+                        if is_sha(value) && value.chars().any(|c| c != '0') {
+                            endpoints.insert(value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    endpoints
+}
+
+struct PrivateHistory {
+    commits: usize,
+    refs: Vec<String>,
+    unreferenced: usize,
+    remote_unchecked: Option<(String, String)>,
+}
+
+/// The commits only a declared submodule's own repository holds
+/// (#1255/#1257, bounded): positives are reflog endpoints,
+/// pseudorefs, every ref and every commit object (salvage's own
+/// commits excluded); negatives are the kept HEAD plus every ref
+/// of a durable repository, with durable object stores as
+/// alternates. Remaining tips are then asked of the recorded
+/// remote's advertisement when it is a local path.
+fn submodule_private_history(
+    cfg: &Cfg,
+    _checkout_path: &Path,
+    sub_path: &Path,
+    kept_head: &str,
+) -> Result<Option<PrivateHistory>> {
+    let common = {
+        let out = git(sub_path, &["rev-parse", "--git-common-dir"])?;
+        let named = PathBuf::from(out.trim());
+        if named.is_absolute() {
+            named
+        } else {
+            sub_path.join(named)
+        }
+    };
+    let git_dir = {
+        let out = git(sub_path, &["rev-parse", "--absolute-git-dir"])?;
+        PathBuf::from(out.trim())
+    };
+    let mut positives: std::collections::BTreeSet<String> = Default::default();
+    positives.extend(reflog_endpoints(&common.join("logs")));
+    if git_dir != common {
+        positives.extend(reflog_endpoints(&git_dir.join("logs")));
+    }
+    for pseudo in ["FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD"] {
+        if let Ok((code, out, _)) =
+            git_unchecked(sub_path, &["rev-parse", "--verify", "-q", pseudo])
+        {
+            if code == Some(0) && is_sha(out.trim()) {
+                positives.insert(out.trim().to_string());
+            }
+        }
+    }
+    let mut ref_commits: Vec<(String, String)> = Vec::new();
+    for line in git(
+        sub_path,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(*objectname) %(refname)",
+        ],
+    )?
+    .lines()
+    {
+        let mut fields = line.splitn(3, ' ');
+        let (Some(direct), peeled, Some(refname)) =
+            (fields.next(), fields.next().unwrap_or(""), fields.next())
+        else {
+            continue;
+        };
+        if is_sha(direct) {
+            positives.insert(direct.to_string());
+        }
+        let tip = if is_sha(peeled) { peeled } else { direct };
+        if is_sha(tip) {
+            ref_commits.push((refname.to_string(), tip.to_string()));
+        }
+    }
+    // Every commit object, excluding salvage's own commits.
+    let all_commits = git(
+        sub_path,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--unordered",
+            "--batch-check=%(objectname)",
+            "--filter=object:type=commit",
+        ],
+    )?;
+    let commit_list: Vec<&str> = all_commits
+        .lines()
+        .filter(|line| is_sha(line.trim()))
+        .collect();
+    if !commit_list.is_empty() {
+        let mut command = Command::new("git");
+        command
+            .args([
+                "--no-replace-objects",
+                "-c",
+                "core.useReplaceRefs=false",
+                "-C",
+            ])
+            .arg(sub_path)
+            .args(["log", "--no-walk=unsorted", "--stdin", "--format=%H %ce"])
+            .env_clear();
+        for (key, value) in std::env::vars() {
+            if !key.starts_with("GIT_") {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("stdin");
+            let _ = stdin.write_all(commit_list.join("\n").as_bytes());
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let (commit, committer) = line.split_once(' ').unwrap_or((line, ""));
+            if committer != "wrkslots@localhost" && is_sha(commit) {
+                positives.insert(commit.to_string());
+            }
+        }
+    }
+    // Durable repositories: the checkout's recorded source when
+    // it lives outside what removal deletes, and the submodule's
+    // own local-path remote outside the slot.
+    let mut durable: Vec<PathBuf> = Vec::new();
+    let mut negatives: std::collections::BTreeSet<String> = Default::default();
+    negatives.insert(kept_head.to_string());
+    let deletion_root = cfg.worktrees.clone();
+    let remote_url = git_unchecked(sub_path, &["remote", "get-url", "origin"])
+        .ok()
+        .and_then(|(code, out, _)| (code == Some(0)).then(|| out.trim().to_string()))
+        .unwrap_or_default();
+    let remote_local: Option<PathBuf> =
+        if !remote_url.is_empty() && !remote_url.contains("://") && !remote_url.contains('@') {
+            let candidate = if Path::new(&remote_url).is_absolute() {
+                PathBuf::from(&remote_url)
+            } else {
+                sub_path.join(&remote_url)
+            };
+            let resolved = candidate.canonicalize().unwrap_or(candidate);
+            (!resolved.starts_with(&deletion_root)).then_some(resolved)
+        } else {
+            None
+        };
+    if let Some(remote) = &remote_local {
+        durable.push(remote.clone());
+    }
+    let mut alternates: Vec<String> = Vec::new();
+    for repository in &durable {
+        for line in git(repository, &["for-each-ref", "--format=%(objectname)"])?.lines() {
+            if is_sha(line.trim()) {
+                negatives.insert(line.trim().to_string());
+            }
+        }
+        let objects = {
+            let out = git(repository, &["rev-parse", "--git-common-dir"])?;
+            let named = PathBuf::from(out.trim());
+            let base = if named.is_absolute() {
+                named
+            } else {
+                repository.join(named)
+            };
+            base.join("objects")
+        };
+        alternates.push(objects.to_string_lossy().into_owned());
+    }
+    let env: Vec<(&str, String)> = if alternates.is_empty() {
+        Vec::new()
+    } else {
+        vec![("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates.join(":"))]
+    };
+    let compute = |positives: &std::collections::BTreeSet<String>,
+                   negatives: &std::collections::BTreeSet<String>|
+     -> Result<(Vec<String>, usize)> {
+        let mut args: Vec<String> = vec!["rev-list".to_string()];
+        args.extend(positives.iter().cloned());
+        args.push("--not".to_string());
+        args.extend(negatives.iter().cloned());
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let listing = git_with_env(sub_path, &arg_refs, &env)?;
+        let commits: Vec<String> = listing
+            .lines()
+            .filter(|line| is_sha(line.trim()))
+            .map(|line| line.trim().to_string())
+            .collect();
+        // Maximal commits: not an ancestor of another in the set.
+        let mut tips: Vec<String> = Vec::new();
+        for candidate in &commits {
+            let mut maximal = true;
+            for other in &commits {
+                if other != candidate {
+                    let (code, _, _) = git_unchecked(
+                        sub_path,
+                        &["merge-base", "--is-ancestor", candidate, other],
+                    )?;
+                    if code == Some(0) {
+                        maximal = false;
+                        break;
+                    }
+                }
+            }
+            if maximal {
+                tips.push(candidate.clone());
+            }
+        }
+        Ok((tips, commits.len()))
+    };
+    let (mut tips, mut total) = compute(&positives, &negatives)?;
+    let mut remote_unchecked: Option<(String, String)> = None;
+    if !tips.is_empty() {
+        // Ask the recorded remote's advertisement (local paths
+        // only in this slice; a fetched proof store is not built).
+        if remote_url.is_empty() {
+            remote_unchecked = Some(("origin".to_string(), "no remote is recorded".to_string()));
+        } else if remote_local.is_none() && !remote_url.contains("://") {
+            remote_unchecked = Some((
+                "origin".to_string(),
+                "the recorded remote is not a local repository".to_string(),
+            ));
+        } else {
+            match git_unchecked(
+                sub_path,
+                &[
+                    "ls-remote",
+                    "--refs",
+                    &remote_url,
+                    "refs/heads/*",
+                    "refs/tags/*",
+                ],
+            ) {
+                Ok((Some(0), out, _)) => {
+                    let mut covering: std::collections::BTreeSet<String> = Default::default();
+                    for line in out.lines() {
+                        let Some((oid, _ref)) = line.split_once('\t') else {
+                            continue;
+                        };
+                        let oid = oid.trim();
+                        if !is_sha(oid) {
+                            continue;
+                        }
+                        if let Ok((code, peeled, _)) = git_unchecked(
+                            sub_path,
+                            &["cat-file", "--batch-check", &format!("{oid}^{{commit}}")],
+                        ) {
+                            if code == Some(0) {
+                                let commit = peeled.split_whitespace().next().unwrap_or("");
+                                if is_sha(commit) {
+                                    covering.insert(commit.to_string());
+                                }
+                            }
+                        } else {
+                            remote_unchecked = Some((
+                                "origin".to_string(),
+                                format!("advertised tip {oid} could not be peeled"),
+                            ));
+                        }
+                    }
+                    if !covering.is_empty() {
+                        negatives.extend(covering);
+                        let (new_tips, new_total) = compute(&positives, &negatives)?;
+                        tips = new_tips;
+                        total = new_total;
+                    }
+                }
+                Ok((_, _, stderr)) => {
+                    remote_unchecked = Some((
+                        "origin".to_string(),
+                        stderr
+                            .trim()
+                            .lines()
+                            .next()
+                            .unwrap_or("ls-remote failed")
+                            .to_string(),
+                    ));
+                }
+                Err(error) => {
+                    remote_unchecked = Some(("origin".to_string(), error));
+                }
+            }
+        }
+    }
+    if tips.is_empty() {
+        return Ok(None);
+    }
+    let _reflog = reflog_endpoints(&common.join("logs"));
+    let mut refs: Vec<String> = Vec::new();
+    let mut unreferenced = 0usize;
+    for tip in &tips {
+        let naming: Vec<&String> = ref_commits
+            .iter()
+            .filter(|(_, commit)| commit == tip)
+            .map(|(name, _)| name)
+            .collect();
+        let named = naming
+            .iter()
+            .any(|name| name.starts_with("refs/heads/") || name.starts_with("refs/tags/"));
+        if named {
+            for name in naming {
+                if !refs.contains(name) {
+                    refs.push(name.clone());
+                }
+            }
+        } else {
+            unreferenced += 1;
+        }
+    }
+    refs.sort();
+    Ok(Some(PrivateHistory {
+        commits: total,
+        refs,
+        unreferenced,
+        remote_unchecked,
+    }))
+}
+
+/// Python `_private_history_refusal`'s exact wording (#1255).
+fn private_history_refusal(slot: &str, sub_name: &str, history: &PrivateHistory) -> String {
+    let found = if history.refs.is_empty() {
+        format!(
+            "{} commit{} not on any remote, which only reflog entries or no name at all hold",
+            history.commits,
+            if history.commits == 1 { "" } else { "s" }
+        )
+    } else {
+        let shown: Vec<&String> = history.refs.iter().take(5).collect();
+        let mut text = format!(
+            "{} commit{} on {} ref{} not on any remote ({})",
+            history.commits,
+            if history.commits == 1 { "" } else { "s" },
+            history.refs.len(),
+            if history.refs.len() == 1 { "" } else { "s" },
+            shown
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if history.refs.len() > 5 {
+            text.push_str(&format!(" and {} more", history.refs.len() - 5));
+        }
+        if history.unreferenced > 0 {
+            text.push_str(&format!(
+                "; {} of those commits only a reflog entry or no name at all holds",
+                history.unreferenced
+            ));
+        }
+        text
+    };
+    let unchecked = match &history.remote_unchecked {
+        Some((remote, reason)) => format!(
+            " (remote {remote} could not be asked, so none of its branches or tags counted: {reason})"
+        ),
+        None => String::new(),
+    };
+    format!(
+        "unpushed private history in submodule {sub_name}: {found}{unchecked}. Removal deletes the slot's own copy of its repository, so it would delete the only copy. remedy: keep that history in a verified local bundle in the salvage archive, never pushed, by rerunning 'wrkslots remove {slot}' with the same options plus --archive-private-history; or publish it by hand and rerun remove"
+    )
+}
+
 fn salvage_gate(
     cfg: &Cfg,
     config: &Value,
@@ -2663,6 +3145,31 @@ fn salvage_gate(
     }
     let submodules = git(&path, &["submodule", "status", "--recursive"])?;
     if has_initialized_submodule(&submodules) {
+        // Declared-submodule private history (#1255/#1257): a
+        // submodule whose own repository holds commits nothing
+        // durable reaches refuses by name before salvage, in
+        // both the prepared and the locked judgment.
+        let slot = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for (sub_name, sub_path) in declared_submodules(&path) {
+            let kept = git(&sub_path, &["rev-parse", "--verify", "HEAD"])
+                .map(|out| out.trim().to_string())
+                .unwrap_or_default();
+            if kept.is_empty() {
+                continue;
+            }
+            if let Some(history) = submodule_private_history(cfg, &path, &sub_path, &kept)? {
+                let relative = sub_path
+                    .strip_prefix(&path)
+                    .map(|rel| rel.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| sub_name.clone());
+                let label = format!("{name}/{relative}");
+                return Err(private_history_refusal(&slot, &label, &history));
+            }
+        }
         return Err(format!(
             "checkout {name} has initialized submodules; submodule salvage stays with the Python edition for now"
         ));
