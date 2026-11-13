@@ -1,6 +1,6 @@
 ---
 title: 'claude-session-summarizer: a warm persistent Claude session as a vibe-talk Summarizer backend'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
