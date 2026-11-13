@@ -1251,10 +1251,22 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         result["agent_status"] = json!(agent_status);
         result["wrapper"] = wrapper;
         let queue_root = self.queue(&record.name)?;
+        // #1479: the oldest pending item's age, as interactive status reports.
+        let oldest_pending_age_seconds =
+            agent::pending_prompts(&queue_root)
+                .ok()
+                .and_then(|prompts| {
+                    prompts
+                        .iter()
+                        .filter_map(|(_, at)| *at)
+                        .min()
+                        .map(|at| agent_queue::queue::now_millis().saturating_sub(at) / 1000)
+                });
         result["queue_state"] = json!({
             "pending": agent_queue::queue::pending_identifiers(&queue_root).unwrap_or_default().len(),
             "inflight": agent_queue::queue::identifiers_if_directory(&queue_root.join(agent_queue::queue::INFLIGHT)).unwrap_or_default().len(),
             "failed": agent_queue::queue::identifiers_if_directory(&queue_root.join(agent_queue::queue::FAILED)).unwrap_or_default().len(),
+            "oldest_pending_age_seconds": oldest_pending_age_seconds,
         });
         let events_dir = events::directory(&directory);
         result["event_log"] = json!(events_dir);

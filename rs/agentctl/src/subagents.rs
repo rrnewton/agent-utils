@@ -12058,6 +12058,31 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 continue;
             };
             if row["mode"].as_str() == Some("headless") {
+                // Headless queues are drained by their own wrapper, never by
+                // this pass — but their oldest item's age still alarms the
+                // manager past the stale cap (#1479), like an interactive
+                // queue this pass could not drain.
+                if let Ok(pending) = self.pending_prompts(name) {
+                    if !pending.is_empty() {
+                        let oldest_seconds = pending
+                            .iter()
+                            .filter_map(|(_, at)| *at)
+                            .min()
+                            .map(|at| now_millis.saturating_sub(at) / 1000);
+                        rows.push(json!({
+                            "name": name,
+                            "queued": pending.len(),
+                            "typed": 0,
+                            "remaining": pending.len(),
+                            "oldest_seconds": oldest_seconds,
+                            "stale": oldest_seconds
+                                .is_some_and(|seconds| seconds >= stale.as_secs()),
+                            "drain_error": null,
+                            "blocked": null,
+                            "headless": true,
+                        }));
+                    }
+                }
                 continue;
             }
             // #903 queue-failed-digest: an agent with nothing pending but

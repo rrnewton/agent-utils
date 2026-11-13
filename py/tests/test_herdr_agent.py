@@ -1710,3 +1710,17 @@ def test_target_lock_root_env_override(tmp_path: Path, monkeypatch: pytest.Monke
         agent_api._host_target_lock_roots()
     monkeypatch.delenv("AGENTCTL_TARGET_LOCK_ROOT")
     assert agent_api._env_target_lock_roots() is None
+
+
+def test_status_reports_the_oldest_pending_age_for_any_item(tmp_path: Path) -> None:
+    """#1479: status names the oldest pending item's age, owner or not
+    (Rust parity: `oldest_pending_age_seconds`)."""
+    drain(client(FakeAgentHerdr()), target(), str(tmp_path))
+    enqueue(str(tmp_path), "old note", message_id="old")
+    artifact = tmp_path / "inbox/old.json"
+    document = json.loads(artifact.read_text())
+    document["queued_at"] = 100.0
+    artifact.write_text(json.dumps(document))
+    result = status(client(FakeAgentHerdr()), target(), str(tmp_path))
+    assert result["oldest_pending_queued_at_millis"] == 100_000
+    assert result["oldest_pending_age_seconds"] >= 800

@@ -144,6 +144,14 @@ pub struct QueueStatus {
     /// beside its age so a reader can recompute the age at any later moment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_pending_chat_queued_at_millis: Option<u64>,
+    /// Age in seconds of the oldest pending prompt of any kind, from its
+    /// `queued_at` (#1479): how long the queue's head has waited, beside when
+    /// it was queued. Absent when nothing waits or nothing records a time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_age_seconds: Option<u64>,
+    /// When the oldest pending prompt was queued (Unix milliseconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_queued_at_millis: Option<u64>,
     /// Pending prompts whose last refusal was `composer_unreadable`, with the
     /// recorded `delivery_error` detail. Empty for every other session.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2610,16 +2618,14 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 .file_name()
                 .expect("inflight path has a file name")
                 .to_owned();
-            let _claim_guard = match agent_queue::queue::take_claim_lock(
-                &directories,
-                &claim_filename,
-            )? {
-                Some(guard) => guard,
-                None => {
-                    let _ = transition(&inflight_path, &path);
-                    continue 'message;
-                }
-            };
+            let _claim_guard =
+                match agent_queue::queue::take_claim_lock(&directories, &claim_filename)? {
+                    Some(guard) => guard,
+                    None => {
+                        let _ = transition(&inflight_path, &path);
+                        continue 'message;
+                    }
+                };
             // The last look before typing comes after the move, so a tombstone written while
             // the prompt was still pending is always seen.
             if let Some((reason, detail)) =
@@ -3435,7 +3441,9 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         }
     }
     // #1372: the oldest pending chat prompt's age, for other senders' caps.
+    // #1479: the same for the oldest pending prompt of any kind.
     let mut oldest_chat_queued: Option<u64> = None;
+    let mut oldest_queued: Option<u64> = None;
     if let Ok(paths) = pending_in_queue_order(&directories) {
         for path in paths {
             let Ok(document) = load_message(&path) else {
@@ -3444,9 +3452,6 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
             let Ok(identifier) = message_id_from_path(&path) else {
                 continue;
             };
-            if !owner_prompt(&identifier, &document) {
-                continue;
-            }
             let Some(queued) = document
                 .get("queued_at")
                 .and_then(Value::as_f64)
@@ -3454,6 +3459,13 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
             else {
                 continue;
             };
+            oldest_queued = Some(match oldest_queued {
+                Some(oldest) => oldest.min(queued),
+                None => queued,
+            });
+            if !owner_prompt(&identifier, &document) {
+                continue;
+            }
             oldest_chat_queued = Some(match oldest_chat_queued {
                 Some(oldest) => oldest.min(queued),
                 None => queued,
@@ -3474,6 +3486,9 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         oldest_pending_chat_age_seconds: oldest_chat_queued
             .map(|queued| now_millis.saturating_sub(queued) / 1000),
         oldest_pending_chat_queued_at_millis: oldest_chat_queued,
+        oldest_pending_age_seconds: oldest_queued
+            .map(|queued| now_millis.saturating_sub(queued) / 1000),
+        oldest_pending_queued_at_millis: oldest_queued,
         composer_unreadable,
         input_stalled,
         inflight: identifiers_if_directory(&directories.inflight)?,
@@ -8605,6 +8620,24 @@ mod tests {
         assert_eq!(snapshot.oldest_pending_chat_queued_at_millis, Some(100_000));
         let age = snapshot.oldest_pending_chat_age_seconds.expect("chat age");
         assert!(age >= 800, "age {age} must reach back to queued_at 100s");
+        // #1479: the oldest pending prompt of any kind, here the same owner item.
+        assert_eq!(snapshot.oldest_pending_queued_at_millis, Some(100_000));
+        assert!(snapshot.oldest_pending_age_seconds.expect("age") >= 800);
+    }
+
+    #[test]
+    fn status_reports_the_oldest_pending_age_for_agent_items_too() {
+        // #1479: with no owner item waiting, the oldest agent item still ages.
+        let directory = TestDirectory::new("status-any-age");
+        prepare(directory.path()).unwrap();
+        bind_queue(directory.path(), &target()).unwrap();
+        queue_at(&directory, "note-1", "900", "newer note");
+        queue_at(&directory, "note-0", "100", "oldest note");
+        let fake = FakeAgent::new(&["working"]);
+        let snapshot = status(&fake, &target(), directory.path()).unwrap();
+        assert_eq!(snapshot.oldest_pending_chat_queued_at_millis, None);
+        assert_eq!(snapshot.oldest_pending_queued_at_millis, Some(100_000));
+        assert!(snapshot.oldest_pending_age_seconds.expect("age") >= 800);
     }
 
     #[test]

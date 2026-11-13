@@ -2501,10 +2501,10 @@ def _drain(
                     os.close(claim_descriptor)
                     _remove_claim_lock(inflight, os.path.basename(path))
                     if isinstance(delivery_error, _NotStaged):
-                        exc = delivery_error
+                        staged_error = delivery_error
                         # Nothing reached the composer: undo the at-most-once barrier so the
                         # prompt stays pending. A crash before the rename still quarantines it.
-                        blocked = _bounded_error(str(exc), max_artifact_bytes)
+                        blocked = _bounded_error(str(staged_error), max_artifact_bytes)
                         document.pop("possibly_submitted", None)
                         document.pop("inflight_at", None)
                         document.pop("delivery_claimed_at", None)
@@ -2516,7 +2516,7 @@ def _drain(
                         retained_path = path
                         break
                     elif isinstance(delivery_error, _Misrouted):
-                        exc = delivery_error
+                        misroute_error = delivery_error
                         # The wrong program was interrupted and told to ignore the prompt.
                         # Retry from readiness, which re-resolves and re-verifies the
                         # recipient; quarantine once the same message misroutes again.
@@ -2524,14 +2524,14 @@ def _drain(
                         misroutes = list(recorded) if isinstance(recorded, list) else []
                         misroutes.append({
                             "at": time.time(),
-                            "error": _bounded_error(str(exc), max_artifact_bytes),
+                            "error": _bounded_error(str(misroute_error), max_artifact_bytes),
                         })
                         document["misroutes"] = misroutes
                         if len(misroutes) >= MAX_MISROUTES:
                             attempts += 1
                             document["delivery_attempts"] = attempts
                             document["tui_delivery_attempts"] = attempts
-                            document["delivery_error"] = _bounded_error(str(exc), max_artifact_bytes)
+                            document["delivery_error"] = _bounded_error(str(misroute_error), max_artifact_bytes)
                             document["probable_misroute"] = True
                             document["delivery_failed_at"] = time.time()
                             _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
@@ -2539,7 +2539,7 @@ def _drain(
                             _transition(inflight_path, failed_path, max_artifact_bytes=max_artifact_bytes)
                             retained_path = failed_path
                             _failed_metadata(
-                                failed_path, outcome="possibly_submitted", error=str(exc),
+                                failed_path, outcome="possibly_submitted", error=str(misroute_error),
                                 max_artifact_bytes=max_artifact_bytes,
                             )
                             quarantined.append(identifier)
@@ -2548,20 +2548,20 @@ def _drain(
                         document.pop("inflight_at", None)
                         document.pop("delivery_claimed_at", None)
                         document["delivery_state"] = "pending"
-                        document["delivery_error"] = _bounded_error(str(exc), max_artifact_bytes)
+                        document["delivery_error"] = _bounded_error(str(misroute_error), max_artifact_bytes)
                         _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
                         _transition(inflight_path, path, max_artifact_bytes=max_artifact_bytes)
                         retained_path = path
                         # The retry does not consume an attempt: the misroute count bounds it.
                         continue
                     elif isinstance(delivery_error, _PossiblySubmitted):
-                        exc = delivery_error
+                        submitted_error = delivery_error
                         attempts += 1
                         document["delivery_attempts"] = attempts
                         document["tui_delivery_attempts"] = attempts
-                        document["delivery_error"] = _bounded_error(str(exc), max_artifact_bytes)
+                        document["delivery_error"] = _bounded_error(str(submitted_error), max_artifact_bytes)
                         document["possibly_submitted"] = True
-                        if exc.misroute:
+                        if submitted_error.misroute:
                             document["probable_misroute"] = True
                         document["delivery_failed_at"] = time.time()
                         _atomic_json(inflight_path, document, max_artifact_bytes=max_artifact_bytes)
@@ -2569,7 +2569,7 @@ def _drain(
                         _transition(inflight_path, failed_path, max_artifact_bytes=max_artifact_bytes)
                         retained_path = failed_path
                         _failed_metadata(
-                            failed_path, outcome="possibly_submitted", error=str(exc),
+                            failed_path, outcome="possibly_submitted", error=str(submitted_error),
                             max_artifact_bytes=max_artifact_bytes,
                         )
                         quarantined.append(identifier)
@@ -2760,7 +2760,9 @@ def status(
     }
     # #1372: the oldest pending chat prompt's age, for other senders' caps
     # (Rust parity: `oldest_pending_chat_age_seconds`).
+    # #1479: the same for the oldest pending prompt of any kind.
     oldest_chat: int | None = None
+    oldest_any: int | None = None
     if os.path.lexists(inbox):
         for identifier in pending_ids:
             try:
@@ -2769,9 +2771,14 @@ def status(
                     "queued prompt", require_private=True)
             except (AgentDeliveryError, OSError):
                 continue
-            if not isinstance(document, dict) or not _is_owner_prompt(identifier, document):
+            if not isinstance(document, dict):
                 continue
             value = document.get("queued_at")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                queued_any = int(max(0.0, float(value)) * 1000)
+                oldest_any = queued_any if oldest_any is None else min(oldest_any, queued_any)
+            if not _is_owner_prompt(identifier, document):
+                continue
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 queued = int(max(0.0, float(value)) * 1000)
                 oldest_chat = queued if oldest_chat is None else min(oldest_chat, queued)
@@ -2779,6 +2786,10 @@ def status(
         result["oldest_pending_chat_queued_at_millis"] = oldest_chat
         result["oldest_pending_chat_age_seconds"] = max(
             0, int(time.time() * 1000) - oldest_chat) // 1000
+    if oldest_any is not None:
+        result["oldest_pending_queued_at_millis"] = oldest_any
+        result["oldest_pending_age_seconds"] = max(
+            0, int(time.time() * 1000) - oldest_any) // 1000
     if info.reported_status is not None:
         result["herdr_agent_status"] = info.reported_status
     return result

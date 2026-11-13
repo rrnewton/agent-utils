@@ -1859,7 +1859,10 @@ mod tests {
         .expect("the fresh claim lock is free to take for its owner");
         claim("stale-new", now - 3600.0, false);
         claim("stale-pasted", now - 3600.0, true);
-        assert_eq!(recover_inflight(&directories).unwrap(), vec!["stale-pasted"]);
+        assert_eq!(
+            recover_inflight(&directories).unwrap(),
+            vec!["stale-pasted"]
+        );
         assert_eq!(
             message_state(&queue.0, "fresh").unwrap(),
             Some(MessageState::Inflight)

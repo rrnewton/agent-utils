@@ -191,6 +191,73 @@ fn priority_name(priority: Priority) -> &'static str {
     }
 }
 
+/// Whether a queue item came from the owner (#1479, keeping #698's intent):
+/// owner items go first in a turn-boundary batch and keep their own heading.
+fn is_owner_item(path: &Path, document: &Map<String, Value>) -> bool {
+    queue::message_id_from_path(path)
+        .is_ok_and(|identifier| crate::agent::owner_prompt(&identifier, document))
+        || document.get("from").and_then(Value::as_str) == Some("owner")
+}
+
+/// One item's section of a combined turn-boundary prompt: its stored text,
+/// headed by its sender header when the text does not already open with one,
+/// so every item stays individually marked (#1479, #698).
+fn batch_section(document: &Map<String, Value>) -> String {
+    let text = document
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if text.starts_with("[from ") {
+        return text.to_owned();
+    }
+    let from = document
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or("agentctl");
+    format!("[from {from} via agentctl]\n{text}")
+}
+
+/// Split `items` into as few combined prompts as fit the harness input limit
+/// (#1479): a group never truncates an item, and a single item larger than
+/// the limit forms its own group, as it would have been typed alone.
+fn batch_groups(
+    items: Vec<(PathBuf, Map<String, Value>)>,
+) -> Vec<Vec<(PathBuf, Map<String, Value>)>> {
+    let limit = crate::agent::MAX_TYPED_PROMPT_BYTES;
+    let mut groups: Vec<Vec<(PathBuf, Map<String, Value>)>> = Vec::new();
+    let mut group: Vec<(PathBuf, Map<String, Value>)> = Vec::new();
+    let mut group_bytes = 0usize;
+    for item in items {
+        let section_bytes = batch_section(&item.1).len() + 2;
+        if !group.is_empty() && group_bytes + section_bytes > limit {
+            groups.push(std::mem::take(&mut group));
+            group_bytes = 0;
+        }
+        group_bytes += section_bytes;
+        group.push(item);
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
+}
+
+/// The combined text of one batch group: every item's section intact.
+fn batch_text(group: &[(PathBuf, Map<String, Value>)]) -> String {
+    let sections: Vec<String> = group
+        .iter()
+        .map(|(_, document)| batch_section(document))
+        .collect();
+    if sections.len() == 1 {
+        return sections.into_iter().next().unwrap_or_default();
+    }
+    format!(
+        "{} queued messages:\n\n{}",
+        sections.len(),
+        sections.join("\n\n")
+    )
+}
+
 /// `now` when the item asks for it, or is urgent and does not ask otherwise.
 fn delivers_now(document: &Map<String, Value>) -> bool {
     match document.get("deliver").and_then(Value::as_str) {
@@ -210,8 +277,21 @@ struct Written {
     document: Map<String, Value>,
     written_at: Instant,
     queued_at: Option<Instant>,
-    /// The item's claim lock, held while it is inflight (#1480).
-    _claim: Option<agent_queue::fsio::HeldLock>,
+    /// The items' claim locks, held while they are inflight (#1480).
+    _claims: Vec<agent_queue::fsio::HeldLock>,
+    /// Extra items delivered in the same combined input (#1479); empty for a
+    /// single-item delivery. Settled with the primary item on Started and
+    /// returned with it on Cancelled.
+    batch: Vec<BatchMember>,
+}
+
+/// One extra item of a combined turn-boundary input (#1479).
+#[derive(Debug)]
+struct BatchMember {
+    queue_id: String,
+    inflight: PathBuf,
+    lane: PathBuf,
+    document: Map<String, Value>,
 }
 
 struct Harness {
@@ -641,14 +721,35 @@ impl Wrapper {
             return Ok(());
         }
         self.pause_until = None;
-        for (path, document) in self.pending()? {
-            if self.busy && !delivers_now(&document) {
-                continue;
+        let pending = self.pending()?;
+        if self.busy {
+            // Mid-turn only `now` items go, one at a time, as before.
+            for (path, document) in pending {
+                if !delivers_now(&document) {
+                    continue;
+                }
+                if self.deliver(&path, document)? {
+                    return Ok(());
+                }
             }
-            if self.deliver(&path, document)? {
-                return Ok(());
-            }
+            return Ok(());
         }
+        // At an idle turn boundary, deliver ALL queued items in one prompt
+        // (#1479): each item keeps its own sender header, owner items first
+        // and individually headed (#698). Only the harness input limit
+        // splits the queue, into as few prompts as fit, never truncating an
+        // item; later groups wait for the next boundary.
+        let mut items = pending;
+        items.sort_by_key(|(path, document)| !is_owner_item(path, document));
+        let Some(group) = batch_groups(items).into_iter().next() else {
+            return Ok(());
+        };
+        if group.len() == 1 {
+            let (path, document) = group.into_iter().next().expect("one item");
+            self.deliver(&path, document)?;
+            return Ok(());
+        }
+        self.deliver_batch(group)?;
         Ok(())
     }
 
@@ -729,7 +830,144 @@ impl Wrapper {
             document,
             written_at: Instant::now(),
             queued_at: None,
-            _claim: claim,
+            _claims: claim.into_iter().collect(),
+            batch: Vec::new(),
+        });
+        Ok(true)
+    }
+
+    /// Hand one combined turn-boundary group to the harness as one input
+    /// (#1479). Every member moves behind the inflight barrier under its own
+    /// claim lock and shares the group's harness input ID; Started settles
+    /// them all, Cancelled returns them all, and a crash recovers each by
+    /// the usual per-item rules, never retyping the combined text.
+    fn deliver_batch(&mut self, group: Vec<(PathBuf, Map<String, Value>)>) -> Result<bool> {
+        let lock = lock_delivery(&self.queue_root, self.queue_identity, &Blocking)?;
+        let uuid = claude::random_uuid().map_err(|error| io_fail("make an input ID", error))?;
+        let mut members: Vec<BatchMember> = Vec::new();
+        let mut claims: Vec<agent_queue::fsio::HeldLock> = Vec::new();
+        for (path, mut document) in group {
+            if !path.exists() {
+                continue;
+            }
+            let queue_id = queue::message_id_from_path(&path)?;
+            if self.consume.contains_key(&queue_id) {
+                self.consume_item(&path, &queue_id)?;
+                continue;
+            }
+            let filename = path
+                .file_name()
+                .expect("queued path has a file name")
+                .to_owned();
+            let inflight = self.directories.inflight.join(&filename);
+            transition(&path, &inflight)?;
+            if let Some((reason, detail)) =
+                set_aside_reason(&self.directories, &queue_id, &document, queue::now_millis())
+            {
+                set_aside(
+                    &self.queue_root,
+                    &self.directories,
+                    &inflight,
+                    document,
+                    reason,
+                    &detail,
+                )?;
+                continue;
+            }
+            let lane = if path.starts_with(&self.directories.inbox_v2) {
+                "inbox.v2"
+            } else {
+                "inbox"
+            };
+            let attempts = queue::delivery_attempts(&document, &path).unwrap_or(0);
+            document.insert("possibly_submitted".to_owned(), json!(true));
+            document.insert("delivery_state".to_owned(), json!("inflight"));
+            document.insert("inflight_at".to_owned(), json!(unix_seconds()));
+            document.insert("paste_tracking".to_owned(), json!(true));
+            document.insert("inflight_from".to_owned(), json!(lane));
+            document.insert("harness_input_id".to_owned(), json!(uuid));
+            document.insert("delivery_attempts".to_owned(), json!(attempts + 1));
+            document.insert("batch_id".to_owned(), json!(uuid));
+            document.remove("paste_started_at");
+            atomic_json(&inflight, &Value::Object(document.clone()))?;
+            document.insert("paste_started_at".to_owned(), json!(unix_seconds()));
+            atomic_json(&inflight, &Value::Object(document.clone()))?;
+            if let Some(claim) = queue::take_claim_lock(&self.directories, &filename)? {
+                claims.push(claim);
+            }
+            members.push(BatchMember {
+                queue_id,
+                inflight,
+                lane: path.clone(),
+                document,
+            });
+        }
+        if members.is_empty() {
+            return Ok(false);
+        }
+        if members.len() == 1 {
+            // Everything else was set aside or consumed: write this one alone.
+            let member = members.into_iter().next().expect("one member");
+            let text = member
+                .document
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            drop(lock);
+            let line = claude::input_line(&uuid, &text, &self.config.session);
+            let _ = self
+                .harness
+                .as_ref()
+                .and_then(|harness| harness.input.as_ref())
+                .map(|input| input.send(line.into_bytes()));
+            self.current = Some(Written {
+                queue_id: member.queue_id,
+                uuid,
+                inflight: member.inflight,
+                lane: member.lane,
+                document: member.document,
+                written_at: Instant::now(),
+                queued_at: None,
+                _claims: claims,
+                batch: Vec::new(),
+            });
+            return Ok(true);
+        }
+        let combined = batch_text(
+            &members
+                .iter()
+                .map(|member| (member.lane.clone(), member.document.clone()))
+                .collect::<Vec<_>>(),
+        );
+        drop(lock);
+        let line = claude::input_line(&uuid, &combined, &self.config.session);
+        let wrote = self
+            .harness
+            .as_ref()
+            .and_then(|harness| harness.input.as_ref())
+            .map(|input| input.send(line.into_bytes()));
+        if let Some(Err(error)) = wrote {
+            let queue_id = members[0].queue_id.clone();
+            self.emit(
+                "error",
+                Some(&queue_id),
+                json!({"class": "harness_write", "queue_id": queue_id, "message": error.to_string()}),
+            )?;
+        }
+        let mut members = members.into_iter();
+        let first = members.next().expect("batch has a first member");
+        let rest: Vec<BatchMember> = members.collect();
+        self.current = Some(Written {
+            queue_id: first.queue_id,
+            uuid,
+            inflight: first.inflight,
+            lane: first.lane,
+            document: first.document,
+            written_at: Instant::now(),
+            queued_at: None,
+            _claims: claims,
+            batch: rest,
         });
         Ok(true)
     }
@@ -797,6 +1035,30 @@ impl Wrapper {
                         &self.directories.processed.join(filename),
                     )?;
                     queue::remove_claim_lock(&self.directories, &filename_ref);
+                    // Settle every other member of a combined input (#1479).
+                    for member in &mut current.batch {
+                        strip_stamps(&mut member.document);
+                        member
+                            .document
+                            .insert("delivery_state".to_owned(), json!("processed"));
+                        member
+                            .document
+                            .insert("started_at".to_owned(), json!(unix_seconds()));
+                        member
+                            .document
+                            .insert("confirmed_at".to_owned(), json!(unix_seconds()));
+                        member
+                            .document
+                            .insert("mid_turn".to_owned(), json!(mid_turn));
+                        atomic_json(&member.inflight, &Value::Object(member.document.clone()))?;
+                        let name = member
+                            .inflight
+                            .file_name()
+                            .expect("inflight path has a file name")
+                            .to_owned();
+                        transition(&member.inflight, &self.directories.processed.join(&name))?;
+                        queue::remove_claim_lock(&self.directories, &name);
+                    }
                 }
                 if !self.busy {
                     self.begin_turn("input", Some(current.queue_id.clone()))?;
@@ -806,6 +1068,13 @@ impl Wrapper {
                     Some(&current.queue_id),
                     json!({"queue_id": current.queue_id, "harness_input_id": uuid, "mid_turn": mid_turn}),
                 )?;
+                for member in &current.batch {
+                    self.emit(
+                        "input.started",
+                        Some(&member.queue_id),
+                        json!({"queue_id": member.queue_id, "harness_input_id": uuid, "mid_turn": mid_turn, "batched": true}),
+                    )?;
+                }
                 self.started_inputs
                     .insert(uuid.to_owned(), current.queue_id.clone());
                 self.rescan = true;
@@ -829,6 +1098,24 @@ impl Wrapper {
                         .to_owned();
                     transition(&current.inflight, &current.lane)?;
                     queue::remove_claim_lock(&self.directories, &filename_ref);
+                    // Return every other member of a combined input (#1479).
+                    for member in &mut current.batch {
+                        strip_stamps(&mut member.document);
+                        member.document.remove("possibly_submitted");
+                        member.document.remove("inflight_at");
+                        member.document.remove("harness_queued_at");
+                        member
+                            .document
+                            .insert("delivery_state".to_owned(), json!("pending"));
+                        atomic_json(&member.inflight, &Value::Object(member.document.clone()))?;
+                        let name = member
+                            .inflight
+                            .file_name()
+                            .expect("inflight path has a file name")
+                            .to_owned();
+                        transition(&member.inflight, &member.lane)?;
+                        queue::remove_claim_lock(&self.directories, &name);
+                    }
                 }
                 self.emit(
                     "input.cancelled",

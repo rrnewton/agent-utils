@@ -547,6 +547,82 @@ fn a_now_item_starts_mid_turn_and_a_turn_boundary_item_waits() {
 }
 
 #[test]
+fn batch_groups_split_only_at_the_input_limit_and_never_truncate() {
+    // #1479 guard: as few prompts as fit, no item ever cut.
+    let item = |id: &str, size: usize| {
+        let mut document = Map::new();
+        document.insert("text".to_owned(), json!("x".repeat(size)));
+        (PathBuf::from(format!("/q/{id}.json")), document)
+    };
+    let limit = crate::agent::MAX_TYPED_PROMPT_BYTES;
+    let groups = batch_groups(vec![
+        item("a", limit - 100),
+        item("b", limit - 100),
+        item("c", 10),
+    ]);
+    assert_eq!(groups.len(), 2, "{groups:?}");
+    assert_eq!(groups[0].len(), 1);
+    assert_eq!(groups[1].len(), 2);
+    for group in &groups {
+        assert!(batch_text(group).len() <= limit || group.len() == 1);
+    }
+    let oversized = batch_groups(vec![item("big", limit + 1), item("small", 10)]);
+    assert_eq!(oversized.len(), 2);
+    assert!(batch_text(&oversized[0]).contains(&"x".repeat(limit + 1)));
+}
+
+#[test]
+fn queued_items_at_an_idle_boundary_arrive_as_one_prompt_owner_first() {
+    // #1479: three items queued before the wrapper starts are delivered as
+    // one combined input in one turn, owner first, each with its own header;
+    // before the fix each started its own turn.
+    let fixture = Fixture::new("batch-boundary", "normal");
+    fixture.enqueue("note-a", "note a", json!({"from": "a"}));
+    fixture.enqueue("owner-q", "owner question", json!({"from": "owner"}));
+    fixture.enqueue("note-b", "note b", json!({"from": "b"}));
+    let handle = fixture.start();
+    for id in ["note-a", "owner-q", "note-b"] {
+        fixture.wait("processed", || {
+            fixture.state(id) == Some(queue::MessageState::Processed)
+        });
+    }
+    fixture.wait("one turn", || {
+        fixture
+            .events()
+            .iter()
+            .filter(|event| event.kind == "turn.completed")
+            .count()
+            == 1
+    });
+    let echoed = fixture
+        .events()
+        .into_iter()
+        .find(|event| event.kind == "assistant.text")
+        .map(|event| event.data["text"].as_str().unwrap_or_default().to_owned())
+        .expect("the harness echoed the combined input");
+    assert!(echoed.contains("3 queued messages:"), "{echoed}");
+    let owner_at = echoed
+        .find("[from owner via agentctl]")
+        .expect("owner heading");
+    let a_at = echoed.find("[from a via agentctl]").expect("a heading");
+    let b_at = echoed.find("[from b via agentctl]").expect("b heading");
+    assert!(owner_at < a_at && a_at < b_at, "{echoed}");
+    assert!(echoed.contains("owner question"), "{echoed}");
+    let batch_ids: Vec<Value> = ["note-a", "owner-q", "note-b"]
+        .iter()
+        .map(|id| {
+            queue::load_message(&fixture.queue().join(format!("processed/{id}.json"))).unwrap()
+                ["batch_id"]
+                .clone()
+        })
+        .collect();
+    assert!(batch_ids[0].is_string(), "{batch_ids:?}");
+    assert_eq!(batch_ids[0], batch_ids[1]);
+    assert_eq!(batch_ids[1], batch_ids[2]);
+    fixture.stop(handle);
+}
+
+#[test]
 fn interrupt_ends_the_running_turn_and_the_next_input_runs() {
     let fixture = Fixture::new("interrupt", "normal");
     let handle = fixture.start();
