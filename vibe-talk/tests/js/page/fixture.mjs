@@ -5497,6 +5497,19 @@ const TUNING_BANDS = {
     "the share until the owner says otherwise, his 5% (#728 vt-quote-read-threshold): lower and a quote of " +
     "one sentence in a long message marks it all read again; higher and a quote of a short message's main " +
     "point leaves it unread"],
+  MIN_MARK_READ_FIRST_PERCENT: [0, 0,
+    "the least first share of a long message a quote can sit in: 0, which holds nothing back by position"],
+  MAX_MARK_READ_FIRST_PERCENT: [100, 100,
+    "the most that first share can be: the whole message, past which every quote sits in it"],
+  DEFAULT_MARK_READ_FIRST_PERCENT: [25, 75,
+    "the first share until the owner says otherwise, his 50%: lower and a quote halfway through a long "
+    + "message marks it read with half ahead; higher and a quote near the end still leaves it unread"],
+  MIN_MARK_READ_LONG_WORDS: [0, 0,
+    "the least word count that makes a message long: over 0 words, so every message counts"],
+  MAX_MARK_READ_LONG_WORDS: [1000, 10000,
+    "the most words that can make a message long: past the longest message anyone answers"],
+  DEFAULT_MARK_READ_LONG_WORDS: [0, 0,
+    "how long is long until the owner says otherwise: over 0 words, so the first-share rule applies to all"],
   CARD_LINE_CHARS: [36, 36,
     "how many characters one card line is counted at, the same as src/threads.rs CARD_LINE_CHARS: " +
     "the server and the page must count a root's lines alike, or a thread is split that the " +

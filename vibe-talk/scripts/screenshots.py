@@ -6385,11 +6385,11 @@ SCENES: tuple[Scene, ...] = (
             ("the settings screen is up", "window.__visible('screen-settings')"),
             (
                 # The owner's name for the list, and the old one gone.
-                # `#728 vt-quote-read-threshold` put Quoted replies under Your own messages.
-                "Messages holds Your own messages, Quoted replies, Mark-read automatically, Empty messages, Combining messages and Rich headers",
+                # Mark read on reply sits under Your own messages.
+                "Messages holds Your own messages, Mark read on reply, Mark-read automatically, Empty messages, Combining messages and Rich headers",
                 "(() => { const heads = [...document.querySelectorAll('#settings-messages .settings-group .group-head > h3')]"
                 ".map((h) => h.textContent.trim()); "
-                "return ['Your own messages', 'Quoted replies', 'Mark-read automatically', 'Empty messages', 'Combining messages', 'Rich headers']"
+                "return ['Your own messages', 'Mark read on reply', 'Mark-read automatically', 'Empty messages', 'Combining messages', 'Rich headers']"
                 ".every((h, i) => heads[i] === h) && !heads.includes('Read automatically'); })()",
             ),
             (

@@ -237,6 +237,8 @@ export interface ElementById {
   "fold-keyboard-body": HTMLDivElement;
   "fold-mark-own": HTMLButtonElement;
   "fold-mark-own-body": HTMLDivElement;
+  "fold-mark-read": HTMLButtonElement;
+  "fold-mark-read-body": HTMLDivElement;
   "fold-message-cache": HTMLButtonElement;
   "fold-message-cache-body": HTMLDivElement;
   "fold-message-links": HTMLButtonElement;
@@ -247,8 +249,6 @@ export interface ElementById {
   "fold-opening-links-body": HTMLDivElement;
   "fold-provider": HTMLButtonElement;
   "fold-provider-body": HTMLDivElement;
-  "fold-mark-read": HTMLButtonElement;
-  "fold-mark-read-body": HTMLDivElement;
   "fold-reading-full": HTMLButtonElement;
   "fold-reading-full-body": HTMLDivElement;
   "fold-reading-width": HTMLButtonElement;
@@ -314,10 +314,10 @@ export interface ElementById {
   "help-link-keyboard": HTMLButtonElement;
   "help-link-live-messages": HTMLButtonElement;
   "help-link-mark-own": HTMLButtonElement;
+  "help-link-mark-read": HTMLButtonElement;
   "help-link-message-cache": HTMLButtonElement;
   "help-link-message-links": HTMLButtonElement;
   "help-link-microphone": HTMLButtonElement;
-  "help-link-mark-read": HTMLButtonElement;
   "help-link-reading-width": HTMLButtonElement;
   "help-link-resuming": HTMLButtonElement;
   "help-link-rich-headers": HTMLButtonElement;
@@ -328,10 +328,10 @@ export interface ElementById {
   "help-link-voice-send": HTMLButtonElement;
   "help-live-messages": HTMLDetailsElement;
   "help-mark-own": HTMLDetailsElement;
+  "help-mark-read": HTMLDetailsElement;
   "help-message-cache": HTMLDetailsElement;
   "help-message-links": HTMLDetailsElement;
   "help-microphone": HTMLDetailsElement;
-  "help-mark-read": HTMLDetailsElement;
   "help-reading-width": HTMLDetailsElement;
   "help-resuming": HTMLDetailsElement;
   "help-rich-headers": HTMLDetailsElement;
@@ -393,8 +393,8 @@ export interface ElementById {
   "mark-read-nonquote": HTMLInputElement;
   "mark-read-on-reply": HTMLSelectElement;
   "mark-read-options": HTMLDivElement;
-  "mark-read-quoted": HTMLDivElement;
   "mark-read-quote-guard": HTMLInputElement;
+  "mark-read-quoted": HTMLDivElement;
   "mark-read-state": HTMLParagraphElement;
   "message-cache-confirm": HTMLDivElement;
   "message-cache-confirm-no": HTMLButtonElement;
