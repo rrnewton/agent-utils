@@ -1128,7 +1128,7 @@ test("a tap on ANOTHER block of the message being read jumps there; on the block
     "the jump reused the old selection, so the server would queue it behind the old read");
   assert.equal(litBlock(page.el("discord-log").children[0]), "li:the rewrite is a draft");
   assert.equal(page.el("read-steer-count").text(), "3 of 3");
-  assert.equal(page.el("read-next").disabled, true, "Next is offered on the last block");
+  assert.equal(page.el("read-next").disabled, false, "Next is not offered on the last block, where it finishes the read");
 
   await page.el("discord-log").children[0].dispatch("click", { target: blockElements(page.el("discord-log").children[0])[2] });
   await page.settle();
@@ -1164,11 +1164,28 @@ test("Previous and Next move the read a block at a time; Previous on the first b
   await page.el("read-next").click();
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  assert.equal(page.el("read-next").disabled, false, "Next is not offered on the last block, where it finishes the read");
   const dismissedBefore = page.dismissCalls.length;
   await page.el("read-next").click();
   await page.settle();
   assert.ok(page.dismissCalls.length > dismissedBefore, "Next on the last block did not finish the message");
   assert.equal(page.el("read-steer").hidden, true, "the strip outlived the finished read");
+});
+
+test("`#1035 read-next-finish`: with Autoplay on, Next on the last block finishes and goes on to the next message", async () => {
+  const { page, rows } = await blockedRead({ store: new Map([["vibe-talk.voice.autoplay", "1"]]) });
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  await page.el("read-next").click();
+  await page.settle();
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  assert.equal(page.el("read-next").disabled, false, "Next is not offered on the last block, where it finishes the read");
+  await page.el("read-next").click();
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [{ messages: [BLOCKED_ID] }], "Next on the last block did not mark the message read");
+  assert.match(page.audioStreams.at(-1).url, /ticket-for-1000000000000000002/, "Autoplay did not go on to the next message");
 });
 
 // --- `#627 scrubber-thumb-arrows`: the fat arrows step a section, the thin ones a block -------------
@@ -5131,6 +5148,7 @@ test("`#1039 documents-read-parity`: Next on the last block and the natural end 
   await page.el("read-next").click();
   await page.settle();
   assert.equal(page.el("read-steer-count").text(), "2 of 2", "the premise: the read is not on its last block");
+  assert.equal(page.el("read-next").disabled, false, "Next is not offered on the document's last block, where it finishes the read");
   const spoken = page.deviceSpeech.utterances.length;
   await page.el("read-next").click();
   await page.settle();

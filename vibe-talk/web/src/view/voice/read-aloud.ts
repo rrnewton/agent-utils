@@ -2389,7 +2389,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (alone) deps.el("read-steer-count").textContent = "";
     if (position === "") return;
     deps.el("read-steer-count").textContent = position;
-    deps.el("read-next").disabled = nowPlaying!.segment! + 1 >= nowPlaying!.segments!.length;
+    // `#1035 read-next-finish`: Next stays offered on the last block, where pressing it finishes
+    // the read through the natural-end path (`stepReading`); disabling it there stranded the
+    // reader on the last block with the button, the media key and the arrow disagreeing.
+    deps.el("read-next").disabled = false;
     const at = nowPlaying!.segment!;
     deps.el("read-section-next").disabled = !readSectionStarts(nowPlaying! as Playing & { segments: SpeechSegment[] }).some((start) => start > at);
     if (wasHidden) placeReadSteer();

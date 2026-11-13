@@ -1,6 +1,6 @@
 ---
 title: 'read-next-finish: Next on the last sentence finishes and marks read'
-status: open
+status: closed
 priority: 1
 issue_type: task
 external_ref: gh-310
@@ -27,3 +27,7 @@ Autoplay off Next-at-last stops + Done; Autoplay on unchanged; media key equals 
 ## Notes
 
 [watermelon-full-preview] mu-docview.
+
+## Resolution
+
+[watermelon-full-preview] mu-readnext. `stepReading` already finished through the natural-end path at the last block (e9348463), but `renderReadSteer` disabled the on-screen Next there, so the button press never reached it and the reader stranded on the last block (owner 046). `read-next` now stays enabled on the last block: Autoplay off stops and marks Done, Autoplay on goes on to the next message, and a document/Discuss read (kind document) ends with nothing archived — the same endings as the natural end, shared by the button, the media nexttrack key and the arrow. Module tests cover Autoplay off/on and the document kind; the browser checks press the real button at phone and desktop width.

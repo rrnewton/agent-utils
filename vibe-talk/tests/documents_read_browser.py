@@ -366,9 +366,10 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     wait_count(page, f"{count} of {count}")
     wait_lit(page, blocks[-1])
     wait_lit_in_view(page)
-    # On the last block the strip's Next is not offered, as a message's is not.
-    check(page.evaluate("() => document.getElementById('read-next').disabled") is True,
-          "Next is offered on the document's last block")
+    # On the last block the strip's Next stays offered, as a message's does:
+    # pressing it finishes the read (`#1035 read-next-finish`).
+    check(page.evaluate("() => document.getElementById('read-next').disabled") is False,
+          "Next is not offered on the document's last block")
     act("#read-prev")
     wait_count(page, f"{count - 1} of {count}")
     wait_lit(page, blocks[-2])
@@ -382,6 +383,18 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     wait_stopped(page)
     wait_unlit(page)
     check(len(utterances(page)) == said_before_finish, "finishing the read said something after it")
+    # The strip's own Next on the last block finishes it the same way, with a
+    # real press (Playwright tap/click, no wall-clock wait: `wait_stopped`
+    # waits on the owner's read state).
+    act("#doc-read")
+    wait_count(page, f"1 of {count}")
+    act(f'#read-timeline button[aria-label="Read from block {count} of {count}"]')
+    wait_count(page, f"{count} of {count}")
+    said_before_finish = len(utterances(page))
+    act("#read-next")
+    wait_stopped(page)
+    wait_unlit(page)
+    check(len(utterances(page)) == said_before_finish, "finishing the read with Next said something after it")
 
     # Flip back: the next read is the server voice's — the sidecar is asked
     # for the document's words, the strip counts cloud blocks, the device rests.

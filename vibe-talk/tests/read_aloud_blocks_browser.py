@@ -1136,8 +1136,8 @@ def main() -> int:
                       f"the media session handlers are {handlers}")
                 page.evaluate("() => window.mediaProbe.handlers.nexttrack({action: 'nexttrack'})")
                 wait_position(page, "7 of 7")
-                check(page.evaluate("() => document.getElementById('read-next').disabled"),
-                      "Next is offered on the last block")
+                check(page.evaluate("() => document.getElementById('read-next').disabled") is False,
+                      "Next is not offered on the last block, where it finishes the read")
                 page.evaluate("() => window.mediaProbe.handlers.previoustrack({action: 'previoustrack'})")
                 wait_position(page, "6 of 7")
                 page.evaluate("() => window.mediaProbe.handlers.pause({action: 'pause'})")
@@ -1190,6 +1190,32 @@ def main() -> int:
                 wait_for(lambda: {"messages": [LONG]} in api.dismissed, 3,
                          "Next on the last block did not finish the message")
                 wait_for(lambda: position(page) == "", 3, "the finished read kept its strip")
+
+                # 6c. The strip's own Next (the right arrow) on the last block
+                # finishes the same way, with real presses at phone and desktop
+                # width (`#1035 read-next-finish`, owner 046): a disabled
+                # button would refuse the press, and no wall-clock wait is
+                # used — every step waits on the read-state count/archive.
+                for width, height, mobile in [(412, 915, True), (1280, 800, False)]:
+                    api.dismissed.clear()
+                    with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as sub_profile:
+                        sub_context, sub_page = open_page(sub_profile, width, height, mobile)
+                        try:
+                            press(sub_page, f'#discord-log > li[data-id="{LONG}"] .body', mobile)
+                            wait_position(sub_page, "1 of 7")
+                            for _ in range(6):
+                                press(sub_page, "#read-next", mobile)
+                            wait_position(sub_page, "7 of 7")
+                            check(sub_page.evaluate(
+                                "() => document.getElementById('read-next').disabled") is False,
+                                f"Next is not offered on the last block at {width}x{height}")
+                            press(sub_page, "#read-next", mobile)
+                            wait_for(lambda: {"messages": [LONG]} in api.dismissed, 3,
+                                     f"the strip's Next on the last block did not finish at {width}x{height}")
+                            wait_for(lambda: position(sub_page) == "", 3,
+                                     f"the finished read kept its strip at {width}x{height}")
+                        finally:
+                            sub_context.close()
 
                 # 7. A message of one block reads whole, as before: no strip, no block asked for.
                 press(page, f'#discord-log > li[data-id="{SHORT}"] .body', True)
