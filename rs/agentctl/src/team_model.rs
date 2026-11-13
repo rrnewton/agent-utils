@@ -316,7 +316,7 @@ pub struct Abstract {
     pub wake_armed: bool,
     /// The persisted deadline has been reached on this re-entry.
     pub deadline_expired: bool,
-    /// A restore launch has not yet reported done.
+    /// A restore launch is still in flight.
     pub restore_in_flight: bool,
     /// An escalation was delivered this incident.
     pub delivered: bool,

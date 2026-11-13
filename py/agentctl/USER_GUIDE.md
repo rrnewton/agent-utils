@@ -1189,7 +1189,7 @@ identity, also shown by a replay as `replayed_epoch` beside `replayed_report`).
 A report written before epochs were recorded still counts for the current
 epoch when the current user manager had already started when it finished
 (proving it was written under this manager); when nothing proves that either
-way, the watch says the report predates epoch keying instead of alarming
+way, the watch says it cannot prove the report for this epoch instead of alarming
 that no restore completed.
 The report's `restart_detected` is true when a running agent's pinned process
 belongs to an earlier boot, or when the recorded report it supersedes belongs

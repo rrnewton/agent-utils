@@ -814,7 +814,7 @@ impl RestoreEpoch {
         Self::from_report(report).is_some_and(|recorded| recorded == *self)
     }
 
-    /// As [`RestoreEpoch::matches_report`], plus the one legacy proof: a
+    /// As [`RestoreEpoch::matches_report`], plus the manager-start proof: a
     /// report written before epochs were recorded (no manager identity)
     /// belongs to this epoch when the current manager had already started
     /// when the report finished, which proves it was written under this
@@ -844,7 +844,8 @@ impl RestoreEpoch {
     }
 }
 
-/// How a recorded report stands against the current epoch, legacy reports
+/// How a recorded report stands against the current epoch, reports
+/// written before manager identity was recorded
 /// (written before manager identity was recorded) included.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LegacyMatch {
@@ -1431,7 +1432,7 @@ fn read_boot_report(
 /// read order: the first report that is complete and belongs to this epoch
 /// wins. Restore's replay and the watch restore check share this pick, so
 /// an incomplete or earlier-epoch report at the current location can never
-/// shadow a completed one at a legacy location (a partial report from a
+/// shadow a completed one at an earlier location (a partial report from a
 /// failed attempt under a new build, the completed one still under
 /// `agents/restore-reports/` from the build that actually restored).
 pub fn completed_boot_report(
@@ -1447,11 +1448,11 @@ pub fn completed_boot_report(
 }
 
 /// What this boot's recorded restore evidence proves, for readers that
-/// must tell an unprovable legacy report apart from no restore at all
+/// must tell an unprovable earlier-format report apart from no restore at all
 /// (the watch check: the former is reported distinctly, never alarmed).
 #[derive(Clone, Debug, PartialEq)]
 pub enum BootReportState {
-    /// A completed report proven to belong to this epoch, legacy proof
+    /// A completed report proven to belong to this epoch, manager-start proof
     /// by manager start included.
     Completed((PathBuf, Value)),
     /// Only a pre-epoch completed report, which nothing can prove.

@@ -76,7 +76,7 @@ builds older than layout 2 stop at this file; upgrade agentctl. Readers of renam
 pub const BRIDGES: &str = "bridges";
 /// Names no agent may take: each is a directory of the registry itself.
 /// `turnover-pins` holds services-turnover pin files (#1220), not an agent.
-/// `restore` (its `reports/` collection) and the legacy `restore-reports`
+/// `restore` (its `reports/` collection) and `restore-reports`
 /// joined when an older migration moved the former into `agents/` as if it
 /// were an agent (#1425): every known registry directory belongs here, in
 /// one list shared by migration, listing, and doctor.
