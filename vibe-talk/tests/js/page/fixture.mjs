@@ -5845,6 +5845,12 @@ const TUNING_BANDS = {
     "channels whose chosen view is kept. Under ten, a reader moving among a dozen channels finds " +
     "the ones they left longest ago back in the default; past a couple of hundred it mostly keeps " +
     "choices made in channels nobody opens any more"],
+  READ_RUN_PEEL_SIZE: [5, 5,
+    "the messages one peel of a folded run reveals from either edge: the owner's five, enough to " +
+    "read a little before or after the fold without opening it; any other number is not the ask"],
+  READ_RUN_PEEL_MIN: [10, 10,
+    "the still-folded count at which a run offers its peels: the owner's ten, under which the " +
+    "line itself opens the rest sooner than two peels would"],
   // `#221 read-modes`. How short a run of read messages may be and still collapse to a line.
   READ_RUN_MIN_ROWS: [2, 3,
     "the fewest rows a run of read messages collapses at. One trades a message for a line as tall as " +

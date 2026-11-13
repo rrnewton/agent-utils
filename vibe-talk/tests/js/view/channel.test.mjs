@@ -3097,7 +3097,7 @@ test("`#624 voice-page-modularity`: the read state's acts — Done copies caught
     byId: () => ({ children: [] }), leftById: () => ({ children: [] }), inThisColumn: (fn) => fn,
     selection: () => ({ view: "flat", threadId: null, thread: null }), threads: () => [],
     readHiding: () => false, readRunsSuspended: () => false, threading: () => true,
-    eachColumnRenderCached: () => {}, openReadRun: () => {}, readRunRows: () => [],
+    eachColumnRenderCached: () => {}, openReadRun: () => {}, peelReadRun: () => {}, readRunRows: () => [],
     threadIdOf: () => null, selectionThread: () => null,
     makeDismissalOffer: () => ({ current: () => offer, set: (next) => { offer = next; } }),
     makeInboxLedger: () => ({ leave: () => {} }),
@@ -3458,6 +3458,7 @@ test("`#624 voice-page-modularity`: the cards filtered, their read runs folded, 
     readRunPlan: (items) => new Map([[items[0], { role: "head" }], [items[1], { role: "member" }]]),
     readRunLine: (row) => { const line = el({}); line.parentNode = row; ownerLine = line; return line; },
     placeInReadRun: (row, role) => log.push(["place", row.getAttribute("data-id"), role]),
+    placeReadRunPeel: (row, count) => log.push(["peel", row.getAttribute("data-id"), count]),
     keepingCardPlace: (change) => change(),
     makeColumnLinksDeps: () => ({
       onTwoColumns: () => false, sideMode: () => "list", mainList: () => null,
@@ -3473,11 +3474,12 @@ test("`#624 voice-page-modularity`: the cards filtered, their read runs folded, 
   // Under Fold read the run's member is placed behind its head's line.
   log.length = 0;
   owner.foldCardRuns(list);
-  assert.deepStrictEqual(log, [["place", "t1", "head"], ["place", "t2", "member"]]);
+  assert.deepStrictEqual(log, [["place", "t1", "head"], ["place", "t2", "member"], ["peel", "t1", 2]],
+    "the cards' run did not size its peel offer (the run under the peel minimum)");
   // Show read again: no places are given.
   mode = "show";
   owner.foldCardRuns(list);
-  assert.deepStrictEqual(log.slice(2), [["place", "t1", null], ["place", "t2", null]]);
+  assert.deepStrictEqual(log.slice(3), [["place", "t1", null], ["place", "t2", null]]);
   // The list's word over no cards at all.
   assert.equal(owner.sideListState(0, 0, 0), "No threads in this channel yet.");
   assert.equal(owner.sideListState(2, 0, 0), "No threads match that search — all of this channel is loaded.");

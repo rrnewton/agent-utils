@@ -4,11 +4,20 @@
 // and the rows a redraw replaced. The runs themselves are readcore's; the modes are
 // present/rows'.
 
-import { readRunText } from "../../present/rows/index.ts";
+import { READ_RUN_PEEL_MIN, READ_RUN_PEEL_SIZE, readRunText } from "../../present/rows/index.ts";
 import { idsOf, rowMessages } from "./rows.ts";
 
+/** Which edge of a folded run a peel reveals: its oldest (`first`) or newest (`last`) messages. */
+export type ReadRunPeelEdge = "first" | "last";
+
 /** A row carrying its read-run line and days. */
-type RunRow = HTMLElement & { readRunLine?: HTMLButtonElement | null; runDays?: string };
+type RunRow = HTMLElement & {
+  readRunLine?: HTMLButtonElement | null;
+  readRunPeels?: HTMLElement | null;
+  readRunPeelFirst?: HTMLButtonElement | null;
+  readRunPeelLast?: HTMLButtonElement | null;
+  runDays?: string;
+};
 
 /** What the read-run lines ask of the page. */
 export interface ReadRunLinesDependencies {
@@ -24,6 +33,7 @@ export interface ReadRunLinesDependencies {
   threadIdOf(message: unknown): string | null;
   selectionThread(): { root?: { id: unknown } | null } | null;
   openReadRun(row: Element): void;
+  peelReadRun(row: Element, edge: ReadRunPeelEdge): void;
   readRunRows(row: Element): Element[];
 }
 
@@ -36,6 +46,8 @@ export interface ReadRunLines {
   runDaysOf(row: Element): string;
   readRunCount(row: Element): number;
   placeInReadRun(row: Element, role: string | null, count: number): void;
+  /** Show or hide `row`'s peel buttons for a still-folded count of `count` (the cards' own wording). */
+  placeReadRunPeel(row: Element, count: number): void;
   isOpenThreadRoot(row: Element, rootId: string): boolean;
   openThreadRootId(): string | null;
   foldedOneIds(key: string): Set<string>;
@@ -97,7 +109,66 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
     }));
     row.replaceChildren(line, ...row.children);
     held.readRunLine = line;
+    ensurePeels(row as HTMLElement);
     return line;
+  }
+
+  function peelButton(row: HTMLElement, edge: ReadRunPeelEdge): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.className = "read-run-peel";
+    button.setAttribute("type", "button");
+    button.setAttribute("data-peel", edge);
+    button.textContent = `(${edge} ${READ_RUN_PEEL_SIZE})`;
+    button.setAttribute("aria-label", edge === "first"
+      ? `Show first ${READ_RUN_PEEL_SIZE} messages of this folded run`
+      : `Show last ${READ_RUN_PEEL_SIZE} messages of this folded run`);
+    button.setAttribute("title", edge === "first"
+      ? `Show the first ${READ_RUN_PEEL_SIZE} of these read messages`
+      : `Show the last ${READ_RUN_PEEL_SIZE} of these read messages`);
+    button.addEventListener("click", deps.inThisColumn((event: Event) => {
+      if (event) event.stopPropagation();
+      const focused = document.activeElement === button && button.matches(":focus-visible");
+      deps.peelReadRun(row, edge);
+      if (!focused) return;
+      const anchor = (row as Element).parentNode ? row as HTMLElement : liveUnpackedRow(row) || liveCardRow(row);
+      const list = anchor && anchor.parentNode ? [...anchor.parentNode.children] as HTMLElement[] : [];
+      const head = list.find((one) => one.getAttribute("data-read-run") === "head") as RunRow | undefined;
+      const peelsShown = head && head.readRunPeels && !head.readRunPeels.hidden;
+      const next = head ? (peelsShown ? (edge === "first" ? head.readRunPeelFirst : head.readRunPeelLast) : head.readRunLine) : null;
+      const target = next && !next.hidden ? next : head || anchor;
+      if (target) {
+        target.setAttribute("tabindex", "-1");
+        target.focus({ preventScroll: true });
+      }
+    }));
+    return button;
+  }
+
+  function ensurePeels(row: HTMLElement): HTMLElement {
+    const held = row as RunRow;
+    if (held.readRunPeels) return held.readRunPeels;
+    const box = document.createElement("span");
+    box.className = "read-run-peels";
+    box.hidden = true;
+    const first = peelButton(row, "first");
+    const last = peelButton(row, "last");
+    box.append(first, last);
+    held.readRunPeels = box;
+    held.readRunPeelFirst = first;
+    held.readRunPeelLast = last;
+    row.append(box);
+    return box;
+  }
+
+  function placeReadRunPeel(row: Element, count: number): void {
+    const held = row as RunRow;
+    const show = count >= READ_RUN_PEEL_MIN && row.getAttribute("data-read-run") === "head";
+    if (!show) {
+      if (held.readRunPeels && !held.readRunPeels.hidden) held.readRunPeels.hidden = true;
+      return;
+    }
+    const box = ensurePeels(row as HTMLElement);
+    if (box.hidden) box.hidden = false;
   }
 
   function readRunWords(row: Element): string {
@@ -116,16 +187,21 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
       if (row.hasAttribute("data-read-run")) row.removeAttribute("data-read-run");
       if (held.hidden) held.hidden = false;
       if (held.readRunLine && !held.readRunLine.hidden) held.readRunLine.hidden = true;
+      if (held.readRunPeels && !held.readRunPeels.hidden) held.readRunPeels.hidden = true;
       return;
     }
     row.setAttribute("data-read-run", role);
     held.hidden = role === "member";
-    if (role !== "head") return;
+    if (role !== "head") {
+      if (held.readRunPeels && !held.readRunPeels.hidden) held.readRunPeels.hidden = true;
+      return;
+    }
     const line = readRunLine(row);
     const words = readRunText(count, runDaysOf(row)) as string;
     if (line.textContent !== words) line.textContent = words;
     line.setAttribute("title", `Show ${count === 1 ? "this read message" : `these ${count} read messages`}`);
     line.hidden = false;
+    placeReadRunPeel(row, count);
   }
 
   function liveCardRow(row: Element): HTMLElement | null {
@@ -146,6 +222,6 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
 
   return {
     hidingRead, liftingHideRead, readRunLine, readRunWords, runDaysOf, readRunCount,
-    placeInReadRun, isOpenThreadRoot, openThreadRootId, foldedOneIds, foldedOnes, liveUnpackedRow, liveCardRow,
+    placeInReadRun, placeReadRunPeel, isOpenThreadRoot, openThreadRootId, foldedOneIds, foldedOnes, liveUnpackedRow, liveCardRow,
   };
 }

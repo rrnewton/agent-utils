@@ -60,6 +60,7 @@ export interface ReadActsDependencies {
   threading(): boolean;
   eachColumnRenderCached(): void;
   openReadRun(row: Element): void;
+  peelReadRun(row: Element, edge: "first" | "last"): void;
   readRunRows(row: Element): Element[];
   threadIdOf(message: unknown): string | null;
   selectionThread(): { root?: { id: unknown } | null } | null;
@@ -132,6 +133,7 @@ export function createReadActs(deps: ReadActsDependencies): ReadActs {
     threading: deps.threading,
     eachColumnRenderCached: deps.eachColumnRenderCached,
     openReadRun: deps.openReadRun,
+    peelReadRun: deps.peelReadRun,
     readRunRows: deps.readRunRows,
     threadIdOf: deps.threadIdOf,
     selectionThread: deps.selectionThread,

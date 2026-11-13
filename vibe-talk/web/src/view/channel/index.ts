@@ -223,7 +223,7 @@ export type { ThreadList, ThreadListDependencies } from "./threadlist.ts";
 export { createOfflineCache } from "./offlinecache.ts";
 export type { OfflineCacheDependencies } from "./offlinecache.ts";
 export { createReadRunLines } from "./readrunlines.ts";
-export type { ReadRunLines, ReadRunLinesDependencies } from "./readrunlines.ts";
+export type { ReadRunLines, ReadRunLinesDependencies, ReadRunPeelEdge } from "./readrunlines.ts";
 export { createCardRuns } from "./cardruns.ts";
 export type { CardRunPlace, CardRuns, CardRunsDependencies } from "./cardruns.ts";
 export { createSideThreadActs } from "./sidethread.ts";

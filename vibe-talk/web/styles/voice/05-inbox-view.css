@@ -1304,6 +1304,68 @@ body .side-card-row[data-linked="true"] {
   outline-offset: -2px;
 }
 
+/* The peels at the far end of a long run's line: small grey real buttons over the line's end, each
+   revealing five messages from its edge while the line stays for the rest. They sit on the head
+   row itself, clear of the line button, so a tap on one never opens the whole run. */
+#side-log li.discord-message[data-read-run="head"],
+#side-cards li.discord-message[data-read-run="head"],
+#discord-log li.discord-message[data-read-run="head"],
+#side-cards li.side-card-row[data-read-run="head"] {
+  position: relative;
+}
+
+#side-log li.discord-message[data-read-run="head"] > .read-run-peels.read-run-peels,
+#side-cards li.discord-message[data-read-run="head"] > .read-run-peels.read-run-peels,
+#side-cards li.side-card-row[data-read-run="head"] > .read-run-peels.read-run-peels,
+#discord-log li.discord-message[data-read-run="head"] > .read-run-peels.read-run-peels {
+  display: flex !important;
+  position: absolute;
+  right: 0.25rem;
+  top: 50%;
+  transform: translateY(-50%);
+  gap: 0.25rem;
+  background: var(--bg);
+  padding-left: 0.5rem;
+}
+
+#side-log .read-run-peels[hidden],
+#side-cards .read-run-peels[hidden],
+#discord-log .read-run-peels[hidden] {
+  display: none !important;
+}
+
+#side-log .read-run-peel,
+#side-cards .read-run-peel,
+#discord-log .read-run-peel {
+  background: none;
+  border: none;
+  margin: 0;
+  padding: 0.65rem 0.35rem;
+  color: var(--muted);
+  font: inherit;
+  font-size: calc(0.78rem * var(--msg-scale));
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#side-log .read-run-peel:active,
+#side-cards .read-run-peel:active,
+#discord-log .read-run-peel:active,
+#side-log .read-run-peel:focus-visible,
+#side-cards .read-run-peel:focus-visible,
+#discord-log .read-run-peel:focus-visible {
+  color: var(--ink);
+}
+
+#side-log .read-run-peel:focus-visible,
+#side-cards .read-run-peel:focus-visible,
+#discord-log .read-run-peel:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 /*
  * THE BOOKMARK. `#240 reading-bookmark`: the owner's place in a channel's backlog, "a clear coloured
  * horizontal separator similar to our collapsed message indicator". So it is the collapsed run's

@@ -633,6 +633,27 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     collapsed.update(root=root_top, line=line_top, answer=answer_top)
     shot("2-collapse-read-entry")
 
+    # Peel five from the oldest edge, then five from the newest: the line stays, its count drops,
+    # and what came out of the fold is not standing open.
+    head_line = '#discord-log > li[data-read-run="head"]'
+    for edge, want in (("first", READ_REPLIES - 5), ("last", READ_REPLIES - 10)):
+        peel = f"{head_line} .read-run-peel[data-peel=\"{edge}\"]"
+        check(page.locator(peel).is_visible(), f"{size}: the ({edge} 5) peel is not on the line")
+        check(page.locator(peel).inner_text() == f"({edge} 5)", f"{size}: the peel says {page.locator(peel).inner_text()!r}")
+        tap(page, peel, touch)
+        page.wait_for_function(
+            f"() => document.querySelector('{head_line} .read-run')?.textContent.includes('{want} read messages')",
+            timeout=5_000)
+        peeled = measure(page)
+        check(peeled["heads"] == 1 and peeled["members"] == want - 1,
+              f"{size}: after peeling {edge} the run is {peeled['heads']} lines over {peeled['members']} hidden rows, not one over {want - 1}")
+        check(peeled["lineText"] == f"… {want} read messages …", f"{size}: the line says {peeled['lineText']!r} after peeling {edge}")
+    opened_out = page.evaluate(f"""() => [...document.querySelectorAll('#discord-log > li:not([data-read-run])')]
+      .filter((li) => li.dataset.id !== '{ANSWER_ID}' && li.dataset.collapsed === 'false').length""")
+    check(opened_out == 0, f"{size}: {opened_out} messages out of the fold are standing open")
+    notes.append(f"peeled 5 + 5: the line stayed for {READ_REPLIES - 10}, nothing out of it open")
+    shot("2b-peel-first-last")
+
     # A real tap on the line opens the run where it is.
     tap(page, '#discord-log > li[data-read-run="head"] .read-run', touch)
     page.wait_for_function("() => !document.querySelector('#discord-log > li[data-read-run]')", timeout=5_000)

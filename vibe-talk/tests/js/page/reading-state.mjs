@@ -1297,6 +1297,60 @@ test("Fold read: a thread opens on its root, one line for the read run, and the 
   assert.deepStrictEqual(collapsedRows(page), [], "a redraw collapsed the run the reader opened");
 });
 
+test("Fold read peels a long run five at a time from either edge, and every message out of it starts collapsed", async () => {
+  const page = newPage();
+  await signIn(page);
+  const ids = Array.from({ length: 25 }, (_unused, at) => String(7000 + at));
+  const messages = ids.map((id, at) => message({ id, content: longMessage(`run message ${at}`) }));
+  for (const id of ids.slice(0, 24)) page.dealtWith.add(id);
+  await showDiscord(page, messages);
+  const row = (id) => rowWithId(page, id);
+  const peel = (head, edge) => head.descendants().find((node) => node.getAttribute("data-peel") === edge);
+  const peelBox = (head) => head.descendants().find((node) => node.className === "read-run-peels");
+  const countSaid = (head) => Number((readRunLineOf(head).textContent.match(/\d+/) || ["0"])[0]);
+  // Two messages the reader opened in Show read: neither may come out of the fold still open.
+  await foldButton(row(ids[0])).click();
+  await foldButton(row(ids[14])).click();
+  assert.equal(row(ids[0]).getAttribute("data-collapsed"), "false", "the premise: a message was not opened");
+  await chooseReadMode(page, "Fold read");
+  let head = row(ids[0]);
+  assert.equal(head.getAttribute("data-read-run"), "head");
+  assert.equal(countSaid(head), 24);
+  assert.deepStrictEqual([peel(head, "first").textContent, peel(head, "last").textContent], ["(first 5)", "(last 5)"]);
+  assert.equal(peel(head, "first").getAttribute("type"), "button", "a peel is not a real button");
+  assert.ok(peel(head, "first").getAttribute("aria-label").includes("first 5"), "a peel says nothing to a screen reader");
+  // Peel the oldest five: they stand revealed, collapsed, and the line stays for the other 19.
+  await peel(head, "first").click();
+  await page.settle();
+  for (const id of ids.slice(0, 5)) {
+    assert.equal(row(id).hasAttribute("data-read-run"), false, `peeled message ${id} stayed behind the line`);
+    assert.equal(row(id).getAttribute("data-collapsed"), "true", `peeled message ${id} came out of the fold open`);
+  }
+  head = row(ids[5]);
+  assert.equal(head.getAttribute("data-read-run"), "head");
+  assert.equal(countSaid(head), 19, "the line did not drop from 24 to 19");
+  // Peel the newest five from the other edge, next to what follows the run.
+  await peel(head, "last").click();
+  await page.settle();
+  for (const id of ids.slice(19, 24)) {
+    assert.equal(row(id).hasAttribute("data-read-run"), false, `peeled message ${id} stayed behind the line`);
+    assert.equal(row(id).getAttribute("data-collapsed"), "true", `peeled message ${id} came out of the fold open`);
+  }
+  assert.equal(countSaid(row(ids[5])), 14, "the line did not drop from 19 to 14");
+  // One more peel takes it under ten: the peels go, and the line opens the rest, collapsed.
+  await peel(row(ids[5]), "first").click();
+  await page.settle();
+  head = row(ids[10]);
+  assert.equal(countSaid(head), 9);
+  assert.equal(peelBox(head).hidden, true, "the peels stayed on a run of under ten");
+  await readRunLineOf(head).click();
+  await page.settle();
+  for (const id of ids.slice(0, 24)) {
+    assert.equal(row(id).hasAttribute("data-read-run"), false, `message ${id} stayed behind the opened line`);
+    assert.equal(row(id).getAttribute("data-collapsed"), "true", `message ${id} came out of the fold open`);
+  }
+});
+
 /**
  * A channel without threads: an unread message, one read message alone, then two read messages
  * the agent posted a second apart — one combined row — and another read one, an unread message,

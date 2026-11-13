@@ -95,6 +95,42 @@ test("`#624 voice-page-modularity`: runs of read messages, and the ones the read
   assert.equal(runs.opened("k"), undefined);
 });
 
+test("fold incremental expansion: peeling 5 from either edge shrinks the run and drops the peel at under 10", () => {
+  const { createReadRuns, READ_RUN_PEEL_MIN, READ_RUN_PEEL_SIZE } = ROWS;
+  assert.equal(READ_RUN_PEEL_SIZE, 5);
+  assert.equal(READ_RUN_PEEL_MIN, 10);
+  const runs = createReadRuns();
+  // 74 read rows plus one unread tail row (the last row never joins a run).
+  const rows = Array.from({ length: 75 }, (_, at) => `m${at}`);
+  const read = new Set(rows.slice(0, 74));
+  const plan = () => runs.plan(rows, "peel", (row) => read.has(row), (row) => [row]);
+  const headOf = (placed) => rows.find((row) => (placed.get(row) || {}).role === "head");
+  const countOf = (placed) => placed.get(headOf(placed)).count;
+  const visible = (placed) => rows.filter((row) => !placed.has(row));
+  assert.equal(countOf(plan()), 74);
+  // Peel the first 5, then the last 5, repeatedly: 74 -> 69 -> 64 -> ... -> 9.
+  const peelEdge = (edge) => {
+    const placed = plan();
+    const folded = rows.filter((row) => placed.has(row));
+    const take = edge === "first" ? folded.slice(0, READ_RUN_PEEL_SIZE) : folded.slice(-READ_RUN_PEEL_SIZE);
+    runs.peel("peel", take);
+    return take;
+  };
+  assert.deepStrictEqual(peelEdge("first"), ["m0", "m1", "m2", "m3", "m4"]);
+  assert.equal(countOf(plan()), 69);
+  assert.deepStrictEqual(visible(plan()).slice(0, 5), ["m0", "m1", "m2", "m3", "m4"]);
+  assert.deepStrictEqual(peelEdge("last"), ["m69", "m70", "m71", "m72", "m73"]);
+  assert.equal(countOf(plan()), 64);
+  for (const want of [59, 54, 49, 44, 39, 34, 29, 24, 19, 14, 9]) {
+    peelEdge("first");
+    assert.equal(countOf(plan()), want);
+  }
+  // Under the peel minimum the run is still folded as one line; opening it reveals the rest.
+  assert.ok(countOf(plan()) < READ_RUN_PEEL_MIN);
+  runs.open("peel", rows.filter((row) => plan().has(row)));
+  assert.equal(plan().size, 0, "the whole-line open left part of the run folded");
+});
+
 test("`#624 voice-page-modularity`: a card's lines by the server's proxy, and a thread's facts, from the module alone", () => {
   const { wrapCardLine, cardProxyLines, proxyLinesOf, foldedCardText, firstLineOf, threadChoice, threadFacts, CARD_LINE_CHARS } = ROWS;
   assert.equal(CARD_LINE_CHARS, 36);

@@ -25,7 +25,7 @@ export type { ReactionFace } from "./labels.ts";
 export { ELISION_COUNTED_TEXTS, FOLD_WIDTHS_EM, NO_ELISION_LABELS, elisionLabels, foldPieces, foldShows, forgetElisionCounts } from "./fold.ts";
 export type { FoldLaid, FoldLine, FoldPiece, FoldRun } from "./fold.ts";
 export { GLOM_WINDOW_MS, isNoise, joinsGroup } from "./grouping.ts";
-export { READ_RUN_MIN_ROWS, createReadRuns } from "./runs.ts";
+export { READ_RUN_MIN_ROWS, READ_RUN_PEEL_MIN, READ_RUN_PEEL_SIZE, createReadRuns } from "./runs.ts";
 export type { ReadRuns, RunPlace } from "./runs.ts";
 export {
   CARD_INDENTED_CHARS,

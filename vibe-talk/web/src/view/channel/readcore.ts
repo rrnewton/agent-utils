@@ -49,7 +49,7 @@ import { cardRunIds, threadCardId } from "./cards.ts";
 import { childByClass } from "../dom/index.ts";
 import { neighbourStayed, rowNeighbours } from "./cardplace.ts";
 import { answeredThread } from "../../core/channels/index.ts";
-import { isNoise, joinsGroup, readRunText } from "../../present/rows/index.ts";
+import { READ_RUN_PEEL_SIZE, isNoise, joinsGroup, readRunText } from "../../present/rows/index.ts";
 import type { CancelSignal, ClockPort } from "../../ports/index.ts";
 
 /** The view on screen in the column being worked on (`selection()`). */
@@ -295,7 +295,9 @@ export interface TimelineViewDependencies {
   noiseRenderCount(): void;
   foldedOneIds(key: string): Set<string>;
   foldedOnes: Map<string, Set<string>>;
-  readRuns: { plan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>): Map<Element, { role: string; count: number }>; open(key: string, ids: string[]): void };
+  readRuns: { plan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>): Map<Element, { role: string; count: number }>; open(key: string, ids: string[]): void; peel(key: string, ids: string[]): void };
+  /** Fold every revealed row back to its head line: a message out of a fold starts collapsed. */
+  collapseRevealed(rows: readonly Element[]): void;
   setReadMode(mode: string): void;
   setJumpNewest(wanted: boolean, view?: string, arrived?: number | null): void;
   scrollToNewest(): void;
@@ -352,6 +354,7 @@ export interface TimelineView {
   readRunPlan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>): Map<Element, { role: string; count: number }>;
   readRunRows(row: Element): Element[];
   openReadRun(row: Element): void;
+  peelReadRun(row: Element, edge: "first" | "last"): void;
   renderReadModeControl(): void;
   readRunsSuspended(): boolean;
   applyNewestPage(payload: TimelineResponse, saved?: boolean): number;
@@ -2331,14 +2334,18 @@ function openReadRun(row: Element): void {
   // `#432 read-mode-unify`. A run of read threads (and Main's read messages) over the cards: kept open by
   // what its cards and rows stand for, and the cards drawn again.
   if (thread === null && row.parentNode === leftEl("side-cards")) {
-    readRuns.open(cardRunKey(), cardRunRows(row).flatMap(cardRunIds));
+    const runRows = cardRunRows(row);
+    deps.collapseRevealed(runRows);
+    readRuns.open(cardRunKey(), runRows.flatMap(cardRunIds));
     cardsDrawn.forget();
     renderSideColumn();
     keepSelection();
     return;
   }
   const key = thread === null ? viewKey() : viewKey("thread", thread);
-  const ids = readRunRows(row).flatMap(idsOf);
+  const runRows = readRunRows(row);
+  const ids = runRows.flatMap(idsOf);
+  deps.collapseRevealed(runRows);
   readRuns.open(key, ids);
   // Opening a run is also un-folding what was folded into it one by one (`#480 fold-one-message-key`).
   const folded = foldedOnes.get(key);
@@ -2348,6 +2355,53 @@ function openReadRun(row: Element): void {
     cardsDrawn.forget();
     renderSideColumn();
     // The block is new rows: the selection, its Tab stop and its focus go to the run's first row's.
+    keepSelection();
+    return;
+  }
+  applyReadRuns();
+  renderScrollTools();
+  requestVisibleSummaries();
+}
+
+/**
+ * Peel one edge of the folded run `row` heads: reveal its oldest (`first`) or newest (`last`)
+ * `READ_RUN_PEEL_SIZE` messages while the rest stays folded behind its line, whose count drops
+ * by what was revealed. Every revealed row starts collapsed, as a whole-line open's do.
+ */
+function peelReadRun(row: Element, edge: "first" | "last"): void {
+  if (!row || !row.hasAttribute("data-read-run")) return;
+  const thread = row.getAttribute("data-unpack-thread");
+  if (thread === null && row.parentNode === leftEl("side-cards")) {
+    const runRows = cardRunRows(row);
+    const take = edge === "first" ? runRows.slice(0, READ_RUN_PEEL_SIZE) : runRows.slice(-READ_RUN_PEEL_SIZE);
+    if (take.length === 0) return;
+    deps.collapseRevealed(take);
+    readRuns.peel(cardRunKey(), take.flatMap(cardRunIds));
+    cardsDrawn.forget();
+    renderSideColumn();
+    keepSelection();
+    return;
+  }
+  const key = thread === null ? viewKey() : viewKey("thread", thread);
+  const runRows = readRunRows(row);
+  const ordered = edge === "first" ? runRows : [...runRows].reverse();
+  const take: Element[] = [];
+  let revealed = 0;
+  for (const one of ordered) {
+    take.push(one);
+    revealed += idsOf(one).length;
+    if (revealed >= READ_RUN_PEEL_SIZE) break;
+  }
+  if (take.length === 0) return;
+  const ids = take.flatMap(idsOf);
+  deps.collapseRevealed(take);
+  readRuns.peel(key, ids);
+  const folded = foldedOnes.get(key);
+  if (folded) for (const id of ids) folded.delete(id);
+  if (folded && folded.size === 0) foldedOnes.delete(key);
+  if (thread !== null) {
+    cardsDrawn.forget();
+    renderSideColumn();
     keepSelection();
     return;
   }
@@ -2492,7 +2546,7 @@ function readRunsSuspended() {
     queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage,
     renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage,
     loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta,
-    loadDiscord, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition,
+    loadDiscord, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition,
     dispose() { disposed = true; },
   };
 }

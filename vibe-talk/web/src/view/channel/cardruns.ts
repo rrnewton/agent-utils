@@ -51,6 +51,7 @@ export interface CardRunsDependencies {
   readRunPlan(items: readonly HTMLElement[], key: string, isRead: (row: HTMLElement) => boolean, ids: typeof cardRunIds): Map<HTMLElement, CardRunPlace>;
   readRunLine(row: HTMLElement): HTMLElement;
   placeInReadRun(row: HTMLElement, role: string | null, count: number): void;
+  placeReadRunPeel(row: HTMLElement, count: number): void;
   keepingCardPlace(change: () => void): void;
   // The links between Main's roots and their cards.
   makeColumnLinksDeps(): {
@@ -254,6 +255,7 @@ export function createCardRuns(deps: CardRunsDependencies): CardRuns {
       const words = cardRunText(run.threads, run.messages);
       if (line.textContent !== words) line.textContent = words;
       line.setAttribute("title", `Show ${words.replace(/^… /, "these ")}`);
+      deps.placeReadRunPeel(run.row, run.threads + run.messages);
     };
     for (const row of rows) {
       if (isItem.has(row)) {

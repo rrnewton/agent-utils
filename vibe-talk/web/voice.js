@@ -5661,6 +5661,7 @@ const readActs = createReadActs({
   threading: () => providerFacts.threading(),
   eachColumnRenderCached: () => eachColumn(renderCachedTimeline),
   openReadRun: (row) => openReadRun(/** @type {any} */ (row)),
+  peelReadRun: (row, edge) => peelReadRun(/** @type {any} */ (row), edge),
   readRunRows: (row) => readRunRows(row),
   threadIdOf: (message) => threadOf(message),
   selectionThread: () => selection().thread,
@@ -5707,7 +5708,7 @@ const readActs = createReadActs({
 const { readRuns, readRunLines, lastDismissal, inboxLedger, caughtUpDone, followDoneEverywhere, rowsMissDone, undoDismissal, clearBacklog } = readActs;
 const {
   hidingRead, liftingHideRead, readRunLine, readRunWords, runDaysOf, readRunCount,
-  placeInReadRun, isOpenThreadRoot, openThreadRootId, foldedOneIds, liveUnpackedRow, liveCardRow,
+  placeInReadRun, placeReadRunPeel, isOpenThreadRoot, openThreadRootId, foldedOneIds, liveUnpackedRow, liveCardRow,
 } = readRunLines;
 const foldedOnes = readRunLines.foldedOnes;
 
@@ -6284,6 +6285,7 @@ const cardRuns = createCardRuns({
   readRunPlan: (items, key, isRead, ids) => /** @type {any} */ (readRunPlan(/** @type {any} */ (items), key, /** @type {any} */ (isRead), /** @type {any} */ (ids))),
   readRunLine: (row) => readRunLine(row),
   placeInReadRun: (row, role, count) => placeInReadRun(row, /** @type {any} */ (role), count),
+  placeReadRunPeel: (row, count) => placeReadRunPeel(row, count),
   keepingCardPlace: (change) => keepingCardPlace(change),
   makeColumnLinksDeps: () => ({
     onTwoColumns: () => layoutShown.columns() && screens.screen() === "main" && screens.view() === "discord",
@@ -6973,6 +6975,7 @@ const timelineView = createTimelineView({
   screenBelongsToToken, readModes, readLedger, api: /** @type {any} */ (api), currentDiscordLoad: (generation, channel, readingTodo) => currentDiscordLoad(generation, channel, readingTodo),
   get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, noteBookmark, plainReach,
   noiseRenderCount: () => noiseSettings.renderCount(), foldedOneIds, foldedOnes, readRuns, setReadMode,
+  collapseRevealed: (rows) => { for (const row of rows) { const entry = /** @type {any} */ (row).foldEntry; if (entry) setFolded(entry, true); } },
   setJumpNewest, scrollToNewest, keepFilterHold, inThisColumn: (fn) => inThisColumn(fn), pinsView, searchOffered: () => searchOffered(),
   pullToRefresh, heldFilterRow, jumpAnchorRow: () => jumpAnchor.row(), scrollAnchor, followsNewest, visibleList, noiseSettings,
   selectionIn: (area) => textSelectionIn(area),
@@ -6985,7 +6988,7 @@ const timelineView = createTimelineView({
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
 });
-const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
+const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
 /**
  * Walking back for older rows, and for a search (web/src/view/channel `mountOlderWalks`,
  * `#624 voice-page-modularity`): the step-back control, the search's bounded walk, the server
