@@ -22158,29 +22158,17 @@ def _read_process_identity(pid: int, *, proc_root: Path = Path("/proc")) -> Proc
             "-- if the caller is PID 1 inside its own PID namespace this refusal does "
             "not apply to it, because such a process is not this machine's init"
         )
-    namespace_pid: int | None = None
-    pidns_inode: str | None = None
-    try:
-        for line in (pid_dir / "status").read_text(encoding="ascii").splitlines():
-            if line.startswith("NSpid:"):
-                numbers = line.split()[1:]
-                if numbers and numbers[-1].isdigit():
-                    namespace_pid = int(numbers[-1])
-                break
-    except (OSError, UnicodeError):
-        pass
-    try:
-        pidns_inode = os.readlink(pid_dir / "ns" / "pid")
-    except OSError:
-        pass
+    # The dual namespace fields are deliberately not captured here yet:
+    # a stored record carrying them would be refused by an older reader
+    # that knows only the five keys (Phase 2a keeps every record it
+    # writes readable by those readers). They are populated by the
+    # Phase 2b join, which records them explicitly.
     return ProcessIdentity(
         pid=pid,
         start_ticks=process_stat.start_ticks,
         boot_id=_boot_id(proc_root),
         host_id=_host_id(),
         cgroup_path=cgroup_path,
-        namespace_pid=namespace_pid,
-        pidns_inode=pidns_inode,
     )
 
 

@@ -65,6 +65,18 @@ pub(crate) fn identity_to_value(identity: &Identity) -> Value {
     value
 }
 
+/// Does `value` name this identity's generation? The dual namespace
+/// fields in `value` are evidence and never part of the answer, so a
+/// five-key record matches a current dual-field reading (#1300).
+pub(crate) fn identity_matches_value(identity: &Identity, value: &Value) -> bool {
+    value.get("pid").and_then(Value::as_i64) == Some(identity.pid)
+        && value.get("start_ticks").and_then(Value::as_i64) == Some(identity.start_ticks)
+        && value.get("boot_id").and_then(Value::as_str) == Some(identity.boot_id.as_str())
+        && value.get("host_id").and_then(Value::as_str) == Some(identity.host_id.as_str())
+        && value.get("cgroup_path").and_then(Value::as_str)
+            == Some(identity.cgroup_path.as_str())
+}
+
 pub(crate) fn optional_namespace_pid(value: &Value) -> Option<i64> {
     value.get("namespace_pid").and_then(Value::as_i64)
 }
@@ -201,28 +213,17 @@ pub(crate) fn read_process_identity(pid: i64) -> std::result::Result<Identity, S
             "PID {pid} is {name}, which can never own, coordinate or act on a slot; recording it would store an identity that stays live until the machine reboots, so the slot could never be reclaimed and no later check could tell it from a real owner. remedy: pass the PID of the real process -- if the caller is PID 1 inside its own PID namespace this refusal does not apply to it, because such a process is not this machine's init"
         ));
     }
-    let namespace_pid = std::fs::read_to_string(format!("{dir}/status"))
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find(|line| line.starts_with("NSpid:"))
-                .and_then(|line| line.split_whitespace().last())
-                .and_then(|last| last.parse::<i64>().ok())
-        })
-        .filter(|pid| *pid >= 1);
-    let pidns_inode = std::fs::read_link(format!("{dir}/ns/pid"))
-        .ok()
-        .and_then(|path| path.to_str().map(str::to_string))
-        .filter(|value| value.starts_with("pid:["));
+    // The dual namespace fields are deliberately not captured here yet:
+    // a stored record carrying them would be refused by an older reader
+    // that knows only the five keys. The Phase 2b join records them.
     Ok(Identity {
         pid,
         start_ticks,
         boot_id: boot_id()?,
         host_id: host_id()?,
         cgroup_path,
-        namespace_pid,
-        pidns_inode,
+        namespace_pid: None,
+        pidns_inode: None,
     })
 }
 

@@ -2640,13 +2640,7 @@ pub(crate) fn remove_slot(
             &active,
         )?;
     }
-    let coordinator_obj = json!({
-        "pid": coordinator.pid,
-        "start_ticks": coordinator.start_ticks,
-        "boot_id": coordinator.boot_id,
-        "host_id": coordinator.host_id,
-        "cgroup_path": coordinator.cgroup_path,
-    });
+    let coordinator_obj = crate::status_state::identity_to_value(&coordinator);
     append_event(
         &cfg,
         &selected,
@@ -2897,13 +2891,7 @@ pub(crate) fn remove_slot(
         "record": current,
         // The removing process (#1121): a classifier reads the journal as
         // busy while it runs, not interrupted by the removed slot's owner.
-        "owner": {
-            "pid": remover.pid,
-            "start_ticks": remover.start_ticks,
-            "boot_id": remover.boot_id,
-            "host_id": remover.host_id,
-            "cgroup_path": remover.cgroup_path,
-        },
+        "owner": crate::status_state::identity_to_value(&remover),
     });
     write_journal(&cfg, &selected, &journal)?;
     let fenced_path = cfg.root.join(

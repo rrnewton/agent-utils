@@ -252,7 +252,9 @@ pub(crate) fn release_in_effect(
     }
     let owner = record_identity(record, "owner");
     let released_owner = payload.get("owner").cloned().unwrap_or(Value::Null);
-    if owner.map(|identity| identity_value(&identity)) != Some(released_owner) {
+    if !owner.is_some_and(|identity| {
+        crate::status_state::identity_matches_value(&identity, &released_owner)
+    }) {
         return Ok(None);
     }
     if payload.get("heartbeat_at").and_then(Value::as_str)

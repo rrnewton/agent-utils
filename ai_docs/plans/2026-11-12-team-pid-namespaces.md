@@ -410,10 +410,13 @@ namespace, under the `_assert_host_process_view` discipline above.
 
 - `ProcessIdentity` gained the dual fields `namespace_pid` and
   `pidns_inode` in both wrkslots editions. They are optional on read,
-  omitted on write when absent (so older readers keep reading new
-  records), populated at capture from `NSpid` and the namespace link,
-  and excluded from generation equality, so a pre-namespace record
-  compares equal to a current reading of the same generation.
+  preserved when present, omitted on write when absent, and excluded
+  from generation equality, so a pre-namespace record compares equal to
+  a current reading of the same generation. Capture does not populate
+  them yet: a stored record carrying new keys would be refused by an
+  older reader that knows only the five keys (an existing older-client
+  test pins exactly that), so the Phase 2b join is what first records
+  them.
 - Owner liveness answers pidfd-first (`_process_state_with_evidence` /
   `process_state_with_evidence`): the pidfd pins the generation, and the
   single-process generation read that follows cannot be redirected by

@@ -87,7 +87,7 @@ pub(crate) fn release_slot(
             "slot {slot} has no bound owner process; adopt it first"
         ));
     }
-    if identity_value(&supplied) != owner_value {
+    if !crate::status_state::identity_matches_value(&supplied, &owner_value) {
         let owner = Identity {
             pid: owner_value.get("pid").and_then(Value::as_i64).unwrap_or(0),
             start_ticks: owner_value
