@@ -148,16 +148,41 @@ export interface ReadingWidth {
 export const READING_GRIP_THRESHOLD_CH = DEFAULT_READING_CH;
 
 /**
+ * The band above the threshold, in characters, that a column must clear before a
+ * hidden handle comes back. Inside the band the handle keeps whichever state it
+ * had: a column hovering at the threshold — a docked panel a few pixels wider or
+ * narrower, a font a fraction larger — must not flip the control back and forth
+ * as it is resized through the boundary.
+ */
+export const READING_GRIP_HYSTERESIS_CH = 6;
+
+/**
  * Whether the handle shows for a column `columnWidthPx` wide at `pxPerCh` pixels per
- * character. An unmeasured column (nothing laid out yet, or a width that is not a
- * number) keeps the handle: hiding a control on a guess is worse than showing one
- * that a measurement a frame later will place.
+ * character, judged clear of the hysteresis band. An unmeasured column (nothing laid
+ * out yet, or a width that is not a number) keeps the handle: hiding a control on a
+ * guess is worse than showing one that a measurement a frame later will place.
  */
 export function readingGripShown(columnWidthPx: number, pxPerCh: number): boolean {
   if (!Number.isFinite(columnWidthPx) || !Number.isFinite(pxPerCh) || columnWidthPx <= 0 || pxPerCh <= 0) {
     return true;
   }
   return columnWidthPx > READING_GRIP_THRESHOLD_CH * pxPerCh;
+}
+
+/**
+ * The handle's next state, with hysteresis: hidden below the threshold, shown above
+ * the threshold plus the band, and unchanged between the two (or when the column
+ * cannot be measured). The comparison is made in characters from the live font, so
+ * a change of font moves both sides together.
+ */
+export function readingGripVisibility(wasShown: boolean, columnWidthPx: number, pxPerCh: number): boolean {
+  if (!Number.isFinite(columnWidthPx) || !Number.isFinite(pxPerCh) || columnWidthPx <= 0 || pxPerCh <= 0) {
+    return wasShown;
+  }
+  const ch = columnWidthPx / pxPerCh;
+  if (ch < READING_GRIP_THRESHOLD_CH) return false;
+  if (ch > READING_GRIP_THRESHOLD_CH + READING_GRIP_HYSTERESIS_CH) return true;
+  return wasShown;
 }
 
 /** The width actually applied for a remembered one: full width while the handle is gated off. */
@@ -299,7 +324,7 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
     if (measuredCh > 0) perCh = measuredCh;
     const screenEl = deps.lookup("screen-main");
     const maximized = screenEl.getAttribute("data-discuss") === "maximized";
-    const shown = !maximized && readingGripShown(area.width, perCh);
+    const shown = !maximized && readingGripVisibility(gripShown, area.width, perCh);
     const grip = deps.lookup("width-grip") as HTMLElement;
     grip.style.left = `${readingGripLeft(pane, screen)}px`;
     // Said on the screen as well as on the handle: in two columns the stylesheet

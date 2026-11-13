@@ -544,6 +544,22 @@ test("`#1398 reading-width-handle-gate`: the handle shows only past the default 
   assert.equal(readingGripShown(0, 8), true);
   assert.equal(readingGripShown(1200, 0), true);
   assert.equal(readingGripShown(Number.NaN, 8), true);
+  // Hysteresis: below the threshold the handle hides from either state, above the
+  // threshold plus its band it shows from either state, and inside the band (72–78ch,
+  // 720–780px at 10px per character) it keeps the state it had — so a column resized
+  // through the boundary does not flip the control on the way.
+  const { readingGripVisibility, READING_GRIP_HYSTERESIS_CH } = VIEW_SETTINGS;
+  assert.equal(READING_GRIP_HYSTERESIS_CH, 6);
+  assert.equal(readingGripVisibility(true, 700, 10), false, "a clearly squeezed column kept the handle");
+  assert.equal(readingGripVisibility(false, 700, 10), false);
+  assert.equal(readingGripVisibility(false, 900, 10), true, "a clearly wide column did not earn the handle back");
+  assert.equal(readingGripVisibility(true, 900, 10), true);
+  assert.equal(readingGripVisibility(true, 750, 10), true, "a column in the band lost the handle it had");
+  assert.equal(readingGripVisibility(false, 750, 10), false, "a column in the band gained a handle it had not earned");
+  assert.equal(readingGripVisibility(true, 720, 10), true, "a column at the threshold flipped");
+  assert.equal(readingGripVisibility(false, 780, 10), false, "a column at the band's top flipped");
+  assert.equal(readingGripVisibility(false, 0, 10), false, "an unmeasured column changed state");
+  assert.equal(readingGripVisibility(true, Number.NaN, 10), true, "an unmeasured column changed state");
   // Below the threshold the remembered narrower width is kept, not applied: the column
   // is applied at full width (the widest allowed, which cannot cap a column this size).
   assert.equal(effectiveReadingWidth(54, false), 120, "a squeezed column still applied the remembered width");
