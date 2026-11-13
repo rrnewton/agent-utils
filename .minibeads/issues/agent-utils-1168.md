@@ -1,6 +1,6 @@
 ---
 title: 'read-toggle-two-way: make the read-messages toggle two-way, Show and Fold only'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-09T22:31:16.855597722+00:00
@@ -57,3 +57,15 @@ messages FROM Slack), consistent with reply 414. The server /todo
 endpoint stays for a follow-up; the page no longer reads it.
 Built as two commits with #1399 toggle-labels-active-style for the
 evening Discuss batch. [watermelon-full-preview]
+
+## Resolution
+
+Delivered in the morning Discuss batch on branch mu-discussam/1399
+(integrator mu-discussam), stacked with #1399 toggle-labels-active-style
+and #1470 toolbar-promotion-by-measured-fit. The read toggle is two-way
+(Show read / Fold read) everywhere: bar button, `h` key and menu item
+share the fixed "Fold read" label with the shared active style; a saved
+Hide preference loads as Fold; Hide read and the to-do view are gone
+from the page (the server /todo endpoint stays for its follow-up).
+Browser suites read-modes, keyboard, two-column, offline-cache and
+scroll-stability pass solo on the integrated tree.
