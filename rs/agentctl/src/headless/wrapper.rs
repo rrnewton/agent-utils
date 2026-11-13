@@ -203,8 +203,14 @@ fn is_owner_item(path: &Path, document: &Map<String, Value>) -> bool {
 /// turnover handoff must reach the new session as its own first input, and a
 /// slash command opens a harness menu: both always go alone.
 fn is_batchable(document: &Map<String, Value>) -> bool {
-    let from = document.get("from").and_then(Value::as_str).unwrap_or_default();
-    let text = document.get("text").and_then(Value::as_str).unwrap_or_default();
+    let from = document
+        .get("from")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let text = document
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let sender = crate::sender_header::parse(text.lines().next().unwrap_or_default())
         .map(|header| header.sender)
         .unwrap_or_default();
@@ -757,7 +763,10 @@ impl Wrapper {
         items.sort_by_key(|(path, document)| !is_owner_item(path, document));
         // A special item (a turnover handoff, a slash command) always goes
         // alone, in order, ahead of any batch behind it.
-        if items.first().is_some_and(|(_, document)| !is_batchable(document)) {
+        if items
+            .first()
+            .is_some_and(|(_, document)| !is_batchable(document))
+        {
             let (path, document) = items.into_iter().next().expect("first item");
             self.deliver(&path, document)?;
             return Ok(());
