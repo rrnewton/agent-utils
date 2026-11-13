@@ -16,8 +16,8 @@
 //! traits, so tests replace `/proc` and `systemctl` with fixtures and never signal a real process.
 //! The real killer re-reads the process identity and, on Linux, signals through a
 //! pidfd pinned before the recheck, so the signal can only reach the exact
-//! process that was checked. This is the Rust edition of `py/agentctl/killpid.py`;
-//! the refusal reason strings are identical in both editions.
+//! process that was checked. The refusal reason strings are the same in both
+//! editions, so they refuse identically.
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
@@ -109,7 +109,7 @@ pub struct KillReport {
 /// The guard refused to signal the PID; `reason` says why, mechanically.
 #[derive(Clone, Debug)]
 pub struct KillRefused {
-    /// Stable refusal reason, shared with the Python edition.
+    /// Stable refusal reason, the same in both editions.
     pub reason: &'static str,
     /// Human detail naming the process and the expectation it failed.
     pub detail: String,
