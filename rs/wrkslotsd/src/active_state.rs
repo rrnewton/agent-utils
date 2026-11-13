@@ -48,6 +48,8 @@ pub(crate) struct Identity {
     pub(crate) boot_id: String,
     host_id: String,
     pub(crate) cgroup_path: String,
+    pub(crate) namespace_pid: Option<i64>,
+    pub(crate) pidns_inode: Option<String>,
 }
 
 pub(crate) struct CheckoutRec {
@@ -202,13 +204,22 @@ pub(crate) fn validate_ref(value: &str, label: &str) -> Result<()> {
 pub(crate) fn identity_to_obj(identity: &Option<Identity>) -> Value {
     match identity {
         None => Value::Null,
-        Some(identity) => serde_json::json!({
-            "pid": identity.pid,
-            "start_ticks": identity.start_ticks,
-            "boot_id": identity.boot_id,
-            "host_id": identity.host_id,
-            "cgroup_path": identity.cgroup_path,
-        }),
+        Some(identity) => {
+            let mut value = serde_json::json!({
+                "pid": identity.pid,
+                "start_ticks": identity.start_ticks,
+                "boot_id": identity.boot_id,
+                "host_id": identity.host_id,
+                "cgroup_path": identity.cgroup_path,
+            });
+            if let Some(namespace_pid) = identity.namespace_pid {
+                value["namespace_pid"] = serde_json::json!(namespace_pid);
+            }
+            if let Some(pidns_inode) = &identity.pidns_inode {
+                value["pidns_inode"] = serde_json::json!(pidns_inode);
+            }
+            value
+        }
     }
 }
 
@@ -220,7 +231,7 @@ pub(crate) fn identity_from_obj(value: &Value, label: &str) -> Result<Option<Ide
     exact_keys(
         raw,
         &["pid", "start_ticks", "boot_id", "host_id", "cgroup_path"],
-        &[],
+        &["namespace_pid", "pidns_inode"],
         label,
     )?;
     let identity = Identity {
@@ -229,6 +240,14 @@ pub(crate) fn identity_from_obj(value: &Value, label: &str) -> Result<Option<Ide
         boot_id: as_str(&raw["boot_id"], &format!("{label}.boot_id"))?.to_owned(),
         host_id: as_str(&raw["host_id"], &format!("{label}.host_id"))?.to_owned(),
         cgroup_path: as_str(&raw["cgroup_path"], &format!("{label}.cgroup_path"))?.to_owned(),
+        namespace_pid: match raw.get("namespace_pid") {
+            None => None,
+            Some(value) => Some(as_int(value, &format!("{label}.namespace_pid"), 1)?),
+        },
+        pidns_inode: match raw.get("pidns_inode") {
+            None => None,
+            Some(value) => Some(as_str(value, &format!("{label}.pidns_inode"))?.to_owned()),
+        },
     };
     if identity.boot_id.is_empty()
         || identity.host_id.is_empty()

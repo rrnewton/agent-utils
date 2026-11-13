@@ -1,8 +1,9 @@
 # Team PID namespaces: slot liveness without host-wide scans (#1300 team-pid-namespaces)
 
-Status: design only, Phase 1, 2026-11-12. Phase 2 (the build) waits for a
-separate go after this design is reviewed. This document must not be read as
-a shipped interface.
+Status: Phase 1 design, 2026-11-12; Phase 2a implemented (see below).
+Phase 2b (the keeper and the join) is not yet authorized: it waits for the
+launcher-compatibility matrix named in the Phase 2b note below. Interfaces
+described for Phase 2b must not be read as shipped.
 
 ## Goal
 
@@ -404,6 +405,31 @@ namespace, under the `_assert_host_process_view` discipline above.
   New fields must be ignorable by old readers and old records readable
   by new readers; a reader that cannot parse the namespace record must
   fall back, never refuse the registry.
+
+## Phase 2a (implemented): migration step 1, no namespaces
+
+- `ProcessIdentity` gained the dual fields `namespace_pid` and
+  `pidns_inode` in both wrkslots editions. They are optional on read,
+  omitted on write when absent (so older readers keep reading new
+  records), populated at capture from `NSpid` and the namespace link,
+  and excluded from generation equality, so a pre-namespace record
+  compares equal to a current reading of the same generation.
+- Owner liveness answers pidfd-first (`_process_state_with_evidence` /
+  `process_state_with_evidence`): the pidfd pins the generation, and the
+  single-process generation read that follows cannot be redirected by
+  the exit/fork races of a host walk. When a pidfd cannot be opened for
+  a reason other than absence, the legacy reading answers and status
+  names the source: `owner_evidence: pidfd | legacy-scan | none`.
+- The removal census for a slot whose recorded owner cgroup is
+  slot-scoped (`wrkslots-…`) enumerates only that cgroup's members
+  (`_cgroup_member_pids`, `_scoped_cgroup_slot_users`) and applies the
+  direct-use checks to them; when the scoped census cannot run, the
+  legacy host census answers unchanged. Slots without a slot-scoped
+  cgroup keep the legacy census exactly as before.
+- Tests assert counts and evidence strings, never wall time: pidfd
+  liveness with zero host `/proc` listings, scoped-census membership
+  independent of other cgroups' process counts, and pre-namespace
+  records answering unchanged, in both editions.
 
 ## Phase 2 sketch (not authorized by this document)
 

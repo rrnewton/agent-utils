@@ -1373,13 +1373,23 @@ class Config:
 
 @dataclasses.dataclass(frozen=True)
 class ProcessIdentity:
-    """One exact operating-system process generation."""
+    """One exact operating-system process generation.
+
+    ``pid`` is always the host-namespace PID. ``namespace_pid`` and
+    ``pidns_inode`` are the dual identity (#1300, Phase 2a): the same
+    process as its own PID namespace numbers it, and that namespace's
+    inode. They are evidence, never part of the generation comparison,
+    so a pre-namespace record (both absent) compares equal to a current
+    reading of the same generation.
+    """
 
     pid: int
     start_ticks: int
     boot_id: str
     host_id: str
     cgroup_path: str
+    namespace_pid: int | None = dataclasses.field(default=None, compare=False)
+    pidns_inode: str | None = dataclasses.field(default=None, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7318,13 +7328,21 @@ def _rename_noreplace(source: Path, destination: Path, label: str) -> None:
 def _identity_to_obj(owner: ProcessIdentity | None) -> object:
     if owner is None:
         return None
-    return {
+    value: dict[str, object] = {
         "pid": owner.pid,
         "start_ticks": owner.start_ticks,
         "boot_id": owner.boot_id,
         "host_id": owner.host_id,
         "cgroup_path": owner.cgroup_path,
     }
+    # Absent dual fields are omitted, never written as null: that is what
+    # lets an older reader, which knows only the five keys, keep reading
+    # a record this code wrote (#1300 Phase 2a).
+    if owner.namespace_pid is not None:
+        value["namespace_pid"] = owner.namespace_pid
+    if owner.pidns_inode is not None:
+        value["pidns_inode"] = owner.pidns_inode
+    return value
 
 
 def _identity_from_obj(value: object, label: str) -> ProcessIdentity | None:
@@ -7334,7 +7352,7 @@ def _identity_from_obj(value: object, label: str) -> ProcessIdentity | None:
     _exact_keys(
         raw,
         {"pid", "start_ticks", "boot_id", "host_id", "cgroup_path"},
-        set(),
+        {"namespace_pid", "pidns_inode"},
         label,
     )
     identity = ProcessIdentity(
@@ -7343,11 +7361,25 @@ def _identity_from_obj(value: object, label: str) -> ProcessIdentity | None:
         boot_id=_as_str(raw["boot_id"], f"{label}.boot_id"),
         host_id=_as_str(raw["host_id"], f"{label}.host_id"),
         cgroup_path=_as_str(raw["cgroup_path"], f"{label}.cgroup_path"),
+        namespace_pid=(
+            None
+            if raw.get("namespace_pid") is None
+            else _as_int(raw["namespace_pid"], f"{label}.namespace_pid", minimum=1)
+        ),
+        pidns_inode=(
+            None
+            if raw.get("pidns_inode") is None
+            else _as_str(raw["pidns_inode"], f"{label}.pidns_inode")
+        ),
     )
     if (
         not identity.boot_id
         or not identity.host_id
         or not identity.cgroup_path.startswith("/")
+        or (
+            identity.pidns_inode is not None
+            and not identity.pidns_inode.startswith("pid:[")
+        )
     ):
         raise StateError(f"{label} has an invalid boot, machine, or cgroup identity")
     return identity
@@ -22126,12 +22158,29 @@ def _read_process_identity(pid: int, *, proc_root: Path = Path("/proc")) -> Proc
             "-- if the caller is PID 1 inside its own PID namespace this refusal does "
             "not apply to it, because such a process is not this machine's init"
         )
+    namespace_pid: int | None = None
+    pidns_inode: str | None = None
+    try:
+        for line in (pid_dir / "status").read_text(encoding="ascii").splitlines():
+            if line.startswith("NSpid:"):
+                numbers = line.split()[1:]
+                if numbers and numbers[-1].isdigit():
+                    namespace_pid = int(numbers[-1])
+                break
+    except (OSError, UnicodeError):
+        pass
+    try:
+        pidns_inode = os.readlink(pid_dir / "ns" / "pid")
+    except OSError:
+        pass
     return ProcessIdentity(
         pid=pid,
         start_ticks=process_stat.start_ticks,
         boot_id=_boot_id(proc_root),
         host_id=_host_id(),
         cgroup_path=cgroup_path,
+        namespace_pid=namespace_pid,
+        pidns_inode=pidns_inode,
     )
 
 
@@ -23140,6 +23189,105 @@ def _assert_whole_cgroup2_hierarchy(root: Path) -> None:
             )
 
 
+_CGROUP_CENSUS_DIRECTORY_LIMIT = 512
+
+
+def _cgroup_member_pids(
+    cgroup_path: str, *, cgroup_root: Path = Path("/sys/fs/cgroup")
+) -> tuple[int, ...] | None:
+    """Member host PIDs of one cgroup and its descendants, or None.
+
+    None means the census is unavailable (no such cgroup, an unreadable
+    member list, a hierarchy beyond the bound); callers fall back to the
+    legacy host scan and name that fallback (#1300 Phase 2a). A vanished
+    cgroup directory mid-walk simply contributes no members.
+    """
+
+    root = cgroup_root / cgroup_path.lstrip("/")
+    if not root.is_dir():
+        return None
+    members: list[int] = []
+    seen: set[int] = set()
+    visited = 0
+    for directory, _children, _files in os.walk(root):
+        visited += 1
+        if visited > _CGROUP_CENSUS_DIRECTORY_LIMIT:
+            return None
+        try:
+            text = (Path(directory) / "cgroup.procs").read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError):
+            return None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pid = int(line)
+                if pid not in seen:
+                    seen.add(pid)
+                    members.append(pid)
+    return tuple(members)
+
+
+def _scoped_cgroup_slot_users(
+    slot_path: Path,
+    record: ActiveRecord | None,
+    *,
+    proc_root: Path = Path("/proc"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> tuple[tuple[int, str, str], ...] | None:
+    """Direct users of ``slot_path`` among the recorded owner's cgroup.
+
+    Returns ``(pid, kind, detail)`` per member whose cwd, root, or open
+    descriptor names the slot, ``()`` when the scoped census ran and
+    found none, and None when it could not run (no recorded owner, no
+    readable cgroup, an unreadable member) so the caller falls back to
+    the legacy host census. A member that vanishes mid-check is skipped:
+    a process that exited uses nothing, as everywhere in this census.
+    """
+
+    if record is None or record.owner is None:
+        return None
+    members = _cgroup_member_pids(record.owner.cgroup_path, cgroup_root=cgroup_root)
+    if members is None:
+        return None
+    users: list[tuple[int, str, str]] = []
+    for pid in members:
+        pid_dir = proc_root / str(pid)
+        links: list[tuple[str, str]] = []
+        unreadable = False
+        for kind in ("cwd", "root", "exe"):
+            try:
+                links.append((kind, os.readlink(pid_dir / kind)))
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            except OSError:
+                unreadable = True
+        fd_dir = pid_dir / "fd"
+        try:
+            fd_names = os.listdir(fd_dir)
+        except (FileNotFoundError, ProcessLookupError):
+            fd_names = []
+        except OSError:
+            fd_names = []
+            unreadable = True
+        for name in fd_names[:1024]:
+            try:
+                links.append(("fd", os.readlink(fd_dir / name)))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError:
+                unreadable = True
+        if not links and unreadable:
+            return None
+        for kind, target in links:
+            observed = Path(target.removesuffix(" (deleted)"))
+            if observed == slot_path or _path_is_within(observed, slot_path):
+                users.append((pid, kind, target))
+                break
+    return tuple(users)
+
+
 def _retained_unit_cgroup_members(
     units: AbstractSet[str], *, root: Path | None = None
 ) -> Mapping[str, int]:
@@ -23952,7 +24100,44 @@ def _other_live_wrkslots_processes(
     return found
 
 
+def _process_state_with_evidence(
+    identity: ProcessIdentity | None,
+) -> tuple[str, str, str]:
+    """``(state, detail, source)`` for one recorded owner (#1300 Phase 2a).
+
+    The pidfd is opened first: it pins the generation that held the host
+    PID at open time, so the exit/fork races of a host-wide walk cannot
+    redirect the answer, and a process that is already gone is proven
+    dead by the open itself. Only when a pidfd cannot be opened for a
+    reason other than absence does the legacy single-process /proc
+    reading answer, named ``legacy-scan`` so status shows which evidence
+    answered. ``source`` is one of ``pidfd``, ``legacy-scan``, ``none``.
+    """
+
+    if identity is None:
+        return "indeterminate", "no owner process generation is recorded", "none"
+    source = "pidfd"
+    pidfd: int | None = None
+    try:
+        pidfd = os.pidfd_open(identity.pid)
+    except (ProcessLookupError, FileNotFoundError):
+        # The recorded PID names no live process; the boot check in the
+        # legacy path still decides dead-versus-different-machine.
+        source = "pidfd"
+    except (AttributeError, PermissionError, OSError):
+        source = "legacy-scan"
+    if pidfd is not None:
+        os.close(pidfd)
+    state, detail = _process_state_legacy(identity)
+    return state, detail, source
+
+
 def _process_state(identity: ProcessIdentity | None) -> tuple[str, str]:
+    state, detail, _source = _process_state_with_evidence(identity)
+    return state, detail
+
+
+def _process_state_legacy(identity: ProcessIdentity | None) -> tuple[str, str]:
     if identity is None:
         return "indeterminate", "no owner process generation is recorded"
     try:
@@ -25193,6 +25378,32 @@ def _assert_slot_unused(
     # A stale image copy this command discards is invisible to the path checks
     # below wherever a process reaches it other than under the slot's path.
     _assert_discarded_copies_unused()
+    if (
+        census is None
+        and fallback_census is None
+        and agent_batch is None
+        and record is not None
+        and record.owner is not None
+        and "wrkslots-" in record.owner.cgroup_path
+    ):
+        # Phase 2a (#1300): a slot-scoped owner cgroup is the census scope.
+        # Members are enumerated from cgroup.procs, never from a host-wide
+        # /proc walk; when that census cannot run, the legacy path below
+        # answers instead and status names it legacy-scan.
+        scoped = _scoped_cgroup_slot_users(slot_path, record)
+        if scoped is not None:
+            users = [
+                user
+                for user in scoped
+                if not (ignore_current_process and user[0] == os.getpid())
+            ]
+            if users:
+                pid, kind, detail = users[0]
+                raise Refusal(
+                    f"live process {pid} uses slot {slot_path}: {kind}={detail} "
+                    "(evidence: cgroup); stop it and retry"
+                )
+            return
     while True:
         observation = _observe_slot_use_once(
             slot_path,
@@ -48813,7 +49024,9 @@ def _status_record(
     owner_release: tuple[_OwnerRelease, str | None] | None = None,
     liveness: tuple[str, str] | None = None,
 ) -> dict[str, object]:
-    process_state, process_detail = _process_state(record.owner)
+    process_state, process_detail, evidence_source = _process_state_with_evidence(
+        record.owner
+    )
     # #879: one liveness source.  Status used to report only the owner
     # process question, which reads "indeterminate" for exactly the
     # rows whose run or registered authority audit asks (an ownerless
@@ -48833,6 +49046,7 @@ def _status_record(
         value["owner_release"] = _owner_release_obj(*owner_release)
     value["owner_state"] = process_state
     value["owner_detail"] = process_detail
+    value["owner_evidence"] = evidence_source
     value["liveness_state"] = liveness_state
     value["liveness_detail"] = liveness_detail
     value["heartbeat_age_seconds"] = int(age)

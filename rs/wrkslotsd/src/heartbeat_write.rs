@@ -58,13 +58,7 @@ pub(crate) fn assert_caller(identity: &Identity, label: &str) -> Result<()> {
 }
 
 pub(crate) fn identity_value(identity: &Identity) -> Value {
-    json!({
-        "pid": identity.pid,
-        "start_ticks": identity.start_ticks,
-        "boot_id": identity.boot_id,
-        "host_id": identity.host_id,
-        "cgroup_path": identity.cgroup_path,
-    })
+    crate::status_state::identity_to_value(identity)
 }
 
 fn record_identity(record: &Value, key: &str) -> Option<Identity> {
@@ -78,6 +72,8 @@ fn record_identity(record: &Value, key: &str) -> Option<Identity> {
         boot_id: value.get("boot_id")?.as_str()?.to_string(),
         host_id: value.get("host_id")?.as_str()?.to_string(),
         cgroup_path: value.get("cgroup_path")?.as_str()?.to_string(),
+        namespace_pid: crate::status_state::optional_namespace_pid(value),
+        pidns_inode: crate::status_state::optional_pidns_inode(value),
     })
 }
 

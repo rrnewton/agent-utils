@@ -431,13 +431,7 @@ pub(crate) fn committed_project_file(path: &Path) -> bool {
 }
 
 fn identity_value(identity: &Identity) -> Value {
-    json!({
-        "pid": identity.pid,
-        "start_ticks": identity.start_ticks,
-        "boot_id": identity.boot_id,
-        "host_id": identity.host_id,
-        "cgroup_path": identity.cgroup_path,
-    })
+    crate::status_state::identity_to_value(identity)
 }
 
 fn parent_pid(pid: i64) -> Option<i64> {
@@ -577,6 +571,8 @@ pub(crate) fn write_handoff(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            namespace_pid: crate::status_state::optional_namespace_pid(&owner_value),
+            pidns_inode: crate::status_state::optional_pidns_inode(&owner_value),
         };
         let (state, detail) = process_state(Some(&owner));
         return Err(format!(

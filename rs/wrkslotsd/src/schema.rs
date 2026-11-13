@@ -337,9 +337,10 @@ fn validate_identity(value: &Value, label: &str) -> Result<Option<Identity>, Obs
         return Ok(None);
     }
     let identity = object(value, label)?;
-    exact_keys(
+    exact_keys_optional(
         identity,
         &["pid", "start_ticks", "boot_id", "host_id", "cgroup_path"],
+        &["namespace_pid", "pidns_inode"],
         label,
     )?;
     let pid = positive(&identity["pid"], &format!("{label}.pid"))?;

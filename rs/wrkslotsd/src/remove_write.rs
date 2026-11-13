@@ -219,6 +219,8 @@ fn identity_of(value: &Value) -> Identity {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        namespace_pid: crate::status_state::optional_namespace_pid(value),
+        pidns_inode: crate::status_state::optional_pidns_inode(value),
     }
 }
 

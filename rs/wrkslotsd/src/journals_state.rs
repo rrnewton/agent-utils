@@ -204,6 +204,11 @@ fn identity_from_value(value: Option<&Value>) -> Option<crate::status_state::Ide
         boot_id: map.get("boot_id")?.as_str()?.to_string(),
         host_id: map.get("host_id")?.as_str()?.to_string(),
         cgroup_path: map.get("cgroup_path")?.as_str()?.to_string(),
+        namespace_pid: map.get("namespace_pid").and_then(Value::as_i64),
+        pidns_inode: map
+            .get("pidns_inode")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 

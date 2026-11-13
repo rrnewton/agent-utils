@@ -20,13 +20,60 @@ use crate::record_holds::load_record_holds;
 
 type Result<T> = std::result::Result<T, String>;
 
-#[derive(PartialEq)]
 pub(crate) struct Identity {
     pub(crate) pid: i64,
     pub(crate) start_ticks: i64,
     pub(crate) boot_id: String,
     pub(crate) host_id: String,
     pub(crate) cgroup_path: String,
+    /// Dual identity (#1300 Phase 2a): this process as its own PID
+    /// namespace numbers it, and that namespace's inode. Evidence only;
+    /// generation comparisons ignore both fields.
+    pub(crate) namespace_pid: Option<i64>,
+    pub(crate) pidns_inode: Option<String>,
+}
+
+impl PartialEq for Identity {
+    /// Generation equality only: the dual namespace fields are
+    /// evidence, so a pre-namespace record equals a current reading
+    /// of the same generation (#1300 Phase 2a).
+    fn eq(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && self.start_ticks == other.start_ticks
+            && self.boot_id == other.boot_id
+            && self.host_id == other.host_id
+            && self.cgroup_path == other.cgroup_path
+    }
+}
+
+pub(crate) fn identity_to_value(identity: &Identity) -> Value {
+    let mut value = json!({
+        "pid": identity.pid,
+        "start_ticks": identity.start_ticks,
+        "boot_id": identity.boot_id,
+        "host_id": identity.host_id,
+        "cgroup_path": identity.cgroup_path,
+    });
+    // Absent dual fields are omitted, never null, so older readers that
+    // know only the five keys keep reading records this code writes.
+    if let Some(namespace_pid) = identity.namespace_pid {
+        value["namespace_pid"] = json!(namespace_pid);
+    }
+    if let Some(pidns_inode) = &identity.pidns_inode {
+        value["pidns_inode"] = json!(pidns_inode);
+    }
+    value
+}
+
+pub(crate) fn optional_namespace_pid(value: &Value) -> Option<i64> {
+    value.get("namespace_pid").and_then(Value::as_i64)
+}
+
+pub(crate) fn optional_pidns_inode(value: &Value) -> Option<String> {
+    value
+        .get("pidns_inode")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn host_id() -> std::result::Result<String, String> {
@@ -154,13 +201,56 @@ pub(crate) fn read_process_identity(pid: i64) -> std::result::Result<Identity, S
             "PID {pid} is {name}, which can never own, coordinate or act on a slot; recording it would store an identity that stays live until the machine reboots, so the slot could never be reclaimed and no later check could tell it from a real owner. remedy: pass the PID of the real process -- if the caller is PID 1 inside its own PID namespace this refusal does not apply to it, because such a process is not this machine's init"
         ));
     }
+    let namespace_pid = std::fs::read_to_string(format!("{dir}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find(|line| line.starts_with("NSpid:"))
+                .and_then(|line| line.split_whitespace().last())
+                .and_then(|last| last.parse::<i64>().ok())
+        })
+        .filter(|pid| *pid >= 1);
+    let pidns_inode = std::fs::read_link(format!("{dir}/ns/pid"))
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string))
+        .filter(|value| value.starts_with("pid:["));
     Ok(Identity {
         pid,
         start_ticks,
         boot_id: boot_id()?,
         host_id: host_id()?,
         cgroup_path,
+        namespace_pid,
+        pidns_inode,
     })
+}
+
+fn pidfd_source(pid: i64) -> &'static str {
+    let Some(raw_pid) = u32::try_from(pid).ok().and_then(|value| {
+        i32::try_from(value).ok()
+    }) else {
+        return "legacy-scan";
+    };
+    let Some(process_pid) = rustix::process::Pid::from_raw(raw_pid) else {
+        return "legacy-scan";
+    };
+    match rustix::process::pidfd_open(process_pid, rustix::process::PidfdFlags::empty()) {
+        Ok(_pidfd) => "pidfd",
+        Err(error) if error == rustix::io::Errno::SRCH => "pidfd",
+        Err(_) => "legacy-scan",
+    }
+}
+
+pub(crate) fn process_state_with_evidence(
+    identity: Option<&Identity>,
+) -> (String, String, &'static str) {
+    let source = match identity {
+        None => "none",
+        Some(identity) => pidfd_source(identity.pid),
+    };
+    let (state, detail) = process_state(identity);
+    (state, detail, source)
 }
 
 pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
@@ -192,7 +282,15 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
     }
     match read_process_identity(identity.pid) {
         Ok(current) => {
-            if current == *identity {
+            // The dual namespace fields are evidence, not generation:
+            // a pre-namespace record must compare equal to a current
+            // reading of the same generation (#1300 Phase 2a).
+            let same_generation = current.pid == identity.pid
+                && current.start_ticks == identity.start_ticks
+                && current.boot_id == identity.boot_id
+                && current.host_id == identity.host_id
+                && current.cgroup_path == identity.cgroup_path;
+            if same_generation {
                 (
                     "live".to_string(),
                     format!("PID {} generation is live", identity.pid),
@@ -225,6 +323,8 @@ pub(crate) fn identity_from_value(value: &Value) -> Option<Identity> {
         boot_id: raw.get("boot_id")?.as_str()?.to_string(),
         host_id: raw.get("host_id")?.as_str()?.to_string(),
         cgroup_path: raw.get("cgroup_path")?.as_str()?.to_string(),
+        namespace_pid: optional_namespace_pid(value),
+        pidns_inode: optional_pidns_inode(value),
     })
 }
 
@@ -310,7 +410,8 @@ pub(crate) fn status_records(
                     )
                 })?)
             };
-            let (state, detail) = process_state(identity.as_ref());
+            let (state, detail, evidence) =
+                process_state_with_evidence(identity.as_ref());
             // #879: one liveness source — the same authority answer
             // audit reports, beside the owner process evidence.
             let slot_type = value
@@ -368,6 +469,7 @@ pub(crate) fn status_records(
                 .ok_or_else(|| "active record is not an object".to_string())?;
             object.insert("owner_state".to_string(), json!(state));
             object.insert("owner_detail".to_string(), json!(detail));
+            object.insert("owner_evidence".to_string(), json!(evidence));
             object.insert("liveness_state".to_string(), json!(liveness.state));
             object.insert("liveness_detail".to_string(), json!(liveness.detail));
             object.insert("heartbeat_age_seconds".to_string(), json!(age_seconds));

@@ -342,13 +342,7 @@ fn submodule_authors(
 }
 
 fn identity_value(identity: &Identity) -> Value {
-    json!({
-        "pid": identity.pid,
-        "start_ticks": identity.start_ticks,
-        "boot_id": identity.boot_id,
-        "host_id": identity.host_id,
-        "cgroup_path": identity.cgroup_path,
-    })
+    crate::status_state::identity_to_value(identity)
 }
 
 fn parent_pid(pid: i64) -> Option<i64> {

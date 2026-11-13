@@ -2074,6 +2074,8 @@ pub(crate) fn finish_slot(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        namespace_pid: crate::status_state::optional_namespace_pid(&owner_value),
+        pidns_inode: crate::status_state::optional_pidns_inode(&owner_value),
     };
     if supplied != recorded_owner {
         let (state, detail) = process_state(Some(&recorded_owner));

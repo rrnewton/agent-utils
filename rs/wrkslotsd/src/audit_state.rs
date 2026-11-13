@@ -5925,7 +5925,7 @@ fn seal_actor(value: &Value, label: &str) -> Result<()> {
     exact_keys(
         raw,
         &["pid", "start_ticks", "boot_id", "host_id", "cgroup_path"],
-        &[],
+        &["namespace_pid", "pidns_inode"],
         label,
     )?;
     as_int(&raw["pid"], &format!("{label}.pid"), 1)?;
