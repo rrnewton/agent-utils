@@ -1985,6 +1985,23 @@ fn collect_ignored_files(
             continue;
         }
         let relative = format!("{prefix}{name}");
+        // Files inside a bare repository directory are its object
+        // store, judged by its own Git checks, not ignored files.
+        let parts: Vec<&str> = relative.split('/').collect();
+        let mut inside_repository = false;
+        for end in 1..parts.len() {
+            let ancestor = checkout_path.join(parts[..end].join("/"));
+            if ancestor.join("HEAD").is_file()
+                && ancestor.join("objects").is_dir()
+                && ancestor.join("refs").is_dir()
+            {
+                inside_repository = true;
+                break;
+            }
+        }
+        if inside_repository {
+            continue;
+        }
         if ignored_path_is_cache(
             config,
             checkout_name,

@@ -32194,6 +32194,23 @@ def _collect_ignored_directory(
             ) from exc
 
 
+def _ignored_ancestor_is_repository(
+    checkout_path: Path, relative: str, repositories: dict[str, bool]
+) -> bool:
+    """Whether any ancestor of ``relative`` is itself a Git repository dir."""
+
+    parts = relative.split("/")
+    for end in range(1, len(parts)):
+        ancestor = "/".join(parts[:end])
+        cached = repositories.get(ancestor)
+        if cached is None:
+            cached = _is_git_repository_directory(checkout_path.joinpath(*parts[:end]))
+            repositories[ancestor] = cached
+        if cached:
+            return True
+    return False
+
+
 def _collect_ignored_files(
     config: Config,
     checkout: Checkout,
@@ -32209,6 +32226,7 @@ def _collect_ignored_files(
         repository,
         ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."],
     ).stdout
+    repositories: dict[str, bool] = {}
     for name in raw.split("\x00"):
         if not name:
             continue
@@ -32217,6 +32235,8 @@ def _collect_ignored_files(
         # evidence: salvage excludes them too (_salvage_pathspecs), and
         # the handoff guards judge them before removal.
         if relative.rsplit("/", 1)[-1].startswith("HANDOFF"):
+            continue
+        if _ignored_ancestor_is_repository(checkout_path, relative, repositories):
             continue
         if _ignored_path_is_cache(
             config, checkout, checkout_path, relative, cargo_targets
@@ -55380,6 +55400,13 @@ def _prepare_retirement_removal(
             archive_drifted=bool(getattr(args, "archive_drifted_checkouts", False)),
             archive_private_history=bool(
                 getattr(args, "archive_private_history", False)
+            ),
+            ignored_mode=(
+                "archive"
+                if bool(getattr(args, "archive_ignored", False))
+                else "discard"
+                if bool(getattr(args, "discard_ignored", False))
+                else "refuse"
             ),
         )
         evidence_write = _reclaim_evidence_write(
