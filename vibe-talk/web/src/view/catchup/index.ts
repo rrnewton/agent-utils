@@ -15,6 +15,7 @@ export type {
   CatchupStamp,
   CatchupUnreadRef,
   CatchupWindow,
+  DiscussFoldState,
   DiscussLayoutMode,
   DiscussPanel,
   DiscussPanelDependencies,
@@ -24,7 +25,7 @@ export type {
 import { createListening } from "../dom/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
 import { DISCUSS_UNAVAILABLE_HINT, createDiscussPanel, isDiscussUnavailable } from "./panel.ts";
-import type { CatchupAnswer, CatchupRequestBody, DiscussScope } from "./panel.ts";
+import type { CatchupAnswer, CatchupRequestBody, DiscussFoldState, DiscussScope } from "./panel.ts";
 import {
   discussScopeKey,
   isSameDiscussScope,
@@ -125,6 +126,9 @@ export interface DiscussViewDependencies {
   /** `#1354 discuss-layout-modes`. The panel's layout mode, forwarded to the panel. */
   storedMode?(): "overlay" | "docked" | "maximized";
   keepMode?(mode: "overlay" | "docked" | "maximized"): void;
+  /** `#1497 discuss-fold-state-persist`. The kept Discuss folds, forwarded to the panel. */
+  storedFolds?(): DiscussFoldState | null;
+  keepFolds?(state: DiscussFoldState): void;
 }
 
 /** The Discuss view, as the page calls it. */
@@ -342,6 +346,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     keepSheetFull: deps.keepSheetFull,
     storedMode: deps.storedMode,
     keepMode: deps.keepMode,
+    storedFolds: deps.storedFolds,
+    keepFolds: deps.keepFolds,
   });
 
   /** Where Discuss is aimed now: the open thread, else the channel in its current view. */

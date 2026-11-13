@@ -12,7 +12,7 @@
 // The answer's wire types are the generated contract's (`CatchupResponse` and its
 // parts); the panel narrows the decoded body to the fields it reads.
 
-import { createListening, foldSectionsByHeading, insertSanitizedHtml, setAllSections, setClassWord } from "../dom/index.ts";
+import { createListening, foldSectionsByHeading, insertSanitizedHtml, openSectionKeys, setAllSections, setClassWord } from "../dom/index.ts";
 import { createComposerKeys } from "../composer/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
@@ -130,6 +130,24 @@ export interface DiscussPanelDependencies {
   /** `#1354 discuss-layout-modes`. The panel's layout mode, as last left on this device. */
   storedMode?(): DiscussLayoutMode;
   keepMode?(mode: DiscussLayoutMode): void;
+  /**
+   * `#1497 discuss-fold-state-persist`. The one kept fold entry on this device
+   * and its keep, handed in where the page keeps them (the device settings, as
+   * the layout choices are); absent in a host that keeps nothing, where folds
+   * then last only while the answer stands. Read on use.
+   */
+  storedFolds?(): DiscussFoldState | null;
+  keepFolds?(state: DiscussFoldState): void;
+}
+
+/**
+ * `#1497 discuss-fold-state-persist`. The folds kept for one saved summary:
+ * its record (scope plus summary generation) and the open sections' keys.
+ * One entry only — a keep for a new summary replaces it whole.
+ */
+export interface DiscussFoldState {
+  record: string;
+  open: string[];
 }
 
 /** `#1354 discuss-layout-modes`. How the panel stands: the resizable overlay, a docked
@@ -449,6 +467,41 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   let sheetFull = false;
   let layoutMode: DiscussLayoutMode = "overlay";
   let drag: { startX: number; startWidth: number } | null = null;
+  // `#1497 discuss-fold-state-persist`. The record the drawn summary answers
+  // to (its scope and generation, `recordKeyFor`), the sections standing open
+  // in it, and the last record a saved draw named — an in-session restore of
+  // that same summary answers to it again. Null while a fresh Summarize's
+  // answer stands before its saved record lands: all collapsed, nothing kept.
+  let foldRecord: string | null = null;
+  let foldOpen: ReadonlySet<string> = new Set();
+  let lastFoldRecord: string | null = null;
+
+  /** A saved summary's record: its scope, as the server keys it, plus its generation. */
+  function recordKeyFor(scope: DiscussScope, createdMs: number): string {
+    return `${scope.channelId}|${scope.threadId ?? ""}|${createdMs}`;
+  }
+
+  /** The folds kept for `record`; a stale or unknown entry is no folds. */
+  function keptFoldsFor(record: string): ReadonlySet<string> {
+    try {
+      const state = deps.storedFolds?.() ?? null;
+      if (state === null || state.record !== record) return new Set();
+      return new Set(state.open.filter((key) => typeof key === "string"));
+    } catch {
+      return new Set();
+    }
+  }
+
+  /** Keep the answer box's open sections for the record they stand in. */
+  function keepFoldsNow(box: HTMLElement): void {
+    if (foldRecord === null) return;
+    foldOpen = new Set(openSectionKeys(box as never));
+    try {
+      deps.keepFolds?.({ record: foldRecord, open: [...foldOpen] });
+    } catch {
+      // Storage refused: the folds hold until the answer is redrawn.
+    }
+  }
 
   function panel(): HTMLElement {
     return deps.byId("discuss-panel");
@@ -629,7 +682,15 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
    * markup when it sent one, the shaped text as text otherwise. Model text reaches
    * innerHTML only through `text_html` — never directly.
    */
-  function drawAnswer(answer: CatchupAnswer): void {
+  function drawAnswer(answer: CatchupAnswer, record: string | null): void {
+    // `#1497`: a different record than the one standing starts from its own
+    // kept folds (none for a fresh summary); the same record redrawn keeps
+    // the folds as they stand.
+    if (record !== foldRecord) {
+      foldRecord = record;
+      foldOpen = record === null ? new Set() : keptFoldsFor(record);
+    }
+    if (record !== null) lastFoldRecord = record;
     const box = deps.byId("discuss-answer");
     box.replaceChildren();
     if (answer.text_html !== "") {
@@ -637,18 +698,29 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       insertSanitizedHtml(box, answer.text_html);
       // `#1387 discuss-collapsible-sections`: workstream sections fold, all
       // collapsed, with one Expand/Collapse-all bar at the top of the answer.
-      const folds = foldSectionsByHeading(box as never, (tag) => document.createElement(tag) as never);
+      const folds = foldSectionsByHeading(box as never, (tag) => document.createElement(tag) as never, foldOpen);
       if (folds > 0) {
+        for (const kid of Array.from(box.children)) {
+          if ((kid as HTMLElement).tagName === "DETAILS") {
+            kid.addEventListener("toggle", () => keepFoldsNow(box));
+          }
+        }
         const bar = document.createElement("div");
         bar.className = "discuss-collapse-bar";
         const expand = document.createElement("button");
         expand.type = "button";
         expand.textContent = "Expand all";
-        expand.addEventListener("click", () => setAllSections(box as never, true));
+        expand.addEventListener("click", () => {
+          setAllSections(box as never, true);
+          keepFoldsNow(box);
+        });
         const collapse = document.createElement("button");
         collapse.type = "button";
         collapse.textContent = "Collapse all";
-        collapse.addEventListener("click", () => setAllSections(box as never, false));
+        collapse.addEventListener("click", () => {
+          setAllSections(box as never, false);
+          keepFoldsNow(box);
+        });
         bar.append(expand, collapse);
         box.prepend(bar);
       }
@@ -787,7 +859,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const shape = asCatchupRecord(value);
         if (shape.summary !== null) {
           lastAnswer = shape.summary;
-          drawAnswer(shape.summary);
+          drawAnswer(shape.summary, recordKeyFor(scope, shape.created_ms));
           drawTerms(shape.summary);
           drawFooter(shape.summary, scope);
           const stampLine = formatStampLine(shape.summary.stamp);
@@ -934,7 +1006,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const unread = answer.window?.unread_count ?? answer.unread_ids.length;
         const count = answer.window?.count ?? answer.unread_ids.length;
         deps.byId("discuss-status").textContent = `Read ${unread} unread of ${count}`;
-        drawAnswer(answer);
+        drawAnswer(answer, null);
         drawTerms(answer);
         drawFooter(answer, scope);
         const stampLine = formatStampLine(answer.stamp);
@@ -1149,6 +1221,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     restoreAnswer(scope: DiscussScope, answer: CatchupAnswer) {
       generation += 1;
       if (pending) setPending(false);
+      // `#1497`: the restored summary answers to the last named record only
+      // where that record was for this scope (read before the scope moves).
+      const restoredRecord = lastScope !== null && lastScope.channelId === scope.channelId && lastScope.threadId === scope.threadId
+        ? lastFoldRecord
+        : null;
       lastScope = scope;
       lastAnswer = answer;
       try {
@@ -1161,7 +1238,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       const unread = answer.window?.unread_count ?? answer.unread_ids.length;
       const count = answer.window?.count ?? answer.unread_ids.length;
       deps.byId("discuss-status").textContent = `Read ${unread} unread of ${count}`;
-      drawAnswer(answer);
+      drawAnswer(answer, restoredRecord);
       drawTerms(answer);
       drawFooter(answer, scope);
       const stampLine = formatStampLine(answer.stamp);

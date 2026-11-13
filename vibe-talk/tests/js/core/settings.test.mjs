@@ -146,6 +146,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["discussWidth", "vibe-talk.voice.discuss-width", 560, [[700, "700"], [320, "320"]], 560],
     ["discussSheetFull", "vibe-talk.voice.discuss-sheet-full", false, [[true, "1"], [false, null]], false],
     ["discussMode", "vibe-talk.voice.discuss-mode", "overlay", [["docked", "docked"], ["maximized", "maximized"], ["overlay", "overlay"]], "overlay"],
+    ["discussFolds", "vibe-talk.voice.discuss-folds", null, [[{ record: "chan-1||1700000000000", open: ["Beta"] }, "{\"record\":\"chan-1||1700000000000\",\"open\":[\"Beta\"]}"], [null, null]], null],
   ];
   const refused = () => { throw new Error("SecurityError"); };
   const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
@@ -168,6 +169,10 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
   const stray = createDeviceSettings({ getItem: () => "{nonsense", setItem: () => {}, removeItem: () => {} });
   assert.deepStrictEqual([stray.get(DEVICE_SETTINGS.readAudioSource), stray.get(DEVICE_SETTINGS.openInView),
     stray.get(DEVICE_SETTINGS.slackOpen), stray.get(DEVICE_SETTINGS.readSteerOffset)], [null, "flat", "browser", null]);
+  // `#1497 discuss-fold-state-persist`: a damaged folds entry is no entry, never a throw.
+  assert.equal(stray.get(DEVICE_SETTINGS.discussFolds), null);
+  assert.equal(createDeviceSettings({ getItem: () => "{\"record\":7,\"open\":\"Beta\"}", setItem: () => {}, removeItem: () => {} })
+    .get(DEVICE_SETTINGS.discussFolds), null);
   // ...and a number out of its range, or not a number at all, as the clamps always read it: held to
   // the range; the default, or for the pace no preference; a blank the default, never zero.
   const keptText = (text) => createDeviceSettings({ getItem: () => text, setItem: () => {}, removeItem: () => {} });

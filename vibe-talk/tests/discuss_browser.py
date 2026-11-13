@@ -16,7 +16,9 @@ reports; the disabled-button state without it is covered by unit tests.
 The walk: open the channel, tap Discuss (nothing is asked), press Summarize,
 see "Reading…" give way to the summary with its covered-messages footer, Mark
 read sending exactly the markable ids, a footer link jumping with the panel
-still open (`#1395 discuss-scope-binding`, `#1345` keep-open), and
+still open (`#1395 discuss-scope-binding`, `#1345` keep-open), the
+summary's opened section surviving close/reopen and a reload but not a
+new Summarize (`#1497 discuss-fold-state-persist`), and
 the panel overlaying the list without moving #scroll-area. Condition waits
 only — no fixed sleeps in any assertion.
 """
@@ -49,9 +51,9 @@ CATCHUP_ANSWER = {
         {"id": MARKABLE[0], "label": "09:51 · Ada", "thread_id": None},
         {"id": MARKABLE[1], "label": "09:52 · Ben", "thread_id": None},
     ],
-    "text": "## Progress\nAda shipped the fix. Ben is reviewing it.",
-    "text_html": "<h2>Progress</h2><p>Ada shipped the fix. "
-                 "Ben is reviewing it.</p>",
+    "text": "## Progress\nAda shipped the fix.\n\n## Review\nBen is reviewing it.",
+    "text_html": "<h2>Progress</h2><p>Ada shipped the fix.</p>"
+                 "<h2>Review</h2><p>Ben is reviewing it.</p>",
     "backend": "fake",
     "model": "fake-model",
     "stamp": {"context_ms": 120, "model_ms": 900, "first_token_ms": None,
@@ -90,11 +92,37 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     """One Discuss walk at one size: open, read, mark, jump, close."""
     posts: list[dict[str, object]] = []
     writes: list[tuple[str, dict[str, object]]] = []
+    # `#1497 discuss-fold-state-persist`: the saved record the reopen reads,
+    # its generation advancing with each Summarize, as a new summary's would.
+    generation: int | None = None
 
     def catchup(route: Route) -> None:
+        nonlocal generation
         posts.append(route.request.post_data_json or {})
+        generation = (generation or 1760000099999) + 1
         route.fulfill(status=200, content_type="application/json",
                       body=json.dumps(CATCHUP_ANSWER))
+
+    def saved_record(route: Route) -> None:
+        if generation is None:
+            route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "exists": False, "thread_id": None, "current_summary": None,
+                "timeline": [], "staleness": None,
+            }))
+            return
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+            "exists": True, "thread_id": None,
+            "current_summary": {
+                "backend": "fake", "model": "fake-model", "view": "flat",
+                "since_ms": None, "created_ms": generation,
+                "window": CATCHUP_ANSWER["window"],
+                "covered_ids": MARKABLE, "markable_ids": MARKABLE, "cited_ids": [],
+                "footer_links": CATCHUP_ANSWER["footer_links"],
+                "text": CATCHUP_ANSWER["text"], "text_html": CATCHUP_ANSWER["text_html"],
+                "unknown_terms": [], "stamp": CATCHUP_ANSWER["stamp"],
+            },
+            "timeline": [], "staleness": None,
+        }))
 
     def preview(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=json.dumps({
@@ -119,8 +147,20 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         route.fulfill(status=200, content_type="application/json",
                       body=json.dumps(body))
 
+    def open_discuss() -> None:
+        # Reopen by whichever entry this build shows (`#1470` promotion):
+        # the bar icon when promoted, the menu item when not.
+        if page.locator("#discuss-open").is_visible():
+            page.click("#discuss-open")
+        else:
+            page.click("#action-menu-open")
+            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+            page.click("#discuss-menu-open")
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+
     page.route("**/api/v1/client-config", client_config)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup/preview*", preview)
+    page.route(f"**/api/v1/channels/{CHANNEL}/catchup/record*", saved_record)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup", catchup)
     page.route(f"**/api/v1/channels/{CHANNEL}/dismiss", dismiss)
     page.route(f"**/api/v1/channels/{CHANNEL}/restore", dismiss)
@@ -182,7 +222,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
           and posts[0].get("view") in ("flat", "main")
           and posts[0].get("since_ms") == 1760000000000,
           f"the panel posted {posts}, not one bounded channel catch-up")
-    heading = page.locator("#discuss-answer h2").text_content() or ""
+    heading = page.locator("#discuss-answer h2").first.text_content() or ""
     check(heading == "Progress", f"the answer did not render its heading: {heading!r}")
     raw = page.locator("#discuss-answer").text_content() or ""
     check("##" not in raw, f"raw Markdown showed in the answer: {raw!r}")
@@ -194,6 +234,41 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     check(page.locator("#discuss-links .discuss-link").first.text_content() == "09:51", "the footer links are not dense HH:MM")
     stamp = page.locator("#discuss-stamp").text_content() or ""
     check("in 4200 chars" in stamp and "out 48 chars" in stamp, f"the stamp line says {stamp!r}")
+
+    # `#1497 discuss-fold-state-persist`: the summary's sections start
+    # collapsed; an opened one survives close/reopen and a reload, kept on
+    # this device for the saved record only; a new Summarize starts
+    # collapsed again. Condition waits only — no fixed sleeps.
+    folds_open = "[...document.querySelectorAll('#discuss-answer details')].map((d) => d.open)"
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,false]'", timeout=20_000)
+    page.locator("#discuss-answer details").nth(1).locator("summary").click()
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=20_000)
+    # The toggle event (and so the keep) lands a task after the open flips.
+    page.wait_for_function(
+        "() => (localStorage.getItem('vibe-talk.voice.discuss-folds') || '').includes('\"Review\"')",
+        timeout=20_000)
+    page.click("#discuss-close")
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    open_discuss()
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=20_000)
+    page.reload(wait_until="load")
+    page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+    for _ in range(3):
+        if not page.locator("#discord-channel").is_hidden():
+            break
+        page.click("#view-switch")
+        try:
+            page.wait_for_selector("#discord-channel", state="visible", timeout=5_000)
+            break
+        except Exception:
+            continue
+    page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
+    open_discuss()
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=20_000)
+    page.wait_for_function(
+        "() => !document.getElementById('discuss-summarize').disabled", timeout=20_000)
+    page.click("#discuss-summarize")
+    page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,false]'", timeout=20_000)
 
     panel_box = page.locator("#discuss-panel").bounding_box()
     check(panel_box is not None and 0 <= panel_box["x"] and panel_box["x"] + panel_box["width"] <= width,

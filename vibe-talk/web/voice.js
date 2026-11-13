@@ -1131,6 +1131,10 @@ const discussView = createDiscussView({
   // `#1354 discuss-layout-modes`. The panel's mode, on this device with the rest.
   storedMode: () => deviceSettings().get(DEVICE_SETTINGS.discussMode),
   keepMode: (mode) => deviceSettings().keep(DEVICE_SETTINGS.discussMode, mode),
+  // `#1497 discuss-fold-state-persist`. The saved summary's open sections, on
+  // this device with the rest; a new summary's keep replaces the entry whole.
+  storedFolds: () => deviceSettings().get(DEVICE_SETTINGS.discussFolds),
+  keepFolds: (state) => deviceSettings().keep(DEVICE_SETTINGS.discussFolds, state),
 });
 
 /** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */

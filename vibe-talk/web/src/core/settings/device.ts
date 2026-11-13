@@ -216,6 +216,25 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (mode: "overlay" | "docked" | "maximized") => mode,
     refused: { value: "overlay" },
   } satisfies DeviceSetting<"overlay" | "docked" | "maximized">,
+  /** `#1497 discuss-fold-state-persist`. Which sections of the saved Discuss summary
+   * stand open, for that summary only: one slot holding its record (scope plus the
+   * summary's generation) and the open sections' keys, overwritten by every keep,
+   * so a new summary forgets the old one's folds. Per device; a damaged entry, and
+   * a refused read, is no entry. */
+  discussFolds: {
+    key: "vibe-talk.voice.discuss-folds",
+    read: (raw: string | null): { record: string; open: string[] } | null => {
+      try {
+        const held = JSON.parse(raw || "null") as { record?: unknown; open?: unknown } | null;
+        if (!held || typeof held.record !== "string" || !Array.isArray(held.open)) return null;
+        return { record: held.record, open: held.open.filter((key): key is string => typeof key === "string") };
+      } catch {
+        return null;
+      }
+    },
+    write: (state: { record: string; open: string[] } | null) => (state === null ? null : JSON.stringify(state)),
+    refused: { value: null },
+  } satisfies DeviceSetting<{ record: string; open: string[] } | null>,
   /** `#425 collapsed-lines`. The lines a fold shows, clamped. Synced. */
   collapsedLines: {
     key: "vibe-talk.voice.collapsed-lines",

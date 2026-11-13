@@ -17,7 +17,7 @@ import { moduleForTests } from "../../../web/build.mjs";
 
 const VIEW = await moduleForTests("src/view/catchup/index.ts");
 const {
-  createDiscussView, formatStampLine, DISCUSS_UNAVAILABLE_HINT,
+  createDiscussView, createDiscussPanel, formatStampLine, DISCUSS_UNAVAILABLE_HINT,
   DISCUSS_BINDING_RULES, WIDEN_OR_SIDEWAYS_ACTION, discussScopeKey, isSameDiscussScope,
   linkDecision, normalizeDiscussScope, viewChangeDecision,
 } = VIEW;
@@ -1133,4 +1133,183 @@ test("catchup toggle: toggle opens over the scope, closes, and reopens with no m
     assert.equal(view.isOpen(), true, "toggle did not reopen the panel");
     assert.deepEqual(fx.calls.posts, [], "reopen asked the model");
   } finally { fx.restore(); }
+});
+
+// ---- #1497 discuss-fold-state-persist -----------------------------------------------------------
+
+function foldEl(tagName = "div", text = "") {
+  const el = {
+    tagName: tagName.toUpperCase(),
+    children: [],
+    listeners: {},
+    attributes: {},
+    style: { setProperty() {} },
+    hidden: false,
+    disabled: false,
+    className: "",
+    type: "",
+    open: undefined,
+    parentNode: null,
+    focus() {},
+    appendChild(kid) { el.children.push(kid); kid.parentNode = el; return kid; },
+    append(...kids) { for (const kid of kids) el.appendChild(kid); },
+    prepend(...kids) { el.children.unshift(...kids); for (const kid of kids) kid.parentNode = el; },
+    insertBefore(kid, before) {
+      const at = before === null ? -1 : el.children.indexOf(before);
+      if (at < 0) el.children.push(kid); else el.children.splice(at, 0, kid);
+      kid.parentNode = el;
+      return kid;
+    },
+    removeChild(kid) { el.children.splice(el.children.indexOf(kid), 1); return kid; },
+    replaceChildren(...kids) { el.children = []; for (const kid of kids) el.appendChild(kid); },
+    addEventListener(type, listener) { (el.listeners[type] ||= []).push(listener); },
+    removeEventListener(type, listener) { el.listeners[type] = (el.listeners[type] || []).filter((one) => one !== listener); },
+    setAttribute(name, value) { el.attributes[name] = String(value); },
+    getAttribute(name) { return name in el.attributes ? el.attributes[name] : null; },
+    removeAttribute(name) { delete el.attributes[name]; },
+  };
+  let own = text;
+  Object.defineProperty(el, "textContent", {
+    get: () => own + el.children.map((kid) => kid?.textContent ?? "").join(""),
+    set: (value) => { own = String(value ?? ""); if (value) el.children = []; },
+  });
+  return el;
+}
+
+test("catchup folds: open sections survive close/reopen and a reload; a new summary resets (#1497)", async () => {
+  const HTML = "<h2>Alpha</h2><p>a</p><h2>Beta</h2><p>b</p>";
+  const scope = { channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" };
+  let generation = 1000;
+  const stored = { value: null, keeps: [] };
+  const recordBody = () => ({
+    exists: true,
+    current_summary: {
+      window: { count: 12, unread_count: 2 },
+      covered_ids: ["m1", "m2"],
+      markable_ids: ["m1", "m2"],
+      cited_ids: [],
+      footer_links: [
+        { id: "m1", label: "09:51 · Ada", thread_id: null },
+        { id: "m2", label: "09:52 · Ben", thread_id: null },
+      ],
+      text: "Alpha a. Beta b.",
+      text_html: HTML,
+      unknown_terms: [],
+      stamp: null,
+      created_ms: generation,
+    },
+    timeline: [],
+    staleness: null,
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createElement: (tag) => {
+      if (tag !== "template") return foldEl(tag);
+      const template = { _html: "", content: null };
+      Object.defineProperty(template, "innerHTML", {
+        set(value) {
+          template._html = String(value);
+          const nodes = [];
+          for (const match of template._html.matchAll(/<(h[1-6]|p)>([^<]*)<\/\1>/g)) nodes.push(foldEl(match[1], match[2]));
+          template.content = { childNodes: nodes };
+        },
+        get() { return template._html; },
+      });
+      return template;
+    },
+  };
+  try {
+    const makePanel = () => {
+      const els = {};
+      for (const id of IDS) els[id] = foldEl(id.endsWith("open") || id.endsWith("close") || id.includes("mark") ? "button" : "div");
+      els["discuss-panel"].hidden = true;
+      const panel = createDiscussPanel({
+        byId: (id) => {
+          const found = els[id];
+          if (!found) throw new Error(`no element ${id}`);
+          return found;
+        },
+        catchupPost: () => Promise.resolve({
+          window: { count: 12, unread_count: 2 },
+          unread_ids: ["m1", "m2"],
+          markable_ids: ["m1", "m2"],
+          cited_ids: [],
+          footer_links: [
+            { id: "m1", label: "09:51 · Ada", thread_id: null },
+            { id: "m2", label: "09:52 · Ben", thread_id: null },
+          ],
+          text: "Alpha a. Beta b.",
+          text_html: HTML,
+          unknown_terms: [],
+          stamp: null,
+        }),
+        catchupPreview: () => Promise.resolve(preview()),
+        catchupRecord: () => Promise.resolve(recordBody()),
+        catchupFollowup: () => Promise.resolve({}),
+        serviceName: () => "discord",
+        onJump: () => {},
+        dismissMessages: async () => {},
+        restoreMessages: async () => {},
+        storedFolds: () => stored.value,
+        keepFolds: (state) => { stored.value = state; stored.keeps.push(state); },
+      });
+      const folds = () => els["discuss-answer"].children.filter((kid) => kid.tagName === "DETAILS");
+      const bar = () => els["discuss-answer"].children.find((kid) => kid.className === "discuss-collapse-bar");
+      return { els, panel, folds, bar };
+    };
+
+    const first = makePanel();
+    first.panel.mount();
+    first.panel.openWith(scope);
+    await flush();
+    await flush();
+    assert.deepEqual(first.folds().map((fold) => fold.open), [false, false], "sections did not start collapsed");
+    assert.ok(first.bar(), "the Expand/Collapse all bar is missing");
+    const beta = first.folds()[1];
+    beta.open = true;
+    fire(beta, "toggle");
+    assert.deepEqual(stored.value, { record: "chan-1||1000", open: ["Beta"] }, "the toggle was not kept for the record");
+    click(first.bar().children[0]);
+    assert.deepEqual(first.folds().map((fold) => fold.open), [true, true], "Expand all did not open every section");
+    assert.deepEqual(stored.value, { record: "chan-1||1000", open: ["Alpha", "Beta"] }, "Expand all was not kept");
+    click(first.bar().children[1]);
+    assert.deepEqual(stored.value, { record: "chan-1||1000", open: [] }, "Collapse all was not kept");
+    const betaAgain = first.folds()[1];
+    betaAgain.open = true;
+    fire(betaAgain, "toggle");
+    first.panel.close();
+    first.panel.openWith(scope);
+    await flush();
+    await flush();
+    assert.deepEqual(first.folds().map((fold) => fold.open), [false, true], "close/reopen reset the folds");
+
+    const reloaded = makePanel();
+    reloaded.panel.mount();
+    reloaded.panel.openWith(scope);
+    await flush();
+    await flush();
+    assert.deepEqual(reloaded.folds().map((fold) => fold.open), [false, true], "a reload reset the folds");
+
+    stored.value = { record: "chan-1||999", open: ["Alpha", "Beta"] };
+    const stale = makePanel();
+    stale.panel.mount();
+    stale.panel.openWith(scope);
+    await flush();
+    await flush();
+    assert.deepEqual(stale.folds().map((fold) => fold.open), [false, false], "a stale record's folds opened sections");
+
+    generation = 2000;
+    click(reloaded.els["discuss-summarize"]);
+    await flush();
+    await flush();
+    await flush();
+    assert.deepEqual(reloaded.folds().map((fold) => fold.open), [false, false], "a new summary inherited folds");
+    const alpha = reloaded.folds()[0];
+    alpha.open = true;
+    fire(alpha, "toggle");
+    assert.deepEqual(stored.value, { record: "chan-1||2000", open: ["Alpha"] }, "the new summary kept folds under the old record");
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+  }
 });
