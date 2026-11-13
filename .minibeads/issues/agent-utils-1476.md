@@ -1,12 +1,12 @@
 ---
 title: 'gh-paced-admin-allowlist: scoped host-local allowlist for admin gh api calls'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - gh-paced
 created_at: 2026-11-13T00:37:00+00:00
-updated_at: 2026-11-13T00:37:00+00:00
+updated_at: 2026-11-13T01:00:21+00:00
 ---
 
 # Description
@@ -38,4 +38,4 @@ gh-paced reads an optional host-local allowlist file (default `~/.local/etc/gh-p
 
 ## Resolution
 
-Pending landing.
+[watermelon-full-preview] Landed as 731fb376fcb9aecf12ad38cb3d2588990b161bab (`gh-paced: add scoped host-local admin allowlist`) on github/main. The scoped path is live: exact method/path (plus `fields=` for `PATCH repos/OWNER/REPO`) in the host-local file admits only that call; everything else keeps exit 64, and `GH_PACED_ALLOW_ADMIN_API=1` is unchanged. Gate passed (37 steps; the first run's two census failures did not reproduce on the fresh local pass or the re-run). The per-host live file with real entries is installed by the coordinator, not shipped here.
