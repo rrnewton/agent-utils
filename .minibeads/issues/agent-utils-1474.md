@@ -1,12 +1,13 @@
 ---
 title: 'tests-rewrite-global-gitconfig: a test can rewrite the real global git config'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - tests
 created_at: 2026-11-12T23:30:00+00:00
-updated_at: 2026-11-12T23:30:00+00:00
+updated_at: 2026-11-13T07:30:00+00:00
+closed_at: 2026-11-13T07:30:00+00:00
 ---
 
 # Description
