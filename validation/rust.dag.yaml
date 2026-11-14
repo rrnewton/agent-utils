@@ -170,7 +170,7 @@ steps:
 
   - group: dagrun
     job: dagrun-model-deps
-    desc: dagrun-model's resolved dependency tree stays serde, serde_json, libc and testrun-core (no YAML crate, extra build script or extra proc-macro)
+    desc: dagrun-model's direct deps stay serde_json, libc and testrun-core and its resolved tree stays within that plus transitive serde/serde_core (no YAML crate, extra build script or extra proc-macro)
     cmd: python3 scripts/check_dagrun_model_deps.py --self-test && python3 scripts/check_dagrun_model_deps.py
     jobs_flag: ""
     labels: [validation-workspace, validation-rust-workspace-tests, component-dagrun]

@@ -12,7 +12,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-serde = "1"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 testrun-core = { version = "0.1.0", path = "../testrun-core" }
 libc = "0.2"

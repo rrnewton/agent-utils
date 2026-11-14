@@ -6,6 +6,7 @@ parsers, extra build scripts and procedural macros. This check resolves the crat
 normal and build dependency closure exactly as ``cargo build -p testrun-core`` would
 (``cargo tree``), reads each package's targets (``cargo metadata``), and fails if:
 
+- dagrun-model's direct dependencies are not exactly ``DIRECT_ALLOWED``;
 - any package in the closure is outside ``ALLOWED`` (a new crate needs a decision here);
 - any package name mentions YAML;
 - any package is a procedural macro other than ``serde_derive``;
@@ -29,12 +30,20 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # Python 3.10: the tomli package provides the same API
+    import tomli as tomllib
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = REPO_ROOT / "rs" / "Cargo.toml"
 SUBJECT = "dagrun-model"
-# serde without its derive feature, serde_json with default features, libc, and what
-# those pull in. serde_derive is the one procedural macro a consumer accepts, but it
-# is not used today; enabling it would also pull its own compile-time dependencies.
+# dagrun-model's own dependencies: serde_json, testrun-core and libc only. It does
+# not use serde directly; serde arrives only transitively via testrun-core, and
+# serde_core via serde_json. serde_derive is the one procedural macro a consumer
+# accepts, but it is not used today; enabling it would also pull its own
+# compile-time dependencies.
+DIRECT_ALLOWED = frozenset({"serde_json", "testrun-core", "libc"})
 ALLOWED = frozenset({SUBJECT, "testrun-core", "serde", "serde_core", "serde_json", "libc", "itoa", "memchr", "zmij"})
 # These base crates ship build scripts of their own; consumers already build them.
 BUILD_SCRIPT_ALLOWED = frozenset({"serde", "serde_core", "serde_json", "libc", "zmij"})
@@ -75,6 +84,28 @@ def violations(packages: list[Package]) -> list[str]:
         if package.name == SUBJECT and package.features:
             errors.append(f"{label}: declares features {sorted(package.features)}; it must have none")
     return errors
+
+
+def direct_violations(direct: set[str]) -> list[str]:
+    """Return the direct-dependency rule break, if any; serde must stay transitive only."""
+
+    if direct == DIRECT_ALLOWED:
+        return []
+    return [
+        f"{SUBJECT}: direct dependencies are {sorted(direct)}; they must be exactly "
+        f"{sorted(DIRECT_ALLOWED)} (serde is used only transitively via testrun-core)"
+    ]
+
+
+def manifest_direct_dependencies() -> set[str]:
+    """Read dagrun-model's direct dependency names from its Cargo.toml."""
+
+    manifest = REPO_ROOT / "rs" / "dagrun-model" / "Cargo.toml"
+    data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    dependencies = data.get("dependencies", {})
+    if not isinstance(dependencies, dict):
+        raise SystemExit("check-dagrun-model-deps: dagrun-model Cargo.toml has no [dependencies] table")
+    return {str(name) for name in dependencies}
 
 
 def _run(argv: list[str]) -> str:
@@ -159,7 +190,9 @@ def self_test() -> None:
     # serde_derive passes the procedural-macro rule but still needs an allowlist decision.
     derive = violations([*good, pkg("serde_derive", "proc-macro")])
     assert derive and all("procedural macros" not in error for error in derive), derive
-    print(f"check-dagrun-model-deps: self-test ok ({len(cases) + 2} cases)")
+    assert direct_violations(set(DIRECT_ALLOWED)) == []
+    assert any("direct dependencies" in error for error in direct_violations({*DIRECT_ALLOWED, "serde"}))
+    print(f"check-dagrun-model-deps: self-test ok ({len(cases) + 4} cases)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -170,12 +203,13 @@ def main(argv: list[str] | None = None) -> int:
         self_test()
         return 0
     packages = resolved_packages()
-    errors = violations(packages)
+    errors = violations(packages) + direct_violations(manifest_direct_dependencies())
     if errors:
         for error in errors:
             print(f"check-dagrun-model-deps: {error}", file=sys.stderr)
         print(
-            "check-dagrun-model-deps: the rule: dagrun-model has no build script; its closure is "
+            "check-dagrun-model-deps: the rule: dagrun-model has no build script; its direct "
+            f"dependencies are exactly {sorted(DIRECT_ALLOWED)}; its closure is "
             f"exactly {sorted(ALLOWED)}; no crate named like YAML; no proc-macro but serde_derive; "
             f"build scripts only in {sorted(BUILD_SCRIPT_ALLOWED)}, which ship their own.",
             file=sys.stderr,
