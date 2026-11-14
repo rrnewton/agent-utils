@@ -1348,6 +1348,37 @@ def _readback_head(text: str) -> str:
     return _readback_form(text)[:40]
 
 
+def _readback_mid(text: str) -> str:
+    """The middle 40 characters of a prompt as read-back compares it. Head and tail
+    together still cannot tell two long briefs by one sender apart: both open with the
+    same sender header and close with the same boilerplate, so an earlier brief in a
+    pane matched a later one's head and tail and counted as its old copy (#1427
+    agentctl-misroute-false-positive). The middle is the brief's own work, so a screen
+    counts as showing a long prompt only when it shows the middle as well as the ends:
+    a robust fingerprint of head, middle, and tail, never a full-text match against a
+    rendered screen, which wrapping, paste placeholders, and redraws defeat."""
+    form = _readback_form(text)
+    start = max(0, (len(form) - 40) // 2)
+    return form[start:start + 40]
+
+
+def _fingerprint_shows(screen: str, text: str) -> bool:
+    """Whether ``screen`` shows the prompt ``text``: its fingerprint (see
+    ``_readback_mid``) shows, compared as read-back compares it."""
+    form = _readback_form(screen)
+    return (_readback_head(text) in form and _readback_mid(text) in form
+            and _readback_tail(text) in form)
+
+
+def _shows_outside_tool_output(screen: str, text: str) -> bool:
+    """Whether ``screen`` shows the prompt ``text`` anywhere but in tool output rows
+    (``⎿`` or ``└``): words a command printed, such as a coordinator reading another
+    pane, are no evidence that a paste landed in this pane."""
+    kept = [line for line in screen.splitlines()
+            if not line.lstrip().startswith(("⎿", "└"))]
+    return _fingerprint_shows("\n".join(kept), text)
+
+
 # Markers that start the rows where typed input lands in a harness pane: the composer and the
 # user turns above it. Claude Code and Muse draw both after ``❯``; Codex draws a user turn after
 # ``›``, input it holds for a running turn after ``↳``, and its input box after ``»``.
@@ -1361,13 +1392,15 @@ def _input_occurrences(screen: str, text: str) -> int:
     output row (``⎿`` or ``└``). The same words printed anywhere else, such as in the output of
     a command that read this target's screen, were not typed into that pane.
 
-    One input region counts only when it holds both the text's head and its tail: a peer
-    that received a different prompt ending in the same words shows the tail alone and
-    counts nothing."""
+    One input region counts only when it holds the text's head, middle, and tail: a peer
+    that received a different prompt ending in the same words, or an earlier brief by
+    the same sender, alike at both ends, shows less than the fingerprint and counts
+    nothing."""
     tail = _readback_tail(text)
     if not tail:
         return 0
     head = _readback_head(text)
+    mid = _readback_mid(text)
     regions: list[list[str]] = []
     open_region = False
     for line in screen.splitlines():
@@ -1387,7 +1420,7 @@ def _input_occurrences(screen: str, text: str) -> int:
     total = 0
     for region in regions:
         form = _readback_form("\n".join(region))
-        if head in form:
+        if head in form and mid in form:
             total += form.count(tail)
     return total
 
@@ -1539,15 +1572,19 @@ class _WorkspaceClient:
         return windows
 
     def _window(self, pane: str, text: str, *, peer: bool = False) -> int:
-        """How often the text shows in the pane's scrollback; in another agent's pane, only
-        where typed input lands."""
+        """How often the text shows in the pane's scrollback: its ending, counted only
+        in a screen that also shows its head and middle (its fingerprint, see
+        ``_readback_mid``); in another agent's pane, only where typed input lands."""
         tail = _readback_tail(text)
         if not tail:
             return 0
         screen = self.client.read_scrollback(pane)
         if peer:
             return _input_occurrences(screen, text)
-        return _readback_form(screen).count(tail)
+        form = _readback_form(screen)
+        if _readback_head(text) not in form or _readback_mid(text) not in form:
+            return 0
+        return form.count(tail)
 
     def _observe(self, pane: str, text: str, before: dict[str, int], *, peer: bool = False) -> str:
         """``fresh`` when the text shows more often than before. When it does not, a pane
@@ -1568,13 +1605,29 @@ class _WorkspaceClient:
         return max(READBACK_SECONDS, self.readback_seconds or 0.0)
 
     def _seen_in_target(self, pane_id: str, text: str, before: dict[str, int]) -> bool:
+        """Wait for the prompt to appear newly in the target pane. The read-back limit
+        is the earliest a verdict may be reached, never the verdict itself: past it,
+        the wait ends only when the prompt shows or when the target screen has settled
+        (two successive reads alike), because a paste on a hot machine may not have
+        rendered yet while its screen keeps changing (#1427
+        agentctl-misroute-false-positive)."""
         deadline = time.monotonic() + self._readback_seconds()
+        previous: str | None = None
         while True:
-            if self._observe(pane_id, text, before) == "fresh":
+            screen = self.client.read_scrollback(pane_id)
+            tail = _readback_tail(text)
+            form = _readback_form(screen)
+            count = (form.count(tail) if tail and _readback_head(text) in form
+                     and _readback_mid(text) in form else 0)
+            old_count = before.get(pane_id, 0)
+            if count > old_count:
                 return True
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline and previous == screen:
                 return False
-            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            previous = screen
+            time.sleep(0.25 if now >= deadline
+                       else min(0.25, max(0.0, deadline - now)))
 
     def _peer_states(self, pane_id: str, text: str, before: dict[str, int]) -> dict[str, str]:
         return {peer: self._observe(peer, text, before, peer=True)
@@ -1626,13 +1679,15 @@ class _WorkspaceClient:
         """Prove the prompt reached this record's pane, or quarantine it.
 
         Evidence for the target: a receipt that saw the prompt printed there, or the
-        prompt newly in its scrollback within the read-back limit (``READBACK_SECONDS``,
-        or the working timeout for a start brief), each followed by a
+        prompt newly in its scrollback, waited for as ``_seen_in_target`` describes
+        (``READBACK_SECONDS``, or the working timeout for a start brief), each followed by a
         passing recipient check. Every other registered agent's pane is inspected as
         well. The prompt newly in exactly one of them, and not in the target, is a
         misroute (quarantined; countermanded only when that is enabled). A target that
         printed the prompt, or newly shows it where typed input lands, received it whatever
-        the peers show (#704 misroute-shared-text). Otherwise a prompt in several peers, or
+        the peers show (#704 misroute-shared-text), and a target that newly shows its
+        fingerprint outside tool output received it over peers that are only
+        ``uncertain`` (#1427 agentctl-misroute-false-positive). Otherwise a prompt in several peers, or
         a peer whose full window cannot rule out a new occurrence: quarantined without a
         note. A prompt the target never
         shows is unproven and quarantined, whatever confirmed the submission.
@@ -1669,6 +1724,23 @@ class _WorkspaceClient:
             self._log_readback(pane_id, text, "attributed",
                                {"in_target": True, "typed_in_target": True, "peers": states})
             return
+        # A positive sighting in the target itself, outside tool output, wins over
+        # ``uncertain`` peers (#1427 agentctl-misroute-false-positive): uncertain only
+        # means a peer already held matching text before this send, which is no
+        # evidence about where this paste landed, while the target newly showing the
+        # prompt's fingerprint is. Only a peer newly showing it (``fresh``) rivals
+        # the target.
+        if in_target and not fresh and uncertain:
+            try:
+                shows = _shows_outside_tool_output(
+                    self.client.read_scrollback(pane_id), text)
+            except (HerdrUnavailable, AgentDeliveryError):
+                shows = False
+            if shows:
+                self._log_readback(
+                    pane_id, text, "attributed",
+                    {"in_target": True, "typed_in_target": False, "peers": states})
+                return
         if fresh or uncertain:
             self._log_readback(pane_id, text, "ambiguous", {"in_target": in_target, "peers": states})
             raise ProbableMisroute(

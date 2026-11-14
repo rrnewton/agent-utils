@@ -1139,6 +1139,54 @@ fn typed(text: &str) -> String {
     format!("❯ {text}")
 }
 
+/// A long `text` as a harness draws it in a user turn: first row after the marker,
+/// the rest indented under it.
+fn typed_long(text: &str) -> String {
+    format!("❯ {}", text.replace('\n', "\n  "))
+}
+
+/// Two long briefs by one sender to one target, redacted from the queue records of
+/// #1427 agentctl-misroute-false-positive: the same sender header, the same closing
+/// boilerplate, different work in between. A fingerprint taken from the opening and
+/// the ending alone cannot tell them apart.
+const BRIEF_OLD: &str = "[from sender-a via agentctl · reply: agentctl send sender-a]\n\
+sender-a -> target-a: REVIEW REQUEST, redacted set r9\n\
+Inputs (redacted):\n\
+- ALPHA-01 contents hash one\n\
+- ALPHA-02 contents hash two\n\
+- ALPHA-03 contents hash three\n\
+- ALPHA-04 contents hash four\n\
+- ALPHA-05 contents hash five\n\
+- ALPHA-06 contents hash six\n\
+- ALPHA-07 contents hash seven\n\
+- ALPHA-08 contents hash eight\n\
+Rules:\n\
+- Build nothing.\n\
+Write your review to a NEW file and then send its hash and the verdict.\n\
+> GOALPOST-MOVING REVIEW RULE\n\
+> Adversarial reviewers must look explicitly for goalpost moving. We are extremely skeptical of any goalpost moving. YOU DO NOT CLEAR THE BAR BY SIMPLY LOWERING THE BAR.\n\
+> - weakening an assertion so a test passes\n\
+> - deleting a check rather than satisfying it.";
+
+const BRIEF_NEW: &str = "[from sender-a via agentctl · reply: agentctl send sender-a]\n\
+sender-a -> target-a: REVIEW REQUEST, redacted set v14\n\
+Inputs (redacted):\n\
+- BETA-01 contents hash one\n\
+- BETA-02 contents hash two\n\
+- BETA-03 contents hash three\n\
+- BETA-04 contents hash four\n\
+- BETA-05 contents hash five\n\
+- BETA-06 contents hash six\n\
+- BETA-07 contents hash seven\n\
+- BETA-08 contents hash eight\n\
+Rules:\n\
+- Build nothing.\n\
+Write your review to a NEW file and then send its hash and the verdict.\n\
+> GOALPOST-MOVING REVIEW RULE\n\
+> Adversarial reviewers must look explicitly for goalpost moving. We are extremely skeptical of any goalpost moving. YOU DO NOT CLEAR THE BAR BY SIMPLY LOWERING THE BAR.\n\
+> - weakening an assertion so a test passes\n\
+> - deleting a check rather than satisfying it.";
+
 #[test]
 fn a_note_that_never_shows_in_the_wrong_pane_is_not_a_recovery() {
     TEST_COUNTERMAND.with(|enabled| enabled.set(Some(true)));
@@ -1441,6 +1489,82 @@ fn a_prompt_new_in_target_and_peer_is_attributed_to_the_target() {
     assert!(failed_documents(&fixture, "worker").is_empty());
     assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
     assert!(!runs(&fixture).contains(&MISROUTE_NOTE.to_owned()));
+}
+
+#[test]
+fn a_new_long_brief_is_attributed_when_peers_hold_an_earlier_brief_by_the_same_sender() {
+    // #1427 agentctl-misroute-false-positive, case B in fingerprint form: the target and a
+    // peer already hold an earlier brief by this sender, opening and closing alike. The
+    // new brief's shared ending alone raises no count anywhere; only its middle tells it
+    // from the old one, in the target that now shows it.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned(), vec![typed_long(BRIEF_OLD)]);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("owned".to_owned(), vec![typed_long(BRIEF_OLD)]);
+    send(&fixture, "worker", BRIEF_NEW).expect("attributed to the target that shows it");
+    assert!(failed_documents(&fixture, "worker").is_empty());
+    assert!(fixture.client.keys_sent.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_long_brief_the_target_shows_outside_typed_input_outweighs_an_uncertain_peer() {
+    // #1427 agentctl-misroute-false-positive, case A: the target shows the brief (here in
+    // its transcript, not parsed as typed input), and the only peer evidence is an old
+    // copy: uncertain, never fresh. A positive target sighting wins over uncertain peers.
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(250))));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned(), vec![typed_long(BRIEF_NEW)]);
+    *fixture.client.print_after.lock().unwrap() = Some(Duration::MAX);
+    *fixture.client.scrollback_on_effect.lock().unwrap() = Some((
+        "owned".to_owned(),
+        BRIEF_NEW.lines().map(str::to_owned).collect(),
+    ));
+    send(&fixture, "worker", BRIEF_NEW).expect("attributed to the target that shows it");
+    assert!(failed_documents(&fixture, "worker").is_empty());
+}
+
+#[test]
+fn a_long_brief_rendering_while_the_target_screen_keeps_changing_is_attributed() {
+    // #1427 agentctl-misroute-false-positive, case B in timing form: the paste takes
+    // reads, not milliseconds, to render, and the target screen keeps changing while it
+    // lands. No read-back budget may decide before it has rendered: the wait is on the
+    // brief showing, or the screen settling, never on the clock.
+    TEST_READBACK.with(|limit| limit.set(Some(Duration::from_millis(1))));
+    let fixture = Fixture::new();
+    fixture.start(None);
+    add_bystander(&fixture);
+    fixture
+        .client
+        .scrollback
+        .lock()
+        .unwrap()
+        .insert("peer".to_owned(), vec![typed_long(BRIEF_NEW)]);
+    *fixture.client.print_after.lock().unwrap() = Some(Duration::MAX);
+    *fixture.client.reveal_scrollback.lock().unwrap() = Some((
+        "owned".to_owned(),
+        BRIEF_NEW.lines().map(str::to_owned).collect(),
+        5,
+    ));
+    send(&fixture, "worker", BRIEF_NEW).expect("attributed once the brief renders");
+    assert!(failed_documents(&fixture, "worker").is_empty());
 }
 
 #[test]

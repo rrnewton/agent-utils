@@ -2555,6 +2555,11 @@ at once, in the scan that first sees it so:
 [chat-bridge WARNING] Your message to coord sent 1 min ago ("deploy the fix") was quarantined as a PROBABLE MISROUTE: it may have reached another pane, or no agent at all, and it will not be sent again by itself. Why: .... If coord does not act on it, send it again.
 ```
 
+An uncertain quarantine (the prompt cannot be attributed to a pane) may in
+fact have been delivered to its target, so that notice instead says it may
+have been delivered and to read the target pane before resending; resending
+blind would duplicate a request the agent already acted on.
+
 Requests already quarantined when the service starts are not reported again.
 Without an outbound helper or a channel, the warnings are only written to the
 service log. A warning that fails to post is logged and not tried again,

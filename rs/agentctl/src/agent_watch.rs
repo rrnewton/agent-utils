@@ -4702,10 +4702,13 @@ fn sweep_editor_drafts(
 }
 
 /// Report, once each, every prompt a drain quarantined as a probable misroute within
-/// [`QUARANTINE_LOOKBACK_SECONDS`]: what it was, why, and how to send it again (#720
+/// [`QUARANTINE_LOOKBACK_SECONDS`]: what it was, why, and what to do next (#720
 /// agentctl-muse-stale-draft). Such a prompt is never typed again by itself, so without a notice
-/// it is simply lost. The notice goes to the coordinator as a priority sender. Returns a row for
-/// each such prompt, for the pass report.
+/// it is simply lost. An uncertain quarantine (the prompt cannot be attributed) may have
+/// been delivered, so its notice says to read the target pane before resending instead
+/// of how to send it again (#1427 agentctl-misroute-false-positive). The notice goes to
+/// the coordinator as a priority sender. Returns a row for each such prompt, for the
+/// pass report.
 fn report_quarantines(
     probe: &mut dyn Probe,
     notifier: &mut dyn Notifier,
@@ -4751,11 +4754,23 @@ fn report_quarantines(
                 path.display()
             )
         };
-        let text = format!(
-            "[agentctl watch-agents] a message to {agent} was quarantined as a PROBABLE \
-             MISROUTE and will not be retried: {id}, beginning \"{excerpt}\". Why: {error}. It \
-             may have reached another pane, or no agent at all. {resend}"
-        );
+        // An unattributable quarantine is uncertain: the prompt may in fact have been
+        // delivered to its target, so the sender is told to look before resending, never
+        // to send it again blind, which duplicates a delivered request (#1427
+        // agentctl-misroute-false-positive).
+        let text = if error.contains("cannot be attributed") {
+            format!(
+                "[agentctl watch-agents] a message to {agent} was quarantined as a PROBABLE \
+                 MISROUTE: {id}, beginning \"{excerpt}\". Why: {error}. It may have been \
+                 delivered: read the target pane before resending."
+            )
+        } else {
+            format!(
+                "[agentctl watch-agents] a message to {agent} was quarantined as a PROBABLE \
+                 MISROUTE and will not be retried: {id}, beginning \"{excerpt}\". Why: {error}. It \
+                 may have reached another pane, or no agent at all. {resend}"
+            )
+        };
         let message_id = format!("agent-watch-quarantine-{:016x}", stable_hash(&key));
         // A delivery to this pane just went astray, so the notice goes elsewhere (#844).
         match tell_about(
@@ -7673,6 +7688,39 @@ mod tests {
         assert_eq!(notifier.urgent.len(), 2);
         watch_agents_once(&mut probe, &mut notifier, &mut state, now + 60.0, &options);
         assert_eq!(notifier.sent.len(), 2, "each quarantine is reported once");
+    }
+
+    #[test]
+    fn an_uncertain_quarantine_tells_the_sender_to_read_the_target_pane_before_resending() {
+        // #1427 agentctl-misroute-false-positive: an unattributable prompt may in fact
+        // have been delivered, so the sender must not be told to send it again blind.
+        let options = options();
+        let mut state = WatchState::default();
+        let mut notifier = RecordingNotifier::default();
+        let mut probe = DeliveryProbe {
+            quarantined: vec![QuarantinedPrompt {
+                agent: "coord5".to_owned(),
+                id: "lane-9".to_owned(),
+                failed_at: 99_940.0,
+                path: PathBuf::from("/r/agents/coord5/queue/failed/lane-9.json"),
+                excerpt: "release the lock".to_owned(),
+                error: "pane wJ:pGY: PROBABLE MISROUTE, quarantined: prompt for agent \
+                        'coord5' cannot be attributed: target shows it, other panes {}; \
+                        quarantined without a note"
+                    .to_owned(),
+                owner: false,
+            }],
+            ..DeliveryProbe::default()
+        };
+        watch_agents_once(&mut probe, &mut notifier, &mut state, 100_000.0, &options);
+        assert_eq!(notifier.sent.len(), 1);
+        let text = &notifier.sent[0].1;
+        assert!(
+            text.contains("may have been delivered: read the target pane before resending"),
+            "{text}"
+        );
+        assert!(!text.contains("will not be retried"), "{text}");
+        assert!(!text.contains("send it again"), "{text}");
     }
 
     #[derive(Default)]

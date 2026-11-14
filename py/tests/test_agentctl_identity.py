@@ -956,6 +956,114 @@ def test_prompt_new_in_target_and_peer_is_attributed_to_the_target(
     assert fake.keys_sent == [] and subagents.MISROUTE_NOTE not in fake.submitted
 
 
+#: Two long briefs by one sender to one target, redacted from the queue records of
+#: #1427 agentctl-misroute-false-positive: the same sender header, the same closing
+#: boilerplate, different work in between.
+_BRIEF_OLD = (
+    "[from sender-a via agentctl · reply: agentctl send sender-a]\n"
+    "sender-a -> target-a: REVIEW REQUEST, redacted set r9\n"
+    "Inputs (redacted):\n"
+    "- ALPHA-01 contents hash one\n- ALPHA-02 contents hash two\n"
+    "- ALPHA-03 contents hash three\n- ALPHA-04 contents hash four\n"
+    "- ALPHA-05 contents hash five\n- ALPHA-06 contents hash six\n"
+    "- ALPHA-07 contents hash seven\n- ALPHA-08 contents hash eight\n"
+    "Rules:\n- Build nothing.\n"
+    "Write your review to a NEW file and then send its hash and the verdict.\n"
+    "> GOALPOST-MOVING REVIEW RULE\n"
+    "> Adversarial reviewers must look explicitly for goalpost moving. "
+    "YOU DO NOT CLEAR THE BAR BY SIMPLY LOWERING THE BAR.\n"
+    "> - weakening an assertion so a test passes\n"
+    "> - deleting a check rather than satisfying it."
+)
+_BRIEF_NEW = (
+    "[from sender-a via agentctl · reply: agentctl send sender-a]\n"
+    "sender-a -> target-a: REVIEW REQUEST, redacted set v14\n"
+    "Inputs (redacted):\n"
+    "- BETA-01 contents hash one\n- BETA-02 contents hash two\n"
+    "- BETA-03 contents hash three\n- BETA-04 contents hash four\n"
+    "- BETA-05 contents hash five\n- BETA-06 contents hash six\n"
+    "- BETA-07 contents hash seven\n- BETA-08 contents hash eight\n"
+    "Rules:\n- Build nothing.\n"
+    "Write your review to a NEW file and then send its hash and the verdict.\n"
+    "> GOALPOST-MOVING REVIEW RULE\n"
+    "> Adversarial reviewers must look explicitly for goalpost moving. "
+    "YOU DO NOT CLEAR THE BAR BY SIMPLY LOWERING THE BAR.\n"
+    "> - weakening an assertion so a test passes\n"
+    "> - deleting a check rather than satisfying it."
+)
+
+
+def test_new_long_brief_wins_over_a_peer_holding_an_earlier_brief_by_the_same_sender(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1427, case B in fingerprint form: an earlier brief by this sender already sits
+    # in the target and a peer; only the new brief's middle tells it apart.
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    fake.transcripts[other] = [_BRIEF_OLD]
+    fake.transcripts[pane] = [_BRIEF_OLD]
+    assert manager.send("worker", _BRIEF_NEW).delivered
+    assert _failed_documents(manager, "worker") == []
+
+
+def test_long_brief_the_target_shows_outside_typed_input_outweighs_an_uncertain_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1427, case A: the target shows the brief in its transcript, not parsed as
+    # typed input, and the peer's only evidence is an old copy: uncertain.
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    fake.transcripts[other] = [_BRIEF_NEW]
+    real = fake.read_scrollback
+    shown: list[bool] = []
+
+    def target_shows_brief(pane_id: str) -> str:
+        if pane_id == pane and shown:
+            return _BRIEF_NEW
+        return real(pane_id)
+
+    def note_effect(effect_pane: str) -> None:
+        fake.before_effect = None
+        shown.append(True)
+        # The paste itself is collapsed by the harness and never drawn as text.
+        fake.transcripts[pane] = []
+
+    monkeypatch.setattr(fake, "read_scrollback", target_shows_brief)
+    fake.before_effect = note_effect
+    assert manager.send("worker", _BRIEF_NEW).delivered
+    assert _failed_documents(manager, "worker") == []
+
+
+def test_long_brief_rendering_while_the_target_screen_keeps_changing_is_attributed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1427, case B in timing form: the paste takes reads, not milliseconds, to
+    # render while the target screen keeps changing. No read-back budget decides
+    # before it renders; the wait ends on the brief showing or the screen settling.
+    manager, fake, pane = _started(tmp_path, monkeypatch)
+    manager.start("bystander", cwd=str(tmp_path), harness="claude")
+    other = manager.get("bystander").pane_id or ""
+    monkeypatch.setattr(subagents, "READBACK_SECONDS", 0.0)
+    fake.transcripts[other] = [_BRIEF_NEW]
+    real = fake.read_scrollback
+    reads: list[int] = []
+
+    def rendering_target(pane_id: str) -> str:
+        if pane_id != pane:
+            return real(pane_id)
+        reads.append(1)
+        if len(reads) > 6:
+            return _BRIEF_NEW
+        return f"rendering {len(reads)}"
+
+    monkeypatch.setattr(fake, "read_scrollback", rendering_target)
+    assert manager.send("worker", _BRIEF_NEW).delivered
+    assert _failed_documents(manager, "worker") == []
+
+
 def test_anchor_from_an_earlier_rule_does_not_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

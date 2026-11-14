@@ -13,6 +13,9 @@
 //!
 //! A request whose prompt was quarantined as a PROBABLE MISROUTE is never typed again by
 //! itself, so its owner is told at once, with the start of the message and how to send it again.
+//! An uncertain quarantine (the prompt cannot be attributed) may have been delivered, so
+//! its notice instead says to read the target pane before resending (#1427
+//! agentctl-misroute-false-positive).
 //! Requests already in that state when the service starts were reported, if at all, by the run
 //! before, so they are not reported again.
 //!
@@ -355,15 +358,31 @@ impl OwnerAlarm {
                 continue;
             }
             let age = minutes(now_millis.saturating_sub(entry.admitted_at_millis));
-            notices.push(Notice {
-                text: format!(
+            let reason = entry.reason.as_deref().unwrap_or_default();
+            // An unattributable quarantine is uncertain: the prompt may in fact have
+            // been delivered to its target, so the owner is told to look before
+            // resending, never to send it again blind (#1427
+            // agentctl-misroute-false-positive).
+            let text = if reason.contains("cannot be attributed") {
+                format!(
+                    "{WARNING}Your message to {agent} sent {age} min ago (\"{}\") was quarantined \
+                     as a PROBABLE MISROUTE: it may have been delivered: read the target pane \
+                     before resending. Why: {}.",
+                    entry.excerpt,
+                    cut(reason, REASON_CHARS)
+                )
+            } else {
+                format!(
                     "{WARNING}Your message to {agent} sent {age} min ago (\"{}\") was quarantined \
                      as a PROBABLE MISROUTE: it may have reached another pane, or no agent at all, \
                      and it will not be sent again by itself. Why: {}. If {agent} does not act on \
                      it, send it again.",
                     entry.excerpt,
-                    cut(entry.reason.as_deref().unwrap_or_default(), REASON_CHARS)
-                ),
+                    cut(reason, REASON_CHARS)
+                )
+            };
+            notices.push(Notice {
+                text,
                 place: Place::TopLevel,
             });
         }
@@ -904,6 +923,33 @@ mod tests {
         );
         assert_eq!(notices[0].place, Place::TopLevel);
         assert!(due(&mut alarm, &entries, minute(13)).is_empty());
+    }
+
+    #[test]
+    fn an_uncertain_misroute_quarantine_tells_the_owner_to_read_the_target_pane_first() {
+        // #1427 agentctl-misroute-false-positive: an unattributable prompt may in fact
+        // have been delivered, so the owner must not be told to send it again blind.
+        let mut alarm = OwnerAlarm::new(DEFAULT_AFTER);
+        let certain = "pane wJ:pGY: PROBABLE MISROUTE, quarantined: target shows it";
+        let mut entries = vec![entry("old", RequestPhase::DeliveryUncertain, 1, certain)];
+        assert!(due(&mut alarm, &entries, minute(2)).is_empty());
+        entries.push(entry(
+            "new",
+            RequestPhase::DeliveryUncertain,
+            10,
+            "pane wJ:pGY: PROBABLE MISROUTE, quarantined: prompt for agent 'coord5' \
+             cannot be attributed: target does not show it, other panes {}; quarantined \
+             without a note",
+        ));
+        let notices = due(&mut alarm, &entries, minute(12));
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let text = &notices[0].text;
+        assert!(
+            text.contains("may have been delivered: read the target pane before resending"),
+            "{text}"
+        );
+        assert!(!text.contains("will not be sent again"), "{text}");
+        assert!(!text.contains("send it again"), "{text}");
     }
 
     // #1372 chat-stale-prompt-wedges-inbox: a prompt that waits only because its

@@ -4092,6 +4092,40 @@ fn readback_tail(text: &str) -> String {
 fn readback_head(text: &str) -> String {
     readback_form(text).chars().take(40).collect()
 }
+
+/// The middle 40 characters of `text` as read-back compares it. Head and tail together
+/// still cannot tell two long briefs by one sender apart: both open with the same sender
+/// header and close with the same boilerplate, so an earlier brief in a pane matched a
+/// later one's head and tail and counted as its old copy (#1427
+/// agentctl-misroute-false-positive). The middle is the brief's own work, so a screen
+/// counts as showing a long prompt only when it shows the middle as well as the ends:
+/// a robust fingerprint of head, middle, and tail, never a full-text match against a
+/// rendered screen, which wrapping, paste placeholders, and redraws defeat.
+fn readback_mid(text: &str) -> String {
+    let chars: Vec<char> = readback_form(text).chars().collect();
+    let start = chars.len().saturating_sub(40) / 2;
+    chars[start..chars.len().min(start + 40)].iter().collect()
+}
+
+/// Whether `screen` shows the prompt `text`: its fingerprint (see [`readback_mid`])
+/// shows, compared as read-back compares it.
+fn fingerprint_shows(screen: &str, text: &str) -> bool {
+    let form = readback_form(screen);
+    form.contains(&readback_head(text))
+        && form.contains(&readback_mid(text))
+        && form.contains(&readback_tail(text))
+}
+
+/// Whether `screen` shows the prompt `text` anywhere but in tool output rows (`⎿` or
+/// `└`): words a command printed, such as a coordinator reading another pane, are no
+/// evidence that a paste landed in this pane.
+fn shows_outside_tool_output(screen: &str, text: &str) -> bool {
+    let kept: Vec<&str> = screen
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(['⎿', '└']))
+        .collect();
+    fingerprint_shows(&kept.join("\n"), text)
+}
 /// Longest wait for another pane's input lock before a countermand gives up.
 const COUNTERMAND_LOCK: Duration = Duration::from_secs(2);
 /// Lines of scrollback each read-back reads; a read this long may have lost old lines.
@@ -4148,13 +4182,20 @@ fn missing_target(error: &impl std::fmt::Display) -> Option<&'static str> {
     None
 }
 
-/// How often `text` shows in the scrollback `screen`, compared as read-back compares it.
+/// How often `text` shows in the scrollback `screen`, compared as read-back compares it:
+/// its ending, counted only in a screen that also shows its head and middle (its
+/// fingerprint, see [`readback_mid`]), so an earlier brief by the same sender, alike at
+/// both ends, counts nothing for a later one.
 fn occurrences(screen: &str, text: &str) -> usize {
     let tail = readback_tail(text);
     if tail.is_empty() {
         return 0;
     }
-    readback_form(screen).matches(&tail).count()
+    let form = readback_form(screen);
+    if !form.contains(&readback_head(text)) || !form.contains(&readback_mid(text)) {
+        return 0;
+    }
+    form.matches(&tail).count()
 }
 
 /// Markers that start the rows where typed input lands in a harness pane: the composer and the
@@ -4169,10 +4210,11 @@ const INPUT_MARKERS: [&str; 4] = ["❯", "›", "↳", "»"];
 /// command the agent ran that read this target's screen, were not typed into that pane, so they
 /// are no evidence that a prompt went there instead of to its target.
 ///
-/// One input region counts only when it holds both the text's head and its tail (see
-/// [`readback_head`]): a peer that received a different prompt ending in the same words —
-/// every chat-bridge prompt ends in the same reply boilerplate — shows the tail alone and
-/// counts nothing, where it used to make the target's prompt unattributable and got it
+/// One input region counts only when it holds the text's head, middle, and tail (see
+/// [`readback_head`] and [`readback_mid`]): a peer that received a different prompt ending
+/// in the same words — every chat-bridge prompt ends in the same reply boilerplate — or an
+/// earlier brief by the same sender, alike at both ends, shows less than the fingerprint
+/// and counts nothing, where it used to make the target's prompt unattributable and got it
 /// quarantined as a probable misroute.
 fn input_occurrences(screen: &str, text: &str) -> usize {
     let tail = readback_tail(text);
@@ -4209,11 +4251,12 @@ fn input_occurrences(screen: &str, text: &str) -> usize {
             region.push('\n');
         }
     }
+    let mid = readback_mid(text);
     regions
         .iter()
         .map(|region| {
             let form = readback_form(region);
-            if form.contains(&head) {
+            if form.contains(&head) && form.contains(&mid) {
                 form.matches(&tail).count()
             } else {
                 0
@@ -4354,7 +4397,13 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         Ok(state_of(self.window(pane, text)?, pane, before))
     }
 
-    /// Wait up to the read-back limit for the prompt to appear newly in the target pane.
+    /// Wait for the prompt to appear newly in the target pane. The read-back limit is the
+    /// earliest a verdict may be reached, never the verdict itself: past it, the wait ends
+    /// only when the prompt shows, when the caller cancels, or when the target screen has
+    /// settled (two successive reads alike), because a paste on a hot machine may not have
+    /// rendered yet while its screen keeps changing (#1427
+    /// agentctl-misroute-false-positive). Deciding on the clock alone quarantined briefs
+    /// that were already in the target's scrollback when the seat took them up.
     fn seen_in_target(
         &self,
         pane_id: &str,
@@ -4363,15 +4412,26 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         runtime: &dyn agent::AgentRuntime,
     ) -> crate::error::Result<bool> {
         let deadline = runtime.monotonic() + self.readback_limit();
+        let mut previous: Option<String> = None;
         loop {
-            if self.observe(pane_id, text, before)? == "fresh" {
+            let screen = self.client.read_scrollback(pane_id)?;
+            if state_of(occurrences(&screen, text), pane_id, before) == "fresh" {
                 return Ok(true);
             }
             let now = runtime.monotonic();
-            if now >= deadline {
+            if now >= deadline && previous.as_deref() == Some(screen.as_str()) {
                 return Ok(false);
             }
-            runtime.sleep(Duration::from_millis(250).min(deadline.saturating_sub(now)));
+            if runtime.cancelled() {
+                return Ok(false);
+            }
+            previous = Some(screen);
+            let wait = Duration::from_millis(250);
+            runtime.sleep(if now >= deadline {
+                wait
+            } else {
+                wait.min(deadline.saturating_sub(now))
+            });
         }
     }
 
@@ -4499,11 +4559,13 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
     /// Prove the prompt reached this record's pane, or countermand where it went.
     ///
     /// Evidence for the target: a receipt that saw the prompt printed there, or the prompt
-    /// newly in its scrollback within the read-back limit ([`READBACK`], or the working timeout
-    /// for a start brief). Every other registered agent's pane is
+    /// newly in its scrollback, waited for as [`Self::seen_in_target`] describes ([`READBACK`],
+    /// or the working timeout for a start brief). Every other registered agent's pane is
     /// inspected as well. The prompt newly in exactly one of them, and not in the target, is
     /// countermanded there. A target that printed the prompt, or newly shows it where typed
-    /// input lands, received it whatever the peers show (#704 misroute-shared-text). Otherwise
+    /// input lands, received it whatever the peers show (#704 misroute-shared-text), and a
+    /// target that newly shows its fingerprint outside tool output received it over peers
+    /// that are only `uncertain` (#1427 agentctl-misroute-false-positive). Otherwise
     /// a prompt in several peers, or a peer whose last occurrence moved nearer the end without
     /// a new one, cannot be told apart: the message is quarantined without a note. A receipt
     /// that saw the prompt taken from the target's composer into the queue of a turn it was
@@ -4589,6 +4651,26 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
                 &json!({"in_target": true, "typed_in_target": true, "peers": states}),
             );
             return Ok(());
+        }
+        // A positive sighting in the target itself, outside tool output, wins over
+        // `uncertain` peers (#1427 agentctl-misroute-false-positive): uncertain only
+        // means a peer already held matching text before this send, which is no evidence
+        // about where this paste landed, while the target newly showing the prompt's
+        // fingerprint is. Only a peer newly showing it (`fresh`) rivals the target.
+        if in_target && fresh.is_empty() && states.values().any(|state| *state == "uncertain") {
+            let shows = self
+                .client
+                .read_scrollback(pane_id)
+                .is_ok_and(|screen| shows_outside_tool_output(&screen, text));
+            if shows {
+                self.log_readback(
+                    pane_id,
+                    text,
+                    "attributed",
+                    &json!({"in_target": true, "typed_in_target": false, "peers": states}),
+                );
+                return Ok(());
+            }
         }
         if states.values().any(|state| *state != "absent") {
             self.log_readback(
@@ -16028,6 +16110,7 @@ pub(crate) mod tests {
                     agent_get_missing: AtomicBool::new(false),
                     herdr_closed: Mutex::new(BTreeSet::new()),
                     print_after: Mutex::new(None),
+                    reveal_scrollback: Mutex::new(None),
                     printing: Mutex::new(Vec::new()),
                     printed_without: Mutex::new(Vec::new()),
                     hold_reads: Mutex::new(None),
@@ -16522,6 +16605,10 @@ pub(crate) mod tests {
         /// How long after its submission a prompt shows in the pane's scrollback, as a harness
         /// that is still starting prints it; `None` shows it at once, `Duration::MAX` never.
         pub(crate) print_after: Mutex<Option<Duration>>,
+        /// Lines a pane's scrollback gains once it has been read `reads` more times, while
+        /// every earlier read returns a different, still-rendering screen: a paste that lands
+        /// late on a busy machine, counted in reads so a test never waits on the clock.
+        pub(crate) reveal_scrollback: Mutex<Option<(String, Vec<String>, usize)>>,
         /// Prompts submitted but not shown yet: pane, printed text, and when it shows.
         printing: Mutex<Vec<(String, String, Option<std::time::Instant>)>>,
         /// Characters a harness drops when it prints a prompt, as Markdown rendering does.
@@ -17391,6 +17478,36 @@ pub(crate) mod tests {
             self.run(pane, text)
         }
         fn read_scrollback(&self, pane: &str) -> AdapterResult<String> {
+            {
+                let mut reveal = self.reveal_scrollback.lock().unwrap();
+                if let Some((_revealed_pane, lines, reads)) =
+                    reveal.as_mut().filter(|(revealed, ..)| revealed == pane)
+                {
+                    if *reads > 0 {
+                        *reads -= 1;
+                        let churn = *reads;
+                        drop(reveal);
+                        let mut screen = self
+                            .scrollback
+                            .lock()
+                            .unwrap()
+                            .get(pane)
+                            .map(|lines| lines.join("\n"))
+                            .unwrap_or_default();
+                        screen.push_str(&format!("\nrendering {churn}"));
+                        return Ok(screen);
+                    }
+                    let lines = lines.clone();
+                    *reveal = None;
+                    drop(reveal);
+                    self.scrollback
+                        .lock()
+                        .unwrap()
+                        .entry(pane.to_owned())
+                        .or_default()
+                        .extend(lines);
+                }
+            }
             {
                 let now = std::time::Instant::now();
                 let mut scrollback = self.scrollback.lock().unwrap();
