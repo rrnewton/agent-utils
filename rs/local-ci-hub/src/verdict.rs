@@ -50,6 +50,16 @@
 //!   would withhold them.
 //! - In [`assess`], composition records and the green-flaky supersede
 //!   escape from the genuine-failure latch: not implemented, stricter.
+//!
+//! One clause is implemented rather than skipped, as an intended oracle
+//! parity rule: the `legacy` clause (see [`legacy_applies`]). A passing
+//! row with no cell-results evidence and no full-coverage claim is a
+//! legacy count-based row; the authority qualifies it by its counts
+//! (its cell-evidence verdict for such a row is a non-blocking
+//! grandfathered unknown), so this predicate judges it by the same
+//! counts and skips the coverage and base-evidence clauses for that
+//! row only. Rows carrying cell evidence keep the strict path,
+//! unchanged; the clause neither loosens nor tightens any other row.
 
 use crate::event::is_lower_hex40;
 use crate::pyjson::PyValue;
@@ -455,6 +465,19 @@ fn derive_green_class(row: &PyValue) -> Option<String> {
     Some(derived)
 }
 
+/// Whether the `legacy` clause applies to `row`: a passing row with
+/// no cell-results evidence (`cell_results` absent or null) and no
+/// full-coverage claim (`full_coverage` absent or null). Such a row is
+/// a legacy count-based row, qualified by its counts; see the module
+/// documentation. An explicit `full_coverage` value (including `false`)
+/// is a claim and defeats the clause, as does any carried cell
+/// evidence.
+fn legacy_applies(row: &PyValue) -> bool {
+    str_of(row, "result") == Some("pass")
+        && present(row, "cell_results").is_none()
+        && present(row, "full_coverage").is_none()
+}
+
 /// Whether one row qualifies as a full green for exact `sha`, with a
 /// stable short reason. Clauses run in authority order and the first
 /// refusal names the reason; see the module documentation for the
@@ -535,6 +558,7 @@ pub fn row_qualifies(row: &PyValue, sha: &str, policy: &Policy) -> (bool, String
             return (false, reason);
         }
     }
+    let legacy = legacy_applies(row);
     let count_capable = schema >= policy.counts_schema;
     let executed_present = present(row, "executed_tests").is_some();
     if count_capable || executed_present {
@@ -549,12 +573,21 @@ pub fn row_qualifies(row: &PyValue, sha: &str, policy: &Policy) -> (bool, String
     } else {
         return refuse("no-execution-count");
     }
-    if count_capable && schema >= COVERAGE_SCHEMA_MIN {
+    if legacy && !count_capable {
+        // The legacy count proof, exactly as the authority states it:
+        // an old-schema row qualifies by counts only when it carries
+        // both counts and proves nonzero execution by them.
+        let counts_present = executed_present && present(row, "filtered_tests").is_some();
+        if !counts_present {
+            return refuse("no-execution-count");
+        }
+    }
+    if !legacy && count_capable && schema >= COVERAGE_SCHEMA_MIN {
         if let Some(reason) = coverage_refusal(row) {
             return refuse(reason);
         }
     }
-    if schema >= BASE_SCHEMA_MIN {
+    if !legacy && schema >= BASE_SCHEMA_MIN {
         for field in &policy.base_fields {
             match str_of(row, field) {
                 Some(text) if is_lower_hex40(text) => {}
@@ -903,6 +936,74 @@ mod tests {
         assert!(ok, "reason: {reason}");
     }
 
+    /// One legacy count-based row: passing, with declared gate counts
+    /// and test counts, but no cell evidence, no coverage object, no
+    /// base-evidence fields, and no full-coverage claim.
+    fn legacy_row(schema: i64, executed: i64, passed: i64, filtered: i64) -> PyValue {
+        let row = set(&happy(), "schema_version", int(schema));
+        let row = set(&row, "executed_tests", int(executed));
+        let row = set(&row, "passed_tests", int(passed));
+        let row = set(&row, "filtered_tests", int(filtered));
+        let row = remove(&row, "coverage");
+        let row = remove(&row, "base_sha");
+        remove(&row, "base_tree")
+    }
+
+    #[test]
+    fn legacy_count_rows_qualify_by_counts() {
+        // Several count shapes, mirroring the legacy population: small
+        // and large executed counts, filtered tests present, and an
+        // old-schema row that predates declared gate contracts.
+        assert!(qualifies(&legacy_row(5, 10, 10, 0)));
+        assert!(qualifies(&legacy_row(5, 740, 740, 350)));
+        assert!(qualifies(&legacy_row(4, 1, 1, 0)));
+        assert!(qualifies(&legacy_row(3, 427, 427, 12)));
+        // Null evidence fields are unset, not claims.
+        let row = set(&legacy_row(5, 10, 10, 0), "cell_results", PyValue::Null);
+        let row = set(&row, "full_coverage", PyValue::Null);
+        assert!(qualifies(&row));
+    }
+
+    #[test]
+    fn legacy_clause_defeated_by_cell_evidence() {
+        // Carried cell evidence keeps the strict path: without coverage
+        // and base evidence this row refuses, evidence or not.
+        let row = set(
+            &legacy_row(5, 10, 10, 0),
+            "cell_results",
+            PyValue::Object(vec![]),
+        );
+        assert!(!qualifies(&row));
+    }
+
+    #[test]
+    fn legacy_clause_defeated_by_full_coverage_claim() {
+        let row = set(
+            &legacy_row(5, 10, 10, 0),
+            "full_coverage",
+            PyValue::Bool(false),
+        );
+        assert!(!qualifies(&row));
+    }
+
+    #[test]
+    fn legacy_clause_defeated_by_non_pass_result() {
+        let row = set(&legacy_row(5, 10, 10, 0), "result", s("fail"));
+        assert!(!qualifies(&row));
+    }
+
+    #[test]
+    fn legacy_row_with_failing_counts_refused() {
+        assert!(!qualifies(&legacy_row(5, 10, 9, 0)));
+        assert!(!qualifies(&legacy_row(5, 0, 0, 0)));
+        let short = set(&legacy_row(5, 10, 10, 0), "gates_run", int(4));
+        assert!(!qualifies(&short));
+        // An old-schema row carrying only one count proves nothing.
+        let one_count = remove(&legacy_row(3, 10, 10, 0), "filtered_tests");
+        let one_count = remove(&one_count, "passed_tests");
+        assert!(!qualifies(&one_count));
+    }
+
     #[test]
     fn uppercase_pass_refused() {
         assert!(!qualifies(&set(&happy(), "result", s("PASS"))));
@@ -937,7 +1038,11 @@ mod tests {
 
     #[test]
     fn absent_coverage_refused() {
-        assert!(!qualifies(&remove(&happy(), "coverage")));
+        // On the strict path (cell evidence carried), coverage is
+        // required. A legacy count row without it is judged by the
+        // legacy clause instead; see legacy_count_rows_qualify_by_counts.
+        let row = set(&happy(), "cell_results", PyValue::Object(vec![]));
+        assert!(!qualifies(&remove(&row, "coverage")));
     }
 
     #[test]
