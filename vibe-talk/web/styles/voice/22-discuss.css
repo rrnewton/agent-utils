@@ -561,6 +561,52 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 .discuss-collapse-bar { display: flex; gap: 8px; margin: 0 0 6px; }
 .discuss-collapse-bar button { font: inherit; }
 
+/* `#1525 fold-marker-on-heading-line` (owner request 054): the fold's
+ * disclosure marker shares the heading's line. `foldSectionsByHeading`
+ * (`view/dom/collapse.ts`, `#1387`) puts the block heading inside the
+ * <summary>, where it stacked under the marker; a flex row keeps the
+ * heading element itself (outline, anchors and the `#1497` fold keys read
+ * it), puts a chevron at the start of its line, and wraps a long heading
+ * beside the chevron, never under it. The row stays the whole tap target,
+ * 44px tall as `.settings-fold`/`.help-entry` are, and the native
+ * <details>/<summary> keeps Enter/Space and the screen-reader button. */
+#discuss-answer details > summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  box-sizing: border-box;
+  min-height: 2.75rem;
+  padding: 0.55rem 0;
+  cursor: pointer;
+  list-style: none;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#discuss-answer details > summary::-webkit-details-marker {
+  display: none;
+}
+
+#discuss-answer details > summary::before {
+  content: "▸";
+  flex: 0 0 auto;
+  margin-top: 0.12rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.2;
+}
+
+#discuss-answer details[open] > summary::before {
+  content: "▾";
+}
+
+#discuss-answer details > summary > h2,
+#discuss-answer details > summary > h3 {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+
 /* `#1388 discuss-summary-staleness-update` (landing 1 strike, landing 2
  * fresh): a bullet or section whose cited messages are all read is struck —
  * muted, still readable, still tappable, still foldable; a section's strike

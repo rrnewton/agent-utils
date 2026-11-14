@@ -281,6 +281,62 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
           f"the panel posted {posts}, not one bounded channel catch-up")
     heading = page.locator("#discuss-answer h2").first.text_content() or ""
     check(heading == "Progress", f"the answer did not render its heading: {heading!r}")
+    # `#1525 fold-marker-on-heading-line`: the chevron shares the heading's
+    # line at the start of a 44px row, the heading element stays inside the
+    # summary, a long heading wraps beside the chevron, and tap plus Enter
+    # still fold. Judged on drawn geometry only, at phone and desk alike.
+    check(page.locator("#discuss-answer details > summary > h2").count() == 2,
+          "a fold heading no longer stands inside its summary")
+    fold_geo = page.evaluate("""() => {
+      const details = document.querySelector('#discuss-answer details');
+      const summary = details.querySelector('summary');
+      const head = summary.querySelector('h2');
+      const s = summary.getBoundingClientRect();
+      const h = head.getBoundingClientRect();
+      return {summaryTop: s.top, headTop: h.top, headLeft: h.left,
+              summaryLeft: s.left, summaryHeight: s.height,
+              chevron: getComputedStyle(summary, '::before').content};
+    }""")
+    check(abs(fold_geo["summaryTop"] - fold_geo["headTop"]) <= 12,
+          f"the marker and heading stack on separate lines: {fold_geo}")
+    check(fold_geo["headLeft"] > fold_geo["summaryLeft"] + 8,
+          f"the heading does not start beside a marker column: {fold_geo}")
+    check(fold_geo["summaryHeight"] >= 44,
+          f"the fold row is under 44px tall: {fold_geo}")
+    check("▸" in fold_geo["chevron"], f"the closed fold shows no chevron: {fold_geo}")
+    wrap_geo = page.evaluate("""() => {
+      const head = document.querySelectorAll('#discuss-answer details > summary > h2')[1];
+      const before = head.textContent;
+      head.textContent = 'Review of the overnight migration and everything that '
+        + 'still needs a second careful look before any of it ships to anyone';
+      const summary = head.closest('summary');
+      const range = document.createRange();
+      range.selectNodeContents(head);
+      const lines = [...range.getClientRects()];
+      const out = {lines: lines.length, firstLeft: lines[0]?.left ?? 0,
+                   secondLeft: lines[1]?.left ?? 0, summaryLeft: summary.getBoundingClientRect().left};
+      head.textContent = before;
+      return out;
+    }""")
+    check(wrap_geo["lines"] >= 2, f"the long heading did not wrap: {wrap_geo}")
+    check(abs(wrap_geo["secondLeft"] - wrap_geo["firstLeft"]) <= 2
+          and wrap_geo["secondLeft"] > wrap_geo["summaryLeft"] + 8,
+          f"the wrapped heading slides under the marker: {wrap_geo}")
+    first_fold = page.locator("#discuss-answer details").first
+    page.locator("#discuss-answer details > summary > h2").first.click()
+    page.wait_for_function(
+        "() => document.querySelector('#discuss-answer details').open", timeout=20_000)
+    page.locator("#discuss-answer details > summary > h2").first.click()
+    page.wait_for_function(
+        "() => !document.querySelector('#discuss-answer details').open", timeout=20_000)
+    page.evaluate("() => document.querySelector('#discuss-answer details > summary').focus()")
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "() => document.querySelector('#discuss-answer details').open", timeout=20_000)
+    page.keyboard.press("Enter")
+    page.wait_for_function(
+        "() => !document.querySelector('#discuss-answer details').open", timeout=20_000)
+    check(not first_fold.evaluate("(d) => d.open"), "the fold did not end closed")
     raw = page.locator("#discuss-answer").text_content() or ""
     check("##" not in raw, f"raw Markdown showed in the answer: {raw!r}")
     status = page.locator("#discuss-status").text_content() or ""
