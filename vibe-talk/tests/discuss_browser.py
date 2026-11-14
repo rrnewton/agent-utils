@@ -19,7 +19,8 @@ read sending exactly the markable ids, a footer link jumping with the panel
 still open (`#1395 discuss-scope-binding`, `#1345` keep-open), the
 summary's opened section surviving close/reopen and a reload but not a
 new Summarize (`#1497 discuss-fold-state-persist`), the summary reading
-aloud through the shared owner — Read, tap-to-read from a block, the lit
+aloud through the shared owner — the bottom toolbar's Read (no top-bar
+Read; `#1531 discuss-top-bar-slim-fixed`), tap-to-read from a block, the lit
 block, and stop on close (`#1501 discuss-read-aloud-parity`, the
 documents-read harness's fake device voice) — and
 the panel overlaying the list without moving #scroll-area on a desk (on a
@@ -287,6 +288,19 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     else:
         page.click("#discuss-open")
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    # `#1531 discuss-top-bar-slim-fixed`: no Read in the top bar; its slim
+    # fixed bar carries "Discuss agent" beside the layout/close buttons.
+    check(page.locator("#discuss-read").count() == 0, "the top bar still carries a Read button")
+    title_text = page.locator(".discuss-title").text_content() or ""
+    check(title_text == "Discuss agent", f"the top bar title says {title_text!r}")
+    close_box0 = page.locator("#discuss-close").bounding_box()
+    title_box0 = page.locator(".discuss-title").bounding_box()
+    check(close_box0 is not None and title_box0 is not None
+          and title_box0["height"] <= close_box0["height"] + 1,
+          f"the title is taller than its buttons: title={title_box0} close={close_box0}")
+    if width < 900:
+        check(close_box0 is not None and close_box0["height"] >= 44 and close_box0["width"] >= 44,
+              f"the phone top-bar buttons are under 44px: {close_box0}")
     # Opening asks nothing: the bound is offered first, and only its press posts.
     page.wait_for_function(
         "() => document.getElementById('discuss-summarize').textContent === 'Summarize'"
@@ -460,7 +474,9 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         page.wait_for_function(
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
             timeout=20_000)
-    page.click("#discuss-read")
+    # `#1531`: the bottom toolbar's Read starts the summary read now.
+    check(page.locator("#read-aloud").is_visible(), "the toolbar Read is not offered with Discuss open")
+    page.click("#read-aloud")
     wait_read_count("1 of 4")
     page.wait_for_function("() => window.deviceSpeech.length >= 1", timeout=20_000)
     said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
@@ -539,7 +555,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         page.wait_for_function(
             "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'true'",
             timeout=20_000)
-    page.click("#discuss-read")
+    page.click("#read-aloud")  # `#1531`: the toolbar Read, not a top-bar button
     wait_read_count("1 of 4")
     check(len(cloud_prepares) > 0 and "discuss%3A" in cloud_prepares[-1] and "%7C" in cloud_prepares[-1],
           f"the cloud read prepared {cloud_prepares}, not the Discuss key")
@@ -553,7 +569,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
         timeout=20_000)
-    page.click("#discuss-read")
+    page.click("#read-aloud")  # `#1531`: the toolbar Read, not a top-bar button
     wait_read_count("1 of 4")
     check(len(cloud_prepares) == 2 and urllib.parse.unquote(cloud_prepares[0].split("/documents/")[1].split("/speech")[0])
           == urllib.parse.unquote(cloud_prepares[1].split("/documents/")[1].split("/speech")[0]),
@@ -786,6 +802,30 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     page.click("#discuss-links .discuss-link >> nth=0")
     # The jump keeps the panel open (it overlays the list it jumped).
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+
+    # `#1531`: the top bar stays fixed while the pane's content scrolls.
+    page.evaluate("""() => {
+      const panel = document.getElementById('discuss-panel');
+      const spacer = document.createElement('div');
+      spacer.id = 'discuss-test-spacer';
+      spacer.style.height = '1600px';
+      panel.appendChild(spacer);
+      panel.scrollTop = 800;
+    }""")
+    page.wait_for_function(
+        """() => {
+          const panel = document.getElementById('discuss-panel');
+          const head = document.querySelector('.discuss-head');
+          const close = document.getElementById('discuss-close');
+          if (!panel || !head || !close) return false;
+          const panelRect = panel.getBoundingClientRect();
+          const headRect = head.getBoundingClientRect();
+          const closeRect = close.getBoundingClientRect();
+          return panel.scrollTop >= 100
+            && Math.abs(headRect.top - panelRect.top) <= 2
+            && closeRect.top >= panelRect.top && closeRect.bottom <= headRect.bottom + 1;
+        }""", timeout=20_000)
+    page.evaluate("() => document.getElementById('discuss-test-spacer')?.remove()")
     page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
 

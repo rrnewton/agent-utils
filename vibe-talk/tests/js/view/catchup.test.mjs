@@ -105,7 +105,10 @@ const IDS = [
   "discuss-followup", "discuss-send",
   "discuss-actions", "discuss-resize",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
-  "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours", "discuss-read",
+  "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours",
+  // `#1531 discuss-top-bar-slim-fixed`: no #discuss-read in the top bar; the
+  // bottom toolbar's #read-aloud (with #read-steer as its standing strip).
+  "read-aloud", "read-steer",
 ];
 
 /** Fire a non-click listener with a plain event carrying `props`. */
@@ -155,6 +158,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["discuss-panel"].hidden = true;
   els["discuss-footer"].hidden = true;
   els["discuss-retry"].hidden = true;
+  els["read-steer"].hidden = true;
   const calls = { posts: [], previews: [], records: [], followups: [], updates: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [], bound: [], history: [] };
   // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
   const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [] };
@@ -1411,8 +1415,9 @@ test("catchup read: Read hands the owner all blocks under the record key; tap, h
   };
   try {
     const els = {};
-    for (const id of IDS) els[id] = foldEl(id.endsWith("open") || id.endsWith("close") || id.includes("mark") || id === "discuss-read" ? "button" : "div");
+    for (const id of IDS) els[id] = foldEl(id.endsWith("open") || id.endsWith("close") || id.includes("mark") || id === "read-aloud" ? "button" : "div");
     els["discuss-panel"].hidden = true;
+    els["read-steer"].hidden = true;
     const reads = [];
     const stops = [];
     const panel = createDiscussPanel({
@@ -1451,7 +1456,9 @@ test("catchup read: Read hands the owner all blocks under the record key; tap, h
     await flush();
     await flush();
     // Read: ONE owner call, the record key, ALL blocks (folded sections read whole).
-    click(els["discuss-read"]);
+    // `#1531`: the toolbar's Read, not a top-bar button, starts it now.
+    assert.equal(els["discuss-read"], undefined, "the top bar still carries a Read button");
+    click(els["read-aloud"]);
     assert.equal(reads.length, 1, "Read did not hand the summary to the owner once");
     assert.equal(reads[0].doc.key, "discuss:chan-1||4242", "the read key is not the saved record identity");
     assert.deepEqual([...reads[0].doc.texts], ["Alpha", "first words", "Beta", "second words"],
@@ -1459,6 +1466,10 @@ test("catchup read: Read hands the owner all blocks under the record key; tap, h
     assert.deepEqual([...reads[0].doc.kinds], ["heading", "paragraph", "heading", "paragraph"],
       "the read kinds are not the drawn blocks' kinds, aligned with the texts");
     assert.equal(typeof reads[0].doc.onReadingBlock, "function", "the read carries no block report");
+    // A second toolbar Read while this read stands does not restart it (it is its Pause).
+    click(els["read-aloud"]);
+    assert.equal(reads.length, 1, "a second toolbar Read restarted the standing summary read");
+    assert.equal(panel.readSummary(), true, "readSummary did not report the standing summary read");
     // Highlight: the reported block lights, a null report clears it.
     const blocks = [];
     const collect = (el) => {
@@ -1487,7 +1498,7 @@ test("catchup read: Read hands the owner all blocks under the record key; tap, h
     panel.openWith(scope);
     await flush();
     await flush();
-    click(els["discuss-read"]);
+    click(els["read-aloud"]);
     stops.length = 0;
     click(els["discuss-summarize"]);
     await flush();

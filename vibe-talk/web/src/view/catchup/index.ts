@@ -190,6 +190,8 @@ export interface DiscussView {
   setMode(mode: "overlay" | "docked" | "maximized"): void;
   /** `#1388` landing 1. Restate the summary's strike from the read set now. */
   refreshStrikes(): void;
+  /** `#1531 discuss-top-bar-slim-fixed`. Read the summary on screen aloud whole; false with none. */
+  readSummary(): boolean;
 }
 
 /** Make the Discuss view from the page's thunks. Nothing is looked up yet. */
@@ -524,5 +526,6 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     mode: () => panel.mode(),
     setMode: (mode: "overlay" | "docked" | "maximized") => panel.setMode(mode),
     refreshStrikes: () => panel.refreshStrikes(),
+    readSummary: () => panel.readSummary(),
   };
 }

@@ -230,6 +230,13 @@ export interface DiscussPanel {
   setMode(mode: DiscussLayoutMode): void;
   /** `#1388` landing 1. Restate the strike from the read set now (a mark landed elsewhere). */
   refreshStrikes(): void;
+  /**
+   * `#1531 discuss-top-bar-slim-fixed`. Read the summary on screen aloud
+   * whole, through the shared owner (the bottom toolbar's Read path).
+   * True when a summary was handed to the owner (or its read already
+   * stands); false when the panel is closed or has no summary yet.
+   */
+  readSummary(): boolean;
 }
 
 /** Why Discuss cannot work on a deployment with no direct LLM summarizer, said once. */
@@ -572,6 +579,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   let readCreatedMs = 0;
   let readKey: string | null = null;
   let litElement: HTMLElement | null = null;
+  // `#1531`: whether this summary's read stands (started, not yet reported
+  // ended), so the toolbar's Read pauses it instead of restarting it.
+  let summaryReadActive = false;
 
   /** A saved summary's record: its scope, as the server keys it, plus its generation. */
   function recordKeyFor(scope: DiscussScope, createdMs: number): string {
@@ -631,6 +641,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   /** The owner's block report: light the block being read, kept in view. */
   function onReadingBlock(block: number | null, element?: number | null): void {
     if (block === null) {
+      summaryReadActive = false;
       clearReadingLight();
       return;
     }
@@ -654,6 +665,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
 
   /** Stop this summary's own reading, and only its own. */
   function stopOwnReading(): void {
+    summaryReadActive = false;
     if (readKey !== null) deps.stopSpeaking?.(readKey);
     clearReadingLight();
   }
@@ -682,6 +694,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       deps.setStatus?.("Nothing to read yet.");
       return;
     }
+    summaryReadActive = true;
     readKey = discussReadKey(lastScope, readCreatedMs);
     // `#1505`: the drawn blocks' kinds, in the owner's vocabulary, aligned
     // with `texts` so speak index and highlight index are one index.
@@ -698,6 +711,22 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     void Promise.resolve(
       fromBlock === null ? deps.readDocument(doc) : deps.readDocument(doc, { part: 0, block: fromBlock }),
     ).catch(() => undefined);
+  }
+
+  /**
+   * `#1531 discuss-top-bar-slim-fixed`. The bottom toolbar's Read, for the
+   * summary on screen: the top bar's old one-tap whole-summary read, now
+   * on the page's own reader controls (Stop and pace are the shared
+   * owner's, beside it). No summary, a closed panel, this summary already
+   * reading, or another read standing (its strip up) starts nothing.
+   */
+  function readSummary(): boolean {
+    if (!isOpen() || lastScope === null || lastAnswer === null || !deps.readDocument) return false;
+    if (summaryReadActive) return true;
+    const steer = maybe("read-steer");
+    if (steer !== null && !steer.hidden) return false;
+    readAloud();
+    return summaryReadActive;
   }
 
   /** Keep the answer box's open sections for the record they stand in. */
@@ -1429,11 +1458,15 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           if (pending) setPending(false);
           setOpen(false);
         });
-        // `#1501 discuss-read-aloud-parity`. Read, beside Close where a host
-        // carries it: the shared owner reads the summary on screen.
-        const readButton = maybe("discuss-read");
-        if (readButton) {
-          listening.listen(readButton, "click", () => readAloud());
+        // `#1531 discuss-top-bar-slim-fixed`. No Read in the top bar: the
+        // bottom toolbar's Read (`#read-aloud`) reads the summary on
+        // screen whole when Discuss stands open with one; its own
+        // Pause/Stop and pace stay the shared owner's (`#1501`).
+        const toolbarRead = maybe("read-aloud");
+        if (toolbarRead) {
+          listening.listen(toolbarRead, "click", () => {
+            readSummary();
+          });
         }
         // The main composer's keys (`discuss-followup-composer`): the same Enter.
         const composerKeys = createComposerKeys({
@@ -1635,5 +1668,6 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     refreshStrikes() {
       restrike();
     },
+    readSummary,
   };
 }
