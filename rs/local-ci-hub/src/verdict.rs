@@ -29,10 +29,10 @@
 //!   a deployment declares an epoch; inactive while no epoch is set.
 //! - Cell-results verdict and the full-validation completeness gate
 //!   (deployment field names and artifact checks): skipped, looser.
-//!   Schema-10 native evidence is the exception: an absent
-//!   `validation_evidence` field at schema 10 refuses rather than
-//!   accepts, while a present one is accepted unverified, looser on
-//!   the proof itself.
+//!   Schema-10 native evidence is likewise skipped, looser: the
+//!   authority reads it from an external checker over the evidence
+//!   archive, never from a row field, so no in-row presence check can
+//!   stand in for it.
 //! - Base-boundary currency (git containment and lag) beside the base
 //!   fields: skipped, looser; only field presence and shape are checked.
 //! - Canonical typed-completeness beyond the row predicate (per-gate
@@ -565,9 +565,6 @@ pub fn row_qualifies(row: &PyValue, sha: &str, policy: &Policy) -> (bool, String
     if schema > 10 {
         return refuse("schema-unsupported");
     }
-    if schema == 10 && present(row, "validation_evidence").is_none() {
-        return refuse("native-evidence-missing");
-    }
     let Some(green_class) = derive_green_class(row) else {
         return refuse("green-class-refused");
     };
@@ -895,6 +892,15 @@ mod tests {
         let outcome = assess(&[happy()], SHA, &Policy::default());
         assert_eq!(outcome.verdict, Verdict::Qualified);
         assert!(outcome.qualified());
+    }
+
+    #[test]
+    fn schema10_row_qualifies_without_in_row_native_evidence() {
+        // Schema-10 native evidence lives with the authority's external
+        // checker, never in a row field; its absence must not refuse.
+        let row = set(&happy(), "schema_version", int(10));
+        let (ok, reason) = row_qualifies(&row, SHA, &Policy::default());
+        assert!(ok, "reason: {reason}");
     }
 
     #[test]
