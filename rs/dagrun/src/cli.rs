@@ -53,7 +53,9 @@ use crate::memory_feedback::{
     apply_memory_admissions, load_memory_admissions, memory_admission_line, DEFAULT_MARGIN_PCT,
     DEFAULT_MIN_UNCENSORED_SAMPLES,
 };
-pub use dagrun_model::select::{select_steps_by_labels, select_steps_by_tags};
+pub use dagrun_model::select::{
+    apply_passthrough_args, select_steps_by_labels, select_steps_by_tags, ARGS_PLACEHOLDER,
+};
 
 use crate::model::{
     step_classification, step_width_is_resizable, DagConfig, ResourceHint, Step, StepOutcome,
@@ -2553,38 +2555,6 @@ fn parse_tag_list(raw: &str) -> Vec<String> {
 }
 
 // --------------------------------------------------------------------------- --args / --stress
-
-const ARGS_PLACEHOLDER: &str = "{args}";
-
-/// Substitute passthrough arguments only in commands that explicitly opt in with `{args}`.
-fn apply_passthrough_args(cfg: &DagConfig, args: Option<&str>) -> Result<DagConfig, String> {
-    let declared = cfg
-        .steps
-        .iter()
-        .any(|step| step.cmd.contains(ARGS_PLACEHOLDER));
-    if args.is_some() && !declared {
-        return Err(format!(
-            "--args was given but no selected step declares the '{ARGS_PLACEHOLDER}' placeholder \
-             in its cmd. Add {{args}} to the step's cmd where the extra args should go, or scope \
-             the selection (--selected) to a step that accepts them."
-        ));
-    }
-    if !declared {
-        return Ok(cfg.clone());
-    }
-    let replacement = args.unwrap_or("");
-    let mut out = cfg.clone();
-    for step in &mut out.steps {
-        if step.cmd.contains(ARGS_PLACEHOLDER) {
-            step.cmd = step
-                .cmd
-                .replace(ARGS_PLACEHOLDER, replacement)
-                .trim()
-                .to_string();
-        }
-    }
-    Ok(out)
-}
 
 fn stress_suffix(index: i64, count: i64) -> String {
     let width = count.to_string().len();

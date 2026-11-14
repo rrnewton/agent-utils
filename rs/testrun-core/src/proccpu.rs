@@ -1837,6 +1837,67 @@ mod tests {
         true
     }
 
+    // Crate-level part of the scheduler's procfs fallback test:
+    // construction and sampling failures keep their reason as a typed
+    // error here, so the native scheduler can name it instead of
+    // reporting a bare absence.
+    #[test]
+    fn native_constructor_and_sampling_retain_failure_reasons() {
+        if run_isolated_native_case(
+            "proccpu::tests::native_constructor_and_sampling_retain_failure_reasons",
+        ) {
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        // A group leader the reader can register: a child in its own session.
+        let mut command = std::process::Command::new("sleep");
+        command.arg("5");
+        // SAFETY: the closure runs in the child after fork and only calls
+        // setsid before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let reader = ProcessGroupCpu::new(child.id()).unwrap();
+
+        // Starve descriptors only in this isolated test process, after a
+        // reader exists: both a fresh construction and a sample of the
+        // existing reader must now refuse with the reason retained.
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: limit is writable storage of the type getrlimit requires.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: a successful getrlimit initialized the structure.
+        let mut limit = unsafe { limit.assume_init() };
+        limit.rlim_cur = 64;
+        // SAFETY: only this isolated test process lowers its own soft limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        let construction = ProcessGroupCpu::new(child.id())
+            .err()
+            .expect("construction must refuse under descriptor starvation");
+        assert!(
+            construction.to_string().contains("descriptor reserve"),
+            "{construction}"
+        );
+        let sampling = reader
+            .seconds()
+            .expect_err("sampling must refuse under descriptor starvation");
+        assert!(
+            sampling.to_string().contains("descriptor reserve"),
+            "{sampling}"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn native_public_compatibility_and_unusual_comm() {
         if run_isolated_native_case("proccpu::tests::native_public_compatibility_and_unusual_comm")

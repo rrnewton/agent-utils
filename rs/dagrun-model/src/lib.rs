@@ -21,4 +21,6 @@ pub use model::{
 pub use ascii::to_ascii_groups;
 pub use check::steps_violating_run_timeout;
 pub use clock::monotonic_now_ns;
-pub use select::{select_steps_by_labels, select_steps_by_tags};
+pub use select::{
+    apply_passthrough_args, select_steps_by_labels, select_steps_by_tags, ARGS_PLACEHOLDER,
+};

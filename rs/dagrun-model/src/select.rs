@@ -103,6 +103,39 @@ pub fn select_steps_by_tags(
     Ok(new_cfg)
 }
 
+/// The placeholder a step's `cmd` carries to opt into passthrough arguments.
+pub const ARGS_PLACEHOLDER: &str = "{args}";
+
+/// Substitute passthrough arguments only in commands that explicitly opt in with `{args}`.
+pub fn apply_passthrough_args(cfg: &DagConfig, args: Option<&str>) -> Result<DagConfig, String> {
+    let declared = cfg
+        .steps
+        .iter()
+        .any(|step| step.cmd.contains(ARGS_PLACEHOLDER));
+    if args.is_some() && !declared {
+        return Err(format!(
+            "--args was given but no selected step declares the '{ARGS_PLACEHOLDER}' placeholder \
+             in its cmd. Add {{args}} to the step's cmd where the extra args should go, or scope \
+             the selection (--selected) to a step that accepts them."
+        ));
+    }
+    if !declared {
+        return Ok(cfg.clone());
+    }
+    let replacement = args.unwrap_or("");
+    let mut out = cfg.clone();
+    for step in &mut out.steps {
+        if step.cmd.contains(ARGS_PLACEHOLDER) {
+            step.cmd = step
+                .cmd
+                .replace(ARGS_PLACEHOLDER, replacement)
+                .trim()
+                .to_string();
+        }
+    }
+    Ok(out)
+}
+
 /// Return every step carrying any requested label and its dependency ancestry.
 ///
 /// An empty label list selects no steps, preserving the original public-library behavior. The CLI

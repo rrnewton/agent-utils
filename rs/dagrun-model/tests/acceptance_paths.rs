@@ -14,8 +14,8 @@ use dagrun_model::model::{
     Step, StepClass, StructuredTestResultsManifest,
 };
 use dagrun_model::{
-    monotonic_now_ns, select_steps_by_labels, select_steps_by_tags, steps_violating_run_timeout,
-    to_ascii_groups,
+    apply_passthrough_args, monotonic_now_ns, select_steps_by_labels, select_steps_by_tags,
+    steps_violating_run_timeout, to_ascii_groups, ARGS_PLACEHOLDER,
 };
 use testrun_core::proccpu::ProcessGroupCpu;
 use testrun_core::{
@@ -65,11 +65,13 @@ fn every_acceptance_path_resolves() {
     let _ = StructuredTestResultsManifest::diagnostic("owner");
     let _ = StructuredTestResultsManifest::skipped("owner");
     // Pure helpers.
+    let _ = ARGS_PLACEHOLDER;
     let _ = (
         result_manifest_owner,
         command_with_inner_jobs,
         env_with_inner_jobs,
         resolved_wall_timeout,
+        apply_passthrough_args,
         select_steps_by_labels,
         select_steps_by_tags,
         steps_violating_run_timeout,
