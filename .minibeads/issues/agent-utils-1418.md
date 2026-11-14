@@ -1,6 +1,6 @@
 ---
 title: 'team-topology-checkins: lead and subordinate teams check in every 6 hours, probe each other, and kick a downed peer'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
@@ -41,6 +41,8 @@ Landed on main in 3e646336 (`agent-teams: add topology fragments, checker and wa
 
 Remains:
 
-- The real `PeerIo` adapter (agent-teams check-in send, remote read of the frozen `agentctl-team-driver/v1` state, `agentctl team kick`, lead/owner notify and #1417 escalation), waiting on #1414's driver landing.
-- A CLI surface for the checker if operators need one; today it is the `agent_teams::topology` library API only.
-- Live enablement: each team lands its own fragment from its own harness repo once the adapter lands.
+- Live enablement: each team lands its own fragment from its own harness repo; live `team kick` against a real registry waits for the agreed drill window and the 05:30 ET turnover.
+
+## Resolution
+
+Closed 2026-11-12. The checker CLI landed in 59ed9126 (`agent-teams topology check`), and the real `PeerIo` adapter landed in 1479886f on the landed driver adcffec1 (#1416/#1417): `parse_driver_state` (frozen `agentctl-team-driver/v1`, incident treated as an opaque string, unknown fields ignored), frozen `team kick` and check-in argv builders, a real `ProcessRunner` (non-zero exit, including the host-namespace refusal, becomes an error carrying its reason), and per-target read-state argv templates from config. Topology tests 15/15 in the final gate (`validate: OK`). No live registry was kicked; enablement is per-team fragment landing plus the drill window.
