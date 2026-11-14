@@ -156,12 +156,88 @@ pub(crate) fn relay_screen_state(kind: &str, herdr_state: &str, screen: &str) ->
         .to_owned()
 }
 
+/// Classification of one `/proc/PID/stat` record under the #1495 rule,
+/// reused for every procfs reader in this module (#1506
+/// rust-client-proc-readers-under-load): a record that cannot be opened
+/// (ENOENT/ESRCH), reads back empty, or vanishes on the re-read a torn
+/// record gets is a process that exited; only a record that stays readable
+/// and unparseable is malformed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProcStatParent {
+    /// The process exited before or during the read.
+    Gone,
+    /// The record parsed; the value is the parent pid.
+    Parent(u64),
+    /// The record stayed readable but did not parse.
+    Malformed,
+}
+
+/// One bounded read of a stat record.
+#[derive(Debug)]
+enum StatRead {
+    /// Unopenable (ENOENT/ESRCH) or empty: the process exited.
+    Gone,
+    /// The record bytes.
+    Bytes(Vec<u8>),
+    /// Readable but out of bounds: stable malformed evidence.
+    Malformed,
+}
+
+fn read_stat_record(path: &Path) -> StatRead {
+    match fs::read(path) {
+        Ok(value) if value.is_empty() => StatRead::Gone,
+        Ok(value) if value.len() > PROC_STAT_BYTES => StatRead::Malformed,
+        Ok(value) => StatRead::Bytes(value),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            StatRead::Gone
+        }
+        Err(_) => StatRead::Malformed,
+    }
+}
+
+/// Classify the stat record read by `read` for `pid`, re-reading once when
+/// the first record does not parse: a re-read that is gone is `Gone`, a
+/// re-read that parses is its parent, anything else is `Malformed`.
+fn proc_stat_parent_with(pid: u64, read: &mut dyn FnMut() -> StatRead) -> ProcStatParent {
+    let value = match read() {
+        StatRead::Gone => return ProcStatParent::Gone,
+        StatRead::Malformed => return ProcStatParent::Malformed,
+        StatRead::Bytes(value) => value,
+    };
+    if let Ok(stat) = parse_process_stat(&value, pid) {
+        return ProcStatParent::Parent(stat.parent_pid);
+    }
+    match read() {
+        StatRead::Gone => ProcStatParent::Gone,
+        StatRead::Malformed => ProcStatParent::Malformed,
+        StatRead::Bytes(value) => match parse_process_stat(&value, pid) {
+            Ok(stat) => ProcStatParent::Parent(stat.parent_pid),
+            Err(_) => ProcStatParent::Malformed,
+        },
+    }
+}
+
+/// Classify `/proc/<pid>/stat` under `proc_root`.
+fn proc_stat_parent(proc_root: &Path, pid: u64) -> ProcStatParent {
+    let path = proc_root.join(pid.to_string()).join("stat");
+    proc_stat_parent_with(pid, &mut || read_stat_record(&path))
+}
+
 /// Parent -> children for every visible process, from world-readable stat files. A root-owned
 /// process's own task directory is not readable by the user, so descendants of sudo are found
-/// through their parent links instead.
+/// through their parent links instead. A record that vanished mid-scan is
+/// skipped: its process is exiting, and callers re-verify aliveness of the
+/// pids they act on.
 fn process_children_map() -> HashMap<u64, Vec<u64>> {
+    process_children_map_in(Path::new("/proc"))
+}
+
+fn process_children_map_in(proc_root: &Path) -> HashMap<u64, Vec<u64>> {
     let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
+    let Ok(entries) = fs::read_dir(proc_root) else {
         return children;
     };
     for entry in entries.flatten() {
@@ -172,12 +248,8 @@ fn process_children_map() -> HashMap<u64, Vec<u64>> {
         else {
             continue;
         };
-        let Ok(value) = bounded_file(&entry.path().join("stat"), PROC_STAT_BYTES, "process stat")
-        else {
-            continue;
-        };
-        if let Ok(stat) = parse_process_stat(&value, pid) {
-            children.entry(stat.parent_pid).or_default().push(pid);
+        if let ProcStatParent::Parent(parent) = proc_stat_parent(proc_root, pid) {
+            children.entry(parent).or_default().push(pid);
         }
     }
     children
@@ -215,19 +287,6 @@ fn shell_alone_in_foreground(state: &PaneProcessState) -> bool {
             .is_some_and(|name| SHELLS.contains(&name))
     });
     only_shell && is_shell
-}
-
-fn bounded_file(path: &Path, limit: usize, label: &str) -> Result<Vec<u8>> {
-    let value = fs::read(path).map_err(|error| {
-        AdapterError::unavailable(format!("cannot read {label} {}: {error}", path.display()))
-    })?;
-    if value.is_empty() || value.len() > limit {
-        return Err(AdapterError::unavailable(format!(
-            "{label} {} has an invalid length",
-            path.display()
-        )));
-    }
-    Ok(value)
 }
 
 // Process identity, liveness and `/proc/PID/stat` parsing live in the agent-queue crate, shared
@@ -403,30 +462,16 @@ pub(crate) fn supported_shell_process(pid: u64) -> Result<Option<LiveCustomProce
     Ok(supported_shell_name(&observed.executable_path).then_some(observed))
 }
 
-fn process_task_ids(pid: u64) -> Result<Vec<String>> {
-    let root = PathBuf::from(format!("/proc/{pid}/task"));
-    let mut tasks = fs::read_dir(&root)
-        .map_err(|error| {
-            AdapterError::unavailable(format!(
-                "cannot enumerate shell tasks for process {pid}: {error}"
-            ))
-        })?
-        .map(|entry| {
-            entry
-                .map_err(|error| {
-                    AdapterError::unavailable(format!(
-                        "cannot inspect shell task for process {pid}: {error}"
-                    ))
-                })
-                .and_then(|entry| {
-                    entry.file_name().into_string().map_err(|_| {
-                        AdapterError::unavailable(format!(
-                            "shell task name for process {pid} is not UTF-8"
-                        ))
-                    })
-                })
-        })
-        .collect::<Result<Vec<_>>>()?;
+/// The sorted task ids of `pid` under `proc_root`, or `None` when the
+/// process is gone or its task set cannot be proven: an idle-shell proof
+/// treats either as "not proven idle", never as an error and never as idle
+/// (#1506 rust-client-proc-readers-under-load).
+fn process_task_ids_in(proc_root: &Path, pid: u64) -> Option<Vec<String>> {
+    let root = proc_root.join(pid.to_string()).join("task");
+    let mut tasks = Vec::new();
+    for entry in fs::read_dir(&root).ok()? {
+        tasks.push(entry.ok()?.file_name().into_string().ok()?);
+    }
     tasks.sort();
     if tasks.is_empty()
         || tasks.len() > MAX_SHELL_TASKS
@@ -436,18 +481,24 @@ fn process_task_ids(pid: u64) -> Result<Vec<String>> {
                 || task.parse::<u64>().ok().is_none_or(|value| value == 0)
         })
     {
-        return Err(AdapterError::unavailable(format!(
-            "shell task set for process {pid} is invalid"
-        )));
+        return None;
     }
-    Ok(tasks)
+    Some(tasks)
 }
 
-pub(crate) fn process_has_no_descendants(pid: u64) -> Result<bool> {
-    let before = process_task_ids(pid)?;
+/// Whether `pid` provably has no descendants under `proc_root`.
+/// Inconclusive is `false` (fail safe): a record that stays readable but
+/// unparseable may be a live descendant mis-read, so it refuses the
+/// proof instead of erroring it, while a vanished or empty record is a
+/// process that exited (#1506, reusing the #1495 rule).
+fn process_has_no_descendants_in(proc_root: &Path, pid: u64) -> bool {
+    let Some(before) = process_task_ids_in(proc_root, pid) else {
+        return false;
+    };
+    let task_root = proc_root.join(pid.to_string()).join("task");
     let mut children_supported = true;
     for task in &before {
-        let path = PathBuf::from(format!("/proc/{pid}/task/{task}/children"));
+        let path = task_root.join(task).join("children");
         let mut file = match File::open(&path) {
             Ok(file) => file,
             Err(error)
@@ -457,41 +508,35 @@ pub(crate) fn process_has_no_descendants(pid: u64) -> Result<bool> {
                 children_supported = false;
                 break;
             }
-            Err(error) => {
-                return Err(AdapterError::unavailable(format!(
-                    "cannot inspect shell descendants for process {pid}: {error}"
-                )))
-            }
+            Err(_) => return false,
         };
         let mut children = Vec::with_capacity(MAX_CHILDREN_BYTES.saturating_add(1));
-        file.by_ref()
+        if file
+            .by_ref()
             .take((MAX_CHILDREN_BYTES + 1) as u64)
             .read_to_end(&mut children)
-            .map_err(|error| {
-                AdapterError::unavailable(format!(
-                    "cannot read shell descendants for process {pid}: {error}"
-                ))
-            })?;
-        if children.len() > MAX_CHILDREN_BYTES
-            || !children.iter().all(|byte| byte.is_ascii_whitespace())
+            .is_err()
         {
-            return Ok(false);
+            return false;
+        }
+        if children.len() > MAX_CHILDREN_BYTES
+            || children
+                .split(|byte| byte.is_ascii_whitespace())
+                .any(|token| !token.is_empty())
+        {
+            return false;
         }
     }
     if children_supported {
-        return Ok(process_task_ids(pid)? == before);
+        return process_task_ids_in(proc_root, pid).as_ref() == Some(&before);
     }
 
-    fn proc_parents() -> Result<HashMap<u64, u64>> {
-        let entries = fs::read_dir("/proc").map_err(|error| {
-            AdapterError::unavailable(format!("cannot enumerate process table: {error}"))
-        })?;
+    fn proc_parents(proc_root: &Path) -> Option<HashMap<u64, u64>> {
+        let entries = fs::read_dir(proc_root).ok()?;
         let mut parents = HashMap::new();
         let mut numeric_entries = 0_usize;
         for entry in entries {
-            let entry = entry.map_err(|error| {
-                AdapterError::unavailable(format!("cannot inspect process table: {error}"))
-            })?;
+            let entry = entry.ok()?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -500,38 +545,26 @@ pub(crate) fn process_has_no_descendants(pid: u64) -> Result<bool> {
             }
             numeric_entries += 1;
             if numeric_entries > MAX_PROC_ENTRIES {
-                return Err(AdapterError::unavailable(
-                    "process table exceeds descendant-proof bound",
-                ));
+                return None;
             }
-            let process = name
-                .parse::<u64>()
-                .map_err(|_| AdapterError::unavailable("process table contains an invalid pid"))?;
-            let raw = match fs::read(entry.path().join("stat")) {
-                Ok(raw) => raw,
-                Err(error)
-                    if error.kind() == io::ErrorKind::NotFound
-                        || error.raw_os_error() == Some(libc::ESRCH) =>
-                {
-                    continue
+            let process = name.parse::<u64>().ok()?;
+            // A vanished or empty record is a process that exited (#1495
+            // classification): it is no live descendant at this scan's
+            // end, and the two-complete-scan rule below re-checks. A
+            // record that stays readable but unparseable may be a live
+            // descendant mis-read, so it makes this scan inconclusive,
+            // never "no descendants" (#1506).
+            match proc_stat_parent(proc_root, process) {
+                ProcStatParent::Parent(parent) => {
+                    if process > 0 {
+                        parents.insert(process, parent);
+                    }
                 }
-                Err(error) => {
-                    return Err(AdapterError::unavailable(format!(
-                        "cannot inspect process {process} parent: {error}"
-                    )))
-                }
-            };
-            if raw.len() > PROC_STAT_BYTES {
-                return Err(AdapterError::unavailable(format!(
-                    "process {process} stat is invalid"
-                )));
-            }
-            let parent = parse_process_stat(&raw, process)?.parent_pid;
-            if process > 0 {
-                parents.insert(process, parent);
+                ProcStatParent::Gone => continue,
+                ProcStatParent::Malformed => return None,
             }
         }
-        Ok(parents)
+        Some(parents)
     }
 
     fn has_descendant(pid: u64, parents: &HashMap<u64, u64>) -> bool {
@@ -549,11 +582,26 @@ pub(crate) fn process_has_no_descendants(pid: u64) -> Result<bool> {
         !seen.is_empty()
     }
 
-    let first = proc_parents()?;
-    let second = proc_parents()?;
-    Ok(!has_descendant(pid, &first)
-        && !has_descendant(pid, &second)
-        && process_task_ids(pid)? == before)
+    // Rely only on complete scans (every live record classified): a
+    // scan that met a malformed record is discarded, and two consecutive
+    // complete scans with no descendant, under a stable task set, prove
+    // the shell idle. A descendant found on any complete scan settles it
+    // at once; never completing two scans is inconclusive.
+    let mut clean_scans = 0_usize;
+    let mut attempts = 0_usize;
+    while clean_scans < 2 && attempts < 16 {
+        attempts += 1;
+        match proc_parents(proc_root) {
+            Some(parents) if has_descendant(pid, &parents) => return false,
+            Some(_) => clean_scans += 1,
+            None => clean_scans = 0,
+        }
+    }
+    clean_scans >= 2 && process_task_ids_in(proc_root, pid).as_ref() == Some(&before)
+}
+
+pub(crate) fn process_has_no_descendants(pid: u64) -> Result<bool> {
+    Ok(process_has_no_descendants_in(Path::new("/proc"), pid))
 }
 
 fn safe_executable_metadata(metadata: &fs::Metadata) -> bool {
@@ -5036,13 +5084,24 @@ mod tests {
             .stdin
             .as_mut()
             .unwrap()
-            .write_all(b"/usr/bin/sleep 30 & wait\n")
+            .write_all(b"/usr/bin/sleep 300 & wait\n")
             .unwrap();
         shell.0.stdin.as_mut().unwrap().flush().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && process_has_no_descendants(u64::from(pid)).unwrap() {
+        // Wait on the condition, not a wall-clock deadline (owner rule
+        // 346): poll until the descendant is observed, with a generous
+        // bound, and fail with the last observed state as diagnostics.
+        let wait_start = Instant::now();
+        let mut last_no_descendants = process_has_no_descendants(u64::from(pid)).unwrap();
+        while last_no_descendants && wait_start.elapsed() < Duration::from_secs(120) {
             thread::sleep(Duration::from_millis(10));
+            last_no_descendants = process_has_no_descendants(u64::from(pid)).unwrap();
         }
+        assert!(
+            !last_no_descendants,
+            "background sleep never observed as a descendant of shell {pid}; \
+             shell alive: {:?}, last no-descendants reading: {last_no_descendants}",
+            shell.0.try_wait().unwrap()
+        );
         assert!(shell.0.try_wait().unwrap().is_none());
         assert!(!process_has_no_descendants(u64::from(pid)).unwrap());
         let response = serde_json::json!({
@@ -5066,6 +5125,186 @@ mod tests {
             .client()
             .pane_is_same_idle_shell("pane", &identity)
             .unwrap());
+    }
+
+    /// A valid stat record for `pid` with parent `ppid` in a fixture root.
+    #[cfg(target_os = "linux")]
+    fn fixture_stat(pid: u64, ppid: u64) -> Vec<u8> {
+        format!("{pid} (bash) S {ppid} {pid} {}100 0", "0 ".repeat(16)).into_bytes()
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ProcFixture {
+        root: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ProcFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "agentctl-proc-fixture-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self { root }
+        }
+
+        fn write_stat(&self, pid: u64, record: &[u8]) {
+            let dir = self.root.join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("stat"), record).unwrap();
+        }
+
+        /// A shell `pid` with one task `pid` whose children file holds
+        /// `children` (`None` leaves the file absent, as when a task's
+        /// children listing vanished mid-scan).
+        fn write_shell(&self, pid: u64, children: Option<&str>) {
+            let task = self
+                .root
+                .join(pid.to_string())
+                .join("task")
+                .join(pid.to_string());
+            fs::create_dir_all(&task).unwrap();
+            if let Some(children) = children {
+                fs::write(task.join("children"), children).unwrap();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ProcFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_parent_classifies_each_vanishing_shape() {
+        // Unopenable and empty records are a process that exited.
+        assert_eq!(
+            proc_stat_parent_with(4242, &mut || StatRead::Gone),
+            ProcStatParent::Gone
+        );
+        // A torn record that vanishes on re-read is gone, not malformed.
+        let mut reads =
+            vec![StatRead::Bytes(b"4242 (bash) S 1".to_vec()), StatRead::Gone].into_iter();
+        assert_eq!(
+            proc_stat_parent_with(4242, &mut || reads.next().unwrap()),
+            ProcStatParent::Gone
+        );
+        // A torn record that reads back whole on re-read is its parent.
+        let mut reads = vec![
+            StatRead::Bytes(b"4242 (bash) S 1".to_vec()),
+            StatRead::Bytes(fixture_stat(4242, 99)),
+        ]
+        .into_iter();
+        assert_eq!(
+            proc_stat_parent_with(4242, &mut || reads.next().unwrap()),
+            ProcStatParent::Parent(99)
+        );
+        // A record that stays readable and unparseable still refuses.
+        let mut reads = vec![
+            StatRead::Bytes(b"not a stat record".to_vec()),
+            StatRead::Bytes(b"not a stat record".to_vec()),
+        ]
+        .into_iter();
+        assert_eq!(
+            proc_stat_parent_with(4242, &mut || reads.next().unwrap()),
+            ProcStatParent::Malformed
+        );
+        // A whole record parses at once.
+        assert_eq!(
+            proc_stat_parent_with(4242, &mut || StatRead::Bytes(fixture_stat(4242, 7))),
+            ProcStatParent::Parent(7)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_parent_reads_fixture_roots() {
+        let fixture = ProcFixture::new();
+        // No stat file at all: gone.
+        fs::create_dir_all(fixture.root.join("4242")).unwrap();
+        assert_eq!(proc_stat_parent(&fixture.root, 4242), ProcStatParent::Gone);
+        // Empty stat file: gone.
+        fixture.write_stat(4242, b"");
+        assert_eq!(proc_stat_parent(&fixture.root, 4242), ProcStatParent::Gone);
+        // Truncated stat file: stays readable and unparseable.
+        fixture.write_stat(4242, b"4242 (bash) S 1");
+        assert_eq!(
+            proc_stat_parent(&fixture.root, 4242),
+            ProcStatParent::Malformed
+        );
+        // Whole stat file: its parent.
+        fixture.write_stat(4242, &fixture_stat(4242, 55));
+        assert_eq!(
+            proc_stat_parent(&fixture.root, 4242),
+            ProcStatParent::Parent(55)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_descendants_fixture_children_listing() {
+        let fixture = ProcFixture::new();
+        // A children listing naming a pid proves a descendant.
+        fixture.write_shell(100, Some("101\n"));
+        assert!(!process_has_no_descendants_in(&fixture.root, 100));
+        // A garbage token in the listing is also a descendant (fail safe).
+        fixture.write_shell(100, Some("garbage\n"));
+        assert!(!process_has_no_descendants_in(&fixture.root, 100));
+        // An empty listing with a stable task set proves no descendants.
+        fixture.write_shell(100, Some(""));
+        assert!(process_has_no_descendants_in(&fixture.root, 100));
+        // A shell whose task set is gone is not proven idle.
+        assert!(!process_has_no_descendants_in(&fixture.root, 999));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_descendants_fixture_fallback_scan() {
+        let fixture = ProcFixture::new();
+        // Children listing vanished: the parent-link scan decides.
+        fixture.write_shell(100, None);
+        fixture.write_stat(100, &fixture_stat(100, 1));
+        fixture.write_stat(200, &fixture_stat(200, 300));
+        assert!(process_has_no_descendants_in(&fixture.root, 100));
+        // A process whose parent is the shell is a descendant.
+        fixture.write_stat(101, &fixture_stat(101, 100));
+        assert!(!process_has_no_descendants_in(&fixture.root, 100));
+        fs::remove_file(fixture.root.join("101").join("stat")).unwrap();
+        fs::remove_dir(fixture.root.join("101")).unwrap();
+        // An empty record is a process that exited: it does not block
+        // the proof, and neither does a vanished one (listed, unreadable).
+        fixture.write_stat(201, b"");
+        assert!(process_has_no_descendants_in(&fixture.root, 100));
+        fixture.write_stat(201, &fixture_stat(201, 300));
+        fs::create_dir_all(fixture.root.join("202")).unwrap();
+        assert!(process_has_no_descendants_in(&fixture.root, 100));
+        fs::remove_dir(fixture.root.join("202")).unwrap();
+        // A truncated record that stays readable is inconclusive, not
+        // "no descendants", and so is a stably malformed one.
+        fixture.write_stat(201, b"201 (sleep) S 1");
+        assert!(!process_has_no_descendants_in(&fixture.root, 100));
+        fixture.write_stat(201, b"not a stat record");
+        assert!(!process_has_no_descendants_in(&fixture.root, 100));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn children_map_fixture_skips_vanished_records() {
+        let fixture = ProcFixture::new();
+        fixture.write_stat(100, &fixture_stat(100, 1));
+        fixture.write_stat(101, &fixture_stat(101, 100));
+        fixture.write_stat(102, b"");
+        fixture.write_stat(103, b"not a stat record");
+        fs::create_dir_all(fixture.root.join("104")).unwrap();
+        let map = process_children_map_in(&fixture.root);
+        assert_eq!(map.get(&1), Some(&vec![100]));
+        assert_eq!(map.get(&100), Some(&vec![101]));
+        assert_eq!(map.len(), 2);
     }
 
     #[cfg(target_os = "linux")]

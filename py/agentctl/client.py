@@ -1702,13 +1702,20 @@ class HerdrClient:
         return observed
 
     @staticmethod
-    def _process_has_no_descendants(pid: int) -> bool:
-        """Boundedly prove that no task in this shell currently has a child."""
-        task_root = f"/proc/{pid}/task"
+    def _process_has_no_descendants(pid: int, proc_root: str = "/proc") -> bool:
+        """Boundedly prove that no task in this shell currently has a child.
+
+        Inconclusive is ``False`` (fail safe, #1506): a record that stays
+        readable but unparseable may be a live descendant mis-read, so it
+        refuses the proof, while a vanished or empty record is a process
+        that exited. This matches the Rust edition's
+        ``process_has_no_descendants_in``.
+        """
+        task_root = os.path.join(proc_root, str(pid), "task")
 
         def proc_parents() -> dict[int, int] | None:
             try:
-                entries = tuple(os.listdir("/proc"))
+                entries = tuple(os.listdir(proc_root))
             except OSError:
                 return None
             numeric = tuple(
@@ -1721,12 +1728,17 @@ class HerdrClient:
             for entry in numeric:
                 try:
                     process = int(entry)
-                    with open(f"/proc/{entry}/stat", "rb") as stream:
+                    with open(os.path.join(proc_root, entry, "stat"), "rb") as stream:
                         raw = stream.read(8193)
                 except (FileNotFoundError, ProcessLookupError):
+                    # Vanished mid-scan: a process that exited (#1506,
+                    # reusing the #1495 classification); it is no live
+                    # descendant at this scan's end.
                     continue
                 except (OSError, UnicodeError, ValueError):
                     return None
+                if not raw:
+                    continue
                 parsed = parse_process_stat(raw)
                 if parsed is None or parsed.pid != process or len(raw) > 8192:
                     return None
@@ -1770,17 +1782,28 @@ class HerdrClient:
                     children = stream.read(_MAX_CHILDREN_BYTES + 1)
                 if len(children) > _MAX_CHILDREN_BYTES or children.split():
                     return False
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             children_supported = False
         except (OSError, UnicodeError):
             return False
         if children_supported:
             return task_ids() == before
-        first = proc_parents()
-        second = proc_parents()
-        return (first is not None and second is not None
-                and not has_descendant(first) and not has_descendant(second)
-                and task_ids() == before)
+        # Rely only on complete scans (every live record classified):
+        # a scan that met a malformed record is discarded, and two
+        # consecutive complete scans with no descendant, under a stable
+        # task set, prove the shell idle (#1506).
+        clean_scans = 0
+        attempts = 0
+        while clean_scans < 2 and attempts < 16:
+            attempts += 1
+            parents = proc_parents()
+            if parents is None:
+                clean_scans = 0
+                continue
+            if has_descendant(parents):
+                return False
+            clean_scans += 1
+        return clean_scans >= 2 and task_ids() == before
 
     def _idle_shell_proof(self, info: ProcessInfo) -> PaneShellProof | None:
         if (info.foreground_pgid != info.shell_pid or len(info.foreground) != 1

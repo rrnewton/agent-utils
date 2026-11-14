@@ -1360,6 +1360,54 @@ time.sleep(60)
         unrelated.wait(timeout=2)
 
 
+def _fixture_stat(pid: int, ppid: int) -> bytes:
+    return f"{pid} (bash) S {ppid} {pid} ".encode() + b"0 " * 16 + b"100 0"
+
+
+def _fixture_shell(root: Path, pid: int, children: str | None) -> None:
+    task = root / str(pid) / "task" / str(pid)
+    task.mkdir(parents=True, exist_ok=True)
+    if children is not None:
+        (task / "children").write_text(children)
+
+
+def test_no_descendants_fixture_children_listing(tmp_path: Path) -> None:
+    _fixture_shell(tmp_path, 100, "101\n")
+    assert not HerdrClient._process_has_no_descendants(100, str(tmp_path))
+    _fixture_shell(tmp_path, 100, "garbage\n")
+    assert not HerdrClient._process_has_no_descendants(100, str(tmp_path))
+    _fixture_shell(tmp_path, 100, "")
+    assert HerdrClient._process_has_no_descendants(100, str(tmp_path))
+    assert not HerdrClient._process_has_no_descendants(999, str(tmp_path))
+
+
+def test_no_descendants_fixture_fallback_vanishing_shapes(tmp_path: Path) -> None:
+    _fixture_shell(tmp_path, 100, None)
+    (tmp_path / "100" / "stat").write_bytes(_fixture_stat(100, 1))
+    (tmp_path / "200").mkdir()
+    (tmp_path / "200" / "stat").write_bytes(_fixture_stat(200, 300))
+    assert HerdrClient._process_has_no_descendants(100, str(tmp_path))
+    (tmp_path / "101").mkdir()
+    (tmp_path / "101" / "stat").write_bytes(_fixture_stat(101, 100))
+    assert not HerdrClient._process_has_no_descendants(100, str(tmp_path))
+    (tmp_path / "101" / "stat").unlink()
+    (tmp_path / "101").rmdir()
+    # Empty and vanished records are processes that exited: they do not
+    # block the proof. Truncated and stably malformed records that stay
+    # readable are inconclusive (not idle), never "no descendants" (#1506).
+    (tmp_path / "201").mkdir()
+    (tmp_path / "201" / "stat").write_bytes(b"")
+    assert HerdrClient._process_has_no_descendants(100, str(tmp_path))
+    (tmp_path / "201" / "stat").write_bytes(_fixture_stat(201, 300))
+    (tmp_path / "202").mkdir()
+    assert HerdrClient._process_has_no_descendants(100, str(tmp_path))
+    (tmp_path / "202").rmdir()
+    (tmp_path / "201" / "stat").write_bytes(b"201 (sleep) S 1")
+    assert not HerdrClient._process_has_no_descendants(100, str(tmp_path))
+    (tmp_path / "201" / "stat").write_bytes(b"not a stat record")
+    assert not HerdrClient._process_has_no_descendants(100, str(tmp_path))
+
+
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="Linux pidfd identity required")
 def test_process_identity_maps_pidfd_close_failure_to_unavailable(
     monkeypatch: pytest.MonkeyPatch,
