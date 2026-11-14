@@ -39,7 +39,7 @@
 //! deletion, repository mutation, daemon, or socket surface; operators should
 //! continue to use the parent `wrkslots quickstart` and `wrkslots --userguide`.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod active_state;
 mod adopt_write;
@@ -109,6 +109,7 @@ mod sandbox_exec;
 mod sandbox_state;
 mod schema;
 mod shell_command_state;
+mod stable_identity;
 mod status_state;
 mod storage_state;
 mod supersede_write;

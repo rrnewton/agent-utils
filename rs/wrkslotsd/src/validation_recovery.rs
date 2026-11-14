@@ -275,9 +275,9 @@ pub(crate) fn repository_path(
 }
 
 /// The mount ID of an open directory, from `/proc/self/fdinfo`
-/// (the crate forbids unsafe code, so the name_to_handle_at
-/// file handle itself is not available yet; see
-/// `private_cleanup_identity`).
+/// (the namespace-local half of the directory identity; the
+/// namespace-independent file handle is
+/// `stable_identity::fd_file_handle`).
 fn mount_id_of(path: &Path) -> Result<u64> {
     use std::os::unix::io::AsRawFd as _;
     let file = std::fs::File::open(path)
@@ -322,15 +322,36 @@ pub(crate) fn open_directory_identity(path: &Path, label: &str) -> Result<(u64, 
     Ok((metadata.dev(), metadata.ino(), mount_id_of(path)?))
 }
 
-/// Python `_fd_private_cleanup_identity`:
-/// (dev, ino, handle type, handle hex). The handle needs
-/// name_to_handle_at, which this crate's `forbid(unsafe_code)`
-/// policy bars; until that policy gains one audited wrapper,
-/// the stable identity refuses explicitly rather than
-/// approximating the handle with a mount ID.
+/// Python `_private_cleanup_path_identity`'s opening step plus
+/// `_fd_private_cleanup_identity`: open the directory without
+/// following links, and read its stable identity from the open
+/// descriptor: (dev, ino, handle type, handle hex).
 pub(crate) fn private_cleanup_identity(path: &Path) -> Result<(u64, u64, i64, String)> {
-    let _ = path;
-    Err("stable directory identity stays with the Python edition for now".to_string())
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "cannot safely open private cleanup path {}: {error}",
+                path.display()
+            )
+        })?;
+    let label = path.to_string_lossy().into_owned();
+    let before = rustix::fs::fstat(&file)
+        .map_err(|error| format!("cannot inspect private cleanup path {label}: {error}"))?;
+    let (handle_type, hex) = crate::stable_identity::fd_file_handle(file.as_raw_fd(), &label)?;
+    let after = rustix::fs::fstat(&file)
+        .map_err(|error| format!("cannot inspect private cleanup path {label}: {error}"))?;
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
+        return Err(format!(
+            "directory identity changed while inspecting {label}"
+        ));
+    }
+    Ok((before.st_dev, before.st_ino, i64::from(handle_type), hex))
 }
 
 /// Python `_assert_cleanup_fence_root_trusted`.
