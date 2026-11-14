@@ -2663,7 +2663,10 @@ steps:
       est_duration_s: 40
       classification: cpu-bound
       preferred_inner_jobs: 8
-      rss_baseline_bytes: 1073741824
+      # `#1388` (landing 2 added the catchup Update's tests and page suites):
+      # measured peak 4621602816 bytes (4.31 GiB) for this step on the
+      # validation host, 2026-11-14; sized to peak plus headroom.
+      rss_baseline_bytes: 2684354560
 
   # The app page's suite, straight through node: tests/js/voice_page.test.mjs over web/voice.js, as
   # four interleaved slices (`VOICE_PAGE_SHARD`, `test-time-vibe-talk`) that run side by side.
