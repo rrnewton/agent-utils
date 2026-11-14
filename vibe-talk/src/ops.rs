@@ -7017,7 +7017,7 @@ pub async fn recap(
         }
         Ok::<_, OpError>((held, truncated))
     };
-    let (mut held, truncated) = match flat.await {
+    let (mut held, mut truncated) = match flat.await {
         Ok(done) => done,
         Err(OpError::Chat(error))
             if matches!(error.cause(), crate::chat::ChatError::Refused(_)) =>
@@ -7066,6 +7066,91 @@ pub async fn recap(
         }
         Err(error) => return Err(error),
     };
+    // `#1528 vibe-talk-recap-drops-thread-replies`: the flat walk only surfaces a thread's
+    // replies when its root's own page is visited (and a backend may cap how many threads
+    // one flat page reads), so a thread rooted before the window can silently lose its
+    // in-window replies. Sweep the threads view for threads active in the window and read
+    // each one's timeline, merging whatever the flat walk missed. A backend that refuses
+    // thread reads has no replies to lose and keeps the flat answer alone.
+    {
+        use crate::threads::{TimelineRequest as SweepRequest, TimelineView as SweepView};
+        let mut active: Vec<String> = Vec::new();
+        let mut before: Option<String> = None;
+        for _ in 0..MAX_RECAP_PAGES {
+            let request = SweepRequest {
+                view: SweepView::Threads,
+                thread_id: None,
+                before: before.clone(),
+                after: None,
+                limit: MAX_PAGE,
+            };
+            let (_, page) = match timeline(state, caller, channel_id, &request).await {
+                Ok(done) => done,
+                Err(OpError::Chat(error))
+                    if matches!(error.cause(), crate::chat::ChatError::Refused(_)) =>
+                {
+                    active.clear();
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            let mut oldest_activity: Option<i64> = None;
+            for summary in &page.threads {
+                if let Some(ms) = crate::clock::instant_ms(&summary.updated_at) {
+                    oldest_activity = Some(oldest_activity.map_or(ms, |held: i64| held.min(ms)));
+                    if ms >= since_ms && !active.contains(&summary.id) {
+                        active.push(summary.id.clone());
+                    }
+                }
+            }
+            if !page.has_more || oldest_activity.is_some_and(|ms| ms < since_ms) {
+                break;
+            }
+            match page.next_before {
+                Some(next) => before = Some(next),
+                None => break,
+            }
+        }
+        for thread_id in &active {
+            let mut before: Option<String> = None;
+            for _ in 0..MAX_RECAP_PAGES {
+                let request = SweepRequest {
+                    view: SweepView::Thread,
+                    thread_id: Some(thread_id.clone()),
+                    before: before.clone(),
+                    after: None,
+                    limit: MAX_PAGE,
+                };
+                let (_, page) = match timeline(state, caller, channel_id, &request).await {
+                    Ok(done) => done,
+                    Err(OpError::Chat(error))
+                        if matches!(error.cause(), crate::chat::ChatError::Refused(_)) =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let reached_start = page
+                    .messages
+                    .iter()
+                    .filter_map(Message::created_ms)
+                    .min()
+                    .is_some_and(|oldest| oldest < since_ms);
+                held.extend(page.messages.into_iter().filter(in_window));
+                if held.len() >= MAX_RECAP_MESSAGES {
+                    truncated = true;
+                    break;
+                }
+                if !page.has_more || reached_start {
+                    break;
+                }
+                match page.next_before {
+                    Some(next) => before = Some(next),
+                    None => break,
+                }
+            }
+        }
+    }
     held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
     held.dedup_by(|next, kept| next.id == kept.id);
     let noise = held.iter().filter(|message| message.noise).count();

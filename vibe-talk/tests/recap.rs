@@ -300,6 +300,150 @@ async fn recap_tags_done_per_message_and_groups_by_thread() {
     assert_eq!(groups[3]["messages"][0]["done"], json!(true));
 }
 
+/// Like Slack: Flat carries only main-timeline messages (roots and standalones); replies
+/// live only in the thread timelines. `#1528 vibe-talk-recap-drops-thread-replies`.
+#[derive(Default)]
+struct MainOnlyBackend {
+    messages: Mutex<Vec<Message>>,
+}
+
+#[async_trait::async_trait]
+impl ChatClient for MainOnlyBackend {
+    fn provider_name(&self) -> &str {
+        "Main Only Test"
+    }
+    fn supports_threading(&self) -> bool {
+        true
+    }
+    async fn identity(&self) -> Result<ChatIdentity, ChatError> {
+        Ok(ChatIdentity {
+            id: "7".to_owned(),
+            username: "Reader".to_owned(),
+            workspace: None,
+        })
+    }
+    async fn fetch_page(
+        &self,
+        _channel: &ChannelId,
+        _limit: u16,
+        _before: Option<&MessageId>,
+        _after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        Ok(vec![])
+    }
+    async fn fetch_timeline(
+        &self,
+        _channel: &ChannelId,
+        request: &TimelineRequest,
+    ) -> Result<TimelinePage, ChatError> {
+        let all = self.messages.lock().expect("messages").clone();
+        let limit = usize::from(request.limit.max(1));
+        let paginate = |source: Vec<Message>| {
+            let end = match &request.before {
+                Some(cursor) => source
+                    .iter()
+                    .position(|held| held.id.as_str() == cursor)
+                    .unwrap_or(source.len()),
+                None => source.len(),
+            };
+            let start = end.saturating_sub(limit);
+            let page = source[start..end].to_vec();
+            TimelinePage {
+                messages: page.clone(),
+                has_threads: true,
+                has_more: start > 0,
+                next_before: (start > 0)
+                    .then(|| page.first().map(|held| held.id.as_str().to_owned()))
+                    .flatten(),
+                ..TimelinePage::default()
+            }
+        };
+        match request.view {
+            TimelineView::Flat => Ok(paginate(
+                all.into_iter()
+                    .filter(|held| held.thread.as_ref().is_none_or(|thread| thread.is_root))
+                    .collect(),
+            )),
+            TimelineView::Thread => {
+                let thread = request.thread_id.as_deref().unwrap_or("");
+                Ok(paginate(
+                    all.into_iter()
+                        .filter(|held| held.thread.as_ref().is_some_and(|held| held.id == thread))
+                        .collect(),
+                ))
+            }
+            TimelineView::Threads => {
+                let mut latest: std::collections::BTreeMap<String, Message> =
+                    std::collections::BTreeMap::new();
+                for held in &all {
+                    if let Some(thread) = &held.thread {
+                        latest
+                            .entry(thread.id.clone())
+                            .and_modify(|kept: &mut Message| {
+                                if held.timestamp > kept.timestamp {
+                                    *kept = held.clone();
+                                }
+                            })
+                            .or_insert_with(|| held.clone());
+                    }
+                }
+                let threads = latest
+                    .into_iter()
+                    .map(|(id, held)| vibe_talk::threads::ThreadSummary {
+                        id,
+                        root: None,
+                        title: String::new(),
+                        reply_count: None,
+                        reply_count_exact: false,
+                        updated_at: held.timestamp.clone(),
+                        display_name: None,
+                        summary: None,
+                        hue: None,
+                    })
+                    .collect();
+                Ok(TimelinePage {
+                    threads,
+                    has_threads: true,
+                    ..TimelinePage::default()
+                })
+            }
+            _ => Ok(TimelinePage::default()),
+        }
+    }
+    async fn post_message(
+        &self,
+        _channel: &ChannelId,
+        _content: &str,
+        _reply: Option<&MessageId>,
+    ) -> Result<Message, ChatError> {
+        Err(ChatError::Refused("read-only fixture".to_owned()))
+    }
+}
+
+#[tokio::test]
+async fn recap_returns_in_window_replies_of_a_pre_window_thread() {
+    let (mut state, _discord, _store) = testing::state_with_store();
+    let backend = Arc::new(MainOnlyBackend::default());
+    *backend.messages.lock().expect("messages") = fixtures();
+    state.replace_chat(backend);
+    let app = vibe_talk::http::router(state);
+    let (status, body) = call(&app, "GET", &window_path(), Some(READ_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Thread A's root (+6h) predates the window (+10h..+20h); its +11h/+12h replies are in it.
+    let groups = body["groups"].as_array().expect("groups");
+    let thread_a = groups
+        .iter()
+        .find(|group| group["thread_id"] == json!(THREAD_A))
+        .expect("thread A group");
+    let contents: Vec<&str> = thread_a["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|held| held["content"].as_str())
+        .collect();
+    assert_eq!(contents, ["A reply 4", "A reply 5"], "{thread_a}");
+}
+
 #[tokio::test]
 async fn recap_refuses_bad_windows_and_unknown_channels() {
     let (app, _messages) = harness().await;
