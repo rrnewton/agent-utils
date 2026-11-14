@@ -22,7 +22,8 @@ new Summarize (`#1497 discuss-fold-state-persist`), the summary reading
 aloud through the shared owner — Read, tap-to-read from a block, the lit
 block, and stop on close (`#1501 discuss-read-aloud-parity`, the
 documents-read harness's fake device voice) — and
-the panel overlaying the list without moving #scroll-area. Condition waits
+the panel overlaying the list without moving #scroll-area on a desk (on a
+phone the half-height sheet is docked under the list, `#1526`). Condition waits
 only — no fixed sleeps in any assertion.
 """
 
@@ -593,8 +594,19 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
       const rect = area.getBoundingClientRect();
       return {top: rect.top, height: rect.height};
     }""")
-    check(scroller_after == scroller_before,
-          f"opening Discuss moved #scroll-area: {scroller_before} -> {scroller_after}")
+    if width >= 900:
+        check(scroller_after == scroller_before,
+              f"opening Discuss moved #scroll-area: {scroller_before} -> {scroller_after}")
+    else:
+        # `#1526 discuss-docked-pane-mobile`: on a phone the half-height
+        # sheet is docked, so the list ends at the sheet's top edge instead
+        # of running underneath it; the sheet's top is the scroller's bottom.
+        panel_top = page.evaluate(
+            "() => document.getElementById('discuss-panel').getBoundingClientRect().top")
+        check(scroller_after["height"] < scroller_before["height"]
+              and abs(scroller_after["top"] + scroller_after["height"] - panel_top) <= 2,
+              f"the phone sheet is not docked under the list: "
+              f"scroller {scroller_before} -> {scroller_after}, panel top {panel_top}")
 
     # `#1344 discuss-panel-resize`: the kept layout, at this size. A desk gets the
     # wider default, drag-resizable, kept per device; a phone gets a full-width

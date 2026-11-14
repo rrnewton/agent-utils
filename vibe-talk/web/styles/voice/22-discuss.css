@@ -654,3 +654,37 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 #discuss-answer details.discuss-fresh > summary {
   color: #7ee2a0;
 }
+
+/* `#1526 discuss-docked-pane-mobile` (owner UI request 055): on a phone the
+ * half-height sheet is a DOCKED pane, not an overlay. As an overlay it stood
+ * over the lower half of #scroll-area while the list kept its full height
+ * underneath, so the scroller's bottom half was unreachable: a citation jump
+ * centred its row in the whole scrollport, half of which lay behind the
+ * sheet, and the row landed hidden at the sheet's top edge (the owner's
+ * screenshot: the Linked message chip and its row clipped behind the panel).
+ * Docked, the sheet takes a grid row of #screen-main under the list:
+ * #scroll-area (row 3) ends at the sheet's top edge, its scrollport is
+ * exactly the visible upper area, the list scrolls to its true bottom
+ * there, and a jump lands in that area. The full-height sheet still covers
+ * the main area (to just talk to Discuss), a closed panel reserves no row,
+ * and the desk regimes above are untouched (a desk docks sideways,
+ * `#1354`). The floating chips (#scroll-tools), anchored to the bottom of
+ * #screen-main, ride above the docked sheet. */
+@media not ((min-width: 900px) and (pointer: fine)) {
+  #screen-main:has(> #discuss-panel:not([hidden])[data-sheet="half"]) {
+    grid-template-rows: auto auto minmax(0, 1fr) minmax(0, 50dvh);
+  }
+
+  #screen-main > #discuss-panel:not([hidden])[data-sheet="half"] {
+    position: relative;
+    grid-row: 4;
+    grid-column: 1;
+    height: auto;
+    box-shadow: none;
+    z-index: auto;
+  }
+
+  #screen-main:has(> #discuss-panel:not([hidden])[data-sheet="half"]) > #scroll-tools {
+    bottom: calc(50dvh + var(--chips-foot, 0.5rem));
+  }
+}
