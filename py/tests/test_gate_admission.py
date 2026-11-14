@@ -550,8 +550,10 @@ def test_timing_sensitive_steps_come_from_the_dag_declaration() -> None:
     ) == ["cross.agentctl.differential-0"]
     assert gate._timing_sensitive_steps(["no.such.step"], labels) == ["no.such.step"]
     real = gate._dag_step_labels()
-    assert gate.TIMING_SENSITIVE_LABEL in real["cross.agentctl.differential-0"]
-    assert gate._timing_sensitive_steps(["cross.agentctl.differential-0"], real)
+    # #1249 cross-differentials-robust: every differential dropped the
+    # gate-exclusive label, so no real step is timing-sensitive now.
+    assert gate.TIMING_SENSITIVE_LABEL not in real["cross.agentctl.differential-0"]
+    assert gate._timing_sensitive_steps(["cross.agentctl.differential-0"], real) == []
     assert gate._timing_sensitive_steps(["python.tick-hub.test"], real) == []
 
 

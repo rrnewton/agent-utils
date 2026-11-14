@@ -186,10 +186,11 @@ steps:
     desc: agentctl Python and Rust commands agree (group shard 1 of 3)
     cmd: python3 cross/differential.py --tool agentctl --shard 0/3
     jobs_flag: ""
-    labels: [component-agentctl, gate-exclusive]
-    # Sharded by group (see cross/agentctl_differential.py shard_groups):
-    # one 1200 s serial node timed out under multi-gate load; three shorter
-    # nodes keep each wall well inside the same budget without raising it.
+    # Main phase (#1249 cross-differentials-robust): this shard carries
+    # no wall-clock verdict (launch refusals declare an effort; generous
+    # hang guard in the shared harness) and qualified under
+    # saturated-scope load; record in #1249.
+    labels: [component-agentctl]
     timeout: 19200
     cpu_timeout: 8192
     hint:

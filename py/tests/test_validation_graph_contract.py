@@ -1118,11 +1118,11 @@ def test_all_cross_filter_fails_closed() -> None:
 def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """#1190/#1249: `--all --list` on a page-only change names the one
-    still-disabled agentctl shard as skipped and plans none of it, while
-    the re-enabled differentials are planned;
-    `--all --cross-all --list` still plans none of the disabled shards;
-    only `--cross-differentials` plans those too."""
+    """#1190/#1249: `--all --list` on a page-only change names no
+    still-disabled agentctl shard (all five differentials are back in
+    the main phase) and plans each of them;
+    `--all --cross-all --list` plans them too now that none is disabled;
+    `--cross-differentials` remains the explicit opt-in spelling."""
     validate = _validate_module()
     monkeypatch.delenv(validate.CROSS_MAIN_PHASE_ENV, raising=False)
     monkeypatch.setattr(
@@ -1130,15 +1130,11 @@ def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
     )
     assert validate.main(["--all", "--list"]) == 0
     listed = capsys.readouterr().out
-    assert "cross filter (#1190" in listed and "skipped" in listed
-    for tag in (
-        "cross.agentctl.differential-0",
-    ):
-        assert listed.count(tag) == 1, tag  # named once, as skipped
-        assert f"STEP  {tag}" not in listed, tag
+    assert "cross filter (#1190" in listed and "skipped none" in listed
     for tag in (
         "cross.agentctl.herdr-agent-differential",
         "cross.herdr-run.differential",
+        "cross.agentctl.differential-0",
         "cross.agentctl.differential-1",
         "cross.agentctl.differential-2",
     ):
@@ -1146,7 +1142,7 @@ def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
     assert validate.main(["--all", "--cross-all", "--list"]) == 0
     forced = capsys.readouterr().out
     assert "cross differentials disabled by default" in forced
-    assert "STEP  cross.agentctl.differential-0" not in forced
+    assert "STEP  cross.agentctl.differential-0" in forced
     assert "STEP  cross.herdr-run.differential" in forced
     assert validate.main(["--all", "--cross-differentials", "--list"]) == 0
     opted = capsys.readouterr().out
