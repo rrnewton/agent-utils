@@ -1168,6 +1168,43 @@ pub(crate) enum Lifecycle {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Release one incomplete retained frozen validation checkout on an operator's word, printing the Python output (writer; fixture registries only until cutover)
+    ReleaseFrozenIncompleteText {
+        /// Absolute standalone frozen validation checkout
+        #[arg(
+            long = "frozen-validate-checkout",
+            value_name = "PATH",
+            required = true
+        )]
+        frozen_validate_checkout: String,
+        /// The checkout's terminal run-record, project-relative
+        #[arg(long = "completed-record", value_name = "PATH", required = true)]
+        completed_record: String,
+        /// The run's source repository, project-relative
+        #[arg(long = "repository", value_name = "PATH", required = true)]
+        repository: String,
+        /// Why the checkout holds nothing anyone needs
+        #[arg(long, value_name = "TEXT", required = true)]
+        reason: String,
+        /// Salvage and remove; without it the command is a dry run
+        #[arg(long)]
+        yes: bool,
+        /// The caller asserts it is the recorded coordinator
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Stable coordinator process PID
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: Option<i64>,
+        /// Output format: human prints the plan lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Set, clear, or show the per-host retire freeze (#780)
     Freeze {
         /// Action: set, clear, or status
@@ -1746,6 +1783,10 @@ const PY_RENAMED: &[(&str, &str)] = &[
         "classify-ownerless-validate-batch",
         "classify-ownerless-validate-batch-text",
     ),
+    (
+        "release-frozen-incomplete",
+        "release-frozen-incomplete-text",
+    ),
 ];
 
 /// Python spellings the Rust edition already serves under the same name.
@@ -1816,7 +1857,13 @@ fn py_compat_triggered(rest: &[String], leading_globals: bool, routed: bool) -> 
         return false;
     };
     match cmd {
-        "doctor" | "audit" | "image" | "sandbox" | "limits" | "worktrees-image" => true,
+        "doctor"
+        | "audit"
+        | "image"
+        | "sandbox"
+        | "limits"
+        | "worktrees-image"
+        | "release-frozen-incomplete" => true,
         "status" => !py_flag_present(rest, "--index"),
         "create"
         | "unpushed"
@@ -3756,6 +3803,41 @@ pub fn run() -> u8 {
                         "{}",
                         crate::batch_text::ownerless_classify(&value, format == "json")
                     );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Lifecycle::ReleaseFrozenIncompleteText {
+                frozen_validate_checkout,
+                completed_record,
+                repository,
+                reason,
+                yes,
+                coordinator_authorized,
+                coordinator_pid,
+                format,
+                root,
+                machine,
+            } => match crate::release_frozen::release_frozen_incomplete(
+                root.as_deref(),
+                machine.as_deref(),
+                &frozen_validate_checkout,
+                &completed_record,
+                &repository,
+                &reason,
+                yes,
+                coordinator_authorized,
+                coordinator_pid,
+            ) {
+                Ok(value) => {
+                    if format == "json" {
+                        println!("{}", serde_json::to_string(&value).unwrap_or_default());
+                    } else {
+                        print!("{}", crate::release_frozen::release_text(&value));
+                    }
                     return 0;
                 }
                 Err(error) => {

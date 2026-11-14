@@ -5107,6 +5107,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "validate-config",
             "quickstart",
             "retirement-queue",
+            "release-frozen-incomplete-text",
             "register",
             "supersede-handoff",
             "config"

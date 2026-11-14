@@ -861,43 +861,43 @@ fn os_error_text(error: &std::io::Error, path: &Path) -> String {
 }
 
 fn service_result_fields(schema: i64) -> Option<Vec<&'static str>> {
-    let base = [
-        "schema_version",
-        "commit",
-        "profile",
-        "final_validate_status",
-        "exit_code",
-        "executed_nodes",
-        "executed_tests",
-    ];
+    // Python `_VALIDATION_SERVICE_RESULT_FIELDS`, in declared order.
+    let head = ["schema_version", "commit", "profile"];
+    let tail = ["exit_code", "executed_nodes", "executed_tests"];
     let fields: Vec<&str> = match schema {
-        1 => base.to_vec(),
-        2 => [base.as_slice(), &["scorecard_writeback"]].concat(),
+        1 => [head.as_slice(), &["final_validate_status"], tail.as_slice()].concat(),
+        2 => [
+            head.as_slice(),
+            &["final_validate_status"],
+            tail.as_slice(),
+            &["scorecard_writeback"],
+        ]
+        .concat(),
         3 => [
-            &base[..4],
-            &["selection_mode"],
-            &base[4..],
+            head.as_slice(),
+            &["selection_mode", "final_validate_status"],
+            tail.as_slice(),
             &["scorecard_writeback"],
         ]
         .concat(),
         4 => [
-            &base[..4],
-            &["selection_mode"],
-            &base[4..],
+            head.as_slice(),
+            &["selection_mode", "final_validate_status"],
+            tail.as_slice(),
             &["passed_tests", "scorecard_writeback"],
         ]
         .concat(),
         5 | 6 => [
-            &base[..4],
-            &["selection_mode", "detail"],
-            &base[4..],
+            head.as_slice(),
+            &["selection_mode", "final_validate_status", "detail"],
+            tail.as_slice(),
             &["passed_tests", "scorecard_writeback"],
         ]
         .concat(),
         7 => [
-            &base[..4],
-            &["selection_mode", "detail"],
-            &base[4..],
+            head.as_slice(),
+            &["selection_mode", "final_validate_status", "detail"],
+            tail.as_slice(),
             &[
                 "passed_tests",
                 "diagnostic_failed_tests",
@@ -906,9 +906,9 @@ fn service_result_fields(schema: i64) -> Option<Vec<&'static str>> {
         ]
         .concat(),
         8 => [
-            &base[..4],
-            &["selection_mode", "detail"],
-            &base[4..],
+            head.as_slice(),
+            &["selection_mode", "final_validate_status", "detail"],
+            tail.as_slice(),
             &[
                 "passed_tests",
                 "diagnostic_failed_tests",
@@ -1012,6 +1012,9 @@ fn scorecard_writeback(value: Option<&Value>, label: &str) -> Result<Option<Valu
     let Some(value) = value else {
         return Ok(None);
     };
+    if value.is_null() {
+        return Ok(None);
+    }
     let Some(object) = value.as_object() else {
         return Err(format!("{label} must be an object or null"));
     };
@@ -2513,6 +2516,259 @@ pub(crate) fn ownerless_validation_journal(
         "fenced": fenced_value,
         "authorization": authorization,
     }))
+}
+
+/// Python `_frozen_release_*` for the dry run (#1089 step 4a):
+/// prove one current incomplete frozen checkout is retained for
+/// exactly the retention reasons, then measure the release plan.
+/// The `--yes` execution stays with the Python edition (step 4b).
+pub(crate) fn frozen_release_dry_run(
+    cfg: &Cfg,
+    config: &Value,
+    checkout_raw: &str,
+    record_raw: &str,
+    repository_raw: &str,
+    reason: &str,
+) -> Result<Value> {
+    let (_relative, target, _allowed) =
+        validation_recovery_target(cfg, checkout_raw, "frozen-checkout")?;
+    let (_stored, repository) = repository_path(cfg, repository_raw, true)?;
+    let frozen_root = frozen_validation_directory(cfg);
+    let identity = private_cleanup_path_identity(cfg, &target, &[0o700], Some(&frozen_root))?;
+    let snapshot = crate::remove_write::capture_process_snapshot(
+        i64::from(std::process::id()),
+        std::slice::from_ref(&target),
+    )?;
+    let batch = BatchContext::new(&[(identity, target.clone())], snapshot);
+    batch.assert_unused(cfg, &target, false)?;
+    let (record_relative, record_path) =
+        relative_inside(&cfg.root, record_raw, "terminal validation record")?;
+    let record_contents = std::fs::read(&record_path).map_err(|error| {
+        format!(
+            "cannot read frozen validation run-record {}: {error}",
+            record_path.display()
+        )
+    })?;
+    let record = strict_json_object(&record_contents, "frozen validation run-record")?;
+    let record_target = record
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let digest = format!("{:x}", Sha256::digest(&record_contents));
+    let (disposition, _schema, _evidence) = frozen_no_proof_disposition(
+        cfg,
+        &record_path,
+        &target,
+        &repository,
+        &digest,
+        &record_target,
+        &|path| crate::remove_write::assert_slot_unused(path, i64::from(std::process::id())),
+    )?;
+    match disposition {
+        FrozenDisposition::CurrentTerminalRemovable => {
+            return Err(
+                "frozen validation checkout has a recorded result; recover-ownerless-validate-batch removes it, not an operator release"
+                    .to_string(),
+            );
+        }
+        FrozenDisposition::CurrentIncompleteRetained => {}
+        other => {
+            return Err(format!(
+                "operator release applies only to a current incomplete frozen validation checkout; this one classifies as {}; preserve it",
+                other.wire()
+            ));
+        }
+    }
+    // The retention proof Python applies before keeping the checkout.
+    if !record_process_is_dead(&record) {
+        return Err("current frozen validation process state is live or uncertain".to_string());
+    }
+    if record.get("checkout").and_then(Value::as_str) != Some(target.to_string_lossy().as_ref())
+        || record.get("temporary_checkout") != Some(&Value::Bool(true))
+        || record.get("source_checkout").and_then(Value::as_str)
+            != Some(repository.to_string_lossy().as_ref())
+        || record_target.len() != 40
+        || !record_target.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || int_value(record.get("schema_version")) != Some(1)
+        || record.get("kind").and_then(Value::as_str) != Some("frozen-validate")
+        || record.get("producer").and_then(Value::as_str) != Some("ci-hub/validate/run_registry.py")
+        || record.get("admission").and_then(Value::as_str) != Some("frozen-validate")
+        || record.get("validation_kind").and_then(Value::as_str) != Some("frozen-validate")
+    {
+        return Err(
+            "terminal validation record is not an authoritative frozen-validation handle; preserve the checkout and pass its current frozen run handle"
+                .to_string(),
+        );
+    }
+    validation_checkout_facts(
+        cfg,
+        config,
+        &target,
+        &repository,
+        Some(&record_target),
+        None,
+        true,
+        None,
+        false,
+    )?;
+    if !crate::finish_write::initialized_submodules(&target)?.is_empty() {
+        return Err("retained validation initialized submodule declarations disagree".to_string());
+    }
+    if crate::finish_write::common_directory(&repository)?
+        == crate::finish_write::common_directory(&target)?
+    {
+        return Err("retained validation source shares Git storage with the clone".to_string());
+    }
+    let producer_path = target.join("ci/manifest-plan/validation-service-result-schema.json");
+    ensure_no_symlink_components(
+        &target,
+        &producer_path,
+        "current frozen validation producer schema",
+    )?;
+    let sidecar_path = historical_sidecar_path(&record_path);
+    let producer = std::fs::read(&producer_path).map_err(|error| {
+        format!(
+            "cannot read current frozen validation evidence {}: {error}",
+            producer_path.display()
+        )
+    })?;
+    let sidecar = std::fs::read(&sidecar_path).map_err(|error| {
+        format!(
+            "cannot read current frozen validation evidence {}: {error}",
+            sidecar_path.display()
+        )
+    })?;
+    let schema = int_value(record.get("service_result_schema")).unwrap_or_default();
+    if !(5..=8).contains(&schema) {
+        return Err("current frozen validation has no supported service-result schema".to_string());
+    }
+    let fields = service_result_schema(&producer, schema)?;
+    let expected_commit = Value::String(record_target.clone());
+    let projection = service_result_projection(&sidecar, schema, &fields, Some(&expected_commit))?;
+    for (field, expected) in &projection {
+        if record.get(field) != Some(expected) {
+            return Err(format!(
+                "current frozen validation service-result {field} differs from the run-record"
+            ));
+        }
+    }
+    batch.assert_unused(cfg, &target, true)?;
+    for (path, contents) in [
+        (&record_path, &record_contents),
+        (&producer_path, &producer),
+        (&sidecar_path, &sidecar),
+    ] {
+        let rebound = std::fs::read(path).map_err(|error| {
+            format!(
+                "cannot read current frozen validation evidence {}: {error}",
+                path.display()
+            )
+        })?;
+        if rebound != *contents {
+            return Err(
+                "current frozen validation evidence changed during classification".to_string(),
+            );
+        }
+    }
+    let head_now = git_text(&target, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    if head_now != record_target {
+        return Err(
+            "current frozen validation checkout HEAD changed during classification".to_string(),
+        );
+    }
+    // The release plan.
+    let record_sha = format!("{:x}", Sha256::digest(&record_contents));
+    let head = git_text(&target, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let remote = cfg.default_remote.clone();
+    let (repo_digest, repo_url) = crate::finish_write::remote_authority(&repository, &remote)?;
+    let (checkout_digest, _checkout_url) = crate::finish_write::remote_authority(&target, &remote)?;
+    if repo_digest != checkout_digest {
+        return Err(
+            "frozen validation checkout remote differs from its source checkout; preserve both"
+                .to_string(),
+        );
+    }
+    let landed_ref = landed_ref_for_remote(cfg);
+    crate::finish_write::fetch_remote(&repository, &remote, &landed_ref, &repo_url)?;
+    let on_remote = !remote_refs_containing(&repository, &remote, &head)?.is_empty();
+    let mut repositories = vec![json!({
+        "repository": ".",
+        "head": head,
+        "on_remote": on_remote,
+    })];
+    let mut submodules = crate::finish_write::initialized_submodules(&target)?;
+    submodules.sort();
+    for relative in submodules {
+        let child = target.join(&relative);
+        let child_head = git_text(&child, &["rev-parse", "HEAD"])?.trim().to_string();
+        let holders = git_text(
+            &child,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "--contains",
+                &child_head,
+                "refs/remotes/",
+            ],
+        )?;
+        repositories.push(json!({
+            "repository": relative,
+            "head": child_head,
+            "on_remote": !holders.trim().is_empty(),
+        }));
+    }
+    let (bytes, files) = tree_usage(&target);
+    Ok(json!({
+        "schema": 1,
+        "action": "dry-run",
+        "checkout": target.to_string_lossy(),
+        "record": record_relative,
+        "record_sha256": record_sha,
+        "target": head,
+        "bytes": bytes,
+        "files": files,
+        "reason": reason,
+        "repositories": repositories,
+        "release_id": Value::Null,
+        "note": Value::Null,
+        "salvage": [],
+    }))
+}
+
+/// Python `_tree_usage`: disk bytes (blocks) and non-directory
+/// entries below a path, without following links.
+fn tree_usage(path: &Path) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut total: u64 = 0;
+    let mut files: u64 = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return (None, None);
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return (None, None);
+            };
+            // Python uses lstat: never follow links.
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                return (None, None);
+            };
+            total += metadata.blocks() * 512;
+            if metadata.is_dir() && !entry.path().is_symlink() {
+                stack.push(entry.path());
+            } else {
+                files += 1;
+            }
+        }
+    }
+    (Some(total), Some(files))
 }
 
 #[cfg(test)]

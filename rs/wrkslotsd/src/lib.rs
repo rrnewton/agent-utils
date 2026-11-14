@@ -99,6 +99,7 @@ mod recover_ownerless_write;
 mod recover_unbound_write;
 mod recover_validate_write;
 mod register_write;
+mod release_frozen;
 mod release_write;
 mod remove_write;
 mod replay;
