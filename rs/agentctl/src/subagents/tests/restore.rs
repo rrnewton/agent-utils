@@ -3473,6 +3473,24 @@ fn watch_unit_repair_off_skips_units_but_still_drains_queues() {
             .any(|r| r["check"] == "herdr" && r["ok"] == true),
         "{findings:?}"
     );
+    // The drain inside one watch pass runs with the product's
+    // bounded ready/deadline budgets on a real clock, and on a
+    // loaded host those can expire queueing for the shared pane
+    // lock — by design the prompt then stays pending for the next
+    // pass, as it does for the periodic watcher. So the condition
+    // is that repeated passes drain it; the guard only reports a
+    // hang.
+    let drain_until = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    while !fixture
+        .manager()
+        .pending_prompts("lane")
+        .unwrap()
+        .is_empty()
+        && std::time::Instant::now() < drain_until
+    {
+        let _ = watch_pass(&fixture, &host, &cfg);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(
         fixture
             .manager()

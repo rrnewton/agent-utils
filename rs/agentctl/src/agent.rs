@@ -5422,6 +5422,10 @@ mod tests {
                 u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                 AtomicOrdering::SeqCst,
             );
+            // Fake time costs no real time, so a lock poll through
+            // this sleep would spin at full CPU and starve the very
+            // holder it waits for; yield instead.
+            std::thread::yield_now();
         }
     }
 
@@ -5444,7 +5448,10 @@ mod tests {
             Duration::ZERO
         }
 
-        fn sleep(&self, _duration: Duration) {}
+        fn sleep(&self, _duration: Duration) {
+            // As in FakeRuntime: never spin a lock poll at full CPU.
+            std::thread::yield_now();
+        }
 
         fn cancelled(&self) -> bool {
             self.checks.fetch_add(1, AtomicOrdering::SeqCst) >= self.cancel_after_checks
@@ -5464,7 +5471,10 @@ mod tests {
             Duration::ZERO
         }
 
-        fn sleep(&self, _duration: Duration) {}
+        fn sleep(&self, _duration: Duration) {
+            // As in FakeRuntime: never spin a lock poll at full CPU.
+            std::thread::yield_now();
+        }
 
         fn cancelled(&self) -> bool {
             self.cancelled.load(AtomicOrdering::SeqCst)
@@ -8144,11 +8154,14 @@ mod tests {
 
     #[test]
     fn cancellation_before_injection_leaves_prompt_safely_pending() {
+        // A pane of its own (see `target_for`): on the shared pane
+        // this send's frozen, always-cancelled runtime would spin
+        // behind another test's drain holding the target lock.
         let directory = TestDirectory::new("cancel-before-injection");
-        let fake = FakeAgent::new(&["idle"]);
+        let fake = FakeAgent::with_pane(&["idle"], "w1:p-cancel-before");
         let error = send_with_runtime(
             &fake,
-            &target(),
+            &target_for("w1:p-cancel-before"),
             directory.path(),
             "do not inject",
             DrainOptions::default(),
@@ -8156,6 +8169,7 @@ mod tests {
         )
         .expect_err("cancelled delivery remains pending");
         assert_eq!(error.outcome(), Some(QueueOutcome::Pending));
+        assert!(error.safe_to_retry());
         assert!(fake.runs().is_empty());
     }
 
@@ -8195,10 +8209,11 @@ mod tests {
     fn cancellation_after_injection_quarantines_unknown_outcome() {
         let directory = TestDirectory::new("cancel-after-injection");
         let cancelled = Arc::new(AtomicBool::new(false));
-        let fake = FakeAgent::with_cancel_after_run(&["idle"], Arc::clone(&cancelled));
+        let fake = FakeAgent::with_cancel_after_run(&["idle"], Arc::clone(&cancelled))
+            .on_pane("w1:p-cancel-after");
         let error = send_with_runtime(
             &fake,
-            &target(),
+            &target_for("w1:p-cancel-after"),
             directory.path(),
             "inject once",
             DrainOptions::default(),
@@ -8232,11 +8247,11 @@ mod tests {
             holder.lock_exclusive().expect("hold lock");
             let contender = open_private_lock(&path, "contended test lock").expect("contender");
             let runtime = CancelOnSleep::default();
-            let started = Instant::now();
+            // The cancelled error is the verdict; how soon it arrives
+            // is scheduling, which a loaded host decides.
             let error = lock_exclusive_with_runtime(&contender, &path, "test contention", &runtime)
                 .expect_err("contention is cancelled");
             assert!(error.to_string().contains("cancelled"));
-            assert!(started.elapsed() < Duration::from_secs(1));
         }
     }
 
@@ -8463,15 +8478,19 @@ mod tests {
 
     #[test]
     fn a_bounded_drain_stops_at_its_item_limit_deadline_or_lock_timeout() {
+        // A pane of its own (see `target_for`): the fake clock never
+        // really waits, so on the shared pane the unbounded drains
+        // below would spin behind another test's target lock.
+        let pane = "w1:p-bounded-drain";
         let directory = TestDirectory::new("bounded-drain");
         let root = directory.path();
         for (id, text) in [("one", "first"), ("two", "second"), ("three", "third")] {
             enqueue(root, text, Some(id)).unwrap();
         }
-        let fake = FakeAgent::new(&["idle"]);
+        let fake = FakeAgent::with_pane(&["idle"], pane);
         let result = drain_with_runtime(
             &fake,
-            &target(),
+            &target_for(pane),
             root,
             DrainOptions {
                 max_items: Some(1),
@@ -8487,7 +8506,7 @@ mod tests {
 
         let result = drain_with_runtime(
             &fake,
-            &target(),
+            &target_for(pane),
             root,
             DrainOptions {
                 deadline: Some(Duration::ZERO),
@@ -8503,7 +8522,7 @@ mod tests {
         holder.lock_exclusive().unwrap();
         let error = drain_with_runtime(
             &fake,
-            &target(),
+            &target_for(pane),
             root,
             DrainOptions {
                 lock_timeout: Some(Duration::from_millis(50)),
@@ -8517,7 +8536,7 @@ mod tests {
         drop(holder);
         let result = drain_with_runtime(
             &fake,
-            &target(),
+            &target_for(pane),
             root,
             DrainOptions::default(),
             &FakeRuntime::default(),

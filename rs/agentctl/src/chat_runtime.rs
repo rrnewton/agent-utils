@@ -6470,6 +6470,9 @@ pub struct BridgeState {
     // How many more reads of each request's reply route fail, as an I/O error, before they work.
     #[cfg(test)]
     route_faults: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    // How many reads of each request's reply route have been tried.
+    #[cfg(test)]
+    route_read_attempts: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
 }
 
 #[cfg(test)]
@@ -6610,6 +6613,8 @@ impl BridgeState {
             gap_retry_runner_probe: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             route_faults: Arc::default(),
+            #[cfg(test)]
+            route_read_attempts: Arc::default(),
         })
     }
 
@@ -6721,6 +6726,8 @@ impl BridgeState {
             gap_retry_runner_probe: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             route_faults: Arc::default(),
+            #[cfg(test)]
+            route_read_attempts: Arc::default(),
         })
     }
 
@@ -13310,6 +13317,12 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         }
         #[cfg(test)]
         {
+            *self
+                .route_read_attempts
+                .lock()
+                .expect("route read attempt lock")
+                .entry(key.to_owned())
+                .or_default() += 1;
             let mut faults = self.route_faults.lock().expect("route fault lock");
             if let Some(remaining) = faults.get_mut(key) {
                 *remaining -= 1;
@@ -13861,6 +13874,17 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         } else {
             faults.insert(key.to_owned(), count);
         }
+    }
+
+    /// How many reads of `key`'s reply route have been tried, failed or not.
+    #[cfg(test)]
+    pub(crate) fn route_read_attempts(&self, key: &str) -> usize {
+        self.route_read_attempts
+            .lock()
+            .expect("route read attempt lock")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Whether every read of a reply route that `fail_route_reads` made fail has been tried.

@@ -15240,41 +15240,60 @@ esac
                 }
                 let mut connection = match listener.accept() {
                     Ok((connection, _)) => connection,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Err(_) => {
+                        // A test double must survive a loaded host:
+                        // no accept failure may take the listener
+                        // down with it.
                         thread::sleep(Duration::from_millis(10));
                         continue;
                     }
-                    Err(error) => panic!("accept herdr event client: {error}"),
                 };
-                connection
-                    .set_nonblocking(false)
-                    .expect("blocking herdr event connection");
+                // Best effort throughout the handshake: the client
+                // gives the acknowledgement a few seconds and drops
+                // the connection when they pass, which a starved
+                // server thread can miss under load through no fault
+                // of the loop under test. Dropping such a connection
+                // and accepting the retry is the behaviour the loop
+                // needs; panicking here kills every later attempt.
+                if connection.set_nonblocking(false).is_err()
+                    || connection
+                        .set_read_timeout(Some(Duration::from_secs(30)))
+                        .is_err()
+                {
+                    continue;
+                }
+                let Ok(reader) = connection.try_clone() else {
+                    continue;
+                };
                 let mut request = String::new();
-                BufReader::new(
-                    connection
-                        .try_clone()
-                        .expect("clone herdr event connection"),
-                )
-                .read_line(&mut request)
-                .expect("read herdr event subscription");
-                let request: Value =
-                    serde_json::from_str(&request).expect("decode herdr event subscription");
-                let pane = request["params"]["subscriptions"][0]["pane_id"]
-                    .as_str()
-                    .expect("subscribed pane")
-                    .to_owned();
+                if !matches!(BufReader::new(reader).read_line(&mut request), Ok(1..)) {
+                    continue;
+                }
+                let Ok(request) = serde_json::from_str::<Value>(&request) else {
+                    continue;
+                };
+                let Some(pane) = request["params"]["subscriptions"][0]["pane_id"].as_str() else {
+                    continue;
+                };
+                let pane = pane.to_owned();
                 if let Some(arm) = &arm {
                     arm.store(true, AtomicOrdering::SeqCst);
                 }
-                writeln!(
+                // Counted once the request is read: that is when the
+                // loop subscribed, whatever the acknowledgement's
+                // fate on a starved host.
+                acknowledged.fetch_add(1, AtomicOrdering::SeqCst);
+                if writeln!(
                     connection,
                     "{}",
                     json!({"id": request["id"], "result": {"type": "subscription_started"}})
                 )
-                .expect("acknowledge herdr event subscription");
-                acknowledged.fetch_add(1, AtomicOrdering::SeqCst);
+                .is_err()
+                {
+                    continue;
+                }
                 for event in events(&pane) {
-                    writeln!(connection, "{event}").expect("write herdr event");
+                    let _ = writeln!(connection, "{event}");
                 }
                 connections.push((connection, pane));
             }
@@ -15635,21 +15654,25 @@ esac
                     overflowed.store(true, AtomicOrdering::SeqCst);
                     wake_output(&output_wake);
                 };
-                // The limit is a CPU budget, not a wall one: under gate
-                // concurrency the loop thread can be starved for most of
-                // the wall window while making steady progress whenever
-                // it is scheduled. The wall hard cap (4x) still ends a
-                // loop that is idle-blocked, and the CPU cap (2x) ends
-                // one that spins without finishing.
+                // The limit is a hang guard, never the verdict: `done`
+                // is the verdict. Under gate concurrency the loop
+                // thread can be starved for most of a wall window
+                // while making steady progress whenever it is
+                // scheduled, and each unit of its work costs more CPU
+                // against contended locks and a busy filesystem, so
+                // both caps sit far above any legitimate run: the
+                // wall cap (12x) ends a loop that is idle-blocked,
+                // and the CPU cap (6x) ends one that spins without
+                // finishing.
                 let started = Instant::now();
-                let wall_deadline = started + limit * 4;
+                let wall_deadline = started + limit * 12;
                 let cpu_started = thread_cpu_seconds(loop_tid);
                 while !done(&notify, &overflow) {
                     if Instant::now() >= wall_deadline {
                         break;
                     }
                     if let (Some(start), Some(now)) = (cpu_started, thread_cpu_seconds(loop_tid)) {
-                        if now - start >= (limit * 2).as_secs_f64() {
+                        if now - start >= (limit * 6).as_secs_f64() {
                             break;
                         }
                     }
@@ -16732,22 +16755,27 @@ esac
                     key = Some(admitted);
                     false
                 }
-                Some(key) => queued(key).is_some(),
+                // Done only once the loop has settled the request:
+                // queued, its wake failed, and it is back to pending
+                // saying why. Stopping as soon as the queue file
+                // exists can land before that settle on a loaded
+                // host, when one headless turn outlasts the harness's
+                // post-done grace; inspecting the request (never the
+                // lock-taking queue state) leaves the loop to do it.
+                Some(key) => state.inspect_request(key).is_ok_and(|inspection| {
+                    inspection["phase"] == "pending"
+                        && inspection["delivery"]["error"]
+                            .as_str()
+                            .is_some_and(|error| {
+                                error.contains("the headless wrapper is not running")
+                            })
+                }),
             },
         );
         let key = key.expect("a request was admitted");
         assert_eq!(queued(&key), Some(QueueMessageState::Pending));
         // Not started by any model, so not delivered: the request waits, saying why.
-        // A submission the loop began just before it stopped settles back
-        // to pending once its wake fails; on a loaded host that can land
-        // after the loop returns, so wait for the settled phase instead
-        // of inspecting once.
-        let settle_deadline = Instant::now() + Duration::from_secs(60);
-        let mut inspection = state.inspect_request(&key).expect("inspect request");
-        while inspection["phase"] != "pending" && Instant::now() < settle_deadline {
-            thread::sleep(Duration::from_millis(10));
-            inspection = state.inspect_request(&key).expect("inspect request");
-        }
+        let inspection = state.inspect_request(&key).expect("inspect request");
         assert_eq!(inspection["phase"], "pending", "{inspection:#}");
         let error = inspection["delivery"]["error"].as_str().unwrap_or_default();
         assert!(
@@ -18319,38 +18347,38 @@ esac
         let (_, state) = worker_bridge_state(&fixture, true);
         let key = admitted_worker_request(&state);
         *fixture.client.screen.lock().expect("screen") = Some(claude_turn_screen(false, 4));
+        // The screen sequence is counted in reads, set in motion by
+        // the typing itself: the first read after it shows the hint
+        // with no block, and every read from then on shows the hint
+        // with the block. Staging that swap from the poller instead
+        // races the loop's polls on a loaded host.
         *fixture
             .client
             .screen_after_run
             .lock()
-            .expect("screen after run") = Some(claude_pasted_screen(false, 4));
+            .expect("screen after run") = Some(claude_pasted_screen(true, 4));
+        fixture
+            .client
+            .screens_after_run
+            .lock()
+            .expect("screens after run")
+            .push_back(claude_pasted_screen(false, 4));
         fixture.client.runs.lock().expect("runs").clear();
-        let read_sources = &fixture.client.read_sources;
         let herdr = owner_loop_herdr(&fixture.root, "herdr", |_| Vec::new());
-        // The number of reads when the prompt was first seen typed, and whether a later read has
-        // been made since.
-        let mut typed_at = None;
-        let mut hint_read = false;
         run_owner_loop_until(
             &fixture,
             &state,
             &herdr,
             Duration::from_secs(3_600),
             Duration::from_secs(15),
-            || {
-                let reads = read_sources.lock().expect("read sources").len();
-                if typed_at.is_none() && !fixture.client.runs.lock().expect("runs").is_empty() {
-                    typed_at = Some(reads);
-                }
-                if !hint_read && typed_at.is_some_and(|typed| reads > typed) {
-                    hint_read = true;
-                    *fixture.client.screen.lock().expect("screen") =
-                        Some(claude_pasted_screen(true, 4));
-                }
-                stored_replies(&state, &key) == 1
-            },
+            || stored_replies(&state, &key) == 1,
         );
-        assert!(hint_read, "no read after the prompt was typed");
+        // The block was captured, which only a read past the one
+        // that consumed the hint-without-block screen could do.
+        assert!(
+            fixture.client.screens.lock().expect("screens").is_empty(),
+            "no read after the prompt was typed consumed the hint screen"
+        );
         assert_eq!(fixture.client.runs.lock().expect("runs").len(), 1);
         assert_eq!(stored_replies(&state, &key), 1);
         drop(herdr.release);
@@ -20501,6 +20529,29 @@ printf '%s\n' "$request" >> "$1" || exit 4
         .expect("stop the reply sender");
     }
 
+    /// A reply transport whose every send fails with an unknown
+    /// outcome, counting the sends it was asked for: the in-process
+    /// form of a helper that exits without answering, with no
+    /// process spawn or file append for a loaded host to starve.
+    struct FailingReplyTransport {
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl chat_runtime::ReplyTransport for FailingReplyTransport {
+        fn send(
+            &mut self,
+            _submission: chat_runtime::ReplySubmission<'_>,
+        ) -> Result<String, chat_runtime::OutboundFailure> {
+            self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(chat_runtime::OutboundFailure {
+                code: "fixture_unknown".to_owned(),
+                detail: "the helper exited without answering".to_owned(),
+                outcome: chat_runtime::OutboundOutcome::Unknown,
+                retryable: true,
+            })
+        }
+    }
+
     #[test]
     fn a_reply_sender_whose_helper_fails_trips_the_breaker_as_the_loop_does() {
         // #858 chat-reply-wake-latency: the reply sender sends through `publish_one`, so a send
@@ -20513,8 +20564,10 @@ printf '%s\n' "$request" >> "$1" || exit 4
         let root = runtime::temporary("reply-sender-breaker");
         let state = BridgeState::initialize(&root, runtime::config()).expect("initialize state");
         let requests = runtime::same_thread_reply_requests(&state, 9);
-        let sends = root.join("failed-sends");
-        let transport = recording_send_helper(&root, &sends, false);
+        let attempts = Arc::new(AtomicU64::new(0));
+        let transport = FailingReplyTransport {
+            attempts: Arc::clone(&attempts),
+        };
         let stop = Arc::new(StopState::default());
         let (send_keys, keys) = mpsc::sync_channel(REPLY_WAKE_CAPACITY);
         let logs = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -20530,7 +20583,9 @@ printf '%s\n' "$request" >> "$1" || exit 4
             logs.iter()
                 .any(|line| line.contains("post-rate breaker tripped"))
         };
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // The tripped log line is the condition; the bound only
+        // reports a hang.
+        let deadline = Instant::now() + Duration::from_secs(180);
         while !tripped(&logs.lock().expect("logs")) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -20538,16 +20593,12 @@ printf '%s\n' "$request" >> "$1" || exit 4
         join_worker_until(
             sender,
             "chat reply sender",
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(60),
         )
         .expect("stop the reply sender");
         let logs = logs.lock().expect("logs").clone();
         assert!(tripped(&logs), "{logs:#?}");
-        let attempts = fs::read_to_string(&sends)
-            .expect("helper attempts")
-            .lines()
-            .count();
-        assert_eq!(attempts, 8, "{logs:#?}");
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 8, "{logs:#?}");
         assert_eq!(
             logs.iter()
                 .filter(|line| line.contains("chat operation: publish"))
@@ -21048,10 +21099,10 @@ printf '%s\n' "$request" >> "$1" || exit 4
         // A request arrives while the agent works, so the pass at startup leaves its prompt
         // waiting. Herdr reports the agent working and sends no event, not even when the agent
         // settles, and no reconciliation is due within the hour, so only a retry after one of the
-        // loop's scans of the request records, which fall due every 50 ms here, can type the
-        // prompt. While Herdr reports the agent working, the loop does not retry: for ten scan
-        // periods and more, the request keeps the reason the pass at startup recorded, which a
-        // retry would replace. Once Herdr reports the agent idle, the retry after the next scan
+        // loop's scans of the request records, which fall due every 250 ms here, can type the
+        // prompt. While Herdr reports the agent working, the loop does not retry: across
+        // many status lookups by its scans, the request keeps the reason the pass at startup
+        // recorded, which a retry would replace. Once Herdr reports the agent idle, the retry after the next scan
         // types the prompt, and the scan after the retry takes the request off the alarm.
         let fixture = crate::subagents::tests::Fixture::new();
         fixture.start(None);
@@ -21076,8 +21127,8 @@ printf '%s\n' "$request" >> "$1" || exit 4
         };
         let lookups = || fixture.client.pane_info_calls.load(AtomicOrdering::SeqCst);
         let typed = || fixture.client.runs.lock().expect("runs").len();
-        // When the alarm first listed the request, and the number of status lookups by then.
-        let mut listed_at: Option<(Instant, u64)> = None;
+        // The number of status lookups when the alarm first listed the request.
+        let mut listed_at: Option<u64> = None;
         // The request's reason when the alarm first listed it.
         let mut listed_reason = None;
         // The request's reason and the number of prompts typed when Herdr began to report the
@@ -21089,7 +21140,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
             &herdr,
             Duration::from_secs(3_600),
             DeliveryTiming {
-                retry_interval: Duration::from_millis(50),
+                retry_interval: Duration::from_millis(250),
                 stall_after: Duration::ZERO,
                 stall_repeat: Duration::from_secs(3_600),
             },
@@ -21098,15 +21149,20 @@ printf '%s\n' "$request" >> "$1" || exit 4
             None,
             None,
             |_, _| {
-                let Some((at, before)) = listed_at else {
+                let Some(before) = listed_at else {
                     if alarmed() {
                         listed_reason = Some(entry().reason);
-                        listed_at = Some((Instant::now(), lookups()));
+                        listed_at = Some(lookups());
                     }
                     return false;
                 };
                 if while_working.is_none() {
-                    if at.elapsed() >= Duration::from_millis(500) && lookups() >= before + 5 {
+                    // Counted in lookups, never in elapsed time: on a
+                    // loaded host any fixed window can pass with no
+                    // scan run in it, and each wait+scan cycle makes
+                    // at most two lookups, so eleven more lookups mean
+                    // at least five scans had their chance to retry.
+                    if lookups() >= before + 11 {
                         while_working = Some((entry().reason, typed()));
                         *fixture.client.status.lock().expect("status") = Some("idle".to_owned());
                     }
@@ -21123,7 +21179,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
             "{listed_reason}"
         );
         let (reason_while_working, typed_while_working) =
-            while_working.expect("the loop never looked the status up five times");
+            while_working.expect("the loop never looked the status up eleven times");
         assert_eq!(
             reason_while_working.as_deref(),
             Some(listed_reason.as_str())
@@ -21319,8 +21375,9 @@ printf '%s\n' "$request" >> "$1" || exit 4
                 .is_some_and(|alarm| alarm.stalled.iter().any(|stalled| stalled.key == key))
         };
         let typed = || fixture.client.runs.lock().expect("runs").len();
-        // When the alarm first listed the request.
-        let mut listed_at: Option<Instant> = None;
+        let lookups = || fixture.client.pane_info_calls.load(AtomicOrdering::SeqCst);
+        // The number of status lookups when the alarm first listed the request.
+        let mut listed_at: Option<u64> = None;
         // The number of prompts typed when Herdr began to report the agent idle.
         let mut typed_while_working = None;
         run_owner_loop_timed(
@@ -21329,7 +21386,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
             &herdr,
             Duration::from_secs(3_600),
             DeliveryTiming {
-                retry_interval: Duration::from_millis(50),
+                retry_interval: Duration::from_millis(250),
                 stall_after: Duration::ZERO,
                 stall_repeat: Duration::from_secs(3_600),
             },
@@ -21338,14 +21395,19 @@ printf '%s\n' "$request" >> "$1" || exit 4
             None,
             None,
             |_, _| {
-                let Some(at) = listed_at else {
+                let Some(before) = listed_at else {
                     if alarmed() {
-                        listed_at = Some(Instant::now());
+                        listed_at = Some(lookups());
                     }
                     return false;
                 };
                 if typed_while_working.is_none() {
-                    if at.elapsed() >= Duration::from_millis(500) {
+                    // Counted in lookups, never in elapsed time: with
+                    // no event stream the status comes from the
+                    // scan's lookup and the backoff-spaced connect
+                    // attempts, so ten more lookups mean several
+                    // scans had their chance to retry while working.
+                    if lookups() >= before + 10 {
                         typed_while_working = Some(typed());
                         *fixture.client.status.lock().expect("status") = Some("idle".to_owned());
                     }
@@ -22180,8 +22242,8 @@ printf '%s\n' "$request" >> "$1" || exit 4
             }
             None
         }
-        // When the reads of the route were last seen all spent.
-        let mut spent_at: Option<Instant> = None;
+        // Route reads tried when the faults were armed.
+        let mut armed_at: Option<usize> = None;
         let mut armed = false;
         run_owner_loop_timed(
             &fixture,
@@ -22189,7 +22251,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
             &herdr,
             Duration::from_secs(3_600),
             DeliveryTiming {
-                retry_interval: Duration::from_millis(50),
+                retry_interval: Duration::from_millis(250),
                 stall_after: Duration::ZERO,
                 stall_repeat: Duration::from_secs(3_600),
             },
@@ -22208,6 +22270,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
                             .expect("the queue")
                             .join("processed");
                         fs::create_dir_all(&processed).expect("processed messages");
+                        armed_at = Some(state.route_read_attempts(&key));
                         state.fail_route_reads(&key, 2);
                         fs::rename(&inbox, processed.join(inbox.file_name().expect("name")))
                             .expect("move the prompt to the processed messages");
@@ -22218,15 +22281,17 @@ printf '%s\n' "$request" >> "$1" || exit 4
                 if entry().phase != RequestPhase::Delivered || !state.route_faults_spent() {
                     return false;
                 }
-                // Several scans more, among them one whose read of the route works.
-                let at = *spent_at.get_or_insert_with(Instant::now);
-                at.elapsed() >= Duration::from_millis(300)
+                // One more read since the faults, the one that
+                // works: counted in reads tried (the two failures
+                // plus a success), never in elapsed time, which a
+                // loaded host can let pass with no scan run in it.
+                state.route_read_attempts(&key) >= armed_at.expect("armed") + 3
             },
         );
         drop(herdr.release);
         herdr.server.join().expect("herdr stand-in");
         assert!(armed, "the alarm never listed the request");
-        assert!(spent_at.is_some(), "the scans never read the route twice");
+        assert!(armed_at.is_some(), "the scans never read the route");
         assert_eq!(entry().phase, RequestPhase::Delivered);
         assert!(!alarmed());
         let prompts = fixture.client.runs.lock().expect("runs").clone();
@@ -22312,6 +22377,23 @@ printf '%s\n' "$request" >> "$1" || exit 4
         Arc<AtomicU64>,
         Arc<Mutex<std::collections::VecDeque<Result<reply_reminders::ClaudeState, String>>>>,
     ) {
+        scripted_reminding_worker_with_idle(idle, Duration::from_millis(100))
+    }
+
+    /// `scripted_reminding_worker` with `idle_time` as the reminders'
+    /// idle time, for a test that must not let real time expire it.
+    #[allow(clippy::type_complexity)]
+    fn scripted_reminding_worker_with_idle(
+        idle: bool,
+        idle_time: Duration,
+    ) -> (
+        crate::subagents::tests::Fixture,
+        BridgeState,
+        ReplyReminders,
+        Arc<AtomicBool>,
+        Arc<AtomicU64>,
+        Arc<Mutex<std::collections::VecDeque<Result<reply_reminders::ClaudeState, String>>>>,
+    ) {
         let fixture = crate::subagents::tests::Fixture::new();
         fixture.start(None);
         *fixture.client.scroll.lock().expect("scroll") = Some(SCREEN_ONLY);
@@ -22323,7 +22405,7 @@ printf '%s\n' "$request" >> "$1" || exit 4
         let asked = Arc::new(AtomicU64::new(0));
         let script = Arc::default();
         let reminders = ReplyReminders::with_source(
-            Duration::from_millis(100),
+            idle_time,
             Box::new(FakeClaude {
                 idle: Arc::clone(&idle),
                 asked: Arc::clone(&asked),
@@ -22855,8 +22937,12 @@ has been seen working and is idle again, or for 1s if it is not seen working"),
             Err("claude agents --json exited 1".to_owned()),
             Ok(reply_reminders::ClaudeState::NoSession),
         ] {
+            // An idle time no scheduling delay can outlast, ended
+            // explicitly below: with a 100 ms window the second
+            // check only has to be descheduled past it on a loaded
+            // host to ask again, correctly, and fail this test.
             let (fixture, state, mut reminders, _idle, asked, script) =
-                scripted_reminding_worker(true);
+                scripted_reminding_worker_with_idle(true, Duration::from_secs(3_600));
             delivered_worker_request(&state);
             fixture.client.runs.lock().expect("runs").clear();
             script.lock().expect("script").push_back(answer.clone());
@@ -22864,7 +22950,7 @@ has been seen working and is idle again, or for 1s if it is not seen working"),
             reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
             reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
             assert_eq!(asked.load(AtomicOrdering::SeqCst), 1, "{answer:?}");
-            thread::sleep(Duration::from_millis(150));
+            reminders.expire_claude_wait();
             reminder_check(&fixture, &state, &mut reminders, &mut turn, false);
             assert_eq!(asked.load(AtomicOrdering::SeqCst), 2, "{answer:?}");
             assert!(reminders_typed(&fixture).is_empty(), "{answer:?}");

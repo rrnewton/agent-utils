@@ -587,6 +587,13 @@ impl ReplyReminders {
         self
     }
 
+    /// End the wait before asking Claude Code again, as its passing
+    /// does, so a test never has to sleep real time for it.
+    #[cfg(test)]
+    pub(super) fn expire_claude_wait(&mut self) {
+        self.claude_wait = Some(Instant::now());
+    }
+
     /// What the service logs at startup about these reminders.
     pub(super) fn describe(settings: &ReplyReminderSettings) -> String {
         format!(

@@ -16296,6 +16296,7 @@ pub(crate) mod tests {
                     unwrapped_empty: AtomicBool::new(false),
                     status: Mutex::new(None),
                     screen_after_run: Mutex::new(None),
+                    screens_after_run: Mutex::new(std::collections::VecDeque::new()),
                     labels: Mutex::new(BTreeMap::new()),
                     terminals: Mutex::new(BTreeMap::new()),
                     harness_pids: Mutex::new(BTreeMap::new()),
@@ -16765,6 +16766,10 @@ pub(crate) mod tests {
         /// The text `screen` becomes once the next text is written with `run`, when set, as a
         /// typed prompt and the turn it starts push the rows above them up.
         pub(crate) screen_after_run: Mutex<Option<String>>,
+        /// Texts successive reads return after the next `run`, first to last, before
+        /// `screen` applies: a screen sequence only the typing sets in motion, counted
+        /// in reads so a test never waits on the clock or races its own staging.
+        pub(crate) screens_after_run: Mutex<std::collections::VecDeque<String>>,
         /// Tab labels by tab id.
         labels: Mutex<BTreeMap<String, String>>,
         /// Terminal ids by pane, overriding the default `term-PANE`.
@@ -17174,6 +17179,10 @@ pub(crate) mod tests {
             if let Some(screen) = self.screen_after_run.lock().unwrap().take() {
                 *self.screen.lock().unwrap() = Some(screen);
             }
+            self.screens
+                .lock()
+                .unwrap()
+                .extend(self.screens_after_run.lock().unwrap().drain(..));
             Ok(())
         }
         fn wait_agent_status(&self, pane: &str, _: &str, _: u64) -> AdapterResult<()> {
@@ -23524,10 +23533,45 @@ fi
         // footer disappears. That old, identical availability error must not prevent continue.
         *fixture.client.screen_after_run.lock().unwrap() =
             Some("■ Selected model is at capacity. Please try a different model.\n›\n".into());
-        fixture
-            .manager()
-            .recover_transient("worker", StuckCause::ModelCapacity)
-            .unwrap();
+        // The Continue send inside recovery carries a deliberately
+        // tight 2 s lock bound, so on a loaded host it can leave the
+        // prompt pending behind the shared pane lock and recovery
+        // reports that instead of success. The condition is the end
+        // state — both prompts typed — reached by flushing a
+        // lock-bound Continue with a generous drain, and, if it
+        // expired untyped, recovering again; the guard only reports
+        // a hang.
+        let manager = fixture.manager();
+        let _ = manager.recover_transient("worker", StuckCause::ModelCapacity);
+        let until = std::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            if *fixture.client.runs.lock().unwrap()
+                == ["/goal resume", "Continue the current task."]
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "recovery never typed both prompts: {:?}",
+                fixture.client.runs.lock().unwrap()
+            );
+            let _ = manager.drain(
+                "worker",
+                DrainOptions {
+                    ready_timeout: Duration::from_secs(120),
+                    deadline: Some(Duration::from_secs(120)),
+                    lock_timeout: Some(Duration::from_secs(120)),
+                    ..DrainOptions::default()
+                },
+            );
+            if manager.pending_prompts("worker").unwrap().is_empty()
+                && *fixture.client.runs.lock().unwrap()
+                    != ["/goal resume", "Continue the current task."]
+            {
+                let _ = manager.recover_transient("worker", StuckCause::ModelCapacity);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             *fixture.client.runs.lock().unwrap(),
             ["/goal resume", "Continue the current task."]

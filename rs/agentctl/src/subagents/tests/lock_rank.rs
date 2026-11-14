@@ -248,9 +248,13 @@ fn a_send_waiting_for_readiness_holds_no_lock_and_types_once_the_pane_is_idle() 
                 "worker",
                 "/status",
                 DrainOptions {
-                    ready_timeout: Duration::from_secs(60),
+                    // Generous hang guards only: the sender must
+                    // outlive this test's own waits below, which it
+                    // does only if its budgets are not the same size
+                    // as theirs.
+                    ready_timeout: Duration::from_secs(300),
                     working_timeout: Duration::from_millis(50),
-                    deadline: Some(Duration::from_secs(60)),
+                    deadline: Some(Duration::from_secs(300)),
                     ..DrainOptions::default()
                 },
                 Some("lock-free-wait"),
@@ -259,22 +263,45 @@ fn a_send_waiting_for_readiness_holds_no_lock_and_types_once_the_pane_is_idle() 
         });
         // Wait until the prompt is queued and the first probe has found the pane busy.
         let queue = fixture.manager().queue("worker").unwrap();
-        let until = std::time::Instant::now() + Duration::from_secs(30);
+        let until = std::time::Instant::now() + Duration::from_secs(180);
         while agent::message_state(&queue, "lock-free-wait").unwrap()
             != Some(agent::QueueMessageState::Pending)
             && std::time::Instant::now() < until
         {
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            agent::message_state(&queue, "lock-free-wait").unwrap(),
+            Some(agent::QueueMessageState::Pending),
+            "the waiting send never queued its prompt"
+        );
+        // The proof is a condition, not a duration: the lifecycle lock
+        // is taken while the pane is still working and the send is
+        // still waiting. A probe holds that lock during its drain
+        // attempt — which itself queues behind other tests on the
+        // shared target lock — so try briefly and retry until a gap
+        // between probes, with the guard only reporting a hang.
         let system = agent::SystemRuntime::default();
-        // The bound proves the lock is free, so it must outlast host
-        // scheduling delays, not measure them.
-        let bounded = agent::UntilRuntime::after(&system, Duration::from_secs(60));
-        let other = fixture
-            .manager()
-            .lock_with_runtime("worker", &bounded)
-            .expect("the waiting send holds no lock");
+        let until = std::time::Instant::now() + Duration::from_secs(180);
+        let other = loop {
+            let bounded = agent::UntilRuntime::after(&system, Duration::from_millis(200));
+            match fixture.manager().lock_with_runtime("worker", &bounded) {
+                Ok(lock) => break lock,
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "the waiting send never left the lifecycle lock free: {error}"
+                    );
+                    assert!(!sender.is_finished(), "the waiting send gave up");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        assert_eq!(
+            *fixture.client.status.lock().unwrap(),
+            Some("working".to_owned()),
+            "the lock was taken only after the pane went idle"
+        );
         drop(other);
         assert!(!sender.is_finished());
         *fixture.client.status.lock().unwrap() = Some("idle".to_owned());

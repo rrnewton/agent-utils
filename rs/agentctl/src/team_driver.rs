@@ -1372,8 +1372,12 @@ mod tests {
     use std::fs;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("team-driver-{}-{tag}", std::process::id()));
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let directory = std::env::temp_dir().join(format!(
+            "team-driver-{}-{tag}-{sequence}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(directory.join("registry")).unwrap();
         directory
@@ -1601,8 +1605,21 @@ mod tests {
         }
     }
     fn run(root: &Path, host: &FakeHost, fake: &mut Fake) -> Result<DriverRecord> {
-        run_with_effects(&root.join("registry"), host, fake, &test_options(root))
-            .map(|(record, _)| record)
+        // A run that finds the driver lock still held reports the stale
+        // record and consumes no effects, so retrying until this run
+        // actually drove the machine is safe — and necessary when a
+        // just-released lock is not yet visible as free. The guard only
+        // reports a hang; having run is the condition.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let (record, action) =
+                run_with_effects(&root.join("registry"), host, fake, &test_options(root))?;
+            if action == RunAction::Ran || std::time::Instant::now() >= deadline {
+                assert_eq!(action, RunAction::Ran, "the run never drove the machine");
+                return Ok(record);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

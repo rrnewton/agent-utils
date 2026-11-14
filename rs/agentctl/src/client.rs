@@ -4158,10 +4158,20 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn process_liveness_tracks_a_real_child_before_and_after_kill() {
-        let mut process = spawn_test_process(Path::new("/usr/bin/sleep"));
-        let pid = u64::from(process.0.id());
-        let identity = live_custom_process(pid).unwrap().identity;
+        // The fixture first, the child second: the fixture's
+        // process-wide mutex can queue behind every other fixture
+        // test, and that wait must not be spent out of the child's
+        // life. The identity is pinned only once the exec has landed
+        // (the condition below): a forked child not yet scheduled to
+        // exec still carries this test binary's image, so an identity
+        // captured then is a different process image from the sleeper
+        // it becomes, and liveness rightly reads Unknown for it.
         let herdr = FakeExecutable::new("{}");
+        let executable = fs::canonicalize("/usr/bin/sleep").unwrap();
+        let mut process = spawn_long_lived_test_process(&executable);
+        let pid = u64::from(process.0.id());
+        wait_until_execd(process.0.id(), &executable);
+        let identity = live_custom_process(pid).unwrap().identity;
         assert_eq!(
             herdr.client().process_liveness(&identity),
             ProcessLiveness::Alive
@@ -4174,7 +4184,9 @@ mod tests {
             revents: 0,
         };
         // SAFETY: descriptor is initialized and refers to an owned child's pidfd.
-        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 2000) }, 1);
+        // The poll is the event wait; its bound only reports a hang.
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 120_000) }, 1);
+        assert_ne!(descriptor.revents & libc::POLLIN, 0);
         // Observe the unreaped zombie first, then the absent PID after reaping.
         assert_eq!(
             herdr.client().process_liveness(&identity),
@@ -4431,6 +4443,47 @@ mod tests {
             "start test executable: {} stayed busy for 2s",
             executable.display()
         );
+    }
+
+    /// [`spawn_test_process`] with a life no scheduling stall can
+    /// outlast: the guard kills the child at the test's end, so its
+    /// own expiry must never be what a test observes.
+    #[cfg(target_os = "linux")]
+    fn spawn_long_lived_test_process(executable: &Path) -> ChildGuard {
+        for _ in 0..100 {
+            let mut command = Command::new(executable);
+            command.arg("300").process_group(0);
+            match command.spawn() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => return ChildGuard(result.expect("start long-lived test executable")),
+            }
+        }
+        panic!(
+            "start long-lived test executable: {} stayed busy for 2s",
+            executable.display()
+        );
+    }
+
+    /// Wait until `pid`'s exec of `executable` has landed — its
+    /// `/proc` executable link names it — so an identity pinned
+    /// afterwards describes that image, never the pre-exec fork copy
+    /// of this test binary. The bound only reports a hang.
+    #[cfg(target_os = "linux")]
+    fn wait_until_execd(pid: u32, executable: &Path) {
+        let started = Instant::now();
+        loop {
+            if fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|path| path == executable) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "pid {pid} never exec'd {}",
+                executable.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5135,9 +5188,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn real_non_shell_process_cannot_be_adopted_as_a_pane_shell() {
+        // Fixture first, child second, identity only once the exec has
+        // landed — as in the liveness test above: neither the fixture
+        // mutex queue nor a pre-exec fork image may decide this test.
+        let herdr = FakeExecutable::new("{}");
         let executable = fs::canonicalize("/usr/bin/sleep").unwrap();
-        let process = spawn_test_process(&executable);
+        let process = spawn_long_lived_test_process(&executable);
         let pid = process.0.id();
+        wait_until_execd(pid, &executable);
         let response = serde_json::json!({
             "result": {
                 "process_info": {
@@ -5146,13 +5204,13 @@ mod tests {
                     "foreground_process_group_id": pid,
                     "foreground_processes": [{
                         "pid": pid,
-                        "argv": [executable.display().to_string(), "30"]
+                        "argv": [executable.display().to_string(), "300"]
                     }]
                 }
             }
         })
         .to_string();
-        let herdr = FakeExecutable::new(&response);
+        herdr.set_response(&response);
         let identity = live_custom_process(u64::from(pid)).unwrap().identity;
 
         let error = herdr.client().pane_shell_identity("pane").unwrap_err();
