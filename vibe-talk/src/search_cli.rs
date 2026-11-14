@@ -704,4 +704,34 @@ mod tests {
         assert!(out.contains("not searched: C1 (serve_off)"), "{out}");
         assert!(out.contains("only what the server's cache holds"), "{out}");
     }
+
+    #[test]
+    fn render_flags_pre_drop_hits_with_the_drop_time_not_as_in_doubt() {
+        // `#1533 vibe-talk-record-completeness`: a hit observed before a dropped update is
+        // printed and flagged with the drop's time; "thread in doubt" is not said of it.
+        let mut hit = message("M 1", "C1", "collapsable sections inside the summary");
+        hit.timestamp = "1794503204.193669".to_owned();
+        let answer = SearchAnswer {
+            hits: vec![hit],
+            scopes: vec![ScopeAnswer {
+                channel: channel("C1", Some("slack")),
+                state: "searched".to_owned(),
+                reason: None,
+                searched_back_to_ms: None,
+                held_from_ms: None,
+                whole: true,
+                expanding: false,
+                capped: 0,
+                partial: 0,
+                withheld: 0,
+                stale: 1,
+                dropped_ms: Some(1_794_671_690_891),
+            }],
+            resume_below_ms: None,
+        };
+        let out = render("https://vibe.example", &answer);
+        assert!(out.contains("collapsable sections"), "{out}");
+        assert!(out.contains("may be stale (channel had a dropped update at"), "{out}");
+        assert!(!out.contains("thread in doubt"), "{out}");
+    }
 }
