@@ -1,6 +1,6 @@
 ---
 title: 'wrkslotsd-observer-schema-writer-skew: observer rejects handoff.discarded_unaccounted'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-14T08:06:48.000000000+00:00
@@ -43,3 +43,9 @@ kind in two days: 5961820b fixed `provisioned` in the same observer schema.
 
 [watermelon-full-preview] Number assigned by coordb. Reported after the observer
 service failed every run since 2026-11-14 00:00 PST.
+
+## Resolution
+
+[watermelon-full-preview] Landed as b24fe708 on github/main. The deployed
+observer binary fails the rebuild with the reported error (exit 1); the fixed
+build replays the full event log (exit 0). Local validate and gate both pass.
