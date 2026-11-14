@@ -3201,6 +3201,7 @@ const keyboard = createKeyboardComposition({
   copyDeepLink: (message) => copyDeepLink(message),
   readCardAloud: (card) => readAloudOwner().readCardAloud(card),
   readRowAloud: (row) => readAloudOwner().readAloud(idsOf(row)),
+  stepReading: (delta) => readAloudOwner().stepReading(delta),
   combinedContent: (messages) => combinedContent(messages),
   renderedHtmlOf: (message) => renderedHtmlOf(message),
   rawTextOf: (message) => rawTextOf(message),

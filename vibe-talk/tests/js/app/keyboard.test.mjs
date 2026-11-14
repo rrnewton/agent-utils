@@ -57,7 +57,7 @@ function fakeDeps(log, overrides = {}) {
     cardForArrow: () => null, columnsShown: () => false, isComposer: () => false, closeThread: () => {},
     sideThreadId: () => "", cardRowOnRight: () => null, closeSideThread: () => {},
     toggleMessageDetails: () => {}, upstreamUrlOf: () => null, upstreamServiceName: () => "service",
-    copyUpstreamLink: () => {}, copyDeepLink: () => {}, readCardAloud: () => {}, readRowAloud: () => {},
+    copyUpstreamLink: () => {}, copyDeepLink: () => {}, readCardAloud: () => {}, readRowAloud: () => {}, stepReading: () => false,
     combinedContent: () => "text", renderedHtmlOf: () => "<p>text</p>", rawTextOf: () => "text",
     writeClipboardText: async () => true,
     closeSettings: () => {}, pressViewSwitch: () => {}, chooseView: () => {}, cycleReadMode: () => {},

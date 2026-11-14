@@ -1217,6 +1217,28 @@ def main() -> int:
                         finally:
                             sub_context.close()
 
+                # 6d. The keyboard's right arrow does the same with real key
+                # events (`page.keyboard`, CDP Input) at phone and desktop
+                # width (`#1035`, owner 046): it steps the read block by
+                # block and, on the last, finishes it and marks it read.
+                for width, height, mobile in [(412, 915, True), (1280, 800, False)]:
+                    api.dismissed.clear()
+                    with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as sub_profile:
+                        sub_context, sub_page = open_page(sub_profile, width, height, mobile)
+                        try:
+                            press(sub_page, f'#discord-log > li[data-id="{LONG}"] .body', mobile)
+                            wait_position(sub_page, "1 of 7")
+                            for at in range(2, 8):
+                                sub_page.keyboard.press("ArrowRight")
+                                wait_position(sub_page, f"{at} of 7")
+                            sub_page.keyboard.press("ArrowRight")
+                            wait_for(lambda: {"messages": [LONG]} in api.dismissed, 3,
+                                     f"ArrowRight on the last block did not finish at {width}x{height}")
+                            wait_for(lambda: position(sub_page) == "", 3,
+                                     f"the read the arrow finished kept its strip at {width}x{height}")
+                        finally:
+                            sub_context.close()
+
                 # 7. A message of one block reads whole, as before: no strip, no block asked for.
                 press(page, f'#discord-log > li[data-id="{SHORT}"] .body', True)
                 wait_for(lambda: api.reads_of(SHORT), 3, "the short message was not read")

@@ -2080,6 +2080,12 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   // `#1038 documents-outline-popup`. g toggles the document outline; Mod+g does so from a message box too.
   assert.deepStrictEqual([press("g", {}), press("g", { ctrlKey: true }, field, { mod: true })],
     [["outlineFromKeyboard did", "outlineFromKeyboard"], ["outlineFromKeyboard did", "outlineFromKeyboard"]]);
+  // `#1035 read-next-finish`: while a read plays, ArrowRight steps it (and finishes it on the
+  // last block); the thread binding keeps the key where no read takes it.
+  const rightArrows = keymap.filter((binding) => binding.run && binding.chords.some((chord) => chord.key === "ArrowRight" && !chord.mod && !chord.shift && !chord.alt));
+  assert.equal(rightArrows.length, 2, "ArrowRight has no read-step binding ahead of its thread binding");
+  assert.deepStrictEqual([rightArrows[0].run({ key: "ArrowRight" }, target), rightArrows[1].run({ key: "ArrowRight" }, target)],
+    ["stepReadingFromKeyboard did", "threadFromKeyboard did"]);
   assert.deepStrictEqual(press("ArrowDown", { repeat: true }), ["stepFromKeyboard did", "stepFromKeyboard [object Object] 1 true"]);
   assert.deepStrictEqual(press("ArrowUp"), ["stepFromKeyboard did", "stepFromKeyboard [object Object] -1"], "↑ was given a third argument");
   assert.deepStrictEqual([press("e"), press("e", { repeat: true, ctrlKey: true }, target, { mod: true }), press("e", { repeat: true }, target, { mod: true })],
@@ -2148,7 +2154,7 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
     "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "outlineFromKeyboard", "packFromKeyboard", "pickChannel",
     "placeFromKeyboard", "pressRowButton", "readCollapseFromKeyboard", "readFromKeyboard", "readModeFromKeyboard",
     "quoteFromKeyboard",
-    "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard", "stepUnreadFromKeyboard",
+    "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard", "stepReadingFromKeyboard", "stepUnreadFromKeyboard",
     "threadFromKeyboard", "threadOutFromKeyboard", "threadStripFromKeyboard", "undoFromKeyboard", "unpackFromKeyboard",
     "viewFromKeyboard", "voiceFromKeyboard", "writeFromKeyboard"];
   const wording = ["afterDone", "chatServiceName", "manyChatServices", "maxCollapsedLines", "minCollapsedLines", "modKeyName", "standalone",

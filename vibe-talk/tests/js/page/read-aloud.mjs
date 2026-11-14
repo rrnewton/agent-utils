@@ -1188,6 +1188,20 @@ test("`#1035 read-next-finish`: with Autoplay on, Next on the last block finishe
   assert.match(page.audioStreams.at(-1).url, /ticket-for-1000000000000000002/, "Autoplay did not go on to the next message");
 });
 
+test("`#1035 read-next-finish`: the right-arrow key steps the read and finishes it on the last block", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  await press(page, page.el("scroll-area"), "ArrowRight");
+  assert.equal(page.el("read-steer-count").text(), "2 of 3", "ArrowRight did not step the read");
+  await press(page, page.el("scroll-area"), "ArrowRight");
+  assert.equal(page.el("read-steer-count").text(), "3 of 3");
+  await press(page, page.el("scroll-area"), "ArrowRight");
+  await page.settle();
+  assert.deepEqual(page.dismissCalls, [{ messages: [BLOCKED_ID] }], "ArrowRight on the last block did not finish the read");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the read the arrow finished");
+});
+
 // --- `#627 scrubber-thumb-arrows`: the fat arrows step a section, the thin ones a block -------------
 
 /** A message of two sections under headings: h2, p, p, h2, p. Sections begin at blocks 0 and 3. */

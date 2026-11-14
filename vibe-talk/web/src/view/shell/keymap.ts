@@ -89,6 +89,8 @@ export interface KeymapActs<Target> {
   openFromKeyboard(event: DispatchedKey, target: Target): unknown;
   threadFromKeyboard(target: Target): unknown;
   threadOutFromKeyboard(): unknown;
+  /** `#1035 read-next-finish`. While a read plays: step it a block (finishing it on the last); else nothing. */
+  stepReadingFromKeyboard(): unknown;
   threadStripFromKeyboard(target: Target): unknown;
   columnFromKeyboard(right: boolean): unknown;
   replyFromKeyboard(target: Target): unknown;
@@ -143,7 +145,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     modKeyName, manyChatServices, chatServiceName, threadOrderWords, minCollapsedLines, maxCollapsedLines, keyContext,
     pressRowButton, onEscape, placeFromKeyboard, listEdge, jumpList, searchFromAnywhere, searchFromKeyboard,
     settingsFromKeyboard, keysFromKeyboard, stepFromKeyboard, stepChannel, pickChannel, openFromKeyboard,
-    threadFromKeyboard, threadOutFromKeyboard, threadStripFromKeyboard, columnFromKeyboard, replyFromKeyboard, quoteFromKeyboard,
+    threadFromKeyboard, threadOutFromKeyboard, stepReadingFromKeyboard, threadStripFromKeyboard, columnFromKeyboard, replyFromKeyboard, quoteFromKeyboard,
     menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard, standalone,
     copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, stepUnreadFromKeyboard, afterDone, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
     foldStepFromKeyboard, collapsedLinesFromKeyboard, packFromKeyboard, unpackFromKeyboard, bookmarkFromKeyboard,
@@ -266,6 +268,15 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
         "open the run. On a thread card, highlight it and show all of it, or put that out",
       rowControls: ["fold", "side-card"],
       run: (event, target) => openFromKeyboard(event, target),
+    },
+    {
+      // `#1035 read-next-finish`: while a read is playing the arrow is the reader's Next, as the
+      // strip's right arrow and the media nexttrack are; on the last block it finishes the read.
+      // Where no read takes it, it falls through to the thread binding below.
+      group: KEYS_MOVING, chords: [{ key: "ArrowRight" }], repeats: true,
+      does: "While a message is being read aloud, the next block of the read; on its last block, finish the read and mark it read",
+      controls: ["read-next"],
+      run: () => stepReadingFromKeyboard(),
     },
     {
       group: KEYS_MOVING, chords: [{ key: "ArrowRight" }],

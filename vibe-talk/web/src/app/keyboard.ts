@@ -199,6 +199,8 @@ export interface KeyboardCompositionDependencies<
   copyDeepLink(message: Message): unknown;
   readCardAloud(card: HTMLElement): void;
   readRowAloud(row: HTMLElement): unknown;
+  /** `#1035 read-next-finish`. Step the read in progress a block (finishing it on the last); whether it did. */
+  stepReading(delta: number): unknown;
   // Copying.
   combinedContent(messages: readonly Message[]): string;
   renderedHtmlOf(message: Message): string;
@@ -808,6 +810,7 @@ export function createKeyboardComposition<
     openFromKeyboard: (event, target) => openFromKeyboard(event, target),
     threadFromKeyboard: (target) => threadFromKeyboard(target),
     threadOutFromKeyboard: () => threadOutFromKeyboard(),
+    stepReadingFromKeyboard: () => deps.stepReading(1),
     threadStripFromKeyboard: (target) => deps.threadStripFromKeyboard(target),
     columnFromKeyboard: (right) => columnFromKeyboard(right),
     replyFromKeyboard: (target) => replyFromKeyboard(target),
