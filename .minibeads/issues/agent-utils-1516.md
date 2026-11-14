@@ -1,10 +1,11 @@
 ---
 title: 'documents-fetched-persist: downloaded documents still show as downloaded after a server restart'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-14T06:38:00.000000000+00:00
-updated_at: 2026-11-14T06:38:00.000000000+00:00
+updated_at: 2026-11-14T07:26:24.000000000+00:00
+closed_at: 2026-11-14T07:26:24.000000000+00:00
 ---
 
 # Description
@@ -34,4 +35,4 @@ Owner request 052 (2026-11-14): "In documents view I downloaded a few earlier. N
 
 Fix: the fetched cache now persists beside the fold as `documents-fetched.json`. `Fetched` is deserializable; `Service::with_persistence` loads the file on startup under the existing count and byte ceilings, drops a copy whose stored SHA-256 does not hash its content (a source ETag is kept verbatim), and rewrites the file trimmed when load drops or evicts anything. `Service::put` writes through on every fetch (evictions included) and `clear_cache` persists the empty state, both atomically by temp-file-plus-rename with one warning on failure and never a startup failure; a corrupt, partial or foreign-version file is ignored with a warning and starts empty. `service_from_config` derives the path from `index_path` via `fetched_path_for_index`, so it sits beside `[storage] path` by default; with no fold path the cache stays in memory only, as before. No page files changed: `document_row`'s `fetched` flag is this cache, so the downloaded state now survives a restart by construction.
 
-Tests: integration tests in `vibe-talk/tests/documents.rs` fetch through a fake fetcher, restart as a new service on the same temporary directory with an empty fetcher, and assert the copy and the `GET /documents` downloaded row survive; count and byte ceilings hold across restarts; corrupt and truncated files are ignored and then replaced by a fetch; and the written file is whole, version 1, keyed by key and SHA-256 version with no temp file left. Unit tests in `documents.rs` pin that ETags survive, SHA mismatches and empty keys drop, and the persisted path sits beside the fold.
+Tests: integration tests in `vibe-talk/tests/documents.rs` fetch through a fake fetcher, restart as a new service on the same temporary directory with an empty fetcher, and assert the copy and the `GET /documents` downloaded row survive; count and byte ceilings hold across restarts; corrupt and truncated files are ignored and then replaced by a fetch; and the written file is whole, version 1, keyed by key and SHA-256 version with no temp file left. Unit tests in `documents.rs` pin that ETags survive, SHA mismatches and empty keys drop, and the persisted path sits beside the fold. Landed as 98bb2bc7 on main after a fresh local validate pass and an owner-priority gate pass on the gated tree.
