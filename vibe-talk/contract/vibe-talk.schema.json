@@ -2690,6 +2690,14 @@
           "$ref": "#/$defs/ChannelInfo",
           "description": "The channel."
         },
+        "dropped_ms": {
+          "description": "When the channel's latest update was dropped, provider time: the \"may be stale since\"\ntime for `stale`. Absent when no update was dropped.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "examined": {
           "description": "Messages tested.",
           "format": "uint64",
@@ -2737,6 +2745,12 @@
             "null"
           ]
         },
+        "stale": {
+          "description": "Matching hits handed out though not seen since the channel's latest dropped update:\neach may be stale, the drop may have been its edit or deletion (`#1533\nvibe-talk-record-completeness`). Handed out flagged, never hidden: the drop names no\nrow, and hiding every older row makes the record incomplete.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "state": {
           "description": "`searched`, or `not_searched`, when `reason` says why.",
           "type": "string"
@@ -2765,7 +2779,8 @@
         "expanding",
         "capped",
         "partial",
-        "withheld"
+        "withheld",
+        "stale"
       ],
       "type": "object"
     },

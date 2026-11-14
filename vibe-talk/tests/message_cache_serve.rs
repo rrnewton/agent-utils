@@ -1351,12 +1351,14 @@ async fn a_search_of_the_servers_copy_keeps_the_serving_rules_and_says_which_ref
     );
 
     // An offer for the channel dropped: what was seen before it may be an edit or a deletion
-    // behind, so it is withheld until a read sees it again.
+    // behind, so it is handed out flagged stale with the drop's time until a read sees it
+    // again (`#1533 vibe-talk-record-completeness`) — never hidden, never vouched for.
     d.clock.advance(SECOND);
     cache.mark_suspect(&chan);
     let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;
-    assert!(hit_texts(&body).is_empty(), "{body}");
-    assert_eq!(body["scopes"][0]["withheld"], 12, "{body}");
+    assert_eq!(hit_texts(&body).len(), 12, "{body}");
+    assert_eq!(body["scopes"][0]["stale"], 12, "{body}");
+    assert_eq!(body["scopes"][0]["withheld"], 0, "{body}");
     d.clock.advance(SECOND);
     d.fill_timeline().await;
     let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), WRITE_TOKEN).await;

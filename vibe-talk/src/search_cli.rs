@@ -731,7 +731,10 @@ mod tests {
         };
         let out = render("https://vibe.example", &answer);
         assert!(out.contains("collapsable sections"), "{out}");
-        assert!(out.contains("may be stale (channel had a dropped update at"), "{out}");
+        assert!(
+            out.contains("may be stale (channel had a dropped update at"),
+            "{out}"
+        );
         assert!(!out.contains("thread in doubt"), "{out}");
     }
 }
