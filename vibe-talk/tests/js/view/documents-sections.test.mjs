@@ -1,9 +1,12 @@
 // Tests for the Documents navigator's section model (`#1508
-// documents-scrubber-multilevel`): the normalized section tree over the
-// ONE block model (`blocks.ts`), its numbers (title rule, skipped levels,
-// Introduction, the author's numbers winning), aggregation to K_target
-// with the minimum chunk size, range compression, and boundary marks.
-// Pure over the blocks, held here without a reader.
+// documents-scrubber-multilevel` for the tree and numbers, `#1541
+// documents-nav-outline-tree` for the scrubber rows): the normalized
+// section tree over the ONE block model (`blocks.ts`), its numbers
+// (title rule, skipped levels, Introduction, the author's numbers
+// winning), and the scrubber's you-are-here unfolding — chunk order
+// (a table between its neighbours), one block per chunk, path-only
+// expansion, and "…" windowing within the width cap. Pure over the
+// blocks, held here without a reader.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -103,77 +106,149 @@ test("sections: a large document numbers nested sections in order", () => {
   assert.ok(deep.end - deep.start > 100, "the huge leaf section holds its blocks");
 });
 
-test("navigator: K values come from the width (24px target, 14px hard)", () => {
-  assert.deepEqual(SECTIONS.navigatorKs(360), { kTarget: 15, kHard: 25, maxRows: 2 });
-  assert.deepEqual(SECTIONS.navigatorKs(720), { kTarget: 30, kHard: 51, maxRows: 3 });
+test("scrubber: cell cap comes from the width (24px target)", () => {
+  assert.equal(SECTIONS.scrubberMaxCells(360), 15);
+  assert.equal(SECTIONS.scrubberMaxCells(390), 16);
+  assert.equal(SECTIONS.scrubberMaxCells(720), 30);
+  assert.equal(SECTIONS.scrubberMaxCells(96), 5);
 });
 
-test("navigator: leaf aggregation honours K_hard and the minimum chunk", () => {
-  const { blocks, model: built } = model(bigDocument());
-  const huge = built.sections.find((s) => s.title === "Section 3.2");
-  const units = SECTIONS.aggregateLeafUnits(blocks, huge, 15, 25);
-  assert.ok(units.length <= 25, `expected at most K_hard units, got ${units.length}`);
-  for (const unit of units) {
-    assert.ok(unit.weight >= SECTIONS.MIN_CHUNK_CHARS || units.length === 1,
-      `unit of ${unit.weight} chars is below the minimum chunk size`);
-  }
-  // The units tile the section exactly, in order.
-  assert.equal(units[0].start, huge.start);
-  assert.equal(units[units.length - 1].end, huge.end);
-  for (let at = 1; at < units.length; at += 1) assert.equal(units[at].start, units[at - 1].end);
-});
-
-test("navigator: list runs aggregate into single units", () => {
-  const markdown = "# T\n\n## Alpha\n\n- one\n- two\n- three\n- four\n- five\n- six\n- seven\n- eight\n";
-  const { blocks, model: built } = model(markdown);
-  const alpha = built.sections.find((s) => s.title === "Alpha");
-  const units = SECTIONS.aggregateLeafUnits(blocks, alpha, 15, 25);
-  assert.equal(units.length, 1, "one list run plus its heading is one unit");
-  assert.equal(units[0].end - units[0].start, alpha.end - alpha.start);
-});
-
-test("navigator: two rows on a phone, ranges compress the peers", () => {
-  const { blocks, model: built } = model(bigDocument());
-  const inDeep = built.sections.find((s) => s.title === "Section 3.2");
-  const nav = SECTIONS.buildNavigator(blocks, built, inDeep.start + 5, 168);
-  assert.ok(nav.rows.length <= 2, `phone shows at most 2 rows, got ${nav.rows.length}`);
-  assert.equal(nav.address.startsWith("3.2 ¶"), true, `address is ${nav.address}`);
-  const top = nav.rows[0];
-  assert.ok(top.units.length <= nav.kHard, "the top row fits K_hard after compression");
-  assert.ok(top.units.some((u) => u.kind === "range" && u.label.includes("…")),
-    `peers compressed into a range: ${top.units.map((u) => u.label).join(",")}`);
-  const numbers = nav.rows.flatMap((row) => row.units.map((u) => u.number || u.label));
-  assert.ok(numbers.some((n) => n.startsWith("3")), "section numbers ride the rows");
-});
-
-test("navigator: tapping a unit starts at its first block (units tile)", () => {
-  const { blocks, model: built } = model(bigDocument());
-  const nav = SECTIONS.buildNavigator(blocks, built, 10, 360);
-  for (const row of nav.rows) {
-    for (const unit of row.units) {
-      assert.ok(unit.start < unit.end && unit.end <= blocks.length);
+test("scrubber: windowing keeps the focus, one gap per hidden run, within cap", () => {
+  for (const count of [1, 5, 16, 40, 119]) {
+    for (const cap of [3, 5, 9, 16]) {
+      for (const focus of [0, 1, Math.floor(count / 2), count - 1]) {
+        const seq = SECTIONS.windowIndices(count, focus, cap);
+        assert.ok(seq.length <= Math.max(cap, 1) || count <= cap,
+          `count ${count} cap ${cap} focus ${focus}: ${seq.length} cells`);
+        if (count > cap) assert.ok(seq.length <= cap, `count ${count} cap ${cap}: ${seq.length} cells over cap`);
+        const kept = seq.filter((e) => "index" in e).map((e) => e.index);
+        assert.ok(kept.includes(Math.min(focus, count - 1)), "the focus is kept");
+        assert.deepEqual(kept, [...kept].sort((a, b) => a - b), "kept indices stay in order");
+        for (let i = 1; i < seq.length; i += 1) {
+          assert.ok(!("gap" in seq[i] && "gap" in seq[i - 1]), "never two gaps in a row");
+        }
+        for (const entry of seq) {
+          if ("gap" in entry) assert.ok(!kept.includes(entry.gap), "a gap names a hidden index");
+        }
+      }
     }
   }
-  const current = nav.rows[nav.rows.length - 1];
-  assert.ok(current.current >= 0, "the bottom row marks the reading unit");
+  // Everything fits: no gaps at all.
+  assert.deepEqual(SECTIONS.windowIndices(4, 2, 9), [{ index: 0 }, { index: 1 }, { index: 2 }, { index: 3 }]);
 });
 
-test("navigator: boundary marks name the section a bottom-row unit enters", () => {
+function flattenSections(cells) {
+  const out = [];
+  for (const cell of cells) {
+    out.push(cell);
+    if (cell.kind === "section" && cell.children !== null) out.push(...flattenSections(cell.children));
+  }
+  return out;
+}
+
+test("scrubber: you-are-here unfolds only the path to the current section", () => {
   const { blocks, model: built } = model(bigDocument());
-  // Reading in section 1.1: the bottom row is its parent row's units where
-  // the sequence crosses sections; at minimum the model exposes adjacent
-  // section numbers for the edge placeholders.
-  const first = built.sections.find((s) => s.title === "Section 1.1");
-  const nav = SECTIONS.buildNavigator(blocks, built, first.start + 1, 360);
-  assert.equal(nav.nextSection !== "", true);
-  const marked = nav.rows.flatMap((r) => r.units).filter((u) => u.boundary !== "");
-  assert.ok(marked.every((u) => built.sections.some((s) => s.number === u.boundary)));
+  const inDeep = built.sections.find((s) => s.title === "Section 3.2");
+  const nav = SECTIONS.buildScrubberNav(blocks, built, inDeep.start + 5, 390);
+  assert.equal(nav.address.startsWith("3.2 ¶"), true, `address is ${nav.address}`);
+  assert.equal(built.sections[nav.currentSection].number, "3.2");
+  const flat = flattenSections(nav.roots);
+  const nodes = flat.filter((c) => c.kind === "section");
+  // Exactly one current, and it is 3.2.
+  assert.deepEqual(nodes.filter((n) => n.current).map((n) => n.number), ["3.2"]);
+  // Expanded (children drawn) exactly where on the path with children:
+  // section 3 is an ancestor; 3.2 itself is a leaf.
+  assert.deepEqual(nodes.filter((n) => n.children !== null).map((n) => n.number), ["3"]);
+  assert.deepEqual(nodes.filter((n) => n.ancestor).map((n) => n.number), ["3"]);
+  // The siblings unfolding showed are present around the current section.
+  const parent3 = nodes.find((n) => n.number === "3");
+  assert.deepEqual(
+    parent3.children.filter((c) => c.kind === "section").map((c) => c.number),
+    ["3.1", "3.2", "3.3"]);
+  // A non-ancestor section stays folded.
+  const folded = nodes.find((n) => n.number === "2");
+  if (folded !== undefined) assert.equal(folded.children, null);
+  // Document order: section starts strictly increase down the flattening,
+  // and every label names its exact tap target.
+  const starts = nodes.map((n) => n.start);
+  assert.deepEqual(starts, [...starts].sort((a, b) => a - b));
+  assert.equal(new Set(starts).size, starts.length);
+  for (const node of nodes) assert.equal(node.start, built.sections[node.sectionIndex].start);
+  // The whole section row fits the width cap (labels plus gap cells).
+  assert.ok(flat.length <= nav.maxCells, `section row holds ${flat.length} cells, cap ${nav.maxCells}`);
+  assert.ok(nav.chunks.length <= nav.maxCells, "chunk row fits the cap");
 });
 
-test("navigator: a document without headings gets one aggregated row", () => {
+test("scrubber: a huge leaf's chunks window with gaps, current kept, ends kept", () => {
+  const { blocks, model: built } = model(bigDocument());
+  const huge = built.sections.find((s) => s.title === "Section 3.2");
+  const at = huge.start + 60;
+  const nav = SECTIONS.buildScrubberNav(blocks, built, at, 390);
+  const range = SECTIONS.sectionChunkRange(built, built.sections.indexOf(huge));
+  assert.equal(range.start, huge.start);
+  assert.equal(range.end, huge.end);
+  assert.ok(range.end - range.start > 100, "the huge leaf holds over a hundred chunks");
+  assert.ok(nav.chunks.length <= nav.maxCells, `chunk row holds ${nav.chunks.length} cells`);
+  assert.ok(nav.chunks.some((c) => c.kind === "gap"), "hidden chunks stand as gap cells");
+  const shown = nav.chunks.filter((c) => c.kind === "chunk");
+  // One chunk is exactly one block, labelled by its local place.
+  for (const cell of shown) assert.equal(cell.local, cell.block - range.start + 1);
+  assert.deepEqual(shown.map((c) => c.block), shown.map((c) => c.block).sort((a, b) => a - b));
+  const current = shown.filter((c) => c.current);
+  assert.deepEqual(current.map((c) => c.block), [at], "the current chunk is shown, once");
+  assert.equal(shown[0].block, range.start, "the first chunk is kept");
+  assert.equal(shown[shown.length - 1].block, range.end - 1, "the last chunk is kept");
+  // A gap taps to its first hidden block, never to a shown one.
+  for (const cell of nav.chunks) {
+    if (cell.kind === "gap") assert.ok(!shown.some((c) => c.block === cell.block));
+  }
+});
+
+test("scrubber: a table's chunk lies between the chunks before and after it", () => {
+  const markdown = [
+    "# Field notes", "",
+    "## Results", "",
+    "Before the table there is a paragraph with plain words to read aloud.", "",
+    "| Lever | Cost |", "| --- | --- |", "| Alpha | 10 |", "| Beta | 20 |", "",
+    "After the table there is a paragraph with plain words to read aloud.", "",
+  ].join("\n");
+  const { blocks, model: built } = model(markdown);
+  const tableAt = blocks.findIndex((b) => b.kind === "table");
+  assert.ok(tableAt > 0, "the table is one block");
+  assert.equal(blocks[tableAt - 1].text.startsWith("Before the table"), true);
+  assert.equal(blocks[tableAt + 1].text.startsWith("After the table"), true);
+  const nav = SECTIONS.buildScrubberNav(blocks, built, tableAt, 390);
+  const shown = nav.chunks.filter((c) => c.kind === "chunk");
+  assert.deepEqual(shown.map((c) => c.block), shown.map((c) => c.block).sort((a, b) => a - b),
+    "chunks stay in document order");
+  const tableCell = shown.find((c) => c.block === tableAt);
+  assert.ok(tableCell !== undefined && tableCell.current, "the table chunk is shown and current");
+  const place = shown.indexOf(tableCell);
+  assert.equal(shown[place - 1].block, tableAt - 1, "the chunk before the table is the paragraph before it");
+  assert.equal(shown[place + 1].block, tableAt + 1, "the chunk after the table is the paragraph after it");
+});
+
+test("scrubber: a parent section's own chunks stop at its first subsection", () => {
+  const { blocks, model: built } = model(bigDocument());
+  const parent = built.sections.find((s) => s.title === "Section 3");
+  const range = SECTIONS.sectionChunkRange(built, built.sections.indexOf(parent));
+  const firstChild = built.sections[parent.children[0]];
+  assert.equal(range.start, parent.start);
+  assert.equal(range.end, firstChild.start);
+  // Standing on the parent's heading, the chunk row is that own range.
+  const nav = SECTIONS.buildScrubberNav(blocks, built, parent.start, 390);
+  for (const cell of nav.chunks) {
+    const block = cell.block;
+    assert.ok(block >= range.start && block < range.end, `chunk ${block} inside the parent's own range`);
+  }
+});
+
+test("scrubber: a document without headings gets a chunk row alone", () => {
   const markdown = Array.from({ length: 80 }, (_, i) => `Paragraph number ${i} carrying enough words to weigh in the balance of the scrubber row.`).join("\n\n");
   const { blocks, model: built } = model(markdown);
-  const nav = SECTIONS.buildNavigator(blocks, built, 40, 360);
-  assert.equal(nav.rows.length, 1);
-  assert.ok(nav.rows[0].units.length <= 25, "the single row still fits K_hard");
+  const nav = SECTIONS.buildScrubberNav(blocks, built, 40, 360);
+  assert.deepEqual(nav.roots.map((c) => c.number), ["0"], "the lone Introduction is the section row");
+  assert.equal(nav.currentSection, 0, "the Introduction holds the position");
+  assert.ok(nav.chunks.length <= nav.maxCells, "the chunk row still fits the cap");
+  assert.ok(nav.chunks.some((c) => c.kind === "chunk" && c.current && c.block === 40));
 });

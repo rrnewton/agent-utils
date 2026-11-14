@@ -22,8 +22,8 @@ import { createListening } from "../dom/index.ts";
 import { centrePopupOver } from "../dom/index.ts";
 import { documentHeadingId, renderDocumentMarkdown } from "./render.ts";
 import { documentReadBlocks } from "./blocks.ts";
-import { authorNumberOf, buildNavigator, buildSections } from "./sections.ts";
-import type { NavUnit, SectionModel } from "./sections.ts";
+import { authorNumberOf, buildScrubberNav, buildSections } from "./sections.ts";
+import type { ScrubSectionCell, SectionModel } from "./sections.ts";
 import { splitIssueHeader } from "./issueheader.ts";
 
 /** What the reader asks of the page. */
@@ -421,7 +421,9 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   let readKey: string | null = null;
   // Whether this document's read is active (started here and not yet
   // reported stopped/finished/failed): only then does a tap on text jump
-  // the read (`#1543`); an inactive tap selects or does nothing.
+  // the read (`#1543`); an inactive tap selects or does nothing. The
+  // scrubber navigator rides the same fact (`#1541`): its rows show only
+  // while this reader's document read is the read in the scrubber.
   let readingActive = false;
   // The navigator's model (`#1508`): the open document's blocks and section
   // tree, built once per open from the same block model the read speaks, so
@@ -693,13 +695,21 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   }
 
   /**
-   * Draw the navigator (`#1508`, the design's focus-plus-context row over
-   * the block row): at most two rows on a phone, three on a desk, peers
-   * that do not fit compressed into ranges, the bottom row carrying
-   * section-boundary marks with the entered section's number. Every unit
-   * is a tap target to its first block — the same `startReading` a tap in
-   * the body takes — so the read and the light follow in the one block
-   * model. A host without the element keeps the reader as it was.
+   * Draw the navigator (`#1541 documents-nav-outline-tree`): two rows
+   * inside the read scrubber, built from the Outline's section tree.
+   * Row one is the tree unfolded only along the path to the current
+   * section — expanded sections drawn as thin rectangular outlines
+   * holding their visible children, tint deepening with depth, the
+   * current section filled; row two is the current section's own
+   * chunks as rectangular blocks in the timeline's language, one
+   * chunk exactly one block, labelled with its local place in the
+   * section. Hidden runs in either row are one "…" cell. Every cell
+   * starts reading at its own block through the same `startReading`
+   * a tap in the body takes, so the read and the light follow in the
+   * one block model. Shown only while a read of the open document
+   * stands (the scrubber is its home; at the reader's head it was
+   * always on and scrolled away). A host without the element keeps
+   * the reader as it was.
    */
   function renderNavigator(): void {
     let nav: HTMLElement;
@@ -708,82 +718,111 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     } catch {
       return;
     }
-    if (!nav || navBlocks === null || navModel === null) return;
+    if (!nav) return;
+    if (!readingActive || navBlocks === null || navModel === null) {
+      nav.hidden = true;
+      return;
+    }
     const width = (typeof nav.clientWidth === "number" && nav.clientWidth > 0)
       ? nav.clientWidth
       : 360;
-    const built = buildNavigator(navBlocks, navModel, navBlock, width);
-    const totalUnits = built.rows.reduce((sum, row) => sum + row.units.length, 0);
-    nav.hidden = totalUnits <= 1;
+    const built = buildScrubberNav(navBlocks, navModel, navBlock, width);
+    let cellCount = built.chunks.length;
+    const countSections = (cells: ScrubSectionCell[]): void => {
+      for (const cell of cells) {
+        cellCount += 1;
+        if (cell.kind === "section" && cell.children !== null) countSections(cell.children);
+      }
+    };
+    countSections(built.roots);
+    nav.hidden = cellCount <= 1;
     if (nav.hidden) return;
     nav.textContent = "";
-    if (built.breadcrumb.length > 0) {
-      const crumb = document.createElement("button");
-      crumb.type = "button";
-      crumb.className = "doc-nav-crumb";
-      crumb.textContent = built.breadcrumb.join(" › ");
-      listening.listen(crumb, "click", () => { setOutlineOpen(true); });
-      nav.appendChild(crumb);
-    }
-    const makeUnit = (unit: NavUnit, current: boolean, heard: boolean): HTMLButtonElement => {
+    const makeCell = (className: string, text: string, label: string, start: number): HTMLButtonElement => {
       const button = document.createElement("button");
       button.type = "button";
-      button.className = "doc-nav-unit";
-      button.style.setProperty("flex-grow", String(Math.max(1, unit.weight)));
-      if (unit.kind === "range") button.setAttribute("data-range", "");
-      if (current) button.setAttribute("aria-current", "true");
-      if (heard) button.setAttribute("data-heard", "");
-      const text = unit.boundary !== ""
-        ? `│${unit.boundary} ${unit.label}`.trim()
-        : (unit.label !== "" ? unit.label : `${unit.start + 1}`);
+      button.className = className;
       button.textContent = text;
-      button.setAttribute("aria-label", `Read from ${text}`);
-      // A nested unit's tap is its own: it must not also fire the host
-      // cell's tap underneath it (`#1508` landing 3).
+      button.setAttribute("aria-label", label);
       listening.listen<MouseEvent>(button, "click", (event) => {
         if (typeof event.stopPropagation === "function") event.stopPropagation();
-        startReading(unit.start);
+        startReading(start);
       });
-      if (unit.nested !== undefined && unit.nested.length > 0) {
-        const nest = document.createElement("span");
-        nest.className = "doc-nav-nested";
-        for (const inner of unit.nested) {
-          const innerCurrent = navBlock >= inner.start && navBlock < inner.end;
-          nest.appendChild(makeUnit(inner, innerCurrent, inner.end <= navBlock));
-        }
-        button.appendChild(nest);
-      }
       return button;
     };
-    built.rows.forEach((row, rowAt) => {
-      const line = document.createElement("div");
-      line.className = "doc-nav-row";
-      const isBottom = rowAt === built.rows.length - 1;
-      if (isBottom && built.prevSection !== "") {
-        const edge = document.createElement("button");
-        edge.type = "button";
-        edge.className = "doc-nav-edge";
-        edge.textContent = `‹ ${built.prevSection}`;
-        edge.setAttribute("aria-label", `Read from section ${built.prevSection}`);
-        const target = navModel?.sections.find((section) => section.number === built.prevSection);
-        listening.listen(edge, "click", () => { if (target !== undefined) startReading(target.start); });
-        line.appendChild(edge);
+    // Section widths follow the visible cells, not the sections'
+    // character counts: the row is navigated by its number labels, so
+    // each label keeps a readable share and an unfolded outline takes
+    // one share per cell it holds. (Character-proportional widths
+    // starved small sections to slivers beside one huge section.)
+    const makeSection = (cell: ScrubSectionCell): { el: HTMLElement; cells: number } => {
+      if (cell.kind === "gap") {
+        const target = navModel?.sections[cell.sectionIndex];
+        const button = makeCell(
+          "doc-nav-unit doc-nav-gap", "…",
+          `Read from section ${target?.number ?? ""}`.trim(), cell.start,
+        );
+        button.setAttribute("data-gap", "");
+        return { el: button, cells: 1 };
       }
-      row.units.forEach((unit, at) => {
-        line.appendChild(makeUnit(unit, at === row.current, unit.end <= navBlock));
-      });
-      if (isBottom && built.nextSection !== "") {
-        const edge = document.createElement("button");
-        edge.type = "button";
-        edge.className = "doc-nav-edge";
-        edge.textContent = `${built.nextSection} ›`;
-        edge.setAttribute("aria-label", `Read from section ${built.nextSection}`);
-        const target = navModel?.sections.find((section) => section.number === built.nextSection);
-        listening.listen(edge, "click", () => { if (target !== undefined) startReading(target.start); });
-        line.appendChild(edge);
+      const button = makeCell(
+        "doc-nav-unit doc-nav-section", cell.number,
+        `Read from section ${cell.number} ${cell.title}`.trim(), cell.start,
+      );
+      if (cell.current) button.setAttribute("aria-current", "true");
+      if (cell.heard) button.setAttribute("data-heard", "");
+      if (cell.children === null) return { el: button, cells: 1 };
+      // An unfolded section: a thin outline around its own label and
+      // its visible children (a span, never a button around buttons).
+      const outline = document.createElement("span");
+      outline.className = "doc-nav-outline";
+      outline.setAttribute("data-depth", String(cell.depth));
+      if (cell.ancestor) outline.setAttribute("data-ancestor", "");
+      outline.appendChild(button);
+      const kids = document.createElement("span");
+      kids.className = "doc-nav-children";
+      let cells = 1;
+      for (const child of cell.children) {
+        const made = makeSection(child);
+        cells += made.cells;
+        kids.appendChild(made.el);
+      }
+      kids.style.setProperty("flex-grow", String(Math.max(1, cells - 1)));
+      outline.appendChild(kids);
+      outline.style.setProperty("flex-grow", String(cells));
+      return { el: outline, cells };
+    };
+    if (built.roots.length > 0) {
+      const line = document.createElement("div");
+      line.className = "doc-nav-row doc-nav-sections";
+      line.setAttribute("role", "group");
+      line.setAttribute("aria-label", "Sections of the document");
+      for (const cell of built.roots) line.appendChild(makeSection(cell).el);
+      nav.appendChild(line);
+    }
+    if (built.chunks.length > 0) {
+      const line = document.createElement("div");
+      line.className = "doc-nav-row doc-nav-chunks";
+      line.setAttribute("role", "group");
+      line.setAttribute("aria-label", "Blocks of the current section");
+      for (const cell of built.chunks) {
+        if (cell.kind === "gap") {
+          const button = makeCell("doc-nav-chunk doc-nav-gap", "…", "Read from here", cell.block);
+          button.setAttribute("data-gap", "");
+          line.appendChild(button);
+          continue;
+        }
+        const button = makeCell(
+          "doc-nav-chunk", String(cell.local),
+          cell.address !== "" ? `Read from ${cell.address}` : "Read from here", cell.block,
+        );
+        button.style.setProperty("flex-grow", String(Math.max(1, cell.weight)));
+        if (cell.current) button.setAttribute("aria-current", "true");
+        if (cell.heard) button.setAttribute("data-heard", "");
+        line.appendChild(button);
       }
       nav.appendChild(line);
-    });
+    }
   }
 
   /** The attribute on the block being read: read-aloud's own for a message's block. */
@@ -869,7 +908,12 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
    */
   function onReadingBlock(block: number | null, _element?: number | null): void {
     if (block === null || !Number.isInteger(block) || currentDoc === null || currentDoc.key !== readKey) {
-      if (block === null) readingActive = false;
+      if (block === null) {
+        readingActive = false;
+        // The read stopped, finished or failed: the scrubber's rows go
+        // with it (`#1541`), so a later message read keeps its timeline.
+        renderNavigator();
+      }
       clearReadingLight();
       return;
     }
@@ -880,6 +924,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       return;
     }
     if (!body) return;
+    // A live position report means this document's read stands, even
+    // where a restart reported a stop (a null block) on its way here.
     readingActive = true;
     navBlock = block;
     renderNavigator();
@@ -1203,7 +1249,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     },
     close(): void {
       stopOwnReading();
-      clearReadingLight();
+        clearReadingLight();
       closeOutline(false);
       stopWatching();
       try {

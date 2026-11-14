@@ -21,7 +21,7 @@ document's words and the device says nothing new. Back stops a read.
 
 The block being read is lit in the reader and kept in view (`#1330
 doc-read-highlight`), as a message's block is lit: starting Read lights the
-first block, Next moves the light, a timeline jump to the last block (off
+first block, Next moves the light, a scrubber-chunk jump to the last block (off
 screen in a document this long) brings the lit block inside the scroller,
 and finishing, stopping and Back all take the light off.
 """
@@ -372,7 +372,9 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     check(handlers == ["nexttrack", "pause", "play", "previoustrack", "stop"],
           f"the document read holds media handlers {handlers}")
     # `#1543`: active — tapping document text jumps the read there, and the
-    # timeline's first block brings it back for the steps that follow.
+    # scrubber's first chunk brings it back for the steps that follow.
+    # (`#1541`: a document read's jumps ride the navigator's chunk row in
+    # the scrubber; the flat per-block timeline stands down for documents.)
     active_block = page.locator("#doc-body > p", has_text=blocks[1][:20])
     if touch:
         active_block.tap()
@@ -382,7 +384,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     wait_lit(page, blocks[1])
     page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=20_000)
     check(utterances(page)[-1] == blocks[1], "an active tap on document text did not jump the read there")
-    act(f'#read-timeline button[aria-label="Read from block 1 of {count}"]')
+    act('#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("1")')
     wait_count(page, f"1 of {count}")
     wait_lit(page, blocks[0])
 
@@ -420,7 +422,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     # and the reader follows it into the scroller's view (`#1330`).
     check(block_off_screen(page, blocks[-1]),
           "the premise: the last block already stands in view before the jump")
-    act(f'#read-timeline button[aria-label="Read from block {count} of {count}"]')
+    act(f'#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("{count}")')
     wait_count(page, f"{count} of {count}")
     wait_lit(page, blocks[-1])
     wait_lit_in_view(page)
@@ -446,7 +448,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     # waits on the owner's read state).
     act("#doc-read")
     wait_count(page, f"1 of {count}")
-    act(f'#read-timeline button[aria-label="Read from block {count} of {count}"]')
+    act(f'#doc-nav .doc-nav-chunks .doc-nav-chunk:text-is("{count}")')
     wait_count(page, f"{count} of {count}")
     said_before_finish = len(utterances(page))
     act("#read-next")

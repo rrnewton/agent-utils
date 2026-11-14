@@ -202,6 +202,14 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       }
       // `#429 keyboard-hides-bar`: the channel's box and a reply in the stream as well, where they were in view.
       if (keepWrittenBox(area, seen, now)) return;
+      // While the Documents pane stands in this scroller, its reader is
+      // placed by its own landing (a document's first open lands at its
+      // top, `#1264`), and dock growth under it — the bar re-dressing
+      // for the reader — must not take that reader to the document's
+      // foot (`#1541`, whose faster open let this report land after the
+      // document's landing). The note above still stands, so growth is
+      // reckoned afresh when a list comes back.
+      if (screens.view() === "docs") return;
       if (grew > 0 && seen !== null && seen.gap !== undefined) {
         if (seen.gap <= BOTTOM_SLACK_PX) deps.toFoot(area);
         return;
