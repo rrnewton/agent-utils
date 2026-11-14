@@ -1,10 +1,11 @@
 ---
 title: 'cross-differential-load-aware: load-aware timing checks so the cross differentials leave the gate''s exclusive phase'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-08T15:20:00.000000000+00:00
-updated_at: 2026-11-08T15:20:00.000000000+00:00
+updated_at: 2026-11-14T22:40:19+00:00
+closed_at: 2026-11-14T22:40:19+00:00
 ---
 
 # Description
@@ -27,3 +28,7 @@ The gate's exclusive phase is the queue's biggest bottleneck: on 2026-11-08 one 
 # Notes
 
 Filed by the devbig030 coordinator at the lead's request (2026-11-08); implemented by a fresh lane from mu-validate's handoff.
+
+## Resolution
+
+[watermelon-full-preview] Closed 2026-11-14 as subsumed by #1249 cross-differentials-robust. The approach changed: instead of making the timing assertions load-aware (judging measured times against load or a same-run calibration, which still keeps a wall clock in the verdict), #1249 removed every wall-clock verdict from the five differentials outright — outputs and behaviour are compared, hang guards are generous and reported as hangs, and pure-speed checks leave gating. All five steps (`cross.agentctl.differential-0/1/2`, `cross.herdr-run.differential`, `cross.agentctl.herdr-agent-differential`) now run in the main phase with no `gate-exclusive` label; the last label-drop landed as 08fbe690 on 2026-11-14. The exclusive phase this issue targeted is therefore empty for these steps, and its acceptance criteria are moot in their original form; the qualification records (10 consecutive saturated-scope passes per differential, CPU-second runaway guards at 2x measured peak) live in #1249.

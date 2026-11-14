@@ -1,10 +1,11 @@
 ---
 title: 'cross-differentials-robust: bring back the cross differentials without wall-clock budgets'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 created_at: 2026-11-10T21:23:00+00:00
-updated_at: 2026-11-10T21:23:00+00:00
+updated_at: 2026-11-14T22:40:19+00:00
+closed_at: 2026-11-14T22:40:19+00:00
 ---
 
 # Description
@@ -41,3 +42,8 @@ Filed by mu-gatefast in the same commit that disables the five steps, at the own
 - CPU budget record (2026-11-14): uncapped solo passes on 24 reserved CPUs measured per-shard CPU demand of 1007 s (differential-0), 3387 s (differential-1) and 1502 s (differential-2); median 1502 s, peak 3387 s. In the 48-CPU gate scope (CPUQuota=4800%) differential-1 was killed at the old 2400 cpu_timeout twice (2469 s and 2570 s wall, zero divergences). The three shards' `cpu_timeout` is now 8192: at least 2x the measured peak (2.4x), rounded up. The cap is a runaway guard in CPU-seconds, not a speed budget (owner rule 346). Finer sharding is #1519 cross-agentctl-differential-shard-finer.
 - `cross.agentctl.differential-0`: qualified 2026-11-14 in the scoped method (24 reserved CPUs, busy spinners, CPUQuota 2400%): passes 1 (1611 s), 2 (1610 s), 5 (1687 s), 6 (1640 s), 7 (1621 s), 8 (1618 s) clean, each `cross[agentctl]: OK - 289 paired checks agree`; uncapped CPU demand 1007 s. Discarded: the aborted first series' pass (vibe-talk deploy build window 14:58:05-14:59:23Z), pass 3 (gate windows mu-foldline 16:04:44-16:12:11Z and mu-prompts from 16:16Z, plus the eb5fd4ed build 16:16:05-16:17:19Z), and pass 4 (gates mu-prompts 16:17:24-16:24:32Z, mu-discussread 16:31:09-16:38:44Z, mu-sharedholds 16:20:55-16:42:45Z). mu-uxqa's disclosed light browser walks overlapped passes 4+ without discard. Per coordb's decision the quiet-host 10x was waived for this shard: CPU-seconds caps with a 2x margin tolerate load, and the main-phase gate is the robustness check. F code (launch refusals declare an effort) landed separately as 9e7c8bb9. Re-enabled in the main phase by dropping its `gate-exclusive` label.
 - `cross.agentctl.differential-1`: qualified 2026-11-13/14 in the same scoped method. Scope: `cpuset-alloc run` reserved disjoint CPUs (passes 1-2 on 4 CPUs 72,138,169,175; passes 3-10 on 24 CPUs) with busy spinners in the same scope (CPUQuota 400%, then 2400%). Result: 10/10 consecutive passes (`cross[agentctl]: OK - 263 paired checks agree` each), pass durations 4200-4281 s. Prerequisites landed separately: effort parity (fc2bdbd2), ultra env gate and status profile drift (8ed43bc8), per-root unique fixture pane identities (18bd54b1), queue-quiescence waits (0b108ebb). Re-enabled in the main phase by dropping its `gate-exclusive` label.
+- `cross.agentctl.differential-1` label-drop landed 862e3240; `cross.agentctl.differential-0` label-drop landed 08fbe690 on a full gate (267 steps, exit 0, zero failed steps; gate verdict PARTIAL only because 7 delegated-live-scope cross checks were skipped-unverified; differentials 0/1/2 PASS 289/263/344 checks in 1491s/4020s/2331s). All five differentials now run in the main phase; no `gate-exclusive` step remains.
+
+## Resolution
+
+[watermelon-full-preview] Complete 2026-11-14. All five differentials are de-timed (no wall-clock budget decides a verdict; generous hang guards only) and back in the main phase, each landed separately: herdr-agent 898935e9, herdr-run d53fde84, agentctl shard 2 (step D) 8f9587b2, shard 1 (step E) 862e3240, shard 0 (step F) 08fbe690. Qualification records per shard are above. CPU caps are runaway guards in CPU-seconds sized at 2x the measured peak (8192), not speed budgets; finer sharding is #1519 cross-agentctl-differential-shard-finer. Related de-flakes landed separately: effort parity fc2bdbd2, communicate hang-guard c59a39df, chat kill-timing family 192a80de (#1486), census fake-proc d80f93e9, gate-admission queue-condition wait 5b0354bd (#1494). #1067 cross-differential-load-aware is closed as subsumed by this issue.
