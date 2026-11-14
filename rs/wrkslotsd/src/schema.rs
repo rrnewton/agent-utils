@@ -9,6 +9,94 @@ use crate::evidence::ScopeIdentity;
 use crate::replay::validate_name;
 use crate::ObserverError;
 
+/// Required and optional keys of each record the observer schema and the
+/// writer/reader schemas both validate (#1517). `active_state.rs` uses
+/// these same tables, and a test below compares them against the Python
+/// writer in `py/wrkslots/cli.py`, so the three cannot drift apart.
+pub(crate) const ACTIVE_RECORD_REQUIRED: &[&str] = &[
+    "slot",
+    "agent",
+    "task",
+    "purpose",
+    "machine",
+    "generation",
+    "created_at",
+    "heartbeat_at",
+    "heartbeat_ttl_seconds",
+    "owner",
+    "coordinator_lease",
+    "coordinator_recovery_note",
+    "handoff",
+    "checkouts",
+];
+pub(crate) const ACTIVE_RECORD_OPTIONAL: &[&str] = &[
+    "slot_type",
+    "layout",
+    "import_source",
+    "task_scope",
+    // Recorded by create for harness-checkout slots (#1299).
+    "harness_checkout_reason",
+];
+pub(crate) const ARCHIVE_RECORD_REQUIRED: &[&str] = &[
+    "archive_id",
+    "slot",
+    "agent",
+    "task",
+    "purpose",
+    "machine",
+    "generation",
+    "created_at",
+    "finished_at",
+    "mode",
+    "actor",
+    "physical_storage",
+    "validation",
+    "limitations",
+    "continuation",
+    "checkouts",
+];
+pub(crate) const ARCHIVE_RECORD_OPTIONAL: &[&str] =
+    &["slot_type", "salvage", "layout", "import_source"];
+pub(crate) const IDENTITY_REQUIRED: &[&str] =
+    &["pid", "start_ticks", "boot_id", "host_id", "cgroup_path"];
+pub(crate) const IDENTITY_OPTIONAL: &[&str] = &["namespace_pid", "pidns_inode"];
+pub(crate) const HANDOFF_REQUIRED: &[&str] =
+    &["recorded_at", "validation", "limitations", "continuation"];
+pub(crate) const HANDOFF_OPTIONAL: &[&str] = &["discarded_unaccounted"];
+pub(crate) const CHECKOUT_REQUIRED: &[&str] = &[
+    "name",
+    "path",
+    "repository",
+    "branch",
+    "start_point",
+    "remote",
+    "remote_url_sha256",
+    "landed_ref",
+    "head",
+    "containing_remote_refs",
+    "vcs",
+];
+// Create records provisioned output on the checkout (#1369); the observer
+// accepts the additive field.
+pub(crate) const CHECKOUT_OPTIONAL: &[&str] = &["provisioned"];
+pub(crate) const IMPORT_SOURCE_REQUIRED: &[&str] = &[
+    "format",
+    "path",
+    "file_sha256",
+    "row_sha256",
+    "status",
+    "row",
+];
+pub(crate) const TASK_SCOPE_REQUIRED: &[&str] = &[
+    "unit",
+    "invocation_id",
+    "cgroup_path",
+    "boot_id",
+    "leader_pid",
+    "leader_start_ticks",
+    "verification",
+];
+
 const ACTIVE_STATUSES: &[&str] = &[
     "active",
     "lease-quarantined",
@@ -78,30 +166,8 @@ pub(crate) fn validate_active_record(
     let record = object(value, label)?;
     exact_keys_optional(
         record,
-        &[
-            "slot",
-            "agent",
-            "task",
-            "purpose",
-            "machine",
-            "generation",
-            "created_at",
-            "heartbeat_at",
-            "heartbeat_ttl_seconds",
-            "owner",
-            "coordinator_lease",
-            "coordinator_recovery_note",
-            "handoff",
-            "checkouts",
-        ],
-        &[
-            "slot_type",
-            "layout",
-            "import_source",
-            "task_scope",
-            // Recorded by create for harness-checkout slots (#1299).
-            "harness_checkout_reason",
-        ],
+        ACTIVE_RECORD_REQUIRED,
+        ACTIVE_RECORD_OPTIONAL,
         label,
     )?;
     let slot = named_string(&record["slot"], &format!("{label}.slot"))?;
@@ -239,25 +305,8 @@ pub(crate) fn validate_archive_record(
     let record = object(value, label)?;
     exact_keys_optional(
         record,
-        &[
-            "archive_id",
-            "slot",
-            "agent",
-            "task",
-            "purpose",
-            "machine",
-            "generation",
-            "created_at",
-            "finished_at",
-            "mode",
-            "actor",
-            "physical_storage",
-            "validation",
-            "limitations",
-            "continuation",
-            "checkouts",
-        ],
-        &["slot_type", "salvage", "layout", "import_source"],
+        ARCHIVE_RECORD_REQUIRED,
+        ARCHIVE_RECORD_OPTIONAL,
         label,
     )?;
     let slot = named_string(&record["slot"], &format!("{label}.slot"))?;
@@ -344,12 +393,7 @@ fn validate_identity(value: &Value, label: &str) -> Result<Option<Identity>, Obs
         return Ok(None);
     }
     let identity = object(value, label)?;
-    exact_keys_optional(
-        identity,
-        &["pid", "start_ticks", "boot_id", "host_id", "cgroup_path"],
-        &["namespace_pid", "pidns_inode"],
-        label,
-    )?;
+    exact_keys_optional(identity, IDENTITY_REQUIRED, IDENTITY_OPTIONAL, label)?;
     let pid = positive(&identity["pid"], &format!("{label}.pid"))?;
     let start_ticks = positive(&identity["start_ticks"], &format!("{label}.start_ticks"))?;
     let boot_id = nonempty_string(&identity["boot_id"], &format!("{label}.boot_id"))?;
@@ -371,11 +415,15 @@ fn validate_handoff(value: &Value, label: &str) -> Result<(), ObserverError> {
         return Ok(());
     }
     let handoff = object(value, label)?;
-    exact_keys(
-        handoff,
-        &["recorded_at", "validation", "limitations", "continuation"],
-        label,
-    )?;
+    exact_keys_optional(handoff, HANDOFF_REQUIRED, HANDOFF_OPTIONAL, label)?;
+    if let Some(discarded) = handoff.get("discarded_unaccounted") {
+        for (index, item) in array(discarded, &format!("{label}.discarded_unaccounted"))?
+            .iter()
+            .enumerate()
+        {
+            digest(item, 40, &format!("{label}.discarded_unaccounted[{index}]"))?;
+        }
+    }
     parse_timestamp(
         string(&handoff["recorded_at"], &format!("{label}.recorded_at"))?,
         &format!("{label}.recorded_at"),
@@ -398,26 +446,7 @@ fn validate_checkouts(value: &Value, parent: &str) -> Result<Vec<Checkout>, Obse
     for (index, value) in values.iter().enumerate() {
         let label = format!("{parent}.checkouts[{index}]");
         let checkout = object(value, &label)?;
-        exact_keys_optional(
-            checkout,
-            &[
-                "name",
-                "path",
-                "repository",
-                "branch",
-                "start_point",
-                "remote",
-                "remote_url_sha256",
-                "landed_ref",
-                "head",
-                "containing_remote_refs",
-                "vcs",
-            ],
-            // Create records provisioned output on the checkout
-            // (#1369); the observer accepts the additive field.
-            &["provisioned"],
-            &label,
-        )?;
+        exact_keys_optional(checkout, CHECKOUT_REQUIRED, CHECKOUT_OPTIONAL, &label)?;
         let name = named_string(&checkout["name"], &format!("{label}.name"))?;
         if !names.insert(name.clone()) {
             return Err(invalid(format!("{parent} has duplicate checkout names")));
@@ -499,18 +528,7 @@ fn validate_import_source(
     }
     let label = format!("{parent}.import_source");
     let source = object(value, &label)?;
-    exact_keys(
-        source,
-        &[
-            "format",
-            "path",
-            "file_sha256",
-            "row_sha256",
-            "status",
-            "row",
-        ],
-        &label,
-    )?;
+    exact_keys(source, IMPORT_SOURCE_REQUIRED, &label)?;
     if string(&source["format"], &format!("{label}.format"))? != "worktree-state-v3" {
         return Err(invalid(format!("{label}.format is unsupported")));
     }
@@ -1298,5 +1316,161 @@ mod tests {
     fn active_record_still_refuses_unknown_checkout_fields() {
         let value = record(json!({"surprise": 1}));
         assert!(validate_active_record(&value, "node-a", "record").is_err());
+    }
+
+    fn record_with_handoff(handoff: Value) -> Value {
+        let mut value = record(json!({}));
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("handoff".to_string(), handoff);
+        value
+    }
+
+    #[test]
+    fn active_record_accepts_discarded_unaccounted_handoff() {
+        // Writers since c88e65a5 record finish-discarded commits on the
+        // handoff (#1364); the observer must not fail a whole rebuild.
+        let value = record_with_handoff(json!({
+            "recorded_at": "2026-11-07T00:00:00Z",
+            "validation": ["checked"],
+            "limitations": [],
+            "continuation": "continue",
+            "discarded_unaccounted": ["a".repeat(40)],
+        }));
+        validate_active_record(&value, "node-a", "record").expect("discarded accepted");
+    }
+
+    #[test]
+    fn active_record_refuses_invalid_discarded_unaccounted() {
+        let value = record_with_handoff(json!({
+            "recorded_at": "2026-11-07T00:00:00Z",
+            "validation": ["checked"],
+            "limitations": [],
+            "continuation": "continue",
+            "discarded_unaccounted": ["not-a-sha"],
+        }));
+        assert!(validate_active_record(&value, "node-a", "record").is_err());
+    }
+
+    fn key_set(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|key| (*key).to_owned()).collect()
+    }
+
+    /// The `(required, optional)` key sets a Python `_exact_keys` call in
+    /// `function` declares, resolving a `fields = {...}` local.
+    fn python_key_sets(source: &str, function: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+        let start = source
+            .find(&format!("def {function}("))
+            .unwrap_or_else(|| panic!("{function} not found in Python writer"));
+        let body = &source[start..];
+        let body = &body[..body.find("\ndef ").unwrap_or(body.len())];
+        let call = body
+            .find("_exact_keys(")
+            .unwrap_or_else(|| panic!("{function} has no _exact_keys call"));
+        let args = &body[call..];
+        let args = &args[..args.find("\n    )").unwrap_or(args.len())];
+        let mut parts: Vec<&str> = Vec::new();
+        let mut depth = 0_i32;
+        let mut part_start = 0_usize;
+        for (index, byte) in args.bytes().enumerate() {
+            match byte {
+                b'{' | b'(' | b'[' => depth += 1,
+                b'}' | b')' | b']' => depth -= 1,
+                b',' if depth == 1 => {
+                    parts.push(&args[part_start..index]);
+                    part_start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&args[part_start..]);
+        let resolve = |part: &str| -> BTreeSet<String> {
+            let part = part.trim().trim_start_matches("_exact_keys(").trim();
+            if part == "set()" {
+                return BTreeSet::new();
+            }
+            let set_text = if let Some(open) = part.find('{') {
+                &part[open..]
+            } else {
+                // A bare name: `fields = {...}` earlier in the function.
+                let name = part.trim_end_matches(',').trim();
+                let assign = body
+                    .find(&format!("{name} = {{"))
+                    .unwrap_or_else(|| panic!("{function}: cannot resolve {name}"));
+                &body[assign..]
+            };
+            let close = set_text.find('}').expect("set closes");
+            set_text[..close]
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(str::to_owned)
+                .collect()
+        };
+        // parts[0] is the mapping argument; required and optional follow.
+        (resolve(parts[1]), resolve(parts[2]))
+    }
+
+    #[test]
+    fn shared_key_tables_match_python_writer() {
+        // Fails when the observer schema and the Python writer disagree
+        // on a shared record's keys (#1517). The Rust reader uses these
+        // same constants, so it is covered by construction.
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../py/wrkslots/cli.py"
+        ))
+        .expect("read Python writer");
+        let cases: [(&str, &[&str], &[&str]); 7] = [
+            (
+                "_record_from_obj",
+                ACTIVE_RECORD_REQUIRED,
+                ACTIVE_RECORD_OPTIONAL,
+            ),
+            (
+                "_archive_record_from_obj",
+                ARCHIVE_RECORD_REQUIRED,
+                ARCHIVE_RECORD_OPTIONAL,
+            ),
+            ("_identity_from_obj", IDENTITY_REQUIRED, IDENTITY_OPTIONAL),
+            ("_handoff_from_obj", HANDOFF_REQUIRED, HANDOFF_OPTIONAL),
+            ("_checkout_from_obj", CHECKOUT_REQUIRED, CHECKOUT_OPTIONAL),
+            ("_import_source_from_obj", IMPORT_SOURCE_REQUIRED, &[]),
+            ("_task_scope_from_obj", TASK_SCOPE_REQUIRED, &[]),
+        ];
+        for (function, required, optional) in cases {
+            let (python_required, python_optional) = python_key_sets(&source, function);
+            assert_eq!(python_required, key_set(required), "{function} required");
+            assert_eq!(python_optional, key_set(optional), "{function} optional");
+        }
+    }
+
+    #[test]
+    fn observer_and_reader_agree_on_active_record_keys() {
+        // Both validators must accept or reject the same key mutations.
+        let base = record(json!({}));
+        assert!(validate_active_record(&base, "node-a", "record").is_ok());
+        assert!(crate::active_state::record_from_obj(&base, "record").is_ok());
+        let mut unknown = base.clone();
+        unknown
+            .as_object_mut()
+            .expect("object")
+            .insert("surprise".to_string(), json!(1));
+        assert!(validate_active_record(&unknown, "node-a", "record").is_err());
+        assert!(crate::active_state::record_from_obj(&unknown, "record").is_err());
+        let mut missing = base.clone();
+        missing.as_object_mut().expect("object").remove("task");
+        assert!(validate_active_record(&missing, "node-a", "record").is_err());
+        assert!(crate::active_state::record_from_obj(&missing, "record").is_err());
+        let discarded = record_with_handoff(json!({
+            "recorded_at": "2026-11-07T00:00:00Z",
+            "validation": ["checked"],
+            "limitations": [],
+            "continuation": "continue",
+            "discarded_unaccounted": ["a".repeat(40)],
+        }));
+        assert!(validate_active_record(&discarded, "node-a", "record").is_ok());
+        assert!(crate::active_state::record_from_obj(&discarded, "record").is_ok());
     }
 }

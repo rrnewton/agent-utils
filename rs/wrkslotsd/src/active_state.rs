@@ -16,6 +16,11 @@ use crate::config_validate::{
     ensure_no_symlink_components, load_config, normpath, refuse_symlink, validate_full_ref,
     validate_layout, validate_name, validate_remote,
 };
+use crate::schema::{
+    ACTIVE_RECORD_OPTIONAL, ACTIVE_RECORD_REQUIRED, CHECKOUT_OPTIONAL, CHECKOUT_REQUIRED,
+    HANDOFF_OPTIONAL, HANDOFF_REQUIRED, IDENTITY_OPTIONAL, IDENTITY_REQUIRED,
+    IMPORT_SOURCE_REQUIRED, TASK_SCOPE_REQUIRED,
+};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -228,12 +233,7 @@ pub(crate) fn identity_from_obj(value: &Value, label: &str) -> Result<Option<Ide
         return Ok(None);
     }
     let raw = as_mapping(value, label)?;
-    exact_keys(
-        raw,
-        &["pid", "start_ticks", "boot_id", "host_id", "cgroup_path"],
-        &["namespace_pid", "pidns_inode"],
-        label,
-    )?;
+    exact_keys(raw, IDENTITY_REQUIRED, IDENTITY_OPTIONAL, label)?;
     let identity = Identity {
         pid: as_int(&raw["pid"], &format!("{label}.pid"), 1)?,
         start_ticks: as_int(&raw["start_ticks"], &format!("{label}.start_ticks"), 1)?,
@@ -265,12 +265,7 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
         return Ok(());
     }
     let raw = as_mapping(value, label)?;
-    exact_keys(
-        raw,
-        &["recorded_at", "validation", "limitations", "continuation"],
-        &["discarded_unaccounted"],
-        label,
-    )?;
+    exact_keys(raw, HANDOFF_REQUIRED, HANDOFF_OPTIONAL, label)?;
     if let Some(discarded) = raw.get("discarded_unaccounted") {
         for (index, item) in as_list(discarded, &format!("{label}.discarded_unaccounted"))?
             .iter()
@@ -307,24 +302,7 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
 
 pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRec> {
     let raw = as_mapping(value, label)?;
-    exact_keys(
-        raw,
-        &[
-            "name",
-            "path",
-            "repository",
-            "branch",
-            "start_point",
-            "remote",
-            "remote_url_sha256",
-            "landed_ref",
-            "head",
-            "containing_remote_refs",
-            "vcs",
-        ],
-        &["provisioned"],
-        label,
-    )?;
+    exact_keys(raw, CHECKOUT_REQUIRED, CHECKOUT_OPTIONAL, label)?;
     let name = as_str(&raw["name"], &format!("{label}.name"))?.to_owned();
     let path = as_str(&raw["path"], &format!("{label}.path"))?.to_owned();
     let repository = as_str(&raw["repository"], &format!("{label}.repository"))?.to_owned();
@@ -405,20 +383,7 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
 
 pub(crate) fn scope_from_obj(value: &Value, label: &str) -> Result<ScopeRec> {
     let raw = as_mapping(value, label)?;
-    exact_keys(
-        raw,
-        &[
-            "unit",
-            "invocation_id",
-            "cgroup_path",
-            "boot_id",
-            "leader_pid",
-            "leader_start_ticks",
-            "verification",
-        ],
-        &[],
-        label,
-    )?;
+    exact_keys(raw, TASK_SCOPE_REQUIRED, &[], label)?;
     let unit = as_str(&raw["unit"], &format!("{label}.unit"))?.to_owned();
     let invocation_id =
         as_str(&raw["invocation_id"], &format!("{label}.invocation_id"))?.to_owned();
@@ -482,19 +447,7 @@ pub(crate) fn import_from_obj(value: Option<&Value>, label: &str) -> Result<Opti
         return Ok(None);
     }
     let raw = as_mapping(value, label)?;
-    exact_keys(
-        raw,
-        &[
-            "format",
-            "path",
-            "file_sha256",
-            "row_sha256",
-            "status",
-            "row",
-        ],
-        &[],
-        label,
-    )?;
+    exact_keys(raw, IMPORT_SOURCE_REQUIRED, &[], label)?;
     let format = as_str(&raw["format"], &format!("{label}.format"))?;
     if format != "worktree-state-v3" {
         return Err(format!("{label}.format is unsupported: {format:?}"));
@@ -665,33 +618,7 @@ fn assert_import_matches(record: &RecordRec, source: &ImportRec, label: &str) ->
 
 pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
     let raw = as_mapping(value, label)?;
-    exact_keys(
-        raw,
-        &[
-            "slot",
-            "agent",
-            "task",
-            "purpose",
-            "machine",
-            "generation",
-            "created_at",
-            "heartbeat_at",
-            "heartbeat_ttl_seconds",
-            "owner",
-            "coordinator_lease",
-            "coordinator_recovery_note",
-            "handoff",
-            "checkouts",
-        ],
-        &[
-            "slot_type",
-            "layout",
-            "import_source",
-            "task_scope",
-            "harness_checkout_reason",
-        ],
-        label,
-    )?;
+    exact_keys(raw, ACTIVE_RECORD_REQUIRED, ACTIVE_RECORD_OPTIONAL, label)?;
     if let Some(value) = raw.get("harness_checkout_reason") {
         if !matches!(value, Value::Null) {
             let reason = as_str(value, &format!("{label}.harness_checkout_reason"))?;
