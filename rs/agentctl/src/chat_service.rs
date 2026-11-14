@@ -3063,8 +3063,12 @@ const REPLY_SENDER_POLL: Duration = Duration::from_millis(250);
 /// `transport`, the replies of each request key `keys` gives, as the owner loop's passes send
 /// them, holding `stop`'s publish lock while it does. It only publishes: it types nothing, reads
 /// no pane, and takes no pane or queue lock, and the reply breaker and held replies apply as on
-/// the loop's sends. A send that fails is logged and left to the loop, which retries it. It ends
-/// once `stop` is stopped or `keys` is disconnected.
+/// the loop's sends. A send that fails is logged and left to the loop, which retries it. A send
+/// the breaker holds is the exception (#1548 chat-replies-captured-not-sent): the sender keeps
+/// the key with the breaker's release time and retries it then — or sooner, if the breaker
+/// record is repaired or deleted — instead of waiting for a loop pass. Replies already held
+/// when the sender starts get the same retry. It ends once `stop` is stopped or `keys` is
+/// disconnected.
 fn spawn_reply_sender(
     state: BridgeState,
     keys: mpsc::Receiver<String>,
@@ -3076,10 +3080,30 @@ fn spawn_reply_sender(
     let handle = thread::Builder::new()
         .name("agentctl-chat-reply-send".to_owned())
         .spawn(move || {
+            let mut held: Vec<(String, u64)> = match state.pending_reply_keys() {
+                Ok(pending) => pending
+                    .into_iter()
+                    .filter_map(|key| {
+                        state
+                            .reply_breaker_release_for_key(&key)
+                            .ok()
+                            .flatten()
+                            .map(|release| (key, release))
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
             while !stop.is_stopped() {
                 match keys.recv_timeout(REPLY_SENDER_POLL) {
-                    Ok(key) => send_announced_replies(&state, &key, &mut transport, &stop, &log),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Ok(key) => {
+                        match send_announced_replies(&state, &key, &mut transport, &stop, &log) {
+                            Some(release) => schedule_breaker_retry(&mut held, key, release),
+                            None => held.retain(|(held_key, _)| held_key != &key),
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        retry_due_breaker_holds(&state, &mut held, &mut transport, &stop, &log)
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -3088,23 +3112,68 @@ fn spawn_reply_sender(
     Ok(ServiceWorker { handle, done })
 }
 
+/// Remember `key` for a retry when its thread's breaker hold ends at `release` (milliseconds
+/// after the Unix epoch), replacing any earlier schedule for the same key.
+fn schedule_breaker_retry(held: &mut Vec<(String, u64)>, key: String, release: u64) {
+    held.retain(|(held_key, _)| held_key != &key);
+    held.push((key, release));
+}
+
+/// Retry each scheduled key whose breaker hold has ended. A hold also ends early when the
+/// breaker record is repaired or deleted, so the live release decides, not the scheduled
+/// time alone. A key that is held again is rescheduled; an unreadable breaker record keeps
+/// its schedule, because a send would fail the same way and the loop reports the record.
+fn retry_due_breaker_holds(
+    state: &BridgeState,
+    held: &mut Vec<(String, u64)>,
+    transport: &mut dyn chat_runtime::ReplyTransport,
+    stop: &StopState,
+    log: &dyn Fn(fmt::Arguments<'_>),
+) {
+    let now = chat_runtime::unix_millis();
+    let mut index = 0;
+    while index < held.len() {
+        if stop.is_stopped() {
+            return;
+        }
+        let key = held[index].0.clone();
+        match state.reply_breaker_release_for_key(&key) {
+            Ok(Some(release)) if release > now => {
+                held[index].1 = release;
+                index += 1;
+            }
+            Ok(_) => {
+                held.remove(index);
+                if let Some(release) = send_announced_replies(state, &key, transport, stop, log) {
+                    schedule_breaker_retry(held, key, release);
+                }
+            }
+            Err(_) => index += 1,
+        }
+    }
+}
+
 /// Send the replies of request `key` that wait, oldest first, at most `MAX_SENDS_PER_PASS` of
 /// them, as one owner-loop pass does, and log what happened as the loop logs its passes.
+/// Returns when the reply breaker stops holding the request's thread, in milliseconds after
+/// the Unix epoch, when a send failed because that breaker holds it; the caller retries the
+/// key then, under the reply's original request ID.
 fn send_announced_replies(
     state: &BridgeState,
     key: &str,
     transport: &mut dyn chat_runtime::ReplyTransport,
     stop: &StopState,
     log: &dyn Fn(fmt::Arguments<'_>),
-) {
+) -> Option<u64> {
     let _publishing = stop
         .publish_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !state.has_unsent_reply(key) {
-        return;
+        return None;
     }
     let mut report = CycleReport::default();
+    let mut held_until = None;
     for _ in 0..MAX_SENDS_PER_PASS {
         if stop.is_stopped() {
             break;
@@ -3113,6 +3182,7 @@ fn send_announced_replies(
             Ok(Some(receipt)) => report.sent.push(receipt),
             Ok(None) => break,
             Err(error) => {
+                held_until = state.reply_breaker_release_for_key(key).ok().flatten();
                 report.error("publish", key, error);
                 break;
             }
@@ -3127,6 +3197,7 @@ fn send_announced_replies(
         ));
     }
     log_report(&report, log);
+    held_until
 }
 
 fn spawn_ack_workers(
@@ -20453,6 +20524,99 @@ printf '%s\n' "$request" >> "$1" || exit 4
             state.status().expect("status")["reply_breaker"]["held_threads"][0]
                 ["recent_or_unresolved_reservations"],
             8
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_breaker_held_reply_reports_its_release_and_sends_after_the_cooldown() {
+        // #1548 chat-replies-captured-not-sent: a reply the post-rate breaker holds must
+        // report when the hold ends, make no provider call while it lasts, and go out
+        // under its original request ID once the breaker record ages past the cooldown.
+        // Time moves only by ageing the breaker record, never by sleeping.
+        use crate::chat_runtime::tests as runtime;
+        let root = runtime::temporary("reply-sender-breaker-retry");
+        let state = BridgeState::initialize(&root, runtime::config()).expect("initialize state");
+        let requests = runtime::same_thread_reply_requests(&state, 9);
+        let sends = root.join("sent-sends");
+        let mut transport = recording_send_helper(&root, &sends, true);
+        let stop = StopState::default();
+        let logs = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = {
+            let logs = Arc::clone(&logs);
+            move |line: fmt::Arguments<'_>| logs.lock().expect("logs").push(line.to_string())
+        };
+        let sent_count = || {
+            fs::read_to_string(&sends)
+                .map(|sent| sent.lines().count())
+                .unwrap_or(0)
+        };
+        for key in &requests[..8] {
+            assert_eq!(
+                send_announced_replies(&state, key, &mut transport, &stop, &log),
+                None
+            );
+        }
+        assert_eq!(sent_count(), 8);
+        let held = &requests[8];
+        let first_hold = send_announced_replies(&state, held, &mut transport, &stop, &log);
+        let held_until = state.status().expect("status")["reply_breaker"]["held_threads"][0]
+            ["held_until_millis"]
+            .as_u64()
+            .expect("held until");
+        assert_eq!(first_hold, Some(held_until));
+        assert_eq!(
+            state.reply_breaker_release_for_key(held).expect("release"),
+            Some(held_until)
+        );
+        // A retry while the trip is live makes no provider call and reports the same hold.
+        assert_eq!(
+            send_announced_replies(&state, held, &mut transport, &stop, &log),
+            Some(held_until)
+        );
+        assert_eq!(sent_count(), 8);
+        assert!(state.has_unsent_reply(held));
+        let reply_file = root.join("replies").join(format!("{held}-000001.json"));
+        let reply: serde_json::Value =
+            serde_json::from_slice(&fs::read(&reply_file).expect("held reply"))
+                .expect("reply JSON");
+        assert_eq!(reply["phase"], "pending");
+        assert_eq!(reply["send_attempts"], 0);
+        let request_id = reply["send_request_id"]
+            .as_str()
+            .expect("request ID")
+            .to_owned();
+        // Age every breaker stamp past the cooldown, as if that time had passed.
+        let breaker = root.join("reply-breaker.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&breaker).expect("breaker")).expect("breaker JSON");
+        for section in ["sends", "trips"] {
+            for event in record[section].as_array_mut().expect("breaker events") {
+                let at = event["at_millis"].as_u64().expect("stamp");
+                event["at_millis"] = serde_json::json!(at.saturating_sub(300_000));
+            }
+        }
+        fs::write(
+            &breaker,
+            serde_json::to_vec(&record).expect("encode breaker"),
+        )
+        .expect("age breaker");
+        assert_eq!(
+            state.reply_breaker_release_for_key(held).expect("release"),
+            None
+        );
+        assert_eq!(
+            send_announced_replies(&state, held, &mut transport, &stop, &log),
+            None
+        );
+        assert_eq!(sent_count(), 9);
+        assert!(!state.has_unsent_reply(held));
+        let sent = fs::read_to_string(&sends).expect("helper attempts");
+        let last = sent.lines().last().expect("released send");
+        assert!(last.contains(&request_id), "{last}");
+        assert_eq!(
+            state.status().expect("status")["reply_breaker"]["held_threads"],
+            serde_json::json!([])
         );
         fs::remove_dir_all(root).expect("cleanup");
     }

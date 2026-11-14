@@ -12801,6 +12801,27 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         })
     }
 
+    /// When the reply breaker stops holding request `key`'s thread, in milliseconds after
+    /// the Unix epoch: `None` when no live trip holds it. A trip whose cooldown has passed
+    /// holds nothing, whether or not a later send has pruned it from the record yet.
+    pub(crate) fn reply_breaker_release_for_key(&self, key: &str) -> Result<Option<u64>> {
+        let request = self.read_request(key)?;
+        let record = self.read_reply_breaker()?;
+        let now = unix_millis();
+        Ok(record
+            .trips
+            .iter()
+            .rev()
+            .find(|trip| {
+                trip.is_for(&request.message)
+                    && now.saturating_sub(trip.at_millis) < THREAD_BREAKER_COOLDOWN_MILLIS
+            })
+            .map(|trip| {
+                trip.at_millis
+                    .saturating_add(THREAD_BREAKER_COOLDOWN_MILLIS)
+            }))
+    }
+
     /// Build the bounded active route cache during startup or explicit recovery.
     pub fn active_reply_routes(&self) -> Result<Vec<ReplyRoute>> {
         if !self.config.outbound_enabled {
@@ -35262,6 +35283,52 @@ k │\n\
             state
                 .publish_one(&keys[3], &mut transport)
                 .expect("outbox empty"),
+            None
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reply_breaker_release_for_key_reports_the_cooldown_end_until_it_passes() {
+        let root = temporary("reply-breaker-release");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let keys = same_thread_reply_requests(&state, MAX_THREAD_REPLIES_PER_WINDOW as u64 + 1);
+        let mut transport = FakeReplyTransport::default();
+        for key in &keys[..MAX_THREAD_REPLIES_PER_WINDOW] {
+            assert!(state
+                .publish_one(key, &mut transport)
+                .expect("publish within the thread budget")
+                .is_some());
+        }
+        assert!(state
+            .publish_one(&keys[MAX_THREAD_REPLIES_PER_WINDOW], &mut transport)
+            .is_err());
+        let tripped_at = state.read_reply_breaker().expect("breaker").trips[0].at_millis;
+        assert_eq!(
+            state
+                .reply_breaker_release_for_key(&keys[MAX_THREAD_REPLIES_PER_WINDOW])
+                .expect("release of the held thread"),
+            Some(tripped_at + THREAD_BREAKER_COOLDOWN_MILLIS)
+        );
+        // A request in another thread is not held by this trip.
+        let other = state
+            .admit_batch(&indexed_delivery(100, 700))
+            .expect("admit request in another thread")
+            .new_request_keys[0]
+            .clone();
+        assert_eq!(
+            state
+                .reply_breaker_release_for_key(&other)
+                .expect("other thread"),
+            None
+        );
+        // Once the cooldown has passed the thread is no longer held, even though no
+        // send has pruned the expired trip from the record yet.
+        let_breaker_time_pass(&state, THREAD_BREAKER_COOLDOWN_MILLIS);
+        assert_eq!(
+            state
+                .reply_breaker_release_for_key(&keys[MAX_THREAD_REPLIES_PER_WINDOW])
+                .expect("release after the cooldown"),
             None
         );
         fs::remove_dir_all(root).expect("cleanup");
