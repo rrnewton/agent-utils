@@ -1,12 +1,12 @@
 ---
 title: 'discuss-cite-owner-messages: allow the Discuss summary to cite the owner'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-11-14T16:24:00+00:00
-updated_at: 2026-11-14T16:24:00+00:00
+updated_at: 2026-11-14T18:30:00+00:00
 ---
 
 # Description
@@ -37,3 +37,7 @@ The coordinator confirmed at 12:09 PM ET the same minute: no special instruction
 # Notes
 
 Owner request 11-12, passed on by the coordinator; #1384 discuss-exclude-owner-messages landed the validation half. Parent: #1316 catchup-side-agent. Sibling: #1356 discuss-readonly-tools (read-only tools for Discuss follow-ups, same prompt area; coordinated directly, no file overlap beyond the shared system prompt).
+
+## Resolution
+
+Landed as 190a44a2 on main and deployed to the devbig014 Slack instance, live about 12:10 PM ET 2026-11-14 (release 7b6e67fe); the 15-minute post-deploy watch passed. Closed by the devbig014 coordinator.

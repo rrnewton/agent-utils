@@ -1,6 +1,6 @@
 ---
 title: 'discuss-bound-hours-control: an editable hours end on the Discuss bound'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -8,7 +8,7 @@ labels:
 - discuss
 - ui
 created_at: 2026-11-14T15:44:00.000000000+00:00
-updated_at: 2026-11-14T15:44:00.000000000+00:00
+updated_at: 2026-11-14T18:30:00+00:00
 ---
 
 # Description
@@ -57,3 +57,7 @@ row, the whole "since HH:MM" part drops; the hours never do.
 on the same panel: #1525 discuss fold line, #1526 mobile Discuss dock,
 #1527 mobile Summarize bottom bar; whoever lands second rebases and
 re-gates. `voice.js` and `web/src/app/main.js` are untouched (#624).
+
+## Resolution
+
+Landed as a5d56431 on main and deployed to the devbig014 Slack instance, live 11:53 AM ET 2026-11-14 (release a5d56431); the 15-minute post-deploy watch passed. Closed by the devbig014 coordinator.

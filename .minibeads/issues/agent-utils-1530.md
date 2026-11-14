@@ -1,13 +1,13 @@
 ---
 title: 'discuss-summary-cloud-read-404: cloud voice reads the Discuss summary'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-discussread
 labels:
 - vibe-talk
 created_at: 2026-11-14T15:50:00.000000000+00:00
-updated_at: 2026-11-14T15:50:00.000000000+00:00
+updated_at: 2026-11-14T18:30:00+00:00
 ---
 
 # Description
@@ -32,3 +32,7 @@ The Discuss panel (#1501 discuss-read-aloud-parity) hands the summary to the sha
 # Notes
 
 Owner UI fast-track (owner rule 286), lane mu-discussread from coordb. Shared read-aloud owner from #1505, Discuss read-aloud from #1501, per-device summary persistence from #1497 and the server Discuss record from discuss-transcript-persist. Do not touch the Discuss top bar markup (mu-discusstop), the `.discuss-bound` span (mu-hoursbound), `web/voice.js` or `web/src/app/main.js`. Gate: owner tier (GATE_PRIORITY=owner), then land-main and coordb deploys.
+
+## Resolution
+
+Landed as 0dda16f7 on main and deployed to the devbig014 Slack instance, live 11:53 AM ET 2026-11-14 (release a5d56431); the 15-minute post-deploy watch passed. Closed by the devbig014 coordinator.

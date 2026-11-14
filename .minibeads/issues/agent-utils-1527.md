@@ -1,10 +1,10 @@
 ---
 title: 'discuss-summarize-bottom-bar-mobile: Summarize control as a bottom bar on mobile'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-14T15:49:00.000000000+00:00
-updated_at: 2026-11-14T15:49:00.000000000+00:00
+updated_at: 2026-11-14T18:30:00+00:00
 ---
 
 # Description
@@ -25,3 +25,7 @@ Placement in `vibe-talk/web/styles/voice/22-discuss.css` plus a one-line DOM mov
 # Notes
 
 Owner request 056; sibling lanes #1524 (K-hours bound), #1525 (heading fold), #1526 (mobile docked Discuss) land independently; whoever lands second rebases and re-gates.
+
+## Resolution
+
+Landed as 16062057 on main and deployed to the devbig014 Slack instance, live about 12:27 PM ET 2026-11-14 (release 3cf557dd); the 15-minute post-deploy watch passed. Closed by the devbig014 coordinator.

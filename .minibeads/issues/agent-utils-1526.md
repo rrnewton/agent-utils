@@ -1,10 +1,10 @@
 ---
 title: 'discuss-docked-pane-mobile: the half-height Discuss sheet on a phone is a docked pane, not an overlay'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-14T15:46:00.000000000+00:00
-updated_at: 2026-11-14T15:46:00.000000000+00:00
+updated_at: 2026-11-14T18:30:00+00:00
 ---
 
 # Description
@@ -53,3 +53,7 @@ Coordinated with #1527 discuss (mobile Summarize bottom bar): that change
 makes the panel a flex column on mobile, which composes with the docked
 grid row; neither touches the other's selectors. #1524 and #1525 touch the
 panel's bound row and heading line only.
+
+## Resolution
+
+Landed as 3044dac0 on main and deployed to the devbig014 Slack instance, live about 12:10 PM ET 2026-11-14 (release 7b6e67fe); the 15-minute post-deploy watch passed. Closed by the devbig014 coordinator.
