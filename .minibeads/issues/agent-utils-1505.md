@@ -1,10 +1,11 @@
 ---
 title: 'documents-read-controls-highlight-tap: play/pause, highlight drift and tap-to-read in the Documents reader'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-13T23:34:08.018515589+00:00
-updated_at: 2026-11-13T23:34:08.018515589+00:00
+updated_at: 2026-11-14T00:53:45.836234305+00:00
+closed_at: 2026-11-14T00:53:45.836233735+00:00
 ---
 
 # Description
@@ -31,3 +32,18 @@ Module tests for the block model (list items, nested lists, headings, code; spea
 # Notes
 
 Lane mu-docreadfix. Coordinated with mu-discussread (#1501) and mu-readnext (#1035) via agentctl before implementation.
+
+## Resolution
+
+[opus 5] Landed 6773f82d44da271761b47a2761af15ca212fa8c5 on github/main
+(replay over c1c2ee0b; gated base 85c994b7). Gate green (gate.py exit 0,
+owner priority) plus the recorded combined-tree check on 09fca9bd with
+the #1505 commits: tsc and architecture, parse of every touched file,
+touched module tests, the documents/documents-read/documents-layout
+and discuss browser checks, and the validation-graph inventory. All
+three owner bugs fixed: the control pane stands in the Documents
+reader while a document read stands (Read is its Pause, Stop and pace
+beside it); one block model (view/documents/blocks.ts) speaks, lights
+and tap-starts the same drawn block at index N on both transports; a
+tap on a drawn block reads from that block. #1501 inherits the kinds/
+from shapes unchanged; #1035's Next-on-last stands.
