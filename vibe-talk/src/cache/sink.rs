@@ -609,6 +609,11 @@ pub struct Fill {
     shape: Shape,
     recent_via_flat: bool,
     rows: bool,
+    /// Whether the sink was armed when the fill began (`#1533 vibe-talk-record-completeness`):
+    /// a deletions-only fill before arming is the startup window, whose reads the arming
+    /// verification and relist immediately re-read, so it marks nothing; after arming, a
+    /// deletions-only fill is a real loss and marks as before.
+    armed: bool,
     arrivals: Weak<Arrivals>,
     documents: Option<Arc<crate::documents::Index>>,
 }
@@ -914,7 +919,11 @@ impl Fill {
                 }
             } else {
                 every = false;
-                cache.mark_suspect_reason(&self.chan, "fill_writes_no_rows");
+                // Before arming this is the startup window, not a loss: the arming
+                // verification and the relist re-read what it saw (`#1533`).
+                if self.armed {
+                    cache.mark_suspect_reason(&self.chan, "fill_writes_no_rows");
+                }
             }
         }
         every
@@ -2051,6 +2060,7 @@ impl Sink {
             shape: route.shape,
             recent_via_flat: route.recent_via_flat,
             rows,
+            armed,
             arrivals: Arc::downgrade(&self.state.arrivals),
             documents: self
                 .state
@@ -3672,6 +3682,61 @@ mod tests {
             sink.begin_for(Caller::Write, &ChannelId("999".to_owned()))
                 .is_none(),
             "a channel the server does not answer for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deletions_only_fill_before_arming_marks_nothing_but_after_arming_it_does() {
+        // `#1533 vibe-talk-record-completeness`: the 13:00 ET drop after the deploy restart
+        // was `fill_writes_no_rows` from the startup window — a read before arming saw rows
+        // it could not write. That window's reads are re-read by the arming verification and
+        // the relist, so marking every channel on every restart is a self-inflicted stale
+        // flag. After arming, the same fill is a real loss and still marks.
+        let dir = crate::testing::TempDir::new("sink-startup-mark");
+        let (state, _fake) = crate::testing::state();
+        let sink = Sink::off();
+        let cache = open(&dir);
+        sink.install(Arc::clone(&cache));
+        sink.set_routes(&state.all_channels(), &state.providers, &state.config);
+        let read = ChannelId(crate::testing::READ_CHANNEL.to_owned());
+        let chan = ChanKey::new(crate::config::LEGACY_DISCORD_PROVIDER_KEY, read.as_str());
+        let message = big_message(&read, 1, "startup window");
+        let live = |kind, message: &Message| LiveMessage {
+            event_id: message.id.as_str().to_owned(),
+            kind,
+            historical: false,
+            message: message.clone(),
+            self_posted: false,
+            client_key: None,
+        };
+
+        let fill = sink
+            .begin_for(Caller::Write, &read)
+            .expect("a fill of deletions alone");
+        assert!(!fill.writes_rows());
+        fill.offer_push(&live(crate::live::LiveKind::Create, &message));
+        assert!(cache.quiesce_blocking(Duration::from_secs(10)));
+        assert!(
+            !cache.is_suspect(&chan),
+            "the startup window marked the channel"
+        );
+        assert_eq!(cache.last_drop_reason(&chan), None);
+
+        sink.arm();
+        assert!(sink.identities_verified(WAIT).await);
+        sink.reverify();
+        let fill = sink
+            .begin_for(Caller::Write, &read)
+            .expect("a fill of deletions alone");
+        assert!(!fill.writes_rows(), "reverified provider still fills");
+        fill.offer_push(&live(crate::live::LiveKind::Create, &message));
+        assert!(cache.quiesce_blocking(Duration::from_secs(10)));
+        // The channel holds no rows yet, so `is_suspect` (which judges held rows) says
+        // nothing; the drop record itself is the mark.
+        assert_eq!(
+            cache.last_drop_reason(&chan),
+            Some("fill_writes_no_rows"),
+            "an armed loss no longer marks"
         );
     }
 
