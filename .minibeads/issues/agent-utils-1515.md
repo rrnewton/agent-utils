@@ -1,6 +1,6 @@
 ---
 title: 'page-update-reload-loses-controls: pressing New version — reload loses the bottom controls bar'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-14T06:37:00.000000000+00:00
@@ -31,4 +31,4 @@ Lane mu-reloadbar. Coordinated by coordb. `#1501` Discuss read-aloud and `#1035`
 
 ## Resolution
 
-Unlanded: fix, module test and browser check written in the lane worktree; gate and landing pending.
+[watermelon-full-preview] Landed 109cf274d36ccc7f583bb5cf2b4bbd317da864da on github/main (replay of baae6465 over 2d05c408; gated base 855a66d1, owner-priority gate green). The Documents control pane now stands in every reader state: `renderControls` hides it only while no reader is open, `showView` keeps it while the reader is open, and reader level changes redraw the controls again; the Documents list keeps no pane. New `#1515` module test in `vibe-talk/tests/js/page/read-aloud.mjs` (same-storage deep-link reload; fails unfixed), updated `#1505` premises, and `vibe-talk/tests/page_update_reload_browser.py` (chip press and reader reload at 393x852 and 1280x800, condition waits only; fails unfixed, passes fixed). SHA sent to coordb for immediate deploy.
