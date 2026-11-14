@@ -53,3 +53,10 @@ Live incident 2026-11-14: trip at 18:28:51Z on the shared thread,
 cooldown to 18:33:51Z, sends at 18:36:02-18:36:08Z. Verified from the
 bridge state, the bridge log, and the outbound helper log; no manual
 release was needed and no duplicate was posted.
+
+Follow-up (to be numbered by the coordinator, not fixed in this lane):
+`test_launch_bridge_killed_first_is_an_error_and_stops_coordinator`
+in the Python launch tests waits on a 60 s wall-clock budget for the
+bridge process to appear, so it can fail under load although the
+bridge is healthy; it passes standalone. Replace that budget with a
+condition-based wait.
