@@ -159,6 +159,9 @@ mod post_split;
 #[path = "provider_diagnostics_ids.rs"]
 mod provider_diagnostics_ids;
 
+#[path = "prompts.rs"]
+mod prompts;
+
 #[path = "range_reads.rs"]
 mod range_reads;
 

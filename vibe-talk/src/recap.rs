@@ -783,13 +783,7 @@ pub async fn run(options: Options) -> anyhow::Result<String> {
     let wanted = options.channel.as_deref().or(hint.as_deref());
     let selected: Vec<&ChannelInfo> = channels
         .iter()
-        .filter(|channel| {
-            wanted.is_none_or(|want| {
-                channel.id.as_str().eq_ignore_ascii_case(want)
-                    || channel.display_name().eq_ignore_ascii_case(want)
-                    || channel.label.eq_ignore_ascii_case(want)
-            })
-        })
+        .filter(|channel| wanted.is_none_or(|want| crate::prompts::channel_matches(want, channel)))
         .collect();
     if selected.is_empty() {
         anyhow::bail!(

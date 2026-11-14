@@ -1274,6 +1274,36 @@ What the server and the page do, so it can be judged:
   the address it was first opened at in its global history even after the page has removed the
   fragment, which matters only while a code is still live.
 
+## The owner's prompts in one go
+
+An agent that needs a record of everything the owner asked for in the last K hours
+runs:
+
+```sh
+vibe-talk prompts --hours K
+```
+
+It prints ONLY the owner's own messages (the configured owner user ids), thread
+replies included, oldest first, with ET times, the channel, and the thread each
+message belongs to. `--since <time>` names the window start instead, `--channel`
+accepts a channel id, label, alias, or name with or without a leading `#`, and
+`--json` prints structured JSON for agents.
+
+The command reads ONLY the local message cache file: it starts no server and makes
+no provider API calls, so it never competes with the live instance for the
+provider's rate limit. Where the cache may be incomplete for a thread in the
+window, the output says so and names the thread instead of fetching upstream.
+
+With no flags on a host where the instance is installed, configuration is found by
+discovery: `--config` or `$VIBE_TALK_CONFIG` wins, then the first of `app.toml`,
+`vibe-talk.toml`, `config.toml` under `$XDG_CONFIG_HOME/vibe-talk`,
+`$XDG_CONFIG_HOME/vibe-talk-slack`, `~/.config/vibe-talk` or
+`~/.config/vibe-talk-slack`, then `./vibe-talk.toml`; a `*-overlay.toml` beside
+the file found layers over it, as for the server.
+When nothing is found, the error names every path it looked for. The owner's
+messages are the single source of their intent and requests: check them before
+saying everything asked is done.
+
 ## Running it
 
 Locally, without touching Discord at all:

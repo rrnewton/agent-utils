@@ -39,6 +39,7 @@ USAGE:
               [--startup-probe-wait SECONDS]
     vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
     vibe-talk recap [--config PATH] [--hours N | --since WHEN] [--channel NAME] [--json]
+    vibe-talk prompts [--hours N | --since WHEN] [--channel NAME] [--json]
     vibe-talk search \"<query>\" [--channel NAME] [--since DATE] [--limit N] [--json]
     vibe-talk <tool> [--json] [--yes]     one subcommand per MCP tool, generated from the
                                           tool manifest (recent-activity, list-channels,
@@ -56,6 +57,9 @@ COMMANDS:
                           grouped by thread, each message tagged DONE or UNREAD (what the owner
                           has marked read), for an agent catching the owner up. Uses the READ
                           token. See `vibe-talk recap --help`
+    prompts               print ONLY the owner's messages over a window, oldest first,
+                          from the local message cache (no server, no provider calls).
+                          See `vibe-talk prompts --help`
     search \"<query>\"      search the chat history the running server holds and print one line
                           per hit (ET time, author, snippet, permalink, vibe-talk deep link),
                           newest first, with a line per channel saying how far back it was
@@ -374,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
     match argv.next().as_deref() {
         Some("pair-link") => return pair_link(argv).await,
         Some("recap") => return recap(argv).await,
+        Some("prompts") => return prompts(argv),
         Some("search") => return search(argv).await,
         // `#1338 vibe-talk-search-cli` slice 2: one generated subcommand per MCP tool,
         // built from the same manifest as `tools/list`; any other first word is the
@@ -1312,6 +1317,15 @@ async fn recap(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         return Ok(());
     };
     println!("{}", vibe_talk::recap::run(options).await?);
+    Ok(())
+}
+
+/// `vibe-talk prompts`. `#1529 vibe-talk-prompts-command`. Cache-only; no server.
+fn prompts(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(options) = vibe_talk::prompts::parse(args)? else {
+        return Ok(());
+    };
+    println!("{}", vibe_talk::prompts::run(options)?);
     Ok(())
 }
 

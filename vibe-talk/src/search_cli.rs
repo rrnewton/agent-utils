@@ -499,11 +499,7 @@ pub async fn run(options: Options) -> anyhow::Result<String> {
         Some(want) => {
             let channel = channels
                 .iter()
-                .find(|channel| {
-                    channel.id.as_str().eq_ignore_ascii_case(want)
-                        || channel.display_name().eq_ignore_ascii_case(want)
-                        || channel.label.eq_ignore_ascii_case(want)
-                })
+                .find(|channel| crate::prompts::channel_matches(want, channel))
                 .with_context(|| {
                     format!(
                         "no channel matches {want:?}; the read token sees: {}",

@@ -15,6 +15,8 @@ that repository, and wins for anything about that repository.
 The tools are the authority for their own usage. Run `<tool> quickstart`, `<tool> --help`, and
 `<tool> userguide` instead of guessing flags, and read the matching tool skill before first use.
 
+The owner's intent: vibe-talk prompts --hours K. Check it before saying everything asked is done.
+
 ## Priorities
 
 1. Do what the owner explicitly asked. If a standing instruction has no end, ask for a duration
