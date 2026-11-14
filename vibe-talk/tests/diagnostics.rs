@@ -896,7 +896,7 @@ async fn the_message_cache_section_is_numbers_and_never_an_id_or_a_word() {
     assert_eq!(stats["batch_us"]["count"], stats["batches"]);
     assert!(stats["batch_us"]["p99_us"].is_u64(), "{stats:#}");
     let shadow = section["shadow"].as_array().expect("shadow counts");
-    assert_eq!(shadow.len(), 10, "every consumer: {section:#}");
+    assert_eq!(shadow.len(), 9, "every consumer: {section:#}");
     let messages = shadow
         .iter()
         .find(|counts| counts["consumer"] == "messages")

@@ -289,12 +289,12 @@ async fn an_id_no_listing_placed_in_a_thread_is_a_miss_after_one_read() {
 }
 
 #[tokio::test]
-async fn the_todo_list_and_the_catch_up_name_a_replys_thread() {
+async fn the_channel_read_and_the_catch_up_name_a_replys_thread() {
     let (state, ids) = fixture();
     let fake = Fake::start(state, PAGE_CAP).await;
     let server = deployment(&fake);
 
-    let (status, todo) = get(&server, &format!("/api/v1/channels/{TEAM}/todo")).await;
+    let (status, todo) = get(&server, &format!("/api/v1/channels/{TEAM}/messages")).await;
     assert_eq!(status, StatusCode::OK, "{todo}");
     let messages = todo["messages"].as_array().expect("messages");
     let reply = messages

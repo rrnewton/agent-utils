@@ -218,14 +218,9 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             format!("/api/v1/channels/{WRITE_CHANNEL}/upstream-read"),
             Some(serde_json::json!({"message_id": "1000000000000000200"})),
         ),
-        // `#50 todo-view`. The to-do list is the owner's own inbox state, and the two acts that
-        // change it are durable writes. All three belong in this table for the same reason
-        // everything above does.
-        (
-            "GET",
-            format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
-            None,
-        ),
+        // `#50 todo-view`. The two acts that change the owner's inbox state are durable writes.
+        // Both belong in this table for the same reason everything above does. (The filtered
+        // listing itself went in #1473 remove-server-todo-endpoint.)
         (
             "POST",
             format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
@@ -2676,7 +2671,7 @@ fn todo_harness() -> (
 }
 
 #[tokio::test]
-async fn a_read_token_may_look_at_the_to_do_list_and_may_not_change_it() {
+async fn a_read_token_may_look_at_the_channel_and_may_not_change_it() {
     // The read token is the one pasted into a hosted voice agent. It may SEE the backlog — that is
     // the same text `/messages` already serves it — and it may not clear one, because a durable
     // write reachable from the least-trusted credential is what the two-token split exists to
@@ -2686,7 +2681,7 @@ async fn a_read_token_may_look_at_the_to_do_list_and_may_not_change_it() {
     let (status, payload) = call(
         &harness,
         "GET",
-        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages"),
         Some(READ_TOKEN),
         None,
     )
@@ -2993,7 +2988,7 @@ async fn reading_aloud_needs_read_scope() {
 
 #[tokio::test]
 async fn the_channel_read_says_which_of_its_messages_are_archived() {
-    // `#50 todo-view`. The To do filter REMOVES archived messages; the ordinary channel view greys
+    // `#50 todo-view`. The ordinary channel view greys archived messages;
     // them and leaves them where they are. It can only do that if the read says which they are,
     // and until this field existed it did not — so archiving a message changed nothing visible in
     // the view the reader is normally looking at, and the gesture read as broken.
@@ -3033,7 +3028,7 @@ async fn the_channel_read_says_which_of_its_messages_are_archived() {
         .await;
         assert_eq!(status, StatusCode::OK, "{route}: {payload}");
         // STILL THERE. The message is reported, and reported as archived -- the read does not
-        // filter it out, because filtering is what `/todo` is for.
+        // filter it out.
         let messages = payload["messages"].as_array().expect("messages");
         assert!(
             messages
@@ -3050,18 +3045,30 @@ async fn the_channel_read_says_which_of_its_messages_are_archived() {
 }
 
 #[tokio::test]
-async fn every_to_do_answer_says_that_this_read_state_is_not_discords() {
-    // Said once, plainly, on every answer — including the LISTING, not only the mutations. The
-    // alternative is that the owner discovers it from a divergence: a badge in the Discord app
-    // that will not clear, or a message vibe-talk still calls undealt-with that he answered on
-    // his laptop an hour ago. Neither is broken. They are different records.
+async fn the_removed_to_do_listing_answers_404() {
+    // #1473 remove-server-todo-endpoint: the page no longer reads the filtered listing, so the
+    // route is gone — a caller still asking for it gets the ordinary unknown-route 404, while
+    // the acts that change the same state keep working (pinned by the tests around this one).
+    let (harness, _store, _ids) = todo_harness();
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{payload}");
+}
+
+#[tokio::test]
+async fn every_dismissal_answer_says_that_this_read_state_is_not_discords() {
+    // Said once, plainly, on every answer. The alternative is that the owner discovers it from a
+    // divergence: a badge in the provider app that will not clear, or a message still called
+    // undealt-with that he answered on his laptop an hour ago. Neither is broken. They are
+    // different records.
     let (harness, _store, ids) = todo_harness();
     let calls: Vec<(&str, String, Option<Value>)> = vec![
-        (
-            "GET",
-            format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
-            None,
-        ),
         (
             "POST",
             format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
@@ -3109,15 +3116,16 @@ async fn bankruptcy_over_http_clears_through_the_boundary_and_hands_back_its_own
     let (_status, left) = call(
         &harness,
         "GET",
-        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/page"),
         Some(WRITE_TOKEN),
         None,
     )
     .await;
-    assert_eq!(left["messages"].as_array().expect("messages").len(), 1);
+    assert_eq!(left["messages"].as_array().expect("messages").len(), 3);
     assert_eq!(
-        left["window"], 3,
-        "the window size is what makes 1 readable"
+        left["dismissed"].as_array().expect("dismissed").len(),
+        2,
+        "the page read still says what the bankruptcy cleared"
     );
 
     // The undo is built from the ANSWER, not from a count, so it restores exactly that set.
@@ -3133,17 +3141,17 @@ async fn bankruptcy_over_http_clears_through_the_boundary_and_hands_back_its_own
     let (_status, left) = call(
         &harness,
         "GET",
-        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/page"),
         Some(WRITE_TOKEN),
         None,
     )
     .await;
-    assert_eq!(left["messages"].as_array().expect("messages").len(), 3);
+    assert_eq!(left["dismissed"], serde_json::json!([]));
 }
 
 #[tokio::test]
 async fn a_bankruptcy_carries_the_window_it_was_read_with_over_the_wire() {
-    // The paging client, end to end: it read `/todo?limit=1`, so it displayed one row, so giving up
+    // The paging client, end to end: it read one row, so it displayed one row, so giving up
     // on that row must clear one row. `ops` enforces it; what is tested HERE is that the number
     // survives the request body at all — a `limit` the deserializer dropped would leave the whole
     // guard unreachable from the only place callers can reach it.
@@ -3151,7 +3159,7 @@ async fn a_bankruptcy_carries_the_window_it_was_read_with_over_the_wire() {
     let (status, page) = call(
         &harness,
         "GET",
-        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo?limit=1"),
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages?limit=1"),
         Some(WRITE_TOKEN),
         None,
     )
@@ -3177,14 +3185,14 @@ async fn a_bankruptcy_carries_the_window_it_was_read_with_over_the_wire() {
     let (_status, left) = call(
         &harness,
         "GET",
-        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/page"),
         Some(WRITE_TOKEN),
         None,
     )
     .await;
     assert_eq!(
-        left["messages"].as_array().expect("messages").len(),
-        2,
+        left["dismissed"].as_array().expect("dismissed").len(),
+        1,
         "messages the caller never displayed were cleared: {left}"
     );
 }
@@ -3214,14 +3222,14 @@ async fn a_dismissal_that_names_both_ways_of_choosing_is_refused_rather_than_gue
     let (_status, left) = call(
         &harness,
         "GET",
-        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/page"),
         Some(WRITE_TOKEN),
         None,
     )
     .await;
     assert_eq!(
-        left["messages"].as_array().expect("messages").len(),
-        3,
+        left["dismissed"],
+        serde_json::json!([]),
         "a refused request cleared something anyway"
     );
 

@@ -91,14 +91,31 @@ async fn set(state: &AppState, entries: &[(&str, &str)]) {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// The ids of a to-do answer's messages.
+/// The ids still wanting attention: the channel read's messages minus its dismissed marks.
+/// (The filtered to-do listing itself went in #1473 remove-server-todo-endpoint; what it
+/// filtered on is exactly what the page read reports.)
 async fn todo(state: &AppState, channel: &str, token: &str) -> BTreeSet<String> {
-    let body = get(state, &format!("/api/v1/channels/{channel}/todo"), token).await;
+    let body = get(
+        state,
+        &format!("/api/v1/channels/{channel}/messages"),
+        token,
+    )
+    .await;
+    let dismissed: BTreeSet<String> = body["dismissed"]
+        .as_array()
+        .map(|marks| {
+            marks
+                .iter()
+                .filter_map(|mark| mark.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     body["messages"]
         .as_array()
         .unwrap_or_else(|| panic!("no messages in {body}"))
         .iter()
         .map(|message| message["id"].as_str().expect("id").to_owned())
+        .filter(|id| !dismissed.contains(id))
         .collect()
 }
 

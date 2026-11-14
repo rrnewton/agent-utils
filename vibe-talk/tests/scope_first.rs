@@ -458,7 +458,6 @@ fn inventory() -> Vec<Route> {
             Write,
             Nothing,
         ),
-        route("GET", "/api/v1/channels/{channel_id}/todo", Read, limit),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/dismiss",
@@ -1737,7 +1736,6 @@ mod read_scope_writes_nothing {
             "page",
             "count",
             "timeline_fallback",
-            "todo",
         ] {
             assert!(
                 shadowed[consumer] > 0,

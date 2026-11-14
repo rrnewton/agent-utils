@@ -213,7 +213,7 @@ fn above(id: &str) -> Value {
     })
 }
 
-const READS: [&str; 4] = ["timeline?view=main", "timeline?view=flat", "page", "todo"];
+const READS: [&str; 3] = ["timeline?view=main", "timeline?view=flat", "page"];
 
 #[tokio::test]
 async fn a_bookmark_is_set_read_back_repeated_and_cleared() {

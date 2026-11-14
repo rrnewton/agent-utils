@@ -4,9 +4,10 @@
 //! main space, each a thread reply from an agent whose real answer arrived later. These tests pin
 //! the claims the feature makes about them:
 //!
-//!   * **Everything that reads "to do" agrees.** The to-do list, the count, the digest and the
-//!     agent's tools leave a placeholder out and SAY how many they left out; the channel reads mark
-//!     it rather than drop it, because the page shows it dimmed.
+//!   * **Everything that counts what is left agrees.** The count, the digest and the agent's
+//!     tools leave a placeholder out and SAY how many they left out; the channel reads mark it
+//!     rather than drop it, because the page shows it dimmed. (The filtered to-do listing that
+//!     also left it out went in #1473 remove-server-todo-endpoint.)
 //!   * **It is evaluated, never recorded.** An edit that turns the placeholder into the answer makes
 //!     it unread again, and removing the rule un-hides everything it caught — without one store row
 //!     changing. Nothing here writes a dismissal.
@@ -119,12 +120,24 @@ impl Harness {
         .await
     }
 
+    /// What still wants attention: the channel window minus its noise and its dismissals,
+    /// computed from the reads that stay (the filtered listing itself went in #1473).
     async fn todo_ids(&self) -> Vec<MessageId> {
-        ops::todo(&self.state, Scope::Read, READ_CHANNEL, None)
+        let window = ops::messages(&self.state, Scope::Read, READ_CHANNEL, None)
             .await
-            .expect("reads")
+            .expect("reads");
+        let dismissed = ops::dismissed_within(
+            &self.state,
+            Scope::Read,
+            &window.channel.id,
+            &window.messages,
+        )
+        .await
+        .expect("reads");
+        window
             .messages
             .into_iter()
+            .filter(|m| !m.noise && !dismissed.contains(&m.id))
             .map(|m| m.id)
             .collect()
     }
@@ -162,20 +175,14 @@ struct Conversation {
 }
 
 #[tokio::test]
-async fn the_to_do_list_leaves_placeholders_out_and_says_how_many() {
+async fn placeholders_are_left_out_of_what_wants_attention() {
     let harness = Harness::new();
     let c = harness.conversation();
-    let view = ops::todo(&harness.state, Scope::Read, READ_CHANNEL, None)
-        .await
-        .expect("reads");
-    let ids: Vec<MessageId> = view.messages.iter().map(|m| m.id.clone()).collect();
     assert_eq!(
-        ids,
+        harness.todo_ids().await,
         vec![c.question.clone(), c.answer.clone()],
         "a placeholder is not something to deal with"
     );
-    assert_eq!(view.noise, 2, "the list must say what it left out");
-    assert_eq!(view.window, 4, "the placeholders are still in the channel");
     // EVALUATED, NOT RECORDED. Nothing was dismissed to produce that list.
     assert!(
         harness
@@ -275,7 +282,7 @@ async fn removing_the_rule_un_hides_everything_it_caught() {
 
 #[tokio::test]
 async fn clearing_the_backlog_dismisses_only_what_the_list_showed() {
-    // The to-do list never shows a placeholder, so "clear everything up to this row" must not
+    // A placeholder never wants attention, so "clear everything up to this row" must not
     // write a dismissal for one. A dismissal is DURABLE: the placeholder would stay hidden after
     // the rule was removed, and an agent that later edited it into the real answer would find the
     // answer hidden as well — and the page, which counted the rows it showed, would promise to

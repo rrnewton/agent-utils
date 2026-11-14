@@ -287,9 +287,13 @@ async fn nothing_toward_a_model_carries_html() {
 }
 
 #[tokio::test]
-async fn the_to_do_list_and_a_posts_answer_carry_rendered_bodies() {
+async fn the_channel_read_and_a_posts_answer_carry_rendered_bodies() {
     let (router, _) = seeded();
-    let todo = get_json(&router, &format!("/api/v1/channels/{WRITE_CHANNEL}/todo")).await;
+    let todo = get_json(
+        &router,
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/page?render=html"),
+    )
+    .await;
     assert!(
         with_text(&todo, LIST_MESSAGE)["content_html"].is_string(),
         "{todo}"

@@ -10,7 +10,7 @@
 //!
 //! # Where a reason comes from
 //!
-//! * **The page says so.** Its timeline and recent-window reads (`/timeline`, `/page`, `/todo`)
+//! * **The page says so.** Its timeline and recent-window reads (`/timeline`, `/page`)
 //!   carry `reason=` with the word for what asked for the read ([`ReadReason::from_query`]). The
 //!   access middleware puts that word in the request's access line as `read_reason` and runs the
 //!   handler inside it ([`ReadReason::scope`]).

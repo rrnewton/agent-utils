@@ -2185,8 +2185,8 @@ pub struct PageQuery {
 /// ASKED FOR, on the one route that needs asking: `/page` is the page's history walk for a
 /// provider without threads AND the voice agent's `read_page` tool, and a model given HTML beside
 /// every message would be reading the same words twice in a form it has no use for. The routes
-/// only the page reads — the timeline, the to-do list, the live stream, a post's answer and the
-/// pins — render without being asked.
+/// only the page reads — the timeline, the live stream, a post's answer and the pins — render
+/// without being asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderQuery {
@@ -2214,8 +2214,8 @@ pub struct PageResponse {
     pub next_since: Option<String>,
     /// Which of `messages` the reader has ARCHIVED, so the view can dim them.
     ///
-    /// The ordinary channel view shows archived rows greyed rather than hidden -- hiding is what
-    /// the To do filter is for -- and it can only do that if the payload says which they are.
+    /// The ordinary channel view shows archived rows greyed rather than hidden, and it can only
+    /// do that if the payload says which they are.
     pub dismissed: Vec<MessageId>,
     /// The revision this channel's pins are at, as on a timeline read. `#206 pin-message`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6171,53 +6171,6 @@ pub async fn forget_read_mark(
     }))))
 }
 
-/// The messages in one channel that have not been dealt with here.
-#[derive(Debug, Serialize)]
-pub struct TodoResponse {
-    /// The to-do list itself: the channel, what is left, and how big the window was.
-    #[serde(flatten)]
-    pub todo: ops::TodoView,
-    /// See [`crate::store::INBOX_NOTICE`]. On the LISTING as well as on the mutations, because
-    /// this is the screen where "unread" means something to a Discord user and this is not that
-    /// thing.
-    pub read_state_notice: &'static str,
-    /// The revision this channel's pins are at, as on a timeline read. `#206 pin-message`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pins_revision: Option<i64>,
-    /// This channel's bookmark, as on a timeline read. `#240 reading-bookmark`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bookmark: Option<crate::store::Bookmark>,
-    /// The messages are somebody else's words, exactly as on every other read.
-    pub untrusted_content_notice: &'static str,
-}
-
-/// `GET /api/v1/channels/{channel_id}/todo`
-pub async fn todo(
-    State(state): State<AppState>,
-    ReadScope(caller): ReadScope,
-    Path(channel_id): Path<String>,
-    Query(query): Query<LimitQuery>,
-) -> Result<Response, ApiError> {
-    let mut todo = ops::todo(&state, caller, &channel_id, query.limit).await?;
-    // `#427 server-thread-hues`: each message carries its thread's colour.
-    ops::attach_message_hues(&state, caller, &todo.channel.id, &mut todo.messages).await;
-    crate::render::fill(
-        &state.config,
-        &state.headings,
-        &todo.channel,
-        &mut todo.messages,
-    );
-    let pins_revision = ops::pins_revision(&state, &todo.channel.id).await;
-    let bookmark = ops::bookmark_state(&state, &todo.channel.id).await;
-    Ok(no_store(Json(TodoResponse {
-        pins_revision,
-        bookmark,
-        todo,
-        read_state_notice: crate::store::INBOX_NOTICE,
-        untrusted_content_notice: untrusted::NOTICE,
-    })))
-}
-
 /// Which messages to mark as dealt with, or put back.
 ///
 /// Exactly one of the two, and supplying both is a refusal rather than a precedence rule: a
@@ -6233,7 +6186,7 @@ pub struct DismissRequest {
     pub through: Option<String>,
     /// The window the caller READ the list with, so `through` cannot clear more than was shown.
     ///
-    /// The same number sent to `GET /todo?limit=`. Without it a client that paged three messages
+    /// The same number sent with the list the caller read. Without it a client that paged three messages
     /// and gave up on them would clear the default fifty, because the boundary would be resolved
     /// against a window it never displayed — clearing work the owner never saw, which is the worst
     /// failure this view has. Ignored when `messages` names the ids one by one: there the window is

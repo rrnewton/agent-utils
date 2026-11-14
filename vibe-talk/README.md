@@ -1654,12 +1654,11 @@ escaped, as `@everyone` is suppressed on Discord.
 
 **Reading a reply by its id.** `#319 slack-reply-by-id`. Slack's history holds no thread reply,
 so a reply is found by its id only within its thread. Every listing says which thread a reply is in
-— `thread_id` on the entries of the digest and the catch-up, `thread` on each message of `/todo`
-and `/messages`, and `| thread <thread id>` on the voice tools' lines — and a read by id that is
+— `thread_id` on the entries of the digest and the catch-up, `thread` on each message of
+`/messages`, and `| thread <thread id>` on the voice tools' lines — and a read by id that is
 given it reads the reply there, in one call. Given none, the read looks among the conversation's
 own messages first, as before, and then in the thread the server already knows the reply to be in:
-from the newest messages it holds (what the digest, the to-do list and the catch-up were drawn
-from), what it read aloud in the last half minute, a pin, or the bookmark. That costs one more call,
+from the newest messages it holds (what the digest and the catch-up were drawn from), what it read aloud in the last half minute, a pin, or the bookmark. That costs one more call,
 and an id no listing placed in a thread costs none: it is `unknown_message` after the one read of
 history.
 
@@ -2257,8 +2256,8 @@ message cache can be worked out from real messages rather than guessed (`#208 pe
   the request to reading the whole answer, so it includes the network both ways. Other providers
   leave this list empty.
 * **Reasons** say why each read was made (`remote-ops-audit`, `src/read_reason.rs`), counted when it
-  is asked. The page names each of its timeline and recent-window reads (`/timeline`, `/page`,
-  `/todo`) in `reason=`: `enter` (opening a channel or a view), `poll`, `live` (after a live
+  is asked. The page names each of its timeline and recent-window reads (`/timeline`, `/page`)
+  in `reason=`: `enter` (opening a channel or a view), `poll`, `live` (after a live
   message), `mutation` (after a live edit or deletion, or the reader's own change: a Done undone,
   the noise rules), `visible` (the page shown again), `reset` and `replay` (the live stream), `pull`
   (pull to refresh, at either end), `expired` (a forward cursor the server could not continue),
@@ -5607,8 +5606,7 @@ beyond where the startup channel probe stands (including whether it was skipped)
 | POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn, `{speaker, text}`; a `you` turn may carry `answer` (the proposal a spoken yes sent). Also the voice page's records: `{speaker: "sent", send}` files the send memory's own copy of send `send` (`404 send_unknown` once forgotten, `409 send_recorded` the second time), and `{speaker: "marker", marker}` a conversation's start or a draft not sent; both carry no text, and anything else is `400 bad_record`. Answers `{id, turn}`, the turn as stored: a record filed in a conversation another has been written to since carries that conversation's last time as its `at_ms`, so it stays inside that conversation and does not move it up the listing |
 | GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call, with the calls before it in the last 12 hours, `words`, how many words of what was said or sent it holds, and `conversations`, how many calls its lines came from — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
-| GET | `/api/v1/channels/{id}/todo?limit=&reason=` | read | the recent window MINUS what has been dealt with; `window` and `complete` say how big the window was and whether it is the whole channel, and `window_from` when its oldest message was sent |
-| POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
+| POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` (at most 1,000 ids), or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read the list with, or `through` is resolved against the default window and clears more than you displayed |
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` (at most 1,000 ids) — the undo, restoring exactly that set |
 | POST | `/api/v1/own-read/apply` | **write** | no body — "Apply to existing messages": marks read every message of the owner's whose first read state this server has decided and that is not Done, answering `{changes:[{channel, messages}], count}`, each change what the undo restores (`#549 own-read-stored`) |
 | POST | `/api/v1/channels/{id}/read` | **write** | `{message_id, epoch?}` — move this server's read mark forward. `epoch` is the `read_epoch` `/inbox` gave (or the last answer's `epoch`): a mark forgotten since has moved to a later epoch, and the request then writes nothing and answers `applied: false` with the mark and epoch as they stand, so a stale mark cannot undo a forget. Without `epoch` it always applies |
@@ -8552,14 +8550,14 @@ from the person it is for, so what it catches has to be predictable by reading i
 `src/noise.rs` holds the matcher and the one sentence Settings quotes about it.
 
 **Evaluated on every read, never recorded.** Each message the server serves is judged against the
-rules as its text reads now and carries `noise: true` when it matches — the page, the to-do list,
+rules as its text reads now and carries `noise: true` when it matches — the page,
 the count, the digest and the agent's tools all read that one flag. Nothing is dismissed — not
-even by **Clear the backlog**, which sweeps only the messages the to-do list showed and so never a
+even by **Clear the backlog**, which sweeps only the messages that wanted attention and so never a
 placeholder — so a placeholder later edited into the answer is unread again, and removing a rule
 brings back everything it caught.
 
-What "read" means here, concretely: `/todo` leaves noise out and says how many (`noise`); `/count`
-and `/digest` skip it and say how many; the agent's `digest_channel`, `read_page` and
+What "read" means here, concretely: `/count`
+and `/digest` skip noise and say how many; the agent's `digest_channel`, `read_page` and
 `count_messages` leave it out and say so, and `find_message` never offers one as a match; read-aloud neither prepares it nor relays it into a
 call; and the page dims it, gives it no unread treatment, and hides it under *Hide read*. A tap on a
 placeholder still reads it aloud — an explicit request is not noise. `/inbox` holds only read marks

@@ -8,8 +8,9 @@
 //!
 //! What is deliberately NOT here: a message leaving the list because it was REPLIED to. That is
 //! derived state and it needs a reply reference on `model::Message`, which is a wire-format change
-//! touching every struct literal that builds one. It is a separate change and a separate issue;
-//! see the note above `ops::todo`.
+//! touching every struct literal that builds one. It is a separate change and a separate issue.
+//! The filtered listing that read these marks (`ops::todo`) went in #1473
+//! remove-server-todo-endpoint; `left` below recomputes it from the reads that stay.
 
 use std::sync::Arc;
 
@@ -49,12 +50,23 @@ impl Server {
         }
     }
 
+    /// What still wants attention: the window minus its dismissals, from the reads that stay.
     async fn left(&self) -> Vec<String> {
-        ops::todo(&self.state, Scope::Read, READ_CHANNEL, None)
+        let window = ops::messages(&self.state, Scope::Read, READ_CHANNEL, None)
             .await
-            .expect("reads")
+            .expect("reads");
+        let dismissed = ops::dismissed_within(
+            &self.state,
+            Scope::Read,
+            &window.channel.id,
+            &window.messages,
+        )
+        .await
+        .expect("reads");
+        window
             .messages
             .iter()
+            .filter(|m| !dismissed.contains(&m.id))
             .map(|m| m.id.0.clone())
             .collect()
     }
@@ -66,18 +78,9 @@ impl Server {
 
 #[tokio::test]
 async fn everything_is_wanting_attention_until_somebody_says_otherwise() {
-    // The floor. A to-do view that started empty would look like a working filter and would be a
-    // view of nothing.
+    // The floor. A filter that started empty would look like it worked and would show nothing.
     let server = Server::with(4);
-    let view = ops::todo(&server.state, Scope::Read, READ_CHANNEL, None)
-        .await
-        .expect("reads");
-    assert_eq!(view.messages.len(), 4);
-    assert_eq!(view.window, 4, "the window size has to be reported as well");
-    assert!(
-        view.complete,
-        "four messages inside a fifty-message ceiling IS the whole channel"
-    );
+    assert_eq!(server.left().await.len(), 4);
 }
 
 #[tokio::test]
@@ -98,12 +101,6 @@ async fn dismissing_one_message_removes_exactly_that_one() {
         ],
         "a dismissal took the wrong messages out of the list"
     );
-    // ...and the WINDOW still says how much there was, so an interface can say "3 of 4 left"
-    // rather than implying the channel has three messages in it.
-    let view = ops::todo(&server.state, Scope::Read, READ_CHANNEL, None)
-        .await
-        .expect("reads");
-    assert_eq!(view.window, 4);
 }
 
 #[tokio::test]
@@ -190,13 +187,13 @@ async fn bankruptcy_at_the_newest_message_clears_the_whole_backlog_and_undo_brin
 #[tokio::test]
 async fn bankruptcy_clears_only_the_window_the_reader_actually_read() {
     // THE worst failure this view has: clearing work the owner never saw. A paging client reads
-    // `/todo?limit=3`, the reader gives up on the three rows in front of them, and the boundary
+    // A three-row page: the reader gives up on the three rows in front of them, and the boundary
     // they name is the newest of those three. Resolved against the DEFAULT window, that same
     // boundary means "everything through the newest message in the channel" — ten here, fifty in
     // the shipped configuration — and the rows above it are marked dealt with without ever having
     // been on screen. The undo would recover them, but only for a reader who noticed.
     let server = Server::with(10);
-    let read = ops::todo(&server.state, Scope::Read, READ_CHANNEL, Some(3))
+    let read = ops::messages(&server.state, Scope::Read, READ_CHANNEL, Some(3))
         .await
         .expect("reads");
     assert_eq!(read.messages.len(), 3, "the narrowed read is the premise");
@@ -407,50 +404,6 @@ async fn a_thousand_ids_are_one_dismissal_and_one_undo() {
 }
 
 #[tokio::test]
-async fn the_list_says_when_its_window_starts_even_once_that_message_is_dealt_with() {
-    // `#240 reading-bookmark`. Hide read draws the bookmark above the first message left when the
-    // bookmark's own message is dealt with and still inside the window, because then everything
-    // between it and the list is dealt with too. Older than the window, nothing is known. So the
-    // list says when the window's oldest message was sent, whether or not that message is left.
-    let server = Server::with(12);
-    let window = ops::messages(&server.state, Scope::Read, READ_CHANNEL, Some(5))
-        .await
-        .expect("reads");
-    let oldest = window.messages.first().expect("a window of five");
-    assert_eq!(oldest.id, server.id(7), "the window is the newest five");
-    let view = ops::todo(&server.state, Scope::Read, READ_CHANNEL, Some(5))
-        .await
-        .expect("reads");
-    assert!(!view.complete);
-    assert_eq!(view.window_from.as_deref(), Some(oldest.timestamp.as_str()));
-    ops::dismiss(&server.state, READ_CHANNEL, &[server.id(7), server.id(8)])
-        .await
-        .expect("dismisses");
-    let view = ops::todo(&server.state, Scope::Read, READ_CHANNEL, Some(5))
-        .await
-        .expect("reads");
-    assert_eq!(
-        view.messages.first().map(|m| m.id.clone()),
-        Some(server.id(9))
-    );
-    assert_eq!(
-        view.window_from.as_deref(),
-        Some(oldest.timestamp.as_str()),
-        "the window's start moved with what was dealt with"
-    );
-    let empty = Server::with(0);
-    let view = ops::todo(&empty.state, Scope::Read, READ_CHANNEL, None)
-        .await
-        .expect("reads");
-    assert_eq!(view.window_from, None);
-    let json = serde_json::to_value(&view).expect("serializes");
-    assert!(
-        json.get("window_from").is_none(),
-        "an empty window names a start: {json}"
-    );
-}
-
-#[tokio::test]
 async fn explicit_dismissal_does_not_reread_the_chat_provider() {
     // A message can scroll out between the read and the tap. The authenticated local operation
     // still succeeds without asking the provider to find it again.
@@ -504,28 +457,30 @@ async fn an_undo_still_works_for_a_message_that_has_scrolled_out_of_the_window()
 }
 
 #[tokio::test]
-async fn a_to_do_list_with_no_store_refuses_rather_than_showing_the_whole_channel() {
-    // The opposite posture from `summarize_message`, and the difference is the point. There the
-    // store is a CACHE, so an absent one produces the same answer more slowly. Here the store IS
-    // the answer: with no overlay every message is undealt-with, so a to-do list served from
-    // nowhere is the plain channel wearing a name that promises filtering.
+async fn a_dismissed_read_with_no_store_refuses_rather_than_guessing() {
+    // With no overlay there is nothing to intersect, so the read refuses rather than reporting
+    // "nothing dismissed" for a channel it never checked.
     let (state, discord) = testing::state_with(Arc::new(vibe_talk::store::disabled::DisabledStore));
     discord.seed(&ChannelId(READ_CHANNEL.to_owned()), "codex-eng", "hello");
-    let error = ops::todo(&state, Scope::Read, READ_CHANNEL, None)
+    let window = ops::messages(&state, Scope::Read, READ_CHANNEL, None)
+        .await
+        .expect("reads");
+    let error = ops::dismissed_within(&state, Scope::Read, &window.channel.id, &window.messages)
         .await
         .expect_err("must refuse");
     assert_eq!(error.code(), "storage_not_configured", "{error}");
 
-    // THE CONTROL: the same channel, the same read, a store that works — and it answers.
+    // THE CONTROL: the same channel, a store that works — and it answers.
     let (state, discord) = testing::state_with(Arc::new(FakeStore::new()));
     discord.seed(&ChannelId(READ_CHANNEL.to_owned()), "codex-eng", "hello");
-    assert_eq!(
-        ops::todo(&state, Scope::Read, READ_CHANNEL, None)
+    let window = ops::messages(&state, Scope::Read, READ_CHANNEL, None)
+        .await
+        .expect("reads");
+    assert!(
+        ops::dismissed_within(&state, Scope::Read, &window.channel.id, &window.messages)
             .await
             .expect("reads")
-            .messages
-            .len(),
-        1
+            .is_empty()
     );
 }
 

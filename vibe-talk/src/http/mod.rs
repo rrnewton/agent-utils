@@ -390,10 +390,11 @@ fn routes(state: AppState) -> Router {
             axum::routing::put(api::set_message_cache).delete(api::erase_message_cache),
         )
         .route("/api/v1/inbox", get(api::inbox))
-        // `#50 todo-view`. The channel filtered down to what has not been dealt with, and the two
-        // acts that change that. READ scope to look, WRITE scope to change — the same split every
-        // durable write on this server takes, and the reason it is not "read scope because it is
-        // only a flag" is that the flag outlives the process and another device reads it back.
+        // `#50 todo-view`'s two acts that change what has been dealt with. WRITE scope to change
+        // — the same split every durable write on this server takes, and the reason it is not
+        // "read scope because it is only a flag" is that the flag outlives the process and another
+        // device reads it back. The filtered listing itself (`GET .../todo`) went with the page
+        // view in #1473 remove-server-todo-endpoint; only these acts stay.
         // `#50` read-aloud. POST because it spends money at a vendor; see `api::speak`.
         .route(
             "/api/v1/channels/{channel_id}/messages/{message_id}/speak",
@@ -438,7 +439,6 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/hidden",
             delete(api::show_channel),
         )
-        .route("/api/v1/channels/{channel_id}/todo", get(api::todo))
         .route("/api/v1/channels/{channel_id}/dismiss", post(api::dismiss))
         .route("/api/v1/channels/{channel_id}/restore", post(api::restore))
         // `#549 own-read-stored`. "Apply to existing messages": the owner's own messages already

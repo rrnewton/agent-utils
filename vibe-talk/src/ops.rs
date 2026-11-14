@@ -6490,119 +6490,16 @@ pub async fn forget_read_mark(
     Ok((channel, epoch))
 }
 
-// --- the to-do view: which messages have NOT been dealt with -------------------------------------
+// --- dealt-with marks: which messages the reader has finished with -------------------------------
 //
-// `#50 todo-view`. A long backlog of assistant messages is a to-do list in practice, and Discord
-// has nowhere to write down which of them you have finished with. So this server writes it down —
-// see `#61 unread-status` and the module documentation on `crate::store`: the overlay is OURS,
-// there is no sync-in and no sync-back, and every answer here says so out loud rather than letting
-// the owner find it from a divergence.
-//
-// WHAT IS NOT HERE, stated so a reader of this file does not go looking for it. `#50` also asks
-// for a message to leave the list when it is REPLIED to, detected from the reply reference Discord
-// records. That needs a field on `crate::model::Message` and a conversion in `crate::discord`, and
-// it is deliberately a separate change: it is a wire-format change touching every struct literal
-// that builds a Message, and landing it inside this one would make an overlay nobody could review
-// on its own. Until it lands, "dealt with" is DECLARED and never derived — which is also why the
-// question of which wins when the two disagree does not arise yet.
-
-/// One channel's to-do list: what has not been dealt with, and how much has.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct TodoView {
-    /// The channel, as configured here.
-    pub channel: ChannelInfo,
-    /// The messages still wanting attention, oldest first.
-    pub messages: Vec<Message>,
-    /// How many messages the window held before the dealt-with ones were dropped.
-    ///
-    /// Reported so a caller can say "9 of 30 left" rather than implying the channel holds nine
-    /// messages. It is the WINDOW's size, not the channel's: see [`Window::is_whole_channel`].
-    pub window: usize,
-    /// Whether that window is the whole channel, so a caller can avoid a confident wrong total.
-    pub complete: bool,
-    /// When the window's oldest message was sent, as the provider stamped it, dealt with or not;
-    /// absent for an empty window. `#240 reading-bookmark`: a page drawing the bookmark on this
-    /// list needs to know whether a message the list leaves out is inside the window (so dealt
-    /// with, like everything between it and the list) or older than it (so nothing is known).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub window_from: Option<String>,
-    /// How many messages in the window the owner's noise rules call read. `#196 auto-read-noise`.
-    ///
-    /// They are not in `messages` — a placeholder is not something to deal with — and they are
-    /// still in `window`, because they are still in the channel.
-    pub noise: usize,
-    /// The window's messages left out because they are Done, oldest first; absent when there are
-    /// none. `#549 own-read-stored`: the owner's own words start Done, the one he just sent among
-    /// them, and a page waiting to see that message come back from the provider before it lets its
-    /// "sent" receipt go would otherwise wait for as long as it shows this list.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub done: Vec<MessageId>,
-}
-
-/// The messages in one channel that have not been dealt with here. Read scope to ask.
-///
-/// The list is the recent window MINUS the dismissals, MINUS what the owner's noise rules call
-/// read: there is no server-side notion of "important" and no inference from dwell time, both of
-/// which `#50` excludes deliberately. A message leaves this list because somebody said so — by
-/// tapping Done on it, or by writing a rule it matches (`#196 auto-read-noise`).
-///
-/// A store that is not configured is an ERROR here, unlike in [`summarize_message`], and the
-/// difference is not an inconsistency. There, the store is a cache and degrading to "generate
-/// every time" produces the same answer more slowly. Here it is the ANSWER: with no overlay every
-/// message is undealt-with, so a to-do list served from a missing store would silently be the
-/// plain channel wearing a name that promises filtering.
-///
-/// # Errors
-///
-/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Chat`] when the fetch fails;
-/// [`OpError::Store`] when no store is configured or the read fails.
-pub async fn todo(
-    state: &AppState,
-    caller: crate::auth::Scope,
-    channel_id: &str,
-    limit: Option<u16>,
-) -> Result<TodoView, OpError> {
-    let window = messages_for(
-        state,
-        caller,
-        channel_id,
-        limit,
-        Wants::Window(Consumer::Todo),
-    )
-    .await?;
-    let complete = window.is_whole_channel();
-    // `#549 own-read-stored`: the owner's own messages this read is the first to meet start read.
-    let own = crate::own_read::settle(state, caller, &window.channel.id, &window.messages).await;
-    let dismissed = state.store.dismissals(&window.channel.id).await?;
-    let dismissed: std::collections::HashSet<&str> =
-        dismissed.iter().map(MessageId::as_str).collect();
-    let total = window.messages.len();
-    let window_from = window
-        .messages
-        .first()
-        .map(|message| message.timestamp.clone());
-    let noise = window
-        .messages
-        .iter()
-        .filter(|message| message.noise)
-        .count();
-    let (left, done): (Vec<Message>, Vec<Message>) = window
-        .messages
-        .into_iter()
-        .filter(|message| !message.noise)
-        .partition(|message| {
-            !dismissed.contains(message.id.as_str()) && !own.contains(&message.id)
-        });
-    Ok(TodoView {
-        channel: window.channel,
-        messages: left,
-        window: total,
-        complete,
-        window_from,
-        noise,
-        done: done.into_iter().map(|message| message.id).collect(),
-    })
-}
+// `#50 todo-view`. A long backlog of assistant messages is a to-do list in practice, and the
+// provider has nowhere to write down which of them you have finished with. So this server writes
+// it down — see `#61 unread-status` and the module documentation on `crate::store`: the overlay
+// is OURS, there is no sync-in and no sync-back. The filtered listing that read it
+// (`GET .../todo`) went with the page view in #1473 remove-server-todo-endpoint; what stays is
+// the marks themselves and the acts that change them, which the timeline, page and agent reads
+// still share. "Dealt with" is DECLARED and never derived — which is also why the question of
+// which wins when the two disagree does not arise.
 
 /// Which of `messages` the reader has archived.
 ///
@@ -6610,8 +6507,8 @@ pub async fn todo(
 /// channel has ever had, and a client only ever needs to grey the rows it is showing. Sending the
 /// lot would grow without bound and say nothing the page could use.
 ///
-/// `#50 todo-view`. The To do filter REMOVES these; the ordinary channel view dims them, and until
-/// this existed it could not, because nothing in the messages payload said which ones they were.
+/// `#50 todo-view`. The ordinary channel view dims these; until this existed it could not,
+/// because nothing in the messages payload said which ones they were.
 ///
 /// # Errors
 ///
@@ -7376,10 +7273,10 @@ pub async fn dismiss(
 /// giving up on. That is a decision, not an accident, and it is tested at the boundary.
 ///
 /// **`limit` is the window the caller READ with, and it bounds what this can clear.** The same
-/// number that was passed to [`todo`], because "everything before this one" means everything the
-/// reader was looking at — and a caller that read a three-message page must not be able to clear a
-/// fifty-message backlog by naming the oldest row of the three. Passing `None` means the default
-/// window, which is what a caller that read `/todo` without a limit was shown. A `through` outside
+/// number that was passed with the list the caller read, because "everything before this one"
+/// means everything the reader was looking at — and a caller that read a three-message page must
+/// not be able to clear a fifty-message backlog by naming the oldest row of the three. Passing
+/// `None` means the default window. A `through` outside
 /// the narrowed window is [`OpError::UnknownMessage`], which is the right refusal: the caller is
 /// naming a boundary it did not display.
 ///
@@ -7569,7 +7466,7 @@ pub async fn exempt_from_noise(
 // pinned messages and nothing is written back to them — and, like `#39 channel-alias`, the owner's
 // act alone: there is no MCP tool for any of this, so a model can neither pin nor read the list.
 
-/// Every pin in one channel, with the revision the list is at. Read scope, like `/todo`: the pins
+/// Every pin in one channel, with the revision the list is at. Read scope: the pins
 /// are copies of messages in a channel the caller may already read.
 ///
 /// # Errors

@@ -90,7 +90,11 @@ async fn the_heading_travels_where_the_rendered_body_does_and_nowhere_toward_a_m
     assert!(message.get("content_html").is_none(), "{message}");
     assert_eq!(message["content"], HEADED, "the text is the whole text");
 
-    let todo = get(&router, &format!("/api/v1/channels/{WRITE_CHANNEL}/todo")).await;
+    let todo = get(
+        &router,
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/page?render=html"),
+    )
+    .await;
     assert!(said(&todo, HEADED)["heading"].is_object(), "{todo}");
 
     // Toward a model: the plain page read, the scrollback, one message, the digest, and the MCP

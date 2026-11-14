@@ -132,8 +132,6 @@ pub enum Consumer {
     Messages,
     /// A digest: `GET /digest` and MCP `digest_channel`.
     Digest,
-    /// A channel's to-do list.
-    Todo,
     /// Declaring bankruptcy on a channel.
     Bankruptcy,
     /// Speech preparation's window of a channel.
@@ -154,10 +152,9 @@ pub enum Consumer {
 
 impl Consumer {
     /// Every consumer, in the order the report lists them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Messages,
         Self::Digest,
-        Self::Todo,
         Self::Bankruptcy,
         Self::Speech,
         Self::MessageById,
@@ -173,7 +170,6 @@ impl Consumer {
         match self {
             Self::Messages => "messages",
             Self::Digest => "digest",
-            Self::Todo => "todo",
             Self::Bankruptcy => "bankruptcy",
             Self::Speech => "speech",
             Self::MessageById => "message_by_id",

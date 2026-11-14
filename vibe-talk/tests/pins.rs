@@ -288,7 +288,7 @@ async fn a_pin_is_listed_with_its_snapshot_and_both_acts_are_idempotent() {
 async fn every_channel_read_carries_the_pin_revision_and_only_a_change_moves_it() {
     // What lets a page keep pins current without re-reading the list on every refresh.
     let harness = Harness::new();
-    for route in ["timeline?view=main", "page", "todo"] {
+    for route in ["timeline?view=main", "page"] {
         assert_eq!(
             harness.revision_on_read(route).await,
             json!(0),
@@ -298,7 +298,7 @@ async fn every_channel_read_carries_the_pin_revision_and_only_a_change_moves_it(
     let (_, pinned) = harness
         .pin(READ_CHANNEL, "1000000000000000100", snapshot("pinned"))
         .await;
-    for route in ["timeline?view=main", "page", "todo"] {
+    for route in ["timeline?view=main", "page"] {
         assert_eq!(
             harness.revision_on_read(route).await,
             pinned["revision"],
