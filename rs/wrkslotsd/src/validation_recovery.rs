@@ -18,6 +18,7 @@ use crate::config_validate::{ensure_no_symlink_components, relative_inside, vali
 type Result<T> = std::result::Result<T, String>;
 
 /// Python `Path.as_posix` for the paths this module renders.
+#[allow(dead_code)]
 fn posix(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -1276,6 +1277,7 @@ fn service_result_projection(
 }
 
 /// Python `_frozen_result_evidence_from_obj` (target-checked).
+#[allow(dead_code)]
 pub(crate) fn frozen_result_evidence(
     value: &Value,
     target: Option<&str>,
@@ -2516,6 +2518,242 @@ pub(crate) fn ownerless_validation_journal(
         "fenced": fenced_value,
         "authorization": authorization,
     }))
+}
+
+/// Python `ValidationRecoveryAuthorization` as decoded by
+/// `_validation_authorization_from_obj` (no proof support yet).
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct Authorization {
+    /// `checkout`, `frozen-checkout`, or `cargo-home`.
+    pub target_kind: String,
+    /// The recorded target path spelling.
+    pub path: String,
+    /// (dev, ino, mount id) of the target.
+    pub identity: (u64, u64, u64),
+    /// The actor identity object.
+    pub actor: Value,
+    /// The terminal-record or coordinator-determination evidence.
+    pub evidence: Value,
+    /// The source repository spelling, for checkouts.
+    pub repository: Option<String>,
+    /// The recorded HEAD, for checkouts.
+    pub head: Option<String>,
+    /// The remote URL digest, for checkouts.
+    pub remote_url_sha256: Option<String>,
+    /// (dev, ino, mount id) of the target's parent.
+    pub parent_identity: Option<(u64, u64, u64)>,
+    /// The stable file-handle identity, for frozen checkouts.
+    pub stable_identity: Option<PrivateIdentity>,
+}
+
+fn identity3(value: Option<&Value>, label: &str) -> Result<Option<(u64, u64, u64)>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(items) = value.as_array() else {
+        return Err(format!("{label} must contain device, inode, and mount id"));
+    };
+    if items.len() != 3 {
+        return Err(format!("{label} must contain device, inode, and mount id"));
+    }
+    let numbers: Vec<u64> = items
+        .iter()
+        .map(|item| item.as_u64().unwrap_or_default())
+        .collect();
+    if items.iter().any(|item| item.as_u64().is_none()) {
+        return Err(format!("{label} must contain device, inode, and mount id"));
+    }
+    Ok(Some((numbers[0], numbers[1], numbers[2])))
+}
+
+/// Python `_validation_authorization_from_obj`.
+pub(crate) fn authorization_from_obj(value: &Value) -> Result<Authorization> {
+    let Some(raw) = value.as_object() else {
+        return Err("validation recovery authorization must be an object".to_string());
+    };
+    if raw.contains_key("removal_proof") && !raw["removal_proof"].is_null() {
+        return Err(
+            "validation removal proof execution stays with the Python edition for now".to_string(),
+        );
+    }
+    if raw.get("no_authored_work") != Some(&Value::Bool(true))
+        || raw.get("no_live_use") != Some(&Value::Bool(true))
+    {
+        return Err("validation recovery authorization is incomplete".to_string());
+    }
+    let identity = identity3(raw.get("identity"), "validation path identity")?
+        .ok_or_else(|| "validation recovery authorization is incomplete".to_string())?;
+    let parent_identity = identity3(raw.get("parent_identity"), "validation parent identity")?;
+    let stable_identity = match raw.get("stable_identity") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let Some(items) = value.as_array() else {
+                return Err(
+                    "validation stable path identity must contain dev, ino, file-handle type, and file-handle bytes"
+                        .to_string(),
+                );
+            };
+            if items.len() != 4 {
+                return Err(
+                    "validation stable path identity must contain dev, ino, file-handle type, and file-handle bytes"
+                        .to_string(),
+                );
+            }
+            Some((
+                items[0].as_u64().unwrap_or_default(),
+                items[1].as_u64().unwrap_or_default(),
+                items[2].as_i64().unwrap_or_default(),
+                items[3].as_str().unwrap_or_default().to_string(),
+            ))
+        }
+    };
+    let text = |key: &str| raw.get(key).and_then(Value::as_str).map(str::to_string);
+    Ok(Authorization {
+        target_kind: text("target_kind").unwrap_or_default(),
+        path: text("path").unwrap_or_default(),
+        identity,
+        actor: raw.get("actor").cloned().unwrap_or(Value::Null),
+        evidence: raw.get("evidence").cloned().unwrap_or(Value::Null),
+        repository: text("repository"),
+        head: text("head"),
+        remote_url_sha256: text("remote_url_sha256"),
+        parent_identity,
+        stable_identity,
+    })
+}
+
+/// Python `_ownerless_validation_paths`: decode the durable
+/// journal without touching the paths it names. Returns
+/// (authorization, target, fenced, phase).
+pub(crate) fn ownerless_validation_paths(
+    cfg: &Cfg,
+    raw: &serde_json::Map<String, Value>,
+) -> Result<(Authorization, PathBuf, PathBuf, String)> {
+    let keys: Vec<&str> = raw.keys().map(String::as_str).collect();
+    let required = [
+        "schema",
+        "kind",
+        "machine",
+        "slot",
+        "phase",
+        "fenced",
+        "authorization",
+    ];
+    if !required.iter().all(|key| keys.contains(key))
+        || !keys
+            .iter()
+            .all(|key| required.contains(key) || *key == "exclusion" || *key == "x")
+    {
+        return Err("ownerless validation journal has unexpected fields".to_string());
+    }
+    if int_value(raw.get("schema")) != Some(2)
+        || raw.get("kind").and_then(Value::as_str) != Some("ownerless-validate-remove")
+        || raw.get("machine").and_then(Value::as_str) != Some(cfg.machine.as_str())
+    {
+        return Err("ownerless validation journal identity is invalid".to_string());
+    }
+    let authorization = authorization_from_obj(raw.get("authorization").unwrap_or(&Value::Null))?;
+    let (_relative, target, _allowed) =
+        validation_recovery_target(cfg, &authorization.path, &authorization.target_kind)?;
+    if raw.get("slot").and_then(Value::as_str)
+        != target
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .as_deref()
+    {
+        return Err("ownerless validation journal slot differs from its path".to_string());
+    }
+    let raw_fenced = raw
+        .get("fenced")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let fenced = if authorization.target_kind == "frozen-checkout" {
+        let fenced = PathBuf::from(&raw_fenced);
+        if !fenced.is_absolute() {
+            return Err("fenced frozen validation path must be absolute".to_string());
+        }
+        let normalized = PathBuf::from(normpath(&raw_fenced));
+        if normalized.parent() != Some(frozen_validation_directory(cfg).as_path()) {
+            return Err("fenced frozen validation path has the wrong parent".to_string());
+        }
+        normalized
+    } else {
+        relative_inside(&cfg.root, &raw_fenced, "fenced path")?.1
+    };
+    let prefix = format!(
+        ".{}.ownerless-validate.",
+        target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    let fenced_name = fenced
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let suffix = fenced_name.strip_prefix(&prefix).unwrap_or_default();
+    if fenced.parent() != target.parent()
+        || suffix.len() != 32
+        || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("fenced validation path does not match its target".to_string());
+    }
+    let phase = raw
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !matches!(
+        phase.as_str(),
+        "prepared" | "fenced" | "removing" | "removed"
+    ) {
+        return Err(format!("unknown ownerless validation phase {phase:?}"));
+    }
+    Ok((authorization, target, fenced, phase))
+}
+
+/// Python `_rollback_validation_fence`: move a fenced path back
+/// to its canonical name and clear the journal.
+#[allow(dead_code)]
+pub(crate) fn rollback_validation_fence(
+    cfg: &Cfg,
+    journal: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let (authorization, target, fenced, _phase) = ownerless_validation_paths(cfg, journal)?;
+    if target.exists() || target.is_symlink() || fenced.is_symlink() || !fenced.is_dir() {
+        return Err(
+            "cannot safely roll back validation path fence; preserve both paths".to_string(),
+        );
+    }
+    std::fs::rename(&fenced, &target).map_err(|error| {
+        format!(
+            "cannot roll back validation path fence {} -> {}: {error}",
+            fenced.display(),
+            target.display()
+        )
+    })?;
+    if let Some(parent) = target.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    let mut rollback = journal.clone();
+    rollback.insert("phase".to_string(), Value::String("prepared".to_string()));
+    let rollback_value = Value::Object(rollback);
+    crate::remove_write::write_journal(cfg, &cfg.machine, &rollback_value)?;
+    if authorization.target_kind == "checkout" {
+        return Err(
+            "ownerless linked validation checkout recovery is disabled because the checkout and its Git administration cannot both be fenced against same-UID replacement; preserve it or import it only with a demonstrably live owner"
+                .to_string(),
+        );
+    }
+    crate::remove_write::clear_journal(cfg, &cfg.machine, &rollback_value)?;
+    Ok(())
 }
 
 /// Python `_frozen_release_*` for the dry run (#1089 step 4a):

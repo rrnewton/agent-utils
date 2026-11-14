@@ -3429,8 +3429,8 @@ fn latest_handoff_read(events: &[Value], record: &Value) -> Result<Option<Value>
     Ok(latest)
 }
 
-fn write_journal(cfg: &Cfg, selected: &str, journal: &Value) -> Result<()> {
-    ensure_event_log(None, cfg, selected)?;
+pub(crate) fn write_journal(cfg: &Cfg, selected: &str, journal: &Value) -> Result<()> {
+    ensure_event_log(Some(&cfg.root), cfg, selected)?;
     append_event(
         cfg,
         selected,
@@ -3448,8 +3448,8 @@ fn write_journal(cfg: &Cfg, selected: &str, journal: &Value) -> Result<()> {
     )
 }
 
-fn clear_journal(cfg: &Cfg, selected: &str, journal: &Value) -> Result<()> {
-    ensure_event_log(None, cfg, selected)?;
+pub(crate) fn clear_journal(cfg: &Cfg, selected: &str, journal: &Value) -> Result<()> {
+    ensure_event_log(Some(&cfg.root), cfg, selected)?;
     append_event(
         cfg,
         selected,
