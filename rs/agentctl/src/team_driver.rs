@@ -312,8 +312,12 @@ pub fn save_record(directory: &Path, record: &mut DriverRecord, now: f64) -> Res
 }
 
 /// The one-driver lock, held only while a run can still return it.
+/// Held as a [`agent_queue::fsio::HeldLock`], whose drop unlocks
+/// explicitly: releasing by closing the descriptor alone would keep
+/// the lock held while any child forked under it sits between fork
+/// and exec, and the next kick's try would spuriously find it busy.
 pub struct DriverLock {
-    _file: File,
+    _file: agent_queue::fsio::HeldLock,
 }
 
 /// Take the one-driver lock without waiting: `None` while another run
@@ -323,7 +327,9 @@ pub fn try_acquire_lock(directory: &Path) -> Result<Option<DriverLock>> {
         agent_queue::fsio::open_private_lock(&directory.join("driver.lock"), "team driver lock")
             .map_err(|error| fail(error.to_string()))?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(DriverLock { _file: file })),
+        Ok(()) => Ok(Some(DriverLock {
+            _file: agent_queue::fsio::HeldLock::new(file),
+        })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(fail(format!("cannot lock the team driver state: {error}"))),
     }
@@ -1618,6 +1624,34 @@ mod tests {
         assert_eq!(fake.restore_calls, 1);
         assert_eq!(exit_code(&record), 0);
         let _ = registry;
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_released_driver_lock_is_free_though_a_descriptor_copy_survives() {
+        // A child forked while the driver holds its lock shares the
+        // lock's open file description until its exec, exactly as a
+        // dup'd descriptor does here. Releasing by closing the
+        // holder's descriptor alone would keep the flock held for as
+        // long as that copy lives, and this test's second try would
+        // find it busy; the explicit unlock on drop frees it at once.
+        use std::os::fd::AsRawFd;
+
+        let root = temp_root("lock-release");
+        let directory = root.join("registry");
+        let lock = try_acquire_lock(&directory)
+            .expect("acquire")
+            .expect("the lock is free");
+        let copy = unsafe { libc::dup(lock._file.as_raw_fd()) };
+        assert!(copy >= 0, "dup the lock descriptor");
+        drop(lock);
+        let again = try_acquire_lock(&directory).expect("try again");
+        assert!(
+            again.is_some(),
+            "a surviving descriptor copy still holds the released lock"
+        );
+        drop(again);
+        unsafe { libc::close(copy) };
         fs::remove_dir_all(&root).unwrap();
     }
 
