@@ -2444,6 +2444,18 @@ test("documents reader: the header star toggles the open document's star", async
   });
 });
 
+test("documents: Show hidden is offered on the list only, never in the reader (#1545 hamburger-show-hidden-list-only)", async () => {
+  await withDocumentsView({}, async ({ view, byId }) => {
+    await view.show();
+    assert.equal(byId("docs-show-hidden").hidden, false, "Show hidden is not offered on the list");
+    await view.show("doc-a");
+    assert.equal(view.reading(), true, "the premise: the reader is up");
+    assert.equal(byId("docs-show-hidden").hidden, true, "Show hidden is offered in the reader");
+    view.showList();
+    assert.equal(byId("docs-show-hidden").hidden, false, "Show hidden did not return with the list");
+  });
+});
+
 // ---- 9. Fetch since: cutoff, pooled progress, the prompt (`#1308 doc-fetch-since-prompt`) ----
 //
 // The fetch half is the `#1307` shape shared with Fetch visible: a pool of

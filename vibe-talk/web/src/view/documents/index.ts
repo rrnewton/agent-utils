@@ -245,10 +245,20 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     panel.hidden = false;
   }
 
+  /** `#1545`: the hamburger's Show hidden belongs to the list alone. */
+  function syncShowHiddenOffer(): void {
+    try {
+      deps.byId("docs-show-hidden").hidden = readingNow;
+    } catch {
+      // A host without the hamburger item keeps the list as it was.
+    }
+  }
+
   /** To the list, the chain forgotten: a view switch here, never a Back step. */
   function toList(redraw = true): void {
     const wasReading = readingNow;
     readingNow = false;
+    syncShowHiddenOffer();
     chain = [];
     if (wasReading) deps.onLevelChange?.();
     reader.close();
@@ -322,6 +332,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       // A host without the reader row keeps the bar's own toggle.
     }
     readingNow = true;
+    syncShowHiddenOffer();
     deps.onLevelChange?.();
     let opened = false;
     try {

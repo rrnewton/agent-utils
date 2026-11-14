@@ -512,6 +512,7 @@ export interface ElementById {
   "read-steer-quote": HTMLButtonElement;
   "read-steer-row": HTMLDivElement;
   "read-timeline": HTMLDivElement;
+  "reader-box": HTMLDivElement;
   "reader-toggle": HTMLButtonElement;
   "reader-toggle-label": HTMLSpanElement;
   "reading-full-group": HTMLElement;

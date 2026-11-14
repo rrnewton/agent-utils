@@ -637,6 +637,41 @@ test("`#1399 toggle-labels-active-style`: the reader toggles are boxed, fixed-la
   assert.match(active, /color:\s*var\(--accent\)/, "an active toggle's words are not blue");
 });
 
+test("#1545 hamburger-show-hidden-list-only: Show hidden only on the Documents list; no empty Reader box in any view's menu", async () => {
+  const page = newPage();
+  page.documents = [{
+    key: "field-notes", title: "Field notes",
+    content: "# Field notes\n\nAlpha.\n", outline: [],
+  }];
+  await signIn(page);
+  // Call view: neither item, and no empty Reader box.
+  assert.equal(page.el("docs-show-hidden").hidden, true, "Show hidden is offered over the call");
+  assert.equal(page.el("reader-box").hidden, true, "the empty Reader box is drawn over the call");
+  await showDiscord(page, [message({ id: "1000000000000000001", content: "one block" })]);
+  // Channel view: the Reader box has its toggles; Show hidden stays away.
+  assert.equal(page.el("reader-box").hidden, false, "the Reader box is hidden over the channel, where its toggles live");
+  assert.equal(page.el("reader-toggle").hidden, false, "the premise: Hide reader is not offered over the channel");
+  assert.equal(page.el("docs-show-hidden").hidden, true, "Show hidden is offered over the channel");
+  // Documents list: Show hidden is offered; the Reader box is empty and gone.
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "docs", "the premise: the switch did not reach Documents");
+  assert.equal(page.el("docs-show-hidden").hidden, false, "Show hidden is not offered on the Documents list");
+  assert.equal(page.el("reader-box").hidden, true, "the empty Reader box is drawn over the Documents list");
+  // Documents reader: Show hidden goes away with the list.
+  let card;
+  for (let tries = 0; tries < 10 && !card; tries += 1) {
+    await page.settle();
+    card = page.el("documents-list").querySelectorAll(".doc-card")[0];
+  }
+  assert.ok(card, "no document card was drawn");
+  await card.click();
+  await page.settle();
+  assert.equal(page.el("docs-reader").hidden, false, "the premise: the reader did not open");
+  assert.equal(page.el("docs-show-hidden").hidden, true, "Show hidden is offered in the Documents reader");
+  assert.equal(page.el("reader-box").hidden, true, "the empty Reader box is drawn in the Documents reader");
+});
+
 test("settings is a gear, not the word Settings", () => {
   // RE-SLICED by `#58 control-bar`: the gear is in the dock now, so `</header>` no longer closes
   // the region it sits in and the old slice would have been empty.

@@ -35,6 +35,10 @@ Unhide, and the desktop Hide button. At phone and desktop sizes they also
 check `#1306 doc-star-gold`: the starred star is visibly different — its
 glyph fills and its computed colour is neither its own background (the old
 accent-blue-on-accent-blue blank button) nor the unstarred colour.
+
+The reader steps at both sizes also cover `#1545
+hamburger-show-hidden-list-only`: with a document open, the hamburger
+offers neither Show hidden (a list-only item) nor the empty Reader box.
 """
 
 import json
@@ -746,6 +750,18 @@ def main() -> int:
                 # star back on for the steps below (`#1306`).
                 tap_card(spage, spage.locator("#documents-list .doc-card", has_text="demo-doc"))
                 spage.wait_for_selector("#doc-body h1", timeout=20_000)
+                # `#1545 hamburger-show-hidden-list-only` at phone width: in
+                # the reader the hamburger offers no Show hidden and no
+                # empty Reader box (both return only with their own views).
+                spage.locator("#action-menu-open").click()
+                spage.wait_for_function(
+                    "() => !document.getElementById('action-menu').hidden"
+                    " && document.getElementById('docs-show-hidden').hidden"
+                    " && document.getElementById('reader-box').hidden",
+                    timeout=20_000)
+                spage.locator("#action-menu-open").click()
+                spage.wait_for_function(
+                    "() => document.getElementById('action-menu').hidden", timeout=20_000)
                 check(spage.locator("#doc-star").get_attribute("aria-pressed") == "true",
                       "the reader header does not show the card's star")
                 phone_header_on = star_appearance(spage.locator("#doc-star"))
@@ -866,6 +882,16 @@ def main() -> int:
                 check_star_gold("desktop card star", desk_card_off, star_appearance(guide_star))
                 hpage.locator("#documents-list .doc-card", has_text="guide.md").click()
                 hpage.wait_for_selector("#doc-body h1", timeout=20_000)
+                # `#1545` at desktop width, as at phone width above.
+                hpage.click("#action-menu-open")
+                hpage.wait_for_function(
+                    "() => !document.getElementById('action-menu').hidden"
+                    " && document.getElementById('docs-show-hidden').hidden"
+                    " && document.getElementById('reader-box').hidden",
+                    timeout=20_000)
+                hpage.click("#action-menu-open")
+                hpage.wait_for_function(
+                    "() => document.getElementById('action-menu').hidden", timeout=20_000)
                 hpage.wait_for_function(
                     "() => document.getElementById('doc-star')"
                     "?.getAttribute('aria-pressed') === 'true'",

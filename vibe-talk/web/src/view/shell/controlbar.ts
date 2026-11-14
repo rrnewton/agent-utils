@@ -113,10 +113,24 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     deps.el("action-menu-open").hidden = !main;
     deps.el("reader-toggle").hidden = deps.view() !== "discord";
     deps.el("autoplay-toggle").hidden = deps.view() !== "discord";
+    // `#1545 hamburger-show-hidden-list-only`. The Reader box holds only those
+    // two toggles; off the channel it would stand in the menu empty.
+    try {
+      deps.el("reader-box").hidden = deps.view() !== "discord";
+    } catch {
+      // A host without the box keeps the toggles' own drawing.
+    }
     // `catchup-side-agent`. Discuss in the menu, on the channel's view as reading is.
     deps.el("discuss-menu-open").hidden = deps.view() !== "discord";
-    // `#1265 documents-star-hide`. Show hidden, on the Documents view only.
-    deps.el("docs-show-hidden").hidden = deps.view() !== "docs";
+    // `#1265 documents-star-hide`; `#1545`: Show hidden, on the Documents
+    // LIST only — the reader (docs-reader up) has no list to unhide into.
+    let docsReaderUp = false;
+    try {
+      docsReaderUp = !deps.el("docs-reader").hidden;
+    } catch {
+      // A host without the reader keeps the view's own drawing.
+    }
+    deps.el("docs-show-hidden").hidden = deps.view() !== "docs" || docsReaderUp;
     if (deps.actionMenuOpen()) deps.renderActionMenu();
     // `#1355 phone-bar-discuss-slot`: the audio toggle in the reader row on the channel,
     // and back in the pack over Documents, whose reader hides that row. Only where a
