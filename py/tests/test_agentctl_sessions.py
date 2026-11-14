@@ -24,8 +24,11 @@ from agentctl.errors import (
 from agentctl.profiles import (
     LaunchProfile,
     blocking_question_warning,
+    check_required_env,
     configuration_root,
-    load_configuration, load_profiles, reasoning_arguments, validate_muse_headless_arguments,
+    effective_environment,
+    load_configuration, load_profiles, reasoning_arguments, required_env_for_launch,
+    validate_muse_headless_arguments,
     validate_raw_harness_arguments, validate_structured_harness_argument_conflicts,
     workspace_for_registry,
 )
@@ -1765,3 +1768,80 @@ def test_registry_discovery_stops_at_a_symlinked_or_slashed_home(tmp_path: Path)
     alias = tmp_path / "home-alias"
     alias.symlink_to(home, target_is_directory=True)
     assert cli.resolve_registry(".agentctl", cwd=repo, environ={}, home=alias) == ".agentctl"
+
+
+def _write_required_env_config(tmp_path: Path, document: dict[str, object]) -> Path:
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    path = directory / "profiles.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def test_required_env_registry_and_profile_parse_and_check(tmp_path: Path) -> None:
+    # #1429 launch-required-env: registry per-harness plus profile additions.
+    _write_required_env_config(tmp_path, {
+        "schema": "agentctl-profiles/v1",
+        "required_env": {"codex": ["EXAMPLE_GATEWAY"]},
+        "profiles": {
+            "gw": {"harness": "codex", "mode": "interactive",
+                   "env": {"EXAMPLE_GATEWAY": "https://example.invalid"},
+                   "required_env": ["EXAMPLE_EXTRA"]},
+        },
+    })
+    _path, profiles, _ws = load_configuration(tmp_path)
+    assert profiles["gw"].required_env == ("EXAMPLE_EXTRA",)
+    assert profiles["gw"].public()["required_env"] == ["EXAMPLE_EXTRA"]
+    registry, selected, all_profiles = required_env_for_launch(tmp_path, tmp_path / ".agentctl", "gw")
+    assert registry == {"codex": ("EXAMPLE_GATEWAY",)}
+    assert selected is not None and selected.name == "gw"
+    # Profile env supplies the registry variable; its own addition is missing.
+    with pytest.raises(AgentDeliveryError, match="EXAMPLE_EXTRA.*profile 'gw' required_env"):
+        check_required_env("codex", effective_environment(selected.environment, {}),
+                           registry_required=registry, profile=selected, profiles=all_profiles)
+    # Present and nonempty passes; empty fails.
+    check_required_env("codex", {"EXAMPLE_GATEWAY": "x", "EXAMPLE_EXTRA": "y"},
+                       registry_required=registry, profile=selected, profiles=all_profiles)
+    with pytest.raises(AgentDeliveryError, match="EXAMPLE_GATEWAY"):
+        check_required_env("codex", {"EXAMPLE_GATEWAY": "", "EXAMPLE_EXTRA": "y"},
+                           registry_required=registry, profile=selected, profiles=all_profiles)
+    # A profile-less launch is refused by the registry alone, suggesting the profile.
+    with pytest.raises(AgentDeliveryError, match=r"registry required_env.*--profile 'gw'"):
+        check_required_env("codex", {}, registry_required=registry, profile=None, profiles=all_profiles)
+    # No requirement for another harness; no config at all is backward compatible.
+    check_required_env("claude", {}, registry_required=registry, profile=None, profiles=all_profiles)
+    assert required_env_for_launch(tmp_path / "nowhere", tmp_path / "nowhere" / ".agentctl") == ({}, None, ())
+
+
+def test_required_env_rejects_bad_shapes(tmp_path: Path) -> None:
+    for document in (
+        {"schema": "agentctl-profiles/v1", "required_env": {"codex": ["BAD-NAME"]}, "profiles": {}},
+        {"schema": "agentctl-profiles/v1", "required_env": {"codex": ["EXAMPLE_GATEWAY", "EXAMPLE_GATEWAY"]}, "profiles": {}},
+        {"schema": "agentctl-profiles/v1", "required_env": {"bogus": ["EXAMPLE_GATEWAY"]}, "profiles": {}},
+        {"schema": "agentctl-profiles/v1", "profiles": {"w": {"harness": "codex", "mode": "interactive", "required_env": "EXAMPLE_GATEWAY"}}},
+    ):
+        _write_required_env_config(tmp_path, document)  # type: ignore[arg-type]
+        with pytest.raises(AgentDeliveryError, match="required_env"):
+            load_configuration(tmp_path)
+
+
+def test_start_refuses_missing_required_env_and_launches_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_required_env_config(tmp_path, {
+        "schema": "agentctl-profiles/v1",
+        "required_env": {"codex": ["EXAMPLE_GATEWAY"]},
+        "profiles": {"gw": {"harness": "codex", "mode": "interactive",
+                            "env": {"EXAMPLE_GATEWAY": "https://example.invalid"}}},
+    })
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    monkeypatch.delenv("EXAMPLE_GATEWAY", raising=False)
+    with pytest.raises(AgentDeliveryError, match="EXAMPLE_GATEWAY"):
+        sessions.start_session("worker", cwd=str(tmp_path), harness="codex")
+    assert fake.launched == []
+    monkeypatch.setenv("EXAMPLE_GATEWAY", "https://example.invalid")
+    result = sessions.start_session("worker", cwd=str(tmp_path), harness="codex")
+    assert result["name"] == "worker"

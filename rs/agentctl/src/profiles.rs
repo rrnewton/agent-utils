@@ -48,6 +48,8 @@ pub(crate) struct LaunchProfile {
     pub(crate) write_sandbox: bool,
     /// Isolation for the write-sandbox box; `None` uses the project's configured isolation.
     pub(crate) slot_isolation: Option<String>,
+    /// Variable names this profile additionally requires at launch (#1429 launch-required-env).
+    pub(crate) required_env: Vec<String>,
 }
 
 /// The roles a launch profile may give its agents (#897 chat-latency-stamps).
@@ -99,6 +101,7 @@ pub(crate) struct PublicProfile {
     /// The profile can park on a blocking question tool (#1158), when detectable.
     #[serde(skip_serializing_if = "Option::is_none")]
     blocking_question_warning: Option<&'static str>,
+    required_env: Vec<String>,
 }
 
 impl LaunchProfile {
@@ -119,6 +122,7 @@ impl LaunchProfile {
             agentcloud: self.cloud.clone(),
             requires_edition: self.cloud.as_ref().map(|_| "rust"),
             blocking_question_warning: blocking_question_warning(&self.harness, &self.argv),
+            required_env: self.required_env.clone(),
         }
     }
 }
@@ -137,6 +141,8 @@ struct Document {
     term_backend: Option<Value>,
     #[serde(default)]
     launch_env: Option<Value>,
+    #[serde(default)]
+    required_env: Option<Value>,
     profiles: UniqueMap<RawProfile>,
     #[serde(flatten)]
     unknown: UnknownKeys,
@@ -261,6 +267,8 @@ struct RawProfile {
     write_sandbox: Option<bool>,
     #[serde(default)]
     slot_isolation: Option<String>,
+    #[serde(default)]
+    required_env: Option<Value>,
     /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
     /// and read from the file by the chat bridge's latency stamps (#897).
     #[serde(default)]
@@ -1116,6 +1124,7 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
             "profile {name:?} write_sandbox does not apply to agentcloud agents"
         )));
     }
+    let required_env = required_names(raw.required_env.as_ref(), &format!("profile {name:?}"))?;
     Ok(LaunchProfile {
         name,
         harness: raw.harness,
@@ -1129,6 +1138,7 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         pinned: raw.pinned,
         write_sandbox: raw.write_sandbox.unwrap_or(false),
         slot_isolation: raw.slot_isolation,
+        required_env,
     })
 }
 
@@ -1262,6 +1272,7 @@ pub(crate) fn load_configuration(
     wrkslots_value(document.wrkslots.as_ref())?;
     backend_value(document.term_backend.as_ref())?;
     launch_env_value(document.launch_env.as_ref())?;
+    registry_required_env(document.required_env.as_ref())?;
     // Only a file that loads is warned about, so a refusal reads the same in both editions.
     if let Some(warning) = unknown_paths_warning(&path, unknown) {
         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -1551,6 +1562,176 @@ fn launch_env_value(value: Option<&Value>) -> Result<Option<LaunchEnv>, AgentErr
         env_file,
         path_prepend,
     }))
+}
+
+/// Validate one `required_env` name list: unique, well-formed variable names (#1429).
+fn required_names(value: Option<&Value>, label: &str) -> Result<Vec<String>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut names: Vec<String> = Vec::new();
+            for item in items {
+                let Some(name) = item.as_str().filter(|name| valid_env_name(name)) else {
+                    return Err(fail(format!(
+                        "{label} required_env names must match [A-Za-z_][A-Za-z0-9_]*"
+                    )));
+                };
+                if names.iter().any(|seen| seen == name) {
+                    return Err(fail(format!("{label} required_env names {name:?} twice")));
+                }
+                names.push(name.to_owned());
+            }
+            Ok(names)
+        }
+        Some(_) => Err(fail(format!(
+            "{label} required_env must be an array of environment variable names"
+        ))),
+    }
+}
+
+/// Validate the top-level `required_env` object: harness to required names (#1429).
+pub(crate) fn registry_required_env(
+    value: Option<&Value>,
+) -> Result<BTreeMap<String, Vec<String>>, AgentError> {
+    match value {
+        None | Some(Value::Null) => Ok(BTreeMap::new()),
+        Some(Value::Object(object)) => {
+            let mut result = BTreeMap::new();
+            for (harness, names) in object {
+                if !matches!(harness.as_str(), "codex" | "claude" | "muse" | "agy" | "agentcloud") {
+                    return Err(fail(format!(
+                        "profile config required_env has unsupported harness {harness:?}; use one of agy, agentcloud, claude, codex, muse"
+                    )));
+                }
+                result.insert(
+                    harness.clone(),
+                    required_names(Some(names), &format!("profile config required_env for harness {harness:?}"))?,
+                );
+            }
+            Ok(result)
+        }
+        Some(_) => Err(fail(
+            "profile config required_env must be an object mapping a harness to an array of environment variable names",
+        )),
+    }
+}
+
+/// The environment a launch will see: the caller's, overridden by literal entries.
+pub(crate) fn effective_environment(entries: &[String]) -> BTreeMap<String, String> {
+    let mut result: BTreeMap<String, String> = std::env::vars().collect();
+    for entry in entries {
+        if let Some((key, value)) = entry.split_once('=') {
+            result.insert(key.to_owned(), value.to_owned());
+        }
+    }
+    result
+}
+
+/// Refuse a launch missing a required variable (#1429 launch-required-env): present and
+/// nonempty only. Names each missing variable, the declaring config, and a profile that
+/// sets the missing names, when one exists.
+pub(crate) fn check_required_env(
+    harness: &str,
+    effective: &BTreeMap<String, String>,
+    registry_required: &BTreeMap<String, Vec<String>>,
+    profile: Option<&LaunchProfile>,
+    profiles: &[LaunchProfile],
+) -> Result<(), AgentError> {
+    let mut declared: Vec<(String, String)> = Vec::new();
+    if let Some(names) = registry_required.get(harness) {
+        for name in names {
+            if !declared.iter().any(|(seen, _)| seen == name) {
+                declared.push((
+                    name.clone(),
+                    format!("registry required_env for harness {harness:?} in profiles.json"),
+                ));
+            }
+        }
+    }
+    if let Some(profile) = profile {
+        for name in &profile.required_env {
+            if !declared.iter().any(|(seen, _)| seen == name) {
+                declared.push((
+                    name.clone(),
+                    format!("profile {:?} required_env", profile.name),
+                ));
+            }
+        }
+    }
+    let missing: Vec<&(String, String)> = declared
+        .iter()
+        .filter(|(name, _)| effective.get(name).is_none_or(|value| value.is_empty()))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let detail = missing
+        .iter()
+        .map(|(name, source)| format!("{name} (declared by {source})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let missing_names: Vec<&str> = missing.iter().map(|(name, _)| name.as_str()).collect();
+    let mut suggestion =
+        "set the variable(s) in the launch environment or use a profile that sets them".to_owned();
+    let mut candidates: Vec<&LaunchProfile> = profiles.iter().collect();
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    for candidate in candidates {
+        if candidate.harness != harness
+            || profile.is_some_and(|selected| selected.name == candidate.name)
+        {
+            continue;
+        }
+        let sets: std::collections::BTreeSet<&str> = candidate
+            .environment
+            .iter()
+            .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
+            .collect();
+        if missing_names.iter().all(|name| sets.contains(name)) {
+            suggestion = format!(
+                "use --profile {:?} (it sets {}) or set the variable(s) in the launch environment",
+                candidate.name,
+                missing_names.join(", ")
+            );
+            break;
+        }
+    }
+    Err(fail(format!(
+        "refusing to launch harness {harness:?}: required environment variable(s) missing or empty: {detail}; {suggestion}"
+    )))
+}
+
+/// Registry requirements, the selected profile, and all profiles for one launch (#1429).
+pub(crate) type RequiredEnvContext = (
+    BTreeMap<String, Vec<String>>,
+    Option<LaunchProfile>,
+    Vec<LaunchProfile>,
+);
+
+/// Registry requirements, the selected profile, and all profiles for one launch (#1429).
+/// No config file means no requirements (backward compatible).
+pub(crate) fn required_env_for_launch(
+    cwd: &Path,
+    registry: &Path,
+    profile_name: Option<&str>,
+) -> Result<RequiredEnvContext, AgentError> {
+    let root = configuration_root(cwd, registry, true)?;
+    if !root.join(PROFILE_PATH).exists() {
+        return Ok((BTreeMap::new(), None, Vec::new()));
+    }
+    let raw = registry_policy(&root.join(".agentctl"))?;
+    let Some(object) = raw else {
+        return Ok((BTreeMap::new(), None, Vec::new()));
+    };
+    let registry_required = registry_required_env(object.get("required_env"))?;
+    let profiles = load_profiles(&root, true)
+        .map(|(_, map)| map)
+        .unwrap_or_default();
+    let selected = profile_name.and_then(|name| profiles.get(name).cloned());
+    Ok((
+        registry_required,
+        selected,
+        profiles.into_values().collect(),
+    ))
 }
 
 /// Read only the launch environment for a conventional project registry.

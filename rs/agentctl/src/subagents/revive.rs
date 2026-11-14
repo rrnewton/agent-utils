@@ -1861,6 +1861,20 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         native: NativeSession,
         cwd: PathBuf,
     ) -> Result<LaunchPlan> {
+        {
+            let (registry_required, selected, profiles) = crate::profiles::required_env_for_launch(
+                &cwd,
+                &self.registry,
+                record.profile.as_deref(),
+            )?;
+            crate::profiles::check_required_env(
+                &record.harness,
+                &crate::profiles::effective_environment(&options.environment),
+                &registry_required,
+                selected.as_ref(),
+                &profiles,
+            )?;
+        }
         let mut slot_command = None;
         let mut relay_command = None;
         let mut relay_executable = None;

@@ -291,6 +291,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         claude::validate_arguments(&options.arguments).map_err(fail)?;
         let cwd = fs::canonicalize(cwd)
             .map_err(|error| fail(format!("working directory {}: {error}", cwd.display())))?;
+        {
+            let (registry_required, selected, profiles) =
+                crate::profiles::required_env_for_launch(&cwd, &self.registry, None)?;
+            crate::profiles::check_required_env(
+                &options.harness,
+                &crate::profiles::effective_environment(&[]),
+                &registry_required,
+                selected.as_ref(),
+                &profiles,
+            )?;
+        }
         let session = match options.session {
             Some(session) if claude::is_uuid(&session) => session.to_ascii_lowercase(),
             Some(session) => {
@@ -558,6 +569,20 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "headless agent {agent_name:?} is {}; nothing to run",
                 record.lifecycle
             )));
+        }
+        {
+            let (registry_required, selected, profiles) = crate::profiles::required_env_for_launch(
+                Path::new(&record.cwd),
+                &self.registry,
+                record.profile.as_deref(),
+            )?;
+            crate::profiles::check_required_env(
+                &record.harness,
+                &crate::profiles::effective_environment(&[]),
+                &registry_required,
+                selected.as_ref(),
+                &profiles,
+            )?;
         }
         if let Some(marker) = takeover_marker(&record) {
             // Exit 0, so a supervisor that restarts on failure does not loop.

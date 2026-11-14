@@ -9917,6 +9917,22 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .push("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on".to_owned());
         }
         options.environment = environment_entries(&options.environment)?;
+        // #1429: a registry or profile required variable must be present and
+        // nonempty in the launched environment; never fall back silently.
+        {
+            let (registry_required, selected, profiles) = crate::profiles::required_env_for_launch(
+                &cwd,
+                &self.registry,
+                options.profile.as_deref(),
+            )?;
+            crate::profiles::check_required_env(
+                &options.harness,
+                &crate::profiles::effective_environment(&options.environment),
+                &registry_required,
+                selected.as_ref(),
+                &profiles,
+            )?;
+        }
         // Placement policy is an input/start concern. Load it before creating
         // the generation so a configuration error cannot leave the name taken.
         let project_workspace = self.start_workspace_policy(&options)?;
@@ -23382,6 +23398,8 @@ fi
     mod progress;
     /// Recorded conversation and launch policy, with no status-time mutation.
     mod recovery_metadata;
+    /// Required launch environment, registry-wide and per profile (#1429).
+    mod required_env;
     /// `agentctl restore` and `agentctl watch` against the fake Herdr and a scripted host.
     mod restore;
     /// `agentctl restore-teams` over two fake-Herdr registries: aggregation,

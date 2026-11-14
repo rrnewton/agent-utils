@@ -66,6 +66,16 @@ while keeping their terminals available for direct inspection.
    agentctl start reviewer-again --cwd . --profile preferred-reviewer --resume SESSION
    ```
 
+   An optional top-level `"required_env": {"codex": ["EXAMPLE_GATEWAY"]}`
+   setting makes those variables mandatory for that harness on every launch
+   (a profile's own `required_env` list adds more); a launch missing one is
+   refused and names the variable and a profile that sets it.
+
+   An optional top-level `"required_env": {"codex": ["EXAMPLE_GATEWAY"]}`
+   setting makes those variables mandatory for that harness on every launch
+   (a profile's own `required_env` list adds more); a launch missing one is
+   refused and names the variable and a profile that sets it.
+
    An optional top-level `"workspace": "project-agents"` setting makes that
    Herdr workspace label authoritative for starts and automated input. Status
    and stop remain available for diagnosis and retirement.

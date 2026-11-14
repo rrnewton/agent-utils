@@ -95,6 +95,8 @@ class LaunchProfile:
     argv: tuple[str, ...]
     environment: tuple[str, ...]
     agentcloud: dict[str, object] | None = None
+    #: Variable names this profile additionally requires at launch (#1429 launch-required-env).
+    required_env: tuple[str, ...] = ()
 
     def public(self) -> dict[str, object]:
         """Return discovery metadata without argument or environment values."""
@@ -106,6 +108,7 @@ class LaunchProfile:
             "reasoning_effort": self.reasoning_effort,
             "argv_count": len(self.argv),
             "environment": [entry.partition("=")[0] for entry in self.environment],
+            "required_env": list(self.required_env),
         }
         if self.agentcloud is not None:
             result["agentcloud"] = dict(self.agentcloud)
@@ -399,6 +402,123 @@ def validate_agentcloud_create_arguments(argv: tuple[str, ...], *, label: str) -
             )
 
 
+def _required_names(value: object, label: str) -> tuple[str, ...]:
+    """Validate one ``required_env`` name list: unique, well-formed variable names."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise AgentDeliveryError(f"{label} required_env must be an array of environment variable names")
+    names: list[str] = []
+    for item in cast(list[object], value):
+        if not isinstance(item, str) or _ENVIRONMENT_NAME.fullmatch(item) is None:
+            raise AgentDeliveryError(f"{label} required_env names must match [A-Za-z_][A-Za-z0-9_]*")
+        if item in names:
+            raise AgentDeliveryError(f"{label} required_env names {item!r} twice")
+        names.append(item)
+    return tuple(names)
+
+
+def registry_required_env(value: object) -> dict[str, tuple[str, ...]]:
+    """Validate the top-level ``required_env`` object: harness to required names."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise AgentDeliveryError(
+            "profile config required_env must be an object mapping a harness to an array of environment variable names"
+        )
+    result: dict[str, tuple[str, ...]] = {}
+    for harness, names in cast(dict[str, object], value).items():
+        if harness not in _HARNESSES:
+            raise AgentDeliveryError(
+                f"profile config required_env has unsupported harness {harness!r}; use one of {', '.join(sorted(_HARNESSES))}"
+            )
+        result[harness] = _required_names(names, f"profile config required_env for harness {harness!r}")
+    return result
+
+
+def effective_environment(
+    entries: Sequence[str], ambient: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """The environment a launch will see: the caller's, overridden by literal entries."""
+    result = dict(os.environ if ambient is None else ambient)
+    for entry in entries:
+        key, _sep, val = entry.partition("=")
+        result[key] = val
+    return result
+
+
+def check_required_env(
+    harness: str, effective: dict[str, str], *,
+    registry_required: dict[str, tuple[str, ...]],
+    profile: LaunchProfile | None = None,
+    profiles: Sequence[LaunchProfile] = (),
+) -> None:
+    """Refuse a launch missing a required variable (#1429 launch-required-env).
+
+    A variable counts only when present and nonempty in the launched process's
+    environment. The refusal names each missing variable and the config that
+    declared it, and suggests a profile that sets the missing names.
+    """
+    declared: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for var in registry_required.get(harness, ()):
+        if var not in seen:
+            seen.add(var)
+            declared.append((var, f"registry required_env for harness {harness!r} in profiles.json"))
+    if profile is not None:
+        for var in profile.required_env:
+            if var not in seen:
+                seen.add(var)
+                declared.append((var, f"profile {profile.name!r} required_env"))
+    missing = [(var, source) for var, source in declared if not effective.get(var)]
+    if not missing:
+        return
+    detail = ", ".join(f"{var} (declared by {source})" for var, source in missing)
+    missing_names = {var for var, _source in missing}
+    suggestion = "set the variable(s) in the launch environment or use a profile that sets them"
+    for candidate in sorted(profiles, key=lambda item: item.name):
+        if candidate.harness != harness or (profile is not None and candidate.name == profile.name):
+            continue
+        if missing_names <= {entry.partition("=")[0] for entry in candidate.environment}:
+            suggestion = (
+                f"use --profile {candidate.name!r} (it sets {', '.join(sorted(missing_names))}) "
+                "or set the variable(s) in the launch environment"
+            )
+            break
+    raise AgentDeliveryError(
+        f"refusing to launch harness {harness!r}: required environment variable(s) "
+        f"missing or empty: {detail}; {suggestion}"
+    )
+
+
+def required_env_for_launch(
+    cwd: str | Path, registry: str | Path, profile_name: str | None = None,
+) -> tuple[dict[str, tuple[str, ...]], LaunchProfile | None, tuple[LaunchProfile, ...]]:
+    """Registry requirements, the selected profile, and all profiles for one launch.
+
+    Reads only the ``required_env`` key plus the profile definitions, so a
+    profile-less ``--harness X`` launch cannot bypass a registry requirement.
+    No config file means no requirements (backward compatible).
+    """
+    root = configuration_root(cwd, registry, absent_ok=True)
+    raw = _config_object_at(root)
+    if raw is None:
+        return {}, None, ()
+    registry_required = registry_required_env(raw.get("required_env"))
+    profiles: dict[str, LaunchProfile] = {}
+    try:
+        _path, profiles = load_profiles(root)
+    except AgentDeliveryError:
+        profiles = {}
+    selected = profiles.get(profile_name) if profile_name is not None else None
+    return registry_required, selected, tuple(profiles.values())
+
+
+def _config_object_at(root: Path) -> dict[str, object] | None:
+    """The raw config object at *root*, reusing the registry-policy reader."""
+    return _registry_policy(root / ".agentctl")
+
+
 def _profile(name: str, raw: object) -> LaunchProfile:
     if not _NAME.fullmatch(name):
         raise AgentDeliveryError(f"invalid profile name {name!r}; use lowercase letters, digits, and hyphens")
@@ -486,7 +606,8 @@ def _profile(name: str, raw: object) -> LaunchProfile:
         if not isinstance(value, str) or "\0" in value:
             raise AgentDeliveryError(f"profile {name!r} environment values must be NUL-free strings")
         environment.append(f"{key}={value}")
-    return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud)
+    required = _required_names(raw.get("required_env"), f"profile {name!r}")
+    return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud, required)
 
 
 def _workspace(value: object) -> str | None:
@@ -636,10 +757,10 @@ def _launch_env(value: object) -> LaunchEnv | None:
 
 # Unknown top-level keys are warned about once and ignored rather than refused, so a key a newer
 # agentctl adds never breaks an older one reading the same file. Keys inside a profile stay strict.
-_KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env"})
+_KNOWN_TOP_LEVEL_KEYS = frozenset({"schema", "profiles", "workspace", "wrkslots", "term_backend", "launch_env", "required_env"})
 _PROFILE_FIELDS = frozenset({
     "harness", "mode", "model", "reasoning_effort", "argv", "env", "agentcloud", "record_edges",
-    "role", "protocol",
+    "role", "protocol", "required_env",
 })
 _ROLES = ("coordinator", "liaison", "coordinator-hands", "worker")
 _PROTOCOLS = ("self-tooling", "hands-delegating")
@@ -713,6 +834,7 @@ def load_configuration(
     if raw.get("schema") != SCHEMA or not isinstance(raw.get("profiles"), dict):
         raise AgentDeliveryError(f"profile config must use schema {SCHEMA!r} and an object of profiles")
     profiles = {name: _profile(name, value) for name, value in cast(dict[str, object], raw["profiles"]).items()}
+    registry_required_env(raw.get("required_env"))
     _wrkslots(raw.get("wrkslots"))
     _term_backend(raw.get("term_backend"))
     _launch_env(raw.get("launch_env"))

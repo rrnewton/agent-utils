@@ -57,8 +57,11 @@ from agentctl.errors import (
 )
 from agentctl.profiles import (
     blocking_question_warning,
+    check_required_env,
+    effective_environment,
     load_profiles,
     reasoning_arguments,
+    required_env_for_launch,
     validate_structured_harness_argument_conflicts,
     LaunchEnv,
     launch_env_for_registry,
@@ -3519,6 +3522,11 @@ class ManagedAgents:
                             for entry in environment)):
             environment = (*environment, "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on")
         environment = environment_entries(environment)
+        # #1429: a registry or profile required variable must be present and
+        # nonempty in the launched environment; never fall back silently.
+        _req_registry, _req_profile, _req_profiles = required_env_for_launch(root, self.registry, profile)
+        check_required_env(harness, effective_environment(environment),
+                           registry_required=_req_registry, profile=_req_profile, profiles=_req_profiles)
         if brief is not None and not brief:
             raise AgentDeliveryError("brief must not be empty")
         if purpose is not None:

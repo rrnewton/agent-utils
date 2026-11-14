@@ -468,6 +468,60 @@ regular file or a directory is missing, and refuses root slot isolation, whose
 relay runs the harness without an interactive shell. The pane shell must accept
 `export NAME=value` (bash, zsh, or another POSIX-style shell).
 
+The top-level `required_env` is optional. It names, per harness, environment
+variables that must be present and nonempty in a launched process's
+environment, so a profile-less launch cannot silently miss a mandatory
+setting:
+
+```json
+{
+  "schema": "agentctl-profiles/v1",
+  "required_env": {"codex": ["EXAMPLE_GATEWAY"]},
+  "profiles": {
+    "gw": {
+      "harness": "codex",
+      "mode": "interactive",
+      "env": {"EXAMPLE_GATEWAY": "https://gateway.example.invalid"}
+    }
+  }
+}
+```
+
+Every launch path (`start`, `run-headless`, `revive`, `restore`, `restart`,
+and turnover relaunch) refuses when a required variable is missing or empty.
+The refusal names the variable, whether the registry `required_env` or a
+profile declared it, and a profile that sets it when one exists. A profile
+may also carry its own `required_env` list, which adds to the registry's for
+that profile's harness. Registries with no `required_env` behave exactly as
+before.
+
+The top-level `required_env` is optional. It names, per harness, environment
+variables that must be present and nonempty in a launched process's
+environment, so a profile-less launch cannot silently miss a mandatory
+setting:
+
+```json
+{
+  "schema": "agentctl-profiles/v1",
+  "required_env": {"codex": ["EXAMPLE_GATEWAY"]},
+  "profiles": {
+    "gw": {
+      "harness": "codex",
+      "mode": "interactive",
+      "env": {"EXAMPLE_GATEWAY": "https://gateway.example.invalid"}
+    }
+  }
+}
+```
+
+Every launch path (`start`, `run-headless`, `revive`, `restore`, `restart`,
+and turnover relaunch) refuses when a required variable is missing or empty.
+The refusal names the variable, whether the registry `required_env` or a
+profile declared it, and a profile that sets it when one exists. A profile
+may also carry its own `required_env` list, which adds to the registry's for
+that profile's harness. Registries with no `required_env` behave exactly as
+before.
+
 A team that runs agentctl from its own pinned build can tell which source a
 binary came from, and catch a build left behind when the pin moves. Build with
 `AGENTCTL_SOURCE_COMMIT` (the 40-character commit of the checkout),

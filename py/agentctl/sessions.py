@@ -18,7 +18,10 @@ from agentctl.client import HerdrClient, _bounded_control_command
 from agentctl.errors import AgentDeliveryError, HerdrRunError
 from agentctl.jsonx import as_mapping
 from agentctl.profiles import (
+    check_required_env,
+    effective_environment,
     reasoning_arguments,
+    required_env_for_launch,
     validate_muse_headless_arguments,
     validate_structured_harness_argument_conflicts,
 )
@@ -146,6 +149,9 @@ class Sessions(ManagedAgents):
         root = str(Path(cwd).expanduser().resolve())
         if not Path(root).is_dir():
             raise AgentDeliveryError(f"cwd is not a directory: {root}")
+        _req_registry, _req_profile, _req_profiles = required_env_for_launch(root, self.registry, profile)
+        check_required_env(harness, effective_environment(()),
+                           registry_required=_req_registry, profile=_req_profile, profiles=_req_profiles)
         with self._lock(name):
             with self._identity_transaction():
                 directory = self._directory(name)

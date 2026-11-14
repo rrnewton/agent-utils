@@ -267,6 +267,20 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 record.lifecycle
             )));
         }
+        {
+            let (registry_required, selected, profiles) = crate::profiles::required_env_for_launch(
+                Path::new(&record.cwd),
+                &self.registry,
+                record.profile.as_deref(),
+            )?;
+            crate::profiles::check_required_env(
+                &record.harness,
+                &crate::profiles::effective_environment(&[]),
+                &registry_required,
+                selected.as_ref(),
+                &profiles,
+            )?;
+        }
         let mut journal = match journal {
             Some(journal) => {
                 if field(&journal, "token") != record.token {

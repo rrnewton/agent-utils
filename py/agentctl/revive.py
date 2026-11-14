@@ -19,7 +19,7 @@ from typing import cast
 from agentctl import agent, launch_spec, registry_layout, sender_header
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable, RecoveryAction, _with_recovery
-from agentctl.profiles import LaunchProfile, configuration_root, load_profiles, reasoning_arguments, validate_structured_harness_argument_conflicts
+from agentctl.profiles import LaunchProfile, check_required_env, configuration_root, effective_environment, load_profiles, reasoning_arguments, required_env_for_launch, validate_structured_harness_argument_conflicts
 from agentctl.subagents import (
     AgentRecord, ManagedAgents, _MAX_AGENT_RECORD_BYTES, _NAME, _SHA256,
     _PinnedAgentDirectory, _missing_target, _name, _native_session,
@@ -386,6 +386,9 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
             environment = _relaunch_environment(record, selected)
         if not _environment_reconstructs(record, environment, sorted(record.environment_names)):
             raise AgentDeliveryError("recorded environment names cannot be reconstructed from the private launch profile")
+    _req_registry, _req_profile, _req_profiles = required_env_for_launch(record.cwd, manager.registry, record.profile)
+    check_required_env(record.harness, effective_environment(environment),
+                       registry_required=_req_registry, profile=_req_profile, profiles=_req_profiles)
     arguments = _expected_arguments(record)
     slot_command = relay_command = relay_executable = healed_slot_project = None
     if record.slot is not None:

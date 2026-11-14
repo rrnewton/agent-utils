@@ -160,7 +160,9 @@ def parser() -> argparse.ArgumentParser:
         help="owner-configured profile from CWD/.agentctl/profiles.json, or, when CWD has none, from the "
              "profiles.json beside a registry named .agentctl (so a worktree outside the project "
              "uses the project's profiles); accepts --resume for local interactive Claude/Codex/Muse profiles; conflicts "
-             "with other explicit harness launch settings")
+             "with other explicit harness launch settings. The top-level required_env key of profiles.json names, per "
+             "harness, variables that must be present and nonempty at launch (a profile's own required_env list adds "
+             "more); any launch missing one is refused, naming the variable and a profile that sets it")
     start.add_argument("--mode", choices=("interactive", "headless"), default=None,
         help="interactive keeps a native TUI; headless runs resumable structured turns (default: interactive)")
     start.add_argument("--backend", choices=("herdr", "tmux"), default="herdr",
