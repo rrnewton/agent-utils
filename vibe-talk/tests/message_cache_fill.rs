@@ -1663,11 +1663,13 @@ async fn an_unarmed_cache_is_filled_by_nothing() {
         get(&state, &uri).await;
     }
     assert!(cache.quiesce_blocking(WAIT));
-    // Each read was left out, and only that it was reached the writer: a time, for a channel the
-    // file holds nothing of, so nothing at all was written.
+    // Each read was left out, and nothing reached the writer at all (`#1533
+    // vibe-talk-record-completeness`): before arming this is the startup window, whose
+    // reads the arming verification and relist re-read, so no drop is recorded — recording
+    // one marked every channel read at startup, on every restart.
     assert!(
-        cache.last_drop_ms(&read_chan()).is_some(),
-        "the reads were left out"
+        cache.last_drop_ms(&read_chan()).is_none(),
+        "the startup window recorded a drop"
     );
     let counts = cache.counts().served().expect("counts");
     assert_eq!(
