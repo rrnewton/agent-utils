@@ -1088,9 +1088,7 @@ const documentsView = createDocumentsView({
     }
   },
   onStatus: (text) => setStatus(text),
-  // `#1505`: the reader opening or closing re-decides the control pane,
-  // which is the document read's transport while the reader stands.
-  onLevelChange: () => { shellNavigation.scheduleBackSync(); voiceCall().renderControls(); },
+  onLevelChange: () => shellNavigation.scheduleBackSync(),
   onBack: () => shellNavigation.documentBack(),
   onJumpToMention: (mention) => {
     void shellNavigation.jumpToSentMessage({

@@ -317,11 +317,7 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
         arg=blocks[0][:20],
         timeout=20_000)
-    # `#1505 documents-read-controls-highlight-tap`: the pane stands with the
-    # reader open — its Read is the document read's Pause, its pace the
-    # read's — where it used to leave with the reader and take play/pause
-    # with it.
-    check(page.locator("#control-pane").is_visible(), "the call controls leave with the reader open")
+    check(page.locator("#control-pane").is_hidden(), "the call controls show over the reader")
 
     # The device/cloud toggle is the Documents view's too now, starting on the
     # server voice; one tap picks the device for the read that follows.
@@ -352,8 +348,11 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     check(handlers == ["nexttrack", "pause", "play", "previoustrack", "stop"],
           f"the document read holds media handlers {handlers}")
 
-    # Pause and Resume from the pane, over the reader (`#1505`): the button
-    # says the act, the read holds, and the strip says it is held.
+    # Pause and Resume from the pane, over the reader (`#1505`): the pane
+    # stands while the read does — where it used to leave with the reader
+    # and take play/pause with it — the button says the act, the read
+    # holds, and the strip says it is held.
+    check(page.locator("#control-pane").is_visible(), "the call controls leave during the document read")
     check(page.locator("#read-aloud-label").inner_text().strip() == "Pause",
           "the pane's Read does not say Pause over the document read")
     act("#read-aloud")

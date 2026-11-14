@@ -1215,6 +1215,11 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     }
     if (wasPending && readingMode) setReadState("ready");
     deps.eachColumn(deps.renderChannelRows);
+    // `#1505 documents-read-controls-highlight-tap`: a stop is a transport
+    // change too — the pane that stood for the read leaves with it, on
+    // every stop path (toggle, Back, view switch), not only the ones that
+    // pass through `setReadState`.
+    deps.renderControls();
   }
 
   /** Fetch the audio for one message. Bytes, not JSON, so it cannot go through `api`. */

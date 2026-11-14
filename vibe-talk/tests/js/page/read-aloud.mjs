@@ -5419,10 +5419,10 @@ test("`#1039 documents-read-parity` stage 3: the reader's Read starts an owner d
   assert.equal(page.deviceSpeech.utterances[0].text, WIRE_BLOCKS[0]);
   assert.deepEqual(prepareRequests(page), [], "a device document read prepared speech");
   assert.equal(page.players.length, 0, "a device document read built an audio player");
-  // `#1505 documents-read-controls-highlight-tap`: the pane stands with the
-  // reader open, so its Read (the read's Pause) and pace are reachable in
-  // the reader; the channel's archive filter does not follow.
-  assert.equal(page.el("control-pane").hidden, false, "the call pane leaves with the reader open");
+  // `#1505 documents-read-controls-highlight-tap`: while the read stands
+  // the pane stands with it — its Read and pace are the read's transport;
+  // the channel's archive filter does not follow into Documents.
+  assert.equal(page.el("control-pane").hidden, false, "the call pane leaves during the document read");
   assert.equal(page.el("read-aloud").hidden, false, "the pane's Read does not follow the open reader");
   assert.equal(page.el("read-speed").hidden, false, "the pane's pace does not follow the open reader");
   assert.equal(page.el("todo-filter").hidden, true, "the channel's archive filter followed into Documents");
@@ -5445,10 +5445,11 @@ test("`#1039 documents-read-parity` stage 3: the reader's Read starts an owner d
 test("`#1505 documents-read-controls-highlight-tap`: a document read pauses and resumes from the pane", async () => {
   const page = devicePage();
   await openWiredDocument(page);
-  assert.equal(page.el("control-pane").hidden, false, "the pane is not standing with the reader open");
+  assert.equal(page.el("control-pane").hidden, true, "the pane stands before any document read");
   await page.el("doc-read").click();
   await page.settle();
   assert.equal(playingKind(page), "document");
+  assert.equal(page.el("control-pane").hidden, false, "the pane does not stand with the document read");
   assert.equal(page.el("read-aloud").hidden, false, "the pane's Read is not offered in the reader");
   assert.equal(page.el("read-speed").hidden, false, "the pane's pace is not offered in the reader");
   assert.equal(page.el("read-aloud-label").text(), "Pause", "the pane's Read does not say Pause over a document read");
@@ -5462,6 +5463,11 @@ test("`#1505 documents-read-controls-highlight-tap`: a document read pauses and 
   assert.equal(page.pure("readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.paused : null"), false,
     "Resume did not carry the document read on");
   assert.equal(page.el("read-aloud-label").text(), "Pause");
+  // The read stopped, the pane leaves with it: the reader is full height again.
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.equal(playingId(page), null, "the premise: the read did not stop");
+  assert.equal(page.el("control-pane").hidden, true, "the pane stands after the document read ended");
 });
 
 test("`#1039 documents-read-parity` stage 3: the reader's Read prepares a cloud document only at its own route", async () => {
