@@ -513,7 +513,9 @@ enabled = true
 # Linked documents (#628 documents-index-server): messages cached by this server are folded
 # into a document index (existence only; nothing is fetched until a reader asks). The fold
 # persists beside [storage] path as documents-index.json unless index_path names another
-# absolute path. Fetched copies live in a bounded in-memory cache.
+# absolute path. Fetched copies live in a bounded cache (max_cached_documents and
+# max_cached_bytes) persisted beside the fold as documents-fetched.json, so what was
+# downloaded still shows as downloaded after a restart.
 # github_token_file = "/run/secrets/github-documents-token"
 # github_token_command = ["gh", "auth", "token"]  # alternative to the file; never both
 # github_raw_base = "https://raw.githubusercontent.com"

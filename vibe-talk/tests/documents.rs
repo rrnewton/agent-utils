@@ -1093,3 +1093,208 @@ async fn search_finds_only_fetched_documents_by_title_and_body() {
     let (status, _) = call(&app, "GET", "/api/v1/documents/search?q=body", None, None).await;
     assert_ne!(status, StatusCode::OK);
 }
+
+// --- fetched-document persistence (`documents-fetched-persist`) -------------
+
+fn persist_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "documents-fetched-persist-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("persist dir");
+    dir
+}
+
+#[tokio::test]
+async fn fetched_documents_survive_a_service_restart_and_list_as_downloaded() {
+    let dir = persist_dir("restart");
+    let index_path = dir.join("documents-index.json");
+    let fetched_path = dir.join("documents-fetched.json");
+    let github = Arc::new(FakeGithub::default());
+    github.put(KEY, "# Real Title\n\nbody\n", "v1");
+    // First server life: no persisted file exists, so it starts empty.
+    {
+        let index = Arc::new(Index::load(Vec::new(), index_path.clone()).expect("index"));
+        index.apply_message(
+            READ_CHANNEL,
+            "1000000000000000001",
+            Some(1_000),
+            "agent",
+            None,
+            &format!("[report]({URL})"),
+        );
+        let service = Service::with_persistence(
+            index,
+            github.clone(),
+            100,
+            1 << 20,
+            Some(fetched_path.clone()),
+        );
+        assert_eq!(service.cache_len(), 0, "no file yet, cache starts empty");
+        let fetched = service.fetch_one(KEY).await.expect("fetch");
+        assert_eq!(fetched.title, "Real Title");
+        assert_eq!(fetched.version, "v1");
+    }
+    // Second server life on the same directory, with a fetcher that has
+    // nothing: the copy must come from disk, never a refetch.
+    let empty = Arc::new(FakeGithub::default());
+    let index = Arc::new(Index::load(Vec::new(), index_path.clone()).expect("reload index"));
+    let service = Arc::new(Service::with_persistence(
+        index,
+        empty,
+        100,
+        1 << 20,
+        Some(fetched_path.clone()),
+    ));
+    let cached = service.cached(KEY).expect("still cached after restart");
+    assert_eq!(cached.content, "# Real Title\n\nbody\n");
+    assert_eq!(cached.version, "v1");
+    assert_eq!(cached.title, "Real Title");
+    // The list payload is the page's downloaded truth after a restart.
+    let (mut state, _discord, _elevenlabs) = testing::state_parts();
+    state.documents = service;
+    let app = router(state);
+    let (status, body) = call(&app, "GET", "/api/v1/documents", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let docs = body["documents"].as_array().expect("documents");
+    let row = docs.iter().find(|d| d["key"] == KEY).expect("row");
+    assert_eq!(row["fetched"], true, "downloaded after restart: {body}");
+    assert_eq!(row["title"], "Real Title");
+    assert_eq!(row["version"], "v1");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn persisted_cache_respects_ceilings_across_restarts() {
+    let dir = persist_dir("ceilings");
+    let fetched_path = dir.join("documents-fetched.json");
+    let github = Arc::new(FakeGithub::default());
+    let keys: Vec<String> = (0..3)
+        .map(|n| format!("github:octo/widgets@main:docs/d{n}.md"))
+        .collect();
+    for (n, key) in keys.iter().enumerate() {
+        github.put(key, &format!("# Doc {n}\n"), "v1");
+    }
+    let build = |fetched_path: std::path::PathBuf, max_entries: usize, max_bytes: usize| {
+        let index = Arc::new(Index::new(Vec::new()));
+        for (n, _key) in keys.iter().enumerate() {
+            index.apply_message(
+                READ_CHANNEL,
+                &format!("100000000000000001{n}"),
+                Some(n as i64 + 1),
+                "agent",
+                None,
+                &format!("https://github.com/octo/widgets/blob/main/docs/d{n}.md"),
+            );
+        }
+        Service::with_persistence(
+            index,
+            github.clone(),
+            max_entries,
+            max_bytes,
+            Some(fetched_path),
+        )
+    };
+    // Count ceiling: fetching three into a two-entry cache evicts the oldest,
+    // and a restart holds the same two.
+    {
+        let service = build(fetched_path.clone(), 2, 1 << 20);
+        for key in &keys {
+            service.fetch_one(key).await.expect("fetch");
+        }
+        assert_eq!(service.cache_len(), 2);
+    }
+    {
+        let service = build(fetched_path.clone(), 2, 1 << 20);
+        assert_eq!(service.cache_len(), 2, "count ceiling held across restart");
+        assert!(service.cached(&keys[0]).is_none(), "oldest stayed evicted");
+        assert!(service.cached(&keys[2]).is_some());
+    }
+    // Byte ceiling: each "# Doc n\n" is 8 bytes, so 10 bytes holds one.
+    let byte_path = dir.join("documents-fetched-bytes.json");
+    {
+        let service = build(byte_path.clone(), 100, 10);
+        for key in &keys {
+            service.fetch_one(key).await.expect("fetch");
+        }
+        assert_eq!(service.cache_len(), 1, "byte ceiling holds one 8-byte doc");
+    }
+    {
+        let service = build(byte_path.clone(), 100, 10);
+        assert_eq!(service.cache_len(), 1, "byte ceiling held across restart");
+        assert!(service.cached(&keys[2]).is_some(), "newest kept");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn a_corrupt_fetched_file_is_ignored_and_fetch_still_works() {
+    let dir = persist_dir("corrupt");
+    let fetched_path = dir.join("documents-fetched.json");
+    for garbage in ["not json at all", "{\"version\":1,\"docs\":[{\"key\":"] {
+        std::fs::write(&fetched_path, garbage).expect("write corrupt file");
+        let github = Arc::new(FakeGithub::default());
+        github.put(KEY, "# Real Title\n\nbody\n", "v1");
+        let index = Arc::new(Index::new(Vec::new()));
+        index.apply_message(
+            READ_CHANNEL,
+            "1000000000000000001",
+            Some(1_000),
+            "agent",
+            None,
+            &format!("[report]({URL})"),
+        );
+        // Construction must not fail: the corrupt file is ignored.
+        let service =
+            Service::with_persistence(index, github, 100, 1 << 20, Some(fetched_path.clone()));
+        assert_eq!(service.cache_len(), 0, "corrupt file ignored: {garbage:?}");
+        let fetched = service.fetch_one(KEY).await.expect("fetch after corrupt");
+        assert_eq!(fetched.title, "Real Title");
+        // The write-through replaced the corrupt file with a whole one.
+        let text = std::fs::read_to_string(&fetched_path).expect("persisted file");
+        let parsed: Value = serde_json::from_str(&text).expect("persisted file parses");
+        assert_eq!(parsed["docs"].as_array().expect("docs").len(), 1);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn persisted_write_is_atomic_and_keyed_by_identity_and_version() {
+    let dir = persist_dir("atomic");
+    let fetched_path = dir.join("documents-fetched.json");
+    let github = Arc::new(FakeGithub::default());
+    let sha = vibe_talk::documents::version_of("# Real Title\n\nbody\n");
+    github.put(KEY, "# Real Title\n\nbody\n", &sha);
+    let index = Arc::new(Index::new(Vec::new()));
+    index.apply_message(
+        READ_CHANNEL,
+        "1000000000000000001",
+        Some(1_000),
+        "agent",
+        None,
+        &format!("[report]({URL})"),
+    );
+    let service =
+        Service::with_persistence(index, github, 100, 1 << 20, Some(fetched_path.clone()));
+    let fetched = service.fetch_one(KEY).await.expect("fetch");
+    assert!(fetched_path.exists(), "fetched file written");
+    let tmp = fetched_path.with_extension("json.tmp");
+    assert!(!tmp.exists(), "no temp file left behind: {}", tmp.display());
+    let parsed: Value =
+        serde_json::from_str(&std::fs::read_to_string(&fetched_path).expect("read persisted"))
+            .expect("persisted parses as one whole file");
+    assert_eq!(parsed["version"], 1);
+    let docs = parsed["docs"].as_array().expect("docs");
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["key"], KEY, "keyed by the cache identity");
+    assert_eq!(
+        docs[0]["version"], fetched.version,
+        "stored content version"
+    );
+    assert_eq!(
+        docs[0]["version"], sha,
+        "keyed by the same SHA-256 content version as the cache"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

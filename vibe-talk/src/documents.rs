@@ -6,7 +6,9 @@
 //! a pure function of the cached messages, maintained incrementally as messages are
 //! cached (live, backfill, edit, delete) and rebuilt or loaded at startup. It caches
 //! `document key -> mentions (when/where)`, never document contents; fetched contents
-//! live in a separate bounded cache. The list path reads only the fold result.
+//! live in a separate bounded cache, persisted beside the fold
+//! (`documents-fetched.json`) so a restart does not lose what was downloaded.
+//! The list path reads only the fold result and that cache.
 //!
 //! One admission sits beside the fold (`#1081 documents-relative-links`): a
 //! write-scope fetch naming a canonical key no message has mentioned registers
@@ -947,7 +949,7 @@ impl Index {
 }
 
 /// A fetched document, as the bounded cache holds it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fetched {
     /// Document key.
     pub key: String,
@@ -1763,6 +1765,155 @@ struct CacheState {
     max_bytes: usize,
 }
 
+impl CacheState {
+    fn evict_to_ceilings(&mut self) -> Vec<String> {
+        let mut evicted = Vec::new();
+        while self.docs.len() > self.max_entries || self.bytes > self.max_bytes {
+            let Some(old_key) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.docs.remove(&old_key) {
+                self.bytes = self.bytes.saturating_sub(old.content.len());
+                evicted.push(old_key);
+            }
+        }
+        evicted
+    }
+
+    fn insert(&mut self, fetched: Fetched) -> Vec<String> {
+        let key = fetched.key.clone();
+        if let Some(old) = self.docs.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.content.len());
+            self.order.retain(|k| k != &key);
+        }
+        self.bytes += fetched.content.len();
+        self.order.push_back(key);
+        self.docs.insert(fetched.key.clone(), fetched);
+        self.evict_to_ceilings()
+    }
+
+    /// This cache in persisted order, oldest first.
+    fn persisted_docs(&self) -> Vec<Fetched> {
+        self.order
+            .iter()
+            .filter_map(|key| self.docs.get(key).cloned())
+            .collect()
+    }
+
+    /// Take in what a previous run persisted, under the same ceilings and
+    /// the same identity and content version the cache holds. An entry
+    /// whose stored SHA-256 version does not match its content, an
+    /// oversized entry and an empty key are dropped, never trusted.
+    /// Returns whether anything was dropped or evicted.
+    fn restore(&mut self, persisted: PersistedFetched) -> bool {
+        let mut dropped = false;
+        for fetched in persisted.docs {
+            if fetched.key.is_empty() || fetched.content.len() > MAX_DOCUMENT_BYTES {
+                dropped = true;
+                continue;
+            }
+            if is_sha256_hex(&fetched.version) && fetched.version != version_of(&fetched.content) {
+                dropped = true;
+                continue;
+            }
+            if !self.insert(fetched).is_empty() {
+                dropped = true;
+            }
+        }
+        dropped
+    }
+}
+
+/// The persisted fetched cache: the bounded cache's copies in cache order.
+/// `documents-fetched-persist`.
+#[derive(Serialize, Deserialize)]
+struct PersistedFetched {
+    version: u32,
+    docs: Vec<Fetched>,
+}
+
+/// The persisted fetched-cache file format this build reads and writes.
+const FETCHED_PERSIST_VERSION: u32 = 1;
+
+fn is_sha256_hex(version: &str) -> bool {
+    version.len() == 64 && version.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Where fetched copies persist for a fold at `index_path`: beside it, as
+/// `documents-fetched.json`, in the same data directory as the fold JSON.
+#[must_use]
+pub fn fetched_path_for_index(index_path: &std::path::Path) -> std::path::PathBuf {
+    match index_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("documents-fetched.json"),
+        _ => std::path::PathBuf::from("documents-fetched.json"),
+    }
+}
+
+/// Load the persisted fetched cache at `path` under the given ceilings.
+/// A missing file starts empty, as a server without the file always has;
+/// a corrupt, partial or foreign-version file is ignored with one warning
+/// and also starts empty — it never fails startup.
+fn load_persisted_cache(
+    path: &std::path::Path,
+    max_entries: usize,
+    max_bytes: usize,
+) -> (CacheState, bool) {
+    let mut state = CacheState {
+        docs: HashMap::new(),
+        order: VecDeque::new(),
+        bytes: 0,
+        max_entries: max_entries.max(1),
+        max_bytes: max_bytes.max(1),
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (state, false),
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "fetched documents not loaded; starting empty");
+            return (state, false);
+        }
+    };
+    match serde_json::from_str::<PersistedFetched>(&text) {
+        Ok(persisted) if persisted.version == FETCHED_PERSIST_VERSION => {
+            let trimmed = state.restore(persisted);
+            (state, trimmed)
+        }
+        Ok(persisted) => {
+            tracing::warn!(
+                version = persisted.version,
+                path = %path.display(),
+                "fetched documents file is of a version this build does not read; starting empty"
+            );
+            (state, false)
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "fetched documents not loaded; starting empty");
+            (state, false)
+        }
+    }
+}
+
+/// Write `docs` to `path` atomically: beside the target, then renamed over
+/// it, so a crash never leaves half a file. A failure is one warning; the
+/// copies live on in memory.
+fn write_persisted_cache(path: &std::path::Path, docs: Vec<Fetched>) {
+    let persisted = PersistedFetched {
+        version: FETCHED_PERSIST_VERSION,
+        docs,
+    };
+    let written = serde_json::to_string(&persisted)
+        .map_err(|e| e.to_string())
+        .and_then(|text| {
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, text)
+                .and_then(|()| std::fs::rename(&tmp, path))
+                .map_err(|e| e.to_string())
+        });
+    if let Err(error) = written {
+        tracing::warn!(%error, path = %path.display(), "fetched documents not written");
+    }
+}
+
 /// The GitHub token `[documents]` configures, as every fetcher asking GitHub on this server
 /// shares it: the command that prints one when it is set, else the file read once here, else
 /// none. `#1058 pr-name-enrichment` asks through the same source.
@@ -1814,11 +1965,19 @@ pub fn service_from_config(config: &crate::config::DocumentsConfig) -> Arc<Servi
     if !config.paste_command.is_empty() {
         fetchers.push(Arc::new(PasteFetcher::new(config.paste_command.clone())));
     }
-    Arc::new(Service::new(
+    // Fetched copies persist beside the fold, in its data directory, so
+    // the downloaded state the page shows survives a restart. No fold
+    // path, no persistence: the cache is in memory only, as before.
+    let fetched_path = config
+        .index_path
+        .as_ref()
+        .map(|p| fetched_path_for_index(p));
+    Arc::new(Service::with_persistence(
         index,
         Arc::new(CompositeFetcher::new(fetchers)),
         config.max_cached_documents,
         config.max_cached_bytes,
+        fetched_path,
     ))
 }
 
@@ -1874,10 +2033,12 @@ pub struct Service {
     pub index: Arc<Index>,
     cache: Mutex<CacheState>,
     fetcher: Arc<dyn Fetcher>,
+    persist_path: Option<std::path::PathBuf>,
 }
 
 impl Service {
     /// A service over `index`, fetching through `fetcher`, with cache bounds.
+    /// Fetched copies live in memory only.
     #[must_use]
     pub fn new(
         index: Arc<Index>,
@@ -1895,7 +2056,60 @@ impl Service {
                 max_bytes: max_bytes.max(1),
             }),
             fetcher,
+            persist_path: None,
         }
+    }
+
+    /// A service whose fetched copies persist at `persist_path` beside the
+    /// fold: loaded on startup under the same ceilings, written through on
+    /// every fetch and eviction, atomically. A missing file starts empty;
+    /// a corrupt or partial file is ignored with a warning and also starts
+    /// empty — it never fails startup. `None` persists nowhere.
+    #[must_use]
+    pub fn with_persistence(
+        index: Arc<Index>,
+        fetcher: Arc<dyn Fetcher>,
+        max_entries: usize,
+        max_bytes: usize,
+        persist_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let (cache, trimmed) = match &persist_path {
+            Some(path) => load_persisted_cache(path, max_entries, max_bytes),
+            None => (
+                CacheState {
+                    docs: HashMap::new(),
+                    order: VecDeque::new(),
+                    bytes: 0,
+                    max_entries: max_entries.max(1),
+                    max_bytes: max_bytes.max(1),
+                },
+                false,
+            ),
+        };
+        let service = Self {
+            index,
+            cache: Mutex::new(cache),
+            fetcher,
+            persist_path,
+        };
+        if trimmed {
+            // What was dropped or evicted on load leaves the disk too, so
+            // the file and the cache hold the same copies from the start.
+            service.persist_cache();
+        }
+        service
+    }
+
+    fn persist_cache(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        let docs = self
+            .cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .persisted_docs();
+        write_persisted_cache(path, docs);
     }
 
     /// A service with the default cache bounds and no fetcher that can fetch.
@@ -1939,26 +2153,13 @@ impl Service {
 
     fn put(&self, fetched: Fetched) {
         let key = fetched.key.clone();
-        let mut evicted = Vec::new();
-        {
+        let evicted = {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(old) = cache.docs.remove(&key) {
-                cache.bytes = cache.bytes.saturating_sub(old.content.len());
-                cache.order.retain(|k| k != &key);
-            }
-            cache.bytes += fetched.content.len();
-            cache.order.push_back(key.clone());
-            cache.docs.insert(key.clone(), fetched);
-            while cache.docs.len() > cache.max_entries || cache.bytes > cache.max_bytes {
-                let Some(old_key) = cache.order.pop_front() else {
-                    break;
-                };
-                if let Some(old) = cache.docs.remove(&old_key) {
-                    cache.bytes = cache.bytes.saturating_sub(old.content.len());
-                    evicted.push(old_key);
-                }
-            }
-        }
+            cache.insert(fetched)
+        };
+        // Write through: the persisted file holds exactly the bounded
+        // cache, evictions included, before the fetch is announced.
+        self.persist_cache();
         // Fetched state is part of the synced record: say it changed.
         self.index.touch(&key);
         for old_key in evicted {
@@ -1980,10 +2181,13 @@ impl Service {
 
     /// Drop every fetched copy (a storage purge).
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache.docs.clear();
-        cache.order.clear();
-        cache.bytes = 0;
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.docs.clear();
+            cache.order.clear();
+            cache.bytes = 0;
+        }
+        self.persist_cache();
     }
 
     /// Fetch one document and cache it: the "sync this item" operation.
@@ -2522,6 +2726,64 @@ mod tests {
         let (_, _, truncated, _) = reloaded.changes_since(999);
         assert!(truncated);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn persisted_fetched(key: &str, content: &str, version: &str) -> Fetched {
+        Fetched {
+            key: key.to_owned(),
+            kind: DocKind::GithubMarkdown,
+            title: "Title".to_owned(),
+            content: content.to_owned(),
+            version: version.to_owned(),
+            fetched_ms: 1,
+            outline: Vec::new(),
+            moved_to: None,
+            issue_status: None,
+        }
+    }
+
+    #[test]
+    fn restored_fetched_copies_keep_etags_and_drop_sha_mismatches() {
+        let good_sha = version_of("good body");
+        let dir =
+            std::env::temp_dir().join(format!("documents-fetched-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("documents-fetched.json");
+        write_persisted_cache(
+            &path,
+            vec![
+                persisted_fetched("github:o/r@main:a.md", "good body", &good_sha),
+                // An ETag is a source version, not a content hash: kept as-is.
+                persisted_fetched("github:o/r@main:b.md", "etag body", "\"etag-1\""),
+                // A SHA-256 version that does not hash its content is corrupt.
+                persisted_fetched("github:o/r@main:c.md", "tampered", &good_sha),
+                persisted_fetched("", "no key", &version_of("no key")),
+            ],
+        );
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "atomic write left a temp file"
+        );
+        let (cache, trimmed) = load_persisted_cache(&path, 100, 1 << 20);
+        assert!(trimmed, "the corrupt entries were dropped on load");
+        assert_eq!(cache.docs.len(), 2);
+        assert!(cache.docs.contains_key("github:o/r@main:a.md"));
+        assert_eq!(
+            cache.docs["github:o/r@main:b.md"].version, "\"etag-1\"",
+            "a source version survives verbatim"
+        );
+        // What was dropped leaves the disk too.
+        let (reloaded, _) = load_persisted_cache(&path, 100, 1 << 20);
+        assert_eq!(reloaded.docs.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetched_path_sits_beside_the_fold() {
+        assert_eq!(
+            fetched_path_for_index(std::path::Path::new("/data/documents-index.json")),
+            std::path::PathBuf::from("/data/documents-fetched.json")
+        );
     }
 
     #[test]
