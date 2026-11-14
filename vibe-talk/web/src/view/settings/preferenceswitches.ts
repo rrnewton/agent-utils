@@ -5,6 +5,7 @@
 // the page's order, and taken down again.
 
 import { createListening } from "../dom/index.ts";
+import { centrePopupOver } from "../dom/index.ts";
 
 export interface PreferenceSwitchesDependencies {
   /** An element of the page by id. */
@@ -44,7 +45,12 @@ export interface PreferenceSwitches {
 export function mountPreferenceSwitches(deps: PreferenceSwitchesDependencies): PreferenceSwitches {
   const { listen, unmount } = createListening();
   const el = (id: string): HTMLElement => deps.lookup(id);
-  listen<Event>(el("read-speed"), "click", () => deps.toggleSpeedPopover());
+  listen<Event>(el("read-speed"), "click", () => {
+    const answered = deps.toggleSpeedPopover();
+    const popover = el("speed-popover");
+    if (!popover.hidden) centrePopupOver(popover, el("read-speed"));
+    return answered;
+  });
   listen<Event>(el("own-read-apply"), "click", () => deps.applyOwnRead());
   listen<Event>(el("own-read-undo"), "click", () => deps.undoOwnRead());
   listen<Event>(el("mark-own-read"), "change", () => deps.markOwnReadChanged());

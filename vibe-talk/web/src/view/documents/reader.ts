@@ -19,6 +19,7 @@
 // http(s) one, and plain text otherwise.
 
 import { createListening } from "../dom/index.ts";
+import { centrePopupOver } from "../dom/index.ts";
 import { documentHeadingId, renderDocumentMarkdown } from "./render.ts";
 import { documentReadBlocks } from "./blocks.ts";
 import { authorNumberOf, buildNavigator, buildSections } from "./sections.ts";
@@ -463,6 +464,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     deps.byId("doc-outline-open").setAttribute("aria-expanded", outlineOpen ? "true" : "false");
     if (outlineOpen !== wasOpen) deps.onOutlineChange?.(outlineOpen);
     if (outlineOpen) {
+      centrePopupOver(deps.byId("doc-outline-pop"), deps.byId("doc-outline-open"));
       refreshHere(true);
       const focusOn = buttons[hereIndex >= 0 ? hereIndex : 0];
       if (focusOn !== undefined && typeof focusOn.focus === "function") focusOn.focus();

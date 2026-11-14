@@ -277,6 +277,39 @@
     right: var(--dock-inset);
   }
 
+  /* `#1544 documents-desktop-control-bar`: the reading controls — the
+     device/cloud audio toggle, Pace, Stop and Read (its Pause while a read
+     plays) — in one centred box named for what it controls. The box is the
+     pane while it holds the reader's controls; the call's pane (Sound,
+     Clear, Hang up, Talk) keeps the row's right end as before. */
+  :root:has(#pane-docs:not([hidden])) #control-pane:has(> #read-aloud:not([hidden])) {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: 0.4rem;
+    border: 1px solid var(--edge);
+    border-radius: 0.85rem;
+    background: var(--panel);
+    padding: 0.35rem 0.5rem;
+  }
+
+  :root:has(#pane-docs:not([hidden])) #control-pane:has(> #read-aloud:not([hidden]))::before {
+    content: "Reader";
+    align-self: center;
+    font-size: 0.85rem;
+    color: var(--ink);
+    padding: 0 0.2rem;
+  }
+
+  /* Outline (reader view) and Fetch (list view) at the bar's right end,
+     beside the hamburger: they never show together (`#1544`). */
+  #control-bar[data-placement="bottom"] #doc-outline-open,
+  #control-bar[data-placement="bottom"] #docs-fetch {
+    position: absolute;
+    right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-menu) + 0.8rem);
+    bottom: 0.4rem;
+  }
+
   /* Sound silences a CALL's voice, and the channel view without a call has none. web/voice.js
      leaves it unhidden there, and on a phone that never shows: Hide read is placed in the same
      grid cell, later in the markup, and covers it. A row has no cells to cover anything with, so

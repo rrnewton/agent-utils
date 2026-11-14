@@ -124,7 +124,16 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     try {
       const audio = deps.el("audio-source");
       const inDocs = deps.view() === "docs";
-      const home = inDocs ? deps.el("bar-pack") : deps.el("control-pane");
+      // With a document open the audio toggle joins the reader's controls
+      // (`#1544`, the desktop Reader box); over the Documents list it stays
+      // in the bar, whose reader row is hidden there.
+      let readerOpen = false;
+      try {
+        readerOpen = inDocs && !deps.el("docs-reader").hidden;
+      } catch {
+        readerOpen = false;
+      }
+      const home = inDocs && !readerOpen ? deps.el("bar-pack") : deps.el("control-pane");
       if (audio.parentNode !== home) {
         if (inDocs) home.appendChild(audio);
         else home.insertBefore(audio, deps.el("read-speed"));

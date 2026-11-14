@@ -2,6 +2,7 @@
 // interface. `#624 voice-page-modularity`, plan step 16.
 
 export { childByClass, nodeWithin, shownNode } from "./tree.ts";
+export { centrePopupOver, centredPopupLeft } from "./popup-position.ts";
 export { elementIn, focusLost, focusMinimally, setFocusReveal } from "./shell.ts";
 export type { FocusReveal } from "./shell.ts";
 export type { ElementById } from "./ids.ts";

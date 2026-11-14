@@ -22,6 +22,7 @@ import type { DocStateStorage } from "./docstate.ts";
 import { createDocumentsList, FOLLOW_SLACK_PX } from "./list.ts";
 import type { DocumentsListPlace } from "./list.ts";
 import { createDocumentsReader, openDocumentNotice } from "./reader.ts";
+import { centrePopupOver } from "../dom/index.ts";
 import { createDocumentsSearch } from "./search.ts";
 import type { OpenDocument } from "./reader.ts";
 
@@ -253,6 +254,12 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     reader.close();
     deps.byId("docs-reader").hidden = true;
     deps.byId("docs-list-view").hidden = false;
+    deps.byId("docs-fetch").hidden = false;
+    try {
+      deps.byId("bar-pack").appendChild(deps.byId("audio-source"));
+    } catch {
+      // A host without the bar pack keeps the toggle where it is.
+    }
     // Back from a fetch: the rows redraw with their fetched state, landing
     // where the list was left (`#1264`), applied by the refresh after its
     // rows render however late they arrive.
@@ -305,6 +312,15 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     }
     deps.byId("docs-list-view").hidden = true;
     deps.byId("docs-reader").hidden = false;
+    // Fetch is the list's button and Outline the reader's (`#1544`): never both.
+    deps.byId("docs-fetch").hidden = true;
+    // The audio toggle joins the reader's controls while a document is open
+    // (`#1544`); the bar takes it back for the list (in toList, below).
+    try {
+      deps.byId("control-pane").insertBefore(deps.byId("audio-source"), deps.byId("read-speed"));
+    } catch {
+      // A host without the reader row keeps the bar's own toggle.
+    }
     readingNow = true;
     deps.onLevelChange?.();
     let opened = false;
@@ -357,6 +373,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     listening.listen(button, "click", () => {
       const open = menu.hidden;
       menu.hidden = !open;
+      if (open) centrePopupOver(menu, button);
       button.setAttribute("aria-expanded", String(open));
       // A Fetch press puts the since prompt away, fetching nothing (`#1308`).
       since.hidden = true;
@@ -377,6 +394,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
           // card hangs above the bar, and its first field takes the focus
           // (its value selected, ready to overtype).
           since.hidden = false;
+          centrePopupOver(since, button);
           try {
             const days = deps.byId("docs-since-days") as HTMLInputElement;
             days.focus();
