@@ -8732,6 +8732,52 @@ pub struct PrepareDocumentSpeechRequest {
     pub voice: Option<String>,
 }
 
+/// A Discuss summary's read key (`#1501`), parsed: its scope and the saved
+/// summary's generation. The page builds `discuss:<channel>|<thread>|<ms>`
+/// (`discussReadKey`); a thread id never carries `|`, so the first and last
+/// separators bound it.
+fn parse_discuss_read_key(key: &str) -> Option<(String, String, i64)> {
+    let rest = key.strip_prefix("discuss:")?;
+    let (channel, rest) = rest.split_once('|')?;
+    let (thread, created) = rest.rsplit_once('|')?;
+    if channel.is_empty() {
+        return None;
+    }
+    let created_ms: i64 = created.parse().ok()?;
+    Some((channel.to_owned(), thread.to_owned(), created_ms))
+}
+
+/// The saved words for a Discuss read key (`#1530`): the current summary of
+/// the scope's record, a superseded timeline summary with that generation,
+/// or — for a generation not named yet (0, a fresh Summarize before its
+/// record redraw) — the current summary. None where the record holds no
+/// summary by that name.
+async fn discuss_summary_text(
+    state: &AppState,
+    channel: &str,
+    thread: &str,
+    created_ms: i64,
+) -> Option<String> {
+    let record = state
+        .store
+        .discuss_record(&crate::model::ChannelId(channel.to_owned()), thread)
+        .await
+        .ok()??;
+    let current = record.current_summary.as_ref();
+    if created_ms == 0 {
+        return current.map(|summary| summary.text.clone());
+    }
+    if let Some(summary) = current.filter(|summary| summary.created_ms == created_ms) {
+        return Some(summary.text.clone());
+    }
+    record.timeline.iter().find_map(|entry| match entry {
+        crate::contract::DiscussEntry::Summary { summary } if summary.created_ms == created_ms => {
+            Some(summary.text.clone())
+        }
+        _ => None,
+    })
+}
+
 /// `POST /api/v1/documents/{key}/speech/prepare` — mint a speech ticket for a
 /// cached document, as [`prepare_speech`] mints one per channel message.
 /// READ scope; the key is percent-decoded by the router, as in [`get_document`].
@@ -8742,6 +8788,14 @@ pub struct PrepareDocumentSpeechRequest {
 /// document this server has not fetched, or one with nothing speakable in it,
 /// is simply absent from `prepared`, as an unresolved message id is;
 /// preparing never fetches. `#1039 documents-read-parity`.
+///
+/// A Discuss summary (`#1501`) rides this same route under a `discuss:` key
+/// that is never a Documents key (`#1530 discuss-summary-cloud-read-404`):
+/// its words are the summary this server saved in the scope's Discuss
+/// record, looked up by scope and generation, so a read after a reload or a
+/// close/reopen — which derives the same key from the same record — speaks
+/// the same saved words. A Discuss key naming no saved summary is
+/// `unknown_discuss_summary`, never `unknown_document`.
 pub async fn prepare_document_speech(
     State(state): State<AppState>,
     _scope: ReadScope,
@@ -8752,7 +8806,22 @@ pub async fn prepare_document_speech(
     if state.speech.describe().playback == crate::speech::Playback::Browser {
         return Err(SpeechError::BrowserPlaybackRequired.into());
     }
-    if state.documents.index.get(&key).is_none() {
+    let discuss = parse_discuss_read_key(&key);
+    let discuss_text = match &discuss {
+        Some((channel, thread, created_ms)) => Some(
+            discuss_summary_text(&state, channel, thread, *created_ms)
+                .await
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "unknown_discuss_summary",
+                        "no saved Discuss summary for this scope",
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    if discuss.is_none() && state.documents.index.get(&key).is_none() {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "unknown_document",
@@ -8764,14 +8833,20 @@ pub async fn prepare_document_speech(
     let _warm_up_started = state
         .read_ahead
         .start_warm_up(std::sync::Arc::clone(&state.speech));
-    let Some(cached) = state.documents.cached(&key) else {
-        return Ok(Json(PrepareSpeechResponse {
-            prepared: Vec::new(),
-            expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
-        }));
+    let content = match discuss_text {
+        Some(text) => text,
+        None => {
+            let Some(cached) = state.documents.cached(&key) else {
+                return Ok(Json(PrepareSpeechResponse {
+                    prepared: Vec::new(),
+                    expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
+                }));
+            };
+            cached.content
+        }
     };
     let now = jiff::Timestamp::now().as_millisecond();
-    let said = crate::speakable::for_speech(&cached.content, now, &state.config.timezone);
+    let said = crate::speakable::for_speech(&content, now, &state.config.timezone);
     if said.trim().is_empty() {
         return Ok(Json(PrepareSpeechResponse {
             prepared: Vec::new(),
@@ -8779,7 +8854,7 @@ pub async fn prepare_document_speech(
         }));
     }
     let blocks = spoken_blocks_for(
-        &cached.content,
+        &content,
         crate::render::Markup::default(),
         &[],
         now,

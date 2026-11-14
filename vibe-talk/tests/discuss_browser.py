@@ -26,12 +26,17 @@ the panel overlaying the list without moving #scroll-area. Condition waits
 only — no fixed sleeps in any assertion.
 """
 
+import io
 import json
+import math
 import socket
+import struct
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import urllib.request
+import wave
 from pathlib import Path
 
 from playwright.sync_api import Page, Route, sync_playwright
@@ -97,6 +102,24 @@ DEVICE_VOICE = """(() => {
   Object.defineProperty(window, 'speechSynthesis', {value: engine, configurable: true});
   window.SpeechSynthesisUtterance = function (text) { this.text = text; };
 })();"""
+
+
+def tone_wav(seconds: float = 2.0, rate: int = 16000) -> bytes:
+    """Unmistakable tone, as a cloud ticket's audio answers in the walk."""
+    frames = b"".join(
+        struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / rate)))
+        for i in range(int(seconds * rate))
+    )
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(frames)
+    return out.getvalue()
+
+
+TONE = tone_wav()
 
 
 def check(condition: bool, message: str) -> None:
@@ -426,6 +449,70 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => !d.open)",
         timeout=20_000)
+
+    # `#1530 discuss-summary-cloud-read-404`: the cloud voice reads the
+    # summary too. The prepare is answered at the network edge in this
+    # walk's style (the real route is covered through the server in the
+    # integration tests) with a ticket whose audio is a tone; what the
+    # owner sees is the point — no `unknown_document` banner, the strip
+    # counting the summary's blocks, and the same Discuss key prepared
+    # again after close/reopen. Condition waits only.
+    cloud_prepares: list[str] = []
+
+    def speech_prepare(route: Route) -> None:
+        cloud_prepares.append(route.request.url)
+        blocks = [
+            {"kind": kind, "spoken": True, "chars": 12, "element": at, "piece": 0, "pieces": 1}
+            for at, kind in enumerate(["heading", "item", "heading", "paragraph"])
+        ]
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+            "prepared": [{"message_id": "discuss", "url": "/api/v1/speech/check-ticket", "blocks": blocks}],
+            "expires_in_seconds": 600,
+        }))
+
+    def speech_audio(route: Route) -> None:
+        route.fulfill(status=200, content_type="audio/wav", body=TONE)
+
+    page.route("**/api/v1/documents/*/speech/prepare", speech_prepare)
+    page.route("**/api/v1/speech/check-ticket*", speech_audio)
+    if page.locator("#audio-source").get_attribute("aria-checked") != "true":
+        page.click("#audio-source")
+        page.wait_for_function(
+            "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'true'",
+            timeout=20_000)
+    page.click("#discuss-read")
+    wait_read_count("1 of 4")
+    check(len(cloud_prepares) > 0 and "discuss%3A" in cloud_prepares[-1] and "%7C" in cloud_prepares[-1],
+          f"the cloud read prepared {cloud_prepares}, not the Discuss key")
+    banner = page.locator("#error").text_content() or ""
+    check("unknown_document" not in banner and "not archived" not in banner,
+          f"the cloud Discuss read showed the old banner: {banner!r}")
+    page.click("#discuss-close")
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    wait_read_stopped()
+    open_discuss()
+    page.wait_for_function(
+        "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
+        timeout=20_000)
+    page.click("#discuss-read")
+    wait_read_count("1 of 4")
+    check(len(cloud_prepares) == 2 and urllib.parse.unquote(cloud_prepares[0].split("/documents/")[1].split("/speech")[0])
+          == urllib.parse.unquote(cloud_prepares[1].split("/documents/")[1].split("/speech")[0]),
+          f"close/reopen prepared a different key: {cloud_prepares}")
+    page.click("#discuss-close")
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    wait_read_stopped()
+    open_discuss()
+    page.wait_for_function(
+        "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
+        timeout=20_000)
+    page.unroute("**/api/v1/documents/*/speech/prepare", speech_prepare)
+    page.unroute("**/api/v1/speech/check-ticket*", speech_audio)
+    if page.locator("#audio-source").get_attribute("aria-checked") == "true":
+        page.click("#audio-source")
+        page.wait_for_function(
+            "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
+            timeout=20_000)
 
     # `#1497 discuss-fold-state-persist`: the summary's sections start
     # collapsed; an opened one survives close/reopen and a reload, kept on

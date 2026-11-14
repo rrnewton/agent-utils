@@ -32,6 +32,23 @@ test("`#624 voice-page-modularity`: what the agent is told of a draft, and the l
     ["Call ended.", "The call ended — the connection dropped.", "The call ended unexpectedly. Settings has the details."]);
 });
 
+test("`#1530 discuss-summary-cloud-read-404`: a missing saved summary or document says what to do, never that a message was archived", () => {
+  const { cloudFailureText } = CALL_WORDS;
+  assert.equal(
+    cloudFailureText("refused", "HTTP 404 unknown_discuss_summary: no saved Discuss summary for this scope"),
+    "Cloud voice: that Discuss summary is no longer saved on the server. Open Discuss, Summarize again, then tap Read.",
+  );
+  assert.equal(
+    cloudFailureText("refused", "HTTP 404 unknown_document: no such document"),
+    "Cloud voice: that document is not on the server any more. Reopen it, then tap Read.",
+  );
+  // A message read keeps its archived wording.
+  assert.equal(
+    cloudFailureText("refused", "speech access denied (ACL)"),
+    "Cloud voice: speech access denied (ACL). The message was not archived.",
+  );
+});
+
 test("`#624 voice-page-modularity`: what a spoken answer says to \"Send it?\", and a read-back held word for word, from the module alone", () => {
   const { classifySpokenAnswer, isExactReadBack, answerWords, unsayableDraft, couldBeSpokenYes, namesWhereToSend } = CALL_WORDS;
   assert.deepStrictEqual(["yes please", "no, change it", "yes and tell him", "Send it?", "what time is it"].map(classifySpokenAnswer),

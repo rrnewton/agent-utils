@@ -912,6 +912,141 @@ async fn document_speech_prepare_mints_a_ticket_from_cached_content() {
     assert_eq!(body["error"], "unknown_speech_block", "{body}");
 }
 
+/// `#1530 discuss-summary-cloud-read-404`: a Discuss summary read hands the
+/// shared owner a `discuss:` key, which is not a Documents key at all. The
+/// server saved that summary in the scope's Discuss record, so preparing its
+/// speech must mint a ticket from the saved words — after a reload and after
+/// close/reopen the same key is derived again and must prepare again — and a
+/// key naming no saved summary must say so as a Discuss failure, never as
+/// `unknown_document`.
+#[tokio::test]
+async fn discuss_summary_speech_prepare_mints_a_ticket_from_the_saved_record() {
+    use vibe_talk::store::StateStore as _;
+    let (mut state, _discord, store, elevenlabs) = testing::state_with_store_and_voice();
+    let github = Arc::new(FakeGithub::default());
+    let index = Arc::new(Index::new(Vec::new()));
+    state.documents = Arc::new(Service::new(index, github, 100, 1 << 20));
+    let tickets = Arc::clone(&state.speech_tickets);
+    let _ = tickets;
+    let app = router(state);
+    let summary = |text: &str, created_ms: i64| {
+        serde_json::json!({
+            "view": "flat", "since_ms": null,
+            "window": {"count": 2, "unread_count": 2, "read_count": 0,
+                       "from_id": "1", "through_id": "2",
+                       "truncated": false, "noise_hidden": 0},
+            "covered_ids": ["1", "2"], "cited_ids": [], "markable_ids": [],
+            "footer_links": [], "text": text, "text_html": "",
+            "unknown_terms": [], "backend": "fake", "model": "fake-model",
+            "stamp": {"context_ms": 1, "model_ms": 2, "first_token_ms": null,
+                      "total_ms": 3, "input_tokens": null, "output_tokens": null,
+                      "input_chars": 4, "output_chars": 9, "unknown_term_count": 0},
+            "created_ms": created_ms
+        })
+    };
+    let record: vibe_talk::contract::DiscussRecord = serde_json::from_value(serde_json::json!({
+        "current_summary": summary("First discuss point for the reader.\n\nSecond discuss point follows it.", 4242),
+        "timeline": [{"kind": "summary", "summary": summary("Earlier discuss point kept in the timeline.", 1111)}]
+    }))
+    .expect("discuss record");
+    store
+        .put_discuss_record(&ChannelId(READ_CHANNEL.to_owned()), "", &record)
+        .await
+        .expect("seed discuss record");
+
+    let key = format!("discuss:{READ_CHANNEL}||4242");
+    let uri = format!(
+        "/api/v1/documents/{}/speech/prepare",
+        encoded(&key).replace('|', "%7C")
+    );
+    // Twice, as a read after reload / close-reopen asks again for the same key.
+    for attempt in 0..2 {
+        let (status, body) = call(
+            &app,
+            "POST",
+            &uri,
+            Some(READ_TOKEN),
+            Some(serde_json::json!({
+                "text": "caller supplied words that must never be spoken"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "attempt {attempt}: {body}");
+        let prepared = body["prepared"].as_array().expect("prepared");
+        assert_eq!(prepared.len(), 1, "{body}");
+        assert_eq!(prepared[0]["message_id"], key, "{body}");
+        let url = prepared[0]["url"].as_str().expect("url").to_owned();
+        let (status, audio) = call_bytes(
+            &app,
+            "GET",
+            &format!("{url}?selection=doc-read&block=0"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!audio.is_empty(), "no audio came back for block 0");
+    }
+    let spoken = elevenlabs.spoken().join("\n");
+    assert!(spoken.contains("First discuss point"), "{spoken}");
+    assert!(
+        !spoken.contains("caller supplied"),
+        "caller text spoken: {spoken}"
+    );
+
+    // A superseded summary prepares by its own generation.
+    let old_uri = format!(
+        "/api/v1/documents/{}/speech/prepare",
+        encoded(&format!("discuss:{READ_CHANNEL}||1111")).replace('|', "%7C")
+    );
+    let (status, body) = call(
+        &app,
+        "POST",
+        &old_uri,
+        Some(READ_TOKEN),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["prepared"].as_array().expect("prepared").len(),
+        1,
+        "{body}"
+    );
+
+    // A fresh summary whose record generation is not named yet (0) prepares
+    // the scope's current summary.
+    let fresh_uri = format!(
+        "/api/v1/documents/{}/speech/prepare",
+        encoded(&format!("discuss:{READ_CHANNEL}||0")).replace('|', "%7C")
+    );
+    let (status, body) = call(
+        &app,
+        "POST",
+        &fresh_uri,
+        Some(READ_TOKEN),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A key naming no saved summary is a Discuss failure an owner can act
+    // on, never the documents 404.
+    let missing_uri = format!(
+        "/api/v1/documents/{}/speech/prepare",
+        encoded(&format!("discuss:{READ_CHANNEL}||9999")).replace('|', "%7C")
+    );
+    let (status, body) = call(
+        &app,
+        "POST",
+        &missing_uri,
+        Some(READ_TOKEN),
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "unknown_discuss_summary", "{body}");
+}
+
 /// `#1039 documents-read-parity`: an unknown key is the documents 404; a
 /// known document nobody has fetched prepares nothing, and asking does not
 /// fetch it.

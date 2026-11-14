@@ -5,6 +5,15 @@
 export function cloudFailureText(reason: string, detail: unknown) {
   if (reason === "silent") return CLOUD_SILENT;
   if (reason === "no_audio") return CLOUD_NO_AUDIO;
+  const rawDetail = String(detail || "");
+  // `#1530`: a document or Discuss read archives nothing, so the archived
+  // tail below would only mislead; say what to do instead.
+  if (/unknown_discuss_summary/u.test(rawDetail)) {
+    return "Cloud voice: that Discuss summary is no longer saved on the server. Open Discuss, Summarize again, then tap Read.";
+  }
+  if (/unknown_document/u.test(rawDetail)) {
+    return "Cloud voice: that document is not on the server any more. Reopen it, then tap Read.";
+  }
   const raw = String(detail || "").replace(/\s+/gu, " ").trim();
   const known = CLOUD_CAUSES.find(([pattern]) => pattern.test(raw));
   const cause = known ? known[1]!
