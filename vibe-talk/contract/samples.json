@@ -154,6 +154,9 @@
             "thread_id": null
           }
         ],
+        "fresh_ids": [
+          "1010"
+        ],
         "markable_ids": [
           "1010"
         ],
@@ -282,6 +285,9 @@
           "thread_id": "thread-1"
         }
       ],
+      "fresh_ids": [
+        "1010"
+      ],
       "markable_ids": [
         "1010"
       ],
@@ -356,6 +362,16 @@
         "truncated": false,
         "unread_count": 0
       }
+    }
+  ],
+  "CatchupUpdateRequest": [
+    {
+      "thread_id": "thread-1",
+      "view": "main"
+    },
+    {
+      "thread_id": null,
+      "view": null
     }
   ],
   "ChannelHistoryState": [

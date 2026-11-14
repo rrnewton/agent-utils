@@ -341,6 +341,13 @@
           },
           "type": "array"
         },
+        "fresh_ids": {
+          "description": "The latest incremental Update's cited ids (`#1388` landing 2), drawn\ngreen by the page until read or the next Update; absent otherwise.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
         "markable_ids": {
           "description": "The subset of `unread_ids` a dismissal can name, for the footer's mark-read act.",
           "items": {
@@ -535,6 +542,32 @@
         "id",
         "at_ms",
         "label"
+      ],
+      "type": "object"
+    },
+    "CatchupUpdateRequest": {
+      "description": "The body of `POST /api/v1/channels/{id}/catchup/update`: one incremental\nUpdate (`#1388` landing 2) over only the messages new since the saved\nsummary. Names the scope, as the read's body does.",
+      "properties": {
+        "thread_id": {
+          "default": null,
+          "description": "The thread whose record this updates; absent updates the channel's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "view": {
+          "default": null,
+          "description": "Which channel view the scope covers: `\"flat\"` (the default) or `\"main\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "thread_id",
+        "view"
       ],
       "type": "object"
     },
@@ -1251,6 +1284,13 @@
           "description": "One link per covered message, oldest first.",
           "items": {
             "$ref": "#/$defs/CatchupFooterLink"
+          },
+          "type": "array"
+        },
+        "fresh_ids": {
+          "description": "The latest incremental Update's cited ids (`#1388` landing 2): the page\ndraws their bullets/sections green until read or the next Update.\nAbsent in records saved before the field existed.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
           },
           "type": "array"
         },
@@ -4296,6 +4336,9 @@
     },
     {
       "$ref": "#/$defs/CatchupFollowupResponse"
+    },
+    {
+      "$ref": "#/$defs/CatchupUpdateRequest"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

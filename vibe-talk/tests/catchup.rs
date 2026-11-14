@@ -739,3 +739,161 @@ async fn on_an_elevenlabs_only_deployment_discuss_refuses_by_backend_name() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn an_update_covers_only_the_new_ids_and_merges() {
+    // `#1388` landing 2: Update spends one cache-only call over only the
+    // unread ids the saved summary did not cover, with the old text as
+    // context; the record keeps the old text, appends the new sections and
+    // names their cites fresh. No timeline entry is made.
+    let messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    let new_id = message(6, None, false).id.clone();
+    let backend = backend_with(messages.clone());
+    let (state, store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state.clone());
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    summarizer.answer_with("## Old\n- first point worth knowing");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Two messages arrive; one is read in the channel before the Update.
+    {
+        let mut held = backend.messages.lock().expect("messages");
+        held.push(message(5, None, false));
+        held.push(message(6, None, false));
+    }
+    fill(&state, TimelineView::Flat, None).await;
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    store
+        .dismiss(&channel, &[message(5, None, false).id])
+        .await
+        .expect("dismiss");
+
+    summarizer.answer_with(&format!("## New\n- second point [m:{}]", new_id.as_str()));
+    let reads = backend.reads();
+    let (status, body) = post(
+        &app,
+        &format!("{channel_path}/update"),
+        Some(WRITE_TOKEN),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(backend.reads(), reads, "the Update read upstream");
+    let calls = summarizer.prompt_calls();
+    assert_eq!(calls.len(), 2, "the Update spent another call");
+    assert!(
+        calls[1].1.contains("message 6") && !calls[1].1.contains("message 5"),
+        "the delta prompt held more than the new unread: {}",
+        calls[1].1
+    );
+    assert!(
+        calls[1].1.contains("first point worth knowing"),
+        "the Update lacked the old summary as context: {}",
+        calls[1].1
+    );
+    let text = body["text"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("## Old") && text.contains("second point"),
+        "the merged text lost a side: {body}"
+    );
+    assert_eq!(body["fresh_ids"], json!([new_id.as_str()]), "{body}");
+    assert_eq!(
+        body["unread_ids"].as_array().map(Vec::len),
+        Some(6),
+        "covered is the old five plus the one new unread: {body}"
+    );
+    // Round-trip: a reopen shows the merged summary, timeline untouched.
+    let (status, record) = get(&app, &format!("{channel_path}/record"), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_eq!(record["current_summary"]["text"], body["text"], "{record}");
+    assert_eq!(
+        record["current_summary"]["fresh_ids"],
+        json!([new_id.as_str()]),
+        "{record}"
+    );
+    assert_eq!(record["timeline"], json!([]), "{record}");
+}
+
+#[tokio::test]
+async fn an_update_without_a_summary_refuses_and_without_news_spends_nothing() {
+    let messages: Vec<Message> = (0..3).map(|seq| message(seq, None, false)).collect();
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    let (status, _body) = post(
+        &app,
+        &format!("{channel_path}/update"),
+        Some(WRITE_TOKEN),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(summarizer.prompt_calls().is_empty());
+
+    summarizer.answer_with("only point");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = post(
+        &app,
+        &format!("{channel_path}/update"),
+        Some(WRITE_TOKEN),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["text"], json!("only point"), "{body}");
+    assert!(
+        body["fresh_ids"].as_array().is_none_or(Vec::is_empty),
+        "a no-news Update kept green: {body}"
+    );
+    assert_eq!(
+        summarizer.prompt_calls().len(),
+        1,
+        "a no-news Update spent a model call"
+    );
+}
+
+#[test]
+fn a_record_saved_before_fresh_ids_still_loads() {
+    // Backward compatibility (`#1388` landing 2): records written before
+    // `fresh_ids` existed deserialize with none, and resave without it.
+    let text = r#"{
+        "current_summary": {
+            "view": "flat", "since_ms": null,
+            "window": {"count": 1, "unread_count": 1, "read_count": 0,
+                       "from_id": "1", "through_id": "1",
+                       "truncated": false, "noise_hidden": 0},
+            "covered_ids": ["1"], "cited_ids": [], "markable_ids": [],
+            "footer_links": [], "text": "old point", "text_html": "",
+            "unknown_terms": [], "backend": "fake", "model": "fake-model",
+            "stamp": {"context_ms": 1, "model_ms": 2, "first_token_ms": null,
+                      "total_ms": 3, "input_tokens": null, "output_tokens": null,
+                      "input_chars": 4, "output_chars": 9, "unknown_term_count": 0},
+            "created_ms": 1
+        },
+        "timeline": []
+    }"#;
+    let record: vibe_talk::contract::DiscussRecord =
+        serde_json::from_str(text).expect("an old record still loads");
+    let summary = record.current_summary.as_ref().expect("the saved summary");
+    assert!(summary.fresh_ids.is_empty());
+    let saved = serde_json::to_string(&record).expect("resave");
+    assert!(
+        !saved.contains("fresh_ids"),
+        "an empty fresh set resaved: {saved}"
+    );
+}

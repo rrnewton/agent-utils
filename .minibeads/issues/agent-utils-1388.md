@@ -1,6 +1,6 @@
 ---
 title: 'discuss-summary-staleness-update: banner and incremental Update for a saved summary (design)'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -29,3 +29,7 @@ Builds on the two-part record of #1345 discuss-transcript-persist (`current_summ
 # Notes
 
 Owner reply 009. Number reserved by coordb; filed by mu-catchup inside the #1345 landing as instructed. Do not build the delta Update on this issue without owner go.
+
+## Resolution
+
+Owner request 044 (11-13) gave GO with a design change: read parts are struck through, not removed, and new parts are drawn green. Delivered in two landings. (1) Live strike-through, page-only, landed on main as 09fca9bd: in the open Discuss summary, a bullet or section whose cited messages are all read is drawn struck (muted, still readable, tappable, foldable with the #1497 fold state), recomputing live from the page read set on Discuss marks, channel marks, read-aloud marks and view changes; citations map to bullets/sections from the rendered answer's citation links, and an uncited bullet is never struck. (2) Incremental Update, in the landing carrying this note: the banner's [Update] makes one cache-only model call over only the messages unread now and not in the saved summary's covered_ids, with the old summary text as context; the record keeps the old text, appends the new sections, and stores their cited ids as fresh_ids, drawn green until read or the next Update; records saved before fresh_ids still load. Module tests cover the citation mapping, live recompute, uncited bullets and fold interplay; Rust tests cover the delta (only new ids sent), the merge, the record round-trip and old records; the discuss browser check covers strike-through and green on phone viewports.

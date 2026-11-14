@@ -2885,6 +2885,7 @@ pub async fn catchup(
             window: window.clone(),
             covered_ids: built.unread_ids.clone(),
             cited_ids: cited_ids.clone(),
+            fresh_ids: Vec::new(),
             markable_ids: built.markable_ids.clone(),
             footer_links: footer_links.clone(),
             text: text.clone(),
@@ -2930,6 +2931,7 @@ pub async fn catchup(
         markable_ids: built.markable_ids,
         footer_links,
         cited_ids,
+        fresh_ids: Vec::new(),
         text,
         text_html,
         unknown_terms,
@@ -3014,6 +3016,354 @@ pub async fn catchup_record(
         current_summary: record.clone().and_then(|held| held.current_summary),
         timeline: record.map(|held| held.timeline).unwrap_or_default(),
         staleness,
+    })))
+}
+
+/// `POST /api/v1/channels/{channel_id}/catchup/update` — one incremental
+/// Update (`#1388 discuss-summary-staleness-update`, landing 2): one
+/// cache-only model call over only the messages new since the saved summary
+/// (unread now and not in its covered set), with the old summary text as
+/// context. The merged summary keeps the old text (the page strikes what is
+/// read, landing 1), appends the new sections — their cited ids saved as
+/// `fresh_ids`, drawn green until read or the next Update — and becomes the
+/// record's top; the timeline is untouched, so a reopen shows the same
+/// thing. Nothing new costs no model call, and still clears the green.
+/// WRITE scope, as the read's.
+pub async fn catchup_update(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(body): Json<crate::contract::CatchupUpdateRequest>,
+) -> Result<Response, ApiError> {
+    let began = std::time::Instant::now();
+    if state.channel(&channel_id).is_none() {
+        return Err(OpError::UnknownChannel.into());
+    }
+    let Some(agent) = state.catchup_summarizer.clone() else {
+        return Err(discuss_not_available());
+    };
+    let thread_id = body
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let channel_key = crate::model::ChannelId(channel_id.clone());
+    let thread_key = thread_id.unwrap_or("");
+    let mut record = state
+        .store
+        .discuss_record(&channel_key, thread_key)
+        .await
+        .map_err(|error| match error {
+            crate::store::StoreError::Unavailable(_) => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_not_configured",
+                "Discuss records need a configured store".to_owned(),
+            ),
+            other => ApiError::from(OpError::Store(other)),
+        })?
+        .unwrap_or_default();
+    let Some(summary) = record.current_summary.clone() else {
+        return Err(ApiError::bad_request(
+            "nothing to update yet: Summarize first, then Update".to_owned(),
+        ));
+    };
+    let (view, view_name) = catchup_view(thread_id, Some(summary.view.as_str()))?;
+    let context_began = std::time::Instant::now();
+    let fetched = crate::read_reason::ReadReason::Discuss
+        .scope(ops::catchup_fetch(
+            &state,
+            Scope::Write,
+            &channel_id,
+            view,
+            thread_id,
+            state.config.summaries.catchup_window_messages,
+        ))
+        .await?;
+    let owner = crate::owner::Owner::of(&state);
+    let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+    let context_ms = u64::try_from(context_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let covered: std::collections::HashSet<&str> =
+        summary.covered_ids.iter().map(|id| id.as_str()).collect();
+    let delta_ids: Vec<MessageId> = built
+        .unread_ids
+        .iter()
+        .filter(|id| !covered.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let model = state
+        .catchup_model
+        .as_deref()
+        .unwrap_or_else(|| agent.backend())
+        .to_owned();
+    // Nothing new: no model call. The Update still clears the green.
+    if delta_ids.is_empty() {
+        let mut cleared = summary.clone();
+        let had_fresh = !cleared.fresh_ids.is_empty();
+        cleared.fresh_ids = Vec::new();
+        if had_fresh {
+            record.current_summary = Some(cleared.clone());
+            state
+                .store
+                .put_discuss_record(&channel_key, thread_key, &record)
+                .await
+                .map_err(|error| ApiError::from(OpError::Store(error)))?;
+        }
+        return Ok(no_store(Json(crate::contract::CatchupResponse {
+            channel: fetched.channel,
+            thread_id: thread_id.map(str::to_owned),
+            view: view_name.to_owned(),
+            window: cleared.window.clone(),
+            unread_ids: cleared.covered_ids.clone(),
+            markable_ids: cleared.markable_ids.clone(),
+            footer_links: cleared.footer_links.clone(),
+            cited_ids: cleared.cited_ids.clone(),
+            fresh_ids: Vec::new(),
+            text: cleared.text.clone(),
+            text_html: cleared.text_html.clone(),
+            unknown_terms: cleared.unknown_terms.clone(),
+            backend: agent.backend().to_owned(),
+            model,
+            stamp: crate::contract::CatchupStamp {
+                context_ms,
+                model_ms: 0,
+                first_token_ms: None,
+                total_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+                input_tokens: None,
+                output_tokens: None,
+                input_chars: 0,
+                output_chars: 0,
+                unknown_term_count: 0,
+            },
+        })));
+    }
+    let delta_set: std::collections::HashSet<MessageId> = delta_ids.iter().cloned().collect();
+    let delta_messages: Vec<Message> = fetched
+        .messages
+        .iter()
+        .filter(|message| delta_set.contains(&message.id))
+        .cloned()
+        .collect();
+    let delta_built = crate::catchup::build_context(&delta_messages, &fetched.read, &owner);
+    let mut prompt = delta_built.prompt;
+    prompt.push_str(
+        "\n\nThe summary you gave most recently (background: keep it, report only what is new):\n",
+    );
+    prompt.push_str(&summary.text);
+    let system = crate::catchup::effective_system_prompt(None);
+    let model_began = std::time::Instant::now();
+    let raw = agent
+        .complete_prompt(&system, &prompt)
+        .await
+        .map_err(|error| match error {
+            crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),
+            other => ApiError::from(OpError::Summarizer(other)),
+        })?;
+    let model_ms = u64::try_from(model_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (raw, delta_terms) = crate::catchup::split_unknown_terms(&raw);
+    let sent: std::collections::HashSet<MessageId> =
+        delta_messages.iter().map(|held| held.id.clone()).collect();
+    let outside_ids: Vec<String> = crate::catchup::cited_ids_in(&raw)
+        .into_iter()
+        .filter(|id| !sent.contains(id))
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let cached: std::collections::HashMap<String, Message> = if outside_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .message_cache
+            .held_messages(&fetched.channel.id, None, &outside_ids)
+            .await
+    };
+    let mut allowed: std::collections::HashSet<MessageId> = sent.clone();
+    for id in cached.keys() {
+        allowed.insert(MessageId(id.clone()));
+    }
+    let by_id: std::collections::HashMap<&str, &Message> = delta_messages
+        .iter()
+        .map(|held| (held.id.as_str(), held))
+        .collect();
+    let provider = fetched
+        .channel
+        .provider
+        .clone()
+        .unwrap_or_else(|| "discord".to_owned());
+    let cite_time = |message: &Message| {
+        if message.spoken_time.is_empty() {
+            message.timestamp.clone()
+        } else {
+            message.spoken_time.clone()
+        }
+    };
+    let cite = |id: &MessageId| -> Option<(String, String, bool)> {
+        if let Some(message) = by_id.get(id.as_str()) {
+            let address = crate::catchup::message_link(
+                &provider,
+                &channel_id,
+                view_name,
+                thread_id,
+                id,
+                message.thread.as_ref().map(|thread| thread.id.as_str()),
+            );
+            return Some((cite_time(message), address, true));
+        }
+        let message = cached.get(id.as_str())?;
+        let target_thread = message
+            .thread
+            .as_ref()
+            .filter(|thread| !thread.is_root)
+            .map(|thread| thread.id.as_str());
+        let address = match target_thread {
+            Some(thread) => crate::catchup::message_link(
+                &provider,
+                &channel_id,
+                "flat",
+                Some(thread),
+                id,
+                Some(thread),
+            ),
+            None => crate::catchup::message_link(&provider, &channel_id, "main", None, id, None),
+        };
+        Some((cite_time(message), address, false))
+    };
+    let (delta_text, delta_cited) = crate::catchup::shape_answer(&raw, &allowed, cite);
+    let trusted: std::collections::HashSet<String> = delta_cited
+        .iter()
+        .filter_map(|id| {
+            cite(id).map(|(_, address, in_scope)| {
+                crate::catchup::trusted_cite_address(&address, in_scope)
+            })
+        })
+        .collect();
+    let delta_html = crate::render::body_html_catchup(
+        &delta_text,
+        crate::render::markup_for(&state.config, &fetched.channel),
+        &trusted,
+    );
+    let nothing_new = delta_text.trim() == "Nothing new since you last read this.";
+    let (text, text_html, fresh_ids) = if nothing_new {
+        (summary.text.clone(), summary.text_html.clone(), Vec::new())
+    } else {
+        let text = format!("{}\n\n{}", summary.text, delta_text);
+        // Concatenated renders stay foldable section by section; a plain side
+        // keeps the merged text plain rather than mix text into markup.
+        let text_html = if !summary.text_html.is_empty() && !delta_html.is_empty() {
+            format!("{}{}", summary.text_html, delta_html)
+        } else if delta_html.is_empty() {
+            summary.text_html.clone()
+        } else {
+            String::new()
+        };
+        (text, text_html, delta_cited.clone())
+    };
+    let merged_covered: Vec<MessageId> = summary
+        .covered_ids
+        .iter()
+        .cloned()
+        .chain(
+            delta_ids
+                .iter()
+                .filter(|id| !covered.contains(id.as_str()))
+                .cloned(),
+        )
+        .collect();
+    let mut merged_cited: Vec<MessageId> = summary.cited_ids.clone();
+    for id in &delta_cited {
+        if !merged_cited.contains(id) {
+            merged_cited.push(id.clone());
+        }
+    }
+    let mut merged_markable: Vec<MessageId> = summary.markable_ids.clone();
+    for id in &delta_built.markable_ids {
+        if !merged_markable.contains(id) {
+            merged_markable.push(id.clone());
+        }
+    }
+    let mut merged_links: Vec<crate::contract::CatchupFooterLink> = summary.footer_links.clone();
+    for id in &delta_built.unread_ids {
+        if merged_links.iter().any(|link| &link.id == id) {
+            continue;
+        }
+        if let Some(message) = by_id.get(id.as_str()) {
+            merged_links.push(crate::contract::CatchupFooterLink {
+                id: id.clone(),
+                label: catchup_label(message),
+                thread_id: message
+                    .thread
+                    .as_ref()
+                    .map(|thread| thread.id.clone())
+                    .or_else(|| thread_id.map(str::to_owned)),
+            });
+        }
+    }
+    let mut merged_terms: Vec<String> = summary.unknown_terms.clone();
+    for term in &delta_terms {
+        if !merged_terms.contains(term) {
+            merged_terms.push(term.clone());
+        }
+    }
+    let window = crate::contract::CatchupWindow {
+        count: fetched.messages.len(),
+        unread_count: built.unread_ids.len(),
+        read_count: fetched
+            .messages
+            .len()
+            .saturating_sub(built.unread_ids.len()),
+        from_id: fetched.messages.first().map(|held| held.id.clone()),
+        through_id: fetched.messages.last().map(|held| held.id.clone()),
+        truncated: fetched.truncated,
+        noise_hidden: fetched.noise_hidden,
+    };
+    let stamp = crate::contract::CatchupStamp {
+        context_ms,
+        model_ms,
+        first_token_ms: None,
+        total_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+        input_tokens: None,
+        output_tokens: None,
+        input_chars: system.chars().count() + prompt.chars().count(),
+        output_chars: delta_text.chars().count(),
+        unknown_term_count: delta_terms.len(),
+    };
+    let merged = crate::contract::DiscussSummary {
+        view: summary.view.clone(),
+        since_ms: summary.since_ms,
+        window: window.clone(),
+        covered_ids: merged_covered,
+        cited_ids: merged_cited,
+        fresh_ids,
+        markable_ids: merged_markable,
+        footer_links: merged_links,
+        text,
+        text_html,
+        unknown_terms: merged_terms,
+        backend: agent.backend().to_owned(),
+        model: model.clone(),
+        stamp: stamp.clone(),
+        created_ms: crate::store::now_ms(),
+    };
+    record.current_summary = Some(merged.clone());
+    state
+        .store
+        .put_discuss_record(&channel_key, thread_key, &record)
+        .await
+        .map_err(|error| ApiError::from(OpError::Store(error)))?;
+    Ok(no_store(Json(crate::contract::CatchupResponse {
+        channel: fetched.channel,
+        thread_id: thread_id.map(str::to_owned),
+        view: view_name.to_owned(),
+        window,
+        unread_ids: merged.covered_ids.clone(),
+        markable_ids: merged.markable_ids.clone(),
+        footer_links: merged.footer_links.clone(),
+        cited_ids: merged.cited_ids.clone(),
+        fresh_ids: merged.fresh_ids.clone(),
+        text: merged.text.clone(),
+        text_html: merged.text_html.clone(),
+        unknown_terms: merged.unknown_terms.clone(),
+        backend: agent.backend().to_owned(),
+        model,
+        stamp,
     })))
 }
 

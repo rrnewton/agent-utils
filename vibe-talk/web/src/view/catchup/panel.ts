@@ -1030,6 +1030,55 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     void scope;
   }
 
+  /**
+   * One incremental Update (`#1388` landing 2): the banner's button. One
+   * delta call over only the new messages; the merged summary is drawn with
+   * its new parts green (landing 1's restrike). A host without the Update
+   * route falls back to a full Summarize, as before landing 2.
+   */
+  function updateFor(scope: DiscussScope): void {
+    if (pending) return;
+    if (!deps.catchupUpdate) {
+      fetchFor(scope, null);
+      return;
+    }
+    generation += 1;
+    const asked = generation;
+    lastScope = scope;
+    deps.byId("discuss-scope").textContent = scope.label;
+    deps.byId("discuss-status").textContent = "Updating…";
+    deps.byId("discuss-retry").hidden = true;
+    setPending(true);
+    void deps.catchupUpdate(scope.channelId, scope).then(
+      (value) => {
+        setPending(false);
+        if (asked !== generation || !isOpen()) return;
+        const answer = asCatchupAnswer(value);
+        lastAnswer = answer;
+        deps.byId("discuss-status").textContent = "Updated.";
+        drawAnswer(answer, null);
+        drawTerms(answer);
+        drawFooter(answer, scope);
+        const stampLine = formatStampLine(answer.stamp);
+        deps.byId("discuss-stamp").textContent = stampLine;
+        deps.byId("discuss-stamp").hidden = stampLine === "";
+        recordFor(scope, true);
+      },
+      (error: unknown) => {
+        setPending(false);
+        if (asked !== generation || !isOpen()) return;
+        if (isDiscussUnavailable(error)) {
+          deps.byId("discuss-status").textContent = DISCUSS_UNAVAILABLE_HINT;
+          deps.showError?.(DISCUSS_UNAVAILABLE_HINT);
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        deps.byId("discuss-status").textContent = message;
+        deps.showError?.(message);
+      },
+    );
+  }
+
   /** Send the composer's question: one follow-up, appended to the timeline. */
   function sendFollowup(): void {
     if (pending || lastScope === null || lastAnswer === null) return;
@@ -1315,7 +1364,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         listening.listen(deps.byId("discuss-send"), "click", () => sendFollowup());
         listening.listen(deps.byId("discuss-update"), "click", () => {
           if (pending || lastScope === null) return;
-          fetchFor(lastScope, null);
+          updateFor(lastScope);
         });
         listening.listen(deps.byId("discuss-retry"), "click", () => {
           if (lastScope !== null) fetchFor(lastScope, lastSinceMs);

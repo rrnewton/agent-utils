@@ -1604,6 +1604,10 @@ pub struct CatchupResponse {
     /// this set; absent from an older server, which cited nothing it could name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cited_ids: Vec<MessageId>,
+    /// The latest incremental Update's cited ids (`#1388` landing 2), drawn
+    /// green by the page until read or the next Update; absent otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fresh_ids: Vec<MessageId>,
     /// The model's answer, shaped by the server: citations checked against the ids
     /// it was shown and replaced inline by `(HH:MM)` deep links, bare issue numbers
     /// linked. Model text only: the footer is structured, above.
@@ -1639,6 +1643,11 @@ pub struct DiscussSummary {
     pub covered_ids: Vec<MessageId>,
     /// The cited subset of `covered_ids`, first-citation order.
     pub cited_ids: Vec<MessageId>,
+    /// The latest incremental Update's cited ids (`#1388` landing 2): the page
+    /// draws their bullets/sections green until read or the next Update.
+    /// Absent in records saved before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fresh_ids: Vec<MessageId>,
     /// The subset of `covered_ids` a dismissal can name.
     pub markable_ids: Vec<MessageId>,
     /// One link per covered message, oldest first.
@@ -1724,6 +1733,19 @@ pub struct CatchupRecordResponse {
     pub staleness: Option<CatchupStaleness>,
 }
 
+/// The body of `POST /api/v1/channels/{id}/catchup/update`: one incremental
+/// Update (`#1388` landing 2) over only the messages new since the saved
+/// summary. Names the scope, as the read's body does.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct CatchupUpdateRequest {
+    /// The thread whose record this updates; absent updates the channel's.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Which channel view the scope covers: `"flat"` (the default) or `"main"`.
+    #[serde(default)]
+    pub view: Option<String>,
+}
+
 /// The body of `POST /api/v1/channels/{id}/catchup/messages`: one follow-up question.
 /// `discuss-followup-composer`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -1803,6 +1825,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<CatchupRecordResponse>(),
         generator.subschema_for::<CatchupFollowupRequest>(),
         generator.subschema_for::<CatchupFollowupResponse>(),
+        // `#1388` landing 2. Appended, for the same reason.
+        generator.subschema_for::<CatchupUpdateRequest>(),
     ]
 }
 

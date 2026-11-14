@@ -154,7 +154,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["discuss-panel"].hidden = true;
   els["discuss-footer"].hidden = true;
   els["discuss-retry"].hidden = true;
-  const calls = { posts: [], previews: [], records: [], followups: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [], bound: [], history: [] };
+  const calls = { posts: [], previews: [], records: [], followups: [], updates: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [], bound: [], history: [] };
   // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
   const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [] };
   const clampW = (value) => {
@@ -179,6 +179,10 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     catchupRecord: (channelId, scope) => {
       calls.records.push({ channelId, scope });
       return Promise.resolve({ exists: false, current_summary: null, timeline: [], staleness: null });
+    },
+    catchupUpdate: (channelId, scope) => {
+      calls.updates.push({ channelId, scope });
+      return Promise.resolve(answer({ fresh_ids: ["m2"], text: "old and new" }));
     },
     catchupFollowup: (channelId, scope, text) => {
       calls.followups.push({ channelId, scope, text });
@@ -684,11 +688,12 @@ test("catchup: reopening draws the saved record and asks nothing", async () => {
     const timeline = fx.els["discuss-timeline"].children;
     assert.equal(timeline.length, 2, "the timeline did not draw");
     assert.equal(timeline[1].textContent, "and the deploy?");
-    // [Update] is the plain re-summarize: one POST, unbounded.
+    // [Update] is the incremental delta (`#1388` landing 2): one update
+    // call, no full re-summarize POST.
     click(fx.els["discuss-update"]);
     await flush();
-    assert.equal(fx.calls.posts.length, 1);
-    assert.equal(fx.calls.posts[0].body.since_ms, null);
+    assert.equal(fx.calls.updates.length, 1);
+    assert.deepEqual(fx.calls.posts, [], "Update refetched a full summary");
   } finally { fx.restore(); }
 });
 
@@ -1519,5 +1524,35 @@ test("catchup strike: the panel strikes live from isReadNow and its mark buttons
     await flush();
     assert.deepEqual(fx.calls.dismiss, [{ messages: ["m1", "m2"] }], "Mark read sent another set");
     assert.equal(hasWord(li, STRUCK_BULLET_CLASS), true, "the mark did not keep the strike");
+  } finally { fx.restore(); }
+});
+
+test("catchup update: the banner's Update is one delta call; new parts green until read (#1388)", async () => {
+  const read = new Set();
+  const fx = fixture();
+  fx.deps.isReadNow = (id) => read.has(id);
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    click(fx.els["discuss-update"]);
+    await flush();
+    assert.equal(fx.calls.updates.length, 1, "Update did not make its one delta call");
+    assert.equal(fx.calls.posts.length, 1, "Update refetched a full summary");
+    assert.equal(fx.els["discuss-status"].textContent, "Updated.");
+    // The merged answer's fresh bullet draws green; read, it strikes instead.
+    const box = fx.els["discuss-answer"];
+    const li = fakeElement("li");
+    const link = fakeElement("a");
+    link.attributes.href = "?c=C9&v=all&m=discord:C9:m2";
+    li.appendChild(link);
+    box.appendChild(li);
+    view.refreshStrikes();
+    assert.equal(hasWord(li, FRESH_CLASS), true, "the Update's bullet was not green");
+    read.add("m2");
+    view.refreshStrikes();
+    assert.equal(hasWord(li, FRESH_CLASS), false, "a read bullet stayed green");
+    assert.equal(hasWord(li, STRUCK_BULLET_CLASS), true, "a read fresh bullet was not struck");
   } finally { fx.restore(); }
 });

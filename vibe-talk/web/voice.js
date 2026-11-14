@@ -1132,8 +1132,9 @@ const discussView = createDiscussView({
   },
   dismissMessages: (body) => dismissMessages(body),
   restoreMessages: (ids) => restoreMessages(ids),
-  // `#1388` landing 1: the strike reads the channel store's read (Done) set.
-  isReadNow: (id) => channelStore.current().dismissed.has(String(id)),
+  // `#1388` landing 1: the strike reads the page's read (Done) set — the
+  // Done marks made here at once, and the store's folded dismissals.
+  isReadNow: (id) => doneState().archived.has(String(id)) || channelStore.current().dismissed.has(String(id)),
   showError: (text) => showError(text),
   setStatus: (text) => setStatus(text),
   // `#1344 discuss-panel-resize`. The panel's kept layout, on this device as the

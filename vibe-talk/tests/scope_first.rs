@@ -295,6 +295,13 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"text":"and the deploy?"}"#),
         ),
+        // `#1388` landing 2: an incremental Update spends a model call, so write scope.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/catchup/update",
+            Write,
+            Json(r#"{}"#),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/resolve",

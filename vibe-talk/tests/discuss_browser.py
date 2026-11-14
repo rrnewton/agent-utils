@@ -55,8 +55,10 @@ CATCHUP_ANSWER = {
         {"id": MARKABLE[1], "label": "09:52 · Ben", "thread_id": None},
     ],
     "text": "## Progress\nAda shipped the fix.\n\n## Review\nBen is reviewing it.",
-    "text_html": "<h2>Progress</h2><p>Ada shipped the fix.</p>"
+    "text_html": "<h2>Progress</h2><ul><li>Ada shipped the fix "
+                 "<a href=\"?c=100000000000000001&v=all&m=discord:100000000000000001:100000000000000101\">(09:51 ↩)</a></li></ul>"
                  "<h2>Review</h2><p>Ben is reviewing it.</p>",
+    "fresh_ids": [],
     "backend": "fake",
     "model": "fake-model",
     "stamp": {"context_ms": 120, "model_ms": 900, "first_token_ms": None,
@@ -129,6 +131,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     # `#1497 discuss-fold-state-persist`: the saved record the reopen reads,
     # its generation advancing with each Summarize, as a new summary's would.
     generation: int | None = None
+    updated = False
 
     def catchup(route: Route) -> None:
         nonlocal generation
@@ -136,6 +139,18 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         generation = (generation or 1760000099999) + 1
         route.fulfill(status=200, content_type="application/json",
                       body=json.dumps(CATCHUP_ANSWER))
+
+    def catchup_update(route: Route) -> None:
+        nonlocal updated
+        updated = True
+        body = dict(CATCHUP_ANSWER)
+        body["text"] = str(CATCHUP_ANSWER["text"]) + "\n\n## Later\nBen approved it."
+        body["text_html"] = str(CATCHUP_ANSWER["text_html"]) + (
+            "<h2>Later</h2><ul><li>Ben approved it "
+            "<a href=\"?c=100000000000000001&v=all&m=discord:100000000000000001:100000000000000102\">(09:52 ↩)</a></li></ul>")
+        body["fresh_ids"] = [MARKABLE[1]]
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
 
     def saved_record(route: Route) -> None:
         if generation is None:
@@ -148,14 +163,20 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
             "exists": True, "thread_id": None,
             "current_summary": {
                 "backend": "fake", "model": "fake-model", "view": "flat",
-                "since_ms": None, "created_ms": generation,
+                "since_ms": None, "created_ms": generation + (1 if updated else 0),
                 "window": CATCHUP_ANSWER["window"],
-                "covered_ids": MARKABLE, "markable_ids": MARKABLE, "cited_ids": [],
+                "covered_ids": MARKABLE, "markable_ids": MARKABLE,
+                "cited_ids": [MARKABLE[1]] if updated else [],
+                "fresh_ids": [MARKABLE[1]] if updated else [],
                 "footer_links": CATCHUP_ANSWER["footer_links"],
-                "text": CATCHUP_ANSWER["text"], "text_html": CATCHUP_ANSWER["text_html"],
+                "text": str(CATCHUP_ANSWER["text"]) + ("\n\n## Later\nBen approved it." if updated else ""),
+                "text_html": str(CATCHUP_ANSWER["text_html"]) + ((
+                    "<h2>Later</h2><ul><li>Ben approved it "
+                    "<a href=\"?c=100000000000000001&v=all&m=discord:100000000000000001:100000000000000102\">(09:52 ↩)</a></li></ul>") if updated else ""),
                 "unknown_terms": [], "stamp": CATCHUP_ANSWER["stamp"],
             },
-            "timeline": [], "staleness": None,
+            "timeline": [],
+            "staleness": {"new_unread": 1, "marked_read": 0} if not updated else None,
         }))
 
     def preview(route: Route) -> None:
@@ -195,6 +216,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     page.route("**/api/v1/client-config", client_config)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup/preview*", preview)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup/record*", saved_record)
+    page.route(f"**/api/v1/channels/{CHANNEL}/catchup/update", catchup_update)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup", catchup)
     page.route(f"**/api/v1/channels/{CHANNEL}/dismiss", dismiss)
     page.route(f"**/api/v1/channels/{CHANNEL}/restore", dismiss)
@@ -267,6 +289,8 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     check(covers == "Other messages processed:", f"the footer says {covers!r}")
     check(page.locator("#discuss-links .discuss-link").count() == 2, "the footer links are missing")
     check(page.locator("#discuss-links .discuss-link").first.text_content() == "09:51", "the footer links are not dense HH:MM")
+    check(page.locator("#discuss-answer .discuss-struck").count() == 0,
+          "a bullet stood struck before anything was read")
     stamp = page.locator("#discuss-stamp").text_content() or ""
     check("in 4200 chars" in stamp and "out 48 chars" in stamp, f"the stamp line says {stamp!r}")
 
@@ -313,7 +337,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     wait_read_count("2 of 4")
     page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=20_000)
     said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
-    check(said[-1] == "Ada shipped the fix.", f"Next said {said}, not the second block")
+    check(said[-1] == "Ada shipped the fix (09:51 ↩)", f"Next said {said}, not the second block")
     page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
     wait_read_stopped()
@@ -518,11 +542,32 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     page.keyboard.press("Control+8")
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
 
+    # `#1388` landing 2: the banner's Update appends its new section green.
+    page.wait_for_selector("#discuss-stale", state="visible", timeout=20_000)
+    page.click("#discuss-update")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#discuss-answer details.discuss-fresh').length === 1"
+        " && document.querySelectorAll('#discuss-answer li.discuss-fresh').length === 1",
+        timeout=20_000)
+
     page.click("#discuss-mark-read")
     page.wait_for_function(
         "() => !document.getElementById('discuss-mark-read').disabled", timeout=20_000)
     check(bool(writes) and writes[-1][0].endswith("/dismiss") and writes[-1][1] == {"messages": MARKABLE},
           f"Mark read sent {writes}, not exactly the markable ids")
+
+    # `#1388` landing 1, phone viewport included: with every cited message
+    # read, its bullet and section stand struck through, the green gone.
+    page.wait_for_function(
+        "() => { const li = document.querySelector('#discuss-answer li');"
+        " return li && li.classList.contains('discuss-struck')"
+        " && getComputedStyle(li).textDecorationLine.includes('line-through'); }",
+        timeout=20_000)
+    page.wait_for_function(
+        "() => document.querySelectorAll('#discuss-answer li.discuss-struck').length === 2"
+        " && document.querySelectorAll('#discuss-answer details.discuss-struck-section').length === 2"
+        " && document.querySelectorAll('#discuss-answer .discuss-fresh').length === 0",
+        timeout=20_000)
 
     # A footer jump stays in its scope: the panel stays open (`#1395`).
     page.click("#discuss-links .discuss-link >> nth=0")

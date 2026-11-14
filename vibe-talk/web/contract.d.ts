@@ -248,6 +248,11 @@ declare namespace VibeTalk {
      */
     footer_links: CatchupFooterLink[];
     /**
+     * The latest incremental Update's cited ids (`#1388` landing 2), drawn
+     * green by the page until read or the next Update; absent otherwise.
+     */
+    fresh_ids?: MessageId[];
+    /**
      * The subset of `unread_ids` a dismissal can name, for the footer's mark-read act.
      */
     markable_ids: MessageId[];
@@ -372,6 +377,22 @@ declare namespace VibeTalk {
      * `"HH:MM · author"`, as the message itself carries it.
      */
     label: string;
+  }
+
+  /**
+   * The body of `POST /api/v1/channels/{id}/catchup/update`: one incremental
+   * Update (`#1388` landing 2) over only the messages new since the saved
+   * summary. Names the scope, as the read's body does.
+   */
+  interface CatchupUpdateRequest {
+    /**
+     * The thread whose record this updates; absent updates the channel's.
+     */
+    thread_id: string | null;
+    /**
+     * Which channel view the scope covers: `"flat"` (the default) or `"main"`.
+     */
+    view: string | null;
   }
 
   /**
@@ -1016,6 +1037,12 @@ declare namespace VibeTalk {
      * One link per covered message, oldest first.
      */
     footer_links: CatchupFooterLink[];
+    /**
+     * The latest incremental Update's cited ids (`#1388` landing 2): the page
+     * draws their bullets/sections green until read or the next Update.
+     * Absent in records saved before the field existed.
+     */
+    fresh_ids?: MessageId[];
     /**
      * The subset of `covered_ids` a dismissal can name.
      */
@@ -3175,6 +3202,7 @@ declare namespace VibeTalk {
     CatchupRecordResponse: CatchupRecordResponse;
     CatchupFollowupRequest: CatchupFollowupRequest;
     CatchupFollowupResponse: CatchupFollowupResponse;
+    CatchupUpdateRequest: CatchupUpdateRequest;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

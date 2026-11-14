@@ -326,6 +326,11 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/catchup/messages",
             post(api::catchup_followup),
         )
+        // `#1388` landing 2. WRITE scope: one delta Update spends one model call.
+        .route(
+            "/api/v1/channels/{channel_id}/catchup/update",
+            post(api::catchup_update),
+        )
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))

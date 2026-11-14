@@ -16,10 +16,10 @@ use serde_json::{json, Value};
 use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, CatchupFollowupRequest, CatchupFollowupResponse,
     CatchupFooterLink, CatchupPreview, CatchupRecordResponse, CatchupRequest, CatchupResponse,
-    CatchupStamp, CatchupUnreadRef, CatchupWindow, ClientConfigResponse, ClientSettings,
-    CommittedPostResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent,
-    MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules,
-    PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
+    CatchupStamp, CatchupUnreadRef, CatchupUpdateRequest, CatchupWindow, ClientConfigResponse,
+    ClientSettings, CommittedPostResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent,
+    LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse,
+    NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
     TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
     UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
@@ -1282,6 +1282,7 @@ fn samples() -> Value {
                     thread_id: Some("thread-1".into()),
                 }],
                 cited_ids: vec![MessageId("1010".into())],
+                fresh_ids: vec![MessageId("1010".into())],
                 text: "one point worth knowing".into(),
                 text_html: "<p>one point worth knowing</p>".into(),
                 unknown_terms: vec!["step 3A".into(), "wave Q".into()],
@@ -1316,6 +1317,7 @@ fn samples() -> Value {
                 markable_ids: Vec::new(),
                 footer_links: Vec::new(),
                 cited_ids: Vec::new(),
+                fresh_ids: Vec::new(),
                 text: String::new(),
                 text_html: String::new(),
                 unknown_terms: Vec::new(),
@@ -1380,6 +1382,7 @@ fn samples() -> Value {
                     },
                     covered_ids: vec![MessageId("1010".into())],
                     cited_ids: vec![MessageId("1010".into())],
+                    fresh_ids: vec![MessageId("1010".into())],
                     markable_ids: vec![MessageId("1010".into())],
                     footer_links: vec![CatchupFooterLink {
                         id: MessageId("1010".into()),
@@ -1441,6 +1444,13 @@ fn samples() -> Value {
                 text: "and the deploy?".into(),
             }),
             to(&CatchupFollowupRequest::default()),
+        ],
+        "CatchupUpdateRequest": [
+            to(&CatchupUpdateRequest {
+                thread_id: Some("thread-1".into()),
+                view: Some("main".into()),
+            }),
+            to(&CatchupUpdateRequest::default()),
         ],
         "CatchupFollowupResponse": [
             to(&CatchupFollowupResponse {
