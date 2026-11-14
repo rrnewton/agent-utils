@@ -269,26 +269,6 @@ settingsReadouts.serverHost();
 // until then.
 var mainFollowState = null;
 
-/**
- * Whether the chips' and the strip's keepers may take Main's list to its foot as they resize:
- * the follow state while the keepers can say it, with a filter's or a quick reply's hold still
- * vetoing; the re-derived test (`followsNewest`) only before they mount. A reader resting a few
- * pixels above the foot, inside the old slack, is not following, and is left where they are.
- *
- * @param {HTMLElement} area
- */
-function chipsFollowFoot(area, grew = 0) {
-  if (!mainFollowState) return followsNewest(area);
-  if (heldFilterRow() !== null || quickReplyHolds(area)) return false;
-  // The keeper's state, or the reader standing at the foot within its rest room where the state
-  // has not heard their landing (a screen coming back, a list whose scrolls were another's):
-  // past that room a reader resting up the list is left where they are (`#1185`). Either way the
-  // reader must stand within the slack plus THIS observer's own growth of the foot: content that
-  // grew elsewhere (a row at the foot laid out taller) strands a follower where they stand, and
-  // the jump to it is offered, not taken (`#207`).
-  if (!atBottom(area, BOTTOM_SLACK_PX + grew)) return false;
-  return mainFollowState() || atBottom(area, FOLLOW_REST_PX);
-}
 
 let scrollToolsHeight = 0;
 if (typeof window.ResizeObserver === "function") {
@@ -2141,40 +2121,10 @@ const connectionReadouts = mountConnectionReadouts({
 
 // --- transcript -----------------------------------------------------------------------------
 
-/**
- * Go to the newest line — deliberately, because somebody asked.
- *
- * This used to run on EVERY arrival, which is the defect `#47 scrollback-stability` is about: the
- * reader scrolls up to find what the assistant said two minutes ago, a turn lands, and the page
- * throws them back to the bottom. Every remaining caller is a deliberate act — entering a view,
- * loading a channel for the first time, tapping "Newest" — or an arrival that happened while the
- * reader was already parked at the bottom, which is `followIfPinned` below.
- */
-function scrollToNewest() {
-  const area = el("scroll-area");
-  // A message a filter change held in place is let go: the reader is going somewhere else. `#243`.
-  filterState().hold = null;
-  // `#338 column-overscroll`: a reader in the room past the right column's foot is on that line already.
-  followFoot(area);
-  setJumpNewest(false);
-}
-
-/**
- * Was the reader already parked on the newest message?
- *
- * A browser clamps scrollTop to scrollHeight - clientHeight, so "at the bottom" is never
- * scrollTop === scrollHeight however hard `scrollToNewest` pushes. The slack absorbs that, plus
- * sub-pixel layout and a thumb that stopped a few pixels short — at which point the reader still
- * means "I am at the bottom", and the page should still follow.
- *
- * `#338 column-overscroll`. Measured from the foot of the rows, so a reader anywhere in the room open
- * past the right column's foot is parked on the newest message too (`footGap`).
- */
+// Going to the newest line, whether the reader is at it, and whether the chips may follow the foot:
+// web/src/view/channel/footroom.ts (`createFootRooms`, `#624`), destructured as `scrollToNewest`,
+// `atBottom` and `chipsFollowFoot` from the foot rooms below. The slack they are handed is kept here for its other readers.
 const BOTTOM_SLACK_PX = 24;
-
-function atBottom(area, slack = BOTTOM_SLACK_PX) {
-  return footGap(area) <= slack;
-}
 
 // --- room past the foot of the right column ---------------------------------------------------
 //
@@ -2257,6 +2207,14 @@ const footRooms = createFootRooms({
     ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0),
   pageStep: (area) => pageStep(area),
   keyboardRoom: (area) => (screenKeyboardRoom ? screenKeyboardRoom.roomIn(area) : 0),
+  bottomSlack: BOTTOM_SLACK_PX,
+  followRestPx: FOLLOW_REST_PX,
+  filterState: () => filterState(),
+  setJumpNewest: (wanted) => setJumpNewest(wanted),
+  mainFollowState: () => mainFollowState,
+  followsNewest: (area) => followsNewest(area),
+  heldFilterRow: () => heldFilterRow(),
+  quickReplyHolds: (area) => quickReplyHolds(area),
   toFoot: (area) => scrollKeeping.toFoot(area),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   wheelBy: (area, px) => scrollKeeping.wheelBy(area, px),
@@ -2264,6 +2222,7 @@ const footRooms = createFootRooms({
 const {
   overscrollRoom, overextendRoom, footGap, footTop, closeOverscroll, waitOverscrollIdle, openOverscroll, fitOverscroll,
   noteOverscrollReader, holdOverscrollReader, followFoot, toFoot, closeOverextend, sizeOverextend, fitOverextend, keepingCardStill,
+  atBottom, scrollToNewest, chipsFollowFoot,
 } = footRooms;
 
 

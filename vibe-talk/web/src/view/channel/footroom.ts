@@ -84,6 +84,23 @@ export interface FootRoomsDependencies {
    * over a composer in `area`.
    */
   keyboardRoom?(area: Scroller): number;
+  /** How far above the foot still counts as parked on the newest line (`BOTTOM_SLACK_PX`). */
+  readonly bottomSlack: number;
+  /** How far above the foot rest still counts as following it (`FOLLOW_REST_PX`). */
+  readonly followRestPx: number;
+  /** The page's element by id, in the column being worked on. */
+  /** The filter change's held row record, whose `hold` a deliberate go to the newest lets go. */
+  filterState(): { hold: unknown };
+  /** Say whether the jump to the newest line is wanted (`setJumpNewest`). */
+  setJumpNewest(wanted: boolean): void;
+  /** Main's follow state as its keeper notes it, or null before the keepers mount. */
+  mainFollowState(): (() => boolean) | null;
+  /** Whether the reader of `area` follows its newest line, re-derived (`followsNewest`). */
+  followsNewest(area: Scroller): boolean;
+  /** The row a filter change holds in place, or null (`heldFilterRow`). */
+  heldFilterRow(): unknown;
+  /** Whether a quick reply holds `area` (`quickReplyHolds`). */
+  quickReplyHolds(area: Scroller): boolean;
   /** Take `area` to its foot, and move it by a measured delta, through the scroll owner (`#1251`). */
   toFoot(area: Scroller): void;
   nudge(area: Scroller, delta: number): void;
@@ -126,6 +143,16 @@ export interface FootRooms {
   wheel(event: Wheel): void;
   /** The right column scrolled (`timeStamp` the event's, or -Infinity with none). */
   scrolled(timeStamp: number): void;
+  /** Whether `area` is at its newest line, within `slack` where one is named. */
+  atBottom(area: Scroller, slack?: number): boolean;
+  /** Go to the newest line — deliberately, because somebody asked. */
+  scrollToNewest(): void;
+  /**
+   * Whether the chips' and the strip's keepers may take Main's list to its foot as they
+   * resize: the follow state while the keepers can say it, with a filter's or a quick
+   * reply's hold still vetoing; the re-derived test only before they mount.
+   */
+  chipsFollowFoot(area: Scroller, grew?: number): boolean;
   /**
    * Run `change` to the cards with thread `id`'s card held exactly where it is on the screen, past the foot
    * of the list where that is what it takes. A card wholly above the screen — ^ pressed deep in its
@@ -424,6 +451,59 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
     return true;
   }
 
+  /**
+   * Whether the chips' and the strip's keepers may take Main's list to its foot as they resize:
+   * the follow state while the keepers can say it, with a filter's or a quick reply's hold still
+   * vetoing; the re-derived test (`followsNewest`) only before they mount. A reader resting a few
+   * pixels above the foot, inside the old slack, is not following, and is left where they are.
+   */
+  function chipsFollowFoot(area: Scroller, grew = 0): boolean {
+    const follow = deps.mainFollowState();
+    if (!follow) return deps.followsNewest(area);
+    if (deps.heldFilterRow() !== null || deps.quickReplyHolds(area)) return false;
+    // The keeper's state, or the reader standing at the foot within its rest room where the state
+    // has not heard their landing (a screen coming back, a list whose scrolls were another's):
+    // past that room a reader resting up the list is left where they are (`#1185`). Either way the
+    // reader must stand within the slack plus THIS observer's own growth of the foot: content that
+    // grew elsewhere (a row at the foot laid out taller) strands a follower where they stand, and
+    // the jump to it is offered, not taken (`#207`).
+    if (!atBottom(area, deps.bottomSlack + grew)) return false;
+    return follow() || atBottom(area, deps.followRestPx);
+  }
+
+  /**
+   * Go to the newest line — deliberately, because somebody asked.
+   *
+   * This used to run on EVERY arrival, which is the defect `#47 scrollback-stability` is about: the
+   * reader scrolls up to find what the assistant said two minutes ago, a turn lands, and the page
+   * throws them back to the bottom. Every remaining caller is a deliberate act — entering a view,
+   * loading a channel for the first time, tapping "Newest" — or an arrival that happened while the
+   * reader was already parked at the bottom, which is `followIfPinned` below.
+   */
+  function scrollToNewest(): void {
+    const area = deps.el("scroll-area");
+    // A message a filter change held in place is let go: the reader is going somewhere else. `#243`.
+    deps.filterState().hold = null;
+    // `#338 column-overscroll`: a reader in the room past the right column's foot is on that line already.
+    followFoot(area);
+    deps.setJumpNewest(false);
+  }
+
+  /**
+   * Was the reader already parked on the newest message?
+   *
+   * A browser clamps scrollTop to scrollHeight - clientHeight, so "at the bottom" is never
+   * scrollTop === scrollHeight however hard `scrollToNewest` pushes. The slack absorbs that, plus
+   * sub-pixel layout and a thumb that stopped a few pixels short — at which point the reader still
+   * means "I am at the bottom", and the page should still follow.
+   *
+   * `#338 column-overscroll`. Measured from the foot of the rows, so a reader anywhere in the room open
+   * past the right column's foot is parked on the newest message too (`footGap`).
+   */
+  function atBottom(area: Scroller, slack: number = deps.bottomSlack): boolean {
+    return footGap(area) <= slack;
+  }
+
   return {
     overscrollRoom,
     overextendRoom,
@@ -441,6 +521,9 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
     sizeOverextend,
     fitOverextend,
     keepingCardStill,
+    atBottom,
+    scrollToNewest,
+    chipsFollowFoot,
     wheel(event) {
       const rested = event.timeStamp - overscrollWheelAt >= OVERSCROLL_REST_MS;
       overscrollWheelAt = event.timeStamp;

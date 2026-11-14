@@ -407,8 +407,15 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
   const card = { hasAttribute: () => false, getBoundingClientRect: () => ({ top: rows - 100 - area.scrollTop, height: 100 }) };
   const timers = [];
   let context = "c1";
+  const filterHold = { hold: "held" };
+  const jumps = [];
+  const footCalls = [];
+  let mainFollow = null;
+  let follows = true;
+  let heldRow = null;
+  let quickHolds = false;
   let heldTop = 100;
-  const heldRow = { getBoundingClientRect: () => ({ top: heldTop, bottom: heldTop + 50, height: 50 }) };
+  const stillRow = { getBoundingClientRect: () => ({ top: heldTop, bottom: heldTop + 50, height: 50 }) };
   const roomDeps = {
     el: () => ({ children: [] }), leftEl: () => ({ children: [card] }),
     layoutColumns: () => true, layoutThreadList: () => false,
@@ -417,7 +424,7 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
     sideContext: () => [context, false, ""], inSideColumn: (act) => act(),
     shownChannelList: () => ({ children: [] }),
     toPosition: (area, top) => { area.scrollTop = top; },
-    finishPackSlide: () => {}, cardRow: () => heldRow, rowShown: () => true,
+    finishPackSlide: () => {}, cardRow: () => stillRow, rowShown: () => true,
     itemAfterBlock: () => null, slideKey: () => "k", slideIntoPlace: () => {},
   };
   const rooms = createFootRooms({
@@ -425,7 +432,11 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
     side: () => area, overscrollBox: () => overscrollBox, overextendBox: () => overextendBox,
     sideUp: () => true, ...roomDeps,
     paddingBottom: () => 0, pageStep: () => 360,
-    toFoot: (area) => { area.scrollTop = area.scrollHeight; }, nudge: (area, delta) => { area.scrollTop += delta; }, wheelBy: (area, px) => { area.scrollTop += px; },
+    bottomSlack: 24, followRestPx: 12,
+    el: () => area, filterState: () => filterHold, setJumpNewest: (wanted) => jumps.push(wanted),
+    mainFollowState: () => (mainFollow === null ? null : () => mainFollow), followsNewest: () => follows,
+    heldFilterRow: () => heldRow, quickReplyHolds: () => quickHolds,
+    toFoot: (area) => { footCalls.push(area); area.scrollTop = area.scrollHeight; }, nudge: (area, delta) => { area.scrollTop += delta; }, wheelBy: (area, px) => { area.scrollTop += px; },
   });
   assert.equal(rooms.footGap(area), 0, "at the foot");
   rooms.scrolled(1000);
@@ -456,6 +467,37 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
   assert.equal(rooms.keepingCardStill("T1", () => { heldTop = 80; }), true, "the card was not held");
   assert.equal(area.scrollTop, 980, "the reader was not put back with the card on its line");
   assert.equal(rooms.overextendRoom(area), 380, "the room held for the card is not the room it takes");
+  // The transcript pair and the chips' follow, from the same owner: at the foot within
+  // the slack, a deliberate go to the newest clears the filter hold and the jump, and
+  // the chips may follow only a reader the follow state or the slack says is following.
+  assert.equal(rooms.atBottom(area), true, "a reader in the room past the foot is not on the newest line");
+  area.scrollTop = 590;
+  assert.equal(rooms.atBottom(area), true, "within the slack of the foot is not at the newest line");
+  assert.equal(rooms.atBottom(area, 5), false, "a named slack smaller than the gap counts as at the newest line");
+  area.scrollTop = 0;
+  assert.equal(rooms.atBottom(area), false, "up the list reads as at the newest line");
+  area.scrollTop = 600;
+  assert.equal(rooms.atBottom(area), true, "at the foot is not read as at the newest line");
+  const feetBefore = footCalls.length;
+  rooms.scrollToNewest();
+  assert.equal(footCalls.length, feetBefore + 1, "going to the newest did not follow the foot");
+  assert.equal(filterHold.hold, null, "going to the newest did not let the filter hold go");
+  assert.deepStrictEqual(jumps, [false], "going to the newest did not put the jump away");
+  assert.equal(rooms.chipsFollowFoot(area), true, "before the keepers mount the re-derived follow does not answer");
+  follows = false;
+  assert.equal(rooms.chipsFollowFoot(area), false, "a reader not following was followed by the chips");
+  mainFollow = false;
+  assert.equal(rooms.chipsFollowFoot(area), true, "a reader at the foot within the rest room does not count as following");
+  area.scrollTop = 580;
+  mainFollow = true;
+  assert.equal(rooms.chipsFollowFoot(area), true, "the keeper's following state does not answer for the chips");
+  mainFollow = false;
+  assert.equal(rooms.chipsFollowFoot(area), false, "past the rest room counts as following");
+  heldRow = "row";
+  assert.equal(rooms.chipsFollowFoot(area), false, "a filter's hold did not veto the chips");
+  heldRow = null;
+  quickHolds = true;
+  assert.equal(rooms.chipsFollowFoot(area), false, "a quick reply's hold did not veto the chips");
   // `#1144 scrollback-typing-jump`: the keyboard's room under a composer at the foot is no part of
   // the rows' foot: resting on the keys is at it, and up from it is measured without the room.
   const mainArea = { clientHeight: 400, clientTop: 0, scrollTop: 880, scrollHeight: 1400, getBoundingClientRect: () => ({ top: 0 }) };
@@ -464,6 +506,10 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
     side: () => area, overscrollBox: () => overscrollBox, overextendBox: () => overextendBox,
     sideUp: () => true, ...roomDeps,
     paddingBottom: () => 0, pageStep: () => 360,
+    bottomSlack: 24, followRestPx: 12,
+    el: () => area, filterState: () => filterHold, setJumpNewest: (wanted) => jumps.push(wanted),
+    mainFollowState: () => (mainFollow === null ? null : () => mainFollow), followsNewest: () => follows,
+    heldFilterRow: () => heldRow, quickReplyHolds: () => quickHolds,
     toFoot: (area) => { area.scrollTop = area.scrollHeight; }, nudge: (area, delta) => { area.scrollTop += delta; }, wheelBy: (area, px) => { area.scrollTop += px; },
     keyboardRoom: (one) => (one === mainArea ? 120 : 0),
   });
