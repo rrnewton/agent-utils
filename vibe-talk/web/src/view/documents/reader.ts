@@ -419,6 +419,10 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   // (`#1505 documents-read-controls-highlight-tap`).
   let litElement: HTMLElement | null = null;
   let readKey: string | null = null;
+  // Whether this document's read is active (started here and not yet
+  // reported stopped/finished/failed): only then does a tap on text jump
+  // the read (`#1543`); an inactive tap selects or does nothing.
+  let readingActive = false;
   // The navigator's model (`#1508`): the open document's blocks and section
   // tree, built once per open from the same block model the read speaks, so
   // its units name the same blocks the light lights.
@@ -865,6 +869,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
    */
   function onReadingBlock(block: number | null, _element?: number | null): void {
     if (block === null || !Number.isInteger(block) || currentDoc === null || currentDoc.key !== readKey) {
+      if (block === null) readingActive = false;
       clearReadingLight();
       return;
     }
@@ -875,6 +880,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       return;
     }
     if (!body) return;
+    readingActive = true;
     navBlock = block;
     renderNavigator();
     const target = documentBlocks(body)[block] as HTMLElement | undefined;
@@ -905,6 +911,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     }
     // The light's read, named before the ask: a device read reports its
     // first block inside the call (`#1330 doc-read-highlight`).
+    readingActive = true;
     readKey = currentDoc.key;
     const doc = {
       key: currentDoc.key,
@@ -926,6 +933,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
 
   /** Stop this reader's own document's reading, and only its own. */
   function stopOwnReading(): void {
+    readingActive = false;
     if (currentDoc !== null) deps.stopSpeaking?.(currentDoc.key);
   }
 
@@ -962,9 +970,11 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     }
     if (docKey === null) {
       // No marked link under the tap: a tap on a drawn block reads from
-      // that block (`#1505`); a tap on a plain link or a button, or one
-      // ending a text selection, is not a read.
-      if (currentDoc === null) return;
+      // that block only while this document's read is already active
+      // (`#1505`, `#1543`); an inactive tap selects or does nothing, and a
+      // tap on a plain link or a button, or one ending a text selection,
+      // is not a read.
+      if (currentDoc === null || !readingActive) return;
       let node: unknown = event.target;
       let sawInteractive = false;
       while (node !== null && typeof node === "object" && node !== (body as unknown)) {
@@ -1016,6 +1026,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     drawKind(null);
     // A new open carries no reading light from the last document (`#1330`).
     clearReadingLight();
+    readingActive = false;
     readKey = null;
     setOutlineOpen(false);
     stopWatching();

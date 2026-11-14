@@ -490,8 +490,9 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
 
     # `#1501 discuss-read-aloud-parity`: the summary reads through the shared
     # owner on the device voice. Read counts its four blocks on the strip,
-    # Next steps it, closing stops it; a tap on the last block then reads
-    # from that block. The block being read is lit. Condition waits only.
+    # Next steps it, closing stops it; an inactive tap on answer text then
+    # starts nothing (`#1543`), and after Read a tap on the last block jumps
+    # there. The block being read is lit. Condition waits only.
     def wait_read_count(want: str) -> None:
         page.wait_for_function(
             """(want) => {
@@ -545,6 +546,16 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_function(
         "() => [...document.querySelectorAll('#discuss-answer details')].every((d) => d.open)",
         timeout=20_000)
+    # `#1543`: inactive — a tap on the answer text starts no read.
+    said_before = page.evaluate("() => window.deviceSpeech.length")
+    page.locator("#discuss-answer p", has_text="Ben is reviewing it.").click()
+    check(page.evaluate("() => readAloudOwner().nowPlaying === null && readAloudOwner().pendingRead === null"),
+          "an inactive tap on the Discuss answer started a read")
+    check(page.evaluate("() => window.deviceSpeech.length") == said_before,
+          "an inactive tap on the Discuss answer spoke")
+    # Active: Read starts it, then a tap on the last block jumps there.
+    page.click("#read-aloud")
+    wait_read_count("1 of 4")
     said_before = page.evaluate("() => window.deviceSpeech.length")
     page.locator("#discuss-answer p", has_text="Ben is reviewing it.").click()
     wait_read_count("4 of 4")

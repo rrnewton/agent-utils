@@ -1490,11 +1490,17 @@ test("catchup read: Read hands the owner all blocks under the record key; tap, h
     assert.equal(blocks[1].getAttribute("data-reading-block"), "current", "block 1 was not lit");
     reads[0].doc.onReadingBlock(null);
     assert.equal(blocks[1].getAttribute("data-reading-block"), null, "the light stayed on after the read stopped");
-    // Tap-to-read: tapping the last block starts from its index.
+    // `#1543`: inactive — tapping a block starts no read.
     reads.length = 0;
     const ev = { target: blocks[3], preventDefault() {}, stopPropagation() {} };
     for (const listener of [...(els["discuss-answer"].listeners.click || [])]) listener(ev);
-    assert.equal(reads.length, 1, "tapping a block started no read");
+    assert.equal(reads.length, 0, "tapping a block started a read while the summary reader was inactive");
+    // Active again: Read restarts it, then a tap jumps to that block.
+    click(els["read-aloud"]);
+    assert.equal(reads.length, 1, "Read did not restart the summary read");
+    reads.length = 0;
+    for (const listener of [...(els["discuss-answer"].listeners.click || [])]) listener(ev);
+    assert.equal(reads.length, 1, "tapping a block started no read while reading");
     assert.deepEqual(reads[0].from, { part: 0, block: 3 }, "the tap did not name its block index");
     assert.equal(reads[0].doc.key, "discuss:chan-1||4242", "the tap read under another key");
     // Stop scoping: closing stops only this key; a new Summarize stops it too.

@@ -1996,18 +1996,28 @@ test("documents reader: the reading light is the reported block itself (#1505)",
   });
 });
 
-test("documents reader: a tap on a block reads from that block (#1505)", async () => {
+test("documents reader: a tap on a block reads from that block only while reading (#1505, #1543)", async () => {
   await withReader({ content: LIST_DOC, outline: [] }, async ({ els, reads, readFroms }) => {
     const { items } = drawnListBody(els);
     const label = readerEl("span");
     label.textContent = "second item";
     items[1].appendChild(label);
+    // Inactive: a tap on text starts no read (it may select or do nothing).
     await flush(dispatchClick(els["doc-body"], { target: label }));
-    assert.equal(reads.length, 1, "a tap on a list item read nothing");
-    assert.deepEqual(readFroms[0], { part: 0, block: 2 }, "the tap did not name its block");
+    assert.equal(reads.length, 0, "a tap on a list item started a read while the reader was inactive");
+    // Active: Read starts the read, then a tap jumps it to that block.
+    dispatchClick(els["doc-read"]);
+    assert.equal(reads.length, 1, "Read started no read");
+    await flush(dispatchClick(els["doc-body"], { target: label }));
+    assert.equal(reads.length, 2, "a tap on a list item read nothing while reading");
+    assert.deepEqual(readFroms[1], { part: 0, block: 2 }, "the tap did not name its block");
     // A tap off any block (the body's own padding) reads nothing new.
     await flush(dispatchClick(els["doc-body"], { target: els["doc-body"] }));
-    assert.equal(reads.length, 1, "a tap off any block started a read");
+    assert.equal(reads.length, 2, "a tap off any block started a read");
+    // Stopped (the owner reports a null block): a tap starts nothing again.
+    reads[0].onReadingBlock(null);
+    await flush(dispatchClick(els["doc-body"], { target: label }));
+    assert.equal(reads.length, 2, "a tap on a list item started a read after the read stopped");
   });
 });
 

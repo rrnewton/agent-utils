@@ -652,6 +652,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       return;
     }
     if (!box) return;
+    summaryReadActive = true;
     const blocks = discussBlocks(box);
     const named = typeof element === "number" && Number.isInteger(element) ? element : block;
     const at = block >= 0 && block < blocks.length ? block : named;
@@ -1044,9 +1045,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       node = (el as { parentNode?: unknown }).parentNode;
     }
     // `#1501 discuss-read-aloud-parity`. No citation took the tap: a tap on
-    // a drawn block reads from that block. A fold's summary (its tap folds)
-    // and the collapse bar keep their own acts.
-    if (!deps.readDocument || lastScope === null || lastAnswer === null) return;
+    // a drawn block reads from that block only while this summary's read is
+    // already active (`#1543`); an inactive tap selects or does nothing. A
+    // fold's summary (its tap folds) and the collapse bar keep their own acts.
+    if (!summaryReadActive || !deps.readDocument || lastScope === null || lastAnswer === null) return;
     let box: HTMLElement;
     try {
       box = deps.byId("discuss-answer");

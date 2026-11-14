@@ -333,6 +333,17 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         timeout=20_000)
 
     count = len(blocks)
+    # `#1543`: inactive — tapping document text starts no read.
+    inactive_block = page.locator("#doc-body > p", has_text=blocks[1][:20])
+    if touch:
+        inactive_block.tap()
+    else:
+        inactive_block.click()
+    state = owner_state(page)
+    check(state["id"] is None and state["pending"] is None,
+          f"an inactive tap on document text started a read: {state}")
+    check(page.locator("#read-steer").is_hidden(), "an inactive tap on document text showed the read strip")
+    check(utterances(page) == [], "an inactive tap on document text spoke")
     # Read: the strip counts the blocks, the device voice says them in order,
     # and the read is the owner's document read — no queue of the reader's own.
     # The block being read is lit in the reader (`#1330 doc-read-highlight`).
@@ -349,6 +360,20 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         "() => Object.keys(window.mediaProbe.handlers).filter((k) => window.mediaProbe.handlers[k]).sort()")
     check(handlers == ["nexttrack", "pause", "play", "previoustrack", "stop"],
           f"the document read holds media handlers {handlers}")
+    # `#1543`: active — tapping document text jumps the read there, and the
+    # timeline's first block brings it back for the steps that follow.
+    active_block = page.locator("#doc-body > p", has_text=blocks[1][:20])
+    if touch:
+        active_block.tap()
+    else:
+        active_block.click()
+    wait_count(page, f"2 of {count}")
+    wait_lit(page, blocks[1])
+    page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=20_000)
+    check(utterances(page)[-1] == blocks[1], "an active tap on document text did not jump the read there")
+    act(f'#read-timeline button[aria-label="Read from block 1 of {count}"]')
+    wait_count(page, f"1 of {count}")
+    wait_lit(page, blocks[0])
 
     # Pause and Resume from the pane, over the reader (`#1505`): the pane
     # stands while the read does — where it used to leave with the reader
@@ -546,8 +571,18 @@ def walk_list(page: Page, base: str) -> None:
     page.evaluate("() => readAloudOwner().stopReading()")
     wait_stopped(page)
     wait_unlit(page)
-    # Tap-to-read (`#1505`): a tap on the closing paragraph starts there,
-    # and a tap on a list item starts at that item.
+    # `#1543`: stopped — a tap on text starts nothing again.
+    said_before = len(utterances(page))
+    page.locator("#doc-body > p", has_text="Closing paragraph").tap()
+    state = owner_state(page)
+    check(state["id"] is None and state["pending"] is None,
+          f"a tap on document text after the read stopped started a read: {state}")
+    check(len(utterances(page)) == said_before, "a tap after the read stopped spoke")
+    # Tap-to-read while active (`#1505`, `#1543`): Read restarts the read,
+    # then a tap on the closing paragraph jumps there, and a tap on a list
+    # item jumps to that item.
+    page.tap("#doc-read")
+    wait_count(page, f"1 of {count}")
     said_before = len(utterances(page))
     page.locator("#doc-body > p", has_text="Closing paragraph").tap()
     wait_count(page, f"{count} of {count}")
