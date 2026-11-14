@@ -39,6 +39,7 @@ def _git(cwd: Path, *args: str) -> str:
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
+    env["WRKSLOTS_TEST_EXCLUSION_ROOTS"] = "/tmp"
     return subprocess.run(
         [str(rust_wrkslotsd()), *command],
         cwd=AU_ROOT, capture_output=True, text=True, check=False,
@@ -234,20 +235,79 @@ def test_release_dry_run_matches_python(
     assert rust_checkout.is_dir()
 
 
-def test_release_yes_execution_stays_python_owned(tmp_path: Path) -> None:
-    root, checkout = _fixture(tmp_path / "rust")
+def test_release_yes_matches_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rust_root, rust_checkout = _fixture(tmp_path / "rust")
+    oracle_root, oracle_checkout = _fixture(tmp_path / "oracle")
+
+    def canonical(_config: object, _path: Path, contents: bytes) -> tuple[object, object]:
+        parsed = wrkslots_cli._strict_json_object(contents, "frozen fixture")
+        return (
+            {
+                "schema_version": parsed["schema_version"],
+                "kind": parsed["kind"],
+                "state": parsed["state"],
+                "target": parsed["target"],
+                "repo": parsed["repo"],
+            },
+            parsed,
+        )
+
+    empty = lambda _paths, **_kwargs: wrkslots_cli._ProcessPathCensus((), ())
+    monkeypatch.setattr(wrkslots_cli, "_canonical_frozen_validation_record", canonical)
+    monkeypatch.setattr(wrkslots_cli, "_capture_lsof_process_path_census", empty)
+    monkeypatch.setattr(wrkslots_cli, "_capture_same_uid_process_path_census", empty)
+    monkeypatch.setattr(wrkslots_cli, "_capture_process_path_census", empty)
+    monkeypatch.setattr(
+        wrkslots_cli, "_OWNERLESS_VALIDATION_EXCLUSION_ROOTS", (Path("/tmp"),)
+    )
+    args = argparse.Namespace(
+        project_root=str(oracle_root),
+        machine=None,
+        wait_lock=0.0,
+        frozen_validate_checkout=str(oracle_checkout),
+        completed_record="ignored/validate/runs/run-frozen.json",
+        repository="upstream-repo",
+        reason=REASON,
+        yes=True,
+        coordinator_authorized=True,
+        coordinator_pid=os.getpid(),
+        format="json",
+    )
+    assert wrkslots_cli._cmd_release_frozen_incomplete(args) == 0
+    expected = json.loads(capsys.readouterr().out)
+    assert not oracle_checkout.exists()
     result = _run(
         [
             "release-frozen-incomplete",
             "--coordinator-authorized", "--coordinator-pid", str(os.getpid()),
-            "--frozen-validate-checkout", str(checkout),
+            "--frozen-validate-checkout", str(rust_checkout),
             "--completed-record", "ignored/validate/runs/run-frozen.json",
             "--repository", "upstream-repo",
             "--reason", REASON,
             "--yes",
-            "--root", str(root),
+            "--format", "json",
+            "--root", str(rust_root),
         ]
     )
-    assert result.returncode == 1
-    assert "stays with the Python edition" in result.stderr
-    assert checkout.is_dir()
+    assert result.returncode == 0, result.stderr
+    mine = json.loads(result.stdout)
+    assert not rust_checkout.exists()
+    for payload in (mine, expected):
+        assert payload["action"] == "released"
+        assert [item["repository"] for item in payload["salvage"]] == ["."]
+        assert payload["note"].startswith("wrkslots-salvage/frozen-releases/")
+    # Both sides wrote one release note and one verified bundle,
+    # and the journal is gone.
+    for root in (rust_root, oracle_root):
+        control = root / "worktrees"
+        notes = sorted(
+            (control / "wrkslots-salvage" / "frozen-releases").glob("*.md")
+        )
+        assert len(notes) == 1
+        assert not (control / f"ACTIVE.{MACHINE}.journal").exists()
+        bundles = sorted((control / "wrkslots-salvage").rglob("repository.bundle"))
+        assert len(bundles) == 1 and bundles[0].stat().st_size > 0

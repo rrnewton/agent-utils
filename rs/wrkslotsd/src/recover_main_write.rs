@@ -10,15 +10,17 @@
 //! (Python `_roll_forward_lagging_scoped_journals`, #1007), and the
 //! repair persists even when the rest of the run then refuses.
 //! Actually resuming a journal (which writes the recovery-started
-//! event and then mutates), recovering partial updates, and
-//! starting ownerless validation cleanup stay with the Python
-//! edition and refuse explicitly. Fixture registries only until
-//! the edition cutover (see `ensure_states::require_fixture`).
+//! event and then mutates) and recovering partial updates stay
+//! with the Python edition and refuse explicitly, except the
+//! ownerless-validate-remove journal, which step 4b-ii executes
+//! here (starting it too, from the cleanup flags). Fixture
+//! registries only until the edition cutover (see
+//! `ensure_states::require_fixture`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::active_state::{as_mapping, as_str, load_cfg, Cfg};
 use crate::config_validate::validate_name;
@@ -358,10 +360,49 @@ pub(crate) fn recover_main(
                     .to_string(),
             );
         }
-        return Err(
-            "starting ownerless validation cleanup stays with the Python edition for now"
-                .to_string(),
-        );
+        if legacy_requested || validation_proof_manifest.is_some() {
+            return Err(
+                "starting ownerless validation cleanup stays with the Python edition for now"
+                    .to_string(),
+            );
+        }
+        let (target_kind, raw_target) = if let Some(value) = frozen_validate_checkout {
+            ("frozen-checkout", value)
+        } else if let Some(value) = ownerless_validate_cargo_home {
+            ("cargo-home", value)
+        } else if let Some(value) = ownerless_validate_checkout {
+            ("checkout", value)
+        } else {
+            return Err(
+                "ownerless validation cleanup requires exactly one target path".to_string(),
+            );
+        };
+        let config = crate::config_validate::load_config(root, machine_override)?;
+        let actor = crate::status_state::identity_to_value(&read_process_identity(pid)?);
+        let journal_value = crate::validation_recovery::ownerless_validation_journal(
+            &cfg,
+            &config,
+            target_kind,
+            raw_target,
+            completed_record,
+            repository,
+            None,
+            &actor,
+        )?;
+        let mut journal_map = journal_value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "ownerless validation journal must be an object".to_string())?;
+        crate::remove_write::write_journal(&cfg, &selected, &journal_value)?;
+        let roots = crate::validation_exclusion::exclusion_roots();
+        let message = crate::validation_exclusion::execute_ownerless_validation(
+            &cfg,
+            &config,
+            &mut journal_map,
+            &actor,
+            &roots,
+        )?;
+        return Ok(json!({"outcome": "recovered", "message": message}));
     }
     if journals.is_empty() {
         return Err("no interrupted mutation is recorded".to_string());
@@ -427,6 +468,27 @@ pub(crate) fn recover_main(
         return Err(format!(
             "journal belongs to machine {machine}; rerun with --machine {machine}"
         ));
+    }
+    if kind == "ownerless-validate-remove" {
+        let expected_journal = cfg.control.join(format!("ACTIVE.{selected}.journal"));
+        if *chosen != expected_journal {
+            return Err("ownerless validation journal filename is invalid".to_string());
+        }
+        let config = crate::config_validate::load_config(root, machine_override)?;
+        let actor = crate::status_state::identity_to_value(&read_process_identity(pid)?);
+        let mut journal_map = raw
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "ownerless validation journal must be an object".to_string())?;
+        let roots = crate::validation_exclusion::exclusion_roots();
+        let message = crate::validation_exclusion::execute_ownerless_validation(
+            &cfg,
+            &config,
+            &mut journal_map,
+            &actor,
+            &roots,
+        )?;
+        return Ok(json!({"outcome": "recovered", "message": message}));
     }
     Err(format!(
         "resuming the recorded {kind} recovery stays with the Python edition for now"

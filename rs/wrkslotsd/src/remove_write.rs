@@ -1330,6 +1330,31 @@ pub(crate) fn capture_process_snapshot_at(
     ))
 }
 
+impl ProcessSnapshot {
+    /// Assert no captured process link names or lives under any
+    /// of `paths` (textual, for paths a device check cannot
+    /// inspect, such as an excluded payload behind a sealed guard).
+    pub(crate) fn assert_unused_paths(&self, paths: &[PathBuf]) -> Result<()> {
+        for process in &self.processes {
+            for (label, observation) in &process.links {
+                if let LinkObservation::Target(target) = observation {
+                    if paths
+                        .iter()
+                        .any(|path| target == path || target.starts_with(path))
+                    {
+                        return Err(format!(
+                            "live {} uses slot {} ({label}); stop it and retry",
+                            process.holder(),
+                            target.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Assert no process in `snapshot` uses `slot_path`.
 pub(crate) fn assert_slot_unused_snapshot(
     snapshot: &ProcessSnapshot,

@@ -2355,9 +2355,11 @@ pub(crate) fn load_global_rows(cfg: &Cfg) -> Result<GlobalRows> {
 }
 
 fn random_hex32() -> String {
+    use std::io::Read as _;
+
     let mut bytes = [0u8; 16];
-    if let Ok(raw) = std::fs::read("/dev/urandom") {
-        bytes.copy_from_slice(&raw[..16.min(raw.len())]);
+    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+        let _ = file.read_exact(&mut bytes);
     }
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -2376,6 +2378,33 @@ pub(crate) fn ownerless_validation_journal(
     frozen_result: Option<&Value>,
     actor: &Value,
 ) -> Result<Value> {
+    ownerless_validation_journal_with_release(
+        cfg,
+        config,
+        target_kind,
+        raw_target,
+        completed_record,
+        repository_raw,
+        frozen_result,
+        None,
+        actor,
+    )
+}
+
+/// `_ownerless_validation_journal` with an operator release
+/// (step 4b-ii; only release-frozen-incomplete supplies one).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ownerless_validation_journal_with_release(
+    cfg: &Cfg,
+    config: &Value,
+    target_kind: &str,
+    raw_target: &str,
+    completed_record: Option<&str>,
+    repository_raw: Option<&str>,
+    frozen_result: Option<&Value>,
+    operator_release: Option<&Value>,
+    actor: &Value,
+) -> Result<Value> {
     if target_kind == "frozen-checkout" && completed_record.is_none() {
         return Err(
             "frozen validation checkout recovery requires --completed-record; pass the terminal frozen run handle and retry"
@@ -2385,6 +2414,16 @@ pub(crate) fn ownerless_validation_journal(
     if frozen_result.is_some() && (target_kind != "frozen-checkout" || completed_record.is_none()) {
         return Err(
             "durable frozen result authority applies only to batch frozen cleanup without a proof"
+                .to_string(),
+        );
+    }
+    if operator_release.is_some()
+        && (target_kind != "frozen-checkout"
+            || completed_record.is_none()
+            || frozen_result.is_some())
+    {
+        return Err(
+            "frozen operator release applies only to one frozen checkout without a proof or durable result"
                 .to_string(),
         );
     }
@@ -2419,20 +2458,58 @@ pub(crate) fn ownerless_validation_journal(
         (Some(stored), Some(resolved))
     };
     let (evidence, record_target) = if let Some(record) = completed_record {
-        let (record_path, digest, record_target) =
-            terminal_validation_record(cfg, record, &target, target_kind)?;
-        let mut evidence = json!({
-            "kind": "terminal-record",
-            "path": record_path,
-            "sha256": digest,
-        });
-        if let Some(target_value) = &record_target {
-            evidence["target"] = json!(target_value);
+        if let Some(release) = operator_release {
+            // Python's terminal record with an operator release:
+            // the record must bind this checkout and be a current
+            // incomplete run with a dead process.
+            frozen_operator_release_from_obj(release)?;
+            let (record_path, record_abs) =
+                relative_inside(&cfg.root, record, "terminal validation record")?;
+            let contents = std::fs::read(&record_abs).map_err(|error| {
+                format!(
+                    "cannot read terminal validation record {}: {error}",
+                    record_abs.display()
+                )
+            })?;
+            let digest = format!("{:x}", Sha256::digest(&contents));
+            let record_obj = strict_json_object(&contents, "terminal validation record")?;
+            if !current_incomplete_frozen_result(&record_obj)
+                || !record_process_is_dead(&record_obj)
+            {
+                return Err(
+                    "frozen operator release applies only to an inactive current incomplete run; this run-record has a result or a live process, so preserve the checkout and let recover-ownerless-validate-batch handle it"
+                        .to_string(),
+                );
+            }
+            let record_target = record_obj
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let evidence = json!({
+                "kind": "terminal-record",
+                "path": record_path,
+                "sha256": digest,
+                "target": record_target,
+                "operator_release": release,
+            });
+            (evidence, Some(record_target))
+        } else {
+            let (record_path, digest, record_target) =
+                terminal_validation_record(cfg, record, &target, target_kind)?;
+            let mut evidence = json!({
+                "kind": "terminal-record",
+                "path": record_path,
+                "sha256": digest,
+            });
+            if let Some(target_value) = &record_target {
+                evidence["target"] = json!(target_value);
+            }
+            if let Some(result) = frozen_result {
+                evidence["frozen_result"] = result.clone();
+            }
+            (evidence, record_target)
         }
-        if let Some(result) = frozen_result {
-            evidence["frozen_result"] = result.clone();
-        }
-        (evidence, record_target)
     } else {
         (
             recordless_validation_evidence(cfg, &target, target_kind, None)?,
@@ -2754,6 +2831,363 @@ pub(crate) fn rollback_validation_fence(
     }
     crate::remove_write::clear_journal(cfg, &cfg.machine, &rollback_value)?;
     Ok(())
+}
+
+/// Python `_frozen_operator_release_from_obj`.
+pub(crate) fn frozen_operator_release_from_obj(value: &Value) -> Result<Value> {
+    let Some(raw) = value.as_object() else {
+        return Err("frozen operator release must be an object".to_string());
+    };
+    let keys: Vec<&str> = raw.keys().map(String::as_str).collect();
+    if keys.len() != 5
+        || !["release_id", "reason", "operator", "note", "salvage"]
+            .iter()
+            .all(|key| keys.contains(key))
+    {
+        return Err("frozen operator release has unexpected fields".to_string());
+    }
+    let release_id = raw
+        .get("release_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if release_id.len() != 32
+        || !release_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("frozen operator release id must be 32 lowercase hex digits".to_string());
+    }
+    let reason = raw
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if reason != reason.trim() || reason.is_empty() || reason.chars().count() > 2000 {
+        return Err("frozen operator release reason is malformed".to_string());
+    }
+    let operator = raw
+        .get("operator")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "frozen operator release.operator must be an object".to_string())?;
+    let operator_keys: Vec<&str> = operator.keys().map(String::as_str).collect();
+    if operator_keys.len() != 3
+        || !["user", "uid", "coordinator_pid"]
+            .iter()
+            .all(|key| operator_keys.contains(key))
+    {
+        return Err("frozen operator release.operator has unexpected fields".to_string());
+    }
+    if raw.get("note").and_then(Value::as_str)
+        != Some(format!("wrkslots-salvage/frozen-releases/{release_id}.md").as_str())
+    {
+        return Err("frozen operator release note path does not match its id".to_string());
+    }
+    let Some(salvage) = raw.get("salvage").and_then(Value::as_array) else {
+        return Err("frozen operator release.salvage must be a list".to_string());
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for (index, item) in salvage.iter().enumerate() {
+        let Some(item) = item.as_object() else {
+            return Err(format!(
+                "frozen operator release.salvage[{index}] must be an object"
+            ));
+        };
+        let item_keys: Vec<&str> = item.keys().map(String::as_str).collect();
+        if item_keys.len() != 6
+            || ![
+                "repository",
+                "commit",
+                "bundle",
+                "bundle_sha256",
+                "bundle_bytes",
+                "receipt",
+            ]
+            .iter()
+            .all(|key| item_keys.contains(key))
+        {
+            return Err(format!(
+                "frozen operator release.salvage[{index}] has unexpected fields"
+            ));
+        }
+        let relative = item
+            .get("repository")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if seen.contains(&relative)
+            || (relative != "."
+                && (relative.is_empty()
+                    || relative.starts_with('/')
+                    || relative.split('/').any(|part| part == "..")))
+        {
+            return Err(format!(
+                "frozen operator release.salvage[{index}].repository is not a distinct checkout-relative path"
+            ));
+        }
+        seen.push(relative);
+        let commit = item
+            .get("commit")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "frozen operator release.salvage[{index}].commit is not a full commit id"
+            ));
+        }
+        for field in ["bundle", "receipt"] {
+            let path = item.get(field).and_then(Value::as_str).unwrap_or_default();
+            if !Path::new(path).is_absolute() {
+                return Err(format!(
+                    "frozen operator release.salvage[{index}].{field} must be absolute"
+                ));
+            }
+        }
+        let sha = item
+            .get("bundle_sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if sha.len() != 64
+            || !sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(format!(
+                "frozen operator release.salvage[{index}].bundle_sha256 is not a SHA-256 digest"
+            ));
+        }
+    }
+    Ok(value.clone())
+}
+
+/// Python `_validation_authorization_to_obj` for a decoded
+/// authorization (used for the removal event identity).
+pub(crate) fn authorization_to_obj(authorization: &Authorization) -> Value {
+    let mut obj = json!({
+        "target_kind": authorization.target_kind,
+        "path": authorization.path,
+        "identity": [
+            authorization.identity.0,
+            authorization.identity.1,
+            authorization.identity.2,
+        ],
+        "actor": authorization.actor,
+        "evidence": authorization.evidence,
+        "no_authored_work": true,
+        "no_live_use": true,
+        "repository": authorization.repository,
+        "head": authorization.head,
+        "remote_url_sha256": authorization.remote_url_sha256,
+        "parent_identity": authorization
+            .parent_identity
+            .map(|value| json!([value.0, value.1, value.2])),
+    });
+    if let Some(stable) = &authorization.stable_identity {
+        obj["stable_identity"] = json!([stable.0, stable.1, stable.2, stable.3]);
+    }
+    obj
+}
+
+/// Python `_ownerless_validation_inputs` result:
+/// (authorization, target, fenced, active, repository).
+pub(crate) type ValidationInputs = (
+    Authorization,
+    PathBuf,
+    PathBuf,
+    Option<PathBuf>,
+    Option<PathBuf>,
+);
+
+/// Python `_ownerless_validation_inputs` (no-proof form).
+pub(crate) fn ownerless_validation_inputs(
+    cfg: &Cfg,
+    config: &Value,
+    journal: &serde_json::Map<String, Value>,
+    recheck: bool,
+) -> Result<ValidationInputs> {
+    let (authorization, target, fenced, phase) = ownerless_validation_paths(cfg, journal)?;
+    let target_present = target.exists() || target.is_symlink();
+    let fenced_present = fenced.exists() || fenced.is_symlink();
+    if target_present && fenced_present {
+        return Err("canonical and fenced validation paths both exist; preserve both".to_string());
+    }
+    let mut active = if target_present {
+        Some(target.clone())
+    } else if fenced_present {
+        Some(fenced.clone())
+    } else {
+        None
+    };
+    if phase != "removed" && active.is_none() && authorization.target_kind != "cargo-home" {
+        return Err(format!(
+            "validation path disappeared during {phase} cleanup; removal outcome is UNKNOWN, so preserve the journal and inspect the authorized identity"
+        ));
+    }
+    if phase == "removed" && active.is_some() {
+        for candidate in [&target, &fenced] {
+            if !candidate.is_symlink()
+                && candidate.is_dir()
+                && open_directory_identity(candidate, "replacement validation path").ok()
+                    == Some(authorization.identity)
+            {
+                return Err(
+                    "authorized validation path reappeared after removal was recorded".to_string(),
+                );
+            }
+        }
+        active = None;
+    }
+    let mut repository: Option<PathBuf> = None;
+    if let Some(active_path) = &active {
+        if active_path.is_symlink()
+            || !active_path.is_dir()
+            || open_directory_identity(active_path, "validation path")? != authorization.identity
+        {
+            return Err("validation path identity changed; preserve it".to_string());
+        }
+        if authorization.target_kind == "frozen-checkout" {
+            let stable = authorization.stable_identity.as_ref().ok_or_else(|| {
+                "frozen validation authorization has no stable file-handle identity".to_string()
+            })?;
+            let observed = private_cleanup_path_identity(
+                cfg,
+                active_path,
+                &[0o700],
+                Some(&frozen_validation_directory(cfg)),
+            )?;
+            if &observed != stable {
+                return Err(
+                    "frozen validation path file-handle identity changed; preserve every candidate path and inspect the interrupted journal before retrying"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if authorization.target_kind == "frozen-checkout" {
+        let parent = open_directory_identity(
+            &frozen_validation_directory(cfg),
+            "frozen validation checkout parent",
+        )?;
+        if Some(parent) != authorization.parent_identity {
+            return Err(
+                "frozen validation checkout parent identity changed; preserve the checkout and restore the original sibling directory before retrying"
+                    .to_string(),
+            );
+        }
+    }
+    if matches!(
+        authorization.target_kind.as_str(),
+        "checkout" | "frozen-checkout"
+    ) {
+        if authorization.repository.is_none()
+            || authorization.head.is_none()
+            || authorization.remote_url_sha256.is_none()
+        {
+            return Err("validation checkout authorization is incomplete".to_string());
+        }
+        let (_stored, resolved) = repository_path(
+            cfg,
+            authorization.repository.as_deref().unwrap_or_default(),
+            true,
+        )?;
+        if resolved == target || path_is_within(&resolved, &target) {
+            return Err("validation repository is inside the removal target".to_string());
+        }
+        repository = Some(resolved);
+    }
+    // Evidence recheck.
+    let evidence = &authorization.evidence;
+    let kind = evidence
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut require_remote_containment = true;
+    if kind == "terminal-record" {
+        if let Some(release) = evidence.get("operator_release") {
+            frozen_operator_release_from_obj(release)?;
+            let salvage = release
+                .get("salvage")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            require_remote_containment = !salvage
+                .iter()
+                .any(|item| item.get("repository").and_then(Value::as_str) == Some("."));
+            if recheck {
+                // The record must still bind this checkout and be
+                // a current incomplete run with a dead process.
+                let record_raw = evidence
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let (_rel, record_path) =
+                    relative_inside(cfg.root.as_path(), record_raw, "terminal validation record")?;
+                let contents = std::fs::read(&record_path).map_err(|error| {
+                    format!(
+                        "cannot read terminal validation record {}: {error}",
+                        record_path.display()
+                    )
+                })?;
+                let digest = format!("{:x}", Sha256::digest(&contents));
+                if Some(digest.as_str()) != evidence.get("sha256").and_then(Value::as_str) {
+                    return Err(
+                        "terminal validation record changed after recovery was authorized"
+                            .to_string(),
+                    );
+                }
+                let record = strict_json_object(&contents, "terminal validation record")?;
+                if !current_incomplete_frozen_result(&record) || !record_process_is_dead(&record) {
+                    return Err(
+                        "frozen operator release applies only to an inactive current incomplete run; this run-record has a result or a live process, so preserve the checkout and let recover-ownerless-validate-batch handle it"
+                            .to_string(),
+                    );
+                }
+            }
+        } else if recheck {
+            let record_raw = evidence
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            terminal_validation_record(cfg, &record_raw, &target, &authorization.target_kind)?;
+        }
+    } else if kind == "coordinator-determination" {
+        if evidence.get("no_retained_record") != Some(&Value::Bool(true)) {
+            return Err("coordinator determination lacks no-record evidence".to_string());
+        }
+        if recheck {
+            let note = evidence.get("note").and_then(Value::as_str);
+            recordless_validation_evidence(cfg, &target, &authorization.target_kind, note)?;
+        }
+    } else {
+        return Err(format!(
+            "unknown validation recovery evidence kind {kind:?}"
+        ));
+    }
+    if recheck {
+        if let Some(active_path) = &active {
+            if matches!(
+                authorization.target_kind.as_str(),
+                "checkout" | "frozen-checkout"
+            ) {
+                let repository = repository.as_deref().expect("repository");
+                validation_checkout_facts(
+                    cfg,
+                    config,
+                    active_path,
+                    repository,
+                    authorization.head.as_deref(),
+                    authorization.remote_url_sha256.as_deref(),
+                    authorization.target_kind == "frozen-checkout",
+                    None,
+                    require_remote_containment,
+                )?;
+            } else if validation_cargo_facts(active_path)?
+                != authorization.parent_identity.expect("cargo parent")
+            {
+                return Err("validation Cargo-home parent identity changed".to_string());
+            }
+        }
+    }
+    Ok((authorization, target, fenced, active, repository))
 }
 
 /// Python `_frozen_release_*` for the dry run (#1089 step 4a):

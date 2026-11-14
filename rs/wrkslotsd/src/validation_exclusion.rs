@@ -24,6 +24,19 @@ type Result<T> = std::result::Result<T, String>;
 /// `_OWNERLESS_VALIDATION_EXCLUSION_ROOTS`); tests pass `/tmp`.
 pub(crate) const EXCLUSION_ROOTS: &[&str] = &["/data/misc"];
 
+/// The exclusion roots for one run: the production roots, or
+/// the `WRKSLOTS_TEST_EXCLUSION_ROOTS` colon-separated override
+/// fixture tests use to keep the guard on the checkout's own
+/// filesystem (the census-churn seam has the same shape).
+pub(crate) fn exclusion_roots() -> Vec<PathBuf> {
+    if let Ok(raw) = std::env::var("WRKSLOTS_TEST_EXCLUSION_ROOTS") {
+        if !raw.is_empty() {
+            return raw.split(':').map(PathBuf::from).collect();
+        }
+    }
+    EXCLUSION_ROOTS.iter().map(PathBuf::from).collect()
+}
+
 /// A parsed `/proc/self/mountinfo` record: (mount id, major:minor,
 /// filesystem root, mount point, fs type, source).
 struct MountRecord {
@@ -675,6 +688,275 @@ pub(crate) fn begin_exclusion(
     })
 }
 
+/// The payload descriptor's (dev, ino, mount id), Python's
+/// `_fd_mount_id` over an already-open directory.
+fn fd_identity3(file: &std::fs::File) -> Result<(u64, u64, u64)> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let metadata = rustix::fs::fstat(file)
+        .map_err(|error| format!("cannot inspect excluded validation checkout: {error}"))?;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))
+        .map_err(|error| format!("cannot determine mount identity: {error}"))?;
+    for line in fdinfo.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim() == "mnt_id" {
+                let mount = value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| "mount identity is malformed".to_string())?;
+                return Ok((metadata.st_dev, metadata.st_ino, mount));
+            }
+        }
+    }
+    Err("mount identity is missing".to_string())
+}
+
+impl Exclusion {
+    /// (dev, ino, mount id) of the held-open payload.
+    pub(crate) fn identity3(&self) -> Result<(u64, u64, u64)> {
+        fd_identity3(&self.payload_file)
+    }
+}
+
+/// Python `_assert_current_process_only_holds_excluded_payload`.
+fn assert_current_process_only_holds(
+    exclusion: &Exclusion,
+    target: &Path,
+    fenced: &Path,
+) -> Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let paths = [
+        exclusion.payload.clone(),
+        exclusion.source_alias.clone(),
+        fenced.to_path_buf(),
+        target.to_path_buf(),
+    ];
+    let hits = |raw: &str| -> bool {
+        let observed = PathBuf::from(raw.strip_suffix(" (deleted)").unwrap_or(raw));
+        paths
+            .iter()
+            .any(|path| observed == *path || observed.starts_with(path))
+    };
+    for name in ["cwd", "root", "exe"] {
+        if let Ok(raw) = std::fs::read_link(format!("/proc/self/{name}")) {
+            if hits(&raw.to_string_lossy()) {
+                return Err(format!(
+                    "cleanup process unexpectedly uses excluded validation path: {name}={}",
+                    raw.display()
+                ));
+            }
+        }
+    }
+    let payload_fd = exclusion.payload_file.as_raw_fd();
+    let mut expected_seen = false;
+    let entries = std::fs::read_dir("/proc/self/fd")
+        .map_err(|error| format!("cannot inspect cleanup process descriptors: {error}"))?;
+    for entry in entries.flatten() {
+        let Ok(raw) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let fd_name = entry.file_name().to_string_lossy().into_owned();
+        if fd_name == payload_fd.to_string() {
+            let identity = exclusion.payload_identity()?;
+            let record =
+                open_directory_identity(&exclusion.payload, "excluded validation checkout")
+                    .unwrap_or((identity.0, identity.1, 0));
+            if (identity.0, identity.1) != (record.0, record.1) && record != (0, 0, 0) {
+                // The payload path is behind the mode-000 guard; the
+                // descriptor identity is the authority here.
+            }
+            expected_seen = true;
+            continue;
+        }
+        if hits(&raw.to_string_lossy()) {
+            return Err(format!(
+                "cleanup process has an unexpected descriptor into the excluded validation path: fd/{fd_name}={}",
+                raw.display()
+            ));
+        }
+    }
+    if !expected_seen {
+        return Err("cleanup process lost its excluded validation descriptor".to_string());
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps")
+        .map_err(|error| format!("cannot inspect cleanup process mappings: {error}"))?;
+    for line in maps.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if let Some(path) = fields.get(5) {
+            if path.starts_with('/') && hits(path) {
+                return Err(
+                    "cleanup process maps a file from the excluded validation path".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Python `_assert_excluded_validation_unused` (fresh census).
+pub(crate) fn assert_excluded_unused(
+    exclusion: &Exclusion,
+    target: &Path,
+    fenced: &Path,
+) -> Result<()> {
+    assert_current_process_only_holds(exclusion, target, fenced)?;
+    let census_paths = [
+        exclusion.payload.clone(),
+        exclusion.source_alias.clone(),
+        fenced.to_path_buf(),
+        target.to_path_buf(),
+    ];
+    let snapshot = crate::remove_write::capture_process_snapshot(
+        i64::from(std::process::id()),
+        &census_paths,
+    )?;
+    snapshot.assert_unused_paths(&census_paths)?;
+    assert_current_process_only_holds(exclusion, target, fenced)
+}
+
+/// Python `_assert_excluded_validation_tree_bound`.
+pub(crate) fn assert_tree_bound(
+    cfg: &Cfg,
+    exclusion: &Exclusion,
+    target: &Path,
+    fenced: &Path,
+    authorization: &crate::validation_recovery::Authorization,
+) -> Result<()> {
+    let _ = cfg;
+    let root_meta = exclusion.root.symlink_metadata().map_err(|error| {
+        format!(
+            "cannot inspect validation exclusion root {}: {error}",
+            exclusion.root.display()
+        )
+    })?;
+    if (root_meta.dev(), root_meta.ino())
+        != (
+            root_metadata(&exclusion.root, "validation exclusion root")?.0,
+            root_metadata(&exclusion.root, "validation exclusion root")?.1,
+        )
+        || root_meta.uid() != 0
+        || root_meta.gid() != 0
+        || root_meta.permissions_mode() != 0o1777
+    {
+        return Err("validation exclusion root identity or permissions changed".to_string());
+    }
+    let guard_meta = exclusion.guard.symlink_metadata().map_err(|error| {
+        format!(
+            "cannot inspect validation exclusion guard {}: {error}",
+            exclusion.guard.display()
+        )
+    })?;
+    if !guard_meta.is_dir()
+        || guard_meta.uid() != 0
+        || guard_meta.gid() != 0
+        || guard_meta.permissions_mode() != 0
+    {
+        return Err("validation exclusion guard became accessible before cleanup".to_string());
+    }
+    if target.exists() || target.is_symlink() {
+        return Err("canonical validation path reappeared before cleanup".to_string());
+    }
+    if fenced.exists() || fenced.is_symlink() {
+        return Err("fenced validation path reappeared before cleanup".to_string());
+    }
+    if exclusion.identity3()? != authorization.identity {
+        return Err("excluded validation checkout identity changed before cleanup".to_string());
+    }
+    let moved = root_metadata(&exclusion.payload, "excluded validation checkout")?;
+    if (moved.0, moved.1) != (authorization.identity.0, authorization.identity.1) {
+        return Err("excluded validation checkout path changed before cleanup".to_string());
+    }
+    if exclusion.source_alias.exists() || exclusion.source_alias.is_symlink() {
+        return Err("validation checkout mount alias reappeared before cleanup".to_string());
+    }
+    if let Some(stable) = &authorization.stable_identity {
+        if &exclusion.payload_identity()? != stable {
+            return Err(
+                "excluded validation checkout stable identity changed before cleanup".to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Empty one directory through its held-open descriptor,
+/// Python `_clear_open_directory` in its validation form.
+fn clear_payload_dir(dir: &std::fs::File) -> Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let fd = dir.as_raw_fd();
+    let listing = std::fs::read_dir(format!("/proc/self/fd/{fd}"))
+        .map_err(|error| format!("cannot enumerate excluded validation checkout: {error}"))?;
+    let mut names: Vec<String> = listing
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for name in names {
+        let child_path = format!("/proc/self/fd/{fd}/{name}");
+        let metadata = std::fs::symlink_metadata(&child_path).map_err(|error| {
+            format!("cannot inspect excluded validation entry {child_path}: {error}")
+        })?;
+        if metadata.is_dir() && !std::path::Path::new(&child_path).is_symlink() {
+            let child = rustix::fs::openat(
+                dir,
+                &name,
+                rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|error| format!("cannot open excluded validation entry {name}: {error}"))?;
+            let child_file = std::fs::File::from(child);
+            clear_payload_dir(&child_file)?;
+            rustix::fs::unlinkat(dir, &name, rustix::fs::AtFlags::REMOVEDIR).map_err(|error| {
+                format!("cannot remove excluded validation directory {name}: {error}")
+            })?;
+        } else {
+            rustix::fs::unlinkat(dir, &name, rustix::fs::AtFlags::empty()).map_err(|error| {
+                format!("cannot remove excluded validation entry {name}: {error}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Python `_remove_excluded_validation_tree`.
+pub(crate) fn remove_excluded_tree(
+    cfg: &Cfg,
+    exclusion: &Exclusion,
+    target: &Path,
+    fenced: &Path,
+    authorization: &crate::validation_recovery::Authorization,
+) -> Result<()> {
+    assert_tree_bound(cfg, exclusion, target, fenced, authorization)?;
+    clear_payload_dir(&exclusion.payload_file)?;
+    assert_tree_bound(cfg, exclusion, target, fenced, authorization)?;
+    root_command(
+        "/usr/bin/rmdir",
+        &[
+            "--".to_string(),
+            exclusion.payload.to_string_lossy().into_owned(),
+        ],
+        "remove the empty excluded validation checkout",
+        false,
+    )?;
+    root_command(
+        "/usr/bin/rmdir",
+        &[
+            "--".to_string(),
+            exclusion.guard.to_string_lossy().into_owned(),
+        ],
+        "remove the empty validation exclusion guard",
+        false,
+    )?;
+    if exclusion.guard.symlink_metadata().is_ok() {
+        return Err("validation exclusion guard remains after removal".to_string());
+    }
+    Ok(())
+}
+
 /// Python `_restore_ownerless_validation_exclusion`.
 pub(crate) fn restore_exclusion(
     cfg: &Cfg,
@@ -824,6 +1106,162 @@ pub(crate) fn restore_exclusion(
     let journal_value = Value::Object(journal.clone());
     crate::remove_write::write_journal(cfg, &cfg.machine, &journal_value)?;
     Ok(())
+}
+
+/// Python `_recover_ownerless_validation`: execute one
+/// ownerless-validate-remove journal to completion. Fixture
+/// registries only; `actor` is the coordinator identity object.
+pub(crate) fn execute_ownerless_validation(
+    cfg: &Cfg,
+    config: &Value,
+    journal: &mut serde_json::Map<String, Value>,
+    actor: &Value,
+    roots: &[PathBuf],
+) -> Result<String> {
+    use crate::validation_recovery::{
+        authorization_to_obj, ownerless_validation_inputs, rollback_validation_fence,
+    };
+
+    // A crash-interrupted exclusion is restored before anything
+    // else re-judges the paths.
+    restore_exclusion(cfg, journal, roots)?;
+    let (authorization, target, fenced, active, _repository) =
+        ownerless_validation_inputs(cfg, config, journal, false)?;
+    let (_auth, _t, _f, _a, _r) = (
+        authorization.clone(),
+        target.clone(),
+        fenced.clone(),
+        active.clone(),
+        _repository.clone(),
+    );
+    let phase = journal
+        .get("phase")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if authorization.target_kind == "checkout" && phase != "removed" {
+        return Err(
+            "ownerless linked validation checkout recovery is disabled because the checkout and its Git administration cannot both be fenced against same-UID replacement; preserve it or import it only with a demonstrably live owner"
+                .to_string(),
+        );
+    }
+    let initial_phase = phase.clone();
+    if let Some(active_path) = active.clone() {
+        if let Err(error) = ownerless_validation_inputs(cfg, config, journal, true) {
+            if active_path == fenced && !target.exists() {
+                let _ = rollback_validation_fence(cfg, journal);
+            }
+            return Err(error);
+        }
+        let mut active_now = active_path.clone();
+        if active_now == target {
+            std::fs::rename(&target, &fenced).map_err(|error| {
+                format!(
+                    "cannot fence validation path {} -> {}: {error}",
+                    target.display(),
+                    fenced.display()
+                )
+            })?;
+            if let Some(parent) = target.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+            journal.insert("phase".to_string(), Value::String("fenced".to_string()));
+            let journal_value = Value::Object(journal.clone());
+            crate::remove_write::write_journal(cfg, &cfg.machine, &journal_value)?;
+            active_now = fenced.clone();
+        }
+        let rechecked = ownerless_validation_inputs(cfg, config, journal, true);
+        let (rechecked_auth, _t2, _f2, rechecked_active, _r2) = match rechecked {
+            Ok(values) => values,
+            Err(error) => {
+                let _ = rollback_validation_fence(cfg, journal);
+                return Err(error);
+            }
+        };
+        let authorization = rechecked_auth;
+        active_now = rechecked_active.unwrap_or(active_now);
+        if active_now != fenced {
+            return Err("validation cleanup did not establish its path fence".to_string());
+        }
+        journal.insert("phase".to_string(), Value::String("removing".to_string()));
+        let journal_value = Value::Object(journal.clone());
+        crate::remove_write::write_journal(cfg, &cfg.machine, &journal_value)?;
+        let exclusion = begin_exclusion(cfg, journal, roots)?;
+        assert_excluded_unused(&exclusion, &target, &fenced)?;
+        remove_excluded_tree(cfg, &exclusion, &target, &fenced, &authorization)?;
+        drop(exclusion);
+        journal.remove("exclusion");
+        journal.insert("phase".to_string(), Value::String("removed".to_string()));
+        let journal_value = Value::Object(journal.clone());
+        crate::remove_write::write_journal(cfg, &cfg.machine, &journal_value)?;
+    }
+    if initial_phase != "removed"
+        && (target.exists() || target.is_symlink() || fenced.exists() || fenced.is_symlink())
+    {
+        return Err("validation path still exists after removal".to_string());
+    }
+    // The removal event, exactly once per authorization.
+    let authorization_payload = authorization_to_obj(&authorization);
+    let slot = journal
+        .get("slot")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let identity_bytes = crate::canonical::canonical_json(&json!({
+        "slot": slot,
+        "authorization": authorization_payload,
+    }))
+    .map_err(|error| error.to_string())?;
+    let recovery_id = format!("{:x}", Sha256::digest(identity_bytes.as_bytes()));
+    let events_dir = cfg.control.join(format!("EVENTS.{}", cfg.machine));
+    let mut matching = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&events_dir) {
+        for entry in entries.flatten() {
+            let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if event.get("kind").and_then(Value::as_str) != Some("ownerless-validate-path-removed")
+            {
+                continue;
+            }
+            let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+            let same = payload.get("slot").and_then(Value::as_str) == Some(slot.as_str())
+                && payload.get("authorization") == Some(&authorization_payload);
+            if payload.get("recovery_id").and_then(Value::as_str) == Some(recovery_id.as_str())
+                || same
+            {
+                matching += 1;
+            }
+        }
+    }
+    if matching > 1 {
+        return Err("duplicate ownerless validation removal events already exist".to_string());
+    }
+    if matching == 0 {
+        crate::ensure_states::append_event(
+            cfg,
+            &cfg.machine,
+            "ownerless-validate-path-removed",
+            json!({
+                "slot": slot,
+                "recovery_id": recovery_id,
+                "authorization": authorization_payload,
+                "recovery_actor": actor,
+            }),
+        )?;
+    }
+    let journal_value = Value::Object(journal.clone());
+    crate::remove_write::clear_journal(cfg, &cfg.machine, &journal_value)?;
+    Ok(format!(
+        "recovered ownerless validation {}={}",
+        authorization.target_kind,
+        target.display()
+    ))
 }
 
 #[cfg(test)]
