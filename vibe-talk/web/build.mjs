@@ -233,11 +233,10 @@ const sourceName = (name) => `vibe-talk/web/${name}`;
 //
 // No other name the modules use is visible outside them, and no object is left behind on the page.
 
-/** The legacy page script, which the prelude runs just before. */
+/** The page's entry module (`#624 voice-page-modularity`, final entry): bundled as one script. */
+export const ENTRY_MODULE = "src/app/main.js";
+/** The plain script name the shell and older shells load the entry under. */
 export const LEGACY_SCRIPT = "voice.js";
-/** The module whose exports are what the legacy script takes from the modules. */
-export const LEGACY_IMPORTS = "src/legacy/imports.ts";
-const PRELUDE_GLOBAL = "__voiceLegacyImports";
 
 /**
  * An esbuild plugin that loads each file `overlays` names with its patch applied: `{ file, find,
@@ -277,24 +276,21 @@ async function exportedNames(esbuild, entry, plugins) {
 }
 
 /**
- * The prelude the legacy script runs after (see above): `{ code, map, lineCount, names }`, or null
- * when web/src/legacy/imports.ts exports nothing. `minify` takes out white space and comments only,
- * as for the rest of the page; `overlays` patch module sources first (see overlayPlugin).
+ * The entry bundle: `src/app/main.js` and everything it imports, as one script part
+ * ({ name, code, map, lineCount, names }), like the prelude it replaces. `names` are the
+ * local names the entry imports from its modules, for tests that read a module binding in
+ * the page's realm. `overlays` patch module sources first (see overlayPlugin).
  */
-export async function legacyPrelude(esbuild, web = WEB, { minify = true, overlays = [] } = {}) {
-  const entry = join(web, LEGACY_IMPORTS);
-  if (!existsSync(entry)) return null;
+export async function entryBundle(esbuild, web = WEB, { minify = true, overlays = [] } = {}) {
+  const entry = join(web, ENTRY_MODULE);
   const plugins = overlays.length > 0 ? [overlayPlugin(web, overlays)] : [];
-  const names = await exportedNames(esbuild, entry, plugins);
-  if (names.length === 0) return null;
   const result = await esbuild.build({
     entryPoints: [entry],
     bundle: true,
-    format: "iife",
-    globalName: PRELUDE_GLOBAL,
+    format: "esm",
     platform: "neutral",
     write: false,
-    outfile: join(web, "prelude.js"),
+    outfile: join(web, "entry.js"),
     sourcemap: "external",
     sourcesContent: true,
     target: "esnext",
@@ -305,17 +301,20 @@ export async function legacyPrelude(esbuild, web = WEB, { minify = true, overlay
     logLevel: "silent",
     plugins,
   });
-  if (result.warnings.length > 0) throw new Error(`the prelude: ${result.warnings.map((warning) => warning.text).join("; ")}`);
+  if (result.warnings.length > 0) throw new Error(`the entry: ${result.warnings.map((warning) => warning.text).join("; ")}`);
   const output = (suffix) => result.outputFiles.find((file) => file.path.endsWith(suffix));
-  const bundled = output(".js").text;
-  const body = bundled.endsWith("\n") ? bundled : `${bundled}\n`;
-  const code = `const { ${names.join(", ")} } = (() => {\n"use strict";\n${body}return ${PRELUDE_GLOBAL};\n})();\n`;
+  const code = output(".js").text.endsWith("\n") ? output(".js").text : `${output(".js").text}\n`;
   const map = JSON.parse(output(".js.map").text);
-  // Two lines (the wrapper's opening) come before the bundle's first; its sources are named from the
-  // repository root, like every other part's.
-  map.mappings = `;;${map.mappings}`;
-  map.sources = map.sources.map((source) => sourceName(source.split("\\").join("/")));
-  return { name: LEGACY_IMPORTS, code, map, lineCount: code.split("\n").length - 1, names };
+  map.sources = map.sources.map((source) => sourceName(source.split("\\").join("/").replace(/^\.\.\//, "")));
+  const source = readFileSync(entry, "utf8");
+  const names = [];
+  for (const block of source.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from/g)) {
+    for (const part of block[1].split(",")) {
+      const name = part.trim().split(/\s+as\s+/).at(-1).trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(name)) names.push(name);
+    }
+  }
+  return { name: LEGACY_SCRIPT, code, map, lineCount: code.split("\n").length - 1, names: [...new Set(names)].sort() };
 }
 
 /**
@@ -476,13 +475,11 @@ export async function build(out, { web = WEB } = {}) {
   const html = readFileSync(join(web, SHELL), "utf8");
   const scripts = shellScripts(html);
   const styles = shellStyles(html);
-  const scriptParts = await minifyAll(esbuild, web, scripts, "js");
-  const prelude = await legacyPrelude(esbuild, web);
-  if (prelude) {
-    const at = scriptParts.findIndex((part) => part.name === LEGACY_SCRIPT);
-    if (at < 0) throw new Error(`the modules have a prelude for ${LEGACY_SCRIPT}, which the shell does not load`);
-    scriptParts.splice(at, 0, prelude);
-  }
+  const scriptParts = await minifyAll(esbuild, web, scripts.filter((name) => name !== LEGACY_SCRIPT), "js");
+  const entry = await entryBundle(esbuild, web);
+  const at = scripts.indexOf(LEGACY_SCRIPT);
+  if (at < 0) throw new Error(`the entry builds ${LEGACY_SCRIPT}, which the shell does not load`);
+  scriptParts.splice(at, 0, entry);
   const js = assemble(scriptParts, {
     stem: "voice",
     extension: "js",
@@ -519,7 +516,7 @@ export async function build(out, { web = WEB } = {}) {
   inputs["vibe-talk/contract/package-lock.json"] = digest(readFileSync(join(TOOLS, "package-lock.json")));
   const manifest = {
     page_build: digest(js.bytes),
-    legacy_imports: prelude ? prelude.names : [],
+    legacy_imports: [],
     assets: {
       script: { path: `/assets/${js.file}`, map: `/assets/${js.mapFile}`, type: "text/javascript; charset=utf-8", sources: scripts },
       style: { path: `/assets/${css.file}`, map: `/assets/${css.mapFile}`, type: "text/css; charset=utf-8", sources: styles },

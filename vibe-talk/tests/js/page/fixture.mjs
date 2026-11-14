@@ -36,7 +36,7 @@ import { join } from "node:path";
 import vm from "node:vm";
 import { Worker } from "node:worker_threads";
 
-import { LEGACY_SCRIPT, legacyPrelude, loadTool, moduleForTests } from "../../../web/build.mjs";
+import { LEGACY_SCRIPT, entryBundle, loadTool, moduleForTests } from "../../../web/build.mjs";
 import { SHELL, WEB, moduleSources, occurrences, readWeb, shellScripts } from "../../../web/page_sources.mjs";
 
 /**
@@ -139,7 +139,8 @@ afterEach(() => {
 });
 
 const SCRIPT_FILE = "voice.js";
-const SCRIPT = readWeb(SCRIPT_FILE);
+const ENTRY = await entryBundle(loadTool("esbuild"), WEB, { minify: false });
+const SCRIPT = ENTRY.code;
 const HTML = readWeb(SHELL);
 /**
  * The scripts every page here runs, in order: the ones the shell loads, as it loads them
@@ -1973,8 +1974,8 @@ const COMPILED = new Map(PAGE_SCRIPTS.map((name) => [
  * declaring for it the names web/src/legacy/imports.ts exports, run just before it as the page build
  * runs it. Built here, unminified, by the same function; null while nothing has moved.
  */
-const PRELUDE = await legacyPrelude(loadTool("esbuild"), WEB, { minify: false });
-const PRELUDE_COMPILED = PRELUDE && new vm.Script(PRELUDE.code, { filename: "prelude.js" });
+const PRELUDE = null;
+const PRELUDE_COMPILED = null;
 /**
  * The page's modules, built for the tests that hold them directly (`#624 voice-page-modularity`).
  * Loaded HERE, above every test, and never further down: node:test starts a test the moment it is
@@ -2010,7 +2011,7 @@ const { OWN_READ_APPLY_ARM_MS } = await moduleForTests("src/view/settings/ownrea
  * (web/src/legacy/imports.ts). `page.pure` refuses them: what moved into a module is tested through
  * that module, which the page runs as it is (`#624 voice-page-modularity`).
  */
-const PRELUDE_NAMES = new Set(PRELUDE ? PRELUDE.names : []);
+const PRELUDE_NAMES = new Set(ENTRY.names);
 /** The device's settings and, on its own handle, its token (web/src/core/settings). */
 const SETTINGS = await moduleForTests("src/core/settings/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
@@ -5033,8 +5034,11 @@ function brokenScript(find, replace, count = 1) {
  * voice.js but is still exercised through the whole page.
  */
 async function brokenModule(overlays, script = SCRIPT) {
-  const built = await legacyPrelude(loadTool("esbuild"), WEB, { minify: false, overlays });
-  return { prelude: new vm.Script(built.code, { filename: "prelude.js" }), script };
+  if (script !== SCRIPT) {
+    throw new Error("brokenModule no longer combines a mutated legacy script with module overlays: patch the entry or the module, not both");
+  }
+  const built = await entryBundle(loadTool("esbuild"), WEB, { minify: false, overlays });
+  return { prelude: null, script: built.code };
 }
 
 /**

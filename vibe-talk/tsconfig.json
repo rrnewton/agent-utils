@@ -18,5 +18,5 @@
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true
   },
-  "files": ["web/contract.d.ts", "web/globals.d.ts", "web/legacy-imports.d.ts", "web/voice.js"]
+  "files": ["web/contract.d.ts", "web/globals.d.ts", "web/src/app/main.js"]
 }

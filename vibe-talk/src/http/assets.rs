@@ -154,7 +154,7 @@ use crate::state::AppState;
 const SHELL: &str = built::SHELL;
 /// The page script's SOURCE, for the tests that assert its shape. What is served is the page build.
 #[cfg(test)]
-pub(crate) const VOICE_JS: &str = include_str!("../../web/voice.js");
+pub(crate) const VOICE_JS: &str = include_str!("../../web/src/app/main.js");
 const CONTRACT_JS: &str = include_str!("../../web/contract.js");
 /// `voice.css` as the page build assembled it from its ordered parts (`web/styles/voice.json`, `#624
 /// voice-page-modularity`): the plain file it writes beside the hashed assets, byte for byte the sheet

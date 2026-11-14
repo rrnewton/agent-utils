@@ -3795,10 +3795,9 @@ test("`#338 column-overscroll`: at a desk PgDn or Space at the foot of the right
   const kept = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
     find: "    if (area === deps.side()) closeOverscroll();\n    deps.toFoot(area);\n  }",
     replace: "    deps.toFoot(area);\n  }" }, { file: "src/view/shell/scrollkeys.ts",
-    find: "    if (deps.scrollArea() === deps.sideScroll()) deps.closeOverscroll();\n", replace: "" }], brokenScriptEach(
-    ["    jumpNewest: inThisColumn(() => {\n      closeOverscroll();\n",
-      "    jumpNewest: inThisColumn(() => {\n"],
-  )));
+    find: "    if (deps.scrollArea() === deps.sideScroll()) deps.closeOverscroll();\n", replace: "" }, { file: "src/app/main.js",
+    find: "    jumpNewest: inThisColumn(() => {\n      closeOverscroll();\n",
+    replace: "    jumpNewest: inThisColumn(() => {\n" }]));
   assert.deepStrictEqual(kept, { ...real, endClosed: false, chipClosed: false });
 });
 

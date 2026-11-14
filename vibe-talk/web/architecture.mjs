@@ -68,18 +68,17 @@ export const PACKAGES = Object.freeze({
   "view/settings": [...BASE, "view/dom", "core/channels", "core/navigation", "core/outbox", "core/settings", "present/notices", "present/settings"],
   // The composition root (`#624 voice-page-modularity`, step 17): it alone may name every
   // layer at once — the browser's ports, every core and present package, and every view —
-  // because wiring them in order is its whole job. It imports no `legacy`: the legacy
-  // script imports it (through legacy/imports.ts), never the other way, and when the final
-  // entry step deletes the legacy script this row is the entry's boundary unchanged.
+  // because wiring them in order is its whole job. Since the final entry step
+  // (`#624`) this row is the entry's boundary: app/main.js is where the platform's own
+  // capabilities are wired into the ports, so `app` names them as platform/web does.
   app: [
     ...BASE,
     "core/annotations", "core/api", "core/call", "core/channels", "core/navigation",
     "core/outbox", "core/search", "core/settings", "core/speech", "core/sync",
     "platform/web",
     "present/call", "present/notices", "present/rows", "present/settings", "present/time",
-    "view/channel", "view/composer", "view/dom", "view/settings", "view/shell", "view/voice",
+    "view/channel", "view/composer", "view/dom", "view/settings", "view/shell", "view/voice", "view/documents", "view/catchup",
   ],
-  legacy: "*",
 });
 
 /**
@@ -93,7 +92,7 @@ export const PLATFORM_GLOBALS = Object.freeze([
   "SpeechSynthesisUtterance", "Notification",
 ]);
 /** The packages that may name `PLATFORM_GLOBALS`. */
-const PLATFORM_PACKAGES = new Set(["platform/web", "legacy"]);
+const PLATFORM_PACKAGES = new Set(["platform/web", "app"]);
 /** The objects whose properties are globals. */
 const GLOBAL_OBJECTS = new Set(["window", "self", "globalThis"]);
 

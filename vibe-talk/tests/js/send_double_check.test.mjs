@@ -6,7 +6,7 @@ import vm from "node:vm";
 import { moduleForTests } from "../../web/build.mjs";
 import { readWeb } from "../../web/page_sources.mjs";
 
-const js = readWeb("voice.js");
+const js = readWeb("src/app/main.js");
 const css = readWeb("voice.css");
 
 /** How a duration is worded, which moved into web/src/present/notices (`#624 voice-page-modularity`). */

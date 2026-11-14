@@ -33,6 +33,6 @@ pub fn page_source(owners: &[&str]) -> String {
             append(&path, &mut text);
         }
     }
-    append(&web.join("voice.js"), &mut text);
+    append(&web.join("src/app/main.js"), &mut text);
     text
 }

@@ -1,4 +1,174 @@
-"use strict";
+// The voice page's entry (`#624 voice-page-modularity`, final entry candidate): the former legacy
+// script as the composition-root module. Its first statement remains `takePairingCode()`
+// (through the const below): the pairing credential leaves the address before anything else.
+
+import {createApplication, createKeyboardComposition, createServerAccess, createPageGuards} from "../app/index.ts";
+import {createGathering,
+  createOpenedGaps,
+  createParsedQueries,
+  createRepliesWalk,
+  createSearchField,
+  createServerSearch,
+  searchQueryMatches,
+  searchQueryTree,
+  searchSubject,} from "../core/search/index.ts";
+import {speechHoldFrom} from "../core/speech/index.ts";
+import {createServerFacts, isSlowFailure, readableFailure} from "../core/api/index.ts";
+import {channelPostsOnce, allReachesThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createProviderFacts, createThreadPresence, createUnpackReads, exactReplyCount, heldNow, newerPage, refreshFailed, threadOf, timeOf, upsertThreadSummary} from "../core/channels/index.ts";
+import {createReadLedger} from "../core/annotations/index.ts";
+import {REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createViewPlaces, createVisits, deepLinkQuery, visitKey} from "../core/navigation/index.ts";
+import {DISCORD_POLL_MS,
+  TIMELINE_DELTA_PAGES,
+  TIMELINE_RECONCILE_MS,
+  VISIBLE_REFRESH_MS,
+  createArrivalCount,
+  createAwayClock,
+  createChannelFollow,
+  createChannelInFlight,
+  createChannelPoll,
+  createChannelReads,
+  createHiddenStream,
+  createLiveEvents,
+  createMutationRefresh,
+  createReadHolds,
+  createReadOrder,
+  createReopenRead,
+  createReplayLedger,
+  createScreenIdentity,
+  createStandInRetries,
+  createStreamGeneration,
+  createWatchAll,
+  isCursorRefusal,} from "../core/sync/index.ts";
+import {DISMISSED_SENDS_DAYS,
+  QUICK_DRAFTS_KEY,
+  createChannelDrafts,
+  createDraftLedger,
+  createDraftRound,
+  createInboxWriteLedger,
+  createOutboxComposition,
+  createOwnPosts,
+  createPendingThreads,
+  createReplyDrafts,
+  createUnconfirmedSends,
+  retryingWrite,
+  sendSnippet,
+  sentReceiptRetires as receiptRetires,
+  underDraft,
+  unsentText,} from "../core/outbox/index.ts";
+import {DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync} from "../core/settings/index.ts";
+import {childByClass,
+  createOncePerFrame,
+  focusLost,
+  focusMinimally,
+  setFocusReveal,
+  isTextField,
+  keepsOwnKeys,
+  nodeWithin,
+  pressedBySpace,
+  scrollsItself,
+  setHiddenIfChanged,
+  setTextIfChanged,
+  shownNode,} from "../view/dom/index.ts";
+import {SCREEN_TITLES, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
+import {KEYBOARD_SEND_PARTS,
+  NEWLINE_KEYS,
+  createComposerBoxes,
+  createComposerKeys,
+  createDictation,
+  createKeyboardDebug,
+  createOnScreenKeyboard,
+  focusAtEnd,
+  isComposer,
+  mountComposerGrowListeners,
+  mountKeyboardListeners,
+  mountMessageBox,
+  mountQuickReplyListeners,
+  wireNewlineKey,} from "../view/composer/index.ts";
+import {briefAge, fullLocalAt, stamp} from "../present/time/index.ts";
+import {doneReadWords, failureWords, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords} from "../present/notices/index.ts";
+import {LINK_KINDS_KEY, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, editedDrawn, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, savedReadMode, undoLabel, undoName, upstreamUrlOf} from "../present/rows/index.ts";
+import {PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCardFlight, createCardPlaces, createColumnSplitter, createColumnReplies, createColumnWork, createColumnStateAccess, createColumns, createElementLookup, createFootRooms, createLayoutShown, createJumpAnchor, createLinkedMark, createPackSlides, screenMotionMs, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createChannelScope, createChannelLoading, createDayTap, createMessageDetails, createNoiseActs, createRichHeaders, createStartsRead, createFilterPlace, createFreshRead, createHeldDone, createReadState, createPendingSends, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshComposerState, freshEntryState, freshDoneState, freshLoadState, freshOlderPages, freshPinsView, freshScrollPlace, freshScrollTools, freshSelection, freshTimelineRows, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountTextSelection, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, createChannelHead,
+  createSearchOpenControl,
+  createServiceWords,
+  createOpenInView,
+  createFreshness,} from "../view/channel/index.ts";
+import {createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, createWatchFrame, mountCallComposer, mountCallControls, mountPageButtons, mountReadControls, createReadingModeActs} from "../view/voice/index.ts";
+import {CANNED_PROMPTS,
+  mountAgentPrefix,
+  mountAgentSettings,
+  mountAudioDevices,
+  mountBarPlacement,
+  mountCannedPrompts,
+  mountChannelBoxListeners,
+  createClientConfig,
+  createSettingsSyncGlue,
+  createStoredScreen,
+  createSignIn,
+  mountChannelDirectory,
+  mountChannelHistory,
+  mountChannelSettings,
+  mountConnectionReadouts,
+  mountDismissedSends,
+  mountHelpFolds,
+  mountHelpLinks,
+  mountHelpScreen,
+  mountIdentityList,
+  mountMessagePreferences,
+  mountMicrophoneSettings,
+  mountNoiseRules,
+  mountOwnReadApply,
+  mountPairing,
+  mountPreferenceSwitches,
+  mountReadingWidth,
+  mountResumePreference,
+  mountSaveTokenButton,
+  mountScreenControls,
+  mountServerCache,
+  mountSettingsFolds,
+  mountSettingsReadouts,
+  mountSettingsSwitches,
+  mountSettingsSyncView,
+  mountSignInControls,
+  mountTextSize,
+  mountUpstreamClear,
+  restoreStoredSettings,} from "../view/settings/index.ts";
+import {audioConstraints, blankResumeLast, createAudioRoute, createCallDevices, createCallResume, createVoiceProvider} from "../core/call/index.ts";
+import {createAbandonedReads, createTimelineReader} from "../core/sync/index.ts";
+import {DISCORD_PAGE_LIMIT, OLDER_TRIGGER_PX} from "../core/channels/index.ts";
+import {isThreadRoot, readLook, unpackHeldMessages, unpackMessages, unpackReadSignature} from "../core/channels/index.ts";
+import {staleWords} from "../present/rows/index.ts";
+import {tokenFingerprint} from "../core/channels/index.ts";
+import {createDocumentsView, createViewSelector, DOC_STATES_KEY} from "../view/documents/index.ts";
+import {createDiscussView} from "../view/catchup/index.ts";
+import {createTimelineView} from "../view/channel/index.ts";
+import {COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_MORE, createFolding} from "../view/channel/index.ts";
+import {createChannelRows} from "../view/channel/index.ts";
+import {createSearchRows} from "../view/channel/index.ts";
+import {SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TAP_MS, createCardGaps, createChannelRefresh, createLiveStream, createMessageBodies, createOutboxRows, createPackControls, createRowDress, createUnpackBlock, mountOlderWalks} from "../view/channel/index.ts";
+import {createRowLinks} from "../view/channel/index.ts";
+import {headingLength, headingOf} from "../present/rows/index.ts";
+import {createCardLines, createReadingBookmark, createSpeakers} from "../view/channel/index.ts";
+import {createCardRefresh} from "../view/channel/index.ts";
+import {createPinnedMessages, createServerSearchCopy} from "../view/channel/index.ts";
+import {createChannelSend} from "../view/composer/index.ts";
+import {createDraftQueries, createOutboxLoads} from "../core/outbox/index.ts";
+import {createOutboxDispatch} from "../core/outbox/index.ts";
+import {createSendTakeBack} from "../view/channel/index.ts";
+import {createThreadList as createThreadListView} from "../view/channel/index.ts";
+import {createWebPorts} from "../platform/web/index.ts";
+import {createOfflineCache, createThreadStrip} from "../view/channel/index.ts";
+import {createScrollTrace, createScrollTraceControls} from "../view/channel/index.ts";
+import {createReadActs} from "../view/channel/index.ts";
+import {createLitCards} from "../view/channel/index.ts";
+import {createThreadCardHead} from "../view/channel/index.ts";
+import {createMainCards} from "../view/channel/index.ts";
+import {createCardPlaceActs} from "../view/channel/index.ts";
+import {createSideThreadActs} from "../view/channel/index.ts";
+import {createCardRuns} from "../view/channel/index.ts";
+import {createReadModeAct} from "../view/channel/index.ts";
+import { decode, decodeTagged, is, roots } from "../contract/index.ts";
+const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
+
 // vibe-talk voice page.
 //
 // The call flow, in order:
@@ -37,7 +207,7 @@
 // The offer and its redemption are web/src/view/settings `mountPairing` (`#624 voice-page-modularity`),
 // made here, with the code, so it holds it from the page's first statement.
 const openedWithPairingCode = takePairingCode();
-/** @type {import("./src/view/settings/index.ts").Pairing} */
+/** @type {import("../view/settings/index.ts").Pairing} */
 const devicePairing = mountPairing({
   code: openedWithPairingCode,
   lookup: (id) => el(id),
@@ -164,7 +334,7 @@ const columns = createColumns({
  * right one, for `el`, which asks on every call: one owner in web/src/view/channel/columnwork.ts (`#624
  * voice-page-modularity`). The page destructures `useColumn` and `inColumn` under their old names.
  *
- * @type {import("./src/view/channel/index.ts").ColumnWorkPort<ColumnFields>}
+ * @type {import("../view/channel/index.ts").ColumnWorkPort<ColumnFields>}
  */
 const columnWork = createColumnWork(columns);
 const { useColumn, inColumn } = columnWork;
@@ -404,7 +574,7 @@ const { guardQuietly, refreshQuietly } = pageGuards;
 // Call state and controls are owned by view/voice. Construction performs no I/O.
 voiceCall();
 
-/** @type {import("./src/view/voice/index.ts").VoiceCall | undefined} */
+/** @type {import("../view/voice/index.ts").VoiceCall | undefined} */
 var pageVoiceCall;
 /** The call owner; dependency properties stay live across asynchronous callbacks. */
 function voiceCall() {
@@ -432,7 +602,7 @@ function voiceCall() {
     get currentView() { return screens.view(); },
     get docsReaderOpen() { return screens.view() === "docs" && documentsView.reading(); },
     get discussOpen() { return discussView.isOpen(); },
-    get CANNED_PROMPTS() { return /** @type {import("./src/view/settings/index.ts").CannedPrompt[]} */ (CANNED_PROMPTS); },
+    get CANNED_PROMPTS() { return /** @type {import("../view/settings/index.ts").CannedPrompt[]} */ (CANNED_PROMPTS); },
     get token() { return token; },
     get apiDecoded() { return apiDecoded; },
     get readingMode() { return readAloudOwner().readingMode; },
@@ -441,7 +611,7 @@ function voiceCall() {
     get navigator() { return typeof navigator === "undefined" ? undefined : navigator; },
     get showError() { return showError; },
     get callAudioRoute() { return audioRoute.current(); },
-    set callAudioRoute(value) { audioRoute.set(/** @type {import("./src/core/call/index.ts").CallAudioRoute | null} */ (value)); },
+    set callAudioRoute(value) { audioRoute.set(/** @type {import("../core/call/index.ts").CallAudioRoute | null} */ (value)); },
     get redact() { return redact; },
     get api() { return api; },
     get clearError() { return clearError; },
@@ -516,7 +686,7 @@ function voiceCall() {
     get stopPostWatch() { return voiceTranscript().stopPostWatch; },
     get withdrawArmedRecap() { return voiceTranscript().withdrawArmedRecap; },
     get resumeLast() { return callResume.last(); },
-    set resumeLast(value) { callResume.setLast(/** @type {import("./src/core/call/index.ts").ResumeLast} */ (value)); },
+    set resumeLast(value) { callResume.setLast(/** @type {import("../core/call/index.ts").ResumeLast} */ (value)); },
     get renderResumeState() { return renderResumeState; },
     get renderReadModeControl() { return renderReadModeControl; },
     get renderReadTransport() { return readAloudOwner().renderReadTransport; },
@@ -539,7 +709,7 @@ function voiceCall() {
   return pageVoiceCall;
 }
 
-/** @type {import("./src/view/voice/index.ts").VoiceTranscript | undefined} */
+/** @type {import("../view/voice/index.ts").VoiceTranscript | undefined} */
 var pageVoiceTranscript;
 /** The call owner; dependency properties stay live across asynchronous callbacks. */
 function voiceTranscript() {
@@ -622,7 +792,7 @@ function voiceTranscript() {
   return pageVoiceTranscript;
 }
 
-/** @type {import("./src/view/voice/index.ts").ReadAloud | undefined} */
+/** @type {import("../view/voice/index.ts").ReadAloud | undefined} */
 var pageReadAloud;
 /** The call owner; dependency properties stay live across asynchronous callbacks. */
 function readAloudOwner() {
@@ -693,7 +863,7 @@ function readAloudOwner() {
 /** This page load's own name for the entries it makes: an entry with another is from before a reload. */
 const BACK_SESSION = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
 
-/** @type {import("./src/view/shell/index.ts").PageNavigation} */
+/** @type {import("../view/shell/index.ts").PageNavigation} */
 const shellNavigation = createPageNavigation({
   createBackStack, createVisits, createDeepLinks, createLinkJumps, visitKey, deepLinkQuery,
   clock: clockOnUse(),
@@ -913,7 +1083,7 @@ const linkedMark = createLinkedMark({
 // by the scroll keeping's capture once mu-stable's shared mark lands, placed again by the lists'
 // keepers, and the trace told through mu-scroll's `noteJumpLost` (`#1208`) where a landing is
 // pushed off screen inside its window with no hand in it.
-/** @type {import("./src/view/channel/index.ts").JumpAnchor} */
+/** @type {import("../view/channel/index.ts").JumpAnchor} */
 const jumpAnchor = createJumpAnchor({
   el: (id) => el(id),
   contextKey: () => channelContextKey(),
@@ -933,7 +1103,7 @@ const jumpAnchor = createJumpAnchor({
  * synced. One owner in web/src/core/settings/inapplinks.ts (`#624 voice-page-modularity`), with what was
  * stored and turning it on or off; Settings draws it.
  *
- * @type {import("./src/core/settings/index.ts").InAppLinks}
+ * @type {import("../core/settings/index.ts").InAppLinks}
  */
 const inAppLinks = createInAppLinks({
   deviceSettings: () => deviceSettings(),
@@ -1179,7 +1349,7 @@ documentsSelector.mount();
  * done there does is handed in as it was taken here, every one of them read as it is called, so a
  * screen shown during start-up finds them as they then stand.
  *
- * @type {import("./src/view/shell/index.ts").ScreenShowing}
+ * @type {import("../view/shell/index.ts").ScreenShowing}
  */
 const screenShowing = createScreenShowing({
   screens,
@@ -1225,7 +1395,7 @@ const { showScreen, closeSettings } = screenShowing;
  * The folds on Settings: whether one is open, open or fold one, whether one is on the page, and the
  * button over them all redrawn, as a group shown or hidden must (`settingsReadouts.agentLink`, `serverCacheBox`).
  *
- * @type {import("./src/view/settings/index.ts").SettingsFolds}
+ * @type {import("../view/settings/index.ts").SettingsFolds}
  */
 const settingsFolds = mountSettingsFolds({
   intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
@@ -1245,7 +1415,7 @@ const settingsFolds = mountSettingsFolds({
 /**
  * Help's folds: its entries, the button over them redrawn, and the screen opened at one entry.
  *
- * @type {import("./src/view/settings/index.ts").HelpFolds}
+ * @type {import("../view/settings/index.ts").HelpFolds}
  */
 const helpFolds = mountHelpFolds({
   intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
@@ -1256,7 +1426,7 @@ const helpFolds = mountHelpFolds({
 /**
  * Help's way in: the screen shown, opened at one entry (`mountHelpScreen`, web/src/view/settings).
  *
- * @type {import("./src/view/settings/index.ts").HelpScreen}
+ * @type {import("../view/settings/index.ts").HelpScreen}
  */
 const helpScreen = mountHelpScreen({
   showScreen: (name) => showScreen(name),
@@ -1296,7 +1466,7 @@ const { showHelp } = helpScreen;
  * for a reader who was not. Kept by web/src/core/navigation `createViewPlaces`, with whether the last entry
  * was a return (`restored`), which the read that follows needs.
  *
- * @type {import("./src/core/navigation/index.ts").ViewPlaces<string>}
+ * @type {import("../core/navigation/index.ts").ViewPlaces<string>}
  */
 const viewScroll = createViewPlaces();
 // `#1251 scroll-single-owner`: the owner's mark for the channel place a view switch took,
@@ -1336,7 +1506,7 @@ const { NO_CHANNEL_TO_READ, UNDESCRIBED_SERVICE, channelName, chatServiceName, l
  * Whether the selected channel holds any thread at all, from its last history page (or yes while a thread is
  * open): one owner in web/src/core/channels/threadpresence.ts (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/channels/index.ts").ThreadPresence}
+ * @type {import("../core/channels/index.ts").ThreadPresence}
  */
 const threadPresence = createThreadPresence();
 
@@ -1346,7 +1516,7 @@ const channelContexts = new Map();
  * What the reader has typed in each message box, by box key, and the device's copy (web/src/core/outbox
  * `createChannelDrafts`, `#624 voice-page-modularity`).
  *
- * @type {import("./src/core/outbox/index.ts").ChannelDrafts}
+ * @type {import("../core/outbox/index.ts").ChannelDrafts}
  */
 const channelDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache() });
 
@@ -1354,7 +1524,7 @@ const channelDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeR
  * `#819 voice-page-quoted-reply-and-draft-chip`. What was written in quick replies and not sent, by channel,
  * message and quoted words, kept on the device as it is written: the same kind of store, under its own key.
  *
- * @type {import("./src/core/outbox/index.ts").ChannelDrafts}
+ * @type {import("../core/outbox/index.ts").ChannelDrafts}
  */
 const quickDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache(), key: QUICK_DRAFTS_KEY });
 
@@ -1363,7 +1533,7 @@ const quickDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoo
  * was last written, kept on the device, for the Draft chip to find them newest first (web/src/core/outbox
  * `createDraftLedger`). The owner lost a dictated reply.
  *
- * @type {import("./src/core/outbox/index.ts").DraftLedger}
+ * @type {import("../core/outbox/index.ts").DraftLedger}
  */
 const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache(), now: () => Date.now() });
 
@@ -1388,7 +1558,7 @@ const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom:
  * the step 17 composition root's outbox half, `#624 voice-page-modularity`). Made here, in the
  * page's order, beside the send service it feeds.
  *
- * @type {import("./src/core/outbox/index.ts").OutboxComposition}
+ * @type {import("../core/outbox/index.ts").OutboxComposition}
  */
 const outboxComposition = createOutboxComposition({
   intoView: (element, block, inline) => scrollKeeping.intoView(/** @type {any} */ (element), block, inline),
@@ -1422,7 +1592,7 @@ const { outbox, outgoingObservations, outgoingFromSaved, dismissedSends, dismiss
  * view back, and the reader's places held across a change of layout for the way back: one owner in
  * web/src/view/channel/layoutshown.ts (`#624 voice-page-modularity`), which says what each place is for.
  *
- * @type {import("./src/view/channel/index.ts").LayoutShown<
+ * @type {import("../view/channel/index.ts").LayoutShown<
  *   {view: string, thread: string | null, summary: any, origin: string | null},
  *   {place: ReturnType<typeof readerPlace>, view: string, channel: string},
  *   {place: {newest: boolean, id: string | null, offset: number}, placed: {newest: boolean, id: string | null, offset: number} | null, channel: string},
@@ -1433,7 +1603,7 @@ const layoutShown = createLayoutShown();
 /**
  * Where the bar is... (layout choice) — see web/src/core/navigation/layout.ts.
  *
- * @type {import("./src/core/navigation/index.ts").LayoutChoice}
+ * @type {import("../core/navigation/index.ts").LayoutChoice}
  */
 const layoutChoice = createLayoutChoice({
   device: deviceStorageOnUse(),
@@ -1542,7 +1712,7 @@ const { sideColumnUp, threadListOnScreen, sideThreads, sideShowing, COLUMNS_TOO_
  * now (`createColumnSplitter`, `#1186 two-column-splitter`). Kept on the device with the other
  * client settings; applied here, before anything is drawn, as the stored settings are.
  *
- * @type {import("./src/view/channel/index.ts").ColumnSplitter}
+ * @type {import("../view/channel/index.ts").ColumnSplitter}
  */
 const columnSplitter = createColumnSplitter({
   lookup: (id) => leftEl(id),
@@ -1942,7 +2112,7 @@ const doneAct = createDoneAct({
 });
 const { doneState, noteArchived, dismissalName, drawUndoLabel, renderTodoControls, backlogIsArmed, disarmBacklog, armBacklog, toggleArchived, markRowDone, forgetDoneFlash, drawDoneFlash, drawDoneFlashes, unflashIds, unflashDone, flashDone, refreshAfterInboxChange, renderDoneChange, putBackRowsOff, queueInboxWrite, inboxWriteOwner, inboxPost, sendLeftOverInboxWrites, noteInboxWrite, settleInboxWrite, noteDoneSaving, doneSaved, dismissMessages, dealtWithWords, markReadUpstream, restoreMessages, mirrorArchived, doneSaving } = doneAct;
 
-/** @typedef {import("./src/core/channels/index.ts").ReplyTally} ReplyTally */
+/** @typedef {import("../core/channels/index.ts").ReplyTally} ReplyTally */
 /** Reply counts and the way down to them: web/src/view/channel's now (`createReplyCounts`, `#624`). */
 const replyCounts = createReplyCounts({
   answeredElsewhere: (target) => answeredElsewhere(target), cardSplit: (choice) => cardSplit(/** @type {any} */ (choice)),
@@ -2011,7 +2181,7 @@ const { answeredRow, doneWhereNotDrawn, answeredDone, doneHeldHere, markAnswered
  * Entering a thread, on its first unread message (`createThreadEntry`, `#624
  * voice-page-modularity`): the landing owed on entry and kept across its read.
  *
- * @type {import("./src/view/channel/index.ts").ThreadEntry}
+ * @type {import("../view/channel/index.ts").ThreadEntry}
  */
 const threadEntry = createThreadEntry({
   el: (id) => el(id),
@@ -2743,7 +2913,7 @@ const FIELD_SIZING = Boolean(window.CSS && typeof window.CSS.supports === "funct
  * One owner in web/src/core/settings/keychoices.ts (`#624 voice-page-modularity`), with what was stored
  * and turning it on or off, which keeps the choice and then says it (`renderEnterSends`).
  *
- * @type {import("./src/core/settings/index.ts").EnterSends}
+ * @type {import("../core/settings/index.ts").EnterSends}
  */
 const enterSends = createEnterSends({
   deviceSettings: () => deviceSettings(),
@@ -2758,7 +2928,7 @@ const enterSends = createEnterSends({
  * `createComposerKeys`, `#624 voice-page-modularity`): on the clock, and on "Enter to send"
  * (`enterSends`), read as each key arrives.
  *
- * @type {import("./src/view/composer/index.ts").ComposerKeys}
+ * @type {import("../view/composer/index.ts").ComposerKeys}
  */
 const composerKeys = createComposerKeys({ now: () => Date.now(), enterSends: () => enterSends.current() });
 
@@ -2767,7 +2937,7 @@ const composerKeys = createComposerKeys({ now: () => Date.now(), enterSends: () 
  * whether they grow, which list each is in, what Enter does said aloud, and what each last took
  * as a paste. See web/src/view/composer/boxes.ts.
  *
- * @type {import("./src/view/composer/index.ts").ComposerBoxes}
+ * @type {import("../view/composer/index.ts").ComposerBoxes}
  */
 const composerBoxes = createComposerBoxes({
   el: (id) => el(id),
@@ -2950,8 +3120,8 @@ const { composerGrowth, storedComposerGrow, applyComposerGrow, renderComposerGro
 
 // What a selection kept per list is (`KeySelection`), and a list the keys move through (`KeyPane`), are
 // web/src/view/shell's (`#624 voice-page-modularity`).
-/** @typedef {import("./src/view/shell/index.ts").KeySelection} KeySelection */
-/** @typedef {import("./src/view/shell/index.ts").KeyPane} KeyPane */
+/** @typedef {import("../view/shell/index.ts").KeySelection} KeySelection */
+/** @typedef {import("../view/shell/index.ts").KeyPane} KeyPane */
 
 /**
  * The keyboard composition: every list the keys move through and every owner the keys dispatch
@@ -2961,7 +3131,7 @@ const { composerGrowth, storedComposerGrow, applyComposerGrow, renderComposerGro
  * so a key pressed after start-up finds them as they then stand. Owners whose acts call later
  * owners keep their thunk shape inside the composition exactly as they had it here.
  *
- * @type {import("./src/app/index.ts").KeyboardComposition}
+ * @type {import("../app/index.ts").KeyboardComposition}
  */
 const keyboard = createKeyboardComposition({
   screens,
@@ -3022,8 +3192,8 @@ const keyboard = createKeyboardComposition({
   statusSays: (text) => statusSays(text),
   dismissStatus: () => dismissStatus(),
   showingLinks: (row) => showingLinks(row),
-  isFolded: (entry) => isFolded(/** @type {import("./src/view/channel/index.ts").FoldEntry} */ (/** @type {unknown} */ (entry))),
-  setFolded: (entry, folded) => setFolded(/** @type {import("./src/view/channel/index.ts").FoldEntry} */ (/** @type {unknown} */ (entry)), folded),
+  isFolded: (entry) => isFolded(/** @type {import("../view/channel/index.ts").FoldEntry} */ (/** @type {unknown} */ (entry))),
+  setFolded: (entry, folded) => setFolded(/** @type {import("../view/channel/index.ts").FoldEntry} */ (/** @type {unknown} */ (entry)), folded),
   atBottom: (area) => atBottom(area),
   preservingScroll: (act) => preservingScroll(act),
   preservingCollapse: (area, row, head, foot, act) => preservingCollapse(area, row, head, foot, act),
@@ -3168,7 +3338,7 @@ const cannedPrompts = mountCannedPrompts({
  * voice-page-modularity`), which says why it is one button for all of them and why it is not kept.
  * An open tray is a level, with an entry of its own (`#304 back-gesture-in-app`).
  *
- * @type {import("./src/view/shell/index.ts").PromptsTray}
+ * @type {import("../view/shell/index.ts").PromptsTray}
  */
 const promptsTray = createPromptsTray({ byId: (id) => /** @type {any} */ (el(id)), changed: () => scheduleBackSync() });
 const setPromptsOpen = promptsTray.setOpen;
@@ -3216,7 +3386,7 @@ const autoplay = createAutoplay({
 /**
  * What {@link api} throws. `#624 voice-page-modularity`: web/src/core/api says what each field means.
  *
- * @typedef {import("./src/core/api/index.ts").ApiRequestError} ApiRequestError
+ * @typedef {import("../core/api/index.ts").ApiRequestError} ApiRequestError
  */
 
 /**
@@ -3225,7 +3395,7 @@ const autoplay = createAutoplay({
  * `remote-ops-audit` W7: see `apiDecoded` and `abandonedReadStands`; `#308 live-reply-in-main`: see
  * `sentNumberOf`.
  *
- * @type {import("./src/core/sync/index.ts").ReadOrder}
+ * @type {import("../core/sync/index.ts").ReadOrder}
  */
 const readOrder = createReadOrder();
 
@@ -3298,14 +3468,14 @@ const microphoneSettings = mountMicrophoneSettings({
  * owner in web/src/core/call/audioroute.ts (`#624 voice-page-modularity`). Which device a label names
  * is {@link classifyAudioDevice}'s.
  *
- * @type {import("./src/core/call/index.ts").AudioRoute}
+ * @type {import("../core/call/index.ts").AudioRoute}
  */
 /**
  * The call's audio devices: what a label says a device is, which capture device a call opens,
  * whether its output can be chosen, opening its microphone and aiming its playback (web/src/core/call
  * `createCallDevices`, beside the route it writes).
  *
- * @type {import("./src/core/call/index.ts").CallDevices}
+ * @type {import("../core/call/index.ts").CallDevices}
  */
 const callDevices = createCallDevices({
   route: {
@@ -3360,7 +3530,7 @@ const audioDevices = mountAudioDevices({
  * web/src/view/settings `mountBarPlacement`, in the words of web/src/present/settings (`#624
  * voice-page-modularity`).
  *
- * @type {import("./src/view/settings/index.ts").BarPlacement}
+ * @type {import("../view/settings/index.ts").BarPlacement}
  */
 const barPlacement = mountBarPlacement({
   lookup: (id) => el(id),
@@ -3411,7 +3581,7 @@ const { renderControlBar } = controlBar;
  * text-size-buttons`): web/src/view/settings `mountTextSize`, in the words of web/src/present/settings
  * (`#624 voice-page-modularity`). Kept on the device.
  *
- * @type {import("./src/view/settings/index.ts").TextSize}
+ * @type {import("../view/settings/index.ts").TextSize}
  */
 const textSize = mountTextSize({
   lookup: (id) => el(id),
@@ -3503,7 +3673,7 @@ const CARD_MAX_LINES_KEY = DEVICE_SETTINGS.cardMaxLines.key;
  * web/src/core/settings/messagelimits.ts (`#624 voice-page-modularity`). Its `apply` is K's only writer:
  * the slider says it, and a K that changed draws every card list again by it (`redraw`).
  *
- * @type {import("./src/core/settings/index.ts").CardMaxLines}
+ * @type {import("../core/settings/index.ts").CardMaxLines}
  */
 const cardMaxLines = createCardMaxLines({
   deviceSettings: () => deviceSettings(),
@@ -3526,7 +3696,7 @@ const QUOTE_READ_PERCENT_KEY = DEVICE_SETTINGS.quoteReadPercent.key;
  * web/src/core/settings/messagelimits.ts (`#624 voice-page-modularity`). Its `apply` is the share's only
  * writer; Settings' slider draws it, and keeps a changed share.
  *
- * @type {import("./src/core/settings/index.ts").QuoteReadPercent}
+ * @type {import("../core/settings/index.ts").QuoteReadPercent}
  */
 const quoteReadPercent = createQuoteReadPercent({
   deviceSettings: () => deviceSettings(),
@@ -3585,7 +3755,7 @@ const markReadLongWords = createMarkReadLongWords({
  * The card lines' page-side acts: what a read says of the server's page build, a summary landing
  * owed a re-read, and the collapsed-lines chord (web/src/view/channel `createCardRefresh`).
  *
- * @type {import("./src/view/channel/index.ts").CardRefresh}
+ * @type {import("../view/channel/index.ts").CardRefresh}
  */
 const cardRefresh = createCardRefresh({
   notePageBuild: (build) => serverFacts.notePageBuild(build),
@@ -3663,7 +3833,7 @@ const {
  * The screen values as stored, read where the page restores its settings (web/src/view/settings
  * `createStoredScreen`, beside the reading width's owner).
  *
- * @type {import("./src/view/settings/index.ts").StoredScreen}
+ * @type {import("../view/settings/index.ts").StoredScreen}
  */
 const storedScreen = createStoredScreen({
   msgScale: () => deviceSettings().get(DEVICE_SETTINGS.msgScale),
@@ -3676,7 +3846,7 @@ const { storedMsgScale, storedReadingWidth } = storedScreen;
  * its keys: web/src/view/settings `mountReadingWidth`, in the words of web/src/present/settings (`#624
  * voice-page-modularity`). Kept on the device; the stylesheet decides whether it means anything.
  *
- * @type {import("./src/view/settings/index.ts").ReadingWidth}
+ * @type {import("../view/settings/index.ts").ReadingWidth}
  */
 const readingWidthControl = mountReadingWidth({
   lookup: (id) => el(id),
@@ -3688,7 +3858,7 @@ const readingWidthControl = mountReadingWidth({
  * When the page was last hidden, and so how long the reader was away (`#203 incremental-refresh`): one owner
  * in web/src/core/sync/away.ts (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/sync/index.ts").AwayClock}
+ * @type {import("../core/sync/index.ts").AwayClock}
  */
 const awayClock = createAwayClock();
 
@@ -3696,7 +3866,7 @@ const awayClock = createAwayClock();
  * The page going hidden and coming back: what a hidden page owes on return, and the refresh a
  * long absence earns (web/src/view/shell `createPageVisibility`, beside the document listeners).
  *
- * @type {import("./src/view/shell/index.ts").PageVisibility}
+ * @type {import("../view/shell/index.ts").PageVisibility}
  */
 const pageVisibility = createPageVisibility({
   syncScreenWakeLock: () => voiceCall().syncScreenWakeLock(),
@@ -3995,6 +4165,40 @@ const reopenReadOwed = createReopenRead();
 // view picker and heading, opening and closing a thread, the walk back, the cards, and a row's
 // thread decoration. Changing the view and the selection stay the page's, injected; the
 // unanswered-thread group stays here until the reply-counts move.
+/**
+ * The thread list with its thread-pin transport filled in (`#1550
+ * thread-list-pins`): the composition point supplies the server API the view
+ * asks for, with the page's kept token, until the app composition root takes
+ * the wiring over. The store on the server stays the pins' only truth.
+ */
+function createThreadList(deps) {
+  const ports = createWebPorts();
+  const keptToken = () => {
+    try {
+      return ports.deviceStorage.getItem("vibe-talk.token") || "";
+    } catch (_error) {
+      return "";
+    }
+  };
+  return createThreadListView({
+    ...deps,
+    readThreadPins: deps.readThreadPins ?? (async (channel) => {
+      const response = await ports.http.fetch(
+        `/api/v1/channels/${encodeURIComponent(channel)}/thread-pins`,
+        { method: "GET", headers: { authorization: `Bearer ${keptToken()}` } },
+      );
+      if (!response.ok) throw new Error(`thread pins: ${response.status}`);
+      return JSON.parse(await response.text());
+    }),
+    setThreadPin: deps.setThreadPin ?? (async (channel, threadId, pinned) => {
+      const response = await ports.http.fetch(
+        `/api/v1/channels/${encodeURIComponent(channel)}/thread-pins/${encodeURIComponent(threadId)}`,
+        { method: pinned ? "PUT" : "DELETE", headers: { authorization: `Bearer ${keptToken()}` } },
+      );
+      if (!response.ok) throw new Error(`thread pin: ${response.status}`);
+    }),
+  });
+}
 const threadList = createThreadList({
   byId: el,
   leftById: leftEl,
@@ -4180,7 +4384,7 @@ const { atOrAfter, foldReadState, noteReplyGaps, readSpeaksFor, sentEpochOf, sen
  * Sending the timeline's reads, the paths and reason words they carry, and joining what
  * landed (web/src/core/sync `createTimelineReader`, `#624 voice-page-modularity`).
  *
- * @type {import("./src/core/sync/index.ts").TimelineReader}
+ * @type {import("../core/sync/index.ts").TimelineReader}
  */
 const timelineReader = createTimelineReader({
   decoded: (path, options) => apiDecoded("TimelineResponse", path, /** @type {{signal?: AbortSignal}} */ (options)),
@@ -4267,7 +4471,7 @@ const { markHeldDone, doneSettlesHere, settleHeldDone, heldDonePart, writeInBatc
  * been spent, and whether the next poll should be one, are web/src/core/sync's (`createStandInRetries`,
  * `#624 voice-page-modularity`).
  *
- * @type {import("./src/core/sync/index.ts").StandInRetries}
+ * @type {import("../core/sync/index.ts").StandInRetries}
  */
 const standInRetries = createStandInRetries();
 
@@ -4290,7 +4494,7 @@ const standInRetries = createStandInRetries();
  * from older state as the page that sent it did (`ownPostStands`). The owner is web/src/core/outbox
  * `createOwnPosts` (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/outbox/index.ts").OwnPosts}
+ * @type {import("../core/outbox/index.ts").OwnPosts}
  */
 const ownPosts = createOwnPosts({
   storage: deviceStorageOnUse(),
@@ -4783,7 +4987,7 @@ const { toggleMessageDetails } = messageDetails;
  * the behaviour, not merely the initial value. One owner in web/src/core/settings/switches.ts
  * (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/settings/index.ts").KeptSwitch}
+ * @type {import("../core/settings/index.ts").KeptSwitch}
  */
 const ownReadSwitch = createKeptSwitch({
   setting: DEVICE_SETTINGS.markOwnRead,
@@ -4820,7 +5024,7 @@ const { startsRead, noteStartsRead, stillToDo } = startsReadOwner;
  * Are empty messages left out? ON unless the reader has turned it off (`#386 hide-empty-messages`).
  * One owner in web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/settings/index.ts").KeptSwitch}
+ * @type {import("../core/settings/index.ts").KeptSwitch}
  */
 const hideEmptySwitch = createKeptSwitch({
   setting: DEVICE_SETTINGS.hideEmptyMessages,
@@ -4833,7 +5037,7 @@ const hideEmptySwitch = createKeptSwitch({
  * Is the combining on? ON unless the reader has turned it off. One owner in
  * web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/settings/index.ts").KeptSwitch}
+ * @type {import("../core/settings/index.ts").KeptSwitch}
  */
 const combineSwitch = createKeptSwitch({
   setting: DEVICE_SETTINGS.combineMessages,
@@ -4875,14 +5079,14 @@ const { tapRow, actOnRow, foldOnTap, swipeable } = rowGestures;
  * `#624 voice-page-modularity`): the server's rendering inserted as nodes, plain text as
  * paragraphs, the heading's restated mark, and what a body links to.
  *
- * @type {import("./src/view/channel/index.ts").MessageBodies}
+ * @type {import("../view/channel/index.ts").MessageBodies}
  */
 const messageBodies = createMessageBodies({ wireMessageLinks });
 const { insertSanitizedHtml, plainParagraphs, messageBody, styled, textBody, anchorsIn, messageText, messageLinks, renderBodyInto, restatedMarked, headingPieces, cardEllipsis, appendCardEllipsis, prependCardEllipsis, unlinkCardBody } = messageBodies;
 /**
  * One channel row's dress (web/src/view/channel `createRowDress`, `#624 voice-page-modularity`).
  *
- * @type {import("./src/view/channel/index.ts").RowDress}
+ * @type {import("../view/channel/index.ts").RowDress}
  */
 const rowDress = createRowDress({
   outboxEntries: () => outbox.values(),
@@ -5093,7 +5297,7 @@ const { olderPages, olderPager, plainReach, renderChannelSeam } = olderPagesOwne
 // and the chat services' search, are designed in `#521 server-side-search` and not built, so nothing
 // here says either searched.
 
-/** @typedef {import("./src/present/notices/index.ts").HistoryReach} HistoryReach */
+/** @typedef {import("../present/notices/index.ts").HistoryReach} HistoryReach */
 
 // The server's copy, searched, is web/src/view/channel's now (`createServerSearchCopy`,
 // `#624 voice-page-modularity`): which search is on screen and its request, gathering older
@@ -5668,7 +5872,7 @@ const agentPrefix = mountAgentPrefix({
  * the channel box read (web/src/view/settings `mountServerCache`, in the words of
  * web/src/present/settings, `#624 voice-page-modularity`).
  *
- * @type {import("./src/view/settings/index.ts").ServerCache}
+ * @type {import("../view/settings/index.ts").ServerCache}
  */
 const serverCacheBox = mountServerCache({
   lookup: (id) => el(id),
@@ -6636,7 +6840,7 @@ const CHANNEL_READ_TIMEOUT_MS = 20000;
  * puts off (`HELD_REASONS`: only the poll) with it (web/src/core/sync `createReadHolds`, `#624
  * voice-page-modularity`).
  *
- * @type {import("./src/core/sync/index.ts").ReadHolds}
+ * @type {import("../core/sync/index.ts").ReadHolds}
  */
 const readHolds = createReadHolds({ now: () => Date.now() });
 
@@ -6648,7 +6852,7 @@ const readHolds = createReadHolds({ now: () => Date.now() });
  * arrived is not folded (`landPlacingRead`, `#308 live-reply-in-main`). web/src/core/sync
  * `createLiveEvents` (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/sync/index.ts").LiveEvents}
+ * @type {import("../core/sync/index.ts").LiveEvents}
  */
 const liveEvents = createLiveEvents();
 
@@ -6657,7 +6861,7 @@ const liveEvents = createLiveEvents();
  * a late answer may still be used (web/src/core/sync `createAbandonedReads`, `#624
  * voice-page-modularity`). Landing one (`landAbandonedTimelineRead`) stays below.
  *
- * @type {import("./src/core/sync/index.ts").AbandonedReads}
+ * @type {import("../core/sync/index.ts").AbandonedReads}
  */
 const abandonedReads = createAbandonedReads({
   holds: readHolds,
@@ -6691,7 +6895,7 @@ const channelPoll = createChannelPoll({
  * (`channelContextKey`; `#220 view-switch-instant`), and the read queued behind it by the column it is for
  * (`#229`): one owner in web/src/core/sync/reads.ts (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/sync/index.ts").ChannelReads<ColumnFields>}
+ * @type {import("../core/sync/index.ts").ChannelReads<ColumnFields>}
  */
 const channelReads = createChannelReads();
 // Every requested replacement gets a generation, including one that arrives while another request
@@ -6704,7 +6908,7 @@ const channelReads = createChannelReads();
  * waiting on a read that may not have seen them (web/src/core/sync `createReplayLedger`, `#43
  * replay-burst-double-read`, `#203 incremental-refresh`, `#624 voice-page-modularity`).
  *
- * @type {import("./src/core/sync/index.ts").ReplayLedger}
+ * @type {import("../core/sync/index.ts").ReplayLedger}
  */
 const replayLedger = createReplayLedger();
 
@@ -6714,7 +6918,7 @@ const replayLedger = createReplayLedger();
  * drawn with no request, and All read behind Main for its counts. The page's hands — drawing,
  * settling, the other column — are passed in; the column is captured across each wait there.
  *
- * @type {import("./src/view/channel/index.ts").TimelineView}
+ * @type {import("../view/channel/index.ts").TimelineView}
  */
 const timelineView = createTimelineView({
   el, selection, timelineRows, olderPages, loadState, listState, entryState, doneState,
@@ -6763,7 +6967,7 @@ const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, q
  * `#624 voice-page-modularity`): the step-back control, the search's bounded walk, the server
  * search and the cards' replies walk rendering. The walk record stays on the column.
  *
- * @type {import("./src/view/channel/index.ts").OlderWalks}
+ * @type {import("../view/channel/index.ts").OlderWalks}
  */
 const olderWalks = mountOlderWalks({
   el, leftEl, selection, selectedChannelId, channelContextKey, viewKey, olderPages,
@@ -6788,7 +6992,7 @@ const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromFie
  * The gaps a search opens in the cards and in an unpacked thread's block (web/src/view/channel
  * `createCardGaps`, `#624 voice-page-modularity`).
  *
- * @type {import("./src/view/channel/index.ts").CardGaps}
+ * @type {import("../view/channel/index.ts").CardGaps}
  */
 const cardGaps = createCardGaps({
   leftEl, selectedChannelId, searchKey, rowShown, placeSeam, gapWords, cardGapWords,
@@ -6800,7 +7004,7 @@ const { openedCardGaps, unpackBlocks, drawUnpackGaps, openUnpackGap, drawCardGap
  * A thread unpacked under its card (web/src/view/channel `createUnpackBlock`,
  * `#624 voice-page-modularity`).
  *
- * @type {import("./src/view/channel/index.ts").UnpackBlock}
+ * @type {import("../view/channel/index.ts").UnpackBlock}
  */
 const unpackBlockOwner = createUnpackBlock({
   channelStore, selectedChannelId, selection, viewKey, discordNode, glom, dressChannelRow,
@@ -6820,7 +7024,7 @@ const { unpackBlock, unpackNeedsRead, queueUnpackRead, redrawUnpackBlock, unpack
  * The threads column's cards packed and unpacked (web/src/view/channel `createPackControls`,
  * `#624 voice-page-modularity`).
  *
- * @type {import("./src/view/channel/index.ts").PackControls}
+ * @type {import("../view/channel/index.ts").PackControls}
  */
 const packControls = createPackControls({
   leftEl, selectedChannelId, cardPacking, cardView, cardsCycle,
@@ -6923,7 +7127,7 @@ const RESUME_KEY = "vibe-talk.voice.resume";
  * the clause under the large control and the fetch of a new call's payload. One owner in
  * web/src/core/call/resume.ts (`#624 voice-page-modularity`), which says what each outcome means.
  *
- * @type {import("./src/core/call/index.ts").CallResume}
+ * @type {import("../core/call/index.ts").CallResume}
  */
 const callResume = createCallResume({
   key: RESUME_KEY,
@@ -7048,7 +7252,7 @@ const mutationRefresh = createMutationRefresh({
  * `#624 voice-page-modularity`): the read queue's release, the poll, the hidden page.
  * Reads asked for go through this script's own `loadDiscord` name above.
  *
- * @type {import("./src/view/channel/index.ts").ChannelRefresh}
+ * @type {import("../view/channel/index.ts").ChannelRefresh}
  */
 const channelRefresh = createChannelRefresh({
   channelReads: /** @type {any} */ (channelReads), channelPoll, hiddenStream: /** @type {any} */ (hiddenStream), columnWork, columns, inColumn,
@@ -7073,7 +7277,7 @@ const { queueDiscordLoad, finishDiscordLoad, currentDiscordLoad, stopDiscordPoll
  * The live stream's frames as the page takes them (web/src/view/channel `createLiveStream`,
  * `#624 voice-page-modularity`).
  *
- * @type {import("./src/view/channel/index.ts").LiveStream}
+ * @type {import("../view/channel/index.ts").LiveStream}
  */
 const liveStream = createLiveStream({
   channelStore, selectedChannelId, providerFacts,
@@ -7103,7 +7307,7 @@ const { onStreamFrame, receiveLiveMessage, heldMessage, placesHeld, settleReplay
  * Loading what a previous page left unsent (web/src/core/outbox `createOutboxLoads`,
  * `#624 voice-page-modularity`). Entries are stored as `saved.ts` decoded them; this layer filters no fields.
  *
- * @type {import("./src/core/outbox/index.ts").OutboxLoads}
+ * @type {import("../core/outbox/index.ts").OutboxLoads}
  */
 const outboxLoads = createOutboxLoads({
   store: outbox, clock: clockOnUse(), blocker: (entry) => outboxDispatch.blocker(entry),
@@ -7123,7 +7327,7 @@ const { persist: persistOutgoingMessages, load: loadOutgoingMessages, observe: o
  * Every unconfirmed send in the outbox, asked of the server once per load (`settleFromServer`): one owner
  * in web/src/core/outbox/unconfirmed.ts (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/outbox/index.ts").UnconfirmedSends}
+ * @type {import("../core/outbox/index.ts").UnconfirmedSends}
  */
 const unconfirmedSends = createUnconfirmedSends({
   ids: () => outbox.ids(),
@@ -7135,7 +7339,7 @@ const unconfirmedSends = createUnconfirmedSends({
  * of a lost answer, and every automatic retry. Placing a reply's target stays here
  * (`placeReplyTarget`), settled from the channel store and timeline reads.
  *
- * @type {import("./src/core/outbox/index.ts").OutboxDispatch}
+ * @type {import("../core/outbox/index.ts").OutboxDispatch}
  */
 const outboxDispatch = createOutboxDispatch({
   store: outbox, observations: outgoingObservations, now: () => Date.now(), clock: clockOnUse(),
@@ -7171,7 +7375,7 @@ if (typeof window.addEventListener === "function") {
  * Taking a send back (web/src/view/channel `createSendTakeBack`, `#624 voice-page-modularity`):
  * Edit, Dismiss and its Undo, putting a dismissed send back, and the dismissed pop-out's listeners.
  *
- * @type {import("./src/view/channel/index.ts").SendTakeBack}
+ * @type {import("../view/channel/index.ts").SendTakeBack}
  */
 const sendTakeBack = createSendTakeBack({
   el, outbox, drop: (id) => outboxDispatch.drop(id),
@@ -7196,7 +7400,7 @@ const { edit: editOutgoingMessage, dismiss: dismissOutgoingMessage, endUndo: end
 /**
  * The outbox's own rows (web/src/view/channel `createOutboxRows`, `#624 voice-page-modularity`).
  *
- * @type {import("./src/view/channel/index.ts").OutboxRows}
+ * @type {import("../view/channel/index.ts").OutboxRows}
  */
 const outboxRows = createOutboxRows({
   el, leftEl, selectedChannelId,
@@ -7230,7 +7434,7 @@ const { outgoingInView, renderOutgoingMessages, renderOutgoingEverywhere, withPe
  * Sending from the channel's message box (web/src/view/composer `createChannelSend`,
  * `#624 voice-page-modularity`).
  *
- * @type {import("./src/view/composer/index.ts").ChannelSend}
+ * @type {import("../view/composer/index.ts").ChannelSend}
  */
 const channelSend = createChannelSend({
   composerState, composerKeys: /** @type {any} */ (composerKeys), el: /** @type {any} */ (el), selectedChannelId, selectionThreadId: () => selection().threadId,
@@ -7246,7 +7450,7 @@ const { sendChannelMessage, cancelChannelMessage, answerChannelDiscard, remember
  * Which drafts are held, and whether one is live (web/src/core/outbox `createDraftQueries`,
  * `#624 voice-page-modularity`). Writing the ledger stays with each writer.
  *
- * @type {import("./src/core/outbox/index.ts").DraftQueries}
+ * @type {import("../core/outbox/index.ts").DraftQueries}
  */
 const draftQueries = createDraftQueries({
   ledger: draftLedger,
@@ -7330,7 +7534,7 @@ const { channelLabel, restateChannelSeam } = channelHeadOwner;
  * retries, as the channel stream's are (`liveFollow`): one owner in web/src/core/sync/watchall.ts
  * (`#624 voice-page-modularity`). The request and what each frame means are the page's.
  *
- * @type {import("./src/core/sync/index.ts").WatchAll}
+ * @type {import("../core/sync/index.ts").WatchAll}
  */
 const watchAll = createWatchAll({
   clock: clockOnUse(),
@@ -7396,7 +7600,7 @@ const channelSettings = mountChannelSettings({
  * the count of a slow read, and one tap to add. web/src/view/settings `mountChannelDirectory`, in the
  * words of web/src/present/settings (`#624 voice-page-modularity`); see "browsing channels".
  *
- * @type {import("./src/view/settings/index.ts").ChannelDirectory}
+ * @type {import("../view/settings/index.ts").ChannelDirectory}
  */
 const channelDirectoryBox = mountChannelDirectory({
   lookup: (id) => el(id),
@@ -7429,7 +7633,7 @@ const channelDirectoryBox = mountChannelDirectory({
  * Clear unread in the channel box, for the picker's channel or All channels: drawn, read again as
  * Settings opens, its Save, and "Mark read now".
  *
- * @type {import("./src/view/settings/index.ts").UpstreamClearBox}
+ * @type {import("../view/settings/index.ts").UpstreamClearBox}
  */
 const upstreamClearBox = mountUpstreamClear({
   lookup: (id) => el(id),
@@ -7455,7 +7659,7 @@ const upstreamClearBox = mountUpstreamClear({
  * The history part of the channel box: drawn for the picker's channel, read again while Settings
  * shows it, and its Save and "Read older messages next".
  *
- * @type {import("./src/view/settings/index.ts").ChannelHistoryBox}
+ * @type {import("../view/settings/index.ts").ChannelHistoryBox}
  */
 const channelHistoryBox = mountChannelHistory({
   lookup: (id) => el(id),
@@ -7483,7 +7687,7 @@ const channelHistoryBox = mountChannelHistory({
  * The conversational voice as the selected provider describes it in client-config: one owner in
  * web/src/core/call/provider.ts (`#624 voice-page-modularity`).
  *
- * @type {import("./src/core/call/index.ts").VoiceProvider}
+ * @type {import("../core/call/index.ts").VoiceProvider}
  */
 const voiceProvider = createVoiceProvider();
 
@@ -7588,7 +7792,7 @@ const { signIn, saveToken, forgetToken, setTokenState, noTokenSentence } = creat
  * The Save button's words, look and state, and the timer putting it back to SAVE_LABEL after a save: one
  * owner in web/src/view/settings/savetoken.ts (`#624 voice-page-modularity`).
  *
- * @type {import("./src/view/settings/index.ts").SaveTokenButton}
+ * @type {import("../view/settings/index.ts").SaveTokenButton}
  */
 const saveTokenButton = mountSaveTokenButton({
   lookup: (id) => el(id),
@@ -8801,7 +9005,7 @@ application.track(mountFilterChips({
  * Watching sizes, as the page offers it to the mounts that watch the lists: a ResizeObserver, where the browser
  * has one (web/src/view/dom `SizeWatching`).
  *
- * @type {import("./src/view/dom/index.ts").SizeWatching}
+ * @type {import("../view/dom/index.ts").SizeWatching}
  */
 const sizeWatching = {
   canWatchSizes: () => typeof window.ResizeObserver === "function",
