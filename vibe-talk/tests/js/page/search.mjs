@@ -2622,7 +2622,7 @@ async function searchServer(page, query) {
 const searchedScope = (fields = {}) => ({
   channel: CHANNEL, state: "searched", examined: 120, searched_back_to_ms: Date.parse("2026-08-01T12:00:00Z"),
   held_from_ms: Date.parse("2026-08-01T12:00:00Z"), top_level_only: true, whole: false, expanding: true,
-  capped: 0, partial: 0, withheld: 0, ...fields,
+  capped: 0, partial: 0, withheld: 0, stale: 0, ...fields,
 });
 
 const searchAnswer = (hits, scopes, extra = {}) =>
