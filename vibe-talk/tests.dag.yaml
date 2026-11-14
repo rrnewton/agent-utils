@@ -1192,6 +1192,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # The multi-level document scrubber (`#1508`): numbers on the document,
+  # navigator rows within their cap, and tap-a-unit reading, at both widths.
+  - group: check
+    job: documents-scrubber-browser
+    desc: section numbers on the document and the two/three-row navigator over a large synthetic document, against the real server (fake chat upstream) in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_scrubber_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # Discuss (`catchup-side-agent`, slice 1): the panel opens, reads, marks and jumps.
   - group: check
     job: discuss-browser
