@@ -1945,21 +1945,38 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         Some(bounded) => bounded,
         None => runtime,
     };
+    // A lock wait this drain gives up on — its lock bound passed, or
+    // its runtime was cancelled — has typed nothing, and every prompt
+    // it might have typed is durable in this queue: that is Pending,
+    // whichever of the drain's locks the wait was for. Passing a
+    // cancelled wait through as an untyped delivery error instead
+    // would make the same unsubmitted state report differently
+    // depending on which lock happened to be contended.
     let lock_limit = |error: AgentError| {
-        match lock_bound {
-        Some(limit) if lock_runtime.cancelled() && !runtime.cancelled() => {
-            AgentError::Pending(UndeliveredMessage {
+        if runtime.cancelled() {
+            return AgentError::Pending(UndeliveredMessage {
                 message: format!(
-                    "a lock of queue {} {LOCK_BOUND_HELD} {}s lock bound; nothing was typed: {error}",
-                    root.display(),
-                    limit.as_secs_f64()
+                    "cancelled while waiting for a lock of queue {}; nothing was typed: {error}",
+                    root.display()
                 ),
                 message_id: String::new(),
                 artifact: root.to_path_buf(),
-            })
+            });
         }
-        _ => error,
-    }
+        match lock_bound {
+            Some(limit) if lock_runtime.cancelled() => {
+                AgentError::Pending(UndeliveredMessage {
+                    message: format!(
+                        "a lock of queue {} {LOCK_BOUND_HELD} {}s lock bound; nothing was typed: {error}",
+                        root.display(),
+                        limit.as_secs_f64()
+                    ),
+                    message_id: String::new(),
+                    artifact: root.to_path_buf(),
+                })
+            }
+            _ => error,
+        }
     };
     let directory_identity =
         bind_queue_with_runtime(root, target, lock_runtime, allow_legacy_workspace_binding)
@@ -5109,6 +5126,22 @@ mod tests {
             }
         }
 
+        /// [`Self::new`] serving only `pane_id`, for [`target_for`].
+        fn with_pane(states: &[&str], pane_id: &str) -> Self {
+            Self::new(states).on_pane(pane_id)
+        }
+
+        /// This fake serving only `pane_id` instead of the common pane.
+        fn on_pane(mut self, pane_id: &str) -> Self {
+            self.panes[0].pane_id = pane_id.to_owned();
+            let mut state = self.state.lock().unwrap();
+            let mut info = state.infos.remove("w1:p1").expect("default pane info");
+            info.pane_id = pane_id.to_owned();
+            state.infos.insert(pane_id.to_owned(), info);
+            drop(state);
+            self
+        }
+
         fn with_screen(screen: crate::submission::fake::FakeScreen) -> Self {
             let mut fake = Self::new(&["idle"]);
             fake.screen = Some(screen);
@@ -5478,8 +5511,18 @@ mod tests {
     }
 
     fn target() -> Target {
+        target_for("w1:p1")
+    }
+
+    /// [`target`] for a pane only this test uses. Every test in the
+    /// process shares one target-lock root keyed by pane digest, so a
+    /// test on the common `w1:p1` pane queues behind every other
+    /// test's drain; a test whose runtime never really waits (a fake
+    /// clock, a frozen cancelled one) then spins instead of waiting.
+    /// A unique pane removes that contention by construction.
+    fn target_for(pane_id: &str) -> Target {
         Target {
-            pane_id: Some("w1:p1".to_owned()),
+            pane_id: Some(pane_id.to_owned()),
             session_agent: Some("codex".to_owned()),
             session_value: Some("session-1".to_owned()),
             expected_agent: Some("codex".to_owned()),
@@ -8114,6 +8157,38 @@ mod tests {
         .expect_err("cancelled delivery remains pending");
         assert_eq!(error.outcome(), Some(QueueOutcome::Pending));
         assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn cancellation_behind_a_held_queue_lock_is_pending_not_a_delivery_error() {
+        // A drain cancelled while it waits for the queue lock another
+        // drain holds: the cancellation surfaces in the lock wait
+        // instead of the readiness wait, and the outcome must still
+        // be Pending — the prompt is durable in the queue and
+        // nothing was typed — not an untyped delivery error that
+        // reads as unsafe to retry.
+        let directory = TestDirectory::new("cancel-behind-queue-lock");
+        let root = directory.path();
+        enqueue(root, "do not inject either", Some("held-back")).unwrap();
+        let holder = open_private_lock(&root.join(".delivery.lock"), "held test lock").unwrap();
+        holder.lock_exclusive().unwrap();
+        let fake = FakeAgent::with_pane(&["idle"], "w1:p-cancel-locked");
+        let error = drain_with_runtime(
+            &fake,
+            &target_for("w1:p-cancel-locked"),
+            root,
+            DrainOptions::default(),
+            &CancelRuntime::new(0),
+        )
+        .expect_err("cancelled delivery remains pending");
+        assert_eq!(error.outcome(), Some(QueueOutcome::Pending), "{error}");
+        assert!(error.safe_to_retry(), "{error}");
+        assert!(fake.runs().is_empty());
+        assert_eq!(
+            pending_prompts(root).expect("pending").len(),
+            1,
+            "the prompt stays durable in the queue"
+        );
     }
 
     #[test]
