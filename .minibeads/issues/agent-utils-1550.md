@@ -1,6 +1,6 @@
 ---
 title: 'thread-list-pins: pinnable threads in the vibe-talk thread picker'
-status: in_progress
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -37,3 +37,7 @@ Earlier designs followed: `#194 thread-picker-polish`, `#281 view-keys`, `#427 s
 # Notes
 
 Sibling lanes on the Documents/Discuss page land independently (#1540–#1545); this change stays inside the thread picker, its store and its API. Unpinning a bang-bound thread: it stays unpinned — the `pinned: false` record stands until the owner pins it again.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 3a338f8d on github/main (gated 2ee6d2cd on base 52bb068d, gate-ledger pass, 158 steps). Thread pins are separate from message pins (#206). Screenshots looked at: /tmp/shots-threadpin/threadpin-phone-1-popup-bang-pinned.png, threadpin-desk-1-popup-bang-pinned.png, threadpin-phone-2-popup-two-pinned.png (gold pin left of each row, @liteinst first). Browser test at 390x852 and 1280x800 plus the Rust API tests pass; the full validate DAG is green.
