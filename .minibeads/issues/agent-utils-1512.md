@@ -1,13 +1,14 @@
 ---
 title: 'page-browser-checks-settle-under-load: browser checks settle by condition not wall-clock so gates pass under load'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - test-robustness
 created_at: 2026-11-14T03:52:29.262035782+00:00
-updated_at: 2026-11-14T03:52:29.262035782+00:00
+updated_at: 2026-11-14T07:37:52.182862071+00:00
+closed_at: 2026-11-14T07:37:52.182861951+00:00
 ---
 
 # Description
