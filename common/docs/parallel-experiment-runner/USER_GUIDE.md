@@ -122,6 +122,8 @@ had to kill is never miscounted as a discovered hit:
 | `log-cap` | detached producer killed the worker at its output byte cap |
 | `cancelled` | never ran / eager-cancelled |
 | `resource-report-error` | configured detached-unit report was missing or malformed |
+| `unknown` | terminal Result unknown (exit 193, no exit code, signal death, or an `INCOMPLETE` detached report) — never a hit or a miss |
+| `unknown` | terminal Result unknown (exit 193, no exit code, signal death, or an `INCOMPLETE` detached report) — never a hit or a miss |
 
 A `pids-cap` breach is special: `pids.max` **contains** the fork (`EAGAIN`) rather than killing
 the worker, so the worker is reaped by the cpu/wall guard. The classifier still reports it as
@@ -248,7 +250,7 @@ wrapper: tasks_limit_hits=0
 The runner verifies every reported limit against its declared `WorkerLimits`, folds the detached
 breach counters into outcome classification, adds detached memory and CPU to the ordinary
 worker-cgroup measurements, and exposes task peak in JSON output. A missing, malformed, or
-mismatched report is an infrastructure breach and never a clean sample. On normal completion and
+mismatched report is an infrastructure breach and never a clean sample. A report may also carry `resource_report_state=INCOMPLETE` (required terminal Result unknown; the launcher then exits 193): its counters may be complete, but the outcome classifies as `unknown`, never as a hit or a miss. A report may also carry `resource_report_state=INCOMPLETE` (required terminal Result unknown; the launcher then exits 193): its counters may be complete, but the outcome classifies as `unknown`, never as a hit or a miss. On normal completion and
 contained signal teardown it attempts to kill, stop, and reset only syntax-valid unit names
 beginning with the declared prefix. This is an ownership boundary: never use a broad prefix shared
 with unrelated units.

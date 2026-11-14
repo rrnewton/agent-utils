@@ -66,10 +66,20 @@ STATUS_PIDS_CAP = "pids-cap"
 STATUS_DISK_CAP = "disk-cap"
 STATUS_LOG_CAP = "log-cap"
 STATUS_RESOURCE_REPORT_ERROR = "resource-report-error"
+STATUS_UNKNOWN = "unknown"
 STATUS_CANCELLED = "cancelled"
 
-#: Statuses that represent a breach of a declared per-worker limit (reported distinctly and
-#: never as a hit). ``command-error`` is a workload failure, not a limit breach.
+#: Exit code by which a wrapping launcher reports that it could not obtain the wrapped
+#: unit's terminal Result (the detached report then carries
+#: ``resource_report_state=INCOMPLETE``). The workload's outcome is unknown, so this code
+#: classifies as :data:`STATUS_UNKNOWN` even when a spec declares it, or the log matches
+#: the hit regex.
+UNKNOWN_RESULT_EXIT_CODE = 193
+
+#: Statuses that represent a breach of a declared per-worker limit, or an infrastructure
+#: outcome whose true result is unknown (reported distinctly, never as a hit, and never
+#: recorded as a clean calibration sample). ``command-error`` is a workload failure, not
+#: a limit breach.
 BREACH_STATUSES = frozenset(
     {
         STATUS_TIMEOUT,
@@ -79,6 +89,7 @@ BREACH_STATUSES = frozenset(
         STATUS_DISK_CAP,
         STATUS_LOG_CAP,
         STATUS_RESOURCE_REPORT_ERROR,
+        STATUS_UNKNOWN,
     }
 )
 

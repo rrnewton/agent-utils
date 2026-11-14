@@ -26,6 +26,7 @@ from parallel_experiment_runner.model import (
     STATUS_MEMORY_CAP,
     STATUS_PIDS_CAP,
     STATUS_TIMEOUT,
+    STATUS_UNKNOWN,
     ExperimentSpec,
     HitCondition,
     ResourceSlice,
@@ -139,6 +140,16 @@ def test_breach_precedence_pids_cap_beats_wall_timeout(tmp_path: Path) -> None:
         spec, _outcome(returncode=1, pids_events=3), row, tmp_path / "seed-3.log"
     )
     assert res.status == STATUS_PIDS_CAP
+
+
+def test_unknown_exit_193_with_matching_log_is_not_a_hit(tmp_path: Path) -> None:
+    spec = _spec(hit=HitCondition(regex="DIVERGENCE"))
+    log = tmp_path / "seed-3.log"
+    log.write_text("DIVERGENCE detected\n")
+    res = _classify_outcome(spec, _outcome(returncode=193), {}, log)
+    assert res.status == STATUS_UNKNOWN
+    assert res.is_hit is False
+    assert "UNKNOWN" in res.breach
 
 
 def test_clean_zero_is_hit_when_default(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ from parallel_experiment_runner.model import (
     STATUS_COMMAND_ERROR,
     STATUS_HIT,
     STATUS_MISS,
+    STATUS_UNKNOWN,
     CostEstimate,
     ExperimentSpec,
     HitCondition,
@@ -244,3 +245,21 @@ def test_classify_miss_clean_zero() -> None:
 def test_classify_command_error_nonzero_non_hit() -> None:
     hit = HitCondition(regex="panic")
     assert classify_workload(hit, 2, "some unrelated failure") == STATUS_COMMAND_ERROR
+
+
+def test_classify_unknown_result_exit_193_is_never_a_hit() -> None:
+    hit = HitCondition(regex="DIVERGENCE")
+    assert classify_workload(hit, 193, "DIVERGENCE detected") == STATUS_UNKNOWN
+    declared = HitCondition(hit_exit_codes=(193,))
+    assert classify_workload(declared, 193, "") == STATUS_UNKNOWN
+
+
+def test_classify_missing_returncode_is_unknown() -> None:
+    hit = HitCondition(regex="DIVERGENCE")
+    assert classify_workload(hit, None, "DIVERGENCE detected") == STATUS_UNKNOWN
+    assert classify_workload(hit, None, "all good") == STATUS_UNKNOWN
+
+
+def test_classify_signal_death_is_unknown() -> None:
+    hit = HitCondition(regex="DIVERGENCE")
+    assert classify_workload(hit, -9, "DIVERGENCE detected") == STATUS_UNKNOWN

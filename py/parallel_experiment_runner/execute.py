@@ -28,6 +28,7 @@ from parallel_experiment_runner.calibrate import (
     resolve_width,
 )
 from parallel_experiment_runner.detached import (
+    REPORT_STATE_INCOMPLETE,
     cleanup_registered_reports,
     cleanup_reports,
     read_report,
@@ -44,6 +45,7 @@ from parallel_experiment_runner.model import (
     STATUS_PIDS_CAP,
     STATUS_RESOURCE_REPORT_ERROR,
     STATUS_TIMEOUT,
+    STATUS_UNKNOWN,
     BREACH_STATUSES,
     CostEstimate,
     ExperimentSpec,
@@ -230,6 +232,8 @@ def _breach_message(
         return "LOG-CAP: detached producer killed the worker at its output byte cap"
     if status == STATUS_TIMEOUT:
         return f"TIMEOUT: wall {wall_s:.0f}s >= {limits_wall}s backstop"
+    if status == STATUS_UNKNOWN:
+        return "UNKNOWN: required terminal Result unknown (no terminal workload result)"
     if status == STATUS_CANCELLED:
         return "CANCELLED: eager-exit after another worker failed"
     return ""
@@ -247,6 +251,9 @@ def _classify_outcome(
     any hit/miss decision, so an infrastructure kill is never counted as a discovered hit. The
     PID-cap axis sits below the two kill-based axes (a fork-bombing worker may also OOM or exhaust
     CPU) and above the plain wall timeout, since a denied fork is a more specific cause than a hang.
+    A detached report whose terminal Result is unknown (``INCOMPLETE``) classifies as UNKNOWN
+    ahead of the hit/miss decision, as does any worker reaching the classifier without a
+    terminal Result.
     """
     seed = int(outcome.tag.split(".", 1)[1])
     limits = spec.worker_limits
@@ -256,6 +263,7 @@ def _classify_outcome(
     peak_bytes = int(peak) if isinstance(peak, (int, float)) else None
     tasks_peak: int | None = None
     report_error = ""
+    report_incomplete = False
     report_path_text = spec.resource_report_path(seed)
     if report_path_text is not None:
         assert spec.detached_unit_prefix is not None
@@ -267,6 +275,7 @@ def _classify_outcome(
         except (OSError, UnicodeError, ValueError) as error:
             report_error = str(error)
         else:
+            report_incomplete = detached.report_state == REPORT_STATE_INCOMPLETE
             peak_bytes = (peak_bytes or 0) + detached.memory_peak_bytes
             cpu_s = (cpu_s or 0.0) + detached.cpu_usage_nsec / 1_000_000_000
             tasks_peak = detached.tasks_peak
@@ -299,6 +308,8 @@ def _classify_outcome(
         status = STATUS_TIMEOUT
     elif report_error:
         status = STATUS_RESOURCE_REPORT_ERROR
+    elif report_incomplete:
+        status = STATUS_UNKNOWN
     else:
         log_text = _read_log_tail(log_path) if spec.hit.regex else ""
         status = classify_workload(spec.hit, outcome.returncode, log_text)

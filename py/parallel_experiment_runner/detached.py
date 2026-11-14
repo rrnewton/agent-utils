@@ -21,6 +21,14 @@ The report also attests the hard controls applied to that unit and reports their
 monotonic breach counters.  Detached execution is refused unless those controls
 exactly match the runner's declared per-worker limits.
 
+A report may also carry ``resource_report_state``: ``COMPLETE`` when the producer
+obtained the unit's terminal Result, or ``INCOMPLETE`` (``required terminal Result
+unknown``) when it did not.  An ``INCOMPLETE`` report's counters can be complete
+while the workload's outcome is still unknown, so the runner classifies it as
+unknown, never as a hit or a miss.  An unrecognised state value is refused
+(fail-closed), and a report with no state field keeps the original
+counter-complete contract.
+
 Only units beginning with the caller-declared prefix are ever passed to ``systemctl``.
 Commands use argv, never a shell, and unit names are syntax-checked first.
 """
@@ -36,6 +44,11 @@ from typing import Iterable
 
 from parallel_experiment_runner.model import WorkerLimits
 
+
+#: ``resource_report_state`` value when the producer obtained a terminal Result.
+REPORT_STATE_COMPLETE = "COMPLETE"
+#: ``resource_report_state`` value when the required terminal Result is unknown.
+REPORT_STATE_INCOMPLETE = "INCOMPLETE"
 
 _UNIT_RE = re.compile(r"[A-Za-z0-9_.@:-]+")
 _LOCK = threading.RLock()
@@ -61,6 +74,7 @@ class DetachedResourceReport:
     log_cap_hit: int
     memory_oom_kills: int
     tasks_limit_hits: int
+    report_state: str = REPORT_STATE_COMPLETE
 
 
 _NUMERIC_FIELDS = (
@@ -79,7 +93,7 @@ _NUMERIC_FIELDS = (
     "memory_oom_kills",
     "tasks_limit_hits",
 )
-_REPORT_FIELDS = frozenset(("unit", *_NUMERIC_FIELDS))
+_REPORT_FIELDS = frozenset(("unit", "resource_report_state", *_NUMERIC_FIELDS))
 
 
 def _fields(path: Path) -> dict[str, str]:
@@ -123,6 +137,12 @@ def read_report(path: Path, unit_prefix: str) -> DetachedResourceReport:
     for field in ("cpu_time_limit_hit", "wall_time_limit_hit", "log_cap_hit"):
         if numbers[field] not in {0, 1}:
             raise ValueError(f"detached resource report {field} must be 0 or 1")
+    report_state = fields.get("resource_report_state", REPORT_STATE_COMPLETE)
+    if report_state not in (REPORT_STATE_COMPLETE, REPORT_STATE_INCOMPLETE):
+        raise ValueError(
+            f"detached resource report resource_report_state must be "
+            f"{REPORT_STATE_COMPLETE} or {REPORT_STATE_INCOMPLETE}"
+        )
     return DetachedResourceReport(
         unit=unit,
         memory_peak_bytes=numbers["memory_peak_bytes"],
@@ -139,6 +159,7 @@ def read_report(path: Path, unit_prefix: str) -> DetachedResourceReport:
         log_cap_hit=numbers["log_cap_hit"],
         memory_oom_kills=numbers["memory_oom_kills"],
         tasks_limit_hits=numbers["tasks_limit_hits"],
+        report_state=report_state,
     )
 
 

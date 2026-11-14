@@ -19,6 +19,7 @@ from parallel_experiment_runner.model import (
     STATUS_PIDS_CAP,
     STATUS_RESOURCE_REPORT_ERROR,
     STATUS_TIMEOUT,
+    STATUS_UNKNOWN,
     ExperimentSpec,
     HitCondition,
     RoundResult,
@@ -27,10 +28,12 @@ from parallel_experiment_runner.model import (
 from parallel_experiment_runner.profile import ProfileStore
 
 
-def _write_report(path: Path, *, unit: str = "worker-7") -> None:
+def _write_report(path: Path, *, unit: str = "worker-7", state: str | None = None) -> None:
+    state_line = f"wrapper: resource_report_state={state}\n" if state is not None else ""
     path.write_text(
         "wrapper: unit=" + unit + "\n"
-        "wrapper: memory_peak_bytes=200\n"
+        + state_line
+        + "wrapper: memory_peak_bytes=200\n"
         "wrapper: cpu_usage_nsec=2000000000\n"
         "wrapper: tasks_peak=7\n"
         "wrapper: limit_memory_bytes=1000\n"
@@ -192,6 +195,77 @@ def test_detached_log_cap_exit_125_cannot_satisfy_hit_exit_code(tmp_path: Path) 
     assert result.status == STATUS_LOG_CAP
     assert result.is_hit is False
     assert result.is_breach
+
+
+def test_incomplete_detached_report_with_hit_log_and_exit_193_is_unknown(
+    tmp_path: Path,
+) -> None:
+    # The reported shape: counter-complete report, zero breaches, log matching the
+    # hit regex, exit 193 -- the terminal Result is unknown, so never a HIT.
+    report = tmp_path / "3.txt"
+    _write_report(report, state="INCOMPLETE")
+    log = tmp_path / "worker.log"
+    log.write_text("DIVERGENCE detected\n")
+    spec = replace(_spec(report), hit=HitCondition(regex="DIVERGENCE"))
+    outcome = StepOutcome(
+        tag="seed.3",
+        ok=False,
+        duration_s=1.0,
+        summary="",
+        returncode=193,
+        oomed=False,
+        oom_kills=0,
+        timed_out=False,
+        cpu_timed_out=False,
+        aborted=False,
+        pids_events=0,
+    )
+    result = _classify_outcome(spec, outcome, {}, log)
+    assert result.status == STATUS_UNKNOWN
+    assert result.is_hit is False
+    assert result.is_breach
+    assert "UNKNOWN" in result.breach
+    round_result = RoundResult(
+        width=1,
+        seeds=(3,),
+        outcomes=(result,),
+        wall_s=1.0,
+        cpu_s=0.0,
+        slice_revision=0,
+        limiting_dimension="memory",
+    )
+    store = ProfileStore(tmp_path / "profile.json")
+    assert _record_samples(store, "key", round_result) is None
+    assert store.estimate("key").is_set is False
+
+
+def test_incomplete_detached_report_is_unknown_even_with_clean_exit(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "3.txt"
+    _write_report(report, state="INCOMPLETE")
+    result = _classify_outcome(_spec(report), _outcome(), {}, tmp_path / "worker.log")
+    assert result.status == STATUS_UNKNOWN
+    assert result.is_hit is False
+
+
+def test_complete_detached_report_state_still_classifies_normally(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "3.txt"
+    _write_report(report, state="COMPLETE")
+    result = _classify_outcome(_spec(report), _outcome(), {}, tmp_path / "worker.log")
+    assert result.status == STATUS_HIT
+    assert result.resource_report_error == ""
+
+
+def test_unrecognised_detached_report_state_is_refused(tmp_path: Path) -> None:
+    report = tmp_path / "3.txt"
+    _write_report(report, state="SOMETHING-ELSE")
+    result = _classify_outcome(_spec(report), _outcome(), {}, tmp_path / "worker.log")
+    assert result.status == STATUS_RESOURCE_REPORT_ERROR
+    assert result.is_hit is False
+    assert "resource_report_state" in result.resource_report_error
 
 
 def test_report_requires_owned_syntax_checked_unit(tmp_path: Path) -> None:

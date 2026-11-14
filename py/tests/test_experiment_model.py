@@ -19,6 +19,7 @@ from parallel_experiment_runner.model import (
     STATUS_PIDS_CAP,
     STATUS_RESOURCE_REPORT_ERROR,
     STATUS_TIMEOUT,
+    STATUS_UNKNOWN,
     WALL_CPU_BACKSTOP_FACTOR,
     ExperimentSpec,
     WorkerLimits,
@@ -37,6 +38,11 @@ def test_pids_cap_is_a_breach_status() -> None:
         STATUS_LOG_CAP,
         STATUS_RESOURCE_REPORT_ERROR,
     }
+
+
+def test_unknown_is_a_breach_status() -> None:
+    # An unknown terminal Result is never a hit and never a clean sample.
+    assert STATUS_UNKNOWN in BREACH_STATUSES
 
 
 def test_pids_max_rejects_zero_and_negative() -> None:
