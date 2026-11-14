@@ -3330,8 +3330,9 @@ test("`#298 thread-card-header`: the card across the window counts the thread's 
   const always = await run(await brokenModule([{ file: "src/view/channel/threadcardhead.ts",
     find: "    if (threadCardsDrawn.get(card.id) === signature) return;\n", replace: "" }]));
   assert.ok(always.writes > 0, "the negative control wrote nothing either, so the check above proves nothing");
-  const heading = await run(brokenScript(
-    "  if (!columnWork.side() && selection().view === \"thread\") paintThreadCard(leftEl(\"thread-card\"), openThreadChoice(), tally);\n", ""));
+  const heading = await run(await brokenModule([{ file: "src/view/channel/channelrows.ts",
+    find: "    if (!deps.side() && deps.selectionView() === \"thread\") deps.paintThreadCard(deps.leftEl(\"thread-card\"), deps.openThreadChoice(), tally);\n",
+    replace: "" }]));
   assert.notDeepStrictEqual(heading.counted, counted, "the negative control counted the Done anyway, so the check above proves nothing");
 });
 

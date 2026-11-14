@@ -2847,7 +2847,8 @@ test("`#301 semicolon-expand-cycle` x `#280 scroll-stability`: AT THE FOOT OF TH
  */
 function keptSizes(page, script) {
   const sizes = {};
-  for (const [, name] of script.matchAll(/^(?:const|let) ([A-Za-z_$][\w$]*) = (?:\[\]|new (?:Map|Set)\()/gm)) {
+  const text = typeof script === "string" ? script : script.script;
+  for (const [, name] of text.matchAll(/^(?:const|let) ([A-Za-z_$][\w$]*) = (?:\[\]|new (?:Map|Set)\()/gm)) {
     const value = page.pure(name);
     sizes[name] = Array.isArray(value) ? value.length : value.size;
   }
@@ -2895,9 +2896,13 @@ test("`#301 semicolon-expand-cycle` x `#226 page-energy-profile`: NOTHING THE PA
   // rows beside the rows again, never pruned, and the test names it. Since `#1229
   // keyed-row-patching` an unchanged channel's rows are kept rather than rebuilt, so the list
   // is fed from the pass over the rows every draw makes, where the fold list once was.
-  const kept = brokenScript("const folding = createFolding({", "const foldsKept = [];\nconst folding = createFolding({")
-    .replace("function renderChannelRows() {", "function renderChannelRows() {\n  for (const keptRow of el(\"discord-log\").children) if (keptRow.getAttribute(\"data-collapsed\") !== null) foldsKept.push(keptRow);");
-  assert.ok(kept.includes("foldsKept.push(keptRow)"), "the control no longer finds the pass over the rows");
+  const scriptWithFolds = brokenScript("const folding = createFolding({", "const foldsKept = [];\nconst folding = createFolding({");
+  assert.ok(scriptWithFolds.includes("const foldsKept = [];"), "the control no longer declares its list beside the rows");
+  // The pass itself is the channel rows owner's now: the overlay throws where
+  // its text no longer stands in the module, as brokenScript did for voice.js.
+  const kept = await brokenModule([{ file: "src/view/channel/channelrows.ts",
+    find: "  function renderChannelRowsNow(): void {\n",
+    replace: "  function renderChannelRowsNow(): void {\n    for (const keptRow of deps.byId(\"discord-log\").children) if ((keptRow as HTMLElement).getAttribute(\"data-collapsed\") !== null) foldsKept.push(keptRow as never);\n" }], scriptWithFolds);
   const leaky = await run(kept);
   assert.equal(leaky.grew.length, 1, `the control grew ${leaky.grew.join(", ")}`);
   assert.match(leaky.grew[0], /^foldsKept \d+ -> \d+$/);

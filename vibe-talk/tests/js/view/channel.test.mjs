@@ -3673,3 +3673,60 @@ test("`#624 voice-page-modularity`: putting the list in a read mode — the mode
     "clear-count", "controls", "apply-runs", "tools", "summaries"],
     "a change hiding nothing new did not draw the runs");
 });
+
+test("`#624` channel rows: the render pass runs its acts in order, held where the scroll owner holds rows", () => {
+  const { createChannelRows } = CHANNEL_VIEW;
+  const calls = [];
+  const row = { getAttribute: () => null };
+  const lists = {
+    "discord-log": { children: [row] },
+    "pinned-log": { children: [] },
+    "settings-channel": { value: "c1" },
+  };
+  const record = (name) => () => calls.push(name);
+  const rows = createChannelRows({
+    byId: (id) => lists[id],
+    side: () => false,
+    quickReplyHolds: () => false,
+    filterChanging: () => false,
+    currentFilterHold: () => null,
+    holdingRows: (act) => { calls.push("hold"); act(); },
+    syncPinnedList: record("pinned"),
+    arrangeChannelRows: record("arrange"),
+    selectedChannelId: () => "c1",
+    answeredBy: () => new Set(),
+    noteAuthor: () => false,
+    keepSeenAuthors: record("keepSeen"),
+    settingsChannelValue: () => "c1",
+    renderIdentityList: record("identity"),
+    replyTally: () => ({}),
+    drawingAll: () => false,
+    markListView: record("mark"),
+    dressChannelRow: () => calls.push("dress"),
+    selectionView: () => "main",
+    drawLinkedMark: () => {},
+    renderReplyLinks: record("links"),
+    renderOutgoingMessages: record("outgoing"),
+    renderNoiseCount: () => {},
+    applyReadRuns: record("runs"),
+    rowsChosen: () => true,
+    drawSeams: record("seams"),
+    placeBookmarkLine: record("bookmark"),
+    paintSideThreadCard: () => {},
+    paintThreadCard: () => {},
+    leftEl: (id) => lists[id],
+    openThreadChoice: () => null,
+    paintAllThreadFocus: () => {},
+    dressedAfter: () => true,
+    dressUnpackedRows: () => {},
+    paintReadingCards: () => {},
+    mainRowsOnScreen: () => false,
+    renderSideCards: () => {},
+    replyState: () => ({ docked: null, pending: null }),
+    placeInlineReply: () => {},
+    reopenPendingReply: () => {},
+  });
+  rows.renderChannelRows();
+  assert.deepStrictEqual(calls, ["hold", "pinned", "arrange", "mark", "dress", "links", "outgoing", "runs", "bookmark"],
+    "the render pass did not run held, in its order");
+});

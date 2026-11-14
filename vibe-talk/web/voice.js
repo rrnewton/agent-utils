@@ -4118,7 +4118,7 @@ const threadStripOwner = createThreadStrip({
   hidingRead: () => hidingRead(),
   readFilterKeeps,
   renderCachedTimeline: () => renderCachedTimeline(),
-  renderChannelRows,
+  renderChannelRows: () => renderChannelRows(),
   hiddenEmpty: (m) => hiddenEmpty(m),
   drawnIds: () => [...el("discord-log").children].flatMap(idsOf),
   fromGatheredThread,
@@ -4589,7 +4589,7 @@ const identityList = mountIdentityList({
 
 const speakers = createSpeakers({
   whoIsWho,
-  renderChannelRows,
+  renderChannelRows: () => renderChannelRows(),
   renderIdentityList: () => identityList.render(),
   selectedChannelId,
 });
@@ -4646,102 +4646,7 @@ const { noteSelfAuthor, messageChannel } = speakers;
 
 
 
-function renderChannelRows() {
-  // `#1251 scroll-single-owner`: every Main-list redraw is held by the owner — except under a
-  // quick-reply hold, whose own holder places the box (`placeQuickReply`).
-  if (columnWork.side() || quickReplyHolds(el("scroll-area")) || filterChanges.changing() || currentFilterHold() !== null) renderChannelRowsNow();
-  else scrollKeeping.holdingRows(() => renderChannelRowsNow());
-}
 
-function renderChannelRowsNow() {
-  // `#206 pin-message`. The Pinned filter's list first, so that the pass below derives its rows as
-  // well: it is drawn from the same messages and has to agree with the channel about every one.
-  syncPinnedList();
-  // `#215 reply-coalesce`. The rows in the order they are meant to be in, gathered or in time
-  // order, before anything below derives a row's state from where it is.
-  arrangeChannelRows();
-  const list = el("discord-log");
-  const rows = [...list.children];
-  // The channel these rows belong to, read once. Every author learned on this pass was seen HERE,
-  // and every bucket drawn on it is a statement about who is in THIS conversation.
-  const viewing = selectedChannelId();
-  // Every message some LOADED message answers.
-  const answered = answeredBy(rows, viewing);
-  // The author census FIRST and in full, because `bucketFor` asks how many other bots there are —
-  // a question no single row can answer, and one whose answer must not change halfway through the
-  // loop that is applying it.
-  let learned = false;
-  for (const row of rows) {
-    learned =
-      whoIsWho.noteAuthor(
-        viewing,
-        row.getAttribute("data-author-id"),
-        row.getAttribute("data-author"),
-        row.getAttribute("data-author-bot") === "true"
-      ) || learned;
-  }
-  if (learned) {
-    whoIsWho.keepSeen();
-    // `#402 who-is-who-channel-box`. Only if Settings' box is on the channel that just learned
-    // something. Otherwise the list is another channel's, and rebuilding it draws the same rows again.
-    if (el("settings-channel").value === viewing) identityList.render();
-  }
-  // `#222 unread-replies`. The replies the store holds, counted once for every row's thread chip.
-  const tally = replyTally();
-  const mainList = new Set(rows);
-  // `#299 all-thread-strip`. All's rows are drawn in the left column only, never on the right.
-  const inAll = drawingAll();
-  markListView();
-  for (const row of [...rows, ...el("pinned-log").children]) {
-    dressChannelRow(/** @type {any} */ (row), { tally, answered, viewing,
-      inMain: selection().view === "main" && mainList.has(row), inAll: inAll && mainList.has(row) });
-    // The linked message's mark is drawn as a row is built; a row kept or put back by a view
-    // (`#1229 keyed-row-patching`) is not built again, so the pass draws the mark on it here.
-    linkedMark.drawOn(/** @type {any} */ (row));
-  }
-  // `#214 reply-arrow` and `#215 reply-coalesce`. Each reply's gutter, from the rows now around it
-  // and the speakers just decided for them.
-  renderReplyLinks();
-  renderOutgoingMessages();
-  // Settings counts what is loaded, and this is where what is loaded changes.
-  noiseSettings.renderCount();
-  // `#221 read-modes`. LAST, from the read state every row has just been given: under Fold
-  // read a message dealt with on this pass joins its run, and a run that grew says so.
-  applyReadRuns();
-  // `#250 date-separators`. The days, from the rows as the runs leave them, inside whatever anchored
-  // mutation drew them: a step back that brings the first row's day with it takes that day's rule off
-  // the row the reader is on, and the change of height has to be part of the one the step makes. Not
-  // while a filter chooses rows, which the search's pass, after this one, decides.
-  if (!rowsChosen()) {
-    drawSeams(el("discord-log"));
-    drawSeams(el("pinned-log"));
-  }
-  // `#240 reading-bookmark`. After the runs, which decide which rows are shown: the line goes above
-  // the first row shown at or after its message.
-  placeBookmarkLine();
-  // `#298 thread-card-header`. The card at the top of the right column's thread counts its replies and
-  // unread as the rows' chips do, so it follows the same arrivals, reads and Done, in either column;
-  // and so does the card at the top of a thread across the window.
-  paintSideThreadCard(tally);
-  if (!columnWork.side() && selection().view === "thread") paintThreadCard(leftEl("thread-card"), openThreadChoice(), tally);
-  // `#299 all-thread-strip`. The thread selected in All, on the rows as they now stand: a live reply of
-  // it arrives at full strength, any other message dimmed.
-  paintAllThreadFocus();
-  // `#407 unpack-row-parity`. Whatever this pass was for — a read aloud starting or ending, a pin, a
-  // reply sent — the rows unpacked under the cards are dressed again with it, as message rows.
-  // `cardsDrawn.dressedAfter`: not where the cards drawn next dress the one block that changed (`redrawUnpackBlock`).
-  if (!columnWork.side() && !cardsDrawn.dressedAfter()) dressUnpackedRows();
-  // `#540 read-aloud-desktop`. And a card whose first message a read is reading, or has asked for.
-  if (!columnWork.side()) readAloudOwner().paintReadingCards();
-  // `#419 threads-view-main-messages`. Main's messages among the cards are Main's rows' messages: what
-  // changed them here (a message posted from the box at the foot, an arrival, a Done) is drawn there too.
-  // Drawn again only where something they draw changed (`renderSideCards`).
-  if (!columnWork.side() && mainRowsOnScreen()) renderSideCards();
-  // `#410 inline-reply-editor`. A reply open in the stream, under its row as the rows now stand; and
-  // one waiting for its message, opened again once the message is drawn.
-  if (replyState.docked) placeInlineReply();
-  else if (replyState.pending) reopenPendingReply();
-}
 
 
 /**
@@ -5003,7 +4908,6 @@ const channelRows = createChannelRows({
   combineOn: () => combineSwitch.on(),
   listedMessages,
   preservingScroll,
-  renderChannelRows,
   renderScrollTools,
   renderBodyInto,
   headingOf,
@@ -5060,8 +4964,47 @@ const channelRows = createChannelRows({
   historyReach: () => historyReach(),
   closeOpenMenu,
   clipboard: () => navigator.clipboard,
+  side: () => columnWork.side(),
+  quickReplyHolds: (area) => quickReplyHolds(area),
+  filterChanging: () => filterChanges.changing(),
+  currentFilterHold: () => currentFilterHold(),
+  holdingRows: (act) => scrollKeeping.holdingRows(act),
+  syncPinnedList: () => syncPinnedList(),
+  arrangeChannelRows: () => arrangeChannelRows(),
+  answeredBy: (rows, viewing) => answeredBy(rows, viewing),
+  noteAuthor: (channel, authorId, author, bot) => whoIsWho.noteAuthor(channel, authorId, author, bot),
+  keepSeenAuthors: () => whoIsWho.keepSeen(),
+  settingsChannelValue: () => el("settings-channel").value,
+  renderIdentityList: () => identityList.render(),
+  replyTally: () => replyTally(),
+  drawingAll: () => drawingAll(),
+  markListView: () => markListView(),
+  dressChannelRow: (row, pass) => dressChannelRow(row, pass),
+  selectionView: () => selection().view,
+  drawLinkedMark: (row) => linkedMark.drawOn(row),
+  renderReplyLinks: () => renderReplyLinks(),
+  renderOutgoingMessages: () => renderOutgoingMessages(),
+  renderNoiseCount: () => noiseSettings.renderCount(),
+  applyReadRuns: () => applyReadRuns(),
+  rowsChosen: () => rowsChosen(),
+  drawSeams: (list) => drawSeams(list),
+  placeBookmarkLine: () => placeBookmarkLine(),
+  paintSideThreadCard: (tally) => paintSideThreadCard(tally),
+  paintThreadCard: (card, choice, tally) => paintThreadCard(card, /** @type {any} */ (choice), tally),
+  leftEl: (id) => leftEl(id),
+  openThreadChoice: () => openThreadChoice(),
+  paintAllThreadFocus: () => paintAllThreadFocus(),
+  dressedAfter: () => cardsDrawn.dressedAfter(),
+  dressUnpackedRows: () => dressUnpackedRows(),
+  paintReadingCards: () => readAloudOwner().paintReadingCards(),
+  mainRowsOnScreen: () => mainRowsOnScreen(),
+  renderSideCards: () => renderSideCards(),
+  replyState: () => replyState,
+  placeInlineReply: () => placeInlineReply(),
+  reopenPendingReply: () => reopenPendingReply(),
 });
 const {
+  renderChannelRows, renderChannelRowsNow,
   rowMenus, emptyMessage, hiddenEmpty, glom, regroupChannelRows, channelRowFrame,
   discordNode, closeRowMenuOutside, closeRowMenuOnEscape, markReadThroughHere,
   storedSlackOpen, upstreamServiceName, copyUpstreamLink, copyMessageText,
@@ -5610,7 +5553,7 @@ const pinnedMessagesOwner = createPinnedMessages({
   providerName: () => channelDirectory.providerName(),
   eachColumn,
   preservingScroll,
-  renderChannelRows,
+  renderChannelRows: () => renderChannelRows(),
   renderScrollTools,
   threading: () => providerFacts.threading(),
   heldThreads: () => channelStore.current().threads,
@@ -8146,7 +8089,7 @@ const readingActsOwner = createReadingModeActs({
   guardQuietly,
   setStatus,
   renderControls: () => voiceCall().renderControls(),
-  renderChannelRows,
+  renderChannelRows: () => renderChannelRows(),
 });
 const { closeSpeedPopover, leaveReadingMode, setReadingMode } = readingActsOwner;
 
