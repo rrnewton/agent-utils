@@ -727,7 +727,12 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
         : (unit.label !== "" ? unit.label : `${unit.start + 1}`);
       button.textContent = text;
       button.setAttribute("aria-label", `Read from ${text}`);
-      listening.listen(button, "click", () => { startReading(unit.start); });
+      // A nested unit's tap is its own: it must not also fire the host
+      // cell's tap underneath it (`#1508` landing 3).
+      listening.listen<MouseEvent>(button, "click", (event) => {
+        if (typeof event.stopPropagation === "function") event.stopPropagation();
+        startReading(unit.start);
+      });
       if (unit.nested !== undefined && unit.nested.length > 0) {
         const nest = document.createElement("span");
         nest.className = "doc-nav-nested";

@@ -125,6 +125,30 @@ def walk_big(page: Page, touch: bool, card_name: str, label: str, width: int) ->
     spoken = first_spoken_after(page, marker)
     check("Part 2 of" in spoken, f"tapping the unit did not start reading section 2: {spoken[:60]!r}")
 
+    # Deep navigation (`#1508` landing 3): into section 3, then 3.2. A desk
+    # draws the third row; a phone folds it into the context row's current
+    # cell, where the nested tap must start 3.2, not its host section 3.
+    unit3 = page.locator("#doc-nav .doc-nav-unit", has_text="3").first
+    unit3.tap() if touch else unit3.click()
+    page.wait_for_function(
+        """() => {
+          const lit = document.querySelector('#doc-body [data-reading-block="current"]');
+          return lit !== null && (lit.textContent || '').includes('Part 3 of');
+        }""", timeout=20_000)
+    unit32 = page.locator("#doc-nav .doc-nav-unit", has_text="3.2").first
+    unit32.tap() if touch else unit32.click()
+    page.wait_for_function(
+        """() => {
+          const lit = document.querySelector('#doc-body [data-reading-block="current"]');
+          return lit !== null && (lit.textContent || '').includes('Part 3.2 of');
+        }""", timeout=20_000)
+    deep_rows = page.evaluate("() => document.querySelectorAll('#doc-nav .doc-nav-row').length")
+    want_rows = 3 if width >= 600 else 2
+    check(deep_rows == want_rows,
+          f"deep in 3.2 the navigator shows {deep_rows} rows at {width}px, want {want_rows}")
+    deep_text = page.evaluate("() => document.getElementById('doc-nav').textContent")
+    check("3.2" in deep_text, f"section 3.2 is missing from the navigator rows: {deep_text[:80]!r}")
+
 
 def walk_authored(page: Page, touch: bool) -> None:
     card = page.locator("#documents-list .doc-card", has_text="authored-doc")

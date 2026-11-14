@@ -1,6 +1,6 @@
 ---
 title: 'documents-scrubber-multilevel: finish the multi-level document scrubber (section tree, numbers, two-row navigator)'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -10,6 +10,7 @@ depends_on:
   agent-utils-629: blocks
 created_at: 2026-11-14T00:00:00+00:00
 updated_at: 2026-11-14T00:00:00+00:00
+closed_at: 2026-11-14T00:00:00+00:00
 ---
 
 # Description
@@ -33,3 +34,13 @@ Suggested landings, each deployable on its own:
 Module tests for section numbering (title rule, skipped levels, Introduction, author-numbered detection incl. 3., 3.2, III., A.), aggregation to K_target with the minimum chunk size, range compression, and boundary marks; browser checks at phone and desktop width with a large synthetic document (hundreds of blocks, nested sections, one huge leaf section): rows count, tap a unit -> reading starts there, numbers on the document. No wall-clock waits (owner rule 346).
 
 # Notes
+
+## Resolution
+
+Landed on rrnewton/agent-utils:main in three gated landings (owner fast-track, GATE_SLOTS=3 owner priority):
+
+1. `0b26e216` — the section model and numbers on the document: pure `sections.ts` over the #1505 block model (title unnumbered, depth as ancestor rank, section 0 Introduction, author's numbers win per level incl. `3.`, `3.2`, `III.`, `A.`), gutter numbers before each heading with no second number beside an author's own, the same numbers in the contents outline, navigator rows from the same model with `K_target = floor(W / 24px)`, `K_hard = floor(W / 14px)`, run aggregation and a 120-char minimum chunk (pinned in the page's tuning bands). Module tests in `tests/js/view/documents-sections.test.mjs`.
+2. `f975298e` — browser proof: `documents_scrubber_browser` (DAG + Makefile) seeds a large synthetic document (hundreds of blocks, nested sections, one 118-paragraph leaf) and an author-numbered document against the real server; at 393x852 and 1280x800 it checks numbers on the document, rows within cap with numbers, and tap-a-unit starts the read there with the light on the same block.
+3. This landing — deep navigation (third row on a desk, folded nested row on a phone with tap isolation), model cleanup, and this close.
+
+The navigator, the on-document numbers and read-aloud share the one block and section model, so tapping a scrubber unit starts reading there and the highlight follows. Read-aloud steering (`voice.js`) is untouched. Verified: module suites, `tsc`, documents browser checks at both widths, `make validate` selection and the owner gate per landing. Unverified: nothing outstanding; the range-compression path is covered by module tests (the browser documents fit K_hard without compression at their widths).

@@ -128,7 +128,6 @@ export function buildSections(blocks: readonly DocumentReadBlock[]): SectionMode
   }
   const placed: Placed[] = [];
   const stack: Array<{ level: number; block: number; siblings: number }> = [];
-  const levelOfBlock = new Map(numbered.map((heading) => [heading.block, heading.level]));
   for (const heading of numbered) {
     while (stack.length > 0 && (stack[stack.length - 1] as (typeof stack)[number]).level >= heading.level) stack.pop();
     const parent = stack.length > 0 ? (stack[stack.length - 1] as (typeof stack)[number]) : null;
@@ -150,7 +149,6 @@ export function buildSections(blocks: readonly DocumentReadBlock[]): SectionMode
       author: authorNumberOf(heading.text),
     });
     stack.push({ level: heading.level, block: heading.block, siblings: 0 });
-    void levelOfBlock;
   }
   // The author's numbers win per depth: every heading there must carry one.
   const authorWon = new Map<number, boolean>();
@@ -206,23 +204,14 @@ export function buildSections(blocks: readonly DocumentReadBlock[]): SectionMode
       children: [],
     });
   });
-  // Parents and children by heading block, then fix each span: a section's
-  // own span runs to the next heading of any depth (set above by document
-  // order), which is exactly the linear sequence the bottom row walks.
+  // Parents and children by heading block. Top-level sections stay the
+  // Introduction's siblings (parent -1), never its children.
   for (const entry of placed) {
     if (entry.parentBlock === -1) continue;
     const child = sections[indexOfBlock.get(entry.block) as number] as DocumentSection;
     const parent = sections[indexOfBlock.get(entry.parentBlock) as number] as DocumentSection;
     child.parent = indexOfBlock.get(entry.parentBlock) as number;
     parent.children.push(indexOfBlock.get(entry.block) as number);
-  }
-  if (hasIntro) {
-    const intro = sections[0] as DocumentSection;
-    for (const section of sections) {
-      if (section.parent === -1 && section !== intro && section.depth === 0) {
-        // Top-level sections are the Introduction's siblings, not children.
-      }
-    }
   }
   const sectionOfBlock: number[] = new Array(blocks.length).fill(-1);
   sections.forEach((section, index) => {
