@@ -305,7 +305,17 @@ fn main() {
         Command::Ledger {
             action: LedgerAction::DigestRows,
         } => {
+            let mut evidence_records: usize = 0;
+            let mut head_field_seen = false;
             if let Err(error) = loaded.index.for_each_row(|row| {
+                if let Some(cell_results) = row.get("cell_results") {
+                    if cell_results.is_object() {
+                        evidence_records += 1;
+                        if cell_results.get(&cli.evidence_head_field).is_some() {
+                            head_field_seen = true;
+                        }
+                    }
+                }
                 let object = PyValue::Object(vec![
                     (
                         "run_id".to_owned(),
@@ -324,6 +334,14 @@ fn main() {
             }) {
                 eprintln!("local-ci-hub: {error}");
                 std::process::exit(2);
+            }
+            if evidence_records > 0 && !head_field_seen {
+                eprintln!(
+                    "local-ci-hub: warning: evidence-head field '{}' absent from all \
+                     {evidence_records} typed cell_results record(s); digests used the \
+                     generic sorted form — check --evidence-head-field against the deployment",
+                    cli.evidence_head_field
+                );
             }
         }
         Command::Ledger {
