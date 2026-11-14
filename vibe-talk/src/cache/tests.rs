@@ -3315,6 +3315,84 @@ fn a_cache_search_matches_with_the_shared_language_and_says_how_far_back_it_look
 }
 
 #[test]
+fn a_search_finds_a_reply_observed_before_a_channel_drop_and_flags_it_stale() {
+    // `#1533 vibe-talk-record-completeness`, test case 1 in miniature: the owner's reply
+    // "I'd also like collapsable sections..." (thread of "TODO: Discuss mode feedback") was
+    // held whole, then a later channel-wide drop (an offer left out, naming no row) made
+    // search withhold it as "thread in doubt" forever, because thread scopes are re-read
+    // only when opened. Fixed instants only: the fixture clock never reads the wall clock.
+    use super::search::{SearchRequest, SearchView};
+    let fx = Fixture::new("cache-search-stale");
+    let first = T0 + 10 * STEP + 1_000;
+    fx.clock.set(first);
+    let mut rows: Vec<Message> = (1..=3).map(m).collect();
+    rows[2].content = "TODO: Discuss mode feedback".to_owned();
+    fx.list(rows, first, Some(newest_proof(ListStart::At(T0 + STEP))));
+    fx.list_scope(
+        Scope::Thread("m3".to_owned()),
+        vec![reply(
+            "r1",
+            "m3",
+            "collapsable sections inside the summary",
+            T0 + 3 * STEP + 500,
+        )],
+        first,
+        Some(newest_proof(ListStart::ScopeStart)),
+    );
+    let day = |d: crate::search_query::Day| d.start_ms_at_offset(0);
+    let query = crate::search_query::parse("collapsable");
+    let request = SearchRequest {
+        query: &query,
+        view: SearchView::All,
+        below_ms: i64::MAX,
+        limit: 10,
+        budget: 100,
+        day_start_ms: &day,
+    };
+    let clean = fx
+        .cache
+        .search(&fx.chan, &request)
+        .served()
+        .expect("served");
+    assert_eq!(clean.hits.len(), 1, "held before any drop");
+    assert_eq!((clean.stale, clean.withheld, clean.dropped_ms), (0, 0, None));
+
+    // A channel-wide drop after the reply was seen: the reply is found, flagged stale with
+    // the drop's time — never hidden, and never shown as vouched-for either.
+    fx.clock.set(first + STEP);
+    fx.cache.mark_suspect_reason(&fx.chan, "queue_or_budget");
+    assert!(fx.cache.quiesce_blocking(Duration::from_secs(30)));
+    assert_eq!(
+        fx.cache.last_drop_reason(&fx.chan),
+        Some("queue_or_budget"),
+        "the mark names its cause"
+    );
+    let flagged = fx
+        .cache
+        .search(&fx.chan, &request)
+        .served()
+        .expect("served");
+    assert_eq!(flagged.hits.len(), 1, "the owner's reply is still found: {flagged:?}");
+    assert_eq!(flagged.hits[0].message.id.0, "r1");
+    assert_eq!(flagged.stale, 1);
+    assert_eq!(flagged.dropped_ms, Some(first + STEP));
+    assert_eq!(flagged.withheld, 0);
+
+    // A thread whose access is truly in doubt is still withheld, drop or no drop.
+    fx.cache
+        .block_scope(&fx.chan, &Scope::Thread("m3".to_owned()));
+    let doubted = fx
+        .cache
+        .search(&fx.chan, &request)
+        .served()
+        .expect("served");
+    assert!(doubted.hits.is_empty(), "{doubted:?}");
+    assert_eq!(doubted.withheld, 1);
+    fx.cache
+        .unblock(&fx.chan, Some(&Scope::Thread("m3".to_owned())));
+}
+
+#[test]
 fn a_cache_search_takes_rare_terms_from_the_index_once_every_text_is_folded() {
     // `#604 server-side-search`: the folded column and the LIKE path over the trigram index.
     use super::search::{SearchRequest, SearchView};

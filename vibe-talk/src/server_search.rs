@@ -266,6 +266,8 @@ fn scope_of(
                 capped: count(outcome.capped),
                 partial: count(outcome.partial),
                 withheld: count(outcome.withheld),
+                stale: count(outcome.stale),
+                dropped_ms: outcome.dropped_ms,
                 resume_below_ms: outcome.resume_below_ms,
             }
         }

@@ -1333,9 +1333,13 @@ impl Writer<'_> {
         let now = self.now();
         lock(&self.shared.drops)
             .entry(chan.clone())
-            .and_modify(|record| record.at_ms = record.at_ms.max(now))
+            .and_modify(|record| {
+                record.at_ms = record.at_ms.max(now);
+                record.reason = "writer_lost";
+            })
             .or_insert(DropRecord {
                 at_ms: now,
+                reason: "writer_lost",
                 queued: false,
             });
         self.work.drops = true;

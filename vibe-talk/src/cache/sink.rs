@@ -914,7 +914,7 @@ impl Fill {
                 }
             } else {
                 every = false;
-                cache.mark_suspect(&self.chan);
+                cache.mark_suspect_reason(&self.chan, "fill_writes_no_rows");
             }
         }
         every

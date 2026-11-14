@@ -1186,6 +1186,11 @@ pub(crate) struct Shared {
 pub(crate) struct DropRecord {
     /// Local time, by the cache's clock.
     pub(crate) at_ms: i64,
+    /// Why the latest drop was recorded (`#1533 vibe-talk-record-completeness`): a mark that
+    /// names no cause cannot be told from a queue overflow, so every path that marks a channel
+    /// says which it was — `queue_or_budget`, `fill_writes_no_rows`, `channel_relisted`,
+    /// `writer_lost`, or `unspecified` from a caller that has not been taught one.
+    pub(crate) reason: &'static str,
     /// An [`Op::Dropped`] for the channel is queued and not yet applied: the writer reads `at_ms`
     /// when it applies it, so a later drop needs no op of its own.
     pub(crate) queued: bool,
@@ -1623,7 +1628,7 @@ impl MessageCache {
             }
             Some(previous) => {
                 for chan in routes.channels.iter().filter(|chan| !previous.allows(chan)) {
-                    self.mark_suspect(chan);
+                    self.mark_suspect_reason(chan, "channel_relisted");
                 }
             }
         }
@@ -1726,7 +1731,7 @@ impl MessageCache {
             &self.shared.stats.bytes_dropped,
             u64::try_from(bytes).unwrap_or(u64::MAX),
         );
-        self.mark_suspect(chan);
+        self.mark_suspect_reason(chan, "queue_or_budget");
     }
 
     /// Something seen of `chan` was not offered, now: it may have been an edit, a deletion or a
@@ -1740,16 +1745,43 @@ impl MessageCache {
     /// applied. A channel the file holds nothing of yet takes the time when its first row is
     /// written.
     pub fn mark_suspect(&self, chan: &ChanKey) {
+        self.mark_suspect_reason(chan, "unspecified");
+    }
+
+    /// [`MessageCache::mark_suspect`], naming why: the reason is kept on the record and logged
+    /// when it changes, so the next mark can be told from a queue overflow without reading the
+    /// file (`#1533 vibe-talk-record-completeness`). The log line names no channel, message or
+    /// text, as every cache line but the shadow's one comparison line must not.
+    pub fn mark_suspect_reason(&self, chan: &ChanKey, reason: &'static str) {
         let now = self.shared.clock.now_ms();
         let mut drops = lock(&self.shared.drops);
+        let fresh = !drops.contains_key(chan);
         let record = drops.entry(chan.clone()).or_insert(DropRecord {
             at_ms: now,
+            reason,
             queued: false,
         });
+        let changed = fresh || record.reason != reason;
         record.at_ms = record.at_ms.max(now);
+        record.reason = reason;
         if !record.queued {
             record.queued = self.control(Op::Dropped { chan: chan.clone() }).is_some();
         }
+        drop(drops);
+        if changed {
+            tracing::warn!(
+                reason,
+                "a message cache offer was left out; its channel is in doubt until re-read"
+            );
+        }
+    }
+
+    /// Why the latest offer for `chan` was dropped in this process, if one was.
+    #[must_use]
+    pub fn last_drop_reason(&self, chan: &ChanKey) -> Option<&'static str> {
+        lock(&self.shared.drops)
+            .get(chan)
+            .map(|record| record.reason)
     }
 
     /// The latest local time an offer for `chan` was dropped in this process, if one was. The file
@@ -2415,11 +2447,15 @@ impl MessageCache {
             Ok((outcome, dropped_ms))
         })
         .map(|(mut outcome, dropped_ms)| {
-            // What a serve would not hand out is not handed out here either (`#605
+            // What a serve would not hand out is mostly not handed out here either (`#605
             // server-side-search`): a reply whose own thread is in doubt or being erased (the
-            // scope read above is the view's, and a thread's block is its own), a row not seen
-            // since the latest offer dropped for the channel (the dropped one may have been its
-            // edit or deletion), and a text only a push brought, which may be a snippet.
+            // scope read above is the view's, and a thread's block is its own), and a text only
+            // a push brought, which may be a snippet. A row not seen since the latest offer
+            // dropped for the channel is handed out and flagged instead (`#1533
+            // vibe-talk-record-completeness`): the drop was channel-wide and names no row, so
+            // withholding every older row hides the owner's own prompts indefinitely (thread
+            // scopes are re-read only when opened or backfilled), while the flag keeps the
+            // staleness honest — the dropped offer may have been this row's edit or deletion.
             let before = outcome.hits.len();
             outcome.hits.retain(|hit| {
                 let thread_clear = hit
@@ -2430,10 +2466,15 @@ impl MessageCache {
                     .is_none_or(|thread| {
                         !self.scope_blocked(chan, &Scope::Thread(thread.id.clone()).key())
                     });
-                let seen_since_drop = dropped_ms.is_none_or(|dropped| hit.observed_ms > dropped);
-                thread_clear && seen_since_drop && !hit.content_partial
+                thread_clear && !hit.content_partial
             });
             outcome.withheld = before - outcome.hits.len();
+            outcome.dropped_ms = dropped_ms;
+            outcome.stale = outcome
+                .hits
+                .iter()
+                .filter(|hit| dropped_ms.is_some_and(|dropped| hit.observed_ms <= dropped))
+                .count();
             outcome
         })
     }

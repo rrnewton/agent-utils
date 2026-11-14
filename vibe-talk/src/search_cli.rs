@@ -288,6 +288,10 @@ struct ScopeAnswer {
     capped: u64,
     partial: u64,
     withheld: u64,
+    #[serde(default)]
+    stale: u64,
+    #[serde(default)]
+    dropped_ms: Option<i64>,
 }
 
 /// The server's search answer, as this client reads it.
@@ -330,6 +334,17 @@ fn coverage_lines(answer: &SearchAnswer) -> Vec<String> {
         }
         if scope.partial > 0 {
             line.push_str(&format!("; {} snippet-only withheld", scope.partial));
+        }
+        if scope.stale > 0 {
+            // `#1533 vibe-talk-record-completeness`: name the real reason and its time; the
+            // hits themselves are printed above, flagged by this line, never hidden.
+            let when = scope
+                .dropped_ms
+                .map_or_else(|| "an unknown time".to_owned(), crate::recap::et_label);
+            line.push_str(&format!(
+                "; {} may be stale (channel had a dropped update at {when})",
+                scope.stale
+            ));
         }
         if scope.withheld > 0 {
             line.push_str(&format!("; {} withheld (thread in doubt)", scope.withheld));
@@ -679,6 +694,8 @@ mod tests {
                 capped: 0,
                 partial: 0,
                 withheld: 0,
+                stale: 0,
+                dropped_ms: None,
             }],
             resume_below_ms: None,
         };

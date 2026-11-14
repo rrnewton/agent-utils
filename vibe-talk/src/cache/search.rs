@@ -282,9 +282,19 @@ pub struct SearchOutcome {
     /// query could match was among them, so `examined` counts candidates, not every row.
     pub indexed: bool,
     /// Matching rows left out of `hits` because a serve would not hand them out (`#605
-    /// server-side-search`): a reply whose thread is in doubt or being erased, a row not seen since
-    /// the latest offer dropped for the channel, or a text only a push brought.
+    /// server-side-search`): a reply whose thread is in doubt or being erased, or a text only a
+    /// push brought. A row not seen since the latest offer dropped for the channel is NOT left
+    /// out (`#1533 vibe-talk-record-completeness`): it is handed out and counted in `stale`,
+    /// because a channel-wide drop says some row of the channel may be stale, never which one,
+    /// and hiding every older row makes the record of the owner's prompts incomplete.
     pub withheld: usize,
+    /// Matching rows handed out in `hits` though not seen since the latest offer dropped for
+    /// the channel: each may be stale (the drop may have been its edit or deletion). Zero when
+    /// no offer was dropped, or every hit was seen since.
+    pub stale: usize,
+    /// When the latest offer for the channel was dropped, provider time; `None` when none was.
+    /// The reader's flag for `stale`: "may be stale since" this time.
+    pub dropped_ms: Option<i64>,
 }
 
 impl SearchOutcome {
@@ -388,6 +398,8 @@ pub(crate) fn test_rows(
         horizon: None,
         indexed: false,
         withheld: 0,
+        stale: 0,
+        dropped_ms: None,
     };
     if request.query.is_empty() || request.limit == 0 || request.budget == 0 {
         // Nothing tested, so nothing below `below_ms` is vouched for.

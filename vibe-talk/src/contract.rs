@@ -619,6 +619,15 @@ pub struct SearchScope {
     pub partial: u64,
     /// Matching replies left out because their thread is in doubt.
     pub withheld: u64,
+    /// Matching hits handed out though not seen since the channel's latest dropped update:
+    /// each may be stale, the drop may have been its edit or deletion (`#1533
+    /// vibe-talk-record-completeness`). Handed out flagged, never hidden: the drop names no
+    /// row, and hiding every older row makes the record incomplete.
+    pub stale: u64,
+    /// When the channel's latest update was dropped, provider time: the "may be stale since"
+    /// time for `stale`. Absent when no update was dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_ms: Option<i64>,
     /// Where this channel's search stopped on its budget, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_below_ms: Option<i64>,
@@ -642,6 +651,8 @@ impl SearchScope {
             capped: 0,
             partial: 0,
             withheld: 0,
+            stale: 0,
+            dropped_ms: None,
             resume_below_ms: None,
         }
     }
