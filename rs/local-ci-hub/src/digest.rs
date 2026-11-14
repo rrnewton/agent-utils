@@ -203,6 +203,441 @@ fn coverage_canonical(coverage: &PyValue) -> Option<String> {
     ))
 }
 
+/// Exact key set of a dict-view object (duplicate written pairs have
+/// already collapsed to their last value, as in a `serde_json::Value`).
+fn exact_keys(value: &PyValue, keys: &[&str]) -> bool {
+    match value.as_object() {
+        Some(pairs) => {
+            pairs.len() == keys.len()
+                && keys
+                    .iter()
+                    .all(|key| pairs.iter().any(|(name, _)| name == key))
+        }
+        None => false,
+    }
+}
+
+fn req_str<'a>(value: &'a PyValue, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(PyValue::as_str)
+}
+
+fn req_u64(value: &PyValue, key: &str) -> Option<u64> {
+    value.get(key).and_then(PyValue::as_u64)
+}
+
+fn req_bool(value: &PyValue, key: &str) -> Option<bool> {
+    match value.get(key) {
+        Some(PyValue::Bool(flag)) => Some(*flag),
+        _ => None,
+    }
+}
+
+/// One nullable typed string: present value or explicit `null`.
+fn opt_str_json(value: &PyValue, key: &str) -> Option<String> {
+    match value.get(key) {
+        None | Some(PyValue::Null) => Some("null".to_owned()),
+        Some(child) => child.as_str().map(json_string),
+    }
+}
+
+fn opt_bool_json(value: &PyValue, key: &str) -> Option<String> {
+    match value.get(key) {
+        None | Some(PyValue::Null) => Some("null".to_owned()),
+        Some(PyValue::Bool(flag)) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+fn str_list_json(value: &PyValue, key: &str) -> Option<String> {
+    match value.get(key) {
+        Some(PyValue::Array(items)) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                parts.push(json_string(item.as_str()?));
+            }
+            Some(format!("[{}]", parts.join(",")))
+        }
+        _ => None,
+    }
+}
+
+const IDENTITY_KEYS: [&str; 5] = ["lane", "category", "test", "mode", "backend"];
+
+fn identity_json(value: &PyValue) -> Option<String> {
+    if !exact_keys(value, &IDENTITY_KEYS) {
+        return None;
+    }
+    let mut out = String::from("{");
+    let mut first = true;
+    for key in IDENTITY_KEYS {
+        emit(&mut out, &mut first, key, &json_string(req_str(value, key)?));
+    }
+    out.push('}');
+    Some(out)
+}
+
+fn comparison_json(value: &PyValue) -> Option<String> {
+    const KEYS: [&str; 16] = [
+        "strictness",
+        "display_name",
+        "compare_logs",
+        "compare_io_buffers",
+        "record_envelope",
+        "virtualize_time",
+        "log_scope",
+        "strip_lines",
+        "canonicalize_addresses",
+        "full_trace",
+        "exact_remainder",
+        "stripped_prefixes",
+        "canonicalizations",
+        "ignore_lines",
+        "skip_commit",
+        "skip_detlog",
+    ];
+    // The four `Option` fields may be absent (they deserialize to
+    // `None` and serialize back as `null`); every other key is required
+    // and no unknown key is allowed.
+    const REQUIRED: [&str; 12] = [
+        "strictness",
+        "compare_logs",
+        "log_scope",
+        "strip_lines",
+        "canonicalize_addresses",
+        "full_trace",
+        "exact_remainder",
+        "stripped_prefixes",
+        "canonicalizations",
+        "ignore_lines",
+        "skip_commit",
+        "skip_detlog",
+    ];
+    let shape_ok = match value.as_object() {
+        Some(pairs) => {
+            pairs.iter().all(|(key, _)| KEYS.contains(&key.as_str()))
+                && REQUIRED
+                    .iter()
+                    .all(|key| pairs.iter().any(|(name, _)| name == key))
+        }
+        None => false,
+    };
+    if !shape_ok {
+        return None;
+    }
+    if !matches!(req_str(value, "strictness")?, "stripped" | "canonical")
+        || !matches!(
+            req_str(value, "log_scope")?,
+            "deterministic" | "info" | "full_trace"
+        )
+    {
+        return None;
+    }
+    let mut out = String::from("{");
+    let mut first = true;
+    emit(
+        &mut out,
+        &mut first,
+        "strictness",
+        &json_string(req_str(value, "strictness")?),
+    );
+    emit(&mut out, &mut first, "display_name", &opt_str_json(value, "display_name")?);
+    emit(
+        &mut out,
+        &mut first,
+        "compare_logs",
+        &req_bool(value, "compare_logs")?.to_string(),
+    );
+    emit(
+        &mut out,
+        &mut first,
+        "compare_io_buffers",
+        &opt_bool_json(value, "compare_io_buffers")?,
+    );
+    emit(
+        &mut out,
+        &mut first,
+        "record_envelope",
+        &opt_str_json(value, "record_envelope")?,
+    );
+    emit(
+        &mut out,
+        &mut first,
+        "virtualize_time",
+        &opt_bool_json(value, "virtualize_time")?,
+    );
+    emit(
+        &mut out,
+        &mut first,
+        "log_scope",
+        &json_string(req_str(value, "log_scope")?),
+    );
+    for key in [
+        "strip_lines",
+        "canonicalize_addresses",
+        "full_trace",
+        "exact_remainder",
+    ] {
+        emit(&mut out, &mut first, key, &req_bool(value, key)?.to_string());
+    }
+    emit(
+        &mut out,
+        &mut first,
+        "stripped_prefixes",
+        &str_list_json(value, "stripped_prefixes")?,
+    );
+    emit(
+        &mut out,
+        &mut first,
+        "canonicalizations",
+        &str_list_json(value, "canonicalizations")?,
+    );
+    for key in ["ignore_lines", "skip_commit", "skip_detlog"] {
+        emit(&mut out, &mut first, key, &req_bool(value, key)?.to_string());
+    }
+    out.push('}');
+    Some(out)
+}
+
+fn verdict_json(value: &PyValue) -> Option<String> {
+    let state = value.get("state").and_then(PyValue::as_str)?;
+    const TIERS: [&str; 4] = [
+        "canonical-bitwise",
+        "exit-and-stream-equality",
+        "execution-only-self-consistent",
+        "declared-but-unverifiable",
+    ];
+    let tier = req_str(value, "comparison_tier")?;
+    if !TIERS.contains(&tier) {
+        return None;
+    }
+    let mut out = String::from("{");
+    let mut first = true;
+    emit(&mut out, &mut first, "state", &json_string(state));
+    emit(&mut out, &mut first, "comparison_tier", &json_string(tier));
+    match state {
+        "compared-and-matched" | "compared-and-diverged" => {
+            if !exact_keys(
+                value,
+                &[
+                    "state",
+                    "comparison_tier",
+                    "comparison",
+                    "bitwise_parity",
+                    "compared_log_messages",
+                ],
+            ) {
+                return None;
+            }
+            emit(
+                &mut out,
+                &mut first,
+                "comparison",
+                &comparison_json(value.get("comparison")?)?,
+            );
+            emit(
+                &mut out,
+                &mut first,
+                "bitwise_parity",
+                &req_bool(value, "bitwise_parity")?.to_string(),
+            );
+            let counts = match value.get("compared_log_messages") {
+                Some(PyValue::Null) => "null".to_owned(),
+                Some(counts) if exact_keys(counts, &["left", "right"]) => {
+                    let mut text = String::from("{");
+                    let mut inner = true;
+                    emit(&mut text, &mut inner, "left", &req_u64(counts, "left")?.to_string());
+                    emit(
+                        &mut text,
+                        &mut inner,
+                        "right",
+                        &req_u64(counts, "right")?.to_string(),
+                    );
+                    text.push('}');
+                    text
+                }
+                _ => return None,
+            };
+            emit(&mut out, &mut first, "compared_log_messages", &counts);
+        }
+        "performs-no-comparison-by-design" | "unavailable-with-reason" => {
+            if !exact_keys(value, &["state", "comparison_tier", "reason"]) {
+                return None;
+            }
+            emit(
+                &mut out,
+                &mut first,
+                "reason",
+                &json_string(req_str(value, "reason")?),
+            );
+        }
+        _ => return None,
+    }
+    out.push('}');
+    Some(out)
+}
+
+fn binding_json(value: &PyValue) -> Option<String> {
+    if !exact_keys(
+        value,
+        &["run_id", "producer", "series_cell", "tree", "selected_attempt"],
+    ) {
+        return None;
+    }
+    let mut out = String::from("{");
+    let mut first = true;
+    for key in ["run_id", "producer", "series_cell", "tree"] {
+        emit(&mut out, &mut first, key, &json_string(req_str(value, key)?));
+    }
+    emit(
+        &mut out,
+        &mut first,
+        "selected_attempt",
+        &req_u64(value, "selected_attempt")?.to_string(),
+    );
+    out.push('}');
+    Some(out)
+}
+
+fn cell_json(value: &PyValue) -> Option<String> {
+    let keys: Vec<&str> = match value.as_object() {
+        Some(pairs) => pairs.iter().map(|(key, _)| key.as_str()).collect(),
+        None => return None,
+    };
+    let base = ["lane", "category", "test", "mode", "backend", "cell_verdict"];
+    let shape_ok = keys.iter().all(|key| base.contains(key) || *key == "evidence_binding")
+        && base.iter().all(|key| keys.contains(key));
+    if !shape_ok {
+        return None;
+    }
+    let mut out = String::from("{");
+    let mut first = true;
+    for key in IDENTITY_KEYS {
+        emit(&mut out, &mut first, key, &json_string(req_str(value, key)?));
+    }
+    emit(
+        &mut out,
+        &mut first,
+        "cell_verdict",
+        &verdict_json(value.get("cell_verdict")?)?,
+    );
+    if let Some(binding) = value.get("evidence_binding") {
+        emit(&mut out, &mut first, "evidence_binding", &binding_json(binding)?);
+    }
+    out.push('}');
+    Some(out)
+}
+
+/// Canonical `cell_results` JSON. A value carrying the exact typed
+/// evidence shape serializes in struct declaration order at every
+/// depth (evidence, artifact, identities, cells, verdicts, bindings);
+/// any other shape keeps the generic sorted-key form, exactly as the
+/// typed reader's retained/raw fallback serializes it.
+fn cell_results_canonical(value: &PyValue) -> Option<String> {
+    let typed = (|| -> Option<String> {
+        const KEYS: [&str; 9] = [
+            "run_id",
+            "hermit_sha",
+            "source_tree_dirty",
+            "selected_count",
+            "recorded_count",
+            "population_sha256",
+            "artifact",
+            "selected",
+            "cells",
+        ];
+        if !exact_keys(value, &KEYS) {
+            return None;
+        }
+        let artifact = value.get("artifact")?;
+        if !exact_keys(artifact, &["path", "sha256", "row_count"]) {
+            return None;
+        }
+        let mut artifact_out = String::from("{");
+        let mut afirst = true;
+        emit(
+            &mut artifact_out,
+            &mut afirst,
+            "path",
+            &json_string(req_str(artifact, "path")?),
+        );
+        emit(
+            &mut artifact_out,
+            &mut afirst,
+            "sha256",
+            &json_string(req_str(artifact, "sha256")?),
+        );
+        emit(
+            &mut artifact_out,
+            &mut afirst,
+            "row_count",
+            &req_u64(artifact, "row_count")?.to_string(),
+        );
+        artifact_out.push('}');
+        let selected = match value.get("selected") {
+            Some(PyValue::Array(items)) => {
+                let mut parts = Vec::with_capacity(items.len());
+                for item in items {
+                    parts.push(identity_json(item)?);
+                }
+                format!("[{}]", parts.join(","))
+            }
+            _ => return None,
+        };
+        let cells = match value.get("cells") {
+            Some(PyValue::Array(items)) => {
+                let mut parts = Vec::with_capacity(items.len());
+                for item in items {
+                    parts.push(cell_json(item)?);
+                }
+                format!("[{}]", parts.join(","))
+            }
+            _ => return None,
+        };
+        let mut out = String::from("{");
+        let mut first = true;
+        emit(&mut out, &mut first, "run_id", &json_string(req_str(value, "run_id")?));
+        emit(
+            &mut out,
+            &mut first,
+            "hermit_sha",
+            &json_string(req_str(value, "hermit_sha")?),
+        );
+        emit(
+            &mut out,
+            &mut first,
+            "source_tree_dirty",
+            &req_bool(value, "source_tree_dirty")?.to_string(),
+        );
+        emit(
+            &mut out,
+            &mut first,
+            "selected_count",
+            &req_u64(value, "selected_count")?.to_string(),
+        );
+        emit(
+            &mut out,
+            &mut first,
+            "recorded_count",
+            &req_u64(value, "recorded_count")?.to_string(),
+        );
+        emit(
+            &mut out,
+            &mut first,
+            "population_sha256",
+            &json_string(req_str(value, "population_sha256")?),
+        );
+        emit(&mut out, &mut first, "artifact", &artifact_out);
+        emit(&mut out, &mut first, "selected", &selected);
+        emit(&mut out, &mut first, "cells", &cells);
+        out.push('}');
+        Some(out)
+    })();
+    match typed {
+        Some(text) => Some(text),
+        None => serde_json::to_string(&to_serde(value)?).ok(),
+    }
+}
+
 fn gate_canonical(gate: &PyValue) -> Option<String> {
     let name = gate.get("name")?.as_str()?;
     let mut out = String::from("{");
@@ -448,7 +883,7 @@ pub fn receipt_canonical_json(row: &PyValue) -> Option<String> {
             }
             "cell_results" => match row.get(field) {
                 None | Some(PyValue::Null) => Some("null".to_owned()),
-                Some(value) => Some(serde_json::to_string(&to_serde(value)?).ok()?),
+                Some(value) => Some(cell_results_canonical(value)?),
             },
             "test_results" => match row.get(field) {
                 None | Some(PyValue::Null) => None,

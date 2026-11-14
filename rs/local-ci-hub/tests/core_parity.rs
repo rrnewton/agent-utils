@@ -213,6 +213,77 @@ fn receipt_canonical_uses_struct_order() {
 }
 
 #[test]
+fn receipt_canonical_nested_typed_cell_results_use_struct_order() {
+    // Synthetic nested record mirroring the typed evidence shape:
+    // written key order is deliberately scrambled at every depth.
+    let row = parse(
+        "{\"schema_version\":7,\"run_id\":\"run-1\",\
+          \"cell_results\":{\"cells\":[{\"backend\":\"b1\",\"mode\":\"m1\",\"test\":\"t1\",\
+          \"category\":\"c1\",\"lane\":\"l1\",\"cell_verdict\":{\"bitwise_parity\":true,\
+          \"compared_log_messages\":{\"right\":2,\"left\":1},\"comparison\":{\
+          \"skip_detlog\":false,\"skip_commit\":true,\"ignore_lines\":false,\
+          \"canonicalizations\":[],\"stripped_prefixes\":[\"p\"],\"exact_remainder\":true,\
+          \"full_trace\":false,\"canonicalize_addresses\":true,\"strip_lines\":false,\
+          \"log_scope\":\"info\",\"virtualize_time\":null,\"record_envelope\":\"all\",\
+          \"compare_io_buffers\":true,\"compare_logs\":true,\"display_name\":\"Spec\",\
+          \"strictness\":\"canonical\"},\"comparison_tier\":\"canonical-bitwise\",\
+          \"state\":\"compared-and-matched\"}}],\
+          \"selected\":[{\"test\":\"t1\",\"backend\":\"b1\",\"lane\":\"l1\",\"mode\":\"m1\",\"category\":\"c1\"}],\
+          \"artifact\":{\"row_count\":3,\"sha256\":\"s\",\"path\":\"a/b.jsonl\"},\
+          \"population_sha256\":\"pop\",\"recorded_count\":1,\"selected_count\":1,\
+          \"source_tree_dirty\":false,\"hermit_sha\":\"hhhh\",\"run_id\":\"run-1\"},\
+          \"coverage\":{\"artifact\":{\"path\":\"cov.json\",\"sha256\":\"cs\",\"row_count\":9},\
+          \"planned_test_nodes\":20,\"executed_test_nodes\":20,\"zero_executed_nodes\":[],\"absent_nodes\":[]},\
+          \"gates\":[{\"name\":\"g1\",\"result\":\"pass\",\"attempts\":[{\"attempt\":1,\"real_seconds\":1.5,\"nested\":{\"y\":1,\"x\":\"café\"}}]}]}",
+    )
+    .unwrap();
+    let canonical = receipt_canonical_json(&row).expect("row canonicalizes");
+    // Evidence struct order, artifact struct order, identity order.
+    assert!(
+        canonical.contains(
+            "\"cell_results\":{\"run_id\":\"run-1\",\"hermit_sha\":\"hhhh\",\"source_tree_dirty\":false,\
+             \"selected_count\":1,\"recorded_count\":1,\"population_sha256\":\"pop\",\
+             \"artifact\":{\"path\":\"a/b.jsonl\",\"sha256\":\"s\",\"row_count\":3},\
+             \"selected\":[{\"lane\":\"l1\",\"category\":\"c1\",\"test\":\"t1\",\"mode\":\"m1\",\"backend\":\"b1\"}]"
+        ),
+        "{canonical}"
+    );
+    // Coverage keeps only its four typed fields; the artifact sub-object
+    // is dropped by the typed shape on both sides.
+    assert!(
+        canonical.contains(
+            "\"coverage\":{\"planned_test_nodes\":20,\"executed_test_nodes\":20,\
+             \"zero_executed_nodes\":[],\"absent_nodes\":[]}"
+        ),
+        "{canonical}"
+    );
+    // Gate attempts stay in the sorted extension area at every depth.
+    assert!(
+        canonical.contains(
+            "\"attempts\":[{\"attempt\":1,\"nested\":{\"x\":\"café\",\"y\":1},\"real_seconds\":1.5}]"
+        ),
+        "{canonical}"
+    );
+}
+
+#[test]
+fn receipt_canonical_untyped_cell_results_keep_sorted_form() {
+    // An unknown key defeats the typed shape: the whole value falls
+    // back to the generic sorted-key form.
+    let row = parse(
+        "{\"cell_results\":{\"run_id\":\"run-1\",\"future_field\":{\"z\":1,\"a\":2}}}",
+    )
+    .unwrap();
+    let canonical = receipt_canonical_json(&row).expect("row canonicalizes");
+    assert!(
+        canonical.contains(
+            "\"cell_results\":{\"future_field\":{\"a\":2,\"z\":1},\"run_id\":\"run-1\"}"
+        ),
+        "{canonical}"
+    );
+}
+
+#[test]
 fn fixture_events_match_by_envelope_or_row_producer() {
     let producers: BTreeSet<String> = ["live-sync-check".to_owned()].into();
     let ordinary = result_event("e1", "r1", "2026-11-01T00:00:00Z", "{}");
