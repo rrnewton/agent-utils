@@ -610,10 +610,10 @@ struct TeamDriverFlags {
     /// Startup-readiness deadline for each revived harness in seconds, greater than 0 and at most 300 (default: 30)
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
-    /// Seconds HANDOFF gets before ESCALATE, from 1 to 86400 (default: 1800)
-    #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..=86400), value_name = "SECONDS")]
+    /// Seconds HANDOFF gets before ESCALATE, positive and bounded (default: 1800)
+    #[arg(long, default_value_t = 1800, value_parser = handoff_seconds, value_name = "SECONDS")]
     handoff_timeout_seconds: u64,
-    /// Seconds a sole unprocessed coordinator notice may stay pending in VERIFY before it counts as failed, from 0 to 86400 (default: 1800)
+    /// Seconds a sole unprocessed coordinator notice may stay pending in VERIFY before it counts as failed, bounded (default: 1800)
     #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
     ack_timeout_seconds: u64,
     /// Escalation route file (default: escalation.toml in the synced configuration directory under $XDG_CONFIG_HOME, else under ~/.config; an absent file means no routes)
@@ -2843,6 +2843,15 @@ fn watch_minutes(value: &str) -> Result<u64, String> {
     let value: u64 = value.parse().map_err(|_| "expected a number of minutes")?;
     if !(1..=1440).contains(&value) {
         return Err("minutes must be between 1 and 1440".to_owned());
+    }
+    Ok(value)
+}
+fn handoff_seconds(value: &str) -> Result<u64, String> {
+    let value: u64 = value
+        .parse()
+        .map_err(|_| "expected a whole number of seconds".to_owned())?;
+    if value == 0 || value > 86_400 {
+        return Err("handoff seconds must be from 1 to one day".to_owned());
     }
     Ok(value)
 }
