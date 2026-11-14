@@ -633,11 +633,11 @@ body:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #doc-outline-open:
    scrolls away with the reader; the list scrolls inside the panel. It stands on
    the dock, by the button that opens it; with the bar moved to the header it
    hangs from the top instead. ALWAYS DARK, in either colour scheme (`#1078`):
-   light text on a dark ground with a border on every row, a step away from the
+   light text on a dark ground, a step away from the
    main window's dress so it reads as an overlay. The colours are stated, not
    taken from the scheme's variables, because in the light scheme the variables
-   would make it light — the filled accent buttons it replaces came from the
-   generic `button` rule wearing through for want of a row rule here. */
+   would make it light. Inside it, the entries are an indented text list
+   (`#1542 documents-outline-text-list`), not button boxes. */
 #doc-outline-pop {
   position: absolute;
   bottom: 8px;
@@ -666,22 +666,27 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
+/* Entries are real <button>s for keyboard and screen-reader behaviour, dressed
+   as plain text (`#1542`): no background, border or radius — indentation by
+   heading level (below) and an underline on hover carry the list. */
 #doc-outline button {
   display: block;
   width: 100%;
-  padding: 6px 8px;
+  padding: 4px 8px;
   text-align: left;
   cursor: pointer;
-  background: #262c36;
+  background: transparent;
   color: #e7e9ee;
-  border: 1px solid #3d4452;
-  border-radius: 6px;
+  border: none;
+  border-radius: 0;
   font: inherit;
+  text-decoration: none;
 }
 #doc-outline button:hover {
-  background: #2b323e;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 #doc-outline button:focus-visible {
   outline: 2px solid #7ab3e3;
@@ -705,14 +710,13 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
 #doc-outline .doc-ol-6 {
   padding-left: 68px;
 }
-/* HERE: the section at the top of the scroller, unmistakable on the dark rows:
-   a lighter ground, an accent border and bar, and bold — colour alone would
+/* HERE: the section at the top of the scroller, unmistakable in the text list:
+   bold, full-white ink and an accent bar at its indent — colour alone would
    leave it to hue, and its `aria-current` says it where colour cannot. */
 #doc-outline button.doc-here {
   font-weight: 700;
   color: #fff;
-  background: #2e3d52;
-  border-color: #5b9dd9;
+  background: transparent;
   box-shadow: inset 3px 0 0 #5b9dd9;
 }
 /* A jumped-to heading clears the scroller's top fade instead of hiding under

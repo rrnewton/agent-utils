@@ -13,10 +13,13 @@ leaves the app, and a GitHub row the stub answers with an error shows that
 error on the row. No documents API is stubbed: list, fetch and render all go
 through the server under test.
 
-The reader steps also cover `#1038 documents-outline-popup`: the seeded paste
+The reader steps also cover `#1038 documents-outline-popup` and
+`#1542 documents-outline-text-list`: the seeded paste
 is long enough to scroll several viewports, and at 393x852 (touch) and again
-at 1280x800 (mouse) the Outline button opens the pop-up, an entry tap/click
-jumps to its heading, the HERE mark follows scrolling, and the title links
+at 1280x800 (mouse) the Outline button opens the pop-up as an indented text
+list (no button boxes, underline on hover), an entry tap/click
+jumps to its heading and the pop-up stays open until an outside tap/click or
+Escape, the HERE mark follows scrolling, and the title links
 to the document's original source in a new tab.
 
 The Fetch since… steps cover `#1308 doc-fetch-since-prompt`: scrolled to
@@ -430,13 +433,23 @@ def main() -> int:
                     }""")
                 check(indent[1] > indent[0] and indent[2] > indent[1] and indent[3] == indent[1],
                       f"outline indentation does not follow heading levels: {indent}")
+                # A text list, not button boxes (`#1542`): no filled
+                # background or border on the entries.
+                chrome = page.evaluate(
+                    """() => [...document.querySelectorAll('#doc-outline button')]
+                        .map((b) => { const s = getComputedStyle(b);
+                          return {bg: s.backgroundColor, border: s.borderTopWidth,
+                                  deco: s.textDecorationLine}; })""")
+                check(all(c["bg"] in ("rgba(0, 0, 0, 0)", "transparent") and c["border"] == "0px"
+                          for c in chrome),
+                      f"outline entries still wear button chrome: {chrome}")
 
-                # A tap on a later entry jumps to its heading, closes the pop-up,
-                # and that entry becomes HERE.
+                # A tap on a later entry jumps to its heading, the pop-up
+                # stays open (`#1542`), and that entry becomes HERE.
                 page.locator("#doc-outline button", has_text="Finish").tap()
                 wait_heading_at_top(page, "doc-finish", "2 Finish")
-                check(page.locator("#doc-outline-pop").is_hidden(),
-                      "picking an outline entry left the pop-up open")
+                check(not page.locator("#doc-outline-pop").is_hidden(),
+                      "picking an outline entry closed the pop-up")
 
                 # Scrolling (here by scrollTop, as a swipe would move it) advances HERE.
                 page.evaluate(
@@ -447,10 +460,8 @@ def main() -> int:
                     }""")
                 wait_here_is(page, "1 Setup")
 
-                # An outside tap closes the pop-up without moving the document.
-                page.tap("#doc-outline-open")
-                page.wait_for_function(
-                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                # An outside tap closes the still-open pop-up without
+                # moving the document (`#1542`: it stayed open after the pick).
                 top_before = page.evaluate("() => document.getElementById('scroll-area').scrollTop")
                 # Inside the scroller, clear of the dock: the reader's pane
                 # stands there now (`#1515`), so a fixed phone coordinate
@@ -610,13 +621,26 @@ def main() -> int:
                     "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
                 dtexts = [t.strip() for t in dpage.locator("#doc-outline button").all_text_contents()]
                 check(dtexts == OUTLINE_TEXTS, f"the desktop outline lists {dtexts}, not {OUTLINE_TEXTS}")
-                dpage.locator("#doc-outline button", has_text="Setup details").click()
-                wait_heading_at_top(dpage, "doc-setup-details", "1.1 Setup details")
-                check(dpage.locator("#doc-outline-pop").is_hidden(),
-                      "picking a desktop outline entry left the pop-up open")
-                dpage.click("#doc-outline-open")
+                # Hover underlines an entry (`#1542`), with no button chrome.
+                hover_entry = dpage.locator("#doc-outline button", has_text="Setup details")
+                hover_entry.hover()
                 dpage.wait_for_function(
-                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                    """() => {
+                      const b = [...document.querySelectorAll('#doc-outline button')]
+                        .find((x) => x.textContent.trim() === '1.1 Setup details');
+                      const s = getComputedStyle(b);
+                      return s.textDecorationLine.includes('underline')
+                        && s.backgroundColor === 'rgba(0, 0, 0, 0)';
+                    }""", timeout=20_000)
+                hover_entry.click()
+                wait_heading_at_top(dpage, "doc-setup-details", "1.1 Setup details")
+                check(not dpage.locator("#doc-outline-pop").is_hidden(),
+                      "picking a desktop outline entry closed the pop-up")
+                # A second pick while still open jumps again (`#1542`).
+                dpage.locator("#doc-outline button", has_text="Finish").click()
+                wait_heading_at_top(dpage, "doc-finish", "2 Finish")
+                check(not dpage.locator("#doc-outline-pop").is_hidden(),
+                      "the second desktop pick closed the pop-up")
                 dpage.keyboard.press("Escape")
                 dpage.wait_for_function(
                     "() => document.getElementById('doc-outline-pop').hidden", timeout=20_000)

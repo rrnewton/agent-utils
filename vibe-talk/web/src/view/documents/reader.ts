@@ -12,6 +12,9 @@
 // come from the headings as rendered in
 // the body — their real anchor ids and levels, not a re-derivation. While the
 // document scrolls, the entry for the section at the top is marked HERE. The
+// entries are an indented text list (`#1542 documents-outline-text-list`):
+// picking one jumps to its section and the pop-up stays open until the reader
+// clicks away outside it or presses Escape. The
 // title is a link to the document's original source where that address is a safe
 // http(s) one, and plain text otherwise.
 
@@ -569,9 +572,11 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       button.className = `doc-ol-item doc-ol-${entry.level}`;
       button.setAttribute("data-level", String(entry.level));
       button.textContent = entry.text;
+      // `#1542 documents-outline-text-list`: a pick jumps and the pop-up
+      // stays open (focus stays on the entry); only an outside click or
+      // Escape closes it, so several sections can be visited in one open.
       listening.listen(button, "click", () => {
         scrollToHeading(entry.id);
-        closeOutline(true);
       });
       item.appendChild(button);
       list.appendChild(item);

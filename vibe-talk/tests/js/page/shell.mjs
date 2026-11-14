@@ -509,14 +509,17 @@ test("`#880 voice-page-menu-placement`: the hamburger is LEFT of the view button
 
 test("`#1078 bottom-bar-switcher`: the pane stands over the bar, Outline is in the bar, and taps step the tab row", async () => {
   // The flip and the moved button, as declarations: one reversed column on a phone, Outline in
-  // the bar's markup and out of the reader's toolbar, dark bordered outline rows.
+  // the bar's markup and out of the reader's toolbar, text-list outline entries.
   assert.match(cssBlock("#dock"), /flex-direction:\s*column-reverse/, "the pane is not drawn over the bar");
   assertMarkupContains("control-bar", "doc-outline-open");
   const toolbar = HTML_CODE.slice(HTML_CODE.indexOf('id="docs-reader"'), HTML_CODE.indexOf('id="doc-body"'));
   assert.ok(!toolbar.includes('id="doc-outline-open"'), "Outline is still in the reader's toolbar");
   const row = cssBlock("#doc-outline button");
-  assert.match(row, /border:\s*1px solid #[0-9a-f]/i, "outline rows have no stated border");
-  assert.match(row, /background:\s*#[0-9a-f]/i, "outline rows have no stated dark ground");
+  // `#1542 documents-outline-text-list`: entries are text, not button boxes.
+  assert.match(row, /border:\s*none/i, "outline entries wear a button border");
+  assert.match(row, /background:\s*transparent/i, "outline entries wear a filled button ground");
+  assert.match(cssBlock("#doc-outline button:hover"), /text-decoration:\s*underline/,
+    "outline entries do not underline on hover");
   assert.doesNotMatch(row, /var\(--accent\)/, "outline rows are filled from the accent again");
   assert.match(cssBlock("#doc-outline-pop"), /background:\s*#[0-9a-f]/i, "the outline panel has no stated dark ground");
   // `#1166 switcher-frame-panel`: the tab row stands in its own framed panel, and its current

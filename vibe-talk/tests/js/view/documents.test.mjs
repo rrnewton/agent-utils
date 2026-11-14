@@ -1150,7 +1150,7 @@ test("documents reader: the Outline button opens and closes the pop-up, said bot
   });
 });
 
-test("documents reader: picking an entry jumps, closes the pop-up, and returns focus", async () => {
+test("documents reader: picking an entry jumps and keeps the pop-up open (#1542 documents-outline-text-list)", async () => {
   const headings = [
     headingEl(1, "doc-demo", "Demo"),
     headingEl(2, "doc-setup", "Setup"),
@@ -1163,8 +1163,17 @@ test("documents reader: picking an entry jumps, closes the pop-up, and returns f
     assert.equal(headings[2].scrolls.length, 1, "the picked heading was not scrolled to");
     assert.deepEqual(headings[2].scrolls[0], { block: "start" });
     assert.equal(headings[0].scrolls.length + headings[1].scrolls.length, 0, "another heading scrolled");
-    assert.equal(els["doc-outline-pop"].hidden, true, "picking an entry left the pop-up open");
-    assert.ok(els["doc-outline-open"].focused >= 1, "focus did not return to the Outline button");
+    assert.equal(els["doc-outline-pop"].hidden, false, "picking an entry closed the pop-up");
+    assert.equal(els["doc-outline-open"].getAttribute("aria-expanded"), "true",
+      "picking an entry marked the Outline button collapsed");
+    assert.equal(els["doc-outline-open"].focused, 0, "picking an entry moved focus to the Outline button");
+    // A second pick while open jumps again and still leaves the pop-up open.
+    dispatchClick(buttons[1]);
+    assert.equal(headings[1].scrolls.length, 1, "the second picked heading was not scrolled to");
+    assert.equal(els["doc-outline-pop"].hidden, false, "the second pick closed the pop-up");
+    // Entries stay real buttons (keyboard/screen-reader behaviour), styled as text by CSS.
+    assert.equal(buttons[1].tagName, "BUTTON", "an outline entry is not a button");
+    assert.equal(buttons[1].type, "button", "an outline entry is not type=button");
   });
 });
 
