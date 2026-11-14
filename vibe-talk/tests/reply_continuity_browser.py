@@ -335,6 +335,33 @@ MEASURE_JS = """(id) => {
 
 OPEN = "() => !document.getElementById('column-reply').hidden"
 CLOSED = "() => document.getElementById('column-reply').hidden"
+# `#1512 page-browser-checks-settle-under-load`: generous failure bound for condition
+# waits. No verdict is taken from a clock; this only bounds a page that never settles.
+STATE_S = 30.0
+# The layout this walk measures, read part by part: the list's scroll, the reply
+# mount, the chip/tools row and the status line the foot is reckoned against, and
+# the row count. A chip row landing late changes a part, so stability over
+# consecutive frame-separated samples is the settle the old fixed 80 ms only
+# hoped for. The parts are separate evaluates on purpose: one evaluate reading
+# every rect at once forces a full layout pass that scroll-anchors the list and
+# drops a live text selection (`#1512` probe: each part alone, and a plain
+# 600 ms wait, left a drag selection intact; the combined read cleared it).
+SNAPSHOT_JS: tuple[str, ...] = (
+    "() => { const a = document.getElementById('scroll-area');"
+    " return a ? [a.scrollTop, a.scrollHeight, a.clientHeight] : null; }",
+    "() => { const e = document.getElementById('column-reply');"
+    " if (!e) return null; const r = e.getBoundingClientRect(); return [r.top, r.bottom, r.left, r.right]; }",
+    "() => { const e = document.getElementById('discord-log');"
+    " if (!e) return null; const r = e.getBoundingClientRect(); return [r.top, r.bottom, r.left, r.right]; }",
+    "() => { const t = document.getElementById('scroll-tools');"
+    " return t ? [t.hidden ? 1 : 0, t.getBoundingClientRect().height] : null; }",
+    "() => { const e = document.getElementById('status-line');"
+    " if (!e) return null; const r = e.getBoundingClientRect(); return [r.top, r.bottom, r.left, r.right]; }",
+    "() => { const e = document.getElementById('channel-composer');"
+    " if (!e) return null; const r = e.getBoundingClientRect(); return [r.top, r.bottom, r.left, r.right]; }",
+    "() => document.querySelectorAll('#discord-log > li[data-id]').length",
+    "() => [window.innerWidth, window.innerHeight]",
+)
 # The gap the stylesheet leaves between a row and the box under it, and what a pixel either way allows.
 UNDER_PX = (0, 8)
 # How near its foot a list counts as at its foot, as web/voice.js's `BOTTOM_SLACK_PX` says.
@@ -395,14 +422,34 @@ class Walk:
         return Measured({str(key): value for key, value in found.items()})
 
     def settled(self) -> None:
-        # Two frames and 80 ms (`#1118 browser-fixed-frame-settle`): in this walk only a paint
-        # window after a `wait_for` has pinned the box open or away, before the moved-by-a-pixel
-        # measures, to land a scroll before its baseline, or to carry a no-move window. Never
+        # Layout stable over consecutive frame-separated samples (`#1512`), not two
+        # frames and 80 ms of wall clock (`#1118`'s settle, which a loaded host could
+        # outrun: a chip/tools row landing after it moved the foot by its own height
+        # after the page had already scrolled). Each sample is taken after two real
+        # animation frames; three identical samples in a row are the settle. Never
         # the only wait before reading what a press draws: `wait_for` that first.
-        self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
-        self.page.wait_for_timeout(80)
+        deadline = time.monotonic() + STATE_S
+        last: str | None = None
+        stable = 0
+        seen: list[str] = []
+        while True:
+            self.page.evaluate(
+                "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
+            snap = json.dumps(
+                [[round(float(v), 1) if isinstance(v, (int, float)) else v for v in part]
+                 if isinstance(part, list) else part
+                 for part in (self.page.evaluate(js) for js in SNAPSHOT_JS)],
+                sort_keys=True)
+            seen = [*seen[-2:], snap]
+            stable = stable + 1 if snap == last else 0
+            last = snap
+            if stable >= 2:
+                return
+            check(time.monotonic() < deadline,
+                  f"{self.label}: layout did not settle within {STATE_S:.0f}s; last samples: {seen}")
+            self.page.wait_for_timeout(50)
 
-    def wait_for(self, condition: str, why: str, seconds: float = 10) -> None:
+    def wait_for(self, condition: str, why: str, seconds: float = STATE_S) -> None:
         try:
             self.page.wait_for_function(condition, timeout=seconds * 1000)
         except Exception as error:  # noqa: BLE001 - Playwright's timeout, said as this check's failure
@@ -422,10 +469,17 @@ class Walk:
             with self.api.lock:
                 posted = list(self.api.replies[sent:])
             if posted:
-                # The old fixed read also caught a second copy posted in the
-                # same burst; keep that detection horizon after the first
-                # arrival instead of returning at first sight.
-                self.page.wait_for_timeout(200)
+                # A second copy posted in the same burst is still caught: return
+                # only once the API's record is unchanged over consecutive polls
+                # (`#1512`), not after a fixed 200 ms a loaded host could outrun.
+                stable = 0
+                count = len(posted)
+                while stable < 3:
+                    self.page.wait_for_timeout(50)
+                    with self.api.lock:
+                        now = list(self.api.replies[sent:])
+                    stable = stable + 1 if len(now) == count else 0
+                    count = len(now)
                 with self.api.lock:
                     return list(self.api.replies[sent:])
             self.check(time.monotonic() < deadline, f"{why}: nothing left the browser")
@@ -574,7 +628,6 @@ def resize_case(walk: Walk, sizes: tuple[tuple[int, int], ...]) -> None:
         assert was is not None
         walk.page.set_viewport_size({"width": width, "height": height})
         walk.settled()
-        walk.page.wait_for_timeout(120)
         after = walk.measure(index)
         size = f"{was['width']}x{was['height']} -> {width}x{height}"
         walk.check(after.found["open"] is True, f"resize {size}: the reply went")
@@ -1327,7 +1380,7 @@ def drafts_walk(walk: Walk) -> None:
     # The box at the channel's foot.
     page.click("#channel-compose-text")
     page.keyboard.type("composer draft")
-    walk.page.wait_for_timeout(200)
+    walk.settled()
     walk.check(state()["chip"] is None, f"drafts: a chip for the draft in the box on screen: {state()}")
     page.evaluate("() => document.activeElement && document.activeElement.blur()")
     # A quick reply, closed by Esc with words in it.

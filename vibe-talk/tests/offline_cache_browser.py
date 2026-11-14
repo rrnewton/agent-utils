@@ -2503,7 +2503,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     "#discord-log > li[data-id]", "items => items.map(i => i.getAttribute('data-id'))")]
 
             def wait_rows(expected: list[str], why: str) -> None:
-                deadline = time.monotonic() + 10
+                # `#1512`: a generous failure bound, never a verdict from a clock.
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and rows() != expected:
                     page.wait_for_timeout(50)
                 check(rows() == expected, f"{why}: showing {rows()}, expected {expected}")
@@ -2533,7 +2534,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 return "/timeline" in address
 
             def wait_pill(prefix: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not (pill().startswith(prefix) if prefix else current(pill())):
                     page.wait_for_timeout(50)
                 check(pill().startswith(prefix) if prefix else current(pill()), f"{label}, {why}: pill {pill()!r}")
@@ -2548,17 +2549,42 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     page.unroute(timeline_read, failing)
                 else:
                     wait_pill("", "the in-place refresh did not recover")
-                page.wait_for_timeout(100)
+                # No fixed dwell: `place` below now judges only a settled place (`#1512`).
 
             def place(where: str) -> dict[str, float]:
+                # `#1512`: judge only a settled place — the same measure unchanged
+                # over consecutive polls — not a one-shot read a late chip row or
+                # ResizeObserver correction could still be moving.
                 found = page.evaluate(PLACE_JS, where)
-                return {key: float(found[key]) for key in ("row", "gap", "top", "bottom", "banner")}
+                place_now = {key: float(found[key]) for key in ("row", "gap", "top", "bottom", "banner")}
+                deadline = time.monotonic() + STATE_S
+                stable = 0
+                while stable < 2:
+                    page.wait_for_timeout(50)
+                    found = page.evaluate(PLACE_JS, "")
+                    again = {key: float(found[key]) for key in ("row", "gap", "top", "bottom", "banner")}
+                    stable = stable + 1 if again == place_now else 0
+                    place_now = again
+                    check(time.monotonic() < deadline,
+                          f"{label}: the reader's place did not settle within {STATE_S:.0f}s; last {place_now}")
+                return place_now
 
             def geometry(state: str, name: str) -> str:
                 # At the head of the list: the pill floats over it with no band reserved
                 # (`#1320 no-freshness-band`); tests/live_pill_browser.py walks the same
                 # floating line at every scroll position.
+                # `#1512`: judge only settled geometry — the same measure unchanged
+                # over consecutive polls — within a generous failure bound.
                 found = page.evaluate(GEOMETRY_JS)
+                deadline = time.monotonic() + STATE_S
+                stable = 0
+                while stable < 2:
+                    page.wait_for_timeout(50)
+                    again = page.evaluate(GEOMETRY_JS)
+                    stable = stable + 1 if again == found else 0
+                    found = again
+                    check(time.monotonic() < deadline,
+                          f"{label}, {state}: geometry did not settle within {STATE_S:.0f}s; last {found}")
                 shot(name)
                 problems = [str(problem) for problem in found["problems"]]
                 check(not problems, f"{label}, {state}: {problems}")
@@ -2667,7 +2693,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(page.evaluate("() => document.getElementById('thread-select').value") == "flat",
                   f"{label}: the reload did not reopen in All")
             wait_rows(["200", "201", "202"], "the snapshot was not drawn before the network answered")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and "refreshing" not in pill():
                 page.wait_for_timeout(50)
             text = pill()
@@ -2689,11 +2715,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             kinds = ["config" if "/client-config" in r else "stream" if "/stream" in r else "read" for r in order]
             check(kinds[:3] == ["config", "stream", "read"],
                   f"the cold-start read did not wait for sign-in and the stream: {order}")
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and not current(pill()):
                 page.wait_for_timeout(50)
             check(current(pill()), f"a refreshed view still says {pill()!r}")
-            check(str(page.evaluate(GEOMETRY_JS)["area"]) == baseline,
+            check(geometry("refreshed", "3-merged-area") == baseline,
                   f"{label}: #scroll-area changed size when the pill turned current")
             shot("3-merged")
 
@@ -2729,7 +2755,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 page.touchscreen.tap(float(centre[0]), float(centre[1]))
             else:
                 page.mouse.click(float(centre[0]), float(centre[1]))
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and page.evaluate("() => document.getElementById('search-field').hidden"):
                 page.wait_for_timeout(50)
             opened = page.evaluate(SEARCH_OPEN_JS, "")
@@ -2866,7 +2892,24 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             # Down from halfway up, so the jump is up by the scroll listener's own decision.
             page.evaluate(PARK_JS, "middle")
             wait_jump(True)
-            park_still(40)
+            # Establish "40px up with the jump showing" as drawn state, however
+            # often the parking has to be redone: under a 48-core burner the
+            # page twice in 20 runs sampled the parking scroll while the room
+            # under the composer was still settling and cleared the scrollback
+            # the jump stands for (once at a drawn gap of exactly 40, once
+            # followed to the foot at gap 0; `#1512`). Re-parking from halfway
+            # up re-raises the jump by the scroll listener's own decision each
+            # time; the shrink judgement below is untouched and still fails a
+            # page that will not hold this state within STATE_S.
+            deadline = time.monotonic() + STATE_S
+            found = cast("JumpMeasure", page.evaluate(JUMP_JS))
+            while not (bool(found["shown"]) and abs(float(found["gap"]) - 40) <= 1):
+                page.evaluate(PARK_JS, "middle")
+                wait_jump(True)
+                park_still(40)
+                found = cast("JumpMeasure", page.evaluate(JUMP_JS))
+                check(time.monotonic() < deadline,
+                      f"{label}: could not park 40px short with the jump showing within {STATE_S:.0f}s; last {found}")
             wait_jump_drawn("come down to 40px short of the end from halfway up, the jump is not still up",
                             lambda found: bool(found["shown"]) and abs(float(found["gap"]) - 40) <= 1)
             page.evaluate("() => { window.__holdScrolls = true; }")
@@ -2919,19 +2962,35 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 # clock stands still while the finger is down; the fetch itself needs no timer. Then
                 # a moment for anything those timers already put on the wire to land before counting.
                 page.clock.pause_at(int(page.evaluate("() => Date.now()")) + 1000)
-                page.wait_for_timeout(500)
+                # `#1512`: until the request record is unchanged over consecutive
+                # polls, not a fixed 500/400 ms a loaded host could outrun.
+                stable = 0
+                seen_count = -1
+                while stable < 3:
+                    page.wait_for_timeout(50)
+                    with api.lock:
+                        now_count = len(api.requests)
+                    stable = stable + 1 if now_count == seen_count else 0
+                    seen_count = now_count
                 with api.lock:
                     seen = len(api.requests)
                 reads_before = len(api.reads())
                 drag_up(30)
-                page.wait_for_timeout(400)
+                stable = 0
+                seen_count = -1
+                while stable < 3:
+                    page.wait_for_timeout(50)
+                    with api.lock:
+                        now_count = len(api.requests)
+                    stable = stable + 1 if now_count == seen_count else 0
+                    seen_count = now_count
                 with api.lock:
                     during = api.requests[seen:]
                 check(len(api.reads()) == reads_before,
                       f"{label}: a 30px drag at the newest line read the channel; requests since: {during}")
                 check(affordance()[0] == "", f"{label}: a short drag left the affordance up: {affordance()}")
                 drag_up(160)
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not affordance()[0].startswith("Updated"):
                     page.wait_for_timeout(50)
                 shown = affordance()
@@ -2946,7 +3005,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 page.clock.resume()
                 # After the resume: `place` waits on animation frames, which the paused clock holds.
                 check(place("")["gap"] <= 2, f"{label}: the refresh moved the reader off the newest line")
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and affordance()[0]:
                     page.wait_for_timeout(50)
                 check(affordance()[0] == "", f"{label}: the pull's result never went: {affordance()}")
@@ -2978,7 +3037,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             chosen = [(entry.get("channel"), entry.get("channelView")) for entry in record.get("channels", [])]
             check(record.get("v") == 2 and chosen == [(CHANNEL["id"], "main")],
                   f"{label}: Main was not kept as the channel's choice: v{record.get('v')} {chosen}")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and not pill().startswith("Offline"):
                 page.wait_for_timeout(50)
             check(pill().startswith("Offline · showing messages saved "), f"offline pill: {pill()!r}")
@@ -2993,7 +3052,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.reload(wait_until="load")
             reopened("a failing refresh")
             wait_rows(["200", "201", "203"], "the snapshot was not kept after a failed refresh")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and not pill().startswith("Refresh failed"):
                 page.wait_for_timeout(50)
             check(pill().startswith("Refresh failed · showing messages from "), f"failed pill: {pill()!r}")
@@ -3001,9 +3060,24 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.unroute(timeline_read, failing)
 
             # 6. Nothing private is in Cache Storage, and no service worker holds one.
-            cache_names = page.evaluate("() => caches.keys()")
+            # `#1512`: waited for as settled registry state — no registration in
+            # flight and no cache appearing — not read once after the walks above.
+            deadline = time.monotonic() + STATE_S
+            cache_names: list[object] = []
+            workers = -1
+            stable = 0
+            while stable < 3:
+                cache_names = list(page.evaluate("() => caches.keys()"))
+                workers = int(page.evaluate("() => navigator.serviceWorker.getRegistrations().then(r => r.length)"))
+                settled_state = not cache_names and workers == 0
+                stable = stable + 1 if settled_state else 0
+                if stable >= 3:
+                    break
+                check(time.monotonic() < deadline,
+                      f"{label}: cache/service-worker state did not settle empty within {STATE_S:.0f}s; "
+                      f"caches {cache_names}, workers {workers}")
+                page.wait_for_timeout(50)
             check(cache_names == [], f"Cache Storage holds {cache_names}")
-            workers = page.evaluate("() => navigator.serviceWorker.getRegistrations().then(r => r.length)")
             check(workers == 0, f"{workers} service workers are registered")
 
             # 6b. A thread named longer than the screen: the page is not widened, and the thread is
@@ -3052,10 +3126,19 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             def storage_state() -> str:
                 return str(page.evaluate("() => document.getElementById('storage-state').textContent"))
 
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and not refused and "write-scope token" not in storage_state():
                 page.wait_for_timeout(50)
-            page.wait_for_timeout(300)
+            # `#1512`: no fixed 300 ms grace — judge once the refusal/console
+            # record is unchanged over consecutive polls, so a late probe on a
+            # loaded host is still seen, and a quiet page is not held to a clock.
+            stable = 0
+            seen = (len(refused), len(console_errors))
+            while stable < 3:
+                page.wait_for_timeout(50)
+                now = (len(refused), len(console_errors))
+                stable = stable + 1 if now == seen else 0
+                seen = now
             shot("8-read-scope")
             check(not refused, f"{label}, read-scope token: the page was refused {refused}")
             check(not console_errors, f"{label}, read-scope token: console errors {console_errors}")
@@ -3132,7 +3215,7 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                     page.mouse.click(x, y)
 
             def wait_for(row_id: str, ready: str, why: str) -> dict[str, object]:
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + STATE_S
                 found = where(row_id)
                 while time.monotonic() < deadline and not page.evaluate(ready, found):
                     page.wait_for_timeout(50)
@@ -3281,7 +3364,7 @@ def tile_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 return f"document.querySelector('#discord-log > li[data-id=\"{row_id}\"]')"
 
             def wait_for(ready: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(ready):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(ready)), f"{label}: {why}")
@@ -3406,7 +3489,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                     page.screenshot(path=str(args.screenshots / f"{label}-dock-{name}.png"), animations="disabled")
 
             def until(script: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(script):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(script)), f"{label}: {why}")
@@ -3417,7 +3500,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 # Settled: a view that has just changed redraws its picker's label once its rows land,
                 # so the dock is measured once two looks a tenth of a second apart agree.
                 found: DockFound = page.evaluate(DOCK_JS, {"desk": desk, "order": order})
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline:
                     page.wait_for_timeout(100)
                     again: DockFound = page.evaluate(DOCK_JS, {"desk": desk, "order": order})
@@ -3742,7 +3825,7 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
                 press(float(at[0]), float(at[1]), twice)
 
             def wait_until(ready: str, why: str) -> None:
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(ready):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(ready)), f"{label}: {why}")
@@ -3947,7 +4030,7 @@ def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 page.on("pageerror", lambda error: errors.append(str(error)))
 
                 def until(script: str, why: str) -> None:
-                    deadline = time.monotonic() + 10
+                    deadline = time.monotonic() + STATE_S
                     while time.monotonic() < deadline and not page.evaluate(script):
                         page.wait_for_timeout(50)
                     check(bool(page.evaluate(script)), f"{shape}: {why}")
@@ -4000,7 +4083,7 @@ def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 menu_of("pinned-log", "201")
                 tap('#pinned-log > li[data-id="201"] .row-pin-button')
                 until("() => !document.querySelector('#pinned-log > li[data-id]')", "Unpin left the row in the filter")
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and "201" in api.pins:
                     page.wait_for_timeout(50)
                 check("201" not in api.pins, f"{shape}: a tap on Unpin never reached the server")
@@ -4048,7 +4131,7 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
                     page.mouse.click(float(found[0]), float(found[1]))
 
             def until(script: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(script):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(script)), f"{label}: {why}")
@@ -4093,7 +4176,7 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             tap('#discord-log > li[data-id="200"] .row-pin-button')
             until("() => { const c = document.querySelector('#discord-log > li[data-id=\"200\"] .pin-chip');"
                   " return Boolean(c) && !c.hidden; }", "Pin did not show on the row")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + STATE_S
             while time.monotonic() < deadline and "200" not in api.pins:
                 page.wait_for_timeout(50)
             check("200" in api.pins, f"{label}: the pin never reached the server")
@@ -4189,7 +4272,7 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                     page.mouse.click(x, y)
 
             def until(script: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(script):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(script)), f"{label}: {why}")
@@ -4325,7 +4408,7 @@ def links_bar_walk(chromium: BrowserType, args: argparse.Namespace, label: str, 
             page.on("pageerror", lambda error: errors.append(str(error)))
 
             def until(script: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(script):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(script)), f"{shape}: {why}")
@@ -4415,7 +4498,7 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                     page.screenshot(path=str(args.screenshots / f"{label}-kinds-{name}.png"))
 
             def until(script: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(script):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(script)), f"{shape}: {why}")
@@ -4613,7 +4696,7 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
             page.on("pageerror", lambda error: errors.append(str(error)))
 
             def until(script: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(script):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(script)), f"{shape}: {why}")
@@ -4717,7 +4800,7 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.on("pageerror", lambda error: errors.append(str(error)))
 
             def until(script: str, why: str) -> None:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(script):
                     page.wait_for_timeout(50)
                 check(bool(page.evaluate(script)), f"{shape}: {why}")
@@ -4732,8 +4815,24 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
                 until(f"() => document.querySelector({json.dumps(selector)}).getAttribute('aria-pressed') === '{value}'", why)
 
             def settled() -> None:
-                # Two frames, so a scroll the page made has been laid out and its events delivered.
-                page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
+                # Layout stable over consecutive frame-separated samples (`#1512`),
+                # not two frames of wall clock a loaded host could outrun.
+                snap_js = ("() => { const a = document.getElementById('scroll-area');"
+                           " const t = document.getElementById('scroll-tools');"
+                           " return JSON.stringify([a.scrollTop, a.scrollHeight, a.clientHeight,"
+                           " t ? t.getBoundingClientRect().height : -1,"
+                           " document.querySelectorAll('#discord-log > li[data-id]').length]); }")
+                deadline = time.monotonic() + STATE_S
+                last, stable = None, 0
+                while stable < 2:
+                    page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
+                    snap = str(page.evaluate(snap_js))
+                    stable = stable + 1 if snap == last else 0
+                    last = snap
+                    if stable >= 2:
+                        return
+                    check(time.monotonic() < deadline, f"{shape}: layout did not settle; last {snap}")
+                    page.wait_for_timeout(50)
 
             def at_newest() -> bool:
                 return bool(page.evaluate("() => { const a = document.getElementById('scroll-area');"
@@ -4827,7 +4926,7 @@ def windows_walk(chromium: BrowserType, args: argparse.Namespace) -> None:
                 with api.lock:
                     api.requests.clear()
                 act()
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not api.reads():
                     page.wait_for_timeout(50)
                 page.wait_for_timeout(200)
