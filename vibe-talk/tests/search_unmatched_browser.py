@@ -133,7 +133,7 @@ class GapApi(FakeApi):
         scope = {"channel": CHANNEL, "state": "searched", "examined": 900,
                  "searched_back_to_ms": 1_750_000_000_000, "held_from_ms": 1_750_000_000_000,
                  "top_level_only": True, "whole": False, "expanding": True,
-                 "capped": 0, "partial": 0, "withheld": 0}
+                 "capped": 0, "partial": 0, "withheld": 0, "stale": 0}
         other = {**scope, "channel": {**CHANNEL, "id": "2220000000000000002", "label": "ops"},
                  "whole": True, "expanding": False}
         return {"hits": hits, "scopes": [scope, other] if everywhere else [scope], "upstream": "none",
