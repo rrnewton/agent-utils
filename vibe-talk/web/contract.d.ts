@@ -2208,6 +2208,11 @@ declare namespace VibeTalk {
      */
     channel: ChannelInfo;
     /**
+     * When the channel's latest update was dropped, provider time: the "may be stale since"
+     * time for `stale`. Absent when no update was dropped.
+     */
+    dropped_ms?: number | null;
+    /**
      * Messages tested.
      */
     examined: number;
@@ -2246,6 +2251,13 @@ declare namespace VibeTalk {
      * server's coverage vouches for nothing, or the search stopped above it.
      */
     searched_back_to_ms?: number | null;
+    /**
+     * Matching hits handed out though not seen since the channel's latest dropped update:
+     * each may be stale, the drop may have been its edit or deletion (`#1533
+     * vibe-talk-record-completeness`). Handed out flagged, never hidden: the drop names no
+     * row, and hiding every older row makes the record incomplete.
+     */
+    stale: number;
     /**
      * `searched`, or `not_searched`, when `reason` says why.
      */
