@@ -71,7 +71,7 @@ PASTE_BODY = (
     + "## Finish\n\n" + _FILLER * 10
     + "The final line.\n"
 )
-OUTLINE_TEXTS = ["Demo deployment report", "Setup", "Setup details", "Finish"]
+OUTLINE_TEXTS = ["Demo deployment report", "1 Setup", "1.1 Setup details", "2 Finish"]
 
 # The GitHub-shaped documents the local raw stub serves (`#1081`): an index
 # whose links are relative, and the document they name. The linked document
@@ -432,7 +432,7 @@ def main() -> int:
                 # A tap on a later entry jumps to its heading, closes the pop-up,
                 # and that entry becomes HERE.
                 page.locator("#doc-outline button", has_text="Finish").tap()
-                wait_heading_at_top(page, "doc-finish", "Finish")
+                wait_heading_at_top(page, "doc-finish", "2 Finish")
                 check(page.locator("#doc-outline-pop").is_hidden(),
                       "picking an outline entry left the pop-up open")
 
@@ -443,7 +443,7 @@ def main() -> int:
                       const h = document.getElementById('doc-setup');
                       root.scrollTop += h.getBoundingClientRect().top - root.getBoundingClientRect().top;
                     }""")
-                wait_here_is(page, "Setup")
+                wait_here_is(page, "1 Setup")
 
                 # An outside tap closes the pop-up without moving the document.
                 page.tap("#doc-outline-open")
@@ -603,7 +603,7 @@ def main() -> int:
                 dtexts = [t.strip() for t in dpage.locator("#doc-outline button").all_text_contents()]
                 check(dtexts == OUTLINE_TEXTS, f"the desktop outline lists {dtexts}, not {OUTLINE_TEXTS}")
                 dpage.locator("#doc-outline button", has_text="Setup details").click()
-                wait_heading_at_top(dpage, "doc-setup-details", "Setup details")
+                wait_heading_at_top(dpage, "doc-setup-details", "1.1 Setup details")
                 check(dpage.locator("#doc-outline-pop").is_hidden(),
                       "picking a desktop outline entry left the pop-up open")
                 dpage.click("#doc-outline-open")

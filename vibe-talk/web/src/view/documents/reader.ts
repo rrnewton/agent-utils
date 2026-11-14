@@ -18,6 +18,8 @@
 import { createListening } from "../dom/index.ts";
 import { documentHeadingId, renderDocumentMarkdown } from "./render.ts";
 import { documentReadBlocks } from "./blocks.ts";
+import { authorNumberOf, buildNavigator, buildSections } from "./sections.ts";
+import type { NavUnit, SectionModel } from "./sections.ts";
 import { splitIssueHeader } from "./issueheader.ts";
 
 /** What the reader asks of the page. */
@@ -413,6 +415,12 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   // (`#1505 documents-read-controls-highlight-tap`).
   let litElement: HTMLElement | null = null;
   let readKey: string | null = null;
+  // The navigator's model (`#1508`): the open document's blocks and section
+  // tree, built once per open from the same block model the read speaks, so
+  // its units name the same blocks the light lights.
+  let navBlocks: ReturnType<typeof documentReadBlocks> | null = null;
+  let navModel: SectionModel | null = null;
+  let navBlock = 0;
 
   /** Scroll the rendered heading `id` into view; say whether it was drawn. */
   function scrollToHeading(id: string): boolean {
@@ -635,6 +643,133 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     if (target !== undefined && typeof target.focus === "function") target.focus();
   }
 
+  /**
+   * Number the headings on the document itself (`#1508`, the design's
+   * "Section numbers"): a gutter label before each heading, from the same
+   * section model the navigator and the read use, as if the document
+   * always had them. The author's numbers win: a heading whose text already
+   * opens with one keeps it alone, with no second number beside it, and the
+   * title is never numbered. Drawn before the outline, so the contents
+   * drawer carries the same numbers. Text only, set as text.
+   */
+  function drawSectionNumbers(): void {
+    if (markdown === null) return;
+    const blocks = documentReadBlocks(markdown);
+    const built = buildSections(blocks);
+    if (built.sections.length === 0) return;
+    const numberOfHeading = new Map<number, string>();
+    for (const section of built.sections) {
+      if (section.headingBlock !== null) numberOfHeading.set(section.headingBlock, section.number);
+    }
+    const body = deps.byId("doc-body");
+    const headings = Array.from(body.querySelectorAll("h1, h2, h3, h4, h5, h6")) as HTMLElement[];
+    let ordinal = -1;
+    blocks.forEach((block, at) => {
+      if (block.kind !== "heading") return;
+      ordinal += 1;
+      const number = numberOfHeading.get(at);
+      if (number === undefined || at === built.titleBlock) return;
+      const heading = headings[ordinal];
+      if (heading === undefined) return;
+      if (authorNumberOf(block.text) !== null) return;
+      const label = document.createElement("span");
+      label.className = "doc-secnum";
+      label.setAttribute("aria-hidden", "true");
+      label.textContent = number;
+      heading.insertBefore(label, heading.firstChild);
+      heading.insertBefore(document.createTextNode(" "), label.nextSibling);
+    });
+  }
+
+  /**
+   * Draw the navigator (`#1508`, the design's focus-plus-context row over
+   * the block row): at most two rows on a phone, three on a desk, peers
+   * that do not fit compressed into ranges, the bottom row carrying
+   * section-boundary marks with the entered section's number. Every unit
+   * is a tap target to its first block — the same `startReading` a tap in
+   * the body takes — so the read and the light follow in the one block
+   * model. A host without the element keeps the reader as it was.
+   */
+  function renderNavigator(): void {
+    let nav: HTMLElement;
+    try {
+      nav = deps.byId("doc-nav");
+    } catch {
+      return;
+    }
+    if (!nav || navBlocks === null || navModel === null) return;
+    const width = (typeof nav.clientWidth === "number" && nav.clientWidth > 0)
+      ? nav.clientWidth
+      : 360;
+    const built = buildNavigator(navBlocks, navModel, navBlock, width);
+    const totalUnits = built.rows.reduce((sum, row) => sum + row.units.length, 0);
+    nav.hidden = totalUnits <= 1;
+    if (nav.hidden) return;
+    nav.textContent = "";
+    if (built.breadcrumb.length > 0) {
+      const crumb = document.createElement("button");
+      crumb.type = "button";
+      crumb.className = "doc-nav-crumb";
+      crumb.textContent = built.breadcrumb.join(" › ");
+      listening.listen(crumb, "click", () => { setOutlineOpen(true); });
+      nav.appendChild(crumb);
+    }
+    const makeUnit = (unit: NavUnit, current: boolean, heard: boolean): HTMLButtonElement => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "doc-nav-unit";
+      button.style.setProperty("flex-grow", String(Math.max(1, unit.weight)));
+      if (unit.kind === "range") button.setAttribute("data-range", "");
+      if (current) button.setAttribute("aria-current", "true");
+      if (heard) button.setAttribute("data-heard", "");
+      const text = unit.boundary !== ""
+        ? `│${unit.boundary} ${unit.label}`.trim()
+        : (unit.label !== "" ? unit.label : `${unit.start + 1}`);
+      button.textContent = text;
+      button.setAttribute("aria-label", `Read from ${text}`);
+      listening.listen(button, "click", () => { startReading(unit.start); });
+      if (unit.nested !== undefined && unit.nested.length > 0) {
+        const nest = document.createElement("span");
+        nest.className = "doc-nav-nested";
+        for (const inner of unit.nested) {
+          const innerCurrent = navBlock >= inner.start && navBlock < inner.end;
+          nest.appendChild(makeUnit(inner, innerCurrent, inner.end <= navBlock));
+        }
+        button.appendChild(nest);
+      }
+      return button;
+    };
+    built.rows.forEach((row, rowAt) => {
+      const line = document.createElement("div");
+      line.className = "doc-nav-row";
+      const isBottom = rowAt === built.rows.length - 1;
+      if (isBottom && built.prevSection !== "") {
+        const edge = document.createElement("button");
+        edge.type = "button";
+        edge.className = "doc-nav-edge";
+        edge.textContent = `‹ ${built.prevSection}`;
+        edge.setAttribute("aria-label", `Read from section ${built.prevSection}`);
+        const target = navModel?.sections.find((section) => section.number === built.prevSection);
+        listening.listen(edge, "click", () => { if (target !== undefined) startReading(target.start); });
+        line.appendChild(edge);
+      }
+      row.units.forEach((unit, at) => {
+        line.appendChild(makeUnit(unit, at === row.current, unit.end <= navBlock));
+      });
+      if (isBottom && built.nextSection !== "") {
+        const edge = document.createElement("button");
+        edge.type = "button";
+        edge.className = "doc-nav-edge";
+        edge.textContent = `${built.nextSection} ›`;
+        edge.setAttribute("aria-label", `Read from section ${built.nextSection}`);
+        const target = navModel?.sections.find((section) => section.number === built.nextSection);
+        listening.listen(edge, "click", () => { if (target !== undefined) startReading(target.start); });
+        line.appendChild(edge);
+      }
+      nav.appendChild(line);
+    });
+  }
+
   /** The attribute on the block being read: read-aloud's own for a message's block. */
   const READING_BLOCK_ATTRIBUTE = "data-reading-block";
 
@@ -728,6 +863,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       return;
     }
     if (!body) return;
+    navBlock = block;
+    renderNavigator();
     const target = documentBlocks(body)[block] as HTMLElement | undefined;
     clearReadingLight();
     if (target === undefined) return;
@@ -930,6 +1067,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       body.textContent = "This document is not available yet.";
       deps.onStatus?.("This document is not available yet.");
     }
+    drawSectionNumbers();
     drawOutline();
     const outline = stringsOf(answer.outline);
     const rawTitle = answer.document?.title;
@@ -944,6 +1082,10 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     const movedTo = answer.document?.moved_to;
     if (typeof movedTo === "string" && movedTo !== "") deps.onStatus?.(`Moved to ${movedTo}`);
     if (markdown !== null) currentDoc = { key, title: titleText, outline, markdown };
+    navBlocks = markdown !== null ? documentReadBlocks(markdown) : null;
+    navModel = navBlocks !== null ? buildSections(navBlocks) : null;
+    navBlock = 0;
+    renderNavigator();
     startWatching();
     if (highlightTerms !== undefined && markdown !== null) {
       const first = highlightSearchTerms(body, highlightTerms);
@@ -1041,6 +1183,12 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       clearReadingLight();
       closeOutline(false);
       stopWatching();
+      try {
+        const nav = deps.byId("doc-nav");
+        if (nav) nav.hidden = true;
+      } catch {
+        // A host without the navigator keeps the reader as it was.
+      }
     },
     unmount(): void {
       clearReadingLight();

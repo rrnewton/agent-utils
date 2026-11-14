@@ -5168,6 +5168,11 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // boundary between a judgement and a different behaviour wearing the same name.
 
 const TUNING_BANDS = {
+  // `#1508 documents-scrubber-multilevel`. The smallest unit the document
+  // scrubber offers, in characters of block text: below a sentence or two a
+  // tap target says too little to steer by; far larger merges whole
+  // sections into one box on a phone.
+  MIN_CHUNK_CHARS: [40, 600, "the minimum characters in one document scrubber unit"],
   // `#1470 toolbar-dynamic-promotion`. Slack between promoting and demoting a toolbar
   // action: wide enough to settle a boundary resize, narrow enough that a real
   // overflow still demotes within a drag.

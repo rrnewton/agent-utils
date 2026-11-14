@@ -485,6 +485,87 @@
 #doc-body > :first-child {
   margin-top: 0;
 }
+/* The multi-level navigator (`#1508`): focus-plus-context rows over the
+   current section's blocks, at the reader's head above the body. */
+#doc-nav {
+  padding: 6px 2px;
+  background: var(--bg, #fff);
+}
+#doc-nav[hidden] {
+  display: none;
+}
+.doc-nav-crumb {
+  display: block;
+  margin-bottom: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted, #888);
+  font: inherit;
+  font-size: 0.85em;
+  text-align: left;
+}
+.doc-nav-row {
+  display: flex;
+  gap: 3px;
+  margin-bottom: 3px;
+}
+.doc-nav-unit {
+  flex-basis: 0;
+  min-width: 24px;
+  min-height: 28px;
+  padding: 2px 3px;
+  overflow: hidden;
+  border: 1px solid var(--edge, #ccc);
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.78em;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.doc-nav-unit[data-heard] {
+  opacity: 0.55;
+}
+.doc-nav-unit[aria-current="true"] {
+  background: var(--accent, #4a7dff);
+  color: #fff;
+}
+.doc-nav-unit[data-range] {
+  border-style: dashed;
+}
+.doc-nav-nested {
+  display: flex;
+  gap: 2px;
+  margin-top: 2px;
+}
+.doc-nav-nested .doc-nav-unit {
+  min-height: 20px;
+  font-size: 0.9em;
+}
+.doc-nav-edge {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 2px 6px;
+  border: 1px solid var(--edge, #ccc);
+  border-radius: 6px;
+  background: none;
+  color: var(--muted, #888);
+  font: inherit;
+  font-size: 0.78em;
+}
+/* Section numbers on the document (`#1508`): a small gutter label before
+   each heading, in the heading's own line, muted beside its words. */
+.doc-secnum {
+  display: inline-block;
+  min-width: 2.2ch;
+  margin-right: 0.45em;
+  color: var(--muted, #888);
+  font-size: 0.72em;
+  font-weight: 600;
+  vertical-align: baseline;
+}
 #doc-body h1,
 #doc-body h2 {
   padding-bottom: 0.3em;

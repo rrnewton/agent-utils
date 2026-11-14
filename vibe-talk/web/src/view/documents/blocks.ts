@@ -16,6 +16,8 @@
 export interface DocumentReadBlock {
   kind: "paragraph" | "heading" | "item" | "quote" | "code" | "table";
   text: string;
+  /** A heading block's source level (its `#` count, 1-6); absent otherwise. */
+  level?: number;
 }
 
 /** Inline dressing off one line of prose: links and images say their words. */
@@ -91,7 +93,11 @@ export function documentReadBlocks(markdown: string): DocumentReadBlock[] {
     }
     const heading = /^(#{1,6})\s+(.*)$/.exec(line);
     if (heading !== null) {
-      blocks.push({ kind: "heading", text: speakable((heading[2] ?? "").replace(/\s+#+\s*$/, "")) });
+      blocks.push({
+        kind: "heading",
+        text: speakable((heading[2] ?? "").replace(/\s+#+\s*$/, "")),
+        level: (heading[1] ?? "#").length,
+      });
       at += 1;
       continue;
     }
