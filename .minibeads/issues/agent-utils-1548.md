@@ -1,10 +1,10 @@
 ---
 title: 'chat-replies-captured-not-sent: breaker-held replies wait for an unrelated loop pass after the cooldown'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-14T18:40:00.000000000+00:00
-updated_at: 2026-11-14T18:40:00.000000000+00:00
+updated_at: 2026-11-14T21:20:00.000000000+00:00
 ---
 
 # Description
@@ -60,3 +60,12 @@ in the Python launch tests waits on a 60 s wall-clock budget for the
 bridge process to appear, so it can fail under load although the
 bridge is healthy; it passes standalone. Replace that budget with a
 condition-based wait.
+
+## Resolution
+
+Landed 404a206d (gated 72980192, gate pass 2026-11-14T21:09:55Z): the
+reply sender schedules breaker-held keys for their release time,
+including at startup, with two regression tests that use no wall
+clock. Live on the bridge since the services turnover to 4cbc07e4
+(2026-11-14 4:17 PM ET, chat health OK). The launch-test follow-up is
+tracked as #1551 agentctl-chat-launch-wallclock-tests.

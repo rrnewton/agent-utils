@@ -1,10 +1,10 @@
 ---
 title: 'agentctl-unsubmitted-paste-backstop: pasted prompts left unsubmitted; watcher backstop blind in busy panes'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-14T18:31:00.000000000+00:00
-updated_at: 2026-11-14T18:31:00.000000000+00:00
+updated_at: 2026-11-14T21:20:00.000000000+00:00
 ---
 
 # Description
@@ -64,3 +64,13 @@ as flush-failed instead of being submitted.
 
 Live deployment (services refresh/turnover) is the coordinator's job
 after landing; the lane never restarts the watcher or bridges.
+
+## Resolution
+
+Landed 4cbc07e4 (gated 49e4cf3d, gate pass 2026-11-14T21:10:07Z). The
+sweep reads Muse drafts through the Muse editor reader, attributes
+under the flush's own vouching, reports unparseable panes with stranded
+prompts as draft:unreadable findings, and the Claude view recognises
+tall drafts whose top rule is off screen. Live on the host watcher and
+bridges since the services turnover to 4cbc07e4 (2026-11-14 4:17 PM ET,
+all units healthy).
