@@ -60,6 +60,14 @@ CATCHUP_ANSWER = {
     "footer_links": [
         {"id": MARKABLE[0], "label": "09:51 · Ada", "thread_id": None},
         {"id": MARKABLE[1], "label": "09:52 · Ben", "thread_id": None},
+        {"id": "100000000000000103", "label": "09:53 · Cy", "thread_id": None},
+        {"id": "100000000000000104", "label": "09:54 · Di", "thread_id": None},
+        {"id": "100000000000000105", "label": "09:55 · Ed", "thread_id": None},
+        {"id": "100000000000000106", "label": "09:56 · Fi", "thread_id": None},
+        {"id": "100000000000000107", "label": "09:57 · Gil", "thread_id": None},
+        {"id": "100000000000000108", "label": "09:58 · Hal", "thread_id": None},
+        {"id": "100000000000000109", "label": "09:59 · Ivy", "thread_id": None},
+        {"id": "100000000000000110", "label": "10:00 · Jo", "thread_id": None},
     ],
     "text": "## Progress\nAda shipped the fix.\n\n## Review\nBen is reviewing it.",
     "text_html": "<h2>Progress</h2><ul><li>Ada shipped the fix "
@@ -439,8 +447,42 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     check(status == "Read 2 unread of 12", f"the status says {status!r}")
     covers = page.locator("#discuss-covers").text_content() or ""
     check(covers == "Other messages processed:", f"the footer says {covers!r}")
-    check(page.locator("#discuss-links .discuss-link").count() == 2, "the footer links are missing")
+    check(page.locator("#discuss-links .discuss-link").count() == 10, "the footer links are missing")
     check(page.locator("#discuss-links .discuss-link").first.text_content() == "09:51", "the footer links are not dense HH:MM")
+    # `#1540 discuss-footer-inline-links`: the times read as one dense,
+    # comma-separated line that wraps like text — measured layout, not
+    # just text: many times share lines, the whole footer stays within
+    # a few lines, and no link stretches full-width. Judged on drawn
+    # geometry at phone and desk alike.
+    footer_geo = page.evaluate("""() => {
+      const links = [...document.querySelectorAll('#discuss-links .discuss-link')];
+      const rects = links.map((el) => el.getBoundingClientRect());
+      const list = document.getElementById('discuss-links').getBoundingClientRect();
+      const covers = document.getElementById('discuss-covers').getBoundingClientRect();
+      const first = rects[0];
+      return {
+        lines: new Set(rects.map((r) => Math.round(r.top))).size,
+        count: rects.length,
+        widest: Math.max(...rects.map((r) => r.width)),
+        listWidth: list.width,
+        shortest: Math.min(...rects.map((r) => r.height)),
+        coversWithFirst: Math.abs(covers.top - first.top) <= 4
+          || Math.abs(covers.bottom - first.bottom) <= 24,
+        text: document.getElementById('discuss-footer').textContent,
+      };
+    }""")
+    check(footer_geo["count"] == 10 and footer_geo["lines"] <= 3,
+          f"the footer times do not wrap as dense text: {footer_geo}")
+    check(footer_geo["lines"] < footer_geo["count"],
+          f"the footer times do not share lines: {footer_geo}")
+    check(footer_geo["widest"] < footer_geo["listWidth"] * 0.6,
+          f"a footer time still stretches full-width: {footer_geo}")
+    check(footer_geo["shortest"] >= 32,
+          f"a footer time tap target is too short: {footer_geo}")
+    check("09:51, 09:52" in footer_geo["text"],
+          f"the footer times are not comma-separated: {footer_geo['text']!r}")
+    check(footer_geo["coversWithFirst"],
+          f"the footer label does not share the times' line: {footer_geo}")
     check(page.locator("#discuss-answer .discuss-struck").count() == 0,
           "a bullet stood struck before anything was read")
     stamp = page.locator("#discuss-stamp").text_content() or ""

@@ -1228,8 +1228,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const cited = new Set(answer.cited_ids);
     const list = deps.byId("discuss-links");
     list.replaceChildren();
-    for (const link of answer.footer_links) {
-      if (cited.has(link.id)) continue;
+    // `#1540 discuss-footer-inline-links`: the uncited remainder reads as
+    // one dense comma-separated line that wraps like text, each time
+    // still its own jump button — not one full-width button per time.
+    const visible = answer.footer_links.filter((link) => !cited.has(link.id));
+    visible.forEach((link, index) => {
       const item = document.createElement("li");
       const button = document.createElement("button");
       button.type = "button";
@@ -1244,8 +1247,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         });
       });
       item.appendChild(button);
+      if (index < visible.length - 1) item.appendChild(document.createTextNode(", "));
       list.appendChild(item);
-    }
+    });
     const unmarkable = deps.byId("discuss-unmarkable");
     if (answer.unread_ids.length !== answer.markable_ids.length) {
       unmarkable.hidden = false;

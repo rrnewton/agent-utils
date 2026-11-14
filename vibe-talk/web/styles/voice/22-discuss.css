@@ -392,31 +392,41 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   font: inherit;
 }
 
+/* `#1540 discuss-footer-inline-links`: the label and its times flow as
+ * one dense comma-separated line that wraps like text, at phone and
+ * desk alike — never one full-width button per time. */
+#discuss-footer {
+  margin-top: 12px;
+}
+
 #discuss-covers {
-  margin: 12px 0 4px;
+  display: inline;
+  margin: 0 0.25em 0 0;
   font-size: 0.9rem;
 }
 
 #discuss-links {
+  display: inline;
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+}
+
+#discuss-links li {
+  display: inline;
 }
 
 .discuss-link {
-  display: block;
-  width: 100%;
-  padding: 6px 8px;
-  text-align: left;
+  display: inline-block;
+  padding: 10px 4px;
   cursor: pointer;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
+  background: none;
+  color: #8ab8ff;
+  border: none;
   border-radius: 6px;
   font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .discuss-link:hover {

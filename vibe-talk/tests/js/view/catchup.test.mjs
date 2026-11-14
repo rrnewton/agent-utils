@@ -216,6 +216,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   };
   const savedDocument = globalThis.document;
   globalThis.document = {
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text), children: [] }),
     createElement: (tag) => {
       if (tag !== "template") return fakeElement(tag);
       // The dom sink's one parser, faked: it records what it was handed and
@@ -513,6 +514,8 @@ test("catchup: the footer covers N and each link jumps with its ref", async () =
     const items = fx.els["discuss-links"].children;
     assert.equal(items.length, 2);
     assert.equal(items[0].children[0].textContent, "09:51");
+    // `#1540`: the times are comma-separated in the footer's text flow.
+    assert.equal(fx.els["discuss-links"].textContent, "09:51, 09:52");
     click(items[1].children[0]);
     assert.deepEqual(fx.calls.jumps, [{ service: "discord", channel: "chan-1", message: "m2", thread: "t9" }]);
   } finally { fx.restore(); }
@@ -528,6 +531,7 @@ test("catchup: cited messages leave the footer; Mark still targets all processed
     const items = fx.els["discuss-links"].children;
     assert.equal(items.length, 1);
     assert.equal(items[0].children[0].textContent, "09:52");
+    assert.equal(fx.els["discuss-links"].textContent, "09:52", "a lone footer time carries no comma");
     click(fx.els["discuss-mark-read"]);
     await flush();
     assert.deepEqual(fx.calls.dismiss, [{ messages: ["m1", "m2"] }]);
@@ -1280,6 +1284,7 @@ test("catchup folds: open sections survive close/reopen and a reload; a new summ
   });
   const savedDocument = globalThis.document;
   globalThis.document = {
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text), children: [] }),
     createElement: (tag) => {
       if (tag !== "template") return foldEl(tag);
       const template = { _html: "", content: null };
@@ -1398,6 +1403,7 @@ test("catchup read: Read hands the owner all blocks under the record key; tap, h
   const scope = { channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" };
   const savedDocument = globalThis.document;
   globalThis.document = {
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text), children: [] }),
     createElement: (tag) => {
       if (tag !== "template") return foldEl(tag);
       const template = { _html: "", content: null };
