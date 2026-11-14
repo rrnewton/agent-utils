@@ -11,8 +11,6 @@ use anyhow::Context as _;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
-use crate::config::Config;
-
 /// Help for `vibe-talk prompts --help`.
 pub const USAGE: &str = "\
 vibe-talk prompts — the owner's own messages over a window, oldest first
@@ -152,72 +150,199 @@ fn config_candidates() -> Vec<PathBuf> {
     out
 }
 
+/// The slice of configuration `prompts` needs, read leniently: a cache-only command
+/// makes no provider calls, so provider credentials are never required or checked.
+#[derive(Clone, Debug, Default)]
+pub struct PromptsConfig {
+    /// The owner's user ids.
+    pub owner_ids: Vec<String>,
+    /// The configured channels (id + label).
+    pub channels: Vec<crate::model::ChannelInfo>,
+    /// `[storage] path`, when named.
+    pub storage_path: Option<PathBuf>,
+    /// `[message_cache] path`, when named.
+    pub cache_path: Option<PathBuf>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LenientFile {
+    #[serde(default)]
+    owner: LenientOwner,
+    #[serde(default)]
+    providers: Vec<LenientProvider>,
+    #[serde(default)]
+    discord: LenientProvider,
+    #[serde(default)]
+    channels: Vec<LenientChannel>,
+    #[serde(default)]
+    storage: LenientStorage,
+    #[serde(default)]
+    message_cache: LenientCache,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LenientOwner {
+    #[serde(default)]
+    user_ids: Vec<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LenientProvider {
+    #[serde(default)]
+    owner_user_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct LenientChannel {
+    id: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LenientStorage {
+    #[serde(default)]
+    path: Option<PathBuf>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LenientCache {
+    #[serde(default)]
+    path: Option<PathBuf>,
+}
+
+/// Parse the merged configuration text leniently into a [`PromptsConfig`].
+///
+/// # Errors
+///
+/// The text does not parse as TOML at all.
+pub fn parse_lenient(text: &str) -> anyhow::Result<PromptsConfig> {
+    let file: LenientFile = toml::from_str(text).context("parsing the configuration")?;
+    let mut owner_ids: Vec<String> = Vec::new();
+    let mut push = |id: &str| {
+        let id = id.trim().to_owned();
+        if !id.is_empty() && !owner_ids.contains(&id) {
+            owner_ids.push(id);
+        }
+    };
+    for id in &file.owner.user_ids {
+        push(id);
+    }
+    if let Some(id) = &file.discord.owner_user_id {
+        push(id);
+    }
+    for provider in &file.providers {
+        if let Some(id) = &provider.owner_user_id {
+            push(id);
+        }
+    }
+    let channels = file
+        .channels
+        .into_iter()
+        .map(|channel| crate::model::ChannelInfo {
+            id: crate::model::ChannelId(channel.id),
+            label: channel.label,
+            writable: false,
+            alias: None,
+            added: false,
+            provider: None,
+            write_source: None,
+        })
+        .collect();
+    Ok(PromptsConfig {
+        owner_ids,
+        channels,
+        storage_path: file.storage.path,
+        cache_path: file.message_cache.path,
+    })
+}
+
 /// Load the configuration the way `prompts` finds it: an explicit flag or environment
 /// variable wins, else the documented discovery order under the user's config dir.
+/// The load is lenient (see [`PromptsConfig`]): no provider token is required.
 ///
 /// # Errors
 ///
 /// Nothing found (the error names every path looked for), or the file found is unusable.
-pub fn discover_config(options: &Options) -> anyhow::Result<Config> {
-    if options.config.is_some() || std::env::var_os(crate::config::ENV_CONFIG_PATH).is_some() {
-        return Config::discover(options.config.clone(), options.overlays.clone())
-            .context("loading the configuration named by flag or environment");
-    }
-    let candidates = config_candidates();
-    for candidate in &candidates {
-        if candidate.exists() {
-            let mut overlays = options.overlays.clone();
-            if let Some(dir) = candidate.parent() {
-                let mut beside: Vec<PathBuf> = std::fs::read_dir(dir)
-                    .map(|entries| {
-                        entries
-                            .filter_map(Result::ok)
-                            .map(|entry| entry.path())
-                            .filter(|path| {
-                                path.file_name()
-                                    .and_then(|name| name.to_str())
-                                    .is_some_and(|name| name.ends_with("-overlay.toml"))
+pub fn discover_config(options: &Options) -> anyhow::Result<PromptsConfig> {
+    let explicit = options
+        .config
+        .clone()
+        .or_else(|| std::env::var_os(crate::config::ENV_CONFIG_PATH).map(PathBuf::from));
+    let (base, mut overlays) = match explicit {
+        Some(path) => (Some(path), options.overlays.clone()),
+        None => {
+            let candidates = config_candidates();
+            let found = candidates.iter().find(|candidate| candidate.exists());
+            match found {
+                Some(path) => {
+                    let mut overlays = options.overlays.clone();
+                    if let Some(dir) = path.parent() {
+                        let mut beside: Vec<PathBuf> = std::fs::read_dir(dir)
+                            .map(|entries| {
+                                entries
+                                    .filter_map(Result::ok)
+                                    .map(|entry| entry.path())
+                                    .filter(|entry| {
+                                        entry
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .is_some_and(|name| name.ends_with("-overlay.toml"))
+                                    })
+                                    .collect()
                             })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                beside.sort();
-                overlays.extend(beside.into_iter().take(1));
+                            .unwrap_or_default();
+                        beside.sort();
+                        overlays.extend(beside.into_iter().take(1));
+                    }
+                    (Some(path.clone()), overlays)
+                }
+                None => anyhow::bail!(
+                    "no vibe-talk configuration found; looked for: {}. Pass --config PATH or set {}",
+                    candidates
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    crate::config::ENV_CONFIG_PATH
+                ),
             }
-            return Config::discover(Some(candidate.clone()), overlays)
-                .with_context(|| format!("loading configuration from {}", candidate.display()));
         }
+    };
+    if let Some(listed) = std::env::var_os(crate::config::ENV_CONFIG_OVERLAY) {
+        overlays.extend(std::env::split_paths(&listed).filter(|path| !path.as_os_str().is_empty()));
     }
-    anyhow::bail!(
-        "no vibe-talk configuration found; looked for: {}. Pass --config PATH or set {}",
-        candidates
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", "),
-        crate::config::ENV_CONFIG_PATH
-    )
+    let read = |path: &std::path::Path| -> anyhow::Result<String> {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading configuration file {}", path.display()))
+    };
+    let base_text = match &base {
+        Some(path) => {
+            if !path.exists() {
+                anyhow::bail!("configuration file {} does not exist", path.display());
+            }
+            read(path)?
+        }
+        None => String::new(),
+    };
+    let mut overlay_texts: Vec<(String, String)> = Vec::new();
+    for overlay in &overlays {
+        overlay_texts.push((overlay.display().to_string(), read(overlay)?));
+    }
+    let merged = if overlay_texts.is_empty() {
+        base_text
+    } else {
+        crate::config::merge_overlays(&base_text, &overlay_texts)
+            .context("merging configuration overlays")?
+            .to_string()
+    };
+    parse_lenient(&merged)
 }
 
 /// The owner's user ids for `config`: `[owner] user_ids` plus each provider's owner id.
 #[must_use]
-pub fn owner_ids(config: &Config) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    let push = |id: &str, ids: &mut Vec<String>| {
-        let id = id.trim().to_owned();
-        if !id.is_empty() && !ids.contains(&id) {
-            ids.push(id);
-        }
-    };
-    for id in &config.owner.user_ids {
-        push(id, &mut ids);
-    }
-    for provider in &config.providers {
-        if let Some(id) = provider.owner_user_id() {
-            push(id, &mut ids);
-        }
-    }
-    ids
+pub fn owner_ids(config: &PromptsConfig) -> Vec<String> {
+    config.owner_ids.clone()
 }
 
 /// One owner message from the cache.
@@ -322,18 +447,15 @@ pub fn parse_since(raw: &str) -> anyhow::Result<i64> {
 
 /// The cache file `prompts` reads: `--cache`, else the configuration's cache path,
 /// else the default beside the store.
-fn cache_path(config: &Config, options: &Options) -> anyhow::Result<PathBuf> {
+fn cache_path(config: &PromptsConfig, options: &Options) -> anyhow::Result<PathBuf> {
     if let Some(path) = &options.cache {
         return Ok(path.clone());
     }
-    if let Some(cache) = &config.message_cache {
-        if let Some(path) = &cache.path {
-            return Ok(path.clone());
-        }
+    if let Some(path) = &config.cache_path {
+        return Ok(path.clone());
     }
     let store = config
-        .storage
-        .path
+        .storage_path
         .as_ref()
         .context("the configuration names no [storage] path, so no default cache file exists; pass --cache PATH")?;
     Ok(crate::cache::file::default_path(
@@ -352,7 +474,7 @@ fn cache_path(config: &Config, options: &Options) -> anyhow::Result<PathBuf> {
 ///
 /// The cache cannot be opened or read, or no owner user id is configured.
 pub fn read_at(
-    config: &Config,
+    config: &PromptsConfig,
     cache_file: &std::path::Path,
     wanted_channel: Option<&str>,
     since_ms: i64,
@@ -453,7 +575,7 @@ pub fn read_at(
             ))
         })
         .context("reading the cache")?;
-    let labels: std::collections::HashMap<String, String> = config
+    let mut labels: std::collections::HashMap<String, String> = config
         .channels
         .iter()
         .map(|channel| {
@@ -463,6 +585,28 @@ pub fn read_at(
             )
         })
         .collect();
+    // Channel names the server learned live (added channels and aliases) live in the
+    // state store at [storage] path; read them read-only when the file is there.
+    if let Some(store_path) = &config.storage_path {
+        if let Ok(store) = Connection::open_with_flags(
+            store_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            let mut load = |sql: &str| {
+                if let Ok(mut statement) = store.prepare(sql) {
+                    if let Ok(rows) = statement.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                        for row in rows.flatten() {
+                            labels.insert(row.0, row.1.trim_start_matches('#').to_owned());
+                        }
+                    }
+                }
+            };
+            load("SELECT channel_id, label FROM added_channels");
+            load("SELECT channel_id, alias FROM channel_aliases");
+        }
+    }
     let mut messages: Vec<PromptMessage> = Vec::new();
     for row in rows {
         let (channel_id, message_id, created_ms, author, content, thread_id, is_root, partial) =

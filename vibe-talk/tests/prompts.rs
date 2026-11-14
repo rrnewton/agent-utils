@@ -1,8 +1,5 @@
 //! `vibe-talk prompts`: owner-only messages from the local cache, cache-only. `#1529`.
 
-use std::collections::BTreeMap;
-
-use vibe_talk::config::Config;
 use vibe_talk::prompts::{channel_matches, read_at, render, HEADER};
 
 const HOUR: i64 = 3_600_000;
@@ -11,37 +8,47 @@ fn base_ms() -> i64 {
     vibe_talk::clock::instant_ms("2026-09-20T00:00:00Z").expect("base instant")
 }
 
-fn config() -> Config {
+fn config() -> vibe_talk::prompts::PromptsConfig {
+    // No provider token anywhere: a cache-only command must not need one.
     let text = format!(
         r#"
-[server]
-bind = "127.0.0.1:0"
-
-[discord]
-bot_token = "test-bot-token"
-default_fetch_limit = 20
-max_fetch_limit = 50
-owner_user_id = "UOWNER"
-
-[auth]
-read_token = "test-read-token-000000000000"
-write_token = "test-write-token-00000000000"
-
 [[channels]]
 id = "{}"
 label = "lead team"
-writable = true
 
 [owner]
 user_ids = ["UOWNER"]
-
-[elevenlabs]
-agent_id = "agent"
-api_key = "key"
 "#,
         vibe_talk::testing::WRITE_CHANNEL
     );
-    Config::from_toml_and_env(&text, &BTreeMap::new()).expect("test config is valid")
+    vibe_talk::prompts::parse_lenient(&text).expect("lenient config parses")
+}
+
+#[test]
+fn prompts_cli_runs_with_a_tokenless_config_file() {
+    let (dir, cache) = fixture_cache();
+    let config_path = dir.path().join("app.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[[channels]]\nid = \"{}\"\nlabel = \"lead team\"\n\n[owner]\nuser_ids = [\"UOWNER\"]\n",
+            vibe_talk::testing::WRITE_CHANNEL
+        ),
+    )
+    .expect("write config");
+    let options = vibe_talk::prompts::Options {
+        config: Some(config_path),
+        cache: Some(cache),
+        hours: None,
+        since: None,
+        channel: Some("#lead team".to_owned()),
+        json: false,
+        overlays: Vec::new(),
+    };
+    let out = vibe_talk::prompts::run_at(options, base_ms() + 20 * HOUR).expect("run");
+    assert!(out.starts_with(vibe_talk::prompts::HEADER), "{out}");
+    assert!(out.contains("first reply"), "{out}");
+    assert!(out.contains("second reply"), "{out}");
 }
 
 fn fixture_cache() -> (vibe_talk::testing::TempDir, std::path::PathBuf) {
