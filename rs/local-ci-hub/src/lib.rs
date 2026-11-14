@@ -9,6 +9,7 @@
 //! derived index over the read authority. Storage connectors and the CLI
 //! build on this core without re-implementing any of those.
 
+pub mod deployment;
 pub mod digest;
 pub mod event;
 pub mod expand;

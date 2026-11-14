@@ -8,6 +8,10 @@
 //! 2 no-result or cannot-tell, 75 could-not-run.
 
 use clap::{Parser, Subcommand};
+use local_ci_hub::deployment::{
+    DeploymentConfig, DEFAULT_BINDING_TREE_FIELD, DEFAULT_EVIDENCE_HEAD_FIELD, DEFAULT_GIT_REF,
+    DEFAULT_REPO,
+};
 use local_ci_hub::digest::receipt_digest_with;
 use local_ci_hub::event::{check_events, is_fixture_event, union, Refusal};
 use local_ci_hub::expand::{expand_line_with, ExpandConfig, FileEvidence, NoEvidence};
@@ -22,34 +26,53 @@ use std::process::Command as ProcCommand;
 
 /// Local CI hub: runs, ledger, receipts, remotes, health, and landing locks.
 #[derive(Parser)]
-#[command(name = "local-ci-hub", version, about)]
+#[command(
+    name = "local-ci-hub",
+    version,
+    about,
+    after_help = "EXAMPLES:\n  local-ci-hub --config deployment.json ledger digest-rows\n  local-ci-hub --repo . --git-ref HEAD ledger rows --terminals\nSee rs/local-ci-hub/README.md for every deployment flag."
+)]
 struct Cli {
-    /// Git repository holding the ledger shards.
-    #[arg(long, global = true, default_value = ".")]
-    repo: PathBuf,
-    /// Ref (or commit) whose git objects are the read authority.
-    #[arg(long, global = true, default_value = "HEAD")]
-    git_ref: String,
-    /// Evidence archive root holding `run-evidence/` objects.
+    /// Deployment config file (JSON; see deployment.example.json).
+    /// Precedence: explicit flag, then config, then built-in default.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Git repository holding the ledger shards (default: `.`;
+    /// config key `repo`).
+    #[arg(long, global = true)]
+    repo: Option<PathBuf>,
+    /// Ref (or commit) whose git objects are the read authority
+    /// (default: `HEAD`; config key `git_ref`).
+    #[arg(long, global = true)]
+    git_ref: Option<String>,
+    /// Evidence archive root holding `run-evidence/` objects
+    /// (default: unset, no evidence source; config key
+    /// `evidence_root`).
     #[arg(long, global = true)]
     evidence_root: Option<PathBuf>,
     /// `cell_results` field naming the validated tree for derived
-    /// evidence bindings.
-    #[arg(long, global = true, default_value = "tree")]
-    binding_tree_field: String,
+    /// evidence bindings (default: `tree`; config key
+    /// `binding_tree_field`).
+    #[arg(long, global = true)]
+    binding_tree_field: Option<String>,
     /// Extra base-evidence field names the predicate requires from
-    /// schema 5 on (repeatable).
+    /// schema 5 on (repeatable; config key `base_fields` replaces
+    /// the whole list when no flag is given).
     #[arg(long, global = true)]
     base_field: Vec<String>,
     /// Producer tool names whose events are admission fixtures and are
-    /// excluded after the union (repeatable).
+    /// excluded after the union (repeatable; config key
+    /// `fixture_producers` replaces the whole list when no flag is
+    /// given).
     #[arg(long, global = true)]
     fixture_producer: Vec<String>,
     /// `cell_results` field naming the validated head for typed
-    /// evidence canonicalization (default: `validated_head_sha`).
-    #[arg(long, global = true, default_value = "validated_head_sha")]
-    evidence_head_field: String,
-    /// Index file path (default: ephemeral in-memory index).
+    /// evidence canonicalization (default: `validated_head_sha`;
+    /// config key `evidence_head_field`).
+    #[arg(long, global = true)]
+    evidence_head_field: Option<String>,
+    /// Index file path (default: ephemeral in-memory index; config
+    /// key `index`, `null` keeps the default).
     #[arg(long, global = true)]
     index: Option<PathBuf>,
     /// Print JSON instead of the human summary.
@@ -104,32 +127,102 @@ struct Loaded {
     authority: String,
 }
 
+/// Flag values after `--config` resolution: explicit flag, then
+/// config, then built-in default.
+struct Effective {
+    repo: PathBuf,
+    git_ref: String,
+    evidence_root: Option<PathBuf>,
+    binding_tree_field: String,
+    base_fields: Vec<String>,
+    fixture_producers: Vec<String>,
+    evidence_head_field: String,
+    index: Option<PathBuf>,
+    json: bool,
+}
+
+fn effective(cli: &Cli) -> Result<Effective, String> {
+    let config = match &cli.config {
+        Some(path) => DeploymentConfig::load(path)?,
+        None => DeploymentConfig::default(),
+    };
+    let repo = cli
+        .repo
+        .clone()
+        .or_else(|| config.repo.map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_REPO));
+    let git_ref = cli
+        .git_ref
+        .clone()
+        .or(config.git_ref)
+        .unwrap_or_else(|| DEFAULT_GIT_REF.to_owned());
+    let evidence_root = cli
+        .evidence_root
+        .clone()
+        .or_else(|| config.evidence_root.map(PathBuf::from));
+    let binding_tree_field = cli
+        .binding_tree_field
+        .clone()
+        .or(config.binding_tree_field)
+        .unwrap_or_else(|| DEFAULT_BINDING_TREE_FIELD.to_owned());
+    let base_fields = if cli.base_field.is_empty() {
+        config.base_fields
+    } else {
+        cli.base_field.clone()
+    };
+    let fixture_producers = if cli.fixture_producer.is_empty() {
+        config.fixture_producers
+    } else {
+        cli.fixture_producer.clone()
+    };
+    let evidence_head_field = cli
+        .evidence_head_field
+        .clone()
+        .or(config.evidence_head_field)
+        .unwrap_or_else(|| DEFAULT_EVIDENCE_HEAD_FIELD.to_owned());
+    let index = cli
+        .index
+        .clone()
+        .or_else(|| config.index.map(PathBuf::from));
+    Ok(Effective {
+        repo,
+        git_ref,
+        evidence_root,
+        binding_tree_field,
+        base_fields,
+        fixture_producers,
+        evidence_head_field,
+        index,
+        json: cli.json,
+    })
+}
+
 fn refusal_exit(refusal: &Refusal) -> ! {
     eprintln!("local-ci-hub: refused: {refusal}");
     std::process::exit(1);
 }
 
-fn load(cli: &Cli) -> Result<Loaded, String> {
+fn load(eff: &Effective) -> Result<Loaded, String> {
     let authority = "git-lcd".to_owned();
     let mut store = GitStore::new(
         authority.clone(),
         Role::Record,
-        cli.repo.clone(),
-        &cli.git_ref,
+        eff.repo.clone(),
+        &eff.git_ref,
     );
-    if let Some(root) = &cli.evidence_root {
+    if let Some(root) = &eff.evidence_root {
         store = store.with_evidence_root(root.clone());
     }
-    let workspace_root = cli.repo.display().to_string();
-    let mut index = match &cli.index {
+    let workspace_root = eff.repo.display().to_string();
+    let mut index = match &eff.index {
         Some(path) => Index::open(path, &authority, &workspace_root).map_err(|e| format!("{e}"))?,
         None => Index::in_memory(&authority, &workspace_root).map_err(|e| format!("{e}"))?,
     };
     let start = index.cursor().map_err(|e| format!("{e}"))?;
     let config = ExpandConfig {
-        binding_tree_field: cli.binding_tree_field.clone(),
+        binding_tree_field: eff.binding_tree_field.clone(),
     };
-    let fixture_producers: BTreeSet<String> = cli.fixture_producer.iter().cloned().collect();
+    let fixture_producers: BTreeSet<String> = eff.fixture_producers.iter().cloned().collect();
     let mut filtered_fixtures: usize = 0;
     let mut cursor = start;
     // Tail the authority page by page, admitting each page to the index
@@ -145,7 +238,7 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
         }
         let mut expanded = Vec::with_capacity(page.events.len());
         for shard_event in &page.events {
-            let event = match &cli.evidence_root {
+            let event = match &eff.evidence_root {
                 Some(root) => {
                     expand_line_with(&shard_event.line, &FileEvidence::new(root.clone()), &config)
                 }
@@ -185,13 +278,13 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
     })
 }
 
-fn resolve_commit(cli: &Cli, commit: &str) -> String {
+fn resolve_commit(eff: &Effective, commit: &str) -> String {
     if commit != "HEAD" && commit != "@" {
         return commit.to_owned();
     }
     let output = ProcCommand::new("git")
         .arg("-C")
-        .arg(&cli.repo)
+        .arg(&eff.repo)
         .args(["rev-parse", "HEAD"])
         .output();
     match output {
@@ -200,9 +293,9 @@ fn resolve_commit(cli: &Cli, commit: &str) -> String {
     }
 }
 
-fn policy(cli: &Cli) -> Policy {
+fn policy(eff: &Effective) -> Policy {
     let mut policy = Policy::default();
-    for field in &cli.base_field {
+    for field in &eff.base_fields {
         if !policy.base_fields.contains(field) {
             policy.base_fields.push(field.clone());
         }
@@ -216,7 +309,14 @@ fn main() {
         println!("local-ci-hub {} (see --help)", env!("CARGO_PKG_VERSION"));
         return;
     };
-    let loaded = match load(&cli) {
+    let eff = match effective(&cli) {
+        Ok(eff) => eff,
+        Err(error) => {
+            eprintln!("local-ci-hub: {error}");
+            std::process::exit(2);
+        }
+    };
+    let loaded = match load(&eff) {
         Ok(loaded) => loaded,
         Err(error) => {
             eprintln!("local-ci-hub: {error}");
@@ -227,7 +327,7 @@ fn main() {
         Command::Receipt {
             action: ReceiptAction::Show { commit },
         } => {
-            let commit = resolve_commit(&cli, commit);
+            let commit = resolve_commit(&eff, commit);
             let rows = match loaded.index.rows_for_commit(&commit) {
                 Ok(rows) => rows,
                 Err(error) => {
@@ -235,13 +335,13 @@ fn main() {
                     std::process::exit(2);
                 }
             };
-            let assessment = assess(&rows, &commit, &policy(&cli));
+            let assessment = assess(&rows, &commit, &policy(&eff));
             let verdict_text = match assessment.verdict {
                 Verdict::Qualified => "qualified",
                 Verdict::NotQualified => "not-qualified",
                 Verdict::NoResult => "no-result",
             };
-            if cli.json {
+            if eff.json {
                 let object = PyValue::Object(vec![
                     (
                         "schema".to_owned(),
@@ -311,7 +411,7 @@ fn main() {
                 if let Some(cell_results) = row.get("cell_results") {
                     if cell_results.is_object() {
                         evidence_records += 1;
-                        if cell_results.get(&cli.evidence_head_field).is_some() {
+                        if cell_results.get(&eff.evidence_head_field).is_some() {
                             head_field_seen = true;
                         }
                     }
@@ -323,7 +423,7 @@ fn main() {
                     ),
                     (
                         "digest".to_owned(),
-                        match receipt_digest_with(&row, &cli.evidence_head_field) {
+                        match receipt_digest_with(&row, &eff.evidence_head_field) {
                             Some(digest) => PyValue::Str(digest),
                             None => PyValue::Null,
                         },
@@ -340,14 +440,14 @@ fn main() {
                     "local-ci-hub: warning: evidence-head field '{}' absent from all \
                      {evidence_records} typed cell_results record(s); digests used the \
                      generic sorted form — check --evidence-head-field against the deployment",
-                    cli.evidence_head_field
+                    eff.evidence_head_field
                 );
             }
         }
         Command::Ledger {
             action: LedgerAction::Verdicts,
         } => {
-            let active_policy = policy(&cli);
+            let active_policy = policy(&eff);
             if let Err(error) = loaded.index.for_each_commit_rows(|commit, commit_rows| {
                 let assessment = assess(&commit_rows, &commit, &active_policy);
                 let verdict_text = match assessment.verdict {

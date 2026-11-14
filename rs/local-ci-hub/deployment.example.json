@@ -1,0 +1,15 @@
+{
+  "repo": "<ledger-repo-path>",
+  "git_ref": "<ledger-head-ref>",
+  "evidence_root": "<evidence-archive-root>",
+  "binding_tree_field": "<binding-tree-field>",
+  "base_fields": [
+    "<base-field-1>",
+    "<base-field-2>"
+  ],
+  "fixture_producers": [
+    "<fixture-producer-1>"
+  ],
+  "evidence_head_field": "<evidence-head-field>",
+  "index": null
+}
