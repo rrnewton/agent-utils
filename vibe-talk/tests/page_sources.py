@@ -133,10 +133,10 @@ def source_text(root: Path, name: str) -> str:
 
 
 def page_code(root: Path) -> str:
-    """The page's handwritten code: every `web/src` module, then `voice.js` (`#624 voice-page-modularity`).
+    """The page's handwritten code: every `web/src` module, the entry among them.
 
     Mirrors `PAGE_CODE` in `tests/js/page/fixture.mjs`: a walk that reads one of the page's own
-    numbers or statements reads it here, so the read survives the code moving out of `voice.js`.
+    numbers or statements reads it here, so the read survives code moving between modules.
     """
     sources = _built_from(root)
     texts: list[str] = []
@@ -145,7 +145,6 @@ def page_code(root: Path) -> str:
         for path in sorted(src.rglob("*")):
             if path.is_file() and path.suffix in (".ts", ".js", ".mjs"):
                 texts.append(path.read_text())
-    texts.append(_read_source(sources, "voice.js"))
     return "\n".join(texts)
 
 
@@ -161,7 +160,6 @@ def file_holding(root: Path, text: str) -> str:
     src = sources / "src"
     if src.is_dir():
         candidates.extend(p for p in sorted(src.rglob("*")) if p.is_file() and p.suffix in (".ts", ".js", ".mjs"))
-    candidates.append(sources / "voice.js")
     holders = [p for p in candidates if p.read_text().count(text) == 1]
     total = sum(p.read_text().count(text) for p in candidates)
     if total != 1 or len(holders) != 1:

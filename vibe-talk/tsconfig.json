@@ -12,8 +12,8 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": [],
     "skipLibCheck": false,
-    // web/legacy-imports.d.ts types what the page build's prelude declares for voice.js by importing
-    // the modules' own types (`#624 voice-page-modularity`).
+    // The entry's own import declarations type what it takes from the modules, against the
+    // modules' own types (`#624 voice-page-modularity`, final entry).
     "module": "esnext",
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true

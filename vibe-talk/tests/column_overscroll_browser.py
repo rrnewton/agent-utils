@@ -302,12 +302,12 @@ CONTROLS: tuple[Control, ...] = (
      (("      if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;\n", ""),), ("STILL",)),
     ("no rest asked of the wheel", FOOT_ROOMS,
      (("const OVERSCROLL_REST_MS = 150;\n", "const OVERSCROLL_REST_MS = 0;\n"),), ("DETENT",)),
-    ("the last card's change of size neither fitted to nor held", "voice.js",
+    ("the last card's change of size neither fitted to nor held", "src/app/main.js",
      ((LIT_CARDS, "    deps.fitOverscroll(pane.scroller());\n    deps.nudge(pane.scroller(), row.getBoundingClientRect().top - before);\n",
        "    deps.nudge(pane.scroller(), row.getBoundingClientRect().top - before);\n"),
       (LIST_KEEPERS, "      holdOverscrollReader(area);\n      const was = footing;\n", "      const was = footing;\n")),
      ("HIGHLIGHT",)),
-    ("the search not what the room was opened over", "voice.js",
+    ("the search not what the room was opened over", "src/app/main.js",
      ((", searchKey()])", "])"),), ("SEARCH",)),
 )
 

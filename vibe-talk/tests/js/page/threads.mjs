@@ -380,7 +380,7 @@ test("ON THE CALL'S VIEW TOO, the chips' room growing under the box keeps a foll
   };
   assert.equal(await run(SCRIPT), true, "the chips' room grew and left the following reader short of the foot");
   // THE CONTROL: the re-pin as it was, for the channel only. The reader is left short.
-  const control = await run(brokenScript(
+  const control = await run(await brokenScript(
     'const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);',
     'const pinned = !landed && screens.screen() === "main" && screens.view() === "discord" && chipsFollowFoot(area, grew);',
     2 // the second is the same re-pin after the dock moves, left as it is
@@ -459,7 +459,7 @@ test("`#280 scroll-stability`: BACK FROM SETTINGS the chips' room is in the list
   assert.deepStrictEqual(real, { up0: true, up50: true, pillAtFoot: true, roomGoes: true, roomBack: true });
   // THE CONTROL: the room written only where the status pill reads it. The reader 50px up is taken to the
   // foot on the way back, and only they are.
-  const unheld = await run(brokenScript(
+  const unheld = await run(await brokenScript(
     '    if (!screen.hidden) screen.style.setProperty("--scroll-tools-clearance", room);\n', ""));
   assert.deepStrictEqual(unheld, { ...real, up50: false });
 });

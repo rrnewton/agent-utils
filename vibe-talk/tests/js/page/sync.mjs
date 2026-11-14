@@ -852,7 +852,7 @@ test("with a token saved, a reload never shows the sign-in form while the token 
 
   // THE CONTROL: with the startup's no-token branch showing the form whatever is saved, this sees it.
   const control = [];
-  const flashing = newPage(first.storage, brokenScript('      } else if (token()) {\n        if (hydrateFromCache()) {',
+  const flashing = newPage(first.storage, await brokenScript('      } else if (token()) {\n        if (hydrateFromCache()) {',
     '      } else if (token()) {\n        showScreen("signin");\n        if (hydrateFromCache()) {'), (p) => {
     noteSigninShown(control)(p);
     p.clientConfig = () => new Promise(() => {});

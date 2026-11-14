@@ -214,29 +214,39 @@ export function requireStrict(name, text, ts = loadTool("typescript")) {
 /** The name a page file carries in source maps and assets.json, wherever the checkout is. */
 const sourceName = (name) => `vibe-talk/web/${name}`;
 
-// ---- The legacy prelude ---------------------------------------------------------------------------
+// ---- The entry prelude -----------------------------------------------------------------------------
 //
-// `#624 voice-page-modularity`. The page's code moves out of web/voice.js into TypeScript modules
-// below web/src/ a piece at a time. What is left of voice.js is still a classic script, and still
-// calls what moved; it is NOT bundled as a module, because esbuild bundling a module rewrites its
-// top-level `let`/`const`/`class` to `var` (a read before its declaration would then give
-// `undefined` instead of throwing) and drops its "use strict" (checked against esbuild 0.28.2). So
-// the modules it calls are bundled on their own, inside a strict function, and that function hands
-// the legacy script exactly the names web/src/legacy/imports.ts exports, as constants declared just
-// before it runs:
+// `#624 voice-page-modularity`, final entry. The page's entry is a module,
+// web/src/app/main.js, importing the TypeScript modules below web/src. It is still NOT
+// bundled as a module, because esbuild bundling a module rewrites its top-level
+// `let`/`const`/`class` to `var` (a read before its declaration would then give `undefined`
+// instead of throwing) and drops its "use strict" (checked against esbuild 0.28.2), and it
+// would put every module-internal name on the page. So the modules the entry imports are
+// bundled on their own, inside a strict function, and that function hands the entry exactly
+// the names its import declarations name, as constants declared just before it runs; the
+// entry's own body follows as a classic strict script with its import declarations blanked:
 //
 //   const { searchQueryParse, ... } = (() => {
 //   "use strict";
-//   var __voiceLegacyImports = (() => { ...the modules... })();
-//   return __voiceLegacyImports;
+//   var __voiceEntryImports = (() => { ...the modules... })();
+//   return __voiceEntryImports;
 //   })();
+//   "use strict";
+//   ...the entry's body, its imports blanked...
 //
-// No other name the modules use is visible outside them, and no object is left behind on the page.
+// The prelude's entry is web/src/app/entry-imports.ts, GENERATED from main.js's import
+// declarations by `entryImportsModule` below (`node web/build.mjs --write-entry-imports`;
+// tests/js/page_build.test.mjs holds the written file to what it generates), so main.js's
+// imports are the one list. No other name the modules use is visible outside them, and no
+// object is left behind on the page.
 
-/** The page's entry module (`#624 voice-page-modularity`, final entry): bundled as one script. */
+/** The page's entry module (`#624 voice-page-modularity`, final entry). */
 export const ENTRY_MODULE = "src/app/main.js";
+/** The generated module re-exporting what the entry imports, for the prelude to bundle. */
+export const ENTRY_IMPORTS = "src/app/entry-imports.ts";
 /** The plain script name the shell and older shells load the entry under. */
 export const LEGACY_SCRIPT = "voice.js";
+const PRELUDE_GLOBAL = "__voiceEntryImports";
 
 /**
  * An esbuild plugin that loads each file `overlays` names with its patch applied: `{ file, find,
@@ -244,7 +254,7 @@ export const LEGACY_SCRIPT = "voice.js";
  * is replaced), so a negative control whose text the module no longer holds fails rather than
  * building the module unchanged.
  */
-function overlayPlugin(web, overlays) {
+function overlayTexts(web, overlays) {
   const byPath = new Map();
   for (const { file, find, replace, count = 1 } of overlays) {
     const path = resolve(web, file);
@@ -253,6 +263,11 @@ function overlayPlugin(web, overlays) {
     if (found !== count) throw new Error(`the overlay patches ${JSON.stringify(find)}, which ${file} holds ${found} times, not ${count}`);
     byPath.set(path, text.replace(find, () => replace));
   }
+  return byPath;
+}
+
+function overlayPlugin(web, overlays) {
+  const byPath = overlayTexts(web, overlays);
   return {
     name: "overlay",
     setup(builder) {
@@ -276,21 +291,101 @@ async function exportedNames(esbuild, entry, plugins) {
 }
 
 /**
- * The entry bundle: `src/app/main.js` and everything it imports, as one script part
- * ({ name, code, map, lineCount, names }), like the prelude it replaces. `names` are the
- * local names the entry imports from its modules, for tests that read a module binding in
- * the page's realm. `overlays` patch module sources first (see overlayPlugin).
+ * The entry's import declarations, by the pinned TypeScript parser: for each, its module
+ * specifier and the bindings it declares as `{ imported, local }` ("default" and "*" for a
+ * default and a namespace import; no bindings for a side-effect import).
  */
-export async function entryBundle(esbuild, web = WEB, { minify = true, overlays = [] } = {}) {
-  const entry = join(web, ENTRY_MODULE);
+function entryImportDeclarations(text) {
+  const { ts, file } = parseScript(ENTRY_MODULE, text);
+  const declarations = [];
+  for (const statement of file.statements) {
+    if (!ts.isImportDeclaration(statement)) continue;
+    const bindings = [];
+    const clause = statement.importClause;
+    if (clause) {
+      if (clause.name) bindings.push({ imported: "default", local: clause.name.text });
+      const named = clause.namedBindings;
+      if (named) {
+        if (ts.isNamespaceImport(named)) bindings.push({ imported: "*", local: named.name.text });
+        else for (const element of named.elements) {
+          bindings.push({ imported: (element.propertyName ?? element.name).text, local: element.name.text });
+        }
+      }
+    }
+    declarations.push({ specifier: statement.moduleSpecifier.text, bindings, statement });
+  }
+  return { ts, file, declarations };
+}
+
+/**
+ * The generated prelude entry (web/src/app/entry-imports.ts): the entry's imports re-exported
+ * under the entry's own local names, in declaration order. Written by
+ * `node web/build.mjs --write-entry-imports` and held to this output by page_build.test.mjs.
+ */
+export function entryImportsModule(entryText) {
+  const { declarations } = entryImportDeclarations(entryText);
+  const lines = [
+    "// GENERATED by web/build.mjs from src/app/main.js's imports. Do not edit.",
+    "// Regenerate with: node web/build.mjs --write-entry-imports",
+    "// The entry's imports, re-exported under its own local names for the page build's prelude",
+    "// (`#624 voice-page-modularity`, final entry; see entryPrelude in web/build.mjs).",
+    "",
+  ];
+  const held = [];
+  for (const { specifier, bindings } of declarations) {
+    const named = bindings.filter(({ imported }) => imported !== "default" && imported !== "*");
+    if (named.length > 0) {
+      const names = named.map(({ imported, local }) => (imported === local ? local : `${imported} as ${local}`));
+      lines.push(`export { ${names.join(", ")} } from "${specifier}";`);
+    }
+    for (const { imported, local } of bindings) {
+      if (imported === "default") lines.push(`import ${local} from "${specifier}";`);
+      else if (imported === "*") lines.push(`import * as ${local} from "${specifier}";`);
+      else continue;
+      held.push(local);
+    }
+    if (bindings.length === 0) lines.push(`import "${specifier}";`);
+  }
+  if (held.length > 0) lines.push(`export { ${held.join(", ")} };`);
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * The entry's body as a classic script: its import declarations blanked in place (every
+ * character but the newlines), so every other line keeps its number and the source map stays
+ * 1:1. The names the imports declared are the prelude's constants, declared just before it.
+ */
+export function blankEntryImports(entryText) {
+  const { file, declarations } = entryImportDeclarations(entryText);
+  const chars = entryText.split("");
+  for (const { statement } of declarations) {
+    for (let at = statement.getStart(file); at < statement.end; at += 1) {
+      if (chars[at] !== "\n") chars[at] = " ";
+    }
+  }
+  return chars.join("");
+}
+
+/**
+ * The prelude the entry runs after (see above): `{ name, code, map, lineCount, names }`, or
+ * null when the generated entry-imports module exports nothing. `minify` takes out white
+ * space and comments only, as for the rest of the page; `overlays` patch module sources
+ * first (see overlayPlugin).
+ */
+export async function entryPrelude(esbuild, web = WEB, { minify = true, overlays = [] } = {}) {
+  const entry = join(web, ENTRY_IMPORTS);
+  if (!existsSync(entry)) return null;
   const plugins = overlays.length > 0 ? [overlayPlugin(web, overlays)] : [];
+  const names = await exportedNames(esbuild, entry, plugins);
+  if (names.length === 0) return null;
   const result = await esbuild.build({
     entryPoints: [entry],
     bundle: true,
-    format: "esm",
+    format: "iife",
+    globalName: PRELUDE_GLOBAL,
     platform: "neutral",
     write: false,
-    outfile: join(web, "entry.js"),
+    outfile: join(web, "prelude.js"),
     sourcemap: "external",
     sourcesContent: true,
     target: "esnext",
@@ -301,20 +396,47 @@ export async function entryBundle(esbuild, web = WEB, { minify = true, overlays 
     logLevel: "silent",
     plugins,
   });
-  if (result.warnings.length > 0) throw new Error(`the entry: ${result.warnings.map((warning) => warning.text).join("; ")}`);
+  if (result.warnings.length > 0) throw new Error(`the prelude: ${result.warnings.map((warning) => warning.text).join("; ")}`);
   const output = (suffix) => result.outputFiles.find((file) => file.path.endsWith(suffix));
-  const code = output(".js").text.endsWith("\n") ? output(".js").text : `${output(".js").text}\n`;
+  const bundled = output(".js").text;
+  const body = bundled.endsWith("\n") ? bundled : `${bundled}\n`;
+  const code = `const { ${names.join(", ")} } = (() => {\n"use strict";\n${body}return ${PRELUDE_GLOBAL};\n})();\n`;
   const map = JSON.parse(output(".js.map").text);
-  map.sources = map.sources.map((source) => sourceName(source.split("\\").join("/").replace(/^\.\.\//, "")));
-  const source = readFileSync(entry, "utf8");
-  const names = [];
-  for (const block of source.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from/g)) {
-    for (const part of block[1].split(",")) {
-      const name = part.trim().split(/\s+as\s+/).at(-1).trim();
-      if (/^[A-Za-z_$][\w$]*$/.test(name)) names.push(name);
-    }
+  // Two lines (the wrapper's opening) come before the bundle's first; its sources are named from the
+  // repository root, like every other part's.
+  map.mappings = `;;${map.mappings}`;
+  map.sources = map.sources.map((source) => sourceName(source.split("\\").join("/")));
+  return { name: ENTRY_IMPORTS, code, map, lineCount: code.split("\n").length - 1, names };
+}
+
+/**
+ * The entry's own script part: its body with its imports blanked (see blankEntryImports),
+ * opened by its own "use strict" and minified as every other classic part is, so its
+ * top-level `const`/`let` stay lexical with their temporal dead zone. `overlays` patch the
+ * entry (and are counted there) first.
+ */
+export async function entryScriptPart(esbuild, web = WEB, { minify = true, overlays = [] } = {}) {
+  const path = resolve(web, ENTRY_MODULE);
+  const source = overlayTexts(web, overlays).get(path) ?? readFileSync(path, "utf8");
+  const result = await esbuild.transform(blankEntryImports(source), {
+    loader: "js",
+    minifyWhitespace: minify,
+    sourcemap: "external",
+    sourcefile: sourceName(ENTRY_MODULE),
+    sourcesContent: true,
+    target: "esnext",
+    charset: "utf8",
+    legalComments: "none",
+    logLevel: "silent",
+  });
+  if (result.warnings.length > 0) {
+    throw new Error(`${ENTRY_MODULE}: ${result.warnings.map((warning) => warning.text).join("; ")}`);
   }
-  return { name: LEGACY_SCRIPT, code, map, lineCount: code.split("\n").length - 1, names: [...new Set(names)].sort() };
+  const body = result.code.endsWith("\n") ? result.code : `${result.code}\n`;
+  const code = `"use strict";\n${body}`;
+  const map = JSON.parse(result.map);
+  map.mappings = `;${map.mappings}`;
+  return { name: LEGACY_SCRIPT, code, map, lineCount: code.split("\n").length - 1 };
 }
 
 /**
@@ -476,10 +598,11 @@ export async function build(out, { web = WEB } = {}) {
   const scripts = shellScripts(html);
   const styles = shellStyles(html);
   const scriptParts = await minifyAll(esbuild, web, scripts.filter((name) => name !== LEGACY_SCRIPT), "js");
-  const entry = await entryBundle(esbuild, web);
+  const prelude = await entryPrelude(esbuild, web);
+  const entryPart = await entryScriptPart(esbuild, web);
   const at = scripts.indexOf(LEGACY_SCRIPT);
   if (at < 0) throw new Error(`the entry builds ${LEGACY_SCRIPT}, which the shell does not load`);
-  scriptParts.splice(at, 0, entry);
+  scriptParts.splice(at, 0, ...(prelude ? [prelude, entryPart] : [entryPart]));
   const js = assemble(scriptParts, {
     stem: "voice",
     extension: "js",
@@ -517,6 +640,7 @@ export async function build(out, { web = WEB } = {}) {
   const manifest = {
     page_build: digest(js.bytes),
     legacy_imports: [],
+    entry_imports: prelude ? prelude.names : [],
     assets: {
       script: { path: `/assets/${js.file}`, map: `/assets/${js.mapFile}`, type: "text/javascript; charset=utf-8", sources: scripts },
       style: { path: `/assets/${css.file}`, map: `/assets/${css.mapFile}`, type: "text/css; charset=utf-8", sources: styles },
@@ -560,6 +684,7 @@ export async function build(out, { web = WEB } = {}) {
 
 function usage() {
   return `usage: node web/build.mjs --out DIR [--web SOURCES]
+       node web/build.mjs --write-entry-imports
 
 Build the page the server embeds into DIR: assets/voice.<hash>.js and .css with their source maps,
 the shell naming them, the plain files an older shell asks for, the manifest and icons, and
@@ -584,6 +709,11 @@ function option(args, flag, fallback) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
+  if (args.length === 1 && args[0] === "--write-entry-imports") {
+    writeFileSync(join(WEB, ENTRY_IMPORTS), entryImportsModule(readFileSync(join(WEB, ENTRY_MODULE), "utf8")));
+    process.stdout.write(`wrote ${ENTRY_IMPORTS}\n`);
+    process.exit(0);
+  }
   const known = new Set(["--out", "--web"]);
   if (args.includes("--help") || args.includes("-h")) {
     process.stdout.write(usage());

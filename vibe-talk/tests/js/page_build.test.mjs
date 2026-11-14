@@ -7,9 +7,22 @@
 // position in the minified file to the right line of the right source; nothing names the machine it
 // was built on; two builds of the same sources are the same bytes.
 
-import { test } from "node:test";
+import { test as nodeTest } from "node:test";
+
+// A throw at this module's top level (a source read for a probe, say) stops every later
+// test() from registering, and the run then reports only the tests it happened to reach
+// (`#624 voice-page-modularity` final entry lost 16 of 25 that way). Count registrations
+// and fail the process loudly below the floor, so a short suite can never read as a pass.
+let registered = 0;
+const test = (...args) => { registered += 1; return nodeTest(...args); };
+process.on("exit", () => {
+  if (registered < 25) {
+    console.error(`page_build: only ${registered} tests registered, below the floor of 25`);
+    process.exitCode = 1;
+  }
+});
 import assert from "node:assert/strict";
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { SourceMap } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -17,8 +30,8 @@ import { pathToFileURL } from "node:url";
 import vm from "node:vm";
 
 import {
-  build, decodeMappings, digest, encodeMappings, joinMaps, linkShell, loadTool, moduleForTests, parseScript, requireOutside,
-  requireStrict,
+  ENTRY_IMPORTS, ENTRY_MODULE, blankEntryImports, build, decodeMappings, digest, encodeMappings, entryImportsModule, entryPrelude, entryScriptPart,
+  joinMaps, linkShell, loadTool, moduleForTests, parseScript, requireOutside, requireStrict,
 } from "../../web/build.mjs";
 import { ASSEMBLED, SHELL, WEB, moduleSources, partsOf, readWeb, shellScripts, shellStyles } from "../../web/page_sources.mjs";
 import { PACKAGES, checkArchitecture } from "../../web/architecture.mjs";
@@ -147,29 +160,45 @@ function topLevelNames(name, text) {
   return names;
 }
 
-test("the script is strict throughout, declares every source's top-level name at its own top level, and links its map", () => {
+/** The local names a module's import declarations bind, by the pinned TypeScript parser. */
+function importedNames(name, text) {
+  const { ts, file } = parseScript(name, text);
+  const names = [];
+  for (const statement of file.statements) {
+    if (!ts.isImportDeclaration(statement) || !statement.importClause) continue;
+    if (statement.importClause.name) names.push(statement.importClause.name.text);
+    const bindings = statement.importClause.namedBindings;
+    if (!bindings) continue;
+    if (ts.isNamespaceImport(bindings)) names.push(bindings.name.text);
+    else for (const element of bindings.elements) names.push(element.name.text);
+  }
+  return names;
+}
+
+test("the script is strict throughout, declares every entry source's top-level name at its own top level, and links its map", () => {
   const script = text(SCRIPT_PATH);
   assert.ok(script.startsWith('"use strict";\n'), "the joined script does not open in strict mode");
   const declared = new Set(topLevelNames("bundle.js", script));
+  const entryNames = topLevelNames(ENTRY_MODULE, readWeb(ENTRY_MODULE));
   let checked = 0;
-  for (const name of shellScripts(readWeb(SHELL))) {
-    for (const top of topLevelNames(name, readWeb(name))) {
-      assert.ok(declared.has(top), `${name}'s top-level ${top} is not declared at the bundle's top level`);
-      checked += 1;
-    }
+  for (const top of entryNames) {
+    assert.ok(declared.has(top), `${ENTRY_MODULE}'s top-level ${top} is not declared at the bundle's top level`);
+    checked += 1;
   }
-  assert.ok(checked > 1000, `only ${checked} top-level names were checked`);
+  assert.equal(checked, entryNames.length, "not every entry top-level name was checked");
+  assert.ok(checked > 100 && entryNames.includes("takePairingCode"), `only ${checked} entry top-level names were checked`);
   const mapPath = MANIFEST.assets.script.map;
   assert.ok(script.endsWith(`\n//# sourceMappingURL=${mapPath}\n`), "the script does not name its map last");
   assert.ok(text(STYLE_PATH).endsWith(`/*# sourceMappingURL=${MANIFEST.assets.style.map} */\n`));
 });
 
-test("an error the page throws is reported at the line of its source it was thrown from", () => {
-  // Run with no browser at all, both the sources and the bundle stop on the same missing global, at
-  // the same statement: the bundle's stack, mapped back, must name the line the sources name.
-  const thrown = (code, filename) => {
+test("an error the page throws is reported at the line of its source it was thrown from", async () => {
+  // Run with no browser at all, the unminified prelude and entry part and the page build's
+  // script stop on the same missing global, at the same statement: each stack, mapped back
+  // through its own map, must name the same source and line.
+  const thrown = (code, filename, context) => {
     try {
-      new vm.Script(code, { filename }).runInContext(vm.createContext({}));
+      new vm.Script(code, { filename }).runInContext(context);
     } catch (error) {
       const at = new RegExp(`${filename.replace(/\./g, "\\.")}:(\\d+):(\\d+)`).exec(error.stack);
       assert.ok(at, `no frame in ${filename}: ${error.stack}`);
@@ -177,40 +206,37 @@ test("an error the page throws is reported at the line of its source it was thro
     }
     return assert.fail(`${filename} ran to the end without a browser`);
   };
-  const scripts = shellScripts(readWeb(SHELL));
-  const last = scripts.at(-1);
-  // The sources as the shell loads them: every script before the last runs cleanly, and the last
-  // throws.
+  const mapped = (at, payload) => {
+    const found = new SourceMap(payload).findEntry(at.line, at.column);
+    return { message: at.message, source: found.originalSource, line: found.originalLine };
+  };
+  const plainPrelude = await entryPrelude(loadTool("esbuild"), WEB, { minify: false });
+  const plainEntry = await entryScriptPart(loadTool("esbuild"), WEB, { minify: false });
   const context = vm.createContext({});
-  for (const name of scripts.slice(0, -1)) new vm.Script(readWeb(name), { filename: name }).runInContext(context);
-  let fromSource;
-  try {
-    new vm.Script(readWeb(last), { filename: last }).runInContext(context);
-  } catch (error) {
-    const at = new RegExp(`${last.replace(/\./g, "\\.")}:(\\d+):`).exec(error.stack);
-    fromSource = { message: error.message, line: Number(at[1]) - 1 };
-  }
-  assert.ok(fromSource, `${last} ran to the end without a browser`);
-  const fromBundle = thrown(text(SCRIPT_PATH), "bundle.js");
-  assert.equal(fromBundle.message, fromSource.message);
-  const map = new SourceMap(JSON.parse(text(relativePath(MANIFEST.assets.script.map))));
-  const found = map.findEntry(fromBundle.line, fromBundle.column);
-  assert.equal(found.originalSource, `vibe-talk/web/${last}`);
-  assert.equal(found.originalLine, fromSource.line,
-    `the bundle's ${fromBundle.message} maps to line ${found.originalLine + 1}, not ${fromSource.line + 1}`);
+  new vm.Script(plainPrelude.code, { filename: "prelude.js" }).runInContext(context);
+  const fromPlain = mapped(thrown(plainEntry.code, "entry.js", context), plainEntry.map);
+  const fromBundle = mapped(thrown(text(SCRIPT_PATH), "bundle.js", vm.createContext({})),
+    JSON.parse(text(relativePath(MANIFEST.assets.script.map))));
+  assert.ok(fromPlain.source.startsWith("vibe-talk/web/"), `the unminified entry's error maps to ${fromPlain.source}`);
+  assert.deepStrictEqual(fromBundle, fromPlain,
+    `the bundle's ${fromBundle.message} maps to ${fromBundle.source}:${fromBundle.line + 1}, not ${fromPlain.source}:${fromPlain.line + 1}`);
 });
 
+
 /**
- * The name of voice.js's first top-level constant: a marker for the tests that find a line of the
- * legacy script in the bundle, taken afresh because `#624 voice-page-modularity` moves what was
- * once there out into modules.
+ * The name of the entry module's first top-level constant: a marker for the tests that find a
+ * line of the entry in the bundle, taken afresh because `#624 voice-page-modularity` moves what
+ * was once there out into modules.
  */
-const FIRST_CONST = /^const (\w+) = /m.exec(readWeb("voice.js"))[1];
+// (Not VibeTalkContract, the entry's first: the contract module in the prelude holds a
+// declaration of the same text, and the probe below finds a line by that text.)
+const FIRST_CONST = [...readWeb(ENTRY_MODULE).matchAll(/^const (\w+) = /gm)].map((m) => m[1])
+  .find((name) => name !== "VibeTalkContract");
 
 test("a position in the minified files maps back to the line of the source it came from", () => {
   const probes = [
-    [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", `const ${FIRST_CONST}=`],
-    [SCRIPT_PATH, MANIFEST.assets.script.map, "voice.js", "const PAGE_BUILD="],
+    [SCRIPT_PATH, MANIFEST.assets.script.map, ENTRY_MODULE, `const ${FIRST_CONST}=`],
+    [SCRIPT_PATH, MANIFEST.assets.script.map, ENTRY_MODULE, "const PAGE_BUILD="],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "src/present/notices/outgoing.ts", "function sendTimingTextWords("],
     [SCRIPT_PATH, MANIFEST.assets.script.map, "src/contract/validators.js", "function decodeTagged("],
     [STYLE_PATH, MANIFEST.assets.style.map, "voice.css", ".send-tick{"],
@@ -245,13 +271,13 @@ test("a copy of the sources changed on purpose builds the same way, and is refus
   // A browser walk's negative control: the page with one thing broken, built exactly as the page is.
   const copy = join(scratch, "patched-sources");
   cpSync(WEB, copy, { recursive: true });
-  const voice = join(copy, "voice.js");
-  writeFileSync(voice, readFileSync(voice, "utf8").replace(`const ${FIRST_CONST} = `, `const ${FIRST_CONST}_PATCHED = `));
+  const entry = join(copy, ENTRY_MODULE);
+  writeFileSync(entry, readFileSync(entry, "utf8").replace(`const ${FIRST_CONST} = `, `const ${FIRST_CONST}_PATCHED = `));
   const out = join(scratch, "patched");
   const patched = await build(out, { web: copy });
   assert.notEqual(patched.page_build, MANIFEST.page_build);
   assert.match(readFileSync(join(out, relativePath(patched.assets.script.path)), "utf8"), new RegExp(`const ${FIRST_CONST}_PATCHED=`));
-  assert.notEqual(patched.inputs["vibe-talk/web/voice.js"], MANIFEST.inputs["vibe-talk/web/voice.js"]);
+  assert.notEqual(patched.inputs[`vibe-talk/web/${ENTRY_MODULE}`], MANIFEST.inputs[`vibe-talk/web/${ENTRY_MODULE}`]);
   assert.throws(() => requireOutside(join(copy, "out"), copy), /inside/);
 });
 
@@ -274,7 +300,10 @@ test("nothing built names the directory it was built in or the one it was built 
       assert.match(source, /^vibe-talk\/web\/[\w.-]+(\/[\w.-]+)*$/, `${map} names ${source}`);
       assert.ok(!source.split("/").includes(".."), `${map} names ${source}`);
     }
-    assert.deepStrictEqual(sourcesContent, sources.map((source) => readWeb(source.replace("vibe-talk/web/", ""))));
+    assert.deepStrictEqual(sourcesContent, sources.map((source) => {
+      const name = source.replace("vibe-talk/web/", "");
+      return name === ENTRY_MODULE ? blankEntryImports(readWeb(name)) : readWeb(name);
+    }));
   }
 });
 
@@ -326,26 +355,34 @@ test("a script that is not strict throughout is refused rather than made strict 
   assert.throws(() => requireStrict("broken.js", '"use strict";\nlet = ;\n', ts), /broken\.js does not parse/);
 });
 
-// ---- The legacy prelude (`#624 voice-page-modularity`) ------------------------------------------
+// ---- The entry module (`#624 voice-page-modularity`, final entry) -------------------------------
 
-test("the prelude gives the legacy script exactly what web/src/legacy/imports.ts exports, and its declarations say the same", () => {
-  const names = MANIFEST.legacy_imports;
+test("the entry takes from its modules exactly what its imports name, and no legacy import list remains", () => {
+  const names = MANIFEST.entry_imports;
   assert.ok(names.length > 0, "nothing has moved, so this checks nothing");
-  const declared = [...readWeb("legacy-imports.d.ts").matchAll(/^declare const (\w+): LegacyImports\["(\w+)"\];$/gm)]
-    .map(([, name, key]) => (assert.equal(name, key), name));
-  // VibeTalkContract keeps the declaration web/contract.d.ts has always given it, for the global.
-  assert.match(readWeb("contract.d.ts"), /^declare const VibeTalkContract: \{/m);
-  const expected = names.filter((name) => name !== "VibeTalkContract");
-  assert.ok(names.includes("VibeTalkContract"), "the legacy script no longer takes the contract from the prelude");
-  assert.deepStrictEqual(declared.sort(), [...expected].sort(), "web/legacy-imports.d.ts and imports.ts name different things");
+  assert.deepStrictEqual(MANIFEST.legacy_imports, [], "the build still records a legacy import list");
+  assert.ok(!existsSync(join(WEB, "src/legacy/imports.ts")), "web/src/legacy/imports.ts is still there");
+  assert.ok(!existsSync(join(WEB, "legacy-imports.d.ts")), "web/legacy-imports.d.ts is still there");
+  assert.ok(!existsSync(join(WEB, "voice.js")), "web/voice.js is still there as a source");
+  assert.equal(readWeb(ENTRY_IMPORTS), entryImportsModule(readWeb(ENTRY_MODULE)),
+    `${ENTRY_IMPORTS} is stale: run node web/build.mjs --write-entry-imports`);
+  const imported = importedNames(ENTRY_MODULE, readWeb(ENTRY_MODULE));
+  assert.deepStrictEqual([...new Set(imported)].sort(), [...names].sort(),
+    "the manifest's entry imports and the entry's import declarations name different things");
+  // The contract's validators come to the entry as imports, assembled under the old name there.
+  for (const name of ["decode", "decodeTagged", "is", "roots"]) assert.ok(names.includes(name), `the entry no longer takes ${name} from the contract`);
+  assert.match(readWeb(ENTRY_MODULE), /const VibeTalkContract = Object\.freeze\(\{ roots, is, decode, decodeTagged \}\);/,
+    "the entry no longer assembles the contract under VibeTalkContract");
 });
 
-test("every name the prelude gives the legacy script is one the script's code still uses", () => {
-  // imports.ts's own rule: a name the legacy script no longer needs comes off the list. A name read
-  // only in a comment, or only as a property (`x.name`, `{ name: ... }`), is not a use.
-  const { ts, file } = parseScript("voice.js", readWeb("voice.js"));
+test("every name the entry takes from its modules is one its code still uses", () => {
+  // The old imports list's rule, on the entry's imports: a name the entry no longer needs comes
+  // off its imports. A name read only in a comment, only in its import declaration, or only as a
+  // property (`x.name`, `{ name: ... }`), is not a use.
+  const { ts, file } = parseScript(ENTRY_MODULE, readWeb(ENTRY_MODULE));
   const used = new Set();
   const visit = (node) => {
+    if (ts.isImportDeclaration(node)) return;
     if (ts.isIdentifier(node)) {
       const parent = node.parent;
       const property = (ts.isPropertyAccessExpression(parent) && parent.name === node) ||
@@ -355,18 +392,18 @@ test("every name the prelude gives the legacy script is one the script's code st
     ts.forEachChild(node, visit);
   };
   visit(file);
-  const unused = MANIFEST.legacy_imports.filter((name) => name !== "VibeTalkContract" && !used.has(name));
-  assert.deepStrictEqual(unused, [], "web/src/legacy/imports.ts gives voice.js names its code no longer uses");
+  const unused = MANIFEST.entry_imports.filter((name) => !used.has(name));
+  assert.deepStrictEqual(unused, [], "the entry imports names its code no longer uses");
 });
 
-test("the bundle declares nothing of the modules but what the legacy script takes, strictly, just before it", () => {
+test("the bundle declares nothing of the modules but what the entry takes, strictly, just before it", () => {
   const script = text(SCRIPT_PATH);
-  const legacy = topLevelNames("voice.js", readWeb("voice.js"));
-  const allowed = new Set([...legacy, ...MANIFEST.legacy_imports]);
+  const entry = topLevelNames(ENTRY_MODULE, readWeb(ENTRY_MODULE));
+  const allowed = new Set([...entry, ...MANIFEST.entry_imports]);
   const declared = topLevelNames("bundle.js", script);
   assert.deepStrictEqual(declared.filter((name) => !allowed.has(name)), [],
-    "the bundle declares a module's name at its top level beyond the legacy imports");
-  // The prelude's one declaration, opening a strict function, immediately before the legacy script.
+    "the bundle declares a module's name at its top level beyond the entry's imports");
+  // The prelude's one declaration, opening a strict function, immediately before the entry part.
   const { ts, file } = parseScript("bundle.js", script);
   const statements = file.statements;
   const at = statements.findIndex((statement) => ts.isVariableStatement(statement) &&
@@ -374,17 +411,18 @@ test("the bundle declares nothing of the modules but what the legacy script take
   assert.ok(at > 0, "no prelude declaration in the bundle");
   const prelude = statements[at];
   assert.deepStrictEqual(prelude.declarationList.declarations[0].name.elements.map((element) => element.name.text).sort(),
-    [...MANIFEST.legacy_imports].sort());
+    [...MANIFEST.entry_imports].sort());
   assert.ok(prelude.getText(file).includes('= (() => {\n"use strict";\n'), "the modules do not run in a strict function");
   const next = statements[at + 1].getText(file);
-  assert.ok(next.startsWith('"use strict"'), `the legacy script does not follow the prelude: ${next.slice(0, 80)}`);
+  assert.ok(next.startsWith('"use strict"'), `the entry part does not follow the prelude: ${next.slice(0, 80)}`);
   // The modules' own names stay inside it.
-  for (const internal of ["SEARCH_FOLD_TABLE", "searchTokens", "__voiceLegacyImports"]) {
+  for (const internal of ["SEARCH_FOLD_TABLE", "searchTokens", "__voiceEntryImports"]) {
     assert.ok(!declared.includes(internal), `${internal} is declared at the bundle's top level`);
   }
 });
 
-test("a position in the prelude maps back to the module's TypeScript source", () => {
+
+test("a position in the bundle maps back to the module's TypeScript source", () => {
   const lines = text(SCRIPT_PATH).split("\n");
   const needle = "function searchCombine(";
   const line = lines.findIndex((l) => l.includes(needle));
@@ -407,14 +445,17 @@ test("a module overlay whose text the module does not hold is refused, not built
   assert.equal(plan.scan, "too-many-alternatives", "the overlay did not reach the built module");
 });
 
-test("every handwritten module is TypeScript, so the strict and portable checks see all of them", () => {
+test("every handwritten module but the entry is TypeScript, so the strict and portable checks see all of them", () => {
   // Machine output may be JavaScript, with generated declarations beside it (the contract's
-  // validators), as the plan allows; nothing written by hand may.
+  // validators), as the plan allows; nothing written by hand may, but the entry module itself:
+  // it is the former voice.js moved as JavaScript for the final entry, checked as it was, and
+  // its strict TypeScript conversion is `#1523 voice-main-strict-ts`.
   const names = new Set(moduleSources().map(({ name }) => name));
+  assert.ok(names.has(ENTRY_MODULE), "the entry module is not below web/src");
   const plain = moduleSources()
-    .filter(({ name, generated }) => !name.endsWith(".ts") && !(generated && names.has(name.replace(/\.js$/, ".d.ts"))))
+    .filter(({ name, generated }) => name !== ENTRY_MODULE && !name.endsWith(".ts") && !(generated && names.has(name.replace(/\.js$/, ".d.ts"))))
     .map(({ name }) => name);
-  assert.deepStrictEqual(plain, [], "a module below web/src is not .ts, so tsconfig.core.json and tsconfig.web.json skip it");
+  assert.deepStrictEqual(plain, [], "a module below web/src but the entry is not .ts, so tsconfig.core.json and tsconfig.web.json skip it");
   assert.ok(moduleSources().length > 0, "no module found, so this checks nothing");
 });
 
@@ -439,7 +480,7 @@ test("`#624 voice-page-modularity`: the import checker fails closed on every wro
     ["foundation/bad.ts", 'import { createApi } from "../core/api/index.ts";\nexport const y = createApi;\n',
       /foundation may not import core\/api/],
     ["ports/bad.ts", 'export type T = import("../core/api/index.ts").ServerApi;\n', /ports may not import core\/api/],
-    ["legacy/bad.ts", 'export { createApi } from "../core/api/client.ts";\n', /only through core\/api\/index\.ts/],
+    ["app/bad.ts", 'export { createApi } from "../core/api/client.ts";\n', /only through core\/api\/index\.ts/],
     ["core/api/bad.ts", 'export const z = () => import("./client.ts");\n', /a dynamic import/],
     ["core/api/bad.ts", 'export const z = require("./client.ts");\n', /a require import/],
     ["core/api/bad.ts", 'import ajv from "ajv";\nexport const a = ajv;\n', /not a relative path/],

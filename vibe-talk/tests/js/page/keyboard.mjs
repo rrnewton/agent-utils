@@ -2896,13 +2896,15 @@ test("`#301 semicolon-expand-cycle` x `#226 page-energy-profile`: NOTHING THE PA
   // rows beside the rows again, never pruned, and the test names it. Since `#1229
   // keyed-row-patching` an unchanged channel's rows are kept rather than rebuilt, so the list
   // is fed from the pass over the rows every draw makes, where the fold list once was.
-  const scriptWithFolds = brokenScript("const folding = createFolding({", "const foldsKept = [];\nconst folding = createFolding({");
-  assert.ok(scriptWithFolds.includes("const foldsKept = [];"), "the control no longer declares its list beside the rows");
-  // The pass itself is the channel rows owner's now: the overlay throws where
-  // its text no longer stands in the module, as brokenScript did for voice.js.
-  const kept = await brokenModule([{ file: "src/view/channel/channelrows.ts",
+  // The pass itself is the channel rows owner's now: both overlays throw where their text no
+  // longer stands in its source, as brokenScript did for voice.js.
+  const kept = await brokenModule([
+    { file: "src/app/main.js", find: "const folding = createFolding({",
+      replace: "const foldsKept = [];\nconst folding = createFolding({" },
+    { file: "src/view/channel/channelrows.ts",
     find: "  function renderChannelRowsNow(): void {\n",
-    replace: "  function renderChannelRowsNow(): void {\n    for (const keptRow of deps.byId(\"discord-log\").children) if ((keptRow as HTMLElement).getAttribute(\"data-collapsed\") !== null) foldsKept.push(keptRow as never);\n" }], scriptWithFolds);
+    replace: "  function renderChannelRowsNow(): void {\n    for (const keptRow of deps.byId(\"discord-log\").children) if ((keptRow as HTMLElement).getAttribute(\"data-collapsed\") !== null) foldsKept.push(keptRow as never);\n" }]);
+  assert.ok(kept.script.includes("foldsKept"), "the control no longer declares its list beside the rows");
   const leaky = await run(kept);
   assert.equal(leaky.grew.length, 1, `the control grew ${leaky.grew.join(", ")}`);
   assert.match(leaky.grew[0], /^foldsKept \d+ -> \d+$/);

@@ -2118,7 +2118,7 @@ test("`#529 page-build-stale-notice`: a read saying the server serves another pa
   assert.equal(unknown.el("page-update").hidden, true, "a page with no build of its own offered a reload");
 });
 
-test("`#624 voice-page-modularity`: a page knows its build from the page build's hashed script name as it does from an older ?v= address, and from nothing else", () => {
+test("`#624 voice-page-modularity`: a page knows its build from the page build's hashed script name as it does from an older ?v= address, and from nothing else", async () => {
   const buildOf = (src, script = SCRIPT) => newPage(new Map(), script, (p) => { p.scriptSrc = src; }).pure("PAGE_BUILD");
   const hash = "0123456789abcdef0123456789abcdef";
   assert.equal(buildOf(`https://vibe.example/assets/voice.${hash}.js`), hash);
@@ -2130,7 +2130,7 @@ test("`#624 voice-page-modularity`: a page knows its build from the page build's
     assert.equal(buildOf(src), "", src);
   }
   // THE CONTROL: the reader as it was, ?v= alone, does not know a page loaded by the hashed name.
-  const before = brokenScript("/\\/assets\\/voice\\.([0-9a-f]{32})\\.js(?:[?#]|$)/.exec(src) || ", "");
+  const before = await brokenScript("/\\/assets\\/voice\\.([0-9a-f]{32})\\.js(?:[?#]|$)/.exec(src) || ", "");
   assert.equal(buildOf(`https://vibe.example/assets/voice.${hash}.js`, before), "");
 });
 

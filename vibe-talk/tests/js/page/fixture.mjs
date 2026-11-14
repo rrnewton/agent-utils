@@ -36,8 +36,8 @@ import { join } from "node:path";
 import vm from "node:vm";
 import { Worker } from "node:worker_threads";
 
-import { LEGACY_SCRIPT, entryBundle, loadTool, moduleForTests } from "../../../web/build.mjs";
-import { SHELL, WEB, moduleSources, occurrences, readWeb, shellScripts } from "../../../web/page_sources.mjs";
+import { ENTRY_MODULE, LEGACY_SCRIPT, entryPrelude, entryScriptPart, loadTool, moduleForTests } from "../../../web/build.mjs";
+import { SHELL, WEB, moduleSources, readWeb, shellScripts } from "../../../web/page_sources.mjs";
 
 /**
  * One slice of the suite, or all of it. `VOICE_PAGE_SHARD=i/n` runs the tests at positions i, i+n,
@@ -139,8 +139,9 @@ afterEach(() => {
 });
 
 const SCRIPT_FILE = "voice.js";
-const ENTRY = await entryBundle(loadTool("esbuild"), WEB, { minify: false });
-const SCRIPT = ENTRY.code;
+const ENTRY_PART = await entryScriptPart(loadTool("esbuild"), WEB, { minify: false });
+const SCRIPT = ENTRY_PART.code;
+const ENTRY_SOURCE = readWeb(ENTRY_MODULE);
 const HTML = readWeb(SHELL);
 /**
  * The scripts every page here runs, in order: the ones the shell loads, as it loads them
@@ -194,13 +195,19 @@ const BASE_CSS = readWeb("style.css");
 const stripJsComments = (text) =>
   text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
 const HTML_CODE = HTML.replace(/<!--[\s\S]*?-->/g, " ");
-const SCRIPT_CODE = stripJsComments(SCRIPT);
 /**
- * The page's modules (every .js and .ts file below web/src/, `#624 voice-page-modularity`), comments removed, and with
- * SCRIPT_CODE every line of the page's handwritten code. An assertion that something appears
- * NOWHERE in the page reads PAGE_CODE, so code that moves out of web/voice.js stays under it.
+ * The entry module's own source (`web/src/app/main.js`, what was web/voice.js), comments removed.
+ * `SCRIPT` is the bundle the page runs; a test that reads the page's source reads this and the
+ * modules once, not the bundle (which already holds them) as well.
  */
-const MODULE_CODE = moduleSources().filter(({ generated }) => !generated).map(({ text }) => stripJsComments(text)).join("\n");
+const SCRIPT_CODE = stripJsComments(ENTRY_SOURCE);
+/**
+ * The page's other modules (every .js and .ts file below web/src/ but the entry, `#624
+ * voice-page-modularity`), comments removed, and with SCRIPT_CODE every line of the page's
+ * handwritten code. An assertion that something appears NOWHERE in the page reads PAGE_CODE, so
+ * code that moves out of the entry stays under it.
+ */
+const MODULE_CODE = moduleSources().filter(({ name, generated }) => !generated && name !== ENTRY_MODULE).map(({ text }) => stripJsComments(text)).join("\n");
 
 /**
  * The keymap's table, comments removed: every binding of web/src/view/shell/keymap.ts, between `return [` and its
@@ -1974,8 +1981,8 @@ const COMPILED = new Map(PAGE_SCRIPTS.map((name) => [
  * declaring for it the names web/src/legacy/imports.ts exports, run just before it as the page build
  * runs it. Built here, unminified, by the same function; null while nothing has moved.
  */
-const PRELUDE = null;
-const PRELUDE_COMPILED = null;
+const PRELUDE = await entryPrelude(loadTool("esbuild"), WEB, { minify: false });
+const PRELUDE_COMPILED = PRELUDE && new vm.Script(PRELUDE.code, { filename: "prelude.js" });
 /**
  * The page's modules, built for the tests that hold them directly (`#624 voice-page-modularity`).
  * Loaded HERE, above every test, and never further down: node:test starts a test the moment it is
@@ -2011,7 +2018,7 @@ const { OWN_READ_APPLY_ARM_MS } = await moduleForTests("src/view/settings/ownrea
  * (web/src/legacy/imports.ts). `page.pure` refuses them: what moved into a module is tested through
  * that module, which the page runs as it is (`#624 voice-page-modularity`).
  */
-const PRELUDE_NAMES = new Set(ENTRY.names);
+const PRELUDE_NAMES = new Set(PRELUDE ? PRELUDE.names : []);
 /** The device's settings and, on its own handle, its token (web/src/core/settings). */
 const SETTINGS = await moduleForTests("src/core/settings/index.ts");
 /** The page's requests to its server, on ports a test supplies (web/src/core/api). */
@@ -5002,7 +5009,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
 }
 
 /**
- * web/voice.js with one thing broken on purpose.
+ * The entry module (`web/src/app/main.js`, what was web/voice.js) with one thing broken on purpose, rebuilt as the page.
  *
  * Every anchoring test below has a negative control built with this, and the control has to FAIL.
  * Without them the layout model above would be unfalsifiable: a fixture that never moves the
@@ -5010,20 +5017,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
  * including one that does nothing. The `includes` check is the other half — a control that no
  * longer matches the source would silently become a second copy of the positive test.
  *
- * `count` is how many times `find` occurs in web/voice.js, one unless the caller says otherwise, and
+ * `count` is how many times `find` occurs in the entry, one unless the caller says otherwise, and
  * only the first is replaced: a needle that came to match a second place would otherwise go on
  * patching whichever comes first without a word (`#624 voice-page-modularity`).
  */
-function brokenScript(find, replace, count = 1) {
-  assert.ok(
-    SCRIPT.includes(find),
-    `the negative control patches ${JSON.stringify(find)}, which web/voice.js no longer contains`
-  );
-  assert.equal(occurrences(SCRIPT, find), count,
-    `the negative control patches ${JSON.stringify(find)}, which web/voice.js holds a different number of times`);
-  const mutated = SCRIPT.replace(find, replace);
-  assert.notEqual(mutated, SCRIPT, "the negative control changed nothing");
-  return mutated;
+async function brokenScript(find, replace, count = 1) {
+  assert.notEqual(find, replace, "the negative control changed nothing");
+  return brokenModule([{ file: ENTRY_MODULE, find, replace, count }]);
 }
 
 /**
@@ -5034,11 +5034,9 @@ function brokenScript(find, replace, count = 1) {
  * voice.js but is still exercised through the whole page.
  */
 async function brokenModule(overlays, script = SCRIPT) {
-  if (script !== SCRIPT) {
-    throw new Error("brokenModule no longer combines a mutated legacy script with module overlays: patch the entry or the module, not both");
-  }
-  const built = await entryBundle(loadTool("esbuild"), WEB, { minify: false, overlays });
-  return { prelude: null, script: built.code };
+  const built = await entryPrelude(loadTool("esbuild"), WEB, { minify: false, overlays });
+  const entry = script === SCRIPT ? await entryScriptPart(loadTool("esbuild"), WEB, { minify: false, overlays }) : null;
+  return { prelude: built && new vm.Script(built.code, { filename: "prelude.js" }), script: entry ? entry.code : script };
 }
 
 /**
@@ -10024,13 +10022,9 @@ const readsSince = (page, from) => page.timelineCalls.slice(from).map((call) => 
 });
 
 /** The page with each of `patches`, a `[find, replace]` pair, made in turn, as `brokenScript` makes one. */
-function brokenScriptEach(...patches) {
-  return patches.reduce((script, [find, replace]) => {
-    assert.ok(script.includes(find), `the negative control patches ${JSON.stringify(find)}, which web/voice.js no longer contains`);
-    const mutated = script.replace(find, replace);
-    assert.notEqual(mutated, script, "the negative control changed nothing");
-    return mutated;
-  }, SCRIPT);
+async function brokenScriptEach(...patches) {
+  for (const [find, replace] of patches) assert.notEqual(find, replace, "the negative control changed nothing");
+  return brokenModule(patches.map(([find, replace]) => ({ file: ENTRY_MODULE, find, replace })));
 }
 
 // `#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`. The card moving between the

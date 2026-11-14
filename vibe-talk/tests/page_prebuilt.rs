@@ -71,14 +71,14 @@ fn a_page_from_other_sources_is_refused_naming_what_differs() {
     let dir = TempDir::new("page-prebuilt-stale");
     let dist = page_build(&dir);
     edit_assets(&dist, |json| {
-        json["inputs"]["vibe-talk/web/voice.js"] = "0".repeat(32).into();
+        json["inputs"]["vibe-talk/web/src/app/main.js"] = "0".repeat(32).into();
     });
     let message = refused(&dist);
     assert!(
         message.contains("not built from these sources"),
         "{message}"
     );
-    assert!(message.contains("vibe-talk/web/voice.js"), "{message}");
+    assert!(message.contains("vibe-talk/web/src/app/main.js"), "{message}");
 
     // An input it never read, as when a file was added to web/ since: a difference too.
     let dir = TempDir::new("page-prebuilt-missing-input");

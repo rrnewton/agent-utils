@@ -1290,8 +1290,8 @@ function unusedBindings(code) {
   });
 }
 
-test("`#231 two-column-polish`: no top-level binding of web/voice.js is declared and never used", () => {
-  assert.deepStrictEqual(unusedBindings(SCRIPT_CODE), [], "web/voice.js declares something nothing uses");
+test("`#231 two-column-polish`: no top-level binding of the entry module is declared and never used", () => {
+  assert.deepStrictEqual(unusedBindings(SCRIPT_CODE), [], "the entry module declares something nothing uses");
   // The control: one more such declaration, `#229`'s `let sideMark = null` as it was, is found.
   assert.deepStrictEqual(unusedBindings(`${SCRIPT_CODE}\nlet sideMark = null;\n`), ["sideMark"],
     "the check does not find a declaration nothing uses, so it proves nothing");
@@ -2918,7 +2918,7 @@ test("`#388 thread-header-collapse`: the fold is kept on the device — a reload
   assert.deepStrictEqual(await reopened("off"), { right: [false, "true"], wide: [false, "true"] });
   assert.deepStrictEqual(await reopened(null), { right: [false, "true"], wide: [false, "true"] }, "with nothing kept the card is folded");
   // The control: a page that reads nothing kept draws the card open after the reload.
-  const forgot = await reopened("on", brokenScript("  setting: DEVICE_SETTINGS.threadCardFolded,\n",
+  const forgot = await reopened("on", await brokenScript("  setting: DEVICE_SETTINGS.threadCardFolded,\n",
     "  setting: { ...DEVICE_SETTINGS.threadCardFolded, read: () => false },\n"));
   assert.deepStrictEqual(forgot.right, [false, "true"], "the negative control kept the fold too, so the check above proves nothing");
   // Across the window: a thread from the picker, the card read from the same choice.

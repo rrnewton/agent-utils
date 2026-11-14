@@ -167,7 +167,6 @@ import {createSideThreadActs} from "../view/channel/index.ts";
 import {createCardRuns} from "../view/channel/index.ts";
 import {createReadModeAct} from "../view/channel/index.ts";
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
-const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
 
 // vibe-talk voice page.
 //
@@ -207,6 +206,7 @@ const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
 // The offer and its redemption are web/src/view/settings `mountPairing` (`#624 voice-page-modularity`),
 // made here, with the code, so it holds it from the page's first statement.
 const openedWithPairingCode = takePairingCode();
+const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
 /** @type {import("../view/settings/index.ts").Pairing} */
 const devicePairing = mountPairing({
   code: openedWithPairingCode,

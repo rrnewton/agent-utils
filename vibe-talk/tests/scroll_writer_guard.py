@@ -49,7 +49,7 @@ INSTRUMENTATION_FILES = frozenset({"web/src/view/channel/scrolltrace.ts"})
 # unclassified, which enforcing mode treats as a violation in every adopted run: a new writer
 # cannot silently opt out.
 PATH_BY_FILE: dict[str, str] = {
-    "web/voice.js": "P8",
+    "web/src/app/main.js": "P8",
     "web/src/view/channel/listkeepers.ts": "P1",
     "web/src/view/channel/footroom.ts": "P1",
     "web/src/view/channel/cardplace.ts": "P2",
@@ -98,7 +98,7 @@ PATH_TITLES: dict[str, str] = {
     "P5": "shell selection / keys (user-initiated, must route through the owner)",
     "P6": "voice transcript / misc user jumps (incl. the #1224 mention-jump shape)",
     "P7": "composer / keyboard geometry",
-    "P8": "legacy script (voice.js, adopted last)",
+    "P8": "entry module (src/app/main.js, adopted last)",
     "P9": "reaction-overlay decide-before-paint (no direct writer; height via the owner)",
     "unclassified": "unclassified — new writer, must be grouped before enforcing",
 }
@@ -171,7 +171,7 @@ def scan_file(path: Path, rel: str) -> list[Writer]:
 
 def scan() -> list[Writer]:
     """Every direct scroll write outside the owner and its instrumentation, sorted by file."""
-    candidates = [WEB_ROOT / "voice.js", *sorted((WEB_ROOT / "src").rglob("*.ts"))]
+    candidates = [WEB_ROOT / "src/app/main.js", *sorted((WEB_ROOT / "src").rglob("*.ts"))]
     writers: list[Writer] = []
     for path in candidates:
         rel = path.relative_to(WEB_ROOT.parent).as_posix()
