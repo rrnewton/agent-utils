@@ -4,7 +4,7 @@
 // shows the rotation as tabs while the reader taps through, the landed view's cell highlighted.
 // Each cell also chooses its view directly. The row takes itself away shortly after the last
 // press (see `VIEW_CARDS_SETTLE_MS`). Construction performs no effects: no element is looked up,
-// no listener is added and no timer is started until `sync`, `cycle` or `toggleCards` is called.
+// no listener is added and no timer is started until `sync`, `cycle`, `toggleCards` or `mount` is called.
 
 import { createListening } from "../dom/index.ts";
 import type { Listening } from "../dom/index.ts";
@@ -66,6 +66,8 @@ export interface ViewSelectorDependencies {
   showDocuments(key?: string): Promise<void>;
   /** The address's query part (`window.location.search`). */
   locationSearch(): string;
+  /** The document its document-level listeners go on, or null where there is none. */
+  documentTarget(): EventTarget | null;
   /** Arm the settle timer; the page's own timers where given, the platform's otherwise. */
   setTimer?(run: () => void, ms: number): unknown;
   /** Forget a settle timer armed by `setTimer`. */
@@ -88,6 +90,11 @@ export interface ViewSelector {
   toggleCards(): void;
   /** Hide the tab row and forget its settle (the page calls this once it has been seen). */
   hideCards(): void;
+  /**
+   * Wire the document-level listeners: Ctrl/Cmd+5 or +9 chooses Documents, and any
+   * key or tap away from the switch puts the tab cards away. Idempotent.
+   */
+  mount(): void;
   /** Take down every listener and timer the selector added. */
   unmount(): void;
   /** Show major view `view`, with each view's entry work. */
@@ -128,6 +135,7 @@ function appendChild(parent: HTMLElement, child: HTMLElement): void {
 
 /** Create the view selector. No effects happen here; they wait for an explicit call. */
 export function createViewSelector(deps: ViewSelectorDependencies): ViewSelector {
+  let mounted = false;
   let cardsShown = false;
   let listening: Listening | null = null;
   let settle: unknown = null;
@@ -255,7 +263,32 @@ export function createViewSelector(deps: ViewSelectorDependencies): ViewSelector
     sync();
   }
 
+  function mount(): void {
+    if (mounted) return;
+    const target = deps.documentTarget();
+    if (!target) return;
+    mounted = true;
+    const { listen } = ensureListening();
+    // Ctrl+5 (Cmd+5 on a Mac) for Documents, beside Ctrl+0 for the call's view.
+    // Ctrl+9 (Cmd+9) goes straight there too, next to Ctrl+0 (owner, thread 214).
+    listen(target, "keydown", (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === "5" || event.key === "9")) {
+        event.preventDefault();
+        chooseMajorView("docs");
+      }
+    });
+    // Keys are the reader at work (reading, stepping): put the cards away at once.
+    listen(target, "keydown", () => hideCards(), { capture: true });
+    // A tap anywhere but the switch or its cards puts the cards away at once.
+    listen(target, "pointerdown", (event: PointerEvent) => {
+      const hit = event.target as { closest?: (selector: string) => unknown } | null;
+      if (hit && typeof hit.closest === "function" && (hit.closest("#view-cards") || hit.closest("#view-switch"))) return;
+      hideCards();
+    }, { capture: true });
+  }
+
   function unmount(): void {
+    mounted = false;
     clearSettle();
     if (listening) listening.unmount();
     listening = null;
@@ -292,5 +325,5 @@ export function createViewSelector(deps: ViewSelectorDependencies): ViewSelector
     if (documentsQueryValue("v") !== "docs") return undefined;
     return documentsQueryValue("d") || undefined;
   }
-  return { sync, cycle, toggleCards, hideCards, unmount, chooseMajorView, documentsQueryValue, documentsDeepLinkKey };
+  return { sync, cycle, toggleCards, hideCards, unmount, mount, chooseMajorView, documentsQueryValue, documentsDeepLinkKey };
 }

@@ -1161,30 +1161,16 @@ const documentsSelector = createViewSelector({
   stopDiscordPolling: () => stopDiscordPolling(),
   showDocuments: (key) => documentsView.show(key),
   locationSearch: () => window.location.search,
+  documentTarget: () => document,
 });
 const { chooseMajorView, documentsQueryValue, documentsDeepLinkKey } = documentsSelector;
 
 
 
 
-// Ctrl+5 (Cmd+5 on a Mac) for Documents, beside Ctrl+0 for the call's view.
-// Ctrl+9 (Cmd+9) goes straight there too, next to Ctrl+0 (owner, thread 214).
-document.addEventListener("keydown", (event) => {
-  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === "5" || event.key === "9")) {
-    event.preventDefault();
-    chooseMajorView("docs");
-  }
-});
-
-// Keys are the reader at work (reading, stepping): put the cards away at once.
-document.addEventListener("keydown", () => documentsSelector.hideCards(), true);
-
-// A tap anywhere but the switch or its cards puts the cards away at once.
-document.addEventListener("pointerdown", (event) => {
-  const target = /** @type {{closest?: (selector: string) => unknown} | null} */ (event.target || null);
-  if (target && typeof target.closest === "function" && (target.closest("#view-cards") || target.closest("#view-switch"))) return;
-  documentsSelector.hideCards();
-}, true);
+// The selector's document-level listeners (Ctrl/Cmd+5 and +9, and putting its cards away):
+// web/src/view/documents/selector.ts (`createViewSelector`), wired here where they stood.
+documentsSelector.mount();
 
 /**
  * Showing a screen — everything that goes with the change, in order, the screen itself shown last:

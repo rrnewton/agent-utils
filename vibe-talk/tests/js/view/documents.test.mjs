@@ -86,6 +86,17 @@ function selectorFixture(start = "voice") {
   const byId = (id) => ({ "view-switch": button, "view-switch-label": label, "view-cards": cards })[id];
   let current = start;
   const chosen = [];
+  const docListeners = [];
+  const docTarget = {
+    addEventListener: (type, fn, options) => docListeners.push({ type, fn, capture: options === true || options?.capture === true }),
+    removeEventListener: (type, fn) => {
+      const at = docListeners.findIndex((one) => one.type === type && one.fn === fn);
+      if (at >= 0) docListeners.splice(at, 1);
+    },
+  };
+  const dispatchDoc = (type, event, capture) => {
+    for (const one of [...docListeners].filter((entry) => entry.type === type && (capture === undefined || entry.capture === capture))) one.fn(event);
+  };
   let restoredFlag = false;
   const entry = [];
   let search = "";
@@ -107,10 +118,11 @@ function selectorFixture(start = "voice") {
     stopDiscordPolling: () => entry.push("stop-poll"),
     showDocuments: async (key) => { entry.push(`docs=${key}`); },
     locationSearch: () => search,
+    documentTarget: () => docTarget,
     setTimer: scheduler.setTimer,
     clearTimer: scheduler.clearTimer,
   };
-  return { button, label, cards, chosen, entry, scheduler, deps, setCurrent: (view) => { current = view; }, setSearch: (value) => { search = value; } };
+  return { button, label, cards, chosen, entry, docListeners, dispatchDoc, scheduler, deps, setCurrent: (view) => { current = view; }, setSearch: (value) => { search = value; } };
 }
 
 test("documents selector: a press shows Voice/Channel/Documents cells with the landed view current", () => {
@@ -2583,4 +2595,36 @@ test("documents selector: the address's query, its deep link, and choosing a maj
   selector.chooseMajorView("voice");
   assert.deepEqual(fx.entry, ["settle", "show=voice", "stop-poll"], "choosing the call did not stop the poll");
   selector.unmount();
+});
+
+test("documents selector: its document listeners choose Documents and put the cards away", () => {
+  const { createViewSelector } = requireModule(SELECTOR, "src/view/documents/selector.ts");
+  const fx = selectorFixture("voice");
+  const selector = createViewSelector(fx.deps);
+  selector.mount();
+  selector.mount();
+  assert.deepEqual(fx.docListeners.map((one) => [one.type, one.capture]),
+    [["keydown", false], ["keydown", true], ["pointerdown", true]],
+    "mount did not wire exactly the three document listeners once");
+  let prevented = false;
+  fx.dispatchDoc("keydown", { ctrlKey: true, metaKey: false, altKey: false, shiftKey: false, key: "5", preventDefault: () => { prevented = true; } }, false);
+  assert.equal(prevented, true, "Ctrl+5 was not taken");
+  assert.deepEqual(fx.chosen, ["docs"], "Ctrl+5 did not choose Documents");
+  selector.cycle();
+  assert.equal(fx.cards.hidden, false, "the cards are not up to be put away");
+  fx.dispatchDoc("keydown", {}, true);
+  assert.equal(fx.cards.hidden, true, "a key did not put the cards away");
+  selector.cycle();
+  fx.dispatchDoc("pointerdown", { target: { closest: (selector) => (selector === "#view-switch" ? {} : null) } }, true);
+  assert.equal(fx.cards.hidden, false, "a tap on the switch put the cards away");
+  fx.dispatchDoc("pointerdown", { target: { closest: (selector) => (selector === "#view-cards" ? {} : null) } }, true);
+  assert.equal(fx.cards.hidden, false, "a tap on the cards put them away");
+  fx.dispatchDoc("pointerdown", { target: { closest: () => null } }, true);
+  assert.equal(fx.cards.hidden, true, "a tap away from the switch did not put the cards away");
+  let prevented9 = false;
+  fx.dispatchDoc("keydown", { ctrlKey: false, metaKey: true, altKey: false, shiftKey: false, key: "9", preventDefault: () => { prevented9 = true; } }, false);
+  assert.equal(prevented9, true, "Cmd+9 was not taken");
+  assert.equal(fx.chosen.at(-1), "docs", "Cmd+9 did not choose Documents");
+  selector.unmount();
+  assert.deepEqual(fx.docListeners, [], "unmount left document listeners behind");
 });
