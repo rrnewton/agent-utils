@@ -293,6 +293,41 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         " && document.getElementById('discuss-since').value !== ''",
         timeout=20_000)
     check(posts == [], f"opening posted {posts}, not nothing")
+    # `#1524 discuss-bound-hours-control`: the hours end stands beside N, the
+    # bound is one row, and "since HH:MM" is dropped whole only when the head
+    # cannot hold it (phone); editing K moves N and the time. Condition waits.
+    check(page.locator("#discuss-hours").is_visible(), "the hours control is missing")
+    check(page.locator("#discuss-hours").input_value() != "", "the hours control is empty")
+    bound_row = page.evaluate("""() => {
+      const r = (id) => document.getElementById(id).getBoundingClientRect();
+      const sincePart = document.querySelector('.discuss-since-part');
+      const sinceStyle = sincePart ? getComputedStyle(sincePart) : null;
+      return {
+        countTop: r('discuss-count').top, hoursTop: r('discuss-hours').top,
+        sinceTop: r('discuss-since').top, buttonTop: r('discuss-summarize').top,
+        sinceHidden: !sincePart || sinceStyle.display === 'none',
+        hoursWidth: r('discuss-hours').width,
+      };
+    }""")
+    check(abs(bound_row["countTop"] - bound_row["hoursTop"]) <= 2
+          and abs(bound_row["countTop"] - bound_row["buttonTop"]) <= 2,
+          f"the bound is not one row: {bound_row}")
+    check(bound_row["hoursWidth"] > 0, f"the hours control was dropped: {bound_row}")
+    if width < 900:
+        check(bound_row["sinceHidden"], f"since HH:MM did not drop on the phone: {bound_row}")
+    else:
+        check(not bound_row["sinceHidden"] and abs(bound_row["sinceTop"] - bound_row["countTop"]) <= 2,
+              f"since HH:MM did not stand on the desk row: {bound_row}")
+    page.fill("#discuss-hours", "1")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-count').value === '1'"
+        " && document.getElementById('discuss-since').value !== ''",
+        timeout=20_000)
+    page.fill("#discuss-count", "2")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-count').value === '2'"
+        " && document.getElementById('discuss-hours').value !== ''",
+        timeout=20_000)
     # (the rendered answer is asserted after Summarize, below)
     page.click("#discuss-summarize")
     page.wait_for_function(

@@ -5,7 +5,7 @@
 // Construction is inert: no element is looked up, no listener is added and nothing is
 // fetched until the controls are mounted and the panel opened.
 
-export { DISCUSS_UNAVAILABLE_HINT, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, countSince, createDiscussPanel, discussReadKey, formatStampLine, hhmm, isDiscussUnavailable } from "./panel.ts";
+export { DISCUSS_UNAVAILABLE_HINT, HOUR_MS, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, boundForHours, countForHours, countSince, createDiscussPanel, discussReadKey, formatStampLine, hhmm, hoursSinceStart, isDiscussUnavailable } from "./panel.ts";
 export { FRESH_CLASS, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, applyStrikes, citationIdsOf, hasWord } from "./strikes.ts";
 export type { StrikeElement } from "./strikes.ts";
 export type {
@@ -135,6 +135,8 @@ export interface DiscussViewDependencies {
   /** `#1497 discuss-fold-state-persist`. The kept Discuss folds, forwarded to the panel. */
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
+  /** `#1524 discuss-bound-hours-control`. Now, forwarded to the panel; injected in tests. */
+  now?(): number;
   /** `#1501 discuss-read-aloud-parity`. The shared read-aloud owner, forwarded to the panel. */
   readDocument?(doc: {
     key: string;
@@ -377,6 +379,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     keepFolds: deps.keepFolds,
     readDocument: deps.readDocument,
     stopSpeaking: deps.stopSpeaking,
+    now: deps.now,
   });
 
   /** Where Discuss is aimed now: the open thread, else the channel in its current view. */

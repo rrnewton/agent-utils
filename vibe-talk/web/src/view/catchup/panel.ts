@@ -1,7 +1,8 @@
 // The Discuss panel's DOM (`catchup-side-agent`): catch-up over the channel or thread
 // on screen. Opening asks nothing of the model (`discuss-summarize-button`): it reads
-// the scope's unread preview from the cache and offers "Summarize last [N] unread
-// since [HH:MM]" — one bound with two linked ends — and only that press POSTs. While
+// the scope's unread preview from the cache and offers "[N] unread, [K] hours
+// since [HH:MM]" beside Summarize — one bound with three linked ends (`#1524`,
+// K rounded up from the start to now) — and only that press POSTs. While
 // a request is in flight nothing starts another. The answer's model text is set as
 // text only, never as markup, and the footer — which unread messages the summary
 // covers, a jump link for each, and Mark read / Mark unread over exactly the
@@ -164,6 +165,8 @@ export interface DiscussPanelDependencies {
   }, from?: { part: number; block: number | null }): unknown;
   /** Stop the reading of summary `key`, where that summary's is the one playing; no other. */
   stopSpeaking?(key: string): unknown;
+  /** `#1524 discuss-bound-hours-control`. Now, for the hours end of the bound; injected in tests. */
+  now?(): number;
 }
 
 /**
@@ -448,6 +451,55 @@ export function boundForCount(unread: readonly CatchupUnreadRef[], n: number): {
   if (unread.length === 0) return { count: 0, sinceMs: null };
   const count = Math.min(Math.max(Math.trunc(n) || 1, 1), unread.length);
   return { count, sinceMs: unread.at(-count)?.at_ms ?? null };
+}
+
+/** One hour in milliseconds, for the bound's hours end (`#1524`). */
+export const HOUR_MS = 3_600_000;
+
+/**
+ * `#1524 discuss-bound-hours-control`. Whole hours from `sinceMs` to `nowMs`,
+ * rounded up, at least 1: K is how far back the bound reaches, stated coarsely
+ * enough that a small clock move never makes it jitter.
+ */
+export function hoursSinceStart(sinceMs: number | null, nowMs: number): number {
+  if (sinceMs === null || !Number.isFinite(sinceMs) || !Number.isFinite(nowMs)) return 1;
+  return Math.max(1, Math.ceil((nowMs - sinceMs) / HOUR_MS));
+}
+
+/** How many unread fall at/after `nowMs - hours` (unknown times count as in). */
+export function countForHours(unread: readonly CatchupUnreadRef[], hours: number, nowMs: number): number {
+  const whole = Math.trunc(Number(hours));
+  const start = nowMs - (Number.isFinite(whole) && whole >= 1 ? whole : 1) * HOUR_MS;
+  let count = 0;
+  for (const ref of unread) if (ref.at_ms === null || ref.at_ms >= start) count += 1;
+  return count;
+}
+
+/**
+ * The bound for "last `hours` hours": the start is `now - K hours`, clamped
+ * to the oldest unread when K reaches past it (so N becomes all unread and
+ * K restates as the rounded-up hours to that oldest message). When no unread
+ * falls inside K, the newest unread alone is covered, as N's minimum of 1.
+ */
+export function boundForHours(
+  unread: readonly CatchupUnreadRef[],
+  hours: number,
+  nowMs: number,
+): { count: number; sinceMs: number | null; hours: number } {
+  if (unread.length === 0) return { count: 0, sinceMs: null, hours: 1 };
+  const whole = Math.trunc(Number(hours));
+  const wanted = Number.isFinite(whole) && whole >= 1 ? whole : 1;
+  const start = nowMs - wanted * HOUR_MS;
+  const oldest = unread[0]?.at_ms ?? null;
+  if (oldest !== null && start <= oldest) {
+    return { count: unread.length, sinceMs: oldest, hours: hoursSinceStart(oldest, nowMs) };
+  }
+  const count = countForHours(unread, wanted, nowMs);
+  if (count === 0) {
+    const newest = unread.at(-1)?.at_ms ?? null;
+    return { count: 1, sinceMs: newest, hours: hoursSinceStart(newest, nowMs) };
+  }
+  return { count, sinceMs: start, hours: wanted };
 }
 
 /** How many unread a "since HH:MM" covers: those whose local time-of-day is at/after it. */
@@ -1177,8 +1229,31 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
 
   let previewUnread: CatchupUnreadRef[] = [];
   let boundCount = 0;
+  // `#1524`: the bound's explicit start when set by the hours end; null means
+  // the count end owns it and the start is that count's oldest message.
+  let boundStartMs: number | null = null;
+  let drawingBound = false;
   let lastSinceMs: number | null = null;
   let pending = false;
+
+  function nowMs(): number {
+    return deps.now ? deps.now() : Date.now();
+  }
+
+  /** The bound as drawn: count, start and rounded-up hours, from the one state. */
+  function currentBound(): { count: number; sinceMs: number | null; hours: number } {
+    if (boundStartMs !== null) {
+      let count = 0;
+      for (const ref of previewUnread) if (ref.at_ms === null || ref.at_ms >= boundStartMs) count += 1;
+      if (count === 0 && previewUnread.length > 0) {
+        const bound = boundForCount(previewUnread, 1);
+        return { count: bound.count, sinceMs: bound.sinceMs, hours: hoursSinceStart(bound.sinceMs, nowMs()) };
+      }
+      return { count, sinceMs: boundStartMs, hours: hoursSinceStart(boundStartMs, nowMs()) };
+    }
+    const bound = boundForCount(previewUnread, boundCount || previewUnread.length);
+    return { count: bound.count, sinceMs: bound.sinceMs, hours: hoursSinceStart(bound.sinceMs, nowMs()) };
+  }
 
   /** Say whether a request is in flight, here and on the page's entry points. */
   function setPending(on: boolean): void {
@@ -1187,24 +1262,33 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     drawBound();
   }
 
-  /** Draw the Summarize bound: its button, and the two linked ends of it. */
+  /** Draw the Summarize bound: its button, and the three linked ends of it. */
   function drawBound(): void {
     const button = deps.byId("discuss-summarize") as HTMLButtonElement;
     const count = deps.byId("discuss-count") as HTMLInputElement;
+    const hours = deps.byId("discuss-hours") as HTMLInputElement;
     const since = deps.byId("discuss-since") as HTMLInputElement;
     const none = previewUnread.length === 0;
     button.disabled = pending || none;
     count.disabled = pending || none;
+    hours.disabled = pending || none;
     since.disabled = pending || none;
     if (none) {
       button.textContent = "Summarize";
       return;
     }
-    const bound = boundForCount(previewUnread, boundCount || previewUnread.length);
+    const bound = currentBound();
     boundCount = bound.count;
-    count.value = String(bound.count);
-    count.max = String(previewUnread.length);
-    since.value = bound.sinceMs === null ? "" : hhmm(bound.sinceMs);
+    if (boundStartMs !== null) boundStartMs = bound.sinceMs;
+    drawingBound = true;
+    try {
+      count.value = String(bound.count);
+      count.max = String(previewUnread.length);
+      hours.value = String(bound.hours);
+      since.value = bound.sinceMs === null ? "" : hhmm(bound.sinceMs);
+    } finally {
+      drawingBound = false;
+    }
     // `#1382`: the button says only "Summarize"; the line beside it carries the bound.
     button.textContent = "Summarize";
   }
@@ -1222,6 +1306,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const preview = asCatchupPreview(value);
         previewUnread = preview.unread;
         boundCount = preview.unread.length;
+        boundStartMs = null;
         if (previewUnread.length === 0) {
           deps.byId("discuss-status").textContent = "Nothing unread here.";
         } else {
@@ -1371,16 +1456,33 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         });
         listening.listen(deps.byId("discuss-summarize"), "click", () => {
           if (pending || lastScope === null || previewUnread.length === 0) return;
-          fetchFor(lastScope, boundForCount(previewUnread, boundCount).sinceMs);
+          fetchFor(lastScope, currentBound().sinceMs);
         });
         const countInput = deps.byId("discuss-count") as HTMLInputElement;
         listening.listen(countInput, "input", () => {
-          boundCount = boundForCount(previewUnread, Number(countInput.value)).count;
+          if (drawingBound) return;
+          const bound = boundForCount(previewUnread, Number(countInput.value));
+          boundCount = bound.count;
+          boundStartMs = null;
+          // Keep the start the count chose, so hours restates from it.
+          if (bound.sinceMs !== null) boundStartMs = bound.sinceMs;
+          drawBound();
+        });
+        const hoursInput = deps.byId("discuss-hours") as HTMLInputElement;
+        listening.listen(hoursInput, "input", () => {
+          if (drawingBound) return;
+          const parsed = Number(hoursInput.value);
+          if (!Number.isFinite(parsed) || parsed < 1) return;
+          const bound = boundForHours(previewUnread, parsed, nowMs());
+          boundCount = bound.count;
+          boundStartMs = bound.sinceMs;
           drawBound();
         });
         const sinceInput = deps.byId("discuss-since") as HTMLInputElement;
         listening.listen(sinceInput, "input", () => {
+          if (drawingBound) return;
           boundCount = countSince(previewUnread, sinceInput.value);
+          boundStartMs = boundForCount(previewUnread, boundCount).sinceMs;
           drawBound();
         });
         listening.listen(deps.byId("discuss-answer"), "click", (event) => answerTap(event));

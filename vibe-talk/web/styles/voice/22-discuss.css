@@ -99,6 +99,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* `#1524`: the bound's fit is measured against the head itself, below. */
+  container-type: inline-size;
 }
 
 .discuss-actions {
@@ -186,6 +188,24 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   min-width: 0;
   padding: 2px 4px;
   text-align: center;
+}
+
+/* `#1524`: the hours end, in the count's dress; never dropped on a narrow row. */
+#discuss-hours {
+  width: 3.4rem;
+  min-width: 0;
+  padding: 2px 4px;
+  text-align: center;
+}
+
+/* `#1524`: when the head cannot hold the whole bound on one row, drop the
+ * whole "since HH:MM" part and never the hours. The fit is the head's own
+ * inline size (a container query), so a dragged-narrow desk panel and a
+ * phone sheet both lose it exactly when they cannot hold it. */
+@container (max-width: 480px) {
+  .discuss-since-part {
+    display: none;
+  }
 }
 
 /* The time's picker button gets its own space at the right, so the HH:MM
@@ -550,6 +570,10 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   }
 
   #discuss-count {
+    width: 2.7rem;
+  }
+
+  #discuss-hours {
     width: 2.7rem;
   }
 

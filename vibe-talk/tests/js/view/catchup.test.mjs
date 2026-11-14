@@ -21,6 +21,7 @@ const {
   DISCUSS_BINDING_RULES, WIDEN_OR_SIDEWAYS_ACTION, discussScopeKey, isSameDiscussScope,
   linkDecision, normalizeDiscussScope, viewChangeDecision,
   applyStrikes, citationIdsOf, hasWord, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, FRESH_CLASS,
+  hoursSinceStart, countForHours, boundForHours,
 } = VIEW;
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -104,7 +105,7 @@ const IDS = [
   "discuss-followup", "discuss-send",
   "discuss-actions", "discuss-resize",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
-  "discuss-summarize", "discuss-count", "discuss-since", "discuss-read",
+  "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours", "discuss-read",
 ];
 
 /** Fire a non-click listener with a plain event carrying `props`. */
@@ -148,7 +149,7 @@ function answer(overrides = {}) {
   };
 }
 
-function fixture({ selection = { view: "flat", threadId: null, thread: null }, respond } = {}) {
+function fixture({ selection = { view: "flat", threadId: null, thread: null }, respond, previewBody, nowMs } = {}) {
   const els = {};
   for (const id of IDS) els[id] = fakeElement(id.includes("mark") || id.endsWith("open") || id.endsWith("close") || id.endsWith("retry") ? "button" : "div");
   els["discuss-panel"].hidden = true;
@@ -174,8 +175,9 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     },
     catchupPreview: (channelId, scope) => {
       calls.previews.push({ channelId, scope });
-      return Promise.resolve(preview());
+      return Promise.resolve(previewBody ?? preview());
     },
+    ...(nowMs === undefined ? {} : { now: () => nowMs }),
     catchupRecord: (channelId, scope) => {
       calls.records.push({ channelId, scope });
       return Promise.resolve({ exists: false, current_summary: null, timeline: [], staleness: null });
@@ -299,6 +301,71 @@ test("catchup: the bound's ends move together (N to time, time to N)", async () 
     click(fx.els["discuss-summarize"]);
     await flush();
     assert.deepEqual(fx.calls.posts.at(-1).body, { thread_id: null, view: "flat", since_ms: T1 });
+  } finally { fx.restore(); }
+});
+
+test("catchup: hours helpers link K, N and since with an injected now (#1524)", () => {
+  const now = new Date(2026, 8, 20, 12, 0).getTime();
+  const unread = [
+    { id: "a", at_ms: now - (5 * 60 + 30) * 60_000, label: "a" },
+    { id: "b", at_ms: now - (2 * 60 + 15) * 60_000, label: "b" },
+    { id: "c", at_ms: now - 30 * 60_000, label: "c" },
+  ];
+  // Rounding: K is whole hours from the start to now, rounded up.
+  assert.equal(hoursSinceStart(unread[0].at_ms, now), 6);
+  assert.equal(hoursSinceStart(now - 2 * 3_600_000, now), 2);
+  assert.equal(hoursSinceStart(null, now), 1);
+  assert.equal(countForHours(unread, 2, now), 1);
+  assert.equal(countForHours(unread, 3, now), 2);
+  assert.deepEqual(boundForHours(unread, 3, now), { count: 2, sinceMs: now - 3 * 3_600_000, hours: 3 });
+  // Past the oldest unread clamps to all unread and to the oldest start.
+  assert.deepEqual(boundForHours(unread, 99, now), { count: 3, sinceMs: unread[0].at_ms, hours: 6 });
+  assert.deepEqual(boundForHours([], 4, now), { count: 0, sinceMs: null, hours: 1 });
+});
+
+test("catchup: the hours end moves together with N and since (#1524)", async () => {
+  const now = new Date(2026, 8, 20, 12, 0).getTime();
+  const unread = [
+    { id: "a", at_ms: now - (5 * 60 + 30) * 60_000, label: "06:30 · A" },
+    { id: "b", at_ms: now - (2 * 60 + 15) * 60_000, label: "09:45 · B" },
+    { id: "c", at_ms: now - 30 * 60_000, label: "11:30 · C" },
+  ];
+  const fx = fixture({ nowMs: now, previewBody: { window: { count: 12, unread_count: 3 }, unread } });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const count = fx.els["discuss-count"];
+    const hours = fx.els["discuss-hours"];
+    const since = fx.els["discuss-since"];
+    assert.equal(count.value, "3");
+    assert.equal(hours.value, "6", "all unread did not show ceil hours to the oldest");
+    assert.equal(since.value, "06:30");
+    // Editing K moves the start to now-K, and N and HH:MM follow.
+    hours.value = "3";
+    fireInput(hours);
+    assert.equal(count.value, "2");
+    assert.equal(since.value, "09:00");
+    assert.equal(hours.value, "3", "editing K rewrote K to another value");
+    // Editing N updates K (rounded up from that message to now).
+    count.value = "1";
+    fireInput(count);
+    assert.equal(hours.value, "1");
+    assert.equal(since.value, "11:30");
+    // Editing HH:MM updates K.
+    since.value = "06:30";
+    fireInput(since);
+    assert.equal(count.value, "3");
+    assert.equal(hours.value, "6");
+    // K past the oldest clamps to all unread.
+    hours.value = "99";
+    fireInput(hours);
+    assert.equal(count.value, "3");
+    assert.equal(hours.value, "6");
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(fx.calls.posts.at(-1).body.since_ms, unread[0].at_ms);
   } finally { fx.restore(); }
 });
 
