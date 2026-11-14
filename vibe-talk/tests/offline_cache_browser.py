@@ -3133,12 +3133,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             # record is unchanged over consecutive polls, so a late probe on a
             # loaded host is still seen, and a quiet page is not held to a clock.
             stable = 0
-            seen = (len(refused), len(console_errors))
+            record_seen = (len(refused), len(console_errors))
             while stable < 3:
                 page.wait_for_timeout(50)
-                now = (len(refused), len(console_errors))
-                stable = stable + 1 if now == seen else 0
-                seen = now
+                record_now = (len(refused), len(console_errors))
+                stable = stable + 1 if record_now == record_seen else 0
+                record_seen = record_now
             shot("8-read-scope")
             check(not refused, f"{label}, read-scope token: the page was refused {refused}")
             check(not console_errors, f"{label}, read-scope token: console errors {console_errors}")
