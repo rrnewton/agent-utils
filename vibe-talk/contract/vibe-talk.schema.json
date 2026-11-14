@@ -2746,7 +2746,8 @@
           ]
         },
         "stale": {
-          "description": "Matching hits handed out though not seen since the channel's latest dropped update:\neach may be stale, the drop may have been its edit or deletion (`#1533\nvibe-talk-record-completeness`). Handed out flagged, never hidden: the drop names no\nrow, and hiding every older row makes the record incomplete.",
+          "default": 0,
+          "description": "Matching hits handed out though not seen since the channel's latest dropped update:\neach may be stale, the drop may have been its edit or deletion (`#1533\nvibe-talk-record-completeness`). Handed out flagged, never hidden: the drop names no\nrow, and hiding every older row makes the record incomplete. Defaulted so an answer\nfrom a server without it still validates.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

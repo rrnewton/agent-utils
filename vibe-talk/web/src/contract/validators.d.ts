@@ -2253,7 +2253,8 @@ export interface SearchScope {
    * Matching hits handed out though not seen since the channel's latest dropped update:
    * each may be stale, the drop may have been its edit or deletion (`#1533
    * vibe-talk-record-completeness`). Handed out flagged, never hidden: the drop names no
-   * row, and hiding every older row makes the record incomplete.
+   * row, and hiding every older row makes the record incomplete. Defaulted so an answer
+   * from a server without it still validates.
    */
   stale: number;
   /**
