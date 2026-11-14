@@ -3367,6 +3367,22 @@ pub async fn catchup_update(
     })))
 }
 
+/// The Discuss follow-up's tool hands: cache-only, read-only. `#1356`.
+struct DiscussTools {
+    state: AppState,
+}
+
+#[async_trait::async_trait]
+impl crate::summarize::discuss::DiscussExecutor for DiscussTools {
+    async fn execute_discuss_tool(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<String, String> {
+        crate::mcp::protocol::execute_discuss_tool(&self.state, name, &arguments).await
+    }
+}
+
 /// `POST /api/v1/channels/{channel_id}/catchup/messages` — one follow-up
 /// (`discuss-followup-composer`): the side agent answers with the cached window plus
 /// the transcript so far, and both turns join the record's timeline. Cache-only, one
@@ -3451,10 +3467,22 @@ pub async fn catchup_followup(
     }
     prompt.push_str("\n\nThe owner's new question:\n");
     prompt.push_str(&question);
+    // `#1356 discuss-readonly-tools`: a follow-up may pull more context with the
+    // read-only tools, cache only. The channel id rides in the prompt (not the
+    // system prompt, which is shared with the first summary) so the model can
+    // name it in a tool call.
+    prompt.push_str(&format!(
+        "\n\nFor tool calls, this channel's channel_id is {channel_id}."
+    ));
     let system = crate::catchup::effective_system_prompt(None);
+    let channels = ops::channels(&state).await;
+    let tools = crate::summarize::discuss::discuss_tool_specs(&channels);
+    let executor = DiscussTools {
+        state: state.clone(),
+    };
     let model_began = std::time::Instant::now();
     let raw = agent
-        .complete_prompt(&system, &prompt)
+        .complete_followup(&system, &prompt, &tools, &executor)
         .await
         .map_err(|error| match error {
             crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),

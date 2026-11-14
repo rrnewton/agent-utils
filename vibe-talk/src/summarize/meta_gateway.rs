@@ -139,6 +139,24 @@ struct ChatMessage {
     content: Option<String>,
     #[serde(default)]
     refusal: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatToolCall {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    function: ChatFunction,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatFunction {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -470,6 +488,219 @@ impl MetaGatewaySummarizer {
     }
 }
 
+/// Parse one chat-completions body into a Discuss step. `#1356 discuss-readonly-tools`.
+pub fn parse_discuss_step(body: &[u8]) -> Result<super::discuss::ModelStep, SummaryError> {
+    let parsed: ChatResponse = serde_json::from_slice(body).map_err(|_| {
+        SummaryError::Shape(
+            "the AI gateway answered 2xx with something that is not a chat-completions response"
+                .to_owned(),
+        )
+    })?;
+    let Some(choice) = parsed.choices.into_iter().next() else {
+        return Err(SummaryError::Shape(
+            "the AI gateway answered with no choices".to_owned(),
+        ));
+    };
+    if choice
+        .message
+        .refusal
+        .as_deref()
+        .is_some_and(|refusal| !refusal.trim().is_empty())
+    {
+        return Err(SummaryError::Refused(
+            "the model declined to answer".to_owned(),
+        ));
+    }
+    if !choice.message.tool_calls.is_empty() {
+        let calls = choice
+            .message
+            .tool_calls
+            .into_iter()
+            .map(|call| super::discuss::ToolCall {
+                id: call.id,
+                name: call.function.name,
+                arguments: match call.function.arguments {
+                    serde_json::Value::String(text) => text,
+                    other => other.to_string(),
+                },
+            })
+            .collect();
+        return Ok(super::discuss::ModelStep::Calls(calls));
+    }
+    let text = choice.message.content.unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(SummaryError::Shape(format!(
+            "the model answered with no text (finish_reason {})",
+            choice.finish_reason.as_deref().unwrap_or("absent")
+        )));
+    }
+    Ok(super::discuss::ModelStep::Text(text))
+}
+
+fn gateway_messages(
+    system: &str,
+    history: &[super::discuss::ToolMessage],
+) -> Vec<serde_json::Value> {
+    let mut messages = vec![serde_json::json!({"role": "system", "content": system})];
+    for message in history {
+        messages.push(match message {
+            super::discuss::ToolMessage::User(text) => {
+                serde_json::json!({"role": "user", "content": text})
+            }
+            super::discuss::ToolMessage::Assistant(text) => {
+                serde_json::json!({"role": "assistant", "content": text})
+            }
+            super::discuss::ToolMessage::AssistantCalls(calls) => serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": calls.iter().map(|call| serde_json::json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments}
+                })).collect::<Vec<_>>()
+            }),
+            super::discuss::ToolMessage::ToolResult { call_id, content } => serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content
+            }),
+        });
+    }
+    messages
+}
+
+struct GatewayDiscussModel<'a>(&'a MetaGatewaySummarizer);
+
+#[async_trait]
+impl super::discuss::DiscussModel for GatewayDiscussModel<'_> {
+    async fn discuss_step(
+        &self,
+        system: &str,
+        history: &[super::discuss::ToolMessage],
+        tools: &[super::discuss::ToolSpec],
+    ) -> Result<super::discuss::ModelStep, SummaryError> {
+        self.0.discuss_step_inner(system, history, tools).await
+    }
+}
+
+impl MetaGatewaySummarizer {
+    async fn discuss_step_inner(
+        &self,
+        system: &str,
+        history: &[super::discuss::ToolMessage],
+        tools: &[super::discuss::ToolSpec],
+    ) -> Result<super::discuss::ModelStep, SummaryError> {
+        let max_wait = Duration::from_secs(self.config.timeout_secs);
+        let began = Instant::now();
+        let deadline = began + max_wait;
+        let mut last = String::new();
+        for attempt in 0..MAX_ATTEMPTS {
+            let patience = deadline.saturating_duration_since(Instant::now());
+            if let Err(wait) = self.limiter.acquire(Priority::Interactive, patience).await {
+                return Err(SummaryError::Transport(format!(
+                    "the summariser's rate limit has no free call for another {}s",
+                    wait.as_secs()
+                )));
+            }
+            match self.send_discuss_step(system, history, tools).await {
+                StepAttempt::Answered(step) => return Ok(step),
+                StepAttempt::Failed(error) => return Err(error),
+                StepAttempt::Retry { after, detail } => {
+                    let wait = after
+                        .unwrap_or_else(|| Duration::from_secs(1 << attempt))
+                        .min(MAX_PAUSE);
+                    self.limiter.pause_for(wait);
+                    self.note(|s| s.retried += 1);
+                    last = detail;
+                }
+            }
+        }
+        Err(SummaryError::Transport(format!(
+            "the AI gateway was still refusing after {MAX_ATTEMPTS} attempts: {last}"
+        )))
+    }
+
+    async fn send_discuss_step(
+        &self,
+        system: &str,
+        history: &[super::discuss::ToolMessage],
+        tools: &[super::discuss::ToolSpec],
+    ) -> StepAttempt {
+        let client = match self.client() {
+            Ok(client) => client,
+            Err(error) => return StepAttempt::Failed(error),
+        };
+        let mut body = serde_json::json!({
+            "model": self.config.model_for(SummaryKind::SideAgent),
+            "max_completion_tokens": self.config.max_tokens,
+            "messages": gateway_messages(system, history),
+        });
+        if let Some(effort) = self.config.reasoning_effort.sent() {
+            body["reasoning_effort"] = serde_json::json!(effort);
+        }
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(
+                tools
+                    .iter()
+                    .map(super::discuss::ToolSpec::chat_json)
+                    .collect(),
+            );
+        }
+        let mut request = client
+            .post(endpoint(&self.config))
+            .timeout(Duration::from_secs(self.config.timeout_secs))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body);
+        for (name, value) in &self.config.extra_headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        self.note(|s| s.requests += 1);
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return StepAttempt::Failed(SummaryError::Transport(format!(
+                    "the AI gateway could not be reached: {}",
+                    causes(&error)
+                )));
+            }
+        };
+        let status = response.status();
+        let retry = retry_after(response.headers());
+        let code = error_code(response.headers());
+        let body = match read_bounded(response).await {
+            Ok(body) => body,
+            Err(error) => return StepAttempt::Failed(error),
+        };
+        if status.is_success() {
+            return match parse_discuss_step(&body) {
+                Ok(step) => {
+                    self.note(|s| s.answered += 1);
+                    StepAttempt::Answered(step)
+                }
+                Err(error) => StepAttempt::Failed(error),
+            };
+        }
+        let detail = describe_failure(status, code.as_deref(), &body);
+        match status.as_u16() {
+            429 | 503 | 529 => StepAttempt::Retry {
+                after: retry,
+                detail,
+            },
+            400..=499 => StepAttempt::Failed(SummaryError::Refused(detail)),
+            _ => StepAttempt::Failed(SummaryError::Transport(detail)),
+        }
+    }
+}
+
+enum StepAttempt {
+    Answered(super::discuss::ModelStep),
+    Retry {
+        after: Option<Duration>,
+        detail: String,
+    },
+    Failed(SummaryError),
+}
+
 #[async_trait]
 impl Summarizer for MetaGatewaySummarizer {
     fn describe(&self) -> &'static str {
@@ -531,6 +762,24 @@ impl Summarizer for MetaGatewaySummarizer {
             crate::config::SummaryKind::SideAgent,
             system,
             prompt,
+        )
+        .await
+    }
+
+    async fn complete_followup(
+        &self,
+        system: &str,
+        prompt: &str,
+        tools: &[super::discuss::ToolSpec],
+        executor: &dyn super::discuss::DiscussExecutor,
+    ) -> Result<String, SummaryError> {
+        // `#1356 discuss-readonly-tools`: the bounded read-only tool loop.
+        super::discuss::run_discuss_loop(
+            &GatewayDiscussModel(self),
+            executor,
+            system,
+            prompt,
+            tools,
         )
         .await
     }

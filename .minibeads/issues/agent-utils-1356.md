@@ -1,6 +1,6 @@
 ---
 title: 'discuss-readonly-tools: read-only tool use for Discuss follow-ups'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-discussq
@@ -31,3 +31,7 @@ Today the side agent is one text-in/text-out call. Follow-up turns (mu-catchup's
 # Notes
 
 [watermelon-full-preview] #1356 discuss-readonly-tools, mu-discussq. Probe (2026-11-12, live wire, request: `tools: [{type: function, function: {name: find_message, parameters: {message_id}}}]`, `max_completion_tokens: 2048`, `reasoning_effort: medium`, user asking to look up one real cached id): small-elk-internal — HTTP 200, 1.2 s, `finish_reason: tool_calls`, `tool_calls: [{name: find_message, arguments: {"message_id": "1570414242325070713"}}]`; muse-spark-1.4-internal — HTTP 200, 1.4 s, same shape. Both models pass function calling, so step 2 builds on the gateway wire; the #1331 claude_session fallback is the pick only if a future deployment's gateway refuses `tools`. Build ETA: about 3–4 h after #1353 discuss composer/transcript lands; coordinate the transcript seam with mu-catchup before building.
+
+## Resolution
+
+[watermelon-full-preview] #1356 discuss-readonly-tools, mu-discusstools. Step 2 shipped: Discuss follow-ups (`POST .../catchup/messages`) now run a bounded read-only tool loop on the gateway summarizer (`Summarizer::complete_followup`, default tool-free on other backends). Tools offered are exactly the read-only manifest subset (`find_message`, `read_page`, `read_message`, `digest_channel`, `fetch_document`, `search`) via `summarize::discuss::discuss_tool_specs`; a write-shaped or unknown call is refused by name as its tool result and never executed (`post_reply`/`mark_read` covered by tests). Execution is in-process through `mcp::protocol::execute_discuss_tool` against the cache only (held messages, `ops::catchup_fetch` held window, cache search, already-fetched documents; no chat-provider call — the catchup integration test freezes the upstream read count). At most 4 tool rounds, then one final tool-free step answers from what was gathered; the first summary still makes exactly one tool-free `complete_prompt` call and is asserted so. Final text keeps the same `split_unknown_terms` + `shape_answer` shaping. Tests: `summarize::discuss` loop tests (write refused, bound, allowed call), gateway wire tests (tools offered, tool result fed back, `tool_calls` parsing; summary body still carries no `tools`), protocol executor tests (writes refused, cache-only with zero upstream reads), and `tests/catchup.rs` end-to-end follow-up tool tests.

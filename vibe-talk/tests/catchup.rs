@@ -897,3 +897,113 @@ fn a_record_saved_before_fresh_ids_still_loads() {
         "an empty fresh set resaved: {saved}"
     );
 }
+
+#[tokio::test]
+async fn a_followup_may_read_the_cache_with_a_tool_and_never_goes_upstream() {
+    // `#1356 discuss-readonly-tools`: the follow-up's model asks for a cached
+    // message, the in-process executor serves it from the cache, and the chat
+    // upstream's read count never moves. The first summary stays one
+    // tool-free call.
+    let messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    let wanted = messages[2].id.clone();
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    summarizer.answer_with("first point");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        summarizer.prompt_calls().len(),
+        1,
+        "first summary: one call"
+    );
+    assert_eq!(
+        summarizer.discuss_steps(),
+        0,
+        "first summary: no tool steps"
+    );
+
+    let reads_before = backend.reads();
+    summarizer.script_discuss(vec![
+        vibe_talk::summarize::discuss::ModelStep::Calls(vec![
+            vibe_talk::summarize::discuss::ToolCall {
+                id: "call-1".to_owned(),
+                name: "read_message".to_owned(),
+                arguments: json!({
+                    "channel_id": WRITE_CHANNEL,
+                    "message_id": wanted.as_str(),
+                })
+                .to_string(),
+            },
+        ]),
+        vibe_talk::summarize::discuss::ModelStep::Text("message 2, as cached".to_owned()),
+    ]);
+    let (status, body) = post(
+        &app,
+        &format!("{channel_path}/messages"),
+        Some(WRITE_TOKEN),
+        &json!({"text": "what did message 2 say?"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["agent"]["text"], json!("message 2, as cached"));
+    assert_eq!(
+        summarizer.discuss_steps(),
+        2,
+        "one tool step, one answer step"
+    );
+    assert_eq!(
+        backend.reads(),
+        reads_before,
+        "a Discuss tool must read only the cache, never the chat upstream"
+    );
+}
+
+#[tokio::test]
+async fn a_followup_write_shaped_tool_call_changes_nothing() {
+    // `#1356 discuss-readonly-tools`: a model that asks to post is refused as
+    // its tool result; nothing is posted and the follow-up still answers.
+    let messages: Vec<Message> = (0..3).map(|seq| message(seq, None, false)).collect();
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+    summarizer.answer_with("first point");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    summarizer.script_discuss(vec![
+        vibe_talk::summarize::discuss::ModelStep::Calls(vec![
+            vibe_talk::summarize::discuss::ToolCall {
+                id: "call-1".to_owned(),
+                name: "post_reply".to_owned(),
+                arguments: json!({
+                    "channel_id": WRITE_CHANNEL,
+                    "text": "hello from the model",
+                })
+                .to_string(),
+            },
+        ]),
+        vibe_talk::summarize::discuss::ModelStep::Text("I cannot post that.".to_owned()),
+    ]);
+    let (status, body) = post(
+        &app,
+        &format!("{channel_path}/messages"),
+        Some(WRITE_TOKEN),
+        &json!({"text": "post hello for me"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["agent"]["text"], json!("I cannot post that."));
+}

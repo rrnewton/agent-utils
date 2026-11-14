@@ -72,6 +72,7 @@
 pub mod agent;
 pub mod claude_session;
 pub mod counters;
+pub mod discuss;
 pub mod fake;
 pub mod messages_api;
 pub mod meta_gateway;
@@ -446,6 +447,28 @@ pub trait Summarizer: Send + Sync {
     async fn complete_prompt(&self, system: &str, prompt: &str) -> Result<String, SummaryError> {
         let _ = (system, prompt);
         Err(SummaryError::NotConfigured("summaries.llm"))
+    }
+
+    /// Answer one Discuss follow-up, with read-only tools offered. `#1356
+    /// discuss-readonly-tools`.
+    ///
+    /// By default the follow-up is the one tool-free call, exactly as
+    /// [`Summarizer::complete_prompt`]: only the gateway backend overrides this
+    /// with the bounded tool loop in [`discuss`]. The first summary never calls
+    /// this, so it stays one tool-free call on every backend.
+    ///
+    /// # Errors
+    ///
+    /// [`SummaryError`] as for [`Summarizer::complete_prompt`].
+    async fn complete_followup(
+        &self,
+        system: &str,
+        prompt: &str,
+        tools: &[discuss::ToolSpec],
+        executor: &dyn discuss::DiscussExecutor,
+    ) -> Result<String, SummaryError> {
+        let _ = (tools, executor);
+        self.complete_prompt(system, prompt).await
     }
 
     /// Summarise one message: the answer flattened and uncut up to the stored ceiling. See

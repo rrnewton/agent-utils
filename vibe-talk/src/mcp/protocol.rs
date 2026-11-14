@@ -630,6 +630,170 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
     }
 }
 
+/// The Discuss follow-up executor. `#1356 discuss-readonly-tools`.
+///
+/// Only [`crate::summarize::discuss::DISCUSS_TOOL_NAMES`] may run, and only from
+/// this server's cache: held messages, the held channel window
+/// ([`ops::catchup_fetch`]), the cache search, and already-fetched documents.
+/// Nothing here calls a chat provider, so a message the cache does not hold is
+/// answered as not held rather than fetched. A write-shaped name is refused
+/// before anything runs.
+///
+/// # Errors
+///
+/// A model-facing sentence when the name is refused or the cache cannot serve it.
+pub async fn execute_discuss_tool(
+    state: &AppState,
+    name: &str,
+    args: &Value,
+) -> Result<String, String> {
+    if !crate::summarize::discuss::is_discuss_tool(name) {
+        return Err(format!(
+            "refused: {name} is not a read-only Discuss tool; only {} may be called",
+            crate::summarize::discuss::DISCUSS_TOOL_NAMES.join(", ")
+        ));
+    }
+    // A channel named by label or alias resolves to its id, as in `call_tool`.
+    let mut args = args.clone();
+    if let Some(named) = arg_id(&args, "channel_id") {
+        if let Some(id) = ops::channel_named(state, &named).await {
+            if let Some(fields) = args.as_object_mut() {
+                fields.insert("channel_id".to_owned(), Value::String(id.0));
+            }
+        }
+    }
+    let args = &args;
+    match name {
+        "fetch_document" => run_fetch_document(state, args).map_err(|error| error.to_string()),
+        "search" => run_search(state, Scope::Write, args)
+            .await
+            .map_err(|error| error.to_string()),
+        "read_message" => {
+            let channel_id = arg_id(args, "channel_id").unwrap_or_default();
+            let message_id = arg_id(args, "message_id").unwrap_or_default();
+            let thread_id = arg_id(args, "thread_id");
+            match ops::held_message(
+                state,
+                Scope::Write,
+                &channel_id,
+                &message_id,
+                thread_id.as_deref(),
+            )
+            .await
+            {
+                Ok(Some(message)) => {
+                    let info = ops::allowed_channel(state, &channel_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let read =
+                        read_set(state, Scope::Write, &info.id, std::slice::from_ref(&message))
+                            .await;
+                    let message_id_text = message.id.to_string();
+                    Ok(format!(
+                        "Message {} from {} (from this server's cache):\n{}",
+                        message_id_text,
+                        info.display_name(),
+                        untrusted::render_for_model_read(
+                            &[message],
+                            &crate::owner::Owner::of(state),
+                            &read
+                        )
+                    ))
+                }
+                Ok(None) => Ok(format!(
+                    "Message {message_id} is not held in this server's cache for channel                      {channel_id}; Discuss tools read only the cache and fetch nothing."
+                )),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        "read_page" | "digest_channel" | "find_message" => {
+            let channel_id = arg_id(args, "channel_id").unwrap_or_default();
+            let fetched = ops::catchup_fetch(
+                state,
+                Scope::Write,
+                &channel_id,
+                crate::threads::TimelineView::Flat,
+                None,
+                150,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let read: std::collections::HashSet<crate::model::MessageId> =
+                fetched.read.iter().cloned().collect();
+            let owner = crate::owner::Owner::of(state);
+            match name {
+                "read_page" => {
+                    let limit = arg_u16(args, "limit").map_or(50, usize::from);
+                    let start = fetched.messages.len().saturating_sub(limit);
+                    let page = &fetched.messages[start..];
+                    Ok(format!(
+                        "Page of {} (id {}) from this server's cache: {} message(s), oldest                          first. The cache may not hold older messages; absence here is not                          absence ever.\n{}",
+                        fetched.channel.display_name(),
+                        fetched.channel.id,
+                        page.len(),
+                        untrusted::render_for_model_read(page, &owner, &read)
+                    ))
+                }
+                "digest_channel" => {
+                    let limit = arg_u16(args, "limit").map_or(50, usize::from);
+                    let start = fetched.messages.len().saturating_sub(limit);
+                    let mut body = String::new();
+                    for message in &fetched.messages[start..] {
+                        let text: String = message.content.chars().take(160).collect();
+                        body.push_str(&format!(
+                            "[{} | {} | {}] {}\n",
+                            message.id.as_str(),
+                            message.spoken(),
+                            owner.speaker(&message.author, message.author_id.as_str()),
+                            untrusted::continued(&text)
+                        ));
+                    }
+                    Ok(format!(
+                        "Digest of {} (id {}) from this server's cache: {} message(s), oldest                          first.\n{}",
+                        fetched.channel.display_name(),
+                        fetched.channel.id,
+                        fetched.messages[start..].len(),
+                        untrusted::fenced(&body)
+                    ))
+                }
+                _ => {
+                    let query = arg_str(args, "query").unwrap_or_default();
+                    let resolution = crate::retrieval::resolve(
+                        state.ranker.as_ref(),
+                        &fetched.messages,
+                        &query,
+                        2,
+                    );
+                    let Some(best) = resolution.best else {
+                        return Ok(format!(
+                            "No message in this server's cached window of {} matched \"{query}\".",
+                            fetched.channel.display_name()
+                        ));
+                    };
+                    let mut found = vec![best.message.clone()];
+                    found.extend(
+                        resolution
+                            .alternatives
+                            .iter()
+                            .map(|alternative| alternative.message.clone()),
+                    );
+                    Ok(format!(
+                        "Best match in {} (searched this server's cached window{}):\n{}",
+                        fetched.channel.display_name(),
+                        if resolution.ambiguous {
+                            ", AMBIGUOUS"
+                        } else {
+                            ""
+                        },
+                        untrusted::render_for_model_read(&found, &owner, &read)
+                    ))
+                }
+            }
+        }
+        _ => Err(format!("refused: {name} is not a read-only Discuss tool")),
+    }
+}
+
 /// Why a tool call produced a tool error rather than its normal result.
 ///
 /// Mostly an [`OpError`] from the shared operations layer. The document tools
@@ -3451,5 +3615,56 @@ mod tests {
         for key in ["fraction", "negative", "word", "list", "flag"] {
             assert_eq!(read(key).expect_err(key).code(), "invalid_hours", "{key}");
         }
+    }
+}
+
+#[cfg(test)]
+mod discuss_tool_tests {
+    use super::*;
+    use crate::testing;
+
+    #[tokio::test]
+    async fn discuss_tools_refuse_writes_and_unknown_names() {
+        let (state, fake) = testing::state();
+        for name in ["post_reply", "mark_read", "ask_agent", "web_scraper"] {
+            let error =
+                execute_discuss_tool(&state, name, &json!({"channel_id": testing::READ_CHANNEL}))
+                    .await
+                    .expect_err("write-shaped and unknown tools are refused");
+            assert!(error.contains("refused"), "{name}: {error}");
+        }
+        assert!(fake.posted().is_empty(), "nothing may be posted");
+        assert_eq!(fake.fetch_count(), 0, "a refusal reads nothing upstream");
+    }
+
+    #[tokio::test]
+    async fn discuss_tools_read_only_the_cache() {
+        // The fake upstream fails the test if a Discuss tool calls it: every
+        // read below must answer from the cache (here: not held / no hits)
+        // with the upstream read count frozen at zero.
+        let (state, fake) = testing::state();
+        fake.seed(
+            &crate::model::ChannelId(testing::READ_CHANNEL.to_owned()),
+            "lead",
+            "the mac runner is green again",
+        );
+        let before = fake.fetch_count();
+        let text = execute_discuss_tool(
+            &state,
+            "read_message",
+            &json!({"channel_id": testing::READ_CHANNEL, "message_id": "12345"}),
+        )
+        .await
+        .expect("cache-only read answers");
+        assert!(text.contains("not held in this server's cache"), "{text}");
+        let text = execute_discuss_tool(&state, "search", &json!({"query": "mac runner"}))
+            .await
+            .expect("cache-only search answers");
+        assert!(!text.is_empty());
+        assert_eq!(
+            fake.fetch_count(),
+            before,
+            "Discuss tools must not call the chat upstream"
+        );
     }
 }

@@ -427,3 +427,80 @@ fn the_endpoint_is_the_chat_completions_path_under_the_base() {
         "off still sent an effort: {body:?}"
     );
 }
+
+#[tokio::test]
+async fn a_followup_offers_read_only_tools_and_feeds_the_result_back() {
+    // `#1356 discuss-readonly-tools`: step 1 asks for a tool, step 2 answers.
+    let tool_reply = Reply {
+        status: 200,
+        headers: vec![("content-type", "application/json".to_owned())],
+        body: json!({
+            "choices": [{
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {"role": "assistant", "content": null, "refusal": null,
+                    "tool_calls": [{"id": "call-1", "type": "function",
+                        "function": {"name": "read_message", "arguments": "{\"channel_id\":\"100\",\"message_id\":\"42\"}"}}]}
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        })
+        .to_string(),
+    };
+    let mock = Mock::start(vec![tool_reply, Reply::text("It shipped at noon.")]).await;
+    let under = MetaGatewaySummarizer::new(gateway(&mock));
+    struct Cache;
+    #[async_trait::async_trait]
+    impl crate::summarize::discuss::DiscussExecutor for Cache {
+        async fn execute_discuss_tool(
+            &self,
+            name: &str,
+            _arguments: Value,
+        ) -> Result<String, String> {
+            Ok(format!("cached {name} result"))
+        }
+    }
+    let channels: Vec<crate::model::ChannelInfo> = vec![];
+    let tools = crate::summarize::discuss::discuss_tool_specs(&channels);
+    let text = under
+        .complete_followup("sys", "question", &tools, &Cache)
+        .await
+        .expect("follow-up answers");
+    assert_eq!(text, "It shipped at noon.");
+    let sent = mock.captured();
+    assert_eq!(sent.len(), 2, "one tool step and one answer step");
+    let offered = sent[0].body["tools"].as_array().expect("tools offered");
+    let names: Vec<&str> = offered
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().expect("name"))
+        .collect();
+    assert!(names.contains(&"read_message"), "{names:?}");
+    assert!(!names.contains(&"post_reply"), "{names:?}");
+    assert!(!names.contains(&"mark_read"), "{names:?}");
+    let second = sent[1].body["messages"].to_string();
+    assert!(second.contains("cached read_message result"), "{second}");
+    assert!(second.contains("call-1"), "{second}");
+}
+
+#[test]
+fn a_tool_calls_body_parses_to_calls_and_a_text_body_to_text() {
+    let calls = parse_discuss_step(
+        br#"{"choices":[{"finish_reason":"tool_calls","message":{"content":null,"tool_calls":[{"id":"c1","function":{"name":"search","arguments":"{\"query\":\"deploy\"}"}}]}}]}"#,
+    )
+    .expect("calls parse");
+    assert_eq!(
+        calls,
+        crate::summarize::discuss::ModelStep::Calls(vec![crate::summarize::discuss::ToolCall {
+            id: "c1".to_owned(),
+            name: "search".to_owned(),
+            arguments: "{\"query\":\"deploy\"}".to_owned(),
+        }])
+    );
+    let text = parse_discuss_step(
+        br#"{"choices":[{"finish_reason":"stop","message":{"content":"done"}}]}"#,
+    )
+    .expect("text parses");
+    assert_eq!(
+        text,
+        crate::summarize::discuss::ModelStep::Text("done".to_owned())
+    );
+}

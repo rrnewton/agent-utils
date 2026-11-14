@@ -42,6 +42,8 @@ struct State {
     names_threads: bool,
     threads: Vec<String>,
     prompts: Vec<(String, String)>,
+    discuss_script: Vec<super::discuss::ModelStep>,
+    discuss_steps: usize,
 }
 
 impl FakeSummarizer {
@@ -108,6 +110,17 @@ impl FakeSummarizer {
         self.lock().prompts.clone()
     }
 
+    /// Script the Discuss tool loop's model steps, in order. `#1356 discuss-readonly-tools`.
+    pub fn script_discuss(&self, steps: Vec<super::discuss::ModelStep>) {
+        self.lock().discuss_script = steps;
+    }
+
+    /// How many tool-loop steps this fake has taken.
+    #[must_use]
+    pub fn discuss_steps(&self) -> usize {
+        self.lock().discuss_steps
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -172,6 +185,22 @@ impl Summarizer for FakeSummarizer {
         Ok(format!("catchup #{}", state.prompts.len()))
     }
 
+    async fn complete_followup(
+        &self,
+        system: &str,
+        prompt: &str,
+        tools: &[super::discuss::ToolSpec],
+        executor: &dyn super::discuss::DiscussExecutor,
+    ) -> Result<String, SummaryError> {
+        if self.lock().discuss_script.is_empty() {
+            return self.complete_prompt(system, prompt).await;
+        }
+        self.lock()
+            .prompts
+            .push((system.to_owned(), prompt.to_owned()));
+        super::discuss::run_discuss_loop(self, executor, system, prompt, tools).await
+    }
+
     async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {
         let mut state = self.lock();
         if let Some(why) = state.fail_next.take() {
@@ -193,5 +222,25 @@ impl Summarizer for FakeSummarizer {
             text: format!("summary #{}", state.requests.len()),
             cut_at: None,
         })
+    }
+}
+
+#[async_trait]
+impl super::discuss::DiscussModel for FakeSummarizer {
+    async fn discuss_step(
+        &self,
+        _system: &str,
+        _history: &[super::discuss::ToolMessage],
+        _tools: &[super::discuss::ToolSpec],
+    ) -> Result<super::discuss::ModelStep, SummaryError> {
+        let mut state = self.lock();
+        state.discuss_steps += 1;
+        if state.discuss_script.is_empty() {
+            let reply = state.answer.clone();
+            return Ok(super::discuss::ModelStep::Text(
+                reply.unwrap_or_else(|| "catchup answer".to_owned()),
+            ));
+        }
+        Ok(state.discuss_script.remove(0))
     }
 }
