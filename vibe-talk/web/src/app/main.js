@@ -1,6 +1,6 @@
-// The voice page's entry (`#624 voice-page-modularity`, final entry candidate): the former legacy
-// script as the composition-root module. Its first statement remains `takePairingCode()`
-// (through the const below): the pairing credential leaves the address before anything else.
+// The voice page's entry (`#624 voice-page-modularity`, final entry): the former legacy
+// script as the composition-root module. Its first statement remains `takePairingCode()`:
+// the pairing credential leaves the address before anything else.
 
 import {createApplication, createKeyboardComposition, createServerAccess, createPageGuards} from "../app/index.ts";
 import {createGathering,

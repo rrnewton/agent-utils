@@ -186,7 +186,7 @@ test("the script is strict throughout, declares every entry source's top-level n
     checked += 1;
   }
   assert.equal(checked, entryNames.length, "not every entry top-level name was checked");
-  assert.ok(checked > 100 && entryNames.includes("takePairingCode"), `only ${checked} entry top-level names were checked`);
+  assert.ok(checked > 1000 && entryNames.includes("takePairingCode"), `only ${checked} entry top-level names were checked`);
   const mapPath = MANIFEST.assets.script.map;
   assert.ok(script.endsWith(`\n//# sourceMappingURL=${mapPath}\n`), "the script does not name its map last");
   assert.ok(text(STYLE_PATH).endsWith(`/*# sourceMappingURL=${MANIFEST.assets.style.map} */\n`));

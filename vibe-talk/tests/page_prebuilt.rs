@@ -78,7 +78,10 @@ fn a_page_from_other_sources_is_refused_naming_what_differs() {
         message.contains("not built from these sources"),
         "{message}"
     );
-    assert!(message.contains("vibe-talk/web/src/app/main.js"), "{message}");
+    assert!(
+        message.contains("vibe-talk/web/src/app/main.js"),
+        "{message}"
+    );
 
     // An input it never read, as when a file was added to web/ since: a difference too.
     let dir = TempDir::new("page-prebuilt-missing-input");

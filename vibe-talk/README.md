@@ -5775,7 +5775,7 @@ The JSON the server and the app exchange is defined once, as Rust types in `src/
 | `contract/vibe-talk.schema.json` | `tests/contract.rs`, from the Rust types via `schemars` | the reviewable JSON Schema (2020-12) |
 | `contract/samples.json` | `tests/contract.rs`, serialized by the Rust types | every union variant, every optional field present and absent |
 | `web/contract.js` | `contract/generate.mjs`, Ajv standalone | runtime validators the page loads as `/contract.js` |
-| `web/contract.d.ts` | `contract/generate.mjs` | declarations for `tsc --checkJs` over `web/voice.js` |
+| `web/contract.d.ts` | `contract/generate.mjs` | declarations for `tsc --checkJs` over the entry module (`web/src/app/main.js`) |
 
 The roots are the client-config answer, the voice-session mint, the timeline page, the API error
 body, the three live-stream events, both directions of `vibe-talk-v1` frames, and the `Message` and
@@ -5808,7 +5808,8 @@ also brings the page build's esbuild, which every `cargo build` runs (`build.rs`
 The page's TypeScript modules below `web/src` are layered: the wire contract, the foundations and
 the ports at the bottom, the portable core services above them (`web/src/core`, checked with no
 browser declarations at all), the browser's implementation of the ports beside them, and the one
-composition point the legacy script reads (`web/src/legacy/imports.ts`). `make typecheck` ends with
+composition point the entry module reads (`web/src/app/entry-imports.ts`, generated from the
+entry's own imports by `web/build.mjs`). `make typecheck` ends with
 `node web/architecture.mjs`, which refuses an import against that direction, a deep import into
 another package past its `index.ts`, a cycle between files, a dynamic or unresolved import, and a
 module in a directory its `PACKAGES` table does not name.

@@ -375,6 +375,15 @@ export function blankEntryImports(entryText) {
 export async function entryPrelude(esbuild, web = WEB, { minify = true, overlays = [] } = {}) {
   const entry = join(web, ENTRY_IMPORTS);
   if (!existsSync(entry)) return null;
+  // Fail closed on a stale generated module: bundling it as it stands would leave a name the
+  // entry newly imports unbound until that code path runs. The comparison reads both files
+  // through the overlays, as the build does.
+  const texts = overlayTexts(web, overlays);
+  const importsText = texts.get(resolve(web, ENTRY_IMPORTS)) ?? readFileSync(entry, "utf8");
+  const entryText = texts.get(resolve(web, ENTRY_MODULE)) ?? readFileSync(join(web, ENTRY_MODULE), "utf8");
+  if (importsText !== entryImportsModule(entryText)) {
+    throw new Error(`${ENTRY_IMPORTS} is stale against ${ENTRY_MODULE}'s imports: run node web/build.mjs --write-entry-imports`);
+  }
   const plugins = overlays.length > 0 ? [overlayPlugin(web, overlays)] : [];
   const names = await exportedNames(esbuild, entry, plugins);
   if (names.length === 0) return null;

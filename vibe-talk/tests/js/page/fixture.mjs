@@ -36,7 +36,7 @@ import { join } from "node:path";
 import vm from "node:vm";
 import { Worker } from "node:worker_threads";
 
-import { ENTRY_MODULE, LEGACY_SCRIPT, entryPrelude, entryScriptPart, loadTool, moduleForTests } from "../../../web/build.mjs";
+import { ENTRY_MODULE, LEGACY_SCRIPT, blankEntryImports, entryPrelude, entryScriptPart, loadTool, moduleForTests } from "../../../web/build.mjs";
 import { SHELL, WEB, moduleSources, readWeb, shellScripts } from "../../../web/page_sources.mjs";
 
 /**
@@ -200,7 +200,7 @@ const HTML_CODE = HTML.replace(/<!--[\s\S]*?-->/g, " ");
  * `SCRIPT` is the bundle the page runs; a test that reads the page's source reads this and the
  * modules once, not the bundle (which already holds them) as well.
  */
-const SCRIPT_CODE = stripJsComments(ENTRY_SOURCE);
+const SCRIPT_CODE = stripJsComments(blankEntryImports(ENTRY_SOURCE));
 /**
  * The page's other modules (every .js and .ts file below web/src/ but the entry, `#624
  * voice-page-modularity`), comments removed, and with SCRIPT_CODE every line of the page's
@@ -1977,9 +1977,9 @@ const COMPILED = new Map(PAGE_SCRIPTS.map((name) => [
   new vm.Script(name === SCRIPT_FILE ? SCRIPT : readWeb(name), { filename: name }),
 ]));
 /**
- * The page build's prelude (`#624 voice-page-modularity`): the modules the legacy script calls,
- * declaring for it the names web/src/legacy/imports.ts exports, run just before it as the page build
- * runs it. Built here, unminified, by the same function; null while nothing has moved.
+ * The page build's prelude (`#624 voice-page-modularity`): the modules the entry imports,
+ * declaring for it the names the generated web/src/app/entry-imports.ts exports, run just
+ * before it as the page build runs it. Built here, unminified, by the same function.
  */
 const PRELUDE = await entryPrelude(loadTool("esbuild"), WEB, { minify: false });
 const PRELUDE_COMPILED = PRELUDE && new vm.Script(PRELUDE.code, { filename: "prelude.js" });
@@ -2014,9 +2014,9 @@ const VIEW_CHANNEL = await moduleForTests("src/view/channel/index.ts");
 const { CANNED_PROMPTS } = await moduleForTests("src/view/settings/canned.ts");
 const { OWN_READ_APPLY_ARM_MS } = await moduleForTests("src/view/settings/ownread.ts");
 /**
- * The names the page takes from its modules: what the prelude declares for the legacy script
- * (web/src/legacy/imports.ts). `page.pure` refuses them: what moved into a module is tested through
- * that module, which the page runs as it is (`#624 voice-page-modularity`).
+ * The names the page takes from its modules: what the prelude declares for the entry (the
+ * generated web/src/app/entry-imports.ts, from the entry's own imports). `page.pure` refuses
+ * them: what moved into a module is tested through that module, which the page runs as it is.
  */
 const PRELUDE_NAMES = new Set(PRELUDE ? PRELUDE.names : []);
 /** The device's settings and, on its own handle, its token (web/src/core/settings). */
