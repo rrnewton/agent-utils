@@ -2576,7 +2576,11 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   // else escapes.
   assert.match(cssBlock(".row-more-menu:popover-open"), /position:\s*fixed/);
   const withoutMenu = CSS_CODE.replace(/\.row-more-menu:popover-open\s*\{[^}]*\}/, " ");
-  assert.doesNotMatch(withoutMenu, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+  // `#1527 discuss-summarize-bottom-bar-mobile`: the phone Discuss ask bar sticks
+  // inside #discuss-panel's own scroller (the panel stands outside #scroll-area),
+  // so it escapes nothing here; every other fixed/sticky still fails.
+  const withoutAskBar = withoutMenu.replace(/\.discuss-ask\s*\{[^}]*position:\s*sticky[^}]*\}/, " ");
+  assert.doesNotMatch(withoutAskBar, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
 });
 
 test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {

@@ -18,6 +18,9 @@
   left: 0;
   right: 0;
   bottom: 0;
+  /* `#1527`: the pane measures `#1524`'s bound fit now that the ask stands
+   * beside the head; the query below reads this box either way. */
+  container-type: inline-size;
   height: 50dvh;
   overflow-y: auto;
   padding: 10px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
@@ -579,6 +582,74 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
   #discuss-since {
     width: 5.6rem;
+  }
+}
+
+/* `#1527 discuss-summarize-bottom-bar-mobile` (owner UI 056): on a phone the
+ * ask row leaves the top of the pane and becomes a bar pinned at the pane's
+ * bottom, bound first and Summarize last (right, under the thumb). The ask div stands as a
+direct panel child (one-line move beside the head, whose sticky top bar
+is #1531's); the pane becomes a column flex, the ask takes the last order
+and sticks to the pane's bottom edge, and inside it the bound keeps the
+start while the button takes the end. The bound span's own contents
+stay its owner's (#1524). The pane itself already ends above the
+ * page's bottom toolbar (overlay sheet) or in its own grid row (docked), and
+ * its dvh height tracks the keyboard, so the stuck bar stays above both.
+ * Desktop keeps the one-row head at the top, untouched. */
+/* Desktop with the ask as a panel child: it keeps its place in the head's
+ * one row, beside the actions, until the sticky title bar (#1531) stands
+ * in the head — then this rule switches itself off and the ask flows
+ * under that bar. */
+@media (min-width: 900px) and (pointer: fine) {
+  #discuss-panel:not(:has(.discuss-title)) .discuss-ask {
+    position: absolute;
+    top: 10px;
+    left: calc(10px + env(safe-area-inset-left));
+    max-width: calc(100% - 200px);
+  }
+
+  #discuss-panel:not(:has(.discuss-title)) .discuss-bound {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+}
+
+@media not ((min-width: 900px) and (pointer: fine)) {
+  #discuss-panel {
+    display: flex;
+    flex-direction: column;
+  }
+
+  #discuss-panel > * {
+    flex: 0 0 auto;
+  }
+
+  .discuss-ask {
+    order: 99;
+    width: auto;
+    position: sticky;
+    bottom: calc(-10px - env(safe-area-inset-bottom));
+    margin-top: auto;
+    margin-right: calc(-10px - env(safe-area-inset-right));
+    margin-bottom: calc(-10px - env(safe-area-inset-bottom));
+    margin-left: calc(-10px - env(safe-area-inset-left));
+    padding: 8px calc(10px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
+    background: #1f232b;
+    border-top: 1px solid #3d4452;
+    z-index: 1;
+  }
+
+  .discuss-bound {
+    order: 0;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  #discuss-summarize {
+    order: 1;
+    margin-left: auto;
   }
 }
 

@@ -400,10 +400,6 @@
                  upper right (dock, fullscreen, close), taking no extra
                  vertical space. Nothing runs until Summarize is pressed. -->
             <div class="discuss-head">
-              <div class="discuss-ask">
-                <button id="discuss-summarize" type="button">Summarize</button>
-                <span class="discuss-bound"><input id="discuss-count" type="number" min="1" step="1" inputmode="numeric" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Number of unread messages"> unread, <input id="discuss-hours" type="number" min="1" step="1" inputmode="numeric" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Hours since the bound"> hours <span class="discuss-since-part">since <input id="discuss-since" type="time" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Since time"></span></span>
-              </div>
               <div id="discuss-actions" class="discuss-actions">
                 <!-- `#1501 discuss-read-aloud-parity`: Read the summary aloud
                      through the shared owner, as the Documents reader's Read does. -->
@@ -418,6 +414,13 @@
                   <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
                 </button>
               </div>
+            </div>
+            <!-- `#1527 discuss-summarize-bottom-bar-mobile`: the ask row stands
+                 as a direct panel child (its bound contents untouched) so the
+                 phone stylesheet can pin it as the pane's bottom bar. -->
+            <div class="discuss-ask">
+              <button id="discuss-summarize" type="button">Summarize</button>
+              <span class="discuss-bound"><input id="discuss-count" type="number" min="1" step="1" inputmode="numeric" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Number of unread messages"> unread, <input id="discuss-hours" type="number" min="1" step="1" inputmode="numeric" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Hours since the bound"> hours <span class="discuss-since-part">since <input id="discuss-since" type="time" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Since time"></span></span>
             </div>
             <p id="discuss-scope"></p>
             <p id="discuss-status" role="status"></p>

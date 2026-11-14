@@ -330,6 +330,28 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         "() => document.getElementById('discuss-count').value === '2'"
         " && document.getElementById('discuss-hours').value !== ''",
         timeout=20_000)
+    # `#1527 discuss-summarize-bottom-bar-mobile`: on a phone the ask row is a
+    # bar at the pane's bottom with Summarize rightmost; on a desk it stays
+    # at the top in its one row. Condition waits only.
+    boxes = page.evaluate("""() => {
+      const r = (s) => { const b = document.querySelector(s).getBoundingClientRect();
+        return {top: b.top, bottom: b.bottom, left: b.left, right: b.right, height: b.height}; };
+      return {panel: r('#discuss-panel'), ask: r('.discuss-ask'), head: r('.discuss-head'),
+              bound: r('.discuss-bound'), btn: r('#discuss-summarize')};
+    }""")
+    if width < 900:
+        check(abs(boxes["ask"]["bottom"] - boxes["panel"]["bottom"]) <= 2,
+              f"phone ask bar is not at the pane bottom: {boxes}")
+        check(boxes["btn"]["right"] > boxes["bound"]["right"]
+              and boxes["btn"]["right"] <= boxes["panel"]["right"] + 1
+              and boxes["btn"]["left"] >= boxes["panel"]["left"],
+              f"phone Summarize is not the rightmost visible control: {boxes}")
+        check(abs(boxes["btn"]["top"] - boxes["bound"]["top"]) <= 4
+              and boxes["ask"]["height"] <= 64,
+              f"phone ask bar is not one row: {boxes}")
+    else:
+        check(boxes["ask"]["top"] - boxes["panel"]["top"] <= 48,
+              f"desktop ask row left the pane top: {boxes}")
     # (the rendered answer is asserted after Summarize, below)
     page.click("#discuss-summarize")
     page.wait_for_function(
