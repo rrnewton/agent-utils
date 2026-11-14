@@ -104,7 +104,9 @@ impl HarnessAdapter for ClaudeCode {
         // A labelled top border is tried only when two plain rules do not already
         // frame a composer, so a draft row that happens to look like a labelled
         // rule cannot change how an unlabelled screen is split.
-        view_framed(rows, is_rule).or_else(|| view_framed(rows, is_labelled_rule))
+        view_framed(rows, is_rule)
+            .or_else(|| view_framed(rows, is_labelled_rule))
+            .or_else(|| view_unframed(rows))
     }
 
     fn trust_prompt(&self, screen: &str) -> bool {
@@ -178,6 +180,34 @@ fn view_framed(
     let (composer, composer_solid) = composer_from(body, offset + 1);
     Some(ComposerView {
         transcript: join_rows(&rows[..top]),
+        composer,
+        composer_solid,
+        footer: join_rows(&rows[bottom + 1..]),
+    })
+}
+
+/// The composer when its top rule is not visible (#1546): a tall draft
+/// grows the composer upward until the top border leaves the visible
+/// frame, leaving only the `❯` row, its continuation rows, and the
+/// bottom rule (the footer under it, background-agent counts included,
+/// is not part of the composer either way).
+fn view_unframed(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
+    let bottom = rows.iter().rposition(|(plain, _)| is_rule(plain))?;
+    let marker = rows[..bottom]
+        .iter()
+        .rposition(|(plain, _)| plain.iter().find(|c| !c.is_whitespace()) == Some(&'❯'))?;
+    if rows[marker + 1..bottom]
+        .iter()
+        .any(|(plain, _)| is_rule(plain))
+    {
+        return None;
+    }
+    let body = &rows[marker..bottom];
+    let first = body.first()?;
+    let offset = first.0.iter().take_while(|c| c.is_whitespace()).count();
+    let (composer, composer_solid) = composer_from(body, offset + 1);
+    Some(ComposerView {
+        transcript: join_rows(&rows[..marker]),
         composer,
         composer_solid,
         footer: join_rows(&rows[bottom + 1..]),

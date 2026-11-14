@@ -329,7 +329,36 @@ def _claude_view(rows: list[tuple[str, str]]) -> ComposerView | None:
     # frame a composer, so a draft row that happens to look like a labelled
     # rule cannot change how an unlabelled screen is split.
     view = _claude_view_framed(rows, _is_rule)
-    return view if view is not None else _claude_view_framed(rows, _is_labelled_rule)
+    if view is not None:
+        return view
+    view = _claude_view_framed(rows, _is_labelled_rule)
+    return view if view is not None else _claude_view_unframed(rows)
+
+
+def _claude_view_unframed(rows: list[tuple[str, str]]) -> ComposerView | None:
+    """The composer when its top rule is not visible (#1546): a tall draft
+    grows the composer upward until the top border leaves the visible
+    frame, leaving only the `❯` row, its continuation rows, and the
+    bottom rule."""
+    bottom = next((index for index in range(len(rows) - 1, -1, -1) if _is_rule(rows[index][0])), None)
+    if bottom is None:
+        return None
+    marker = next((index for index in range(bottom - 1, -1, -1)
+                   if rows[index][0].lstrip().startswith("❯")), None)
+    if marker is None or any(_is_rule(rows[index][0]) for index in range(marker + 1, bottom)):
+        return None
+    body = rows[marker:bottom]
+    plain_lines = [plain for plain, _ in body]
+    solid_lines = [solid for _, solid in body]
+    marker_offset = len(body[0][0]) - len(body[0][0].lstrip())
+    plain_lines[0] = plain_lines[0][marker_offset + 1:]
+    solid_lines[0] = solid_lines[0][marker_offset + 1:]
+    return ComposerView(
+        transcript="\n".join(plain for plain, _ in rows[:marker]),
+        composer="\n".join(plain_lines),
+        composer_solid="\n".join(solid_lines),
+        footer="\n".join(plain for plain, _ in rows[bottom + 1:]),
+    )
 
 
 def _claude_view_framed(

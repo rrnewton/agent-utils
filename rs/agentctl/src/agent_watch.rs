@@ -4506,6 +4506,66 @@ fn owner_wait_hint(agent: &str, reason: &str) -> String {
 /// before the sweep submits it (#731 agentctl-paste-tail-flush).
 const DRAFT_SWEEP_AGE: Duration = Duration::from_secs(60);
 
+/// What one sweep read of an editor shows: whether any editor was
+/// recognised, the draft it holds, and the draft's first line (#1546).
+/// Muse has no generic `composer_view`; its draft comes from the Muse
+/// editor reader, so a Muse pane is visible to the sweep like any other.
+fn editor_draft(harness: &str, screen: &str) -> (bool, Option<crate::stale_draft::Draft>, String) {
+    if harness == "muse" {
+        let plain = crate::harness_tui::plain(screen);
+        let readable = crate::client::muse_screen_has_composer(&plain);
+        let draft = crate::client::muse_verified_process_editor_draft(&plain);
+        let first_line = match &draft {
+            Some(crate::stale_draft::Draft::Text(rows)) => rows
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or_default()
+                .to_owned(),
+            Some(other) => other.describe(),
+            None => String::new(),
+        };
+        return (readable, draft, first_line);
+    }
+    let view = crate::submission::composer_view(harness, screen);
+    let readable = view.is_some();
+    let first_line = view.as_ref().map_or_else(String::new, |view| {
+        view.composer
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .to_owned()
+    });
+    let draft = view.as_ref().and_then(crate::submission::composer_draft);
+    (readable, draft, first_line)
+}
+
+/// The ID of a prompt stranded in `queue` (typed, then put back in its
+/// inbox with `stranded_at`), when one is recorded (#1546).
+fn stranded_prompt_id(queue: &std::path::Path) -> Option<String> {
+    for phase in ["inbox", "inbox.v2", "inflight"] {
+        let Ok(entries) = std::fs::read_dir(queue.join(phase)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Ok(document) = crate::agent::read_private_json(&path) else {
+                continue;
+            };
+            if document.get("stranded_at").is_some_and(|at| !at.is_null()) {
+                if let Some(id) = document.get("id").and_then(serde_json::Value::as_str) {
+                    return Some(id.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The idle sweep over editor drafts (#731 agentctl-paste-tail-flush):
 /// a draft the agent's own queue records prove agentctl typed — a whole
 /// prompt or a paste tail fragment of one — that has sat unsent for
@@ -4525,21 +4585,84 @@ fn sweep_editor_drafts(
     // A draft blocks the pane it sits in, so no notice about it goes there (#844).
     let no_jams = BTreeSet::new();
     for (agent, screen, harness) in screens {
-        let Some(view) = crate::submission::composer_view(&harness, &screen) else {
-            continue;
-        };
-        let Some(draft) = crate::submission::composer_draft(&view) else {
+        let (readable, draft, first_line) = editor_draft(&harness, &screen);
+        let Some(draft) = draft else {
             state.draft_sweeps.remove(&agent);
+            if !readable {
+                // No recognisable editor: a stranded paste may sit in a
+                // pane this reader cannot parse (a busy layout, a tall
+                // draft). That is a finding, never a silent skip (#1546).
+                if let Some((queue, id)) = probe
+                    .agent_queue(&agent)
+                    .and_then(|queue| stranded_prompt_id(&queue).map(|id| (queue, id)))
+                {
+                    let _ = queue;
+                    let fingerprint = format!("unreadable:{id}");
+                    let entry = state
+                        .unattributed_drafts
+                        .entry(agent.clone())
+                        .or_insert_with(|| DraftSweep {
+                            first_seen: now,
+                            fingerprint: fingerprint.clone(),
+                            failures: 0,
+                            blocked_reported: false,
+                        });
+                    if entry.fingerprint != fingerprint {
+                        *entry = DraftSweep {
+                            first_seen: now,
+                            fingerprint: fingerprint.clone(),
+                            failures: 0,
+                            blocked_reported: false,
+                        };
+                    }
+                    let age = (now - entry.first_seen).max(0.0);
+                    let mut row = json!({"agent": agent, "draft": "unreadable",
+                                         "id": id, "age_seconds": age});
+                    if !options.check_only
+                        && age >= DRAFT_SWEEP_AGE.as_secs_f64()
+                        && !entry.blocked_reported
+                    {
+                        entry.blocked_reported = true;
+                        let _ = tell_about(
+                            notifier,
+                            &agent,
+                            &no_jams,
+                            &format!(
+                                "BLOCKED: {agent}'s pane shows no recognisable editor, \
+                                 and a prompt agentctl typed sits stranded in its queue \
+                                 ({id}); deliveries to {agent} have been blocked for {}s. \
+                                 Look in {agent}'s pane: submit or clear what is in its \
+                                 input box.",
+                                age as u64
+                            ),
+                            &format!("draft-unreadable:{agent}:{fingerprint}"),
+                            options,
+                        );
+                        row["blocked"] = json!(true);
+                    }
+                    rows.push(row);
+                }
+                continue;
+            }
             state.unattributed_drafts.remove(&agent);
             continue;
         };
         let Some(queue) = probe.agent_queue(&agent) else {
             continue;
         };
+        // Attribute under the vouching the flush itself applies, so a draft
+        // the sweep calls ours is the draft the flush will submit (#1546):
+        // Muse takes back steers it showed as taken (Recent); Claude and
+        // Codex recall the newest prompt with the history keys (Unproven).
+        let vouching = if harness == "muse" {
+            crate::stale_draft::Vouching::Recent
+        } else {
+            crate::stale_draft::Vouching::Unproven
+        };
         let prompt = crate::stale_draft::find(
             &queue,
             &draft,
-            crate::stale_draft::Vouching::Recent,
+            vouching,
             UNIX_EPOCH + Duration::from_secs_f64(now.max(0.0)),
         );
         let Some(prompt) = prompt else {
@@ -4567,15 +4690,7 @@ fn sweep_editor_drafts(
                 };
             }
             let age = (now - entry.first_seen).max(0.0);
-            let first_line: String = view
-                .composer
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or_default()
-                .chars()
-                .take(120)
-                .collect();
+            let first_line: String = first_line.chars().take(120).collect();
             let mut row = json!({"agent": agent, "draft": "unattributed",
                                  "first_line": first_line,
                                  "age_seconds": age, "blocked_seconds": age});
@@ -8187,6 +8302,182 @@ mod tests {
             .filter(|id| id.starts_with("draft-sweep-blocked:"))
             .collect();
         assert_eq!(blocked.len(), 1, "{:?}", notifier.urgent);
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    // #1546 agentctl-unsubmitted-paste-backstop: sanitised captures of the
+    // busy layouts that left pastes unsubmitted on 2026-11-14 (names, paths
+    // and text replaced; layout kept). A Muse pane at work draws its
+    // terminals panel between the editor's bottom rule and the footer.
+    fn sweep_muse_screen(draft: &str) -> String {
+        let divider = "─".repeat(40);
+        let footer = "main · ↓ to select\n├ ◆ Watch a gate  watching  1h 00m 00s\n└ +2\n  model-x · xhigh · ~/work/proj · YOLO";
+        let body: Vec<String> = draft.lines().map(str::to_owned).collect();
+        let mut editor = vec![format!("❯ {}", body[0])];
+        editor.extend(body[1..].iter().map(|line| format!("  {line}")));
+        format!(
+            "◆ earlier work\n{divider}\n{}\n{divider}\n{footer}\n",
+            editor.join("\n")
+        )
+    }
+
+    const SWEEP_PROMPT: &str = "[from lane-a via agentctl · reply: agentctl send lane-a]\nfirst line of the message\nsecond line follows here\nafter. Needs your disposition (ledger-tree file). Details in the queue.";
+
+    #[test]
+    fn a_muse_draft_under_a_background_panel_is_flushed_by_the_sweep() {
+        let queue = sweep_queue("muse", 1_000.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![(
+                "worker".into(),
+                sweep_muse_screen(SWEEP_PROMPT),
+                "muse".into(),
+            )],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            1_120.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["action"], "flushed", "{rows:?}");
+        assert_eq!(notifier.flushes, ["worker"]);
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn a_claude_tall_draft_with_no_top_rule_is_flushed_by_the_sweep() {
+        // A long pasted draft grows the composer upward until its top rule
+        // leaves the visible frame; only the bottom rule, under a footer
+        // counting background agents, remains.
+        let divider = "─".repeat(40);
+        let screen = format!(
+            "● earlier output\n❯ {SWEEP_TAIL}\n{divider}\n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 2 agents\n"
+        );
+        let queue = sweep_queue("tall", 1_000.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), screen, "claude".into())],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            1_120.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["action"], "flushed", "{rows:?}");
+        assert_eq!(notifier.flushes, ["worker"]);
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn a_delivered_claude_draft_is_reported_not_flush_attempted() {
+        // The sweep must call a draft ours only under the vouching the
+        // flush itself applies (Unproven for Claude): a whole prompt the
+        // queue records as delivered may be a person's history recall.
+        // A short prompt, so the fake screen draws its text, not a
+        // numbered paste placeholder (which vouches by its label).
+        use std::os::unix::fs::DirBuilderExt;
+        let queue =
+            std::env::temp_dir().join(format!("agentctl-sweep-delivered-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(queue.join("processed"))
+            .unwrap();
+        let short = "[from lane-a via agentctl · reply: agentctl send lane-a]\na short delivered prompt that stayed whole";
+        crate::agent::atomic_json(
+            &queue.join("processed/lane.json"),
+            &json!({"id": "lane", "text": short, "delivery_state": "processed",
+                    "inflight_at": 1_000.0}),
+        )
+        .unwrap();
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), sweep_screen(short), "claude".into())],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            1_120.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["draft"], "unattributed", "{rows:?}");
+        assert!(notifier.flushes.is_empty(), "{:?}", notifier.flushes);
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    fn sweep_queue_stranded(tag: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let queue =
+            std::env::temp_dir().join(format!("agentctl-sweep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(queue.join("inbox"))
+            .unwrap();
+        crate::agent::atomic_json(
+            &queue.join("inbox/lane.json"),
+            &json!({"id": "lane", "text": SWEEP_PROMPT, "stranded_at": 1_000.0}),
+        )
+        .unwrap();
+        queue
+    }
+
+    #[test]
+    fn an_unreadable_pane_with_a_stranded_prompt_is_a_finding_not_silence() {
+        let queue = sweep_queue_stranded("unreadable");
+        let screen = "a menu is open\n  Yes, proceed\n  No, stop\n".to_owned();
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), screen, "claude".into())],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            5_000.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["draft"], "unreadable", "{rows:?}");
+        assert!(notifier.flushes.is_empty());
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            5_120.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["draft"], "unreadable", "{rows:?}");
+        let notices: Vec<&String> = notifier
+            .urgent
+            .iter()
+            .filter(|id| id.starts_with("draft-unreadable:worker:"))
+            .collect();
+        assert_eq!(notices.len(), 1, "{:?}", notifier.urgent);
         let _ = std::fs::remove_dir_all(&queue);
     }
 

@@ -415,6 +415,23 @@ def test_labelled_rules_only_frame_a_composer_that_plain_rules_do_not() -> None:
         assert _is_labelled_rule(row), row
 
 
+def test_a_tall_draft_with_no_top_rule_still_frames_the_composer() -> None:
+    # #1546: a tall draft grows the composer upward until its top rule
+    # leaves the visible frame; the footer under the bottom rule counts
+    # background agents and is not part of the composer.
+    rule = "─" * 40
+    screen = (
+        "• earlier\n"
+        "❯ a long draft tail that stayed unsent\n"
+        f"{rule}\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← 2 agents\n"
+    )
+    view = composer_view("claude", screen)
+    assert view is not None
+    assert "a long draft tail" in view.composer_solid
+    assert "← 2 agents" in view.footer
+
+
 def test_escape_characters_are_refused_before_typing() -> None:
     agent = FakeAgent("claude")
     with pytest.raises(PromptNotStaged, match="escape"):
