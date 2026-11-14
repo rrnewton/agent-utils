@@ -1,13 +1,14 @@
 ---
 title: 'discuss-cache-only: Discuss reads only the message cache, never upstream'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-catchup
 labels:
 - vibe-talk
 created_at: 2026-11-12T11:05:23+00:00
-updated_at: 2026-11-12T11:05:23+00:00
+updated_at: 2026-11-14T16:14:54.000000000+00:00
+closed_at: 2026-11-14T16:14:54.000000000+00:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ Live evidence 2026-11-11: `POST /api/v1/channels/C0CC755QYSK/catchup` returned 5
 # Notes
 
 Owner replies 414 (cache-only hard rule), 376 (speed), 413/415 (slice-2 panel programme). Number reserved by coordb. Filed by mu-catchup; implementation lands separately from the other slice-2 issues.
+
+## Resolution
+
+[watermelon-full-preview] Landed in 6840007d2489b3b4e2237b596e1c03bb5849e957 and e246c4016469721973fdc0a34e68553ad53e9b00 on main and live in release ba329b5a. Discuss windows now read only the message cache (`Sink::stale_timeline` / `Sink::held_below`) with no provider call and no background refresh; a cache miss answers without a model call, and the stamp splits cache ms / model ms / output chars. The counting-fake test pins zero provider calls. Verified as ancestors of the live release.

@@ -1,13 +1,14 @@
 ---
 title: 'discuss-summarize-button: Discuss asks only when told, over the last N unread since a time'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-catchup
 labels:
 - vibe-talk
 created_at: 2026-11-12T13:20:12+00:00
-updated_at: 2026-11-12T13:20:12+00:00
+updated_at: 2026-11-14T16:14:54.000000000+00:00
+closed_at: 2026-11-14T16:14:54.000000000+00:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ Parent: #1316 catchup-side-agent. Cache behaviour: #1348 discuss-cache-only (lan
 # Notes
 
 Owner replies 413/414. Number reserved by coordb. Sibling layout work (#1344/#1354, mu-discusslay) owns the panel header shell; the Summarize button goes in its actions slot next to Close.
+
+## Resolution
+
+[watermelon-full-preview] Landed in 6ba127f0c70add5f6026f352fde47ff8d1cc9519 on main and live in release ba329b5a. Opening Discuss asks nothing of the model; the Summarize control bounds the one catch-up by the linked last-N-unread / since-time ends over the cache, and every Discuss entry point stays disabled while a request is in flight. Verified as an ancestor of the live release and by the panel control in the shipped page.

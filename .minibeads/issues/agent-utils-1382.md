@@ -1,12 +1,13 @@
 ---
 title: 'discuss-summarize-control-oneline: one line — [Summarize] last [N] unread since [HH:MM picker]'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-11-12T17:10:00+00:00
-updated_at: 2026-11-12T17:10:00+00:00
+updated_at: 2026-11-14T16:14:54.000000000+00:00
+closed_at: 2026-11-14T16:14:54.000000000+00:00
 ---
 
 # Description
@@ -33,4 +34,4 @@ Owner replies 005/006. Lands with #1383 discuss-header-icons as one owner-tier l
 
 ## Resolution
 
-[watermelon-full-preview] Delivered in e5fc567c (4:30 PM ET Discuss small-fix batch, owner reply 012; integrator mu-discussfoot, gated 851343ad). The Summarize control is one line — [Summarize] last [N] unread since [HH:MM picker] — with a short button, a 3-digit count input, and the time picker given its own space so the digits are never obscured. Focused tests and the Discuss browser walk passed in the batch gate; screenshots at 390x844/375x667/1280x800 were recorded in the lane handoff.
+[watermelon-full-preview] Landed in 54432f9a371205903c8d5636cdd29a256097ee82 on main and live in release ba329b5a. The Summarize control is one line — [Summarize] last [N] unread since [HH:MM picker] — with a short button, a 3-digit count input, and the time picker given its own space so the digits are never obscured. Focused tests and the Discuss browser walk passed in the batch gate; screenshots at 390x844/375x667/1280x800 were recorded in the lane handoff. Verified as an ancestor of the live release.

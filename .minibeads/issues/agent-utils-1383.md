@@ -1,12 +1,13 @@
 ---
 title: 'discuss-header-icons: no title row; dock, fullscreen and close as three small square icons'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-11-12T17:10:00+00:00
-updated_at: 2026-11-12T17:10:00+00:00
+updated_at: 2026-11-14T16:14:54.000000000+00:00
+closed_at: 2026-11-14T16:14:54.000000000+00:00
 ---
 
 # Description
@@ -31,4 +32,4 @@ Owner replies 005/006; shape confirmed by coordb (exactly the owner's three icon
 
 ## Resolution
 
-[watermelon-full-preview] Delivered in e5fc567c (4:30 PM ET Discuss small-fix batch, owner reply 012; integrator mu-discussfoot, gated 851343ad). The Discuss title row is gone; dock, fullscreen and close stand as three small square icons at the upper right of the control row, with the kept per-device layout choices unchanged. Focused tests and the Discuss browser walk passed in the batch gate.
+[watermelon-full-preview] Landed in 54432f9a371205903c8d5636cdd29a256097ee82 on main and live in release ba329b5a. The Discuss title row is gone; dock, fullscreen and close stand as three small square icons at the upper right of the control row, with the kept per-device layout choices unchanged. Focused tests and the Discuss browser walk passed in the batch gate. Verified as an ancestor of the live release.

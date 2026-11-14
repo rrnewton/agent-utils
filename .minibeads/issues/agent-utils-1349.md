@@ -1,13 +1,14 @@
 ---
 title: 'discuss-markdown-render: the Discuss answer draws as rendered Markdown'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-catchup
 labels:
 - vibe-talk
 created_at: 2026-11-12T16:47:30+00:00
-updated_at: 2026-11-12T16:47:30+00:00
+updated_at: 2026-11-14T16:14:54.000000000+00:00
+closed_at: 2026-11-14T16:14:54.000000000+00:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ Parent: #1316 catchup-side-agent.
 # Notes
 
 Owner fast-track via coordb (reply 005 session relay). Number reserved by coordb. Server fields: #1350/#1351 (mu-discussq, landed).
+
+## Resolution
+
+[watermelon-full-preview] Landed in 97c51ef3ab2f5d252ded56289c08c0c668b2ca5d on main and live in release ba329b5a. The Discuss answer now draws the server's sanitized `text_html` as markup (headings, lists and links formatted, citation taps jumping in-app) and falls back to plain `text` when no render is present; unknown terms draw collapsed. Verified as an ancestor of the live release and by `text_html` in the shipped server render path.
