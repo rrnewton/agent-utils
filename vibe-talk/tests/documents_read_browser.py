@@ -322,7 +322,18 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     check(page.locator("#control-pane").is_visible(), "the reader's controls do not stand over the reader")
 
     # The device/cloud toggle is the Documents view's too now, starting on the
-    # server voice; one tap picks the device for the read that follows.
+    # server voice; one tap picks the device for the read that follows. The
+    # picked source is decided asynchronously (the server's client-config
+    # answer, then any synced choice it carries), so wait for that decision
+    # to land on the toggle instead of reading it mid-flight: under load the
+    # document can render before the decision does (`#1549
+    # documents-read-browser-voice-premise-flake`).
+    page.wait_for_function(
+        """() => {
+          const toggle = document.getElementById('audio-source');
+          return !!toggle && !toggle.hidden && toggle.getAttribute('aria-checked') === 'true';
+        }""",
+        timeout=20_000)
     toggle = page.locator("#audio-source")
     check(toggle.is_visible(), "the audio source toggle is not offered over the Documents view")
     check(toggle.get_attribute("aria-checked") == "true",
@@ -534,6 +545,20 @@ def lit_words(page: Page) -> str:
     return words
 
 
+def forget_synced_source(base: str) -> None:
+    """Forget any synced voice-source choice the server holds (`#1549`).
+
+    The walks share one server, so one walk's final toggle would otherwise
+    be carried into the next walk's fresh browser context by the settings
+    sync (`#457 settings-server-side`) and legitimately picked there —
+    racing the next walk's premise about the default source. Each walk
+    starts from the shipped default instead.
+    """
+    call(base, "PUT", "/api/v1/client-settings", WRITE_TOKEN,
+         {"set": [{"key": "vibe-talk.voice.read-audio-source", "value": None, "updated_ms": 0}],
+          "seed": []})
+
+
 def walk_list(page: Page, base: str) -> None:
     """The list document by touch: lit == spoken through the list, tap-to-read."""
     page.goto(base + "/?v=docs", wait_until="load")
@@ -542,6 +567,15 @@ def walk_list(page: Page, base: str) -> None:
     page.wait_for_function(
         "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
         arg="nested item under five", timeout=20_000)
+    # Wait for the voice-source decision (server capability known, toggle
+    # drawn) before reading the toggle, as in walk() (`#1549`).
+    page.wait_for_function(
+        """() => {
+          const toggle = document.getElementById('audio-source');
+          return !!toggle && !toggle.hidden && readAloudOwner().agentReadAloud !== null
+            && readAloudOwner().agentReadAloud !== undefined;
+        }""",
+        timeout=20_000)
     toggle = page.locator("#audio-source")
     if toggle.get_attribute("aria-checked") == "true":
         page.tap("#audio-source")
@@ -661,6 +695,7 @@ def main() -> int:
                     (393, 852, True, DOCS[0]),
                     (1280, 800, False, DOCS[1]),
                 ):
+                    forget_synced_source(base)
                     ctx = browser.new_context(
                         viewport={"width": width, "height": height}, has_touch=touch, is_mobile=touch)
                     page = ctx.new_page()
@@ -672,6 +707,7 @@ def main() -> int:
                     ctx.close()
                 # The list document by touch (`#1505`): lit == spoken through
                 # the list, pause from the pane, and tap-to-read.
+                forget_synced_source(base)
                 ctx = browser.new_context(
                     viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
                 page = ctx.new_page()
