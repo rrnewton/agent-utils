@@ -1,10 +1,11 @@
 ---
 title: 'local-ci-hub-missing-evidence-root-cause: find why complete manifests read as missing evidence'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-14T02:42:14.070298365+00:00
-updated_at: 2026-11-14T02:42:14.070298365+00:00
+updated_at: 2026-11-14T02:42:39.606293740+00:00
+closed_at: 2026-11-14T02:42:39.606293489+00:00
 ---
 
 # Description

@@ -1,10 +1,11 @@
 ---
 title: 'local-ci-hub-nested-canonical-digest: canonicalize nested evidence in typed struct order'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-14T02:42:14.072565420+00:00
-updated_at: 2026-11-14T02:42:14.072565420+00:00
+updated_at: 2026-11-14T02:42:39.606452728+00:00
+closed_at: 2026-11-14T02:42:39.606452659+00:00
 ---
 
 # Description
