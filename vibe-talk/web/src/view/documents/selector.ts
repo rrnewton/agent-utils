@@ -52,8 +52,20 @@ export interface ViewSelectorDependencies {
   byId(id: string): HTMLElement;
   /** The view being shown now. */
   current(): DocViewName;
-  /** Show `view`. */
-  choose(view: DocViewName): unknown;
+  /** Settle the kept UI state before a view switch (`uiState.settle`). */
+  settleUiState(): void;
+  /** Show `view`, the page's own view switch (`showView`). */
+  showView(view: DocViewName): void;
+  /** Read the channel just entered (`readEnteredChannel`). */
+  readEnteredChannel(restored: boolean): unknown;
+  /** Whether the view's scroll place was restored (`viewScroll.restored`). */
+  restored(): boolean;
+  /** Stop the channel poll on leaving it (`stopDiscordPolling`). */
+  stopDiscordPolling(): void;
+  /** Show the Documents view, opening `key` where one is named (`documentsView.show`). */
+  showDocuments(key?: string): Promise<void>;
+  /** The address's query part (`window.location.search`). */
+  locationSearch(): string;
   /** Arm the settle timer; the page's own timers where given, the platform's otherwise. */
   setTimer?(run: () => void, ms: number): unknown;
   /** Forget a settle timer armed by `setTimer`. */
@@ -78,6 +90,12 @@ export interface ViewSelector {
   hideCards(): void;
   /** Take down every listener and timer the selector added. */
   unmount(): void;
+  /** Show major view `view`, with each view's entry work. */
+  chooseMajorView(view: DocViewName): void;
+  /** One `?name=value` of the address, decoded; null when absent. */
+  documentsQueryValue(name: string): string | null;
+  /** The document key `?v=docs&d=KEY` names, or undefined for the list. */
+  documentsDeepLinkKey(): string | undefined;
 }
 
 function setAttributeIfPresent(element: HTMLElement, name: string, value: string): void {
@@ -142,7 +160,7 @@ export function createViewSelector(deps: ViewSelectorDependencies): ViewSelector
   }
 
   function cycle(): void {
-    deps.choose(nextView(deps.current()));
+    chooseMajorView(nextView(deps.current()));
     cardsShown = true;
     sync();
     armSettle();
@@ -205,7 +223,7 @@ export function createViewSelector(deps: ViewSelectorDependencies): ViewSelector
       }
       const pick = (): void => {
         // The current cell only dismisses: choosing the view already up is no choice.
-        if (!isCurrent) deps.choose(view);
+        if (!isCurrent) chooseMajorView(view);
         hideCards();
       };
       listen(card, "click", () => pick());
@@ -243,5 +261,36 @@ export function createViewSelector(deps: ViewSelectorDependencies): ViewSelector
     listening = null;
   }
 
-  return { sync, cycle, toggleCards, hideCards, unmount };
+  /** Show major view `view` (voice/discord/docs), with each view's entry work. */
+  function chooseMajorView(view: DocViewName): void {
+    deps.settleUiState();
+    deps.showView(view);
+    if (view === "discord") {
+      deps.readEnteredChannel(deps.restored());
+      return;
+    }
+    deps.stopDiscordPolling();
+    if (view === "docs") void deps.showDocuments(documentsDeepLinkKey());
+  }
+
+  /** One `?name=value` of the address, decoded; null when absent. */
+  function documentsQueryValue(name: string): string | null {
+    for (const part of (deps.locationSearch() || "").replace(/^\?/, "").split("&")) {
+      const eq = part.indexOf("=");
+      if (eq === -1 || part.slice(0, eq) !== name) continue;
+      try {
+        return decodeURIComponent(part.slice(eq + 1).replace(/\+/g, " "));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /** The document key `?v=docs&d=KEY` names, or undefined for the list. */
+  function documentsDeepLinkKey(): string | undefined {
+    if (documentsQueryValue("v") !== "docs") return undefined;
+    return documentsQueryValue("d") || undefined;
+  }
+  return { sync, cycle, toggleCards, hideCards, unmount, chooseMajorView, documentsQueryValue, documentsDeepLinkKey };
 }

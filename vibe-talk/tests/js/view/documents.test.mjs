@@ -86,6 +86,9 @@ function selectorFixture(start = "voice") {
   const byId = (id) => ({ "view-switch": button, "view-switch-label": label, "view-cards": cards })[id];
   let current = start;
   const chosen = [];
+  let restoredFlag = false;
+  const entry = [];
+  let search = "";
   let nextTimer = 1;
   const timers = new Map();
   const scheduler = {
@@ -97,11 +100,17 @@ function selectorFixture(start = "voice") {
   const deps = {
     byId,
     current: () => current,
-    choose: (view) => { chosen.push(view); current = view; },
+    settleUiState: () => entry.push("settle"),
+    showView: (view) => { entry.push(`show=${view}`); chosen.push(view); current = view; restoredFlag = true; },
+    readEnteredChannel: (restored) => entry.push(`read=${restored}`),
+    restored: () => { entry.push(`restored=${restoredFlag}`); return restoredFlag; },
+    stopDiscordPolling: () => entry.push("stop-poll"),
+    showDocuments: async (key) => { entry.push(`docs=${key}`); },
+    locationSearch: () => search,
     setTimer: scheduler.setTimer,
     clearTimer: scheduler.clearTimer,
   };
-  return { button, label, cards, chosen, scheduler, deps, setCurrent: (view) => { current = view; } };
+  return { button, label, cards, chosen, entry, scheduler, deps, setCurrent: (view) => { current = view; }, setSearch: (value) => { search = value; } };
 }
 
 test("documents selector: a press shows Voice/Channel/Documents cells with the landed view current", () => {
@@ -2543,4 +2552,35 @@ test("documents view: Fetch since shows its prompt focused; Cancel fetches nothi
     assert.equal(button.disabled, false, "the button stayed disabled after the run");
     assert.deepEqual(statuses, ["Fetched 2 documents."]);
   });
+});
+
+test("documents selector: the address's query, its deep link, and choosing a major view", () => {
+  const { createViewSelector } = requireModule(SELECTOR, "src/view/documents/selector.ts");
+  const fx = selectorFixture("voice");
+  const selector = createViewSelector(fx.deps);
+  fx.setSearch("?v=docs&d=hello+world%21&x=%E0%A4%A");
+  assert.equal(selector.documentsQueryValue("d"), "hello world!", "a query value is not decoded");
+  assert.equal(selector.documentsQueryValue("x"), null, "a malformed query value is not null");
+  assert.equal(selector.documentsQueryValue("missing"), null, "an absent query value is not null");
+  assert.equal(selector.documentsDeepLinkKey(), "hello world!", "the deep link does not name its document");
+  selector.chooseMajorView("docs");
+  assert.deepEqual(fx.entry, ["settle", "show=docs", "stop-poll", "docs=hello world!"], "choosing Documents did not open its deep-linked document");
+  fx.entry.length = 0;
+  fx.setSearch("?v=voice&d=hello");
+  assert.equal(selector.documentsDeepLinkKey(), undefined, "a non-documents address names a document");
+  fx.setSearch("?d=first&d=second&flag&v=docs");
+  assert.equal(selector.documentsQueryValue("d"), "first", "a later duplicate wins over the first match");
+  assert.equal(selector.documentsQueryValue("flag"), null, "a part without = is not skipped");
+  fx.setSearch("?d=%E0%A4%A&d=ok&v=docs");
+  assert.equal(selector.documentsQueryValue("d"), null, "a malformed first match does not stop at null");
+  fx.setSearch("?v=docs&d=");
+  assert.equal(selector.documentsDeepLinkKey(), undefined, "an empty d names a document");
+  fx.setSearch("?v=docs");
+  assert.equal(selector.documentsDeepLinkKey(), undefined, "a documents address with no d names a document");
+  selector.chooseMajorView("discord");
+  assert.deepEqual(fx.entry, ["settle", "show=discord", "restored=true", "read=true"], "choosing the channel did not read it with the restored flag read after the switch");
+  fx.entry.length = 0;
+  selector.chooseMajorView("voice");
+  assert.deepEqual(fx.entry, ["settle", "show=voice", "stop-poll"], "choosing the call did not stop the poll");
+  selector.unmount();
 });

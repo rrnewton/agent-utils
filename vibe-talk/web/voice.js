@@ -1154,40 +1154,18 @@ const discussView = createDiscussView({
 const documentsSelector = createViewSelector({
   byId: (id) => el(id),
   current: () => /** @type {"voice"|"discord"|"docs"} */ (screens.view()),
-  choose: (view) => chooseMajorView(view),
+  settleUiState: () => uiState.settle(),
+  showView: (view) => showView(view),
+  readEnteredChannel: (restored) => readEnteredChannel(restored),
+  restored: () => viewScroll.restored(),
+  stopDiscordPolling: () => stopDiscordPolling(),
+  showDocuments: (key) => documentsView.show(key),
+  locationSearch: () => window.location.search,
 });
+const { chooseMajorView, documentsQueryValue, documentsDeepLinkKey } = documentsSelector;
 
-/** Show major view `view` (voice/discord/docs), with each view's entry work. */
-function chooseMajorView(view) {
-  uiState.settle();
-  showView(view);
-  if (view === "discord") {
-    readEnteredChannel(viewScroll.restored());
-    return;
-  }
-  stopDiscordPolling();
-  if (view === "docs") void documentsView.show(documentsDeepLinkKey());
-}
 
-/** One `?name=value` of the address, decoded; null when absent. */
-function documentsQueryValue(name) {
-  for (const part of (window.location.search || "").replace(/^\?/, "").split("&")) {
-    const eq = part.indexOf("=");
-    if (eq === -1 || part.slice(0, eq) !== name) continue;
-    try {
-      return decodeURIComponent(part.slice(eq + 1).replace(/\+/g, " "));
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
 
-/** The document key `?v=docs&d=KEY` names, or undefined for the list. */
-function documentsDeepLinkKey() {
-  if (documentsQueryValue("v") !== "docs") return undefined;
-  return documentsQueryValue("d") || undefined;
-}
 
 // Ctrl+5 (Cmd+5 on a Mac) for Documents, beside Ctrl+0 for the call's view.
 // Ctrl+9 (Cmd+9) goes straight there too, next to Ctrl+0 (owner, thread 214).
