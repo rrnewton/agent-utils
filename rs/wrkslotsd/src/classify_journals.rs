@@ -974,6 +974,131 @@ pub(crate) fn create_journal_state(
         .map(|row| row.map(|row| row.state))
 }
 
+/// One create-journal classification for the batch commands:
+/// the journal path, its target slot path, and the Python
+/// `_CreateJournalClassification.to_obj` rendering.
+pub(crate) struct CreateJournalRow {
+    /// The journal file.
+    pub journal: PathBuf,
+    /// The create target's slot directory.
+    pub slot_path: PathBuf,
+    /// The `to_obj` JSON rendering.
+    pub obj: Value,
+}
+
+/// Python `_classify_create_journals` with no requested slot:
+/// every outstanding journal across all machines, classified.
+pub(crate) fn create_journal_rows(cfg: &Cfg, config: &Value) -> Result<Vec<CreateJournalRow>> {
+    let mut states: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut archives: Vec<Vec<Value>> = Vec::new();
+    for machine in crate::global_state::discover_machines(&cfg.control)? {
+        let active_path = cfg.control.join(format!("ACTIVE.{machine}.json"));
+        if let Ok(text) = std::fs::read_to_string(&active_path) {
+            if let Ok(doc) = serde_json::from_str::<Value>(&text) {
+                states.push((
+                    machine.clone(),
+                    doc.get("slots")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        let archive_path = cfg.control.join(format!("ARCHIVED.{machine}.json"));
+        if let Ok(text) = std::fs::read_to_string(&archive_path) {
+            if let Ok(doc) = serde_json::from_str::<Value>(&text) {
+                archives.push(
+                    doc.get("records")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+    let paths = outstanding(&cfg.control, None)?;
+    let mut rows: Vec<Row> = Vec::new();
+    for path in &paths {
+        let row =
+            classify_one(cfg, config, path, &states, &archives, "", "agent").map_err(|error| {
+                if error.starts_with("busy:") {
+                    error
+                } else {
+                    journal_refusal(path, &error)
+                }
+            })?;
+        if let Some(row) = row {
+            rows.push(row);
+        }
+    }
+    let mut seen_slots: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut seen_agents: BTreeSet<String> = BTreeSet::new();
+    for row in &rows {
+        if !seen_slots.insert((row.machine.clone(), row.slot.clone())) {
+            return Err(journal_refusal(
+                &row.journal,
+                &format!(
+                    "multiple interrupted creates claim {}/{}",
+                    row.machine, row.slot
+                ),
+            ));
+        }
+        if row.slot_type == "agent" && !seen_agents.insert(row.agent.clone()) {
+            return Err(journal_refusal(
+                &row.journal,
+                &format!("multiple interrupted creates claim agent {:?}", row.agent),
+            ));
+        }
+    }
+    Ok(rows
+        .iter()
+        .map(|row| CreateJournalRow {
+            journal: row.journal.clone(),
+            slot_path: row.slot_path.clone(),
+            obj: row_obj(row),
+        })
+        .collect())
+}
+
+/// Python `_CreateJournalClassification.to_obj`.
+fn row_obj(row: &Row) -> Value {
+    json!({
+        "agent": row.agent,
+        "checkouts": row.observed.iter().map(|c| json!({
+            "branch": field(c, "branch"),
+            "dirty": row.dirty.contains(&field(c, "name")),
+            "head": field(c, "head"),
+            "name": field(c, "name"),
+            "path": field(c, "path"),
+        })).collect::<Vec<_>>(),
+        "coordinator": row.coordinator_detail,
+        "coordinator_state": row.coordinator_state,
+        "created": row.created.len(),
+        "dirty_checkouts": row.dirty,
+        "journal": row.journal.to_string_lossy(),
+        "journal_identity": {
+            "device": row.identity.0,
+            "inode": row.identity.1,
+            "sha256": row.identity.3,
+            "size": row.identity.2,
+        },
+        "machine": row.machine,
+        "owner": row.owner_detail,
+        "owner_state": row.owner_state,
+        "planned": row.planned.len(),
+        "registry_state": if row.state == "completed-create" { "exact-active" } else { "absent" },
+        "slot": row.slot,
+        "slot_path": row.slot_path.to_string_lossy(),
+        "slot_type": row.slot_type,
+        "state": row.state,
+    })
+}
+
+/// Every outstanding journal path (Python `_outstanding_journals`).
+pub(crate) fn outstanding_journal_paths(cfg: &Cfg) -> Result<Vec<PathBuf>> {
+    outstanding(&cfg.control, None)
+}
+
 fn classify_one(
     cfg: &Cfg,
     config: &Value,

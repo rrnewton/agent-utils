@@ -352,7 +352,9 @@ pub(crate) fn recover_ownerless_validate_batch(
     Err("ownerless validation batch recovery stays with the Python edition for now".to_string())
 }
 
-/// Refuse ownerless validation batch classification after its input contract.
+/// Python `_cmd_classify_ownerless_validate_batch`: classify
+/// retained validation checkouts without locks or writes.
+/// Proof-manifest classification stays with the Python edition.
 pub(crate) fn classify_ownerless_validate_batch(
     root: Option<&Path>,
     machine_override: Option<&str>,
@@ -363,7 +365,7 @@ pub(crate) fn classify_ownerless_validate_batch(
     proofs: &[String],
 ) -> Result<Value> {
     require_fixture()?;
-    batch_shape(
+    let frozen = batch_shape(
         "classify-ownerless-validate-batch",
         checkouts,
         frozen_checkouts,
@@ -371,11 +373,267 @@ pub(crate) fn classify_ownerless_validate_batch(
         repositories,
         proofs,
     )?;
+    if !proofs.is_empty() {
+        return Err(
+            "ownerless validation batch proof classification stays with the Python edition for now"
+                .to_string(),
+        );
+    }
     let (cfg, selected) = load_cfg(root, machine_override)?;
     validate_name(&selected, "machine")?;
-    let _ = (cfg, selected);
-    Err(
-        "ownerless validation batch classification stays with the Python edition for now"
-            .to_string(),
-    )
+    let config = crate::config_validate::load_config(root, machine_override)?;
+    crate::ensure_states::refuse_partial_state_allow_seals(&cfg.control)?;
+    // Python `_validate_batch_seal_journals`: any seal journal
+    // blocks admission before classification.
+    if let Ok(entries) = std::fs::read_dir(&cfg.control) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("VALIDATE-BATCH-SEAL.") && name.ends_with(".journal") {
+                return Err(
+                    "an interrupted validation-batch seal is recorded; recover it before admission"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    crate::hold_write::validate_global(root, &cfg)?;
+    let before_rows = crate::validation_recovery::load_global_rows(&cfg)?;
+    let before_paths = crate::classify_journals::outstanding_journal_paths(&cfg)?;
+    let create_rows = crate::classify_journals::create_journal_rows(&cfg, &config)?;
+    let target_kind = if frozen {
+        "frozen-checkout"
+    } else {
+        "checkout"
+    };
+    let selected_checkouts: &[String] = if frozen { frozen_checkouts } else { checkouts };
+    let mut results: Vec<Value> = Vec::new();
+    type PreparedRow = (
+        String,
+        String,
+        String,
+        PathBuf,
+        crate::validation_recovery::PrivateIdentity,
+    );
+    let mut prepared: Vec<PreparedRow> = Vec::new();
+    for (index, checkout) in selected_checkouts.iter().enumerate() {
+        let prepared_row = (|| -> Result<(PathBuf, (u64, u64, i64, String))> {
+            let (_relative, target, _allowed) =
+                crate::validation_recovery::validation_recovery_target(
+                    &cfg,
+                    checkout,
+                    target_kind,
+                )?;
+            if create_rows.iter().any(|row| {
+                crate::validation_recovery::path_is_within_pub(&target, &row.slot_path)
+                    || crate::validation_recovery::path_is_within_pub(&row.slot_path, &target)
+            }) {
+                return Err("validation path overlaps an interrupted create".to_string());
+            }
+            let managed = if frozen {
+                Some(crate::validation_recovery::frozen_validation_directory(
+                    &cfg,
+                ))
+            } else {
+                None
+            };
+            let identity = crate::validation_recovery::private_cleanup_path_identity(
+                &cfg,
+                &target,
+                &[0o700],
+                managed.as_deref(),
+            )?;
+            Ok((target, identity))
+        })();
+        match prepared_row {
+            Ok((target, identity)) => prepared.push((
+                checkout.clone(),
+                records[index].clone(),
+                repositories[index].clone(),
+                target,
+                identity,
+            )),
+            Err(error) => results.push(json!({
+                "blocks_entry": true,
+                "checkout": checkout,
+                "reason": error,
+                "state": "could-not-classify",
+            })),
+        }
+    }
+    let duplicate_identity = (0..prepared.len()).any(|index| {
+        ((index + 1)..prepared.len()).any(|other| prepared[other].4 == prepared[index].4)
+    });
+    if duplicate_identity {
+        return Err(
+            "classify-ownerless-validate-batch resolved multiple checkouts to one directory"
+                .to_string(),
+        );
+    }
+    let census_count = i64::from(!prepared.is_empty());
+    let snapshot = if prepared.is_empty() {
+        None
+    } else {
+        let targets: Vec<PathBuf> = prepared.iter().map(|row| row.3.clone()).collect();
+        match crate::remove_write::capture_process_snapshot(i64::from(std::process::id()), &targets)
+        {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                results.extend(prepared.iter().map(|row| {
+                    json!({
+                        "blocks_entry": true,
+                        "checkout": row.0,
+                        "reason": error,
+                        "state": "could-not-classify",
+                    })
+                }));
+                prepared.clear();
+                None
+            }
+        }
+    };
+    let batch = snapshot.map(|snapshot| {
+        let pairs: Vec<((u64, u64, i64, String), PathBuf)> = prepared
+            .iter()
+            .map(|row| (row.4.clone(), row.3.clone()))
+            .collect();
+        crate::validation_recovery::BatchContext::new(&pairs, snapshot)
+    });
+    let actor_identity = crate::status_state::read_process_identity(i64::from(std::process::id()))
+        .map(|identity| crate::status_state::identity_to_value(&identity))?;
+    for (checkout, record, repository, target, _identity) in &prepared {
+        let classified = (|| -> Result<Value> {
+            if let Some(batch) = &batch {
+                batch.assert_unused(&cfg, target, false)?;
+            }
+            let mut frozen_result: Option<Value> = None;
+            if frozen {
+                // The record file and its recorded target, as the
+                // disposition inputs.
+                let record_path = cfg.root.join(record);
+                let contents = std::fs::read(&record_path).map_err(|error| {
+                    format!(
+                        "cannot read frozen validation run-record {}: {error}",
+                        record_path.display()
+                    )
+                })?;
+                let record_obj = crate::validation_recovery::strict_json_object_pub(
+                    &contents,
+                    "frozen validation run-record",
+                )?;
+                let record_target = record_obj
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let digest = {
+                    use sha2::Digest as _;
+                    format!("{:x}", sha2::Sha256::digest(&contents))
+                };
+                let repository_path =
+                    crate::validation_recovery::repository_path(&cfg, repository, true)?.1;
+                let (disposition, historical_schema, evidence) =
+                    crate::validation_recovery::frozen_no_proof_disposition(
+                        &cfg,
+                        &record_path,
+                        target,
+                        &repository_path,
+                        &digest,
+                        &record_target,
+                        &|path| {
+                            crate::remove_write::assert_slot_unused(
+                                path,
+                                i64::from(std::process::id()),
+                            )
+                        },
+                    )?;
+                match disposition {
+                    crate::validation_recovery::FrozenDisposition::CurrentIncompleteRetained => {
+                        return Ok(json!({
+                            "blocks_entry": false,
+                            "checkout": checkout,
+                            "reason": "current incomplete frozen validation is exact and inactive; the checkout and no-result remain retained",
+                            "state": "current-incomplete-retained",
+                        }));
+                    }
+                    crate::validation_recovery::FrozenDisposition::HistoricalNonblocking => {
+                        return Ok(json!({
+                            "blocks_entry": false,
+                            "checkout": checkout,
+                            "reason": format!(
+                                "historical schema {} validation is exact and inactive; it remains retained",
+                                historical_schema.unwrap_or_default()
+                            ),
+                            "state": "historical-retained",
+                        }));
+                    }
+                    crate::validation_recovery::FrozenDisposition::BlocksEntry => {
+                        return Err(
+                            "frozen validation has no typed removal proof and cannot be classified as historical"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        frozen_result = evidence;
+                    }
+                }
+            }
+            crate::validation_recovery::ownerless_validation_journal(
+                &cfg,
+                &config,
+                target_kind,
+                checkout,
+                Some(record),
+                Some(repository),
+                frozen_result.as_ref(),
+                &actor_identity,
+            )?;
+            Ok(json!({
+                "blocks_entry": false,
+                "checkout": checkout,
+                "reason": "terminal validation is exact and unused; read-only classification left it retained",
+                "state": "terminal-retained",
+            }))
+        })();
+        match classified {
+            Ok(row) => results.push(row),
+            Err(error) => results.push(json!({
+                "blocks_entry": true,
+                "checkout": checkout,
+                "reason": error,
+                "state": "could-not-classify",
+            })),
+        }
+    }
+    let after_rows = crate::validation_recovery::load_global_rows(&cfg)?;
+    if before_rows != after_rows {
+        return Err("active registry changed during validation classification".to_string());
+    }
+    let after_paths = crate::classify_journals::outstanding_journal_paths(&cfg)?;
+    if before_paths != after_paths
+        || create_rows
+            .iter()
+            .map(|row| row.journal.clone())
+            .collect::<Vec<_>>()
+            != after_paths
+                .iter()
+                .filter(|path| create_rows.iter().any(|row| &row.journal == *path))
+                .cloned()
+                .collect::<Vec<_>>()
+    {
+        return Err("recovery journal set changed before validation classification".to_string());
+    }
+    // Re-classify to prove the create rows are stable.
+    let stable_rows = crate::classify_journals::create_journal_rows(&cfg, &config)?;
+    if stable_rows.iter().map(|row| &row.obj).collect::<Vec<_>>()
+        != create_rows.iter().map(|row| &row.obj).collect::<Vec<_>>()
+    {
+        return Err("create journal changed while it was classified".to_string());
+    }
+    Ok(json!({
+        "classifications": results,
+        "create_journals": create_rows.iter().map(|row| row.obj.clone()).collect::<Vec<_>>(),
+        "process_censuses": census_count,
+        "requested": selected_checkouts.len(),
+        "schema": 1,
+    }))
 }

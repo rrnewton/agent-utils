@@ -53,6 +53,19 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
+/// `path_is_within` for the batch classify overlap check.
+pub(crate) fn path_is_within_pub(path: &Path, root: &Path) -> bool {
+    path_is_within(path, root)
+}
+
+/// `strict_json_object` for the batch classify record read.
+pub(crate) fn strict_json_object_pub(
+    contents: &[u8],
+    label: &str,
+) -> Result<serde_json::Map<String, Value>> {
+    strict_json_object(contents, label)
+}
+
 /// The managed worktrees root (slots surface), mirroring
 /// `_managed_worktrees_root` as the journal module computes it.
 fn managed_worktrees_root(cfg: &Cfg) -> PathBuf {
@@ -374,8 +387,9 @@ fn assert_fence_root_trusted(cfg: &Cfg, fenced: &Path, managed_root: Option<&Pat
     for candidate in components {
         let metadata = candidate.symlink_metadata().map_err(|error| {
             format!(
-                "cannot inspect cleanup fence root {}: {error}",
-                candidate.display()
+                "cannot inspect cleanup fence root {}: {}",
+                candidate.display(),
+                os_error_text(&error, &candidate)
             )
         })?;
         let mode = metadata.permissions().mode() & 0o7777;
@@ -1505,8 +1519,42 @@ fn historical_projection_binding(
     Ok(())
 }
 
+/// The durable-result evidence object Python's
+/// `_frozen_result_evidence_to_obj` renders for the journal.
+fn frozen_result_evidence_obj(cfg: &Cfg, record_path: &Path) -> Result<Value> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let stem = record_path
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let path = cfg
+        .root
+        .join(format!("ignored/validate/frozen/{stem}.jsonl"));
+    let contents = std::fs::read(&path).map_err(|error| {
+        format!(
+            "cannot read durable frozen validation result {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        format!(
+            "cannot inspect durable frozen validation result {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(json!({
+        "path": path.to_string_lossy(),
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "size": contents.len(),
+        "sha256": format!("{:x}", Sha256::digest(&contents)),
+    }))
+}
+
 /// Python `_frozen_no_proof_disposition`; the census is injected.
-/// Returns (disposition, historical schema when historical).
+/// Returns (disposition, historical schema when historical,
+/// durable frozen-result evidence when terminal-removable).
 pub(crate) fn frozen_no_proof_disposition(
     cfg: &Cfg,
     record_path: &Path,
@@ -1515,7 +1563,7 @@ pub(crate) fn frozen_no_proof_disposition(
     record_digest: &str,
     record_target: &str,
     census_unused: &dyn Fn(&Path) -> Result<()>,
-) -> Result<(FrozenDisposition, Option<i64>)> {
+) -> Result<(FrozenDisposition, Option<i64>, Option<Value>)> {
     let contents = std::fs::read(record_path).map_err(|error| {
         format!(
             "cannot read frozen validation run-record {}: {error}",
@@ -1530,20 +1578,24 @@ pub(crate) fn frozen_no_proof_disposition(
         && !(matches!(schema, Some(1..=3))
             && source == Some("historical-validation-service-result"))
     {
-        return Ok((FrozenDisposition::LegacyRecovery, None));
+        return Ok((FrozenDisposition::LegacyRecovery, None, None));
     }
     if matches!(schema, Some(4..=8)) && source == Some("validation-service-result") {
         if current_incomplete_frozen_result(&record) {
-            return Ok((FrozenDisposition::CurrentIncompleteRetained, None));
+            return Ok((FrozenDisposition::CurrentIncompleteRetained, None, None));
         }
         if current_frozen_service_result(&record) {
             if !record_process_is_dead(&record) {
-                return Ok((FrozenDisposition::BlocksEntry, None));
+                return Ok((FrozenDisposition::BlocksEntry, None, None));
             }
             durable_frozen_result(cfg, record_path, &record, record_target)?;
-            return Ok((FrozenDisposition::CurrentTerminalRemovable, None));
+            return Ok((
+                FrozenDisposition::CurrentTerminalRemovable,
+                None,
+                Some(frozen_result_evidence_obj(cfg, record_path)?),
+            ));
         }
-        return Ok((FrozenDisposition::BlocksEntry, None));
+        return Ok((FrozenDisposition::BlocksEntry, None, None));
     }
     // Historical schemas: producer-schema + sidecar projection.
     if matches!(schema, Some(2..=3))
@@ -1591,9 +1643,9 @@ pub(crate) fn frozen_no_proof_disposition(
                     .to_string(),
             );
         }
-        return Ok((FrozenDisposition::HistoricalNonblocking, Some(schema)));
+        return Ok((FrozenDisposition::HistoricalNonblocking, Some(schema), None));
     }
-    Ok((FrozenDisposition::BlocksEntry, None))
+    Ok((FrozenDisposition::BlocksEntry, None, None))
 }
 
 /// Python `_terminal_validation_record` for the non-frozen
@@ -2214,6 +2266,255 @@ pub(crate) fn validation_cargo_facts(path: &Path) -> Result<(u64, u64, u64)> {
     )
 }
 
+/// Python `_PrivateCleanupIdentity` in its four-field form:
+/// (dev, ino, handle type, handle hex).
+pub(crate) type PrivateIdentity = (u64, u64, i64, String);
+
+/// Every machine's (machine, ACTIVE slots, ARCHIVED records).
+pub(crate) type GlobalRows = Vec<(String, Vec<Value>, Vec<Value>)>;
+
+/// Python `_OwnerlessValidationBatchContext`: the shared census
+/// plus the canonical identity map for one batch classification.
+pub(crate) struct BatchContext {
+    canonical: std::collections::HashMap<PrivateIdentity, PathBuf>,
+    snapshot: crate::remove_write::ProcessSnapshot,
+}
+
+impl BatchContext {
+    /// Build the context from the prepared (target, identity) rows.
+    pub(crate) fn new(
+        prepared: &[(PrivateIdentity, PathBuf)],
+        snapshot: crate::remove_write::ProcessSnapshot,
+    ) -> BatchContext {
+        BatchContext {
+            canonical: prepared.iter().cloned().collect(),
+            snapshot,
+        }
+    }
+
+    /// Python `assert_unused`: the target's identity must be in
+    /// the shared census, the shared census must show it unused,
+    /// and a fresh same-UID census must agree.
+    pub(crate) fn assert_unused(&self, cfg: &Cfg, target: &Path, fresh: bool) -> Result<()> {
+        let managed = if target.parent() == Some(frozen_validation_directory(cfg).as_path()) {
+            Some(frozen_validation_directory(cfg))
+        } else {
+            None
+        };
+        let identity = private_cleanup_path_identity(cfg, target, &[0o700], managed.as_deref())?;
+        let Some(canonical) = self.canonical.get(&identity) else {
+            return Err(format!(
+                "private validation checkout identity was not in the shared census: {}",
+                target.display()
+            ));
+        };
+        crate::remove_write::assert_slot_unused_snapshot(&self.snapshot, canonical)?;
+        if fresh {
+            crate::remove_write::assert_slot_unused(target, i64::from(std::process::id()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Load every machine's ACTIVE slots and ARCHIVED records, in the
+/// shape the journal builder and the global-rows comparison use:
+/// (machine, slot records, archive records).
+pub(crate) fn load_global_rows(cfg: &Cfg) -> Result<GlobalRows> {
+    let mut rows = Vec::new();
+    for machine in crate::global_state::discover_machines(&cfg.control)? {
+        let mut slots = Vec::new();
+        let active_path = cfg.control.join(format!("ACTIVE.{machine}.json"));
+        if let Ok(text) = std::fs::read_to_string(&active_path) {
+            if let Ok(doc) = serde_json::from_str::<Value>(&text) {
+                slots = doc
+                    .get("slots")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+        let mut records = Vec::new();
+        let archive_path = cfg.control.join(format!("ARCHIVED.{machine}.json"));
+        if let Ok(text) = std::fs::read_to_string(&archive_path) {
+            if let Ok(doc) = serde_json::from_str::<Value>(&text) {
+                records = doc
+                    .get("records")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+        rows.push((machine, slots, records));
+    }
+    Ok(rows)
+}
+
+fn random_hex32() -> String {
+    let mut bytes = [0u8; 16];
+    if let Ok(raw) = std::fs::read("/dev/urandom") {
+        bytes.copy_from_slice(&raw[..16.min(raw.len())]);
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Python `_ownerless_validation_journal` (build only; the caller
+/// decides whether the journal is ever written). Proof manifests
+/// and operator releases stay with the Python edition for now.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ownerless_validation_journal(
+    cfg: &Cfg,
+    config: &Value,
+    target_kind: &str,
+    raw_target: &str,
+    completed_record: Option<&str>,
+    repository_raw: Option<&str>,
+    frozen_result: Option<&Value>,
+    actor: &Value,
+) -> Result<Value> {
+    if target_kind == "frozen-checkout" && completed_record.is_none() {
+        return Err(
+            "frozen validation checkout recovery requires --completed-record; pass the terminal frozen run handle and retry"
+                .to_string(),
+        );
+    }
+    if frozen_result.is_some() && (target_kind != "frozen-checkout" || completed_record.is_none()) {
+        return Err(
+            "durable frozen result authority applies only to batch frozen cleanup without a proof"
+                .to_string(),
+        );
+    }
+    let (relative, target, _allowed) = validation_recovery_target(cfg, raw_target, target_kind)?;
+    for (machine, slots, _records) in load_global_rows(cfg)? {
+        let _ = machine;
+        for record in &slots {
+            let slot = record
+                .get("slot")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let slot_type = record
+                .get("slot_type")
+                .and_then(Value::as_str)
+                .unwrap_or("agent");
+            if let Ok(slot_path) = crate::active_state::slot_directory(cfg, slot, slot_type) {
+                if target == slot_path || path_is_within(&target, &slot_path) {
+                    return Err(format!("validation path belongs to registered slot {slot}"));
+                }
+            }
+        }
+    }
+    let (repository_relative, repository) = if target_kind == "cargo-home" {
+        if repository_raw.is_some() {
+            return Err("--repository applies only to validation checkouts".to_string());
+        }
+        (None, None)
+    } else {
+        let raw = repository_raw
+            .ok_or_else(|| "validation checkout recovery requires --repository".to_string())?;
+        let (stored, resolved) = repository_path(cfg, raw, true)?;
+        (Some(stored), Some(resolved))
+    };
+    let (evidence, record_target) = if let Some(record) = completed_record {
+        let (record_path, digest, record_target) =
+            terminal_validation_record(cfg, record, &target, target_kind)?;
+        let mut evidence = json!({
+            "kind": "terminal-record",
+            "path": record_path,
+            "sha256": digest,
+        });
+        if let Some(target_value) = &record_target {
+            evidence["target"] = json!(target_value);
+        }
+        if let Some(result) = frozen_result {
+            evidence["frozen_result"] = result.clone();
+        }
+        (evidence, record_target)
+    } else {
+        (
+            recordless_validation_evidence(cfg, &target, target_kind, None)?,
+            None,
+        )
+    };
+    let identity = open_directory_identity(&target, "validation recovery path")?;
+    let mut stable_identity: Option<(u64, u64, i64, String)> = None;
+    let mut parent_identity: Option<(u64, u64, u64)> = None;
+    let (head, remote_digest) = if target_kind == "cargo-home" {
+        parent_identity = Some(validation_cargo_facts(&target)?);
+        (None, None)
+    } else {
+        let repository = repository.as_deref().expect("repository");
+        if target_kind == "frozen-checkout" {
+            let frozen_root = frozen_validation_directory(cfg);
+            let stable = private_cleanup_path_identity(cfg, &target, &[0o700], Some(&frozen_root))?;
+            let parent =
+                open_directory_identity(&frozen_root, "frozen validation checkout parent")?;
+            if stable.0 != identity.0 || stable.1 != identity.1 || identity.2 != parent.2 {
+                return Err("frozen validation checkout identity or mount changed".to_string());
+            }
+            stable_identity = Some(stable);
+            parent_identity = Some(parent);
+        }
+        let (head, digest) = validation_checkout_facts(
+            cfg,
+            config,
+            &target,
+            repository,
+            record_target.as_deref(),
+            None,
+            target_kind == "frozen-checkout",
+            None,
+            false,
+        )?;
+        (Some(head), Some(digest))
+    };
+    if target_kind == "checkout" {
+        return Err(
+            "ownerless linked validation checkout recovery is disabled because the checkout and its Git administration cannot both be fenced against same-UID replacement; preserve it or import it only with a demonstrably live owner"
+                .to_string(),
+        );
+    }
+    let mut authorization = json!({
+        "target_kind": target_kind,
+        "path": relative,
+        "identity": [identity.0, identity.1, identity.2],
+        "actor": actor,
+        "evidence": evidence,
+        "no_authored_work": true,
+        "no_live_use": true,
+        "repository": repository_relative,
+        "head": head,
+        "remote_url_sha256": remote_digest,
+        "parent_identity": parent_identity.map(|value| json!([value.0, value.1, value.2])),
+    });
+    if let Some(stable) = &stable_identity {
+        authorization["stable_identity"] = json!([stable.0, stable.1, stable.2, stable.3]);
+    }
+    let fenced = target.with_file_name(format!(
+        ".{}.ownerless-validate.{}",
+        target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        random_hex32()
+    ));
+    let fenced_value = if target_kind == "frozen-checkout" {
+        fenced.to_string_lossy().into_owned()
+    } else {
+        fenced
+            .strip_prefix(&cfg.root)
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| fenced.to_string_lossy().into_owned())
+    };
+    Ok(json!({
+        "schema": 2,
+        "kind": "ownerless-validate-remove",
+        "machine": cfg.machine,
+        "slot": target.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+        "phase": "prepared",
+        "fenced": fenced_value,
+        "authorization": authorization,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2773,7 +3074,7 @@ print(json.dumps(out, sort_keys=True))
         );
         let expected: Value = serde_json::from_slice(&output.stdout).expect("oracle json");
         match (&mine, expected.get("ok").and_then(Value::as_str)) {
-            (Ok((disp, _)), Some(value)) => {
+            (Ok((disp, _, _)), Some(value)) => {
                 let mine_value = match disp {
                     FrozenDisposition::HistoricalNonblocking => "historical-nonblocking",
                     FrozenDisposition::CurrentTerminalRemovable => "current-terminal-removable",

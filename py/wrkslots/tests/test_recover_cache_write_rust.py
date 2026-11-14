@@ -239,14 +239,183 @@ def test_batch_recovery_stays_python_owned(tmp_path: Path) -> None:
     )
     assert result.returncode == 1
     assert "stays with the Python edition" in result.stderr
+
+
+def test_batch_classify_matches_python(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    args = argparse.Namespace(
+        project_root=str(oracle_root),
+        machine=None,
+        checkouts=["worktrees/validate/a"],
+        frozen_validate_checkouts=[],
+        completed_records=["record.json"],
+        repositories=["../repo"],
+        validation_proof_manifests=[],
+        format="json",
+    )
+    assert wrkslots_cli._cmd_classify_ownerless_validate_batch(args) == 0
+    expected = capsys.readouterr().out.strip().replace(
+        str(oracle_root), str(rust_root)
+    )
     classify = _run(
         [
             "classify-ownerless-validate-batch",
             "--checkout", "worktrees/validate/a",
             "--completed-record", "record.json",
             "--repository", "../repo",
-            "--root", str(root),
+            "--format", "json",
+            "--root", str(rust_root),
         ]
     )
-    assert classify.returncode == 1
-    assert "stays with the Python edition" in classify.stderr
+    assert classify.returncode == 0, classify.stderr
+    assert json.loads(classify.stdout) == json.loads(expected)
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def _frozen_fixture(base: Path) -> tuple[Path, Path, str]:
+    root = _fixture(base)
+    upstream = root / "upstream-repo"
+    upstream.mkdir()
+    schema = upstream / "ci" / "manifest-plan" / "validation-service-result-schema.json"
+    schema.parent.mkdir(parents=True)
+    schema.write_text(json.dumps({
+        "schema_version": 2,
+        "fields": [
+            "schema_version", "commit", "profile", "final_validate_status",
+            "exit_code", "executed_nodes", "executed_tests", "scorecard_writeback",
+        ],
+        "outcomes": {
+            "PASSED": {"validation_exit_code": 0, "state": "completed", "result": "success"},
+            "FAILED": {"validation_exit_code": 1, "state": "completed", "result": "failure"},
+            "COULD_NOT_RUN": {"validation_exit_code": 75, "state": "completed", "result": "no-result"},
+        },
+        "scorecard_writeback": {
+            "nullable": True,
+            "variants": {"completed": ["status"], "failed": ["status", "error"]},
+        },
+    }))
+    (upstream / "file.txt").write_text("one\n")
+    _git(upstream, "init", "-q", "-b", "main")
+    _git(upstream, "add", ".")
+    _git(upstream, "-c", "user.email=test@example.invalid", "-c",
+         "user.name=Test", "commit", "-q", "-m", "one")
+    _git(upstream, "remote", "add", "origin", str(upstream))
+    _git(upstream, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    target = _git(upstream, "rev-parse", "HEAD")
+    frozen_root = root.parent / f".{root.name}-frozen-validate"
+    frozen_root.mkdir(mode=0o700)
+    checkout = frozen_root / "validate-fresh-a"
+    _git(root, "clone", "-q", "--no-checkout", "--no-tags",
+         str(upstream), str(checkout))
+    _git(checkout, "checkout", "-q", "--detach", target)
+    checkout.chmod(0o700)
+    runs = root / "ignored" / "validate" / "runs"
+    runs.mkdir(parents=True)
+    record = {
+        "schema_version": 1,
+        "kind": "frozen-validate",
+        "producer": "ci-hub/validate/run_registry.py",
+        "admission": "frozen-validate",
+        "validation_kind": "frozen-validate",
+        "service_result_schema": 2,
+        "result_source": "historical-validation-service-result",
+        "materialized_target": False,
+        "qualifying_receipt": False,
+        "state": "unknown",
+        "result": "unknown",
+        "final_validate_status": "FAILED",
+        "exit_code": 1,
+        "executed_nodes": 14,
+        "executed_tests": None,
+        "passed_tests": None,
+        "detail": (
+            "validation-service-result-schema_version: historical schema 2 "
+            "is readable but has no current authority"
+        ),
+        "scorecard_writeback": {"status": "completed"},
+        "process_identity": {
+            "pid": 999999, "start_ticks": 1, "boot_id": "historical-boot",
+        },
+        "checkout": str(checkout),
+        "source_checkout": str(upstream),
+        "target": target,
+        "repo": "consumer-a/project",
+        "temporary_checkout": True,
+    }
+    (runs / "run-frozen.json").write_text(json.dumps(record))
+    (runs / "run-frozen.service-result.json").write_text(json.dumps({
+        "schema_version": 2,
+        "commit": target,
+        "profile": "only-portable",
+        "final_validate_status": "FAILED",
+        "exit_code": 1,
+        "executed_nodes": 14,
+        "executed_tests": None,
+        "scorecard_writeback": {"status": "completed"},
+    }))
+    return root, checkout, target
+
+
+def test_batch_classify_frozen_historical_matches_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rust_root, rust_checkout, _ = _frozen_fixture(tmp_path / "rust")
+    oracle_root, oracle_checkout, _ = _frozen_fixture(tmp_path / "oracle")
+
+    def canonical(_config: object, _path: Path, contents: bytes) -> tuple[object, object]:
+        parsed = wrkslots_cli._strict_json_object(contents, "frozen fixture")
+        return (
+            {
+                "schema_version": parsed["schema_version"],
+                "kind": parsed["kind"],
+                "state": parsed["state"],
+                "target": parsed["target"],
+                "repo": parsed["repo"],
+            },
+            parsed,
+        )
+
+    empty = lambda _paths, **_kwargs: wrkslots_cli._ProcessPathCensus((), ())
+    monkeypatch.setattr(wrkslots_cli, "_canonical_frozen_validation_record", canonical)
+    monkeypatch.setattr(wrkslots_cli, "_capture_lsof_process_path_census", empty)
+    monkeypatch.setattr(wrkslots_cli, "_capture_same_uid_process_path_census", empty)
+    monkeypatch.setattr(wrkslots_cli, "_capture_process_path_census", empty)
+    args = argparse.Namespace(
+        project_root=str(oracle_root),
+        machine=None,
+        checkouts=[],
+        frozen_validate_checkouts=[str(oracle_checkout)],
+        completed_records=["ignored/validate/runs/run-frozen.json"],
+        repositories=["upstream-repo"],
+        validation_proof_manifests=[],
+        format="json",
+    )
+    assert wrkslots_cli._cmd_classify_ownerless_validate_batch(args) == 0
+    expected = capsys.readouterr().out.strip().replace(
+        str(oracle_root), str(rust_root)
+    ).replace(str(oracle_checkout), str(rust_checkout))
+    classify = _run(
+        [
+            "classify-ownerless-validate-batch",
+            "--frozen-validate-checkout", str(rust_checkout),
+            "--completed-record", "ignored/validate/runs/run-frozen.json",
+            "--repository", "upstream-repo",
+            "--format", "json",
+            "--root", str(rust_root),
+        ]
+    )
+    assert classify.returncode == 0, classify.stderr
+    assert json.loads(classify.stdout) == json.loads(expected)
