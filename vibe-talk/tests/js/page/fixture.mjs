@@ -5213,6 +5213,10 @@ const TUNING_BANDS = {
     "(#610 mobile-keyboard-compose): under half a second Safari's keyboard is still animating up and its pan " +
     "over the field comes after the jump, leaving the box off the keys; past a few seconds a page that " +
     "moves the list by itself (a message arriving) is taken back to the box long after the keyboard settled"],
+  KEYBOARD_SEND_GAP_PX: [0, 32,
+    "the room the Send at the keyboard's top keeps above the keys (ios-keyboard-send): past a thumb's " +
+    "slack it floats off the keyboard it belongs to and over the words being written; at none it sits on " +
+    "the keys' own top row, where a reach for Send can land on a key instead"],
   BACK_TRAVERSAL_MS: [500, 10000,
     "how long the page waits for its own going-back through the history to land: shorter takes a " +
     "busy phone's ordinary traversal for one that never came and stops going back, leaving entries the " +

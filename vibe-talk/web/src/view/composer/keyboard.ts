@@ -8,6 +8,7 @@
 
 import type { ClockPort } from "../../ports/index.ts";
 import { isTextField, nodeWithin } from "../dom/index.ts";
+import { COMPOSER_FIELDS } from "./keys.ts";
 
 /** The least height, in CSS pixels, an on-screen keyboard takes: more than a browser's toolbar. */
 const KEYBOARD_MIN_PX = 150;
@@ -27,6 +28,23 @@ const KEYBOARD_FIT_PARTS: Readonly<Record<string, readonly [string, string, stri
   "channel-compose-text": ["channel-composer", "channel-send", "channel-compose-state"],
   "side-compose-text": ["side-composer", "side-send", "side-compose-state"],
 };
+
+/**
+ * `ios-keyboard-send`. Each sending box's own Send, the one its row already holds: the Send at the
+ * keyboard's top presses this very button, so the two can never become two opinions about sending.
+ * The call's box is not here: its Send stands in the dock, which stays over the keyboard in the
+ * call's view (`#241 voice-composer`), so it is never the one the keyboard covers.
+ */
+const KEYBOARD_SEND_PARTS: Readonly<Record<string, string>> = {
+  "channel-compose-text": "channel-send",
+  "side-compose-text": "side-send",
+  "reply-text": "reply-send",
+  "quick-reply-text": "quick-reply-send",
+  "discuss-followup": "discuss-send",
+};
+
+/** The room the Send at the keyboard's top keeps above the keys, in CSS pixels. */
+const KEYBOARD_SEND_GAP_PX = 8;
 
 /** The visual viewport, as far as the keyboard reads it. */
 interface Viewport {
@@ -63,6 +81,13 @@ export interface OnScreenKeyboardDependencies {
   nudge(area: HTMLElement, delta: number): void;
   /** Take `area` to its foot through the scroll owner (`#1251`). */
   toFoot(area: HTMLElement): void;
+  /**
+   * `ios-keyboard-send`. The Send that stands at the keyboard's top (`#keyboard-send`), where the
+   * page has it; absent, no second Send is stood. Optional: a page built without it still fits.
+   */
+  cornerSend?(): HTMLElement | null | undefined;
+  /** `ios-keyboard-send`. `field`'s own Send (`KEYBOARD_SEND_PARTS`), or null where it has none. */
+  normalSend?(field: Element): HTMLElement | null | undefined;
 }
 
 /** The keyboard's commands. */
@@ -91,6 +116,12 @@ export interface OnScreenKeyboard {
   showKeyboardDebug(on: boolean): void;
   /** Draw the readout, where it is on. */
   renderKeyboardDebug(): void;
+  /**
+   * `ios-keyboard-send`. Press the focused box's own Send from the Send at the keyboard's top:
+   * true where it pressed one. False while that Send already stands in the visible part, where
+   * the corner Send is down and its press would be a second send of the same words.
+   */
+  pressCornerSend(): boolean;
 }
 
 /** No keyboard yet. */
@@ -119,9 +150,10 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     fitted: Element | null; fittedHeight: number; settling: boolean; generation: number; readerMoved: boolean;
     inset: number; lastFit: { target: number; moved: number; field: string } | null;
     fittedArea: HTMLElement | null; fittedRoom: number; inputDue: boolean;
+    cornerField: Element | null; cornerShown: boolean;
   } = { up: false, shown: false, tallest: new Map(), width: -1, turnedAt: null, fitted: null,
     fittedHeight: 0, settling: false, generation: 0, readerMoved: false, inset: 0, lastFit: null,
-    fittedArea: null, fittedRoom: 0, inputDue: false };
+    fittedArea: null, fittedRoom: 0, inputDue: false, cornerField: null, cornerShown: false };
 
   /** Whether the readout is drawn; see `showKeyboardDebug`. */
   let keyboardDebug = false;
@@ -190,7 +222,59 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     } else if (fit && onScreenKeyboard.settling) {
       settleKeyboardFit(fit);
     }
+    renderCornerSend(shown, field, viewport);
     renderKeyboardDebug();
+  }
+
+  /**
+   * `ios-keyboard-send`. Stand a Send where the reader can always reach it: in the corner above
+   * the keyboard, like the new-line key (`#575`), for whichever sending box holds the focus —
+   * but only while that box's own Send stands outside the visual viewport, under the keyboard
+   * or above its pan, so the two never stand together. Its foot is the keyboard's top, counted
+   * from the visual viewport (`offsetTop + height`, `#610`) up from the layout viewport's foot,
+   * and said again on every measure, which the viewport's own resize and scroll already ask
+   * for: as Safari pans and the keyboard changes size the Send follows it. No keyboard, no
+   * sending box, or the row's Send already on screen, and it stands down.
+   */
+  function renderCornerSend(shown: boolean, field: Element | null, viewport: Viewport | null): void {
+    const button = typeof deps.cornerSend === "function" ? deps.cornerSend() : null;
+    const cornerField = shown && field && COMPOSER_FIELDS.includes(field.id) && KEYBOARD_SEND_PARTS[field.id]
+      ? field : null;
+    onScreenKeyboard.cornerField = cornerField;
+    onScreenKeyboard.cornerShown = false;
+    if (!button) return;
+    let show = false;
+    if (cornerField) {
+      const normal = typeof deps.normalSend === "function" ? deps.normalSend(cornerField) : null;
+      if (!normal) show = true;
+      else if (typeof normal.getBoundingClientRect === "function") {
+        const rect = normal.getBoundingClientRect();
+        const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0)
+          : deps.innerHeight() || 0;
+        const viewTop = viewport ? Number(viewport.offsetTop) || 0 : 0;
+        const onScreen = rect.bottom > rect.top && rect.bottom <= keysTop + 1 && rect.top >= viewTop - 1;
+        show = !onScreen;
+      } else show = true;
+      if (show) {
+        const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0)
+          : deps.innerHeight() || 0;
+        const foot = Math.max(0, Math.floor((deps.innerHeight() || 0) - keysTop)) + KEYBOARD_SEND_GAP_PX;
+        const style = (button as HTMLElement).style as { bottom?: string } | undefined;
+        if (style) style.bottom = `${foot}px`;
+      }
+    }
+    onScreenKeyboard.cornerShown = show;
+    (button as HTMLElement & { hidden: boolean }).hidden = !show;
+  }
+
+  /** Press the corner field's own Send: the corner Send's whole act (`renderCornerSend`). */
+  function pressCornerSend(): boolean {
+    if (!onScreenKeyboard.cornerShown || !onScreenKeyboard.cornerField) return false;
+    const normal = typeof deps.normalSend === "function" ? deps.normalSend(onScreenKeyboard.cornerField) : null;
+    if (!normal || (normal as HTMLButtonElement).disabled) return false;
+    if (typeof (normal as HTMLElement).click !== "function") return false;
+    (normal as HTMLElement).click();
+    return true;
   }
 
   /**
@@ -388,8 +472,9 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     },
     showKeyboardDebug,
     renderKeyboardDebug,
+    pressCornerSend,
   };
 }
 
 // What the page and the tests use of it.
-export { KEYBOARD_FIT_PARTS, KEYBOARD_MIN_PX, KEYBOARD_MIN_SHARE, KEYBOARD_SETTLE_MS };
+export { KEYBOARD_FIT_PARTS, KEYBOARD_MIN_PX, KEYBOARD_MIN_SHARE, KEYBOARD_SEND_PARTS, KEYBOARD_SETTLE_MS };

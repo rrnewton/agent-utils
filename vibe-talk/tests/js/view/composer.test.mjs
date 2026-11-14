@@ -727,3 +727,115 @@ test("the keyboard debug choice is kept on this device, absent off, and shown ei
   debug.applyKeyboardDebug(false);
   assert.deepEqual(shown, [true, false], "a refused keep still draws it for this session");
 });
+
+test("ios-keyboard-send: every box that sends is in COMPOSER_FIELDS, quick reply and Discuss included", () => {
+  const { COMPOSER_FIELDS, isComposer } = VIEW_COMPOSER;
+  const sending = ["compose-text", "channel-compose-text", "side-compose-text", "reply-text", "quick-reply-text", "discuss-followup"];
+  assert.deepStrictEqual([...COMPOSER_FIELDS].sort(), [...sending].sort(),
+    "a box that sends is missing from COMPOSER_FIELDS, so its return key is never named");
+  for (const id of sending) assert.equal(isComposer({ id }), true, `#${id} is not read as a composer`);
+  assert.equal(isComposer({ id: "read-speed-box" }), false, "a box that never sends was read as a composer");
+});
+
+test("ios-keyboard-send: the return key and input mode say what Enter does, in every sending box", () => {
+  const { createComposerBoxes } = VIEW_COMPOSER;
+  const els = new Map();
+  const el = (id) => {
+    if (!els.has(id)) {
+      els.set(id, { id, hidden: false, checked: false, textContent: "", attrs: {},
+        setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
+        removeAttribute(k) { delete this.attrs[k]; } });
+    }
+    return els.get(id);
+  };
+  let sends = true;
+  const boxes = createComposerBoxes({
+    el, leftEl: (id) => el(id), replyScroller: () => el("reply-scroller"),
+    atBottom: () => true, followFoot: () => {}, nudge: () => {}, toPosition: () => {},
+    keepBoxInView: () => {}, activeElement: () => null, bottomSlack: 24, fieldSizing: false,
+    keepGrow: () => {}, storedGrow: () => false, enterSendsCurrent: () => sends,
+    platform: () => "iPhone", noteInsertion: () => {},
+  });
+  const sending = ["compose-text", "channel-compose-text", "side-compose-text", "reply-text", "quick-reply-text", "discuss-followup"];
+  boxes.renderEnterSends();
+  for (const id of sending) {
+    assert.equal(el(id).attrs.enterkeyhint, "send", `#${id} did not ask the keyboard for Send while Enter sends`);
+    assert.equal(el(id).attrs.inputmode, "text", `#${id} did not keep a text keyboard while Enter sends`);
+  }
+  sends = false;
+  boxes.renderEnterSends();
+  for (const id of sending) {
+    assert.equal(el(id).attrs.enterkeyhint, "enter", `#${id} still asked for Send with Enter to send off`);
+    assert.equal(el(id).attrs.inputmode, "text", `#${id} lost its text keyboard with Enter to send off`);
+  }
+  // Dictation holding the keyboard down (`inputmode="none"`) is not undone by saying what Enter does.
+  el("channel-compose-text").attrs.inputmode = "none";
+  sends = true;
+  boxes.renderEnterSends();
+  assert.equal(el("channel-compose-text").attrs.enterkeyhint, "send");
+  assert.equal(el("channel-compose-text").attrs.inputmode, "none", "saying what Enter does brought the keyboard back over dictation");
+});
+
+test("ios-keyboard-send: a Send stands at the keyboard's top while the row's own Send is under it, and only then", () => {
+  const { createOnScreenKeyboard } = VIEW_COMPOSER;
+  const root = { clientWidth: 390, clientHeight: 844, setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };
+  const corner = { id: "keyboard-send", hidden: true, style: {} };
+  // The row's Send, below the shrunk viewport until the reader scrolls to it.
+  let sendRect = { top: 700, bottom: 744 };
+  let pressed = 0;
+  const normal = { id: "channel-send", disabled: false, getBoundingClientRect: () => sendRect, click() { pressed += 1; } };
+  const field = { tagName: "TEXTAREA", id: "channel-compose-text", type: "textarea", isContentEditable: false, getClientRects: () => [{}] };
+  const els = { "read-speed-box": { id: "read-speed-box" }, "speed-popover": { hidden: true },
+    "keyboard-debug": { checked: false }, "keyboard-debug-readout": { hidden: true, style: {} } };
+  // No keyboard: the full height. Up: 844 -> 460 with no pan, so the keyboard's top is at 460
+  // and its foot stands 384px above the layout viewport's foot.
+  let viewport = { height: 844, scale: 1, offsetTop: 0 };
+  const keyboard = createOnScreenKeyboard({
+    clock: { setTimeout: () => 0, clearTimeout: () => {} },
+    lookup: (id) => els[id] || { id, getClientRects: () => [] }, el: (id) => els[id],
+    viewport: () => viewport, innerHeight: () => 844, scrollY: () => 0, root: () => root,
+    activeElement: () => field, virtualKeyboard: () => undefined, computedStyle: () => null,
+    closeSpeedPopover: () => {}, nudge: () => {}, toFoot: () => {},
+    cornerSend: () => corner,
+    normalSend: () => normal,
+  });
+  keyboard.noteKeyboard();
+  assert.equal(corner.hidden, true, "the corner Send stood with no keyboard up");
+  viewport = { height: 460, scale: 1, offsetTop: 0 };
+  keyboard.noteKeyboard();
+  assert.equal(corner.hidden, false, "no Send stood above the keyboard while the row's Send was under it");
+  assert.equal(corner.style.bottom, "392px", "the corner Send did not stand at the keyboard's top edge");
+  assert.equal(keyboard.pressCornerSend(), true, "the corner Send did not press the box's own Send");
+  assert.equal(pressed, 1);
+  // The reader scrolled the row's Send into the visible part: no second Send over it.
+  sendRect = { top: 400, bottom: 444 };
+  keyboard.noteKeyboard();
+  assert.equal(corner.hidden, true, "a second Send stood over the row's own, already on screen");
+  assert.equal(keyboard.pressCornerSend(), false, "a hidden corner Send still sent");
+  assert.equal(pressed, 1);
+  // The keyboard going down takes the corner Send with it.
+  sendRect = { top: 700, bottom: 744 };
+  viewport = { height: 844, scale: 1, offsetTop: 0 };
+  keyboard.noteKeyboard();
+  assert.equal(corner.hidden, true, "the corner Send outlived the keyboard");
+});
+
+test("ios-keyboard-send: the call's box gets no corner Send, its own standing in the dock over the keyboard", () => {
+  const { createOnScreenKeyboard } = VIEW_COMPOSER;
+  const root = { clientWidth: 390, clientHeight: 844, setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };
+  const corner = { id: "keyboard-send", hidden: true, style: {} };
+  const field = { tagName: "TEXTAREA", id: "compose-text", type: "textarea", isContentEditable: false, getClientRects: () => [{}] };
+  const els = { "read-speed-box": { id: "read-speed-box" }, "speed-popover": { hidden: true },
+    "keyboard-debug": { checked: false }, "keyboard-debug-readout": { hidden: true, style: {} } };
+  const keyboard = createOnScreenKeyboard({
+    clock: { setTimeout: () => 0, clearTimeout: () => {} },
+    lookup: (id) => els[id] || { id, getClientRects: () => [] }, el: (id) => els[id],
+    viewport: () => ({ height: 460, scale: 1, offsetTop: 0 }), innerHeight: () => 844, scrollY: () => 0, root: () => root,
+    activeElement: () => field, virtualKeyboard: () => undefined, computedStyle: () => null,
+    closeSpeedPopover: () => {}, nudge: () => {}, toFoot: () => {},
+    cornerSend: () => corner, normalSend: () => null,
+  });
+  keyboard.noteKeyboard();
+  assert.equal(corner.hidden, true, "a corner Send stood over the call's dock, which already holds its Send");
+  assert.equal(keyboard.pressCornerSend(), false);
+});

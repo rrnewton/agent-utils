@@ -50,6 +50,7 @@ declare const setFocusReveal: LegacyImports["setFocusReveal"];
 declare const focusAtEnd: LegacyImports["focusAtEnd"];
 declare const isComposer: LegacyImports["isComposer"];
 declare const createComposerBoxes: LegacyImports["createComposerBoxes"];
+declare const KEYBOARD_SEND_PARTS: LegacyImports["KEYBOARD_SEND_PARTS"];
 declare const NEWLINE_KEYS: LegacyImports["NEWLINE_KEYS"];
 declare const createComposerKeys: LegacyImports["createComposerKeys"];
 declare const createOnScreenKeyboard: LegacyImports["createOnScreenKeyboard"];

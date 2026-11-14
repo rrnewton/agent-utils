@@ -421,12 +421,20 @@ test("the platform words the hint and decides nothing: Ctrl+Enter and Cmd+Enter 
 
 test("a phone's own return key says what Enter will do, in every message box", async () => {
   // `enterkeyhint` is what an on-screen keyboard draws on its return key: a send arrow, or a return.
+  // `ios-keyboard-send`: the quick reply and the Discuss follow-up send too, so their keys are
+  // named with the rest, with a text keyboard in each setting.
   const page = newPage();
   await signIn(page);
-  const boxes = ["compose-text", "channel-compose-text", "reply-text"];
-  for (const id of boxes) assert.equal(page.el(id).getAttribute("enterkeyhint"), "send", `#${id} with it on`);
+  const boxes = ["compose-text", "channel-compose-text", "side-compose-text", "reply-text", "quick-reply-text", "discuss-followup"];
+  for (const id of boxes) {
+    assert.equal(page.el(id).getAttribute("enterkeyhint"), "send", `#${id} with it on`);
+    assert.equal(page.el(id).getAttribute("inputmode"), "text", `#${id} input mode with it on`);
+  }
   await page.el("enter-sends").setChecked(false);
-  for (const id of boxes) assert.equal(page.el(id).getAttribute("enterkeyhint"), "enter", `#${id} with it off`);
+  for (const id of boxes) {
+    assert.equal(page.el(id).getAttribute("enterkeyhint"), "enter", `#${id} with it off`);
+    assert.equal(page.el(id).getAttribute("inputmode"), "text", `#${id} input mode with it off`);
+  }
   await page.el("enter-sends").setChecked(true);
   for (const id of boxes) assert.equal(page.el(id).getAttribute("enterkeyhint"), "send", `#${id} turned back on`);
 });

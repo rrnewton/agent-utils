@@ -805,7 +805,7 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         desk.check("microphone on your keyboard" in str(state), f"react, no recognition: the box says {state!r}")
         # `#829`: nothing listens, so the keyboard, the way to speak here, is not kept down, and no badge shows.
         unheard = page.evaluate(MIC_JS)
-        desk.check(unheard["inputmode"] is None and not unheard["shown"],
+        desk.check(unheard["inputmode"] != "none" and not unheard["shown"],
                    f"react, no recognition: the keyboard is kept down or the badge shows: {unheard}")
         page.keyboard.press("Escape")
     desk.check(label(page) == "Resume", f"react: the read did not stay paused: Read says {label(page)!r}")
@@ -830,7 +830,7 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
             check_listening(desk, "react, playing, listening")
             press(page, "#quick-reply-text", touch)
             tapped = page.evaluate(MIC_JS)
-            desk.check(tapped["inputmode"] is None and tapped["shown"],
+            desk.check(tapped["inputmode"] != "none" and tapped["shown"],
                        f"react: a tap in the box did not bring the keyboard back while listening on: {tapped}")
             press(page, "#quick-reply-mic", touch)
             desk.wait_for("() => document.getElementById('quick-reply-mic').hidden"
@@ -840,7 +840,7 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
                                     " open: !document.getElementById('quick-reply').hidden,"
                                     " focused: document.activeElement === document.getElementById('quick-reply-text'),"
                                     " inputmode: document.getElementById('quick-reply-text').getAttribute('inputmode')})")
-            desk.check(stopped["aborts"] >= 1 and stopped["open"] and stopped["focused"] and stopped["inputmode"] is None,
+            desk.check(stopped["aborts"] >= 1 and stopped["open"] and stopped["focused"] and stopped["inputmode"] != "none",
                        f"react: the badge's tap did not stop only the listening, the box focused: {stopped}")
             # `#1503 react-dictation-keeps-listening`: a real stop says so on the still-open box.
             desk.check("Stopped listening" in str(page.evaluate("() => document.getElementById('quick-reply-state').textContent")),

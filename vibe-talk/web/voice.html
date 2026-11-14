@@ -430,7 +430,7 @@
             <div id="discuss-timeline"></div>
             <!-- `discuss-followup-composer`: the main composer's box and keys. -->
             <div class="discuss-compose">
-              <textarea id="discuss-followup" rows="2" data-lpignore="true" data-1p-ignore="true" data-form-type="other" autocomplete="off" placeholder="Ask about this…" aria-label="Ask a follow-up"></textarea>
+              <textarea id="discuss-followup" enterkeyhint="send" rows="2" data-lpignore="true" data-1p-ignore="true" data-form-type="other" autocomplete="off" placeholder="Ask about this…" aria-label="Ask a follow-up"></textarea>
               <button id="discuss-send" type="button">Send</button>
             </div>
             <div id="discuss-footer" hidden>
@@ -709,7 +709,7 @@
               <div id="channel-composer">
                 <!-- No heading line: it read like one more message. The box says where the message
                      goes in its placeholder, and names itself to a screen reader the same way. -->
-                <textarea id="channel-compose-text" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
+                <textarea id="channel-compose-text" enterkeyhint="send" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
                 <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
                      so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
                 <button id="channel-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
@@ -764,7 +764,7 @@
                     <label for="reply-text">Your reply</label>
                     <p id="reply-target-meta" class="hint"></p>
                   </div>
-                  <textarea id="reply-text" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="4" placeholder="write a reply"></textarea>
+                  <textarea id="reply-text" enterkeyhint="send" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="4" placeholder="write a reply"></textarea>
                   <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
                        so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
                   <button id="reply-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
@@ -986,7 +986,7 @@
                 <ol id="side-pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
                 <ol id="side-outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
                 <div id="side-composer">
-                  <textarea id="side-compose-text" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="3" placeholder="Reply in this thread…" aria-label="Reply in this thread" aria-describedby="side-compose-state"></textarea>
+                  <textarea id="side-compose-text" enterkeyhint="send" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="3" placeholder="Reply in this thread…" aria-label="Reply in this thread" aria-describedby="side-compose-state"></textarea>
                   <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
                        so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
                   <button id="side-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
@@ -4093,7 +4093,7 @@
     -->
     <div id="quick-reply" class="quick-reply" role="group" aria-label="Quick reply" hidden>
       <blockquote id="quick-reply-quote" class="quick-reply-quote"></blockquote>
-      <textarea id="quick-reply-text" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="2" aria-label="Your reply to the quoted words" placeholder="Reply to these words"></textarea>
+      <textarea id="quick-reply-text" enterkeyhint="send" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="2" aria-label="Your reply to the quoted words" placeholder="Reply to these words"></textarea>
       <div class="quick-reply-actions">
         <!-- `#1315 floating-reply-dock`: at the actions row's start, the box's lower-left: docking
              moves the draft, its quote and its Post to main choice into the reply in the stream. -->
@@ -4121,6 +4121,14 @@
         <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11Z" /></svg>
       </button>
     </div>
+
+    <!--
+      `ios-keyboard-send`. A Send that stands at the keyboard's top while the keyboard covers the
+      focused box's own Send: over the page, put there by web/voice.js from the visual
+      viewport, and pressing the box's own Send. Hidden until the keyboard covers that Send, so
+      the two never stand together; a page whose script never runs shows no second Send at all.
+    -->
+    <button id="keyboard-send" class="keyboard-send" type="button" hidden>Send</button>
 
     <!--
       The dock: the third grid ROW, not a pinned or absolutely positioned overlay, which is why it

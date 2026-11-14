@@ -155,7 +155,12 @@ export function createComposerBoxes(deps: ComposerBoxesDependencies): ComposerBo
    *     it" — and the one place a reader who has just turned Enter off is looking.
    *   * Each box's `enterkeyhint`, which is what a phone's keyboard draws on its own return key: a
    *     send arrow while Enter sends, a return arrow while it is a new line. The key itself is the
-   *     hint, so no placeholder or extra line under a box has to carry it.
+   *     hint, so no placeholder or extra line under a box has to carry it. With it the box keeps
+   *     `inputmode="text"` (`ios-keyboard-send`): the pair is what WebKit reads for the return
+   *     key, and stating the text mode keeps a box whose mode dictation put down (`"none"`, which
+   *     this saying never undoes) the only one without a keyboard. WebKit still draws a return,
+   *     not Send, in a multiline box on some phones; the Send at the keyboard's top
+   *     (view/composer's keyboard) is the one that never depends on that drawing.
    */
   function renderEnterSends(): void {
     const sends = deps.enterSendsCurrent();
@@ -164,7 +169,10 @@ export function createComposerBoxes(deps: ComposerBoxesDependencies): ComposerBo
       ? "Shift+Enter starts a new line, and on a phone's keyboard so does ↵ in the box's corner."
       : `${sendChordName()} sends. Enter starts a new line.`;
     for (const id of COMPOSER_FIELDS) {
-      deps.el(id).setAttribute("enterkeyhint", sends ? "send" : "enter");
+      const box = deps.el(id) as HTMLElement & { getAttribute?: (name: string) => string | null };
+      box.setAttribute("enterkeyhint", sends ? "send" : "enter");
+      const mode = typeof box.getAttribute === "function" ? box.getAttribute("inputmode") : null;
+      if (mode !== "none") box.setAttribute("inputmode", "text");
     }
   }
 

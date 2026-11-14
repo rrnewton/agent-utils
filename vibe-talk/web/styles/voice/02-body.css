@@ -1016,6 +1016,34 @@
   display: none;
 }
 
+/* `ios-keyboard-send`. The Send at the keyboard's top: over the page at the foot web/voice.js
+   counts from the visual viewport, at the right hand's edge with its safe-area room, never in
+   the layout, so no list scrolls it and the keyboard cannot cover it. Absolute, like the
+   keyboard readout: the document itself never scrolls, so the layout viewport it is placed
+   against is the screen, and nothing here escapes a scroller it does not live in. 44px tall,
+   the touch target iOS asks for, as the new-line key is. Down (`hidden`) whenever the box's
+   own Send already stands in the visible part, so the reader never sees two. */
+.keyboard-send {
+  position: absolute;
+  right: calc(0.6rem + env(safe-area-inset-right));
+  bottom: 0.5rem;
+  z-index: var(--z-menu);
+  min-width: 5rem;
+  min-height: 2.75rem;
+  padding: 0 1rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.85rem;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.keyboard-send[hidden] {
+  display: none;
+}
+
 /* `#610 mobile-keyboard-compose`. The keyboard's numbers, for a screenshot from a phone (Settings › Typing ›
    Keyboard layout debug): over the top of everything, taking no touch. Placed against the layout viewport,
    as the document never scrolls (absolute, not fixed: nothing here escapes a scroller's containment), and

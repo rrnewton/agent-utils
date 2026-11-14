@@ -8696,6 +8696,13 @@ const screenKeyboard = createOnScreenKeyboard({
   closeSpeedPopover: () => closeSpeedPopover(),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   toFoot: (area) => scrollKeeping.toFoot(area),
+  // `ios-keyboard-send`. The Send at the keyboard's top, and each box's own Send it presses:
+  // every Send id stands once in the document, so the left column's lookup finds each.
+  cornerSend: () => leftEl("keyboard-send"),
+  normalSend: (field) => {
+    const sendId = KEYBOARD_SEND_PARTS[field.id];
+    return sendId ? leftEl(sendId) : null;
+  },
 });
 const { noteKeyboard, noteKeyboardReader, settleOnScroll, showKeyboardDebug, renderKeyboardDebug } = screenKeyboard;
 screenKeyboardRoom = screenKeyboard;
@@ -8800,6 +8807,7 @@ application.track(mountKeyboardListeners({
   keyboardDebugChecked: () => el("keyboard-debug").checked,
   showKeyboardDebug: () => showKeyboardDebug(storedKeyboardDebug()),
   afterThisTask: (act) => { setTimeout(act, 0); },
+  pressCornerSend: () => screenKeyboard.pressCornerSend(),
 }));
 // Before the first channel read, so the very first list of rows is already filtered rather
 // than appearing unfiltered for a frame and then rearranging under the reader.

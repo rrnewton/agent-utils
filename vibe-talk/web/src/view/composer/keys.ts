@@ -5,8 +5,15 @@
 
 import { focusMinimally } from "../dom/index.ts";
 
-/** The message boxes, each of which hands its Enter to `onKey`. */
-const COMPOSER_FIELDS = ["compose-text", "channel-compose-text", "reply-text", "side-compose-text"];
+/**
+ * Every box whose words a Send posts, each of which hands its Enter to `onKey`: the call's, the
+ * channel's and its right-column twin, the reply in the stream, the floating quick reply and the
+ * Discuss follow-up (`ios-keyboard-send`). The quick reply and the follow-up were missing, so
+ * `renderEnterSends` never named their return key and `isComposer` never read them as composers:
+ * on a phone their keyboards kept a plain return where the other boxes asked for Send.
+ */
+const COMPOSER_FIELDS = ["compose-text", "channel-compose-text", "reply-text", "side-compose-text",
+  "quick-reply-text", "discuss-followup"];
 
 /**
  * How long after a paste, a drop or a run of text put in outside a composition an Enter in the same

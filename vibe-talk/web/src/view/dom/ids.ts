@@ -361,6 +361,7 @@ export interface ElementById {
   "keyboard-debug-hint": HTMLParagraphElement;
   "keyboard-debug-readout": HTMLPreElement;
   "keyboard-keys": HTMLDivElement;
+  "keyboard-send": HTMLButtonElement;
   "link-kind-action": HTMLButtonElement;
   "link-kind-action-count": HTMLSpanElement;
   "link-kind-commit": HTMLButtonElement;

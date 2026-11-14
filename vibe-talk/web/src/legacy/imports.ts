@@ -87,6 +87,7 @@ export {
 } from "../view/dom/index.ts";
 export { SCREEN_TITLES, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
+  KEYBOARD_SEND_PARTS,
   NEWLINE_KEYS,
   createComposerBoxes,
   createComposerKeys,

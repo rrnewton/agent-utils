@@ -35,6 +35,11 @@ export interface KeyboardListenersDependencies {
   showKeyboardDebug(): void;
   /** Run `act` once the current task is done, as `setTimeout(act, 0)` did. */
   afterThisTask(act: () => void): void;
+  /**
+   * `ios-keyboard-send`. The Send at the keyboard's top pressed: the focused box's own Send.
+   * Optional: a page built without the corner Send hears no press for it.
+   */
+  pressCornerSend?(): unknown;
 }
 
 /** The listeners, mounted. */
@@ -66,6 +71,14 @@ export function mountKeyboardListeners(deps: KeyboardListenersDependencies): Key
     listen<Event>(document, type, () => deps.noteKeyboardReader(), { capture: true, passive: true });
   }
   listen<Event>(deps.lookup("keyboard-debug"), "change", () => deps.applyKeyboardDebug(deps.keyboardDebugChecked()));
+  // `ios-keyboard-send`. The Send at the keyboard's top keeps the focus in its box through the
+  // press (`mousedown`, which a tap is given too, would otherwise take the keyboard down), as
+  // the new-line key does (`wireNewlineKey`).
+  const cornerSend = deps.lookup("keyboard-send");
+  if (cornerSend && typeof deps.pressCornerSend === "function") {
+    listen<Event>(cornerSend, "mousedown", (event) => event.preventDefault());
+    listen<Event>(cornerSend, "click", () => deps.pressCornerSend!());
+  }
   deps.showKeyboardDebug();
   const keys = deps.virtualKeyboard();
   if (keys) listen<Event>(keys, "geometrychange", () => deps.noteKeyboard());
