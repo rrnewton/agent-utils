@@ -1424,6 +1424,8 @@ test("catchup read: Read hands the owner all blocks under the record key; tap, h
     if (savedDocument === undefined) delete globalThis.document;
     else globalThis.document = savedDocument;
   }
+});
+
 // ---- #1388 landing 1: live strike-through -------------------------------------------------------
 
 function strikeEl(tag, kids = [], href = null) {
