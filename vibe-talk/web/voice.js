@@ -1088,7 +1088,11 @@ const documentsView = createDocumentsView({
     }
   },
   onStatus: (text) => setStatus(text),
-  onLevelChange: () => shellNavigation.scheduleBackSync(),
+  // `#1515 page-update-reload-loses-controls`: the reader opening or
+  // closing re-decides the control pane, which is the reader's transport
+  // in every reader state — a reload reopens the reader with no read
+  // standing, and only this redraw stands the pane back up.
+  onLevelChange: () => { shellNavigation.scheduleBackSync(); voiceCall().renderControls(); },
   onBack: () => shellNavigation.documentBack(),
   onJumpToMention: (mention) => {
     void shellNavigation.jumpToSentMessage({

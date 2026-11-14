@@ -5445,7 +5445,10 @@ test("`#1039 documents-read-parity` stage 3: the reader's Read starts an owner d
 test("`#1505 documents-read-controls-highlight-tap`: a document read pauses and resumes from the pane", async () => {
   const page = devicePage();
   await openWiredDocument(page);
-  assert.equal(page.el("control-pane").hidden, true, "the pane stands before any document read");
+  // `#1515 page-update-reload-loses-controls`: the pane is the reader's
+  // transport in every reader state, so it already stands here — a reload
+  // reopens the reader with no read standing, and must find it standing.
+  assert.equal(page.el("control-pane").hidden, false, "the pane does not stand with the open reader before any read");
   await page.el("doc-read").click();
   await page.settle();
   assert.equal(playingKind(page), "document");
@@ -5463,11 +5466,56 @@ test("`#1505 documents-read-controls-highlight-tap`: a document read pauses and 
   assert.equal(page.pure("readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.paused : null"), false,
     "Resume did not carry the document read on");
   assert.equal(page.el("read-aloud-label").text(), "Pause");
-  // The read stopped, the pane leaves with it: the reader is full height again.
+  // The read stopped; the pane stands on with the reader (`#1515`): it is
+  // the transport that starts the next read, and the reader keeps it.
   await page.el("doc-read").click();
   await page.settle();
   assert.equal(playingId(page), null, "the premise: the read did not stop");
-  assert.equal(page.el("control-pane").hidden, true, "the pane stands after the document read ended");
+  assert.equal(page.el("control-pane").hidden, false, "the pane left with the stopped read while the reader stands");
+});
+
+test("`#1515 page-update-reload-loses-controls`: a reload reopens the reader with its transport standing, and the list without it", async () => {
+  const page = devicePage();
+  await openWiredDocument(page);
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.equal(playingId(page), "doc:field-notes", "the premise: no document read stands before the reload");
+  assert.equal(page.el("control-pane").hidden, false, "the premise: the pane does not stand with the read");
+  // A reload over the same storage, at the reader's own deep link: the
+  // reader reopens, no read can have survived, and the pane — the
+  // transport that starts the next read — stands with the reader.
+  const again = newPage(page.storage, SCRIPT, (p) => {
+    p.documents = [{
+      key: "field-notes", title: "Field notes",
+      content: WIRE_BLOCKS.join("\n\n") + "\n", outline: [],
+    }];
+    p.setAddress({ search: "?v=docs&d=field-notes" });
+  });
+  again.readAloud = DEVICE_SPEECH;
+  again.enableDeviceSpeech();
+  await signIn(again);
+  await again.settle();
+  assert.equal(again.tab(), "docs", "the reload did not reopen on Documents");
+  assert.equal(again.el("docs-reader").hidden, false, "the reload did not reopen the reader");
+  assert.equal(playingId(again), null, "a document read survived the reload");
+  assert.equal(again.el("control-pane").hidden, false, "the reload left the reopened reader with no controls bar");
+  assert.equal(again.el("read-aloud").hidden, false, "the reopened reader offers no Read in its bar");
+  assert.equal(again.el("read-speed").hidden, false, "the reopened reader offers no pace in its bar");
+  // The Documents list is not the reader: no pane there, as before.
+  const listed = newPage(page.storage, SCRIPT, (p) => {
+    p.documents = [{
+      key: "field-notes", title: "Field notes",
+      content: WIRE_BLOCKS.join("\n\n") + "\n", outline: [],
+    }];
+    p.setAddress({ search: "?v=docs" });
+  });
+  listed.readAloud = DEVICE_SPEECH;
+  listed.enableDeviceSpeech();
+  await signIn(listed);
+  await listed.settle();
+  assert.equal(listed.tab(), "docs", "the list reload did not open on Documents");
+  assert.equal(listed.el("docs-reader").hidden, true, "the premise: the list reload opened a reader");
+  assert.equal(listed.el("control-pane").hidden, true, "the Documents list grew a control pane");
 });
 
 test("`#1039 documents-read-parity` stage 3: the reader's Read prepares a cloud document only at its own route", async () => {

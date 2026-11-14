@@ -4620,15 +4620,19 @@ function renderControls() {
   // Read and pace are the channel's too — inert there while the pane itself stays the channel's.
   const channel = deps.currentView === "discord" && !live;
   const reading = channel || ((deps.docsReaderOpen || deps.discussOpen) && !live);
-  // `#1505 documents-read-controls-highlight-tap`: in Documents the pane is
-  // the reader's transport while a document read stands (playing, held or
-  // being fetched) — Read is its Pause, Stop and pace beside it (the strip
-  // steers but cannot pause). With no read standing the pane leaves with
-  // the reader as it did, so the reader keeps its full height. Synced here
-  // because a read's start and end are no view switch: the owner's state
-  // changes (`setReadState`) redraw these controls.
+  // `#1505 documents-read-controls-highlight-tap`, widened by
+  // `#1515 page-update-reload-loses-controls`: in Documents the pane is the
+  // reader's transport in EVERY reader state — Read starts a read, and
+  // while one stands (playing, held or being fetched) Read is its Pause,
+  // Stop and pace beside it (the strip steers but cannot pause). Gating it
+  // on a standing read lost the bar on every reload: a read cannot survive
+  // `location.reload()`, the reader reopens from its deep link, and
+  // nothing re-showed the pane. With no reader open the pane leaves, so
+  // the Documents list keeps its full height. Synced here because a
+  // reader opening or closing is no view switch: `setReadState` and the
+  // reader's level changes redraw these controls.
   if (deps.currentScreen === "main" && deps.currentView === "docs") {
-    deps.el("control-pane").hidden = !(deps.docsReaderOpen && (deps.readInProgress() || deps.pendingRead !== null));
+    deps.el("control-pane").hidden = !deps.docsReaderOpen;
   }
   deps.el("read-aloud").hidden = !reading;
   deps.el("read-speed").hidden = !reading;

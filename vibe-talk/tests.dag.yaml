@@ -1261,6 +1261,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1515 page-update-reload-loses-controls` against the real server binary: press
+  # `New version — reload` in the channel and reload at the reader's deep link, at
+  # 393x852 and 1280x800, and assert the bottom bar (and, in the reader, its pane)
+  # stands after every reload.
+  - group: check
+    job: page-update-reload-browser
+    desc: the bottom controls bar after a page-update reload in the channel, the Documents list and the reader, against the real server (fake chat upstream) in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/page_update_reload_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#1236 documents-reader-layout` against the real server binary: the reader's
   # measure and dress at phone and desk, split from documents-browser so it gates
   # in parallel with `#1235 documents-list-continuation`.
