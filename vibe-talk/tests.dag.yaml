@@ -278,6 +278,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 536870912
 
+  # `ios-keyboard-send` at an iPhone's size: every sending box's return key and input mode for the
+  # setting, a real Enter sending from the reply box, and the Send at the simulated keyboard's top
+  # while the row's own Send is outside the visible part. Chromium here, as its neighbours run;
+  # `--browser webkit` on a host with that browser installed runs the iOS engine, and a missing
+  # WebKit there skips with its reason rather than failing.
+  - group: check
+    job: ios-keyboard-send-browser
+    desc: every sending box names its return key, Enter sends, and a Send stands at the keyboard's top, at an iPhone size in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/ios_keyboard_send_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 240
+    cpu_timeout: 30
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
   # `#457 settings-server-side` in the browser engine, on two devices at once: one seeds the
   # server from its local choice, the other takes that choice on load, and a change on one
   # converges on the still-open other from the live stream, while a Screen and keys choice

@@ -85,3 +85,18 @@ sending, the attributes and the corner Send's place do not depend on that
 drawing: Enter sends through the key rule in every sending box, and the
 corner Send stands above where the keyboard will be whether or not the
 keyboard draws its key as Send.
+
+Follow-up (registration): the browser check is registered as
+`check.ios-keyboard-send-browser` in vibe-talk/tests.dag.yaml with a
+`make ios-keyboard-send-browser` target — Chromium at iPhone size by
+default, `--browser webkit` where that browser is installed, and a missing
+WebKit is a skip with its reason, never a failure.
+
+Process note: while building the combined tree after the gate (main had
+moved under the gated commit), one read-pause dictation assertion was
+changed (a kept-down keyboard reads as any input mode but `none`, the page
+now stating `text`) and a second was dropped where #1503's restart-on-end
+landed over it. That post-gate test edit was covered by recorded
+combined-tree checks (both typecheck configs, parse, the touched module
+tests and the read-pause browser walk), not by a fresh gate of that exact
+commit; next time a post-gate test edit gets a re-gate.

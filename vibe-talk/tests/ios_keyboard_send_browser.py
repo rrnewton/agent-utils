@@ -175,6 +175,13 @@ def arguments() -> argparse.Namespace:
         default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
+    parser.add_argument(
+        "--browser",
+        choices=["chromium", "webkit"],
+        default="chromium",
+        help="the engine to run (default: chromium, as validation runs it; webkit where that "
+             "browser is installed — a missing WebKit is a skip with its reason, never a failure)",
+    )
     return parser.parse_args()
 
 
@@ -186,11 +193,12 @@ def check(condition: bool, message: str) -> None:
 def main() -> int:
     args = arguments()
     try:
+        from playwright.sync_api import Error as PlaywrightError
         from playwright.sync_api import sync_playwright
     except ImportError as error:
         raise SystemExit(
             "Python Playwright is required: python3 -m pip install --user playwright && "
-            "python3 -m playwright install webkit"
+            "python3 -m playwright install chromium"
         ) from error
 
     api = FakeApi()
@@ -207,7 +215,18 @@ def main() -> int:
                 "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                               "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
             }
-            browser = playwright.webkit.launch(headless=True)
+            if args.browser == "webkit":
+                try:
+                    browser = playwright.webkit.launch(headless=True)
+                except PlaywrightError as error:
+                    if "Executable doesn't exist" not in str(error) and "executable doesn't exist" not in str(error):
+                        raise
+                    print("SKIP ios-keyboard-send: Playwright WebKit is not installed here, so the "
+                          "WebKit run is skipped (never a failure); install it with "
+                          "python3 -m playwright install webkit, or run --browser chromium")
+                    return 0
+            else:
+                browser = playwright.chromium.launch(headless=True)
             context = browser.new_context(**iphone)
             page = context.new_page()
             errors: list[str] = []
@@ -307,7 +326,7 @@ def main() -> int:
             browser.close()
     finally:
         server.shutdown()
-    print("ios-keyboard-send: WebKit at an iPhone size names every sending box's return key, "
+    print(f"ios-keyboard-send: {args.browser} at an iPhone size names every sending box's return key, "
           "sends on a real Enter, and stands a Send at the simulated keyboard's top")
     return 0
 
