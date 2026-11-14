@@ -130,6 +130,33 @@ element, a non-list `defer_unit_exclude`, a `defer_mode` other than
 "enforce"/"observe", a non-string `defer_observe_log`) refuse the start
 with exit 2, like every other malformed defer key.
 
+Shared measurement holds (#1521 gate-defer-shared-measurement-holds): in
+addition to `defer_holds_dir`, a gate reads the shared holds directory
+(host key `defer_shared_holds_dir`, default
+~/.local/state/measurement-holds, empty string disables it;
+$GATE_DEFER_SHARED_HOLDS_DIR overrides per key). Each `<name>.json` there
+holds {"schema_version": 1, "marker_file": <path, usually the JSON
+itself>, "max_hold_seconds": N, "owner": "<team>/<agent>", "reason":
+"...", "started_at": "<UTC ISO>"}; the hold is in force from `started_at`
+until `started_at + max_hold_seconds`, subject to the marker rules below.
+Owner-aware exemption: a gate whose $GATE_MEASUREMENT_OWNER equals a
+hold's `owner` is not deferred by that hold (its own gate and `--rerun`
+load checks are not held by its own measurement), while other holds
+still defer it. Expired holds (cap already passed) never defer, in
+either directory, and each is reported once — a stderr line plus the
+report state file ~/.local/state/agent-utils/gate-defer-hold-reports.json
+(override $GATE_DEFER_HOLD_REPORT_STATE) — so its owner cleans it up; a
+hold ended by a `WINDOW-END` line is ended, not expired. Malformed
+shared holds fail closed: unparseable JSON or missing/invalid fields
+DEFERS, naming the file and the parse error, and is re-reported every
+hour it persists, so a badly written hold cannot silently ruin a
+measurement or silently block forever. A missing marker file counts as
+expired only when the hold has no future end (cap already passed);
+otherwise it defers and is reported hourly like a malformed hold. The
+same expiry and fail-closed rules apply to `defer_holds_dir` holds.
+`gate.py status` shows shared holds with owner, reason and remaining
+time, and marks exempted and expired holds.
+
 Rerun tickets: --rerun marks a short solo rerun of a few already-run steps
 (at most RERUN_MAX_STEPS `--selected` steps). Since #1260 it runs in the
 shared class unless a selected step is declared timing-sensitive in the
@@ -412,7 +439,8 @@ def host_slot_cap(path: Path | None = None) -> tuple[int | None, str | None]:
     if (
         not set(raw) <= {"slots", "cpu_quota_cpus", "defer_unit_pattern", "defer_unit_exclude",
                          "defer_mode", "defer_observe_log", "owner_defers",
-                         "defer_holds_dir", "defer_holds_root", "defer_quiet_command"}
+                         "defer_holds_dir", "defer_holds_root", "defer_quiet_command",
+                         "defer_shared_holds_dir"}
         or isinstance(value, bool) or not isinstance(value, int) or value < 1
     ):
         return 1, f"gate slots config {path} must hold `slots = N` with N >= 1 (and optionally `cpu_quota_cpus = N`); capping at 1"
@@ -990,6 +1018,18 @@ DEFAULT_DEFER_CONFIG = Path("~/.local/etc/agent-utils/gate-defer.toml")
 #: Where observe mode records would-have-deferred checks (#1489).
 DEFAULT_DEFER_OBSERVE_LOG = Path("~/.local/state/agent-utils/gate-defer-observe.jsonl")
 
+#: The shared measurement-holds directory every team on the host writes
+#: to (#1521); a host may point it elsewhere or disable it with "".
+DEFAULT_SHARED_HOLDS_DIR = "~/.local/state/measurement-holds"
+
+#: Where expired/malformed hold reports are remembered so an expired
+#: hold is reported once and a malformed one only hourly (#1521).
+DEFAULT_HOLD_REPORT_STATE = Path("~/.local/state/agent-utils/gate-defer-hold-reports.json")
+
+#: Seconds before a still-malformed (or marker-missing) hold is reported
+#: again (#1521).
+HOLD_REPORT_REPEAT_S = 3600.0
+
 #: How often a deferred gate re-checks the protected units (#1406).
 DEFER_POLL_DEFAULT_S = 1.0
 
@@ -1016,6 +1056,7 @@ class DeferSettings:
     excludes: tuple[str, ...] = ()
     mode: str = "enforce"
     observe_log: str = ""
+    shared_holds_dir: str = DEFAULT_SHARED_HOLDS_DIR
 
 
 def defer_config_path() -> Path:
@@ -1023,7 +1064,8 @@ def defer_config_path() -> Path:
 
 
 _DEFER_KEYS = {"defer_unit_pattern", "defer_unit_exclude", "defer_mode", "defer_observe_log",
-               "owner_defers", "defer_holds_dir", "defer_quiet_command", "defer_holds_root"}
+               "owner_defers", "defer_holds_dir", "defer_quiet_command", "defer_holds_root",
+               "defer_shared_holds_dir"}
 
 
 def _glob_list(value: object, key: str, source: str, *, list_required: bool = False) -> tuple[str, ...]:
@@ -1054,8 +1096,8 @@ def _defer_from_mapping(raw: dict[str, object], source: str) -> DeferSettings:
     if not set(raw) <= _DEFER_KEYS:
         raise DeferConfigError(
             f"gate defer config {source} may only set defer_unit_pattern, defer_unit_exclude, "
-            "defer_mode, defer_observe_log, owner_defers, defer_holds_dir, defer_holds_root "
-            "and defer_quiet_command"
+            "defer_mode, defer_observe_log, owner_defers, defer_holds_dir, defer_holds_root, "
+            "defer_shared_holds_dir and defer_quiet_command"
         )
     patterns = _glob_list(raw.get("defer_unit_pattern", ""), "defer_unit_pattern", source)
     excludes = _glob_list(raw.get("defer_unit_exclude", []), "defer_unit_exclude", source,
@@ -1094,9 +1136,15 @@ def _defer_from_mapping(raw: dict[str, object], source: str) -> DeferSettings:
             f"gate defer config {source}: defer_holds_root must be a string, "
             f"not {holds_root!r}"
         )
+    shared_holds_dir = raw.get("defer_shared_holds_dir", DEFAULT_SHARED_HOLDS_DIR)
+    if not isinstance(shared_holds_dir, str):
+        raise DeferConfigError(
+            f"gate defer config {source}: defer_shared_holds_dir must be a string, "
+            f"not {shared_holds_dir!r}"
+        )
     return DeferSettings(
         patterns, owner_defers, source, holds_dir.strip(), quiet_command.strip(),
-        holds_root.strip(), excludes, mode, observe_log.strip(),
+        holds_root.strip(), excludes, mode, observe_log.strip(), shared_holds_dir.strip(),
     )
 
 
@@ -1164,6 +1212,9 @@ def defer_settings() -> DeferSettings:
     env_quiet = os.environ.get("GATE_DEFER_QUIET_COMMAND")
     if env_quiet is not None:
         settings = dataclasses.replace(settings, quiet_command=env_quiet.strip())
+    env_shared = os.environ.get("GATE_DEFER_SHARED_HOLDS_DIR")
+    if env_shared is not None:
+        settings = dataclasses.replace(settings, shared_holds_dir=env_shared.strip())
     return settings
 
 
@@ -1247,75 +1298,249 @@ def _parse_hold_timestamp(text: str) -> dt.datetime:
     return parsed
 
 
+def measurement_owner() -> str:
+    """This gate run's declared measurement owner (#1521):
+    $GATE_MEASUREMENT_OWNER, matched against a hold's `owner`."""
+
+    return os.environ.get("GATE_MEASUREMENT_OWNER", "").strip()
+
+
+@dataclasses.dataclass(frozen=True)
+class HoldFinding:
+    """One evaluated measurement hold (#1521): `status` is active,
+    exempt, expired, ended, malformed, missing-marker or inactive;
+    `blocker` is the deferral label when it defers, else None."""
+
+    name: str
+    path: str
+    status: str
+    owner: str = ""
+    reason: str = ""
+    detail: str = ""
+    remaining_seconds: float | None = None
+    blocker: str | None = None
+
+
+def _evaluate_hold(
+    declaration: Path, now: dt.datetime, *, shared: bool,
+    owner_wanted: str, relative_base: Path,
+) -> HoldFinding:
+    name = declaration.stem
+    try:
+        raw = json.loads(declaration.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("declaration is not a JSON object")
+        if shared:
+            version = raw.get("schema_version")
+            if isinstance(version, bool) or version != 1:
+                raise ValueError("schema_version must be 1")
+        status_raw = raw.get("marker_file", raw.get("status_file"))
+        if not isinstance(status_raw, str) or not status_raw:
+            raise ValueError("marker_file must name a file")
+        cap_raw = raw.get("max_hold_seconds")
+        if isinstance(cap_raw, bool) or not isinstance(cap_raw, (int, float)) or cap_raw <= 0:
+            raise ValueError("max_hold_seconds must be a positive number")
+        cap = float(cap_raw)
+        owner_raw = raw.get("owner", "")
+        if not isinstance(owner_raw, str):
+            raise ValueError("owner must be a string")
+        reason_raw = raw.get("reason", "")
+        if not isinstance(reason_raw, str):
+            raise ValueError("reason must be a string")
+        json_started: dt.datetime | None = None
+        started_raw = raw.get("started_at")
+        if started_raw is not None:
+            if not isinstance(started_raw, str) or not started_raw:
+                raise ValueError("started_at must be an ISO 8601 string")
+            json_started = _parse_hold_timestamp(started_raw)
+        elif shared:
+            raise ValueError("started_at must be an ISO 8601 string")
+    except (OSError, ValueError) as exc:
+        label = f"hold declaration {declaration}: {exc}"
+        return HoldFinding(name, str(declaration), "malformed",
+                           detail=str(exc), blocker=label)
+    owner, reason = owner_raw.strip(), reason_raw.strip()
+    status_path = Path(status_raw).expanduser()
+    if not status_path.is_absolute():
+        status_path = relative_base / status_path
+    started = json_started
+    ended = False
+    try:
+        lines = status_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        expiry = started + dt.timedelta(seconds=cap) if started is not None else None
+        if expiry is not None and now >= expiry:
+            return HoldFinding(name, str(declaration), "expired", owner, reason,
+                               detail=f"marker file {status_path} missing and cap passed at "
+                                      f"{expiry:%Y-%m-%dT%H:%M:%SZ}")
+        label = f"hold {name}: status file {status_path} unreadable: {exc}"
+        return HoldFinding(name, str(declaration), "missing-marker", owner, reason,
+                           detail=str(exc), blocker=label)
+    window_started: dt.datetime | None = None
+    in_force = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("WINDOW-START"):
+            try:
+                window_started = _parse_hold_timestamp(stripped[len("WINDOW-START"):])
+                in_force = True
+                ended = False
+            except ValueError as exc:
+                detail = f"status file {status_path}: bad WINDOW-START line {stripped!r}: {exc}"
+                return HoldFinding(name, str(declaration), "malformed", owner, reason,
+                                   detail=detail, blocker=f"hold {name}: {detail}")
+        elif stripped.startswith("WINDOW-END"):
+            in_force = False
+            ended = window_started is not None or started is not None
+    if window_started is not None:
+        started = window_started
+    if ended and not in_force:
+        return HoldFinding(name, str(declaration), "ended", owner, reason)
+    if started is None:
+        return HoldFinding(name, str(declaration), "inactive", owner, reason)
+    expiry = started + dt.timedelta(seconds=cap)
+    if now >= expiry:
+        return HoldFinding(name, str(declaration), "expired", owner, reason,
+                           detail=f"cap passed at {expiry:%Y-%m-%dT%H:%M:%SZ}")
+    if started > now:
+        return HoldFinding(name, str(declaration), "inactive", owner, reason)
+    # A legacy hold is in force only inside its WINDOW window; a shared
+    # (structured) hold is in force from started_at until its cap.
+    if not shared and window_started is not None and not in_force:
+        return HoldFinding(name, str(declaration), "inactive", owner, reason)
+    if not shared and json_started is None and window_started is None:
+        return HoldFinding(name, str(declaration), "inactive", owner, reason)
+    remaining = (expiry - now).total_seconds()
+    if owner_wanted and owner and owner == owner_wanted:
+        return HoldFinding(name, str(declaration), "exempt", owner, reason,
+                           remaining_seconds=remaining)
+    label = f"hold {name} ({status_path}) until {expiry:%Y-%m-%dT%H:%M:%SZ}"
+    if owner:
+        label += f" owner {owner}"
+    if reason:
+        label += f" reason {reason}"
+    label += f" {int(remaining)}s remaining"
+    return HoldFinding(name, str(declaration), "active", owner, reason,
+                       remaining_seconds=remaining, blocker=label)
+
+
+def evaluate_measurement_holds(
+    holds_dir: str, now: dt.datetime, holds_root: str = "", *, shared: bool = False,
+    measurement_owner: str | None = None,
+) -> tuple[list[str], list[HoldFinding]]:
+    """Blockers and per-hold findings in `holds_dir` (#1406, #1521).
+
+    The legacy contract: `<name>.json` naming `marker_file` (or
+    `status_file`) and `max_hold_seconds`; in force from the marker's
+    last `WINDOW-START <UTC>` until a later `WINDOW-END`, capped at
+    `max_hold_seconds`. The shared contract (#1521, `shared=True`) also
+    requires `schema_version` and `started_at`, and is in force from
+    `started_at` until its cap. A relative marker resolves against
+    `holds_root` when set, else the holds directory. Fail closed:
+    malformed declarations and (with a future end) missing markers
+    defer; expired holds never defer. An empty or absent directory
+    holds no holds."""
+
+    if not holds_dir:
+        return [], []
+    root = Path(holds_dir).expanduser()
+    if not root.is_dir():
+        return [], []
+    relative_base = Path(holds_root).expanduser() if holds_root else root
+    owner_wanted = (os.environ.get("GATE_MEASUREMENT_OWNER", "").strip()
+                    if measurement_owner is None else measurement_owner.strip())
+    findings = [
+        _evaluate_hold(declaration, now, shared=shared,
+                       owner_wanted=owner_wanted, relative_base=relative_base)
+        for declaration in sorted(root.glob("*.json"))
+    ]
+    return [f.blocker for f in findings if f.blocker is not None], findings
+
+
 def measurement_hold_blockers(
     holds_dir: str, now: dt.datetime, holds_root: str = ""
 ) -> list[str]:
-    """Active measurement-hold blockers in `holds_dir` (#1406), one label
-    per hold in force. The small file contract, reimplemented here: the
-    directory holds `<name>.json` declarations, each naming a marker file
-    (`marker_file`, or `status_file`) and a `max_hold_seconds` cap; the
-    hold is in force from the marker file's last `WINDOW-START <UTC>` line
-    until a later `WINDOW-END` line, capped at `max_hold_seconds` after
-    that start. A relative marker path resolves against `holds_root` when
-    the host sets one, else against the holds directory. Fail closed: a
-    declaration or marker file that cannot be parsed counts as an active
-    hold, and its label names the file and the problem. An empty or absent
-    directory holds no holds."""
+    """Active measurement-hold blockers in `holds_dir` (#1406)."""
 
-    if not holds_dir:
-        return []
-    root = Path(holds_dir).expanduser()
-    if not root.is_dir():
-        return []
-    relative_base = Path(holds_root).expanduser() if holds_root else root
-    blockers: list[str] = []
-    for declaration in sorted(root.glob("*.json")):
-        name = declaration.stem
-        try:
-            raw = json.loads(declaration.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                raise ValueError("declaration is not a JSON object")
-            status_raw = raw.get("marker_file", raw.get("status_file"))
-            if not isinstance(status_raw, str) or not status_raw:
-                raise ValueError("marker_file must name a file")
-            cap_raw = raw.get("max_hold_seconds")
-            if isinstance(cap_raw, bool) or not isinstance(cap_raw, (int, float)) or cap_raw <= 0:
-                raise ValueError("max_hold_seconds must be a positive number")
-            cap = float(cap_raw)
-        except (OSError, ValueError) as exc:
-            blockers.append(f"hold declaration {declaration}: {exc}")
-            continue
-        status_path = Path(status_raw).expanduser()
-        if not status_path.is_absolute():
-            status_path = relative_base / status_path
-        try:
-            lines = status_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError as exc:
-            blockers.append(f"hold {name}: status file {status_path} unreadable: {exc}")
-            continue
-        started: dt.datetime | None = None
-        in_force = False
-        problem: str | None = None
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("WINDOW-START"):
-                try:
-                    started = _parse_hold_timestamp(stripped[len("WINDOW-START"):])
-                    in_force = True
-                except ValueError as exc:
-                    problem = f"status file {status_path}: bad WINDOW-START line {stripped!r}: {exc}"
-                    break
-            elif stripped.startswith("WINDOW-END"):
-                in_force = False
-        if problem is not None:
-            blockers.append(f"hold {name}: {problem}")
-        elif in_force and started is not None:
-            expiry = started + dt.timedelta(seconds=cap)
-            if started <= now < expiry:
-                blockers.append(
-                    f"hold {name} ({status_path}) until {expiry:%Y-%m-%dT%H:%M:%SZ}"
-                )
+    blockers, _findings = evaluate_measurement_holds(holds_dir, now, holds_root)
     return blockers
+
+
+def hold_report_state_path() -> Path:
+    """Where hold reports are remembered (#1521):
+    $GATE_DEFER_HOLD_REPORT_STATE, else the per-user state file."""
+
+    raw = os.environ.get("GATE_DEFER_HOLD_REPORT_STATE", "")
+    return Path(raw).expanduser() if raw.strip() else DEFAULT_HOLD_REPORT_STATE.expanduser()
+
+
+def due_hold_reports(
+    findings: list[HoldFinding], now: dt.datetime, state_path: Path
+) -> list[str]:
+    """Report lines due for `findings` (#1521): an expired hold once
+    ever, a malformed or marker-missing hold once an hour. The state
+    file remembers what was reported; injected `now` decides due-ness."""
+
+    reportable = [f for f in findings if f.status in ("expired", "malformed", "missing-marker")]
+    if not reportable:
+        return []
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError):
+        state = {}
+    lines: list[str] = []
+    changed = False
+    for finding in reportable:
+        key = f"{finding.status}:{finding.path}:{finding.detail}"
+        last_raw = state.get(key)
+        last: dt.datetime | None = None
+        if isinstance(last_raw, str):
+            try:
+                last = _parse_hold_timestamp(last_raw)
+            except ValueError:
+                last = None
+        due = last is None or (
+            finding.status != "expired"
+            and (now - last).total_seconds() >= HOLD_REPORT_REPEAT_S
+        )
+        if not due:
+            continue
+        detail = f": {finding.detail}" if finding.detail else ""
+        lines.append(f"gate: hold report: {finding.status} hold {finding.name} "
+                     f"({finding.path}){detail}; owner should clean it up (#1521)")
+        state[key] = now.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        changed = True
+    if changed:
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(state, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"gate: warning: cannot write hold report state {state_path}: {exc}",
+                  file=sys.stderr, flush=True)
+    return lines
+
+
+def report_hold_findings(
+    findings: list[HoldFinding], now: dt.datetime, settings: DeferSettings
+) -> list[HoldFinding]:
+    """Emit due hold reports to stderr (#1521) and return `findings`."""
+
+    for line in due_hold_reports(findings, now, hold_report_state_path()):
+        print(line, file=sys.stderr, flush=True)
+    return findings
+
+
+def defer_hold_findings(
+    settings: DeferSettings, now: dt.datetime
+) -> list[HoldFinding]:
+    """Every hold finding across both hold directories (#1521)."""
+
+    _b1, legacy = evaluate_measurement_holds(settings.holds_dir, now, settings.holds_root)
+    _b2, shared = evaluate_measurement_holds(
+        settings.shared_holds_dir, now, settings.holds_root, shared=True)
+    return legacy + shared
 
 
 def quiet_command_blocker(command: str) -> str | None:
@@ -1346,7 +1571,12 @@ def defer_signals(
     itself failed (reported, not a blocker)."""
 
     units, problem = active_defer_units(settings.patterns, settings.excludes)
-    holds = measurement_hold_blockers(settings.holds_dir, now, settings.holds_root)
+    legacy_blockers, legacy_findings = evaluate_measurement_holds(
+        settings.holds_dir, now, settings.holds_root)
+    shared_blockers, shared_findings = evaluate_measurement_holds(
+        settings.shared_holds_dir, now, settings.holds_root, shared=True)
+    report_hold_findings(legacy_findings + shared_findings, now, settings)
+    holds = legacy_blockers + shared_blockers
     quiet = quiet_command_blocker(settings.quiet_command)
     return units, holds, quiet, problem
 
@@ -1413,7 +1643,8 @@ def _defer_applies(settings: DeferSettings, priority: str | None) -> bool:
     any configured signal applies, and owner priority defers too, unless
     the host file sets owner_defers = false."""
 
-    configured = bool(settings.patterns or settings.holds_dir or settings.quiet_command)
+    configured = bool(settings.patterns or settings.holds_dir
+                      or settings.shared_holds_dir or settings.quiet_command)
     return configured and (priority != "owner" or settings.owner_defers)
 
 
@@ -2491,11 +2722,14 @@ def _defer_status_lines(prefix: str) -> list[str]:
         settings = defer_settings()
     except DeferConfigError as exc:
         return [f"{prefix}: defer config unusable: {exc}; a new gate would refuse (exit 2)"]
-    if not (settings.patterns or settings.holds_dir or settings.quiet_command):
+    if not (settings.patterns or settings.holds_dir or settings.shared_holds_dir
+            or settings.quiet_command):
         return [f"{prefix}: no deferral configured ({settings.source}); "
                 f"defer mode: {settings.mode}"]
     try:
-        blockers, problem = defer_blockers(settings, defer_now())
+        now = defer_now()
+        blockers, problem = defer_blockers(settings, now)
+        findings = defer_hold_findings(settings, now)
     except DeferConfigError as exc:
         return [f"{prefix}: defer config unusable: {exc}; a new gate would refuse (exit 2)"]
     signals = []
@@ -2505,6 +2739,8 @@ def _defer_status_lines(prefix: str) -> list[str]:
         signals.append(f"excluded {list(settings.excludes)!r}")
     if settings.holds_dir:
         signals.append(f"holds dir {settings.holds_dir}")
+    if settings.shared_holds_dir:
+        signals.append(f"shared holds dir {settings.shared_holds_dir}")
     if settings.quiet_command:
         signals.append(f"quiet command {settings.quiet_command!r}")
     lines = [
@@ -2517,6 +2753,19 @@ def _defer_status_lines(prefix: str) -> list[str]:
     ]
     if problem is not None:
         lines.append(f"{prefix}: warning: {problem}; gates proceed without the unit check")
+    for finding in findings:
+        if finding.status in ("active", "exempt", "expired", "malformed", "missing-marker"):
+            parts = [f"hold {finding.name}: {finding.status}"]
+            if finding.owner:
+                parts.append(f"owner {finding.owner}")
+            if finding.reason:
+                parts.append(f"reason {finding.reason}")
+            if finding.remaining_seconds is not None:
+                parts.append(f"{int(finding.remaining_seconds)}s remaining")
+            if finding.detail and finding.status != "active":
+                parts.append(finding.detail)
+            suffix = " (exempt for this gate owner)" if finding.status == "exempt" else ""
+            lines.append(f"{prefix}: {', '.join(parts)}{suffix} (#1521)")
     return lines
 
 
@@ -3324,13 +3573,24 @@ def main(argv: list[str] | None = None) -> int:
             '  defer_mode = "enforce"                # or "observe": log, never wait\n'
             '  defer_observe_log = "~/.local/state/agent-utils/gate-defer-observe.jsonl"\n'
             '  defer_holds_dir = "/host/path/holds"  # measurement-hold declarations\n'
+            '  defer_shared_holds_dir = "~/.local/state/measurement-holds"  # shared holds (#1521; "" disables)\n'
             '  defer_quiet_command = "host-quiet"    # exit 0 means OK to run\n'
             "  owner_defers = true                   # owner priority defers too (default)\n"
-            "$GATE_DEFER_UNIT_PATTERN, $GATE_DEFER_HOLDS_DIR, $GATE_DEFER_MODE, "
+            "$GATE_DEFER_UNIT_PATTERN, $GATE_DEFER_HOLDS_DIR, "
+            "$GATE_DEFER_SHARED_HOLDS_DIR, $GATE_DEFER_MODE, "
             "$GATE_DEFER_OBSERVE_LOG and "
             "$GATE_DEFER_QUIET_COMMAND override per key (empty disables that "
-            "signal); an empty or unset unit pattern means no unit deferral, and "
-            "no configuration at all means no deferral. While a unit matching the "
+            "signal); an empty or unset unit pattern means no unit deferral. "
+            "Shared holds (#1521) live in defer_shared_holds_dir (default "
+            "~/.local/state/measurement-holds): each <name>.json holds "
+            '{"schema_version": 1, "marker_file": <path>, '
+            '"max_hold_seconds": N, "owner": "<team>/<agent>", '
+            '"reason": "...", "started_at": "<UTC ISO>"} and is in force '
+            "until started_at + max_hold_seconds. $GATE_MEASUREMENT_OWNER "
+            "matching a hold's owner exempts that hold for this gate. "
+            "Expired holds never defer and are reported once; malformed "
+            "shared holds defer (fail closed) and are re-reported hourly; "
+            "a missing marker defers unless its cap already passed. While a unit matching the "
             "pattern is active (`systemctl --user list-units --no-legend "
             "'<pattern>' --state=active`), a measurement hold is in force (a "
             "`<name>.json` declaration naming `marker_file` and "

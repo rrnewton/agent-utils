@@ -43,6 +43,9 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("GATE_DEFER_HOLDS_DIR", raising=False)
     monkeypatch.delenv("GATE_DEFER_QUIET_COMMAND", raising=False)
     monkeypatch.delenv("GATE_DEFER_NOW", raising=False)
+    monkeypatch.setenv("GATE_DEFER_SHARED_HOLDS_DIR", str(tmp_path / "no-shared-holds"))
+    monkeypatch.setenv("GATE_DEFER_HOLD_REPORT_STATE", str(tmp_path / "hold-reports.json"))
+    monkeypatch.delenv("GATE_MEASUREMENT_OWNER", raising=False)
     # Tests run real gate.py subprocesses whose commands wait on files in
     # tmp_path; with CPU containment on, each admitted command becomes a
     # real systemd user scope, and a test that times out leaves its scope
@@ -58,7 +61,9 @@ def _env(tmp_path: Path) -> dict[str, str]:
                            "GATE_INTERLEAVE_AFTER", "GATE_INTERLEAVE_CONFIG",
                            "GATE_DEFER_UNIT_PATTERN", "GATE_DEFER_MODE",
                            "GATE_DEFER_OBSERVE_LOG", "GATE_DEFER_HOLDS_DIR",
-                           "GATE_DEFER_QUIET_COMMAND", "GATE_DEFER_NOW")}
+                           "GATE_DEFER_QUIET_COMMAND", "GATE_DEFER_NOW",
+                           "GATE_DEFER_SHARED_HOLDS_DIR", "GATE_MEASUREMENT_OWNER",
+                           "GATE_DEFER_HOLD_REPORT_STATE")}
     return {**base, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
             "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
             "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml"),
@@ -66,6 +71,8 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "GATE_PHASE_PRIORITY_CONFIG": str(tmp_path / "gate-phase-priority.toml"),
             "GATE_BLACKOUT_CONFIG": str(tmp_path / "gate.toml"),
             "GATE_DEFER_CONFIG": str(tmp_path / "gate-defer.toml"),
+            "GATE_DEFER_SHARED_HOLDS_DIR": str(tmp_path / "no-shared-holds"),
+            "GATE_DEFER_HOLD_REPORT_STATE": str(tmp_path / "hold-reports.json"),
             "GATE_DEFER_POLL_S": "0.05",
             # A lane may run the suite under GATE_SLOTS=1; the tests assume the default.
             "GATE_SLOTS": "2",
@@ -2217,3 +2224,123 @@ def test_enforce_with_a_list_pattern_still_defers(tmp_path: Path) -> None:
     out, _ = gate.communicate(timeout=30)
     assert gate.returncode == 0, out
     assert f"deferred: waiting on {_STUB_UNIT}" in out
+
+
+# --------------------------------- shared measurement holds (#1521)
+
+
+def _shared_hold(holds: Path, name: str, **fields: object) -> Path:
+    holds.mkdir(parents=True, exist_ok=True)
+    path = holds / f"{name}.json"
+    data: dict[str, object] = {
+        "schema_version": 1, "marker_file": str(path), "max_hold_seconds": 3600,
+        "owner": "team-a/lane-1", "reason": "qualification run",
+        "started_at": "2026-11-12T11:30:00Z",
+    }
+    data.update(fields)
+    path.write_text(json.dumps(data))
+    return path
+
+
+def test_shared_hold_active_exempt_and_combined(tmp_path: Path) -> None:
+    """#1521: an active shared hold defers (naming owner, reason and
+    remaining time), the owner's own gate is exempt from it but not from
+    another hold, and both hold directories combine."""
+    gate = _gate_module()
+    shared = tmp_path / "shared"
+    _shared_hold(shared, "s")
+    blockers, findings = gate.evaluate_measurement_holds(str(shared), _NOW, shared=True)
+    assert len(blockers) == 1, blockers
+    assert "team-a/lane-1" in blockers[0] and "qualification run" in blockers[0]
+    assert "1800s remaining" in blockers[0], blockers
+    assert findings[0].status == "active" and findings[0].owner == "team-a/lane-1"
+    blockers, findings = gate.evaluate_measurement_holds(
+        str(shared), _NOW, shared=True, measurement_owner="team-a/lane-1")
+    assert blockers == [] and findings[0].status == "exempt", findings
+    blockers, findings = gate.evaluate_measurement_holds(
+        str(shared), _NOW, shared=True, measurement_owner="team-b/lane-2")
+    assert len(blockers) == 1 and findings[0].status == "active"
+    legacy = _marker_hold(tmp_path / "legacy", "w", "WINDOW-START 2026-11-12T11:30:00Z\n")
+    settings = gate.DeferSettings((), True, "t", holds_dir=str(legacy),
+                                  shared_holds_dir=str(shared))
+    _units, holds, _quiet, _problem = gate.defer_signals(settings, _NOW)
+    assert len(holds) == 2, holds
+
+
+def test_shared_hold_expired_reported_once_and_malformed_hourly(tmp_path: Path) -> None:
+    """#1521 (amended): expired holds never defer and are reported once;
+    malformed holds defer (fail closed) and are re-reported hourly.
+    Injected `now` only — no sleeps."""
+    gate = _gate_module()
+    state = tmp_path / "reports.json"
+    shared = tmp_path / "shared"
+    _shared_hold(shared, "old", started_at="2026-11-12T08:00:00Z")
+    blockers, findings = gate.evaluate_measurement_holds(str(shared), _NOW, shared=True)
+    assert blockers == [] and findings[0].status == "expired", findings
+    assert len(gate.due_hold_reports(findings, _NOW, state)) == 1
+    assert gate.due_hold_reports(findings, _NOW, state) == []
+    bad = tmp_path / "badshared"
+    bad.mkdir()
+    (bad / "b.json").write_text("{not json")
+    blockers, findings = gate.evaluate_measurement_holds(str(bad), _NOW, shared=True)
+    assert len(blockers) == 1 and findings[0].status == "malformed", findings
+    assert str(bad / "b.json") in blockers[0], blockers
+    assert len(gate.due_hold_reports(findings, _NOW, state)) == 1
+    assert gate.due_hold_reports(
+        findings, _NOW + dt.timedelta(minutes=30), state) == []
+    assert len(gate.due_hold_reports(
+        findings, _NOW + dt.timedelta(minutes=61), state)) == 1
+    missing = tmp_path / "missingshared"
+    _shared_hold(missing, "m")
+    data = json.loads((missing / "m.json").read_text())
+    del data["started_at"]
+    (missing / "m.json").write_text(json.dumps(data))
+    blockers, findings = gate.evaluate_measurement_holds(str(missing), _NOW, shared=True)
+    assert len(blockers) == 1 and findings[0].status == "malformed", findings
+
+
+def test_shared_hold_missing_marker_future_vs_expired(tmp_path: Path) -> None:
+    """#1521 (amended): a missing marker counts as expired only when the
+    hold has no future end; with a future cap it defers and is reported."""
+    gate = _gate_module()
+    state = tmp_path / "reports.json"
+    future = tmp_path / "future"
+    gone = str(tmp_path / "gone-marker.json")
+    _shared_hold(future, "f", marker_file=gone)
+    blockers, findings = gate.evaluate_measurement_holds(str(future), _NOW, shared=True)
+    assert len(blockers) == 1 and findings[0].status == "missing-marker", findings
+    assert len(gate.due_hold_reports(findings, _NOW, state)) == 1
+    past = tmp_path / "past"
+    _shared_hold(past, "p", marker_file=gone, started_at="2026-11-12T08:00:00Z")
+    blockers, findings = gate.evaluate_measurement_holds(str(past), _NOW, shared=True)
+    assert blockers == [] and findings[0].status == "expired", findings
+
+
+def test_shared_holds_config_and_owner_exempt_gate(tmp_path: Path) -> None:
+    """#1521: the host key defaults to the shared directory and validates,
+    status names the hold, and an owner-exempt gate runs at once."""
+    gate = _gate_module()
+    default = gate._defer_from_mapping({}, "t")
+    assert default.shared_holds_dir == "~/.local/state/measurement-holds", default
+    named = gate._defer_from_mapping({"defer_shared_holds_dir": "/tmp/holds"}, "t")
+    assert named.shared_holds_dir == "/tmp/holds"
+    assert gate._defer_from_mapping({"defer_shared_holds_dir": ""}, "t").shared_holds_dir == ""
+    with pytest.raises(gate.DeferConfigError):
+        gate._defer_from_mapping({"defer_shared_holds_dir": 3}, "t")
+    shared = tmp_path / "shared"
+    _shared_hold(shared, "s")
+    env = {**_env(tmp_path), "GATE_DEFER_SHARED_HOLDS_DIR": str(shared),
+           "GATE_DEFER_NOW": "2026-11-12T12:00:00+00:00",
+           "GATE_MEASUREMENT_OWNER": "team-a/lane-1"}
+    status = subprocess.run([PY, str(GATE), "status"], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert status.returncode == 0, status.stdout
+    assert "team-a/lane-1" in status.stdout and "exempt" in status.stdout, status.stdout
+    result = subprocess.run([PY, str(GATE), "--", "/bin/true"], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout
+    assert "deferred: waiting on hold s" not in result.stdout
+    env["GATE_MEASUREMENT_OWNER"] = "team-b/lane-2"
+    status = subprocess.run([PY, str(GATE), "status"], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert "1800s remaining" in status.stdout, status.stdout
