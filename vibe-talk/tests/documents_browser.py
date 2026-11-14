@@ -456,7 +456,8 @@ def main() -> int:
                 # stands there now (`#1515`), so a fixed phone coordinate
                 # would land on its controls instead of the document.
                 area_box = page.locator("#scroll-area").bounding_box()
-                check(area_box is not None, "the scroller has no box to tap in")
+                if area_box is None:
+                    raise AssertionError("the scroller has no box to tap in")
                 page.touchscreen.tap(area_box["x"] + 30, area_box["y"] + 40)
                 page.wait_for_function(
                     "() => document.getElementById('doc-outline-pop').hidden", timeout=20_000)
