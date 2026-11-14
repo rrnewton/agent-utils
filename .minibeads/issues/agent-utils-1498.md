@@ -1,6 +1,6 @@
 ---
 title: 'dagrun-model-crate: extract the DAG model and JSON IO into a small crate'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-dagmodel
@@ -33,3 +33,7 @@ Acceptance list, restated: 65 symbols grouped by kind. Env names (9): the delega
 # Notes
 
 Number reserved by coordb. No wall-clock assertions in new tests.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main in three steps: (a) 9eeed771, the dagrun-model crate with the model and JSON IO move; (b) b73e001d, the pure helpers, env module, and testrun-core root re-exports; (c) 4332e397, the acceptance compile test. Every acceptance-list row resolves from dagrun_model or testrun_core; dagrun re-exports each moved item under its old path, so no caller changed and the wire format is byte-identical. Local and slot gates green (one untouched merge-queue red in the step-(a) slot gate passed solo).
