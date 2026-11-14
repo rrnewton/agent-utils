@@ -1092,11 +1092,6 @@ const documentsView = createDocumentsView({
 // drawing are the view's. The Done acts it marks through are made below and read
 // only inside these thunks, as the Documents view's are.
 
-/** `#1388` landing 1. Restate an open summary's strike after any mark settles. */
-function refreshDiscussStrikes() {
-  try { discussView.refreshStrikes(); } catch { /* no panel yet */ }
-}
-
 /** The mounted Discuss view. */
 const discussView = createDiscussView({
   byId: (id) => el(id),
@@ -1149,6 +1144,11 @@ const discussView = createDiscussView({
     }
   },
 });
+
+/** `#1388` landing 1. Restate an open summary's strike after any mark settles. */
+const refreshDiscussStrikes = () => {
+  try { discussView.refreshStrikes(); } catch { /* no panel yet */ }
+};
 
 /** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */
 const documentsSelector = createViewSelector({
@@ -3533,13 +3533,6 @@ const quoteReadPercent = createQuoteReadPercent({
   render: (n) => messagePreferences.quoteReadPercent.render(n),
 });
 
-/** Draw every Mark read on reply control as the switches now stand. */
-function renderMarkReadSettings() {
-  messagePreferences.markRead.render(
-    markReadOnReplySwitch.on(), markReadQuoteGuardSwitch.on(), markReadFoldGuardSwitch.on(),
-    markReadNonquoteSwitch.on(), markReadFinalGuardSwitch.on(), markReadFirstGuardSwitch.on());
-}
-
 /** Mark read on reply itself: Yes unless the reader said No. Synced. */
 const markReadOnReplySwitch = createKeptSwitch({
   setting: DEVICE_SETTINGS.markReadOnReply, deviceSettings: () => deviceSettings(), initial: true,
@@ -3570,6 +3563,12 @@ const markReadFirstGuardSwitch = createKeptSwitch({
   setting: DEVICE_SETTINGS.markReadFirstGuard, deviceSettings: () => deviceSettings(), initial: true,
   render: () => renderMarkReadSettings(),
 });
+/** Draw every Mark read on reply control as the switches now stand. */
+const renderMarkReadSettings = () => {
+  messagePreferences.markRead.render(
+    markReadOnReplySwitch.on(), markReadQuoteGuardSwitch.on(), markReadFoldGuardSwitch.on(),
+    markReadNonquoteSwitch.on(), markReadFinalGuardSwitch.on(), markReadFirstGuardSwitch.on());
+};
 /** The first share of a long message, in percent (25 until the reader says otherwise). Synced. */
 const markReadFirstPercent = createMarkReadFirstPercent({
   deviceSettings: () => deviceSettings(),
