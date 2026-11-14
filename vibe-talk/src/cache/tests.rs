@@ -3355,7 +3355,10 @@ fn a_search_finds_a_reply_observed_before_a_channel_drop_and_flags_it_stale() {
         .served()
         .expect("served");
     assert_eq!(clean.hits.len(), 1, "held before any drop");
-    assert_eq!((clean.stale, clean.withheld, clean.dropped_ms), (0, 0, None));
+    assert_eq!(
+        (clean.stale, clean.withheld, clean.dropped_ms),
+        (0, 0, None)
+    );
 
     // A channel-wide drop after the reply was seen: the reply is found, flagged stale with
     // the drop's time — never hidden, and never shown as vouched-for either.
@@ -3372,7 +3375,11 @@ fn a_search_finds_a_reply_observed_before_a_channel_drop_and_flags_it_stale() {
         .search(&fx.chan, &request)
         .served()
         .expect("served");
-    assert_eq!(flagged.hits.len(), 1, "the owner's reply is still found: {flagged:?}");
+    assert_eq!(
+        flagged.hits.len(),
+        1,
+        "the owner's reply is still found: {flagged:?}"
+    );
     assert_eq!(flagged.hits[0].message.id.0, "r1");
     assert_eq!(flagged.stale, 1);
     assert_eq!(flagged.dropped_ms, Some(first + STEP));
