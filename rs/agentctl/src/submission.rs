@@ -122,6 +122,10 @@ use crate::harness::codex::{
     idle_composer as codex_idle_composer, pending_previews as codex_pending_previews,
     timer_row as codex_timer_row, QUEUE_HINT as CODEX_QUEUE_HINT,
 };
+use crate::harness::codex::{
+    only_placeholder_and_braille as codex_only_placeholder_and_braille,
+    without_braille_and_whitespace,
+};
 /// Positive evidence that a staged prompt left the composer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubmissionReceipt {
@@ -1108,8 +1112,11 @@ const DRAFT_SETTLE: Duration = Duration::from_secs(3);
 /// The draft a composer holds: its solid text, or a paste placeholder, which some Codex builds
 /// draw faint. `None` when it is empty.
 pub(crate) fn composer_draft(view: &ComposerView) -> Option<crate::stale_draft::Draft> {
+    if codex_only_placeholder_and_braille(&view.composer, &view.composer_solid) {
+        return None;
+    }
     let solid = view.composer_solid.trim();
-    if !solid.is_empty() {
+    if !without_braille_and_whitespace(solid).is_empty() {
         return Some(crate::stale_draft::Draft::from_composer(solid));
     }
     (paste_placeholders(&view.composer) > 0)
@@ -1498,9 +1505,15 @@ pub fn submit_verified(
     shown.note_before_paste(&before);
     // A harness that draws a paste placeholder faint (some Codex builds do) shows no solid text
     // for a paste left unsent; a new paste would join it, and the key would submit both.
-    let draft = match before.composer_solid.trim() {
-        "" if composer_draft(&before).is_some() => before.composer.trim(),
-        solid => solid,
+    let draft = if harness == "codex"
+        && codex_only_placeholder_and_braille(&before.composer, &before.composer_solid)
+    {
+        ""
+    } else {
+        match before.composer_solid.trim() {
+            "" if composer_draft(&before).is_some() => before.composer.trim(),
+            solid => solid,
+        }
     };
     if !draft.is_empty() {
         let preview: String = draft
@@ -1829,10 +1842,18 @@ fn composer_content(view: &ComposerView) -> String {
 
 /// Whether `view` shows an empty composer: no solid text and no paste placeholder. Faint
 /// placeholder and hint text, such as Claude Code's `Press up to edit queued messages`, and the
-/// reverse-video cursor cell do not count.
+/// reverse-video cursor cell do not count. Braille-pattern cells (U+2800-U+28FF) alone are
+/// decoration (the Codex idle animation), so a composer holding only those cells, whitespace
+/// and a Codex placeholder is also empty; text mixing braille with letters counts.
 #[must_use]
 pub fn composer_is_empty(view: &ComposerView) -> bool {
-    view.composer_solid.trim().is_empty() && paste_placeholders(&view.composer) == 0
+    if paste_placeholders(&view.composer) != 0 {
+        return false;
+    }
+    if codex_only_placeholder_and_braille(&view.composer, &view.composer_solid) {
+        return true;
+    }
+    without_braille_and_whitespace(view.composer_solid.trim()).is_empty()
 }
 
 /// Delete everything in the composer of `harness` in `pane_id` without submitting it, and prove
@@ -3358,6 +3379,101 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn codex_braille_idle_fixtures_agree_on_empty_and_idle() {
+        // Shared with the Python edition: the same screens must read the same way.
+        let cases: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/composer/codex-braille-cases.json"
+        ))
+        .unwrap();
+        let cases = cases.as_array().expect("fixture list");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let screen = case["screen"].as_str().unwrap();
+            let view = composer_view("codex", screen)
+                .unwrap_or_else(|| panic!("{name}: no composer in {screen:?}"));
+            assert_eq!(
+                composer_is_empty(&view),
+                case["empty"].as_bool().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                composer_draft(&view).is_some(),
+                !case["empty"].as_bool().unwrap(),
+                "{name} draft"
+            );
+            assert_eq!(
+                codex_idle_composer(screen),
+                case["idle"].as_bool().unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_braille_character_set_is_exactly_u2800_to_u28ff() {
+        for character in ['\u{2800}', '\u{28ff}', '⠋', '⣿'] {
+            assert!(
+                crate::harness::codex::is_braille_pattern(character),
+                "{character:?}"
+            );
+        }
+        for character in ['✻', '•', 'a', ' '] {
+            assert!(
+                !crate::harness::codex::is_braille_pattern(character),
+                "{character:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_idle_animation_frames_do_not_block_a_first_brief() {
+        for frame in ["⠋", "⠙⠹", "⠸⠼⠴⠦", "⣾⣽⣻"] {
+            let before = format!(
+                "Codex\n» {frame} \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n  GPT default · /work/project\n"
+            );
+            let replay = Replay::new(
+                before,
+                codex_v0_159_1::staged(),
+                codex_v0_159_1::submitted(),
+            );
+            let clock = Clock::default();
+            let outcome = submit_verified(
+                &replay,
+                "w1:p1",
+                "codex",
+                codex_v0_159_1::PROMPT,
+                SubmitTimeouts::default(),
+                &clock,
+            );
+            let receipt = receipt(outcome);
+            assert_eq!(receipt.key, "Enter", "{frame}");
+        }
+    }
+
+    #[test]
+    fn codex_mixed_braille_and_letters_still_blocks_a_first_brief() {
+        let before = "Codex\n» ⠋ hello ⠙\n  GPT default · /work/project\n".to_owned();
+        let replay = Replay::new(
+            before,
+            codex_v0_159_1::staged(),
+            codex_v0_159_1::submitted(),
+        );
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "codex",
+            codex_v0_159_1::PROMPT,
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        let reason = refusal(outcome);
+        assert!(reason.contains("refusing to append"), "{reason}");
+        assert!(replay.pastes.lock().unwrap().is_empty());
     }
 
     #[test]

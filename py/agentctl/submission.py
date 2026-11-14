@@ -92,6 +92,60 @@ _CODEX_QUEUE_HINT = "tab to queue message"
 #: draw ``›``; v0.159.1 draws ``»``, and keeps ``›`` for selection lists such as
 #: its folder-trust prompt.
 _CODEX_COMPOSER_MARKERS = ("›", "»")
+#: Codex's rotating composer placeholders (mirrors the Rust harness list).
+_CODEX_PLACEHOLDERS = (
+    "Ask Codex to do anything",
+    "Explain this codebase",
+    "Summarize recent commits",
+    "Implement {feature}",
+    "Find and fix a bug in @filename",
+    "Write tests for @filename",
+    "Improve documentation in @filename",
+    "Run /review on my current changes",
+    "Use /skills to list available skills",
+)
+
+
+def _is_braille_pattern(character: str) -> bool:
+    """Whether ``character`` is a braille pattern cell (U+2800-U+28FF)."""
+    return "\u2800" <= character <= "\u28ff"
+
+
+def _without_braille_and_whitespace(text: str) -> str:
+    return "".join(
+        character for character in text
+        if not character.isspace() and not _is_braille_pattern(character)
+    )
+
+
+def _is_subsequence(needle: str, haystack: str) -> bool:
+    iterator = iter(haystack)
+    return all(any(candidate == character for candidate in iterator) for character in needle)
+
+
+def _codex_only_placeholder_and_braille(composer: str, composer_solid: str) -> bool:
+    """Whether a Codex composer holds only its placeholder, braille cells and whitespace.
+
+    Codex draws an idle particle animation in braille-pattern cells over its
+    placeholder line. Those cells are decoration, not a draft. Real text,
+    including text that mixes braille with letters, is not decoration.
+    """
+    if _PASTE_PLACEHOLDER.search(composer) is not None:
+        return False
+    solid = _without_braille_and_whitespace(composer_solid)
+    if not solid:
+        return True
+    for placeholder in _CODEX_PLACEHOLDERS:
+        compact_placeholder = "".join(placeholder.split())
+        if solid == compact_placeholder:
+            return True
+        # Braille cells overlaid on a solid-drawn placeholder replace some of
+        # its cells, leaving a long in-order fragment of the placeholder.
+        if len(solid) * 2 >= len(compact_placeholder) and _is_subsequence(solid, compact_placeholder):
+            return True
+    return False
+
+
 _CODEX_READY_BLOCKERS = (
     _WORKING_MARKER, _CODEX_QUEUE_HINT, *_QUEUE_MARKERS,
     "paste again to expand", "trust this folder?", "trust and continue",
@@ -326,6 +380,8 @@ def _codex_view(rows: list[tuple[str, str]]) -> ComposerView | None:
     solid_lines = [solid for _, solid in body]
     plain_lines[0] = plain_lines[0][1:]
     solid_lines[0] = solid_lines[0][1:]
+    if _codex_only_placeholder_and_braille("\n".join(plain_lines), "\n".join(solid_lines)):
+        solid_lines = ["" for _ in solid_lines]
     return ComposerView(
         transcript="\n".join(plain for plain, _ in rows[:start]),
         composer="\n".join(plain_lines),
@@ -571,6 +627,10 @@ def submit_verified(
             )
         sleep(POLL_SECONDS)
     draft = before.composer_solid.strip()
+    if harness == "codex" and _codex_only_placeholder_and_braille(
+        before.composer, before.composer_solid
+    ):
+        draft = ""
     # A harness that draws a paste placeholder faint (some Codex builds do) shows no solid text
     # for a paste left unsent; a new paste would join it, and the key would submit both.
     if not draft and _PASTE_PLACEHOLDER.search(before.composer):
@@ -644,8 +704,17 @@ def submit_verified(
 
 
 def composer_is_empty(view: ComposerView) -> bool:
-    """No solid text and no paste placeholder: faint hints and the cursor cell do not count."""
-    return not view.composer_solid.strip() and not _PASTE_PLACEHOLDER.findall(view.composer)
+    """No solid text and no paste placeholder: faint hints and the cursor cell do not count.
+
+    Braille-pattern cells (U+2800-U+28FF) alone are decoration (the Codex idle
+    animation), so a composer holding only those cells, whitespace and a
+    Codex placeholder is also empty. Text mixing braille with letters counts.
+    """
+    if _PASTE_PLACEHOLDER.findall(view.composer):
+        return False
+    if _codex_only_placeholder_and_braille(view.composer, view.composer_solid):
+        return True
+    return not _without_braille_and_whitespace(view.composer_solid)
 
 
 def _composer_content(view: ComposerView) -> str:

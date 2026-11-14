@@ -31,6 +31,7 @@ from agentctl.submission import (
     _is_labelled_rule,
     _staged,
     codex_idle_composer,
+    composer_is_empty,
     composer_view,
     submit_verified,
 )
@@ -593,6 +594,37 @@ def test_codex_0_159_1_idle_composer_is_recognised(screen: str) -> None:
     assert "Ask Codex to do anything" in view.composer
     assert "~/project" in view.footer
     assert "Ask Codex" not in view.transcript
+
+
+_BRAILLE_FIXTURES = Path(__file__).resolve().parents[2] / "rs" / "agentctl" / "tests" / "fixtures" / "composer"
+
+
+def test_codex_braille_idle_fixtures_agree_on_empty_and_idle() -> None:
+    # Shared with the Rust edition: the same screens must read the same way.
+    cases = json.loads((_BRAILLE_FIXTURES / "codex-braille-cases.json").read_text())
+    assert cases, "fixture file must not be empty"
+    for case in cases:
+        view = composer_view("codex", case["screen"])
+        assert view is not None, case["name"]
+        assert composer_is_empty(view) == case["empty"], case["name"]
+        assert codex_idle_composer(case["screen"]) == case["idle"], case["name"]
+
+
+@pytest.mark.parametrize("frame", ["⠋", "⠙⠹", "⠸⠼⠴⠦", "⣾⣽⣻"])
+def test_codex_idle_animation_frames_do_not_block_a_first_brief(frame: str) -> None:
+    before = f"Codex\n» {frame} " + _dim("Ask Codex to do anything") + "\n  GPT default · /work/project\n"
+    replay = Replay(before, _V159_STAGED, _V159_SUBMITTED)
+    receipt = _replay_submit(replay, _V159_PROMPT)
+    assert getattr(receipt, "key") == "Enter"
+    assert replay.pastes == [f"{_PASTE_START}{_V159_PROMPT}{_PASTE_END}"]
+
+
+def test_codex_mixed_braille_and_letters_still_blocks_a_first_brief() -> None:
+    before = "Codex\n» ⠋ hello ⠙\n  GPT default · /work/project\n"
+    replay = Replay(before, _V159_STAGED, _V159_SUBMITTED)
+    with pytest.raises(PromptNotStaged, match="refusing to append"):
+        _replay_submit(replay, _V159_PROMPT)
+    assert replay.pastes == [] and replay.keys == []
 
 
 @pytest.mark.parametrize("screen", [

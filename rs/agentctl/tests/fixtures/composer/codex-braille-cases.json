@@ -1,0 +1,74 @@
+[
+  {
+    "name": "idle-frame-braille-only",
+    "screen": "Codex\n» ⠋⠙⠹⠸⠼\n  GPT default · /work/project\n",
+    "empty": true,
+    "idle": true
+  },
+  {
+    "name": "idle-frame-single-braille-cell",
+    "screen": "Codex\n» ⠋\n  GPT default · /work/project\n",
+    "empty": true,
+    "idle": true
+  },
+  {
+    "name": "idle-frame-braille-range-boundaries",
+    "screen": "Codex\n» ⠀⣿\n  GPT default · /work/project\n",
+    "empty": true,
+    "idle": true
+  },
+  {
+    "name": "idle-frame-braille-over-faint-placeholder",
+    "screen": "Codex\n» \u001b[2mAsk Codex to do anything\u001b[0m⠋⠙\n  GPT default · /work/project\n",
+    "empty": true,
+    "idle": true
+  },
+  {
+    "name": "idle-frame-placeholder-overlaid-with-braille",
+    "screen": "Codex\n» ⠁Ask Codex to do anything⠈\n  GPT default · /work/project\n",
+    "empty": true,
+    "idle": true
+  },
+  {
+    "name": "idle-frame-placeholder-fragmented-by-braille",
+    "screen": "Codex\n» Ask ⠋odex to do anything\n  GPT default · /work/project\n",
+    "empty": true,
+    "idle": true
+  },
+  {
+    "name": "idle-frame-braille-only-line",
+    "screen": "Codex\n» ⠋⠙⠹\n  ⠸⠼⠴\n  GPT default · /work/project\n",
+    "empty": true,
+    "idle": true
+  },
+  {
+    "name": "idle-frame-braille-line-and-placeholder-line",
+    "screen": "Codex\n» ⠋⠙⠹\n  \u001b[2mAsk Codex to do anything\u001b[0m\n  GPT default · /work/project\n",
+    "empty": true,
+    "idle": true
+  },
+  {
+    "name": "real-draft",
+    "screen": "Codex\n» hello world\n  GPT default · /work/project\n",
+    "empty": false,
+    "idle": false
+  },
+  {
+    "name": "mixed-braille-and-letters",
+    "screen": "Codex\n» ⠋ hello ⠙\n  GPT default · /work/project\n",
+    "empty": false,
+    "idle": false
+  },
+  {
+    "name": "non-braille-glyph-is-not-decoration",
+    "screen": "Codex\n» ✻\n  GPT default · /work/project\n",
+    "empty": false,
+    "idle": false
+  },
+  {
+    "name": "faint-paste-placeholder-is-a-draft",
+    "screen": "Codex\n» \u001b[2m[Pasted Content 1500 chars]\u001b[0m\n  GPT default · /work/project\n",
+    "empty": false,
+    "idle": false
+  }
+]

@@ -343,6 +343,7 @@ pub fn composer_draft(screen: &str) -> Option<String> {
     }
     let text = text.join("\n").trim().to_owned();
     (!text.is_empty()
+        && !crate::harness::codex::only_placeholder_and_braille(&text, &text)
         && !composer_placeholders()
             .iter()
             .any(|hint| text.starts_with(hint)))
@@ -764,6 +765,21 @@ pub(crate) mod tests {
         assert_eq!(
             composer_draft("❯ fix the flake\n────\n"),
             Some("fix the flake".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_codex_braille_idle_animation_is_not_a_composer_draft() {
+        for screen in [
+            "» ⠋⠙⠹⠸⠼\n\n  GPT default · /work/project\n",
+            "» ⠁Ask Codex to do anything⠈\n\n  GPT default · /work/project\n",
+            "» Ask ⠋odex to do anything\n\n  GPT default · /work/project\n",
+        ] {
+            assert_eq!(composer_draft(screen), None, "{screen}");
+        }
+        assert_eq!(
+            composer_draft("» ⠋ hello ⠙\n\n  GPT default · /work/project\n"),
+            Some("⠋ hello ⠙".to_owned())
         );
     }
 

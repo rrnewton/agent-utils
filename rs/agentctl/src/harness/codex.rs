@@ -223,6 +223,47 @@ pub const PENDING_HEADINGS: [&str; 4] = [
 /// prompt. A shorter preview counts only when it is the whole prompt.
 const PREVIEW_MIN_CHARS: usize = 12;
 
+/// Whether `character` is a braille pattern cell (U+2800-U+28FF).
+pub(crate) fn is_braille_pattern(character: char) -> bool {
+    ('\u{2800}'..='\u{28ff}').contains(&character)
+}
+
+/// `text` without braille-pattern cells or whitespace.
+pub(crate) fn without_braille_and_whitespace(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_whitespace() && !is_braille_pattern(*character))
+        .collect()
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut haystack_chars = haystack.chars();
+    needle
+        .chars()
+        .all(|character| haystack_chars.any(|candidate| candidate == character))
+}
+
+/// Whether a Codex composer holds only its placeholder, braille cells and whitespace.
+///
+/// Codex draws an idle particle animation in braille-pattern cells over its
+/// placeholder line. Those cells are decoration, not a draft. Real text,
+/// including text that mixes braille with letters, is not decoration.
+pub(crate) fn only_placeholder_and_braille(composer: &str, composer_solid: &str) -> bool {
+    if composer.contains("[Pasted text #") || composer.contains("[Pasted Content ") {
+        return false;
+    }
+    let solid = without_braille_and_whitespace(composer_solid);
+    if solid.is_empty() {
+        return true;
+    }
+    MARKERS.composer_placeholders.iter().any(|placeholder| {
+        let compact_placeholder: String =
+            placeholder.chars().filter(|c| !c.is_whitespace()).collect();
+        solid == compact_placeholder
+            || (solid.chars().count() * 2 >= compact_placeholder.chars().count()
+                && is_subsequence(&solid, &compact_placeholder))
+    })
+}
+
 fn view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
     let populated: Vec<usize> = rows
         .iter()
@@ -249,7 +290,10 @@ fn view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
         }
     }
     let start = start?;
-    let (composer, composer_solid) = composer_from(&rows[start..footer], 1);
+    let (composer, mut composer_solid) = composer_from(&rows[start..footer], 1);
+    if only_placeholder_and_braille(&composer, &composer_solid) {
+        composer_solid = "\n".repeat(composer_solid.matches('\n').count());
+    }
     Some(ComposerView {
         transcript: join_rows(&rows[..start]),
         composer,
@@ -266,10 +310,12 @@ pub(crate) fn idle_composer(screen: &str) -> bool {
     let Some(view) = composer_view("codex", screen) else {
         return false;
     };
-    if !view.composer_solid.trim().is_empty()
-        || view.composer.contains("[Pasted text #")
-        || view.composer.contains("[Pasted Content ")
+    if !only_placeholder_and_braille(&view.composer, &view.composer_solid)
+        && !view.composer_solid.trim().is_empty()
     {
+        return false;
+    }
+    if view.composer.contains("[Pasted text #") || view.composer.contains("[Pasted Content ") {
         return false;
     }
     let footer = view.footer.to_ascii_lowercase();
