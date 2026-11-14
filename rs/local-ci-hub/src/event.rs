@@ -7,7 +7,9 @@
 //! first-wins and no last-wins for conflicting bodies.
 
 use crate::pyjson::{dumps_pairs, parse, py_repr, py_str, PyValue};
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 
 /// Input event schema tag this reader accepts.
@@ -119,15 +121,58 @@ impl RawEvent {
         dumps_pairs(&self.value)
     }
 
+    /// Hash of the written-pair identity, for conflict comparison without
+    /// retaining the full encoding. Equality matches [`RawEvent::identity`]
+    /// up to SHA-256 collision resistance.
+    pub fn identity_hash(&self) -> String {
+        crate::digest::sha256_of(dumps_pairs(&self.value).as_bytes())
+    }
+
     /// Grouping key: Python `str(event_id)` over the dict view.
     pub fn grouping_id(&self) -> String {
         py_str(self.get("event_id"))
+    }
+
+    /// Grouping key borrowing the stored text when the id is already a
+    /// string (the common case), allocating only for coerced ids.
+    pub fn grouping_key(&self) -> Cow<'_, str> {
+        match self.get("event_id") {
+            Some(PyValue::Str(text)) => Cow::Borrowed(text.as_str()),
+            other => Cow::Owned(py_str(other)),
+        }
     }
 
     /// Total-order key: `(str(emitted_at), str(event_id))`.
     pub fn order_key(&self) -> (String, String) {
         (py_str(self.get("emitted_at")), py_str(self.get("event_id")))
     }
+}
+
+/// Borrowed `str(value)` text when it needs no coercion: a missing value
+/// reads as the empty string and a string reads as itself. Any other shape
+/// returns `None`, meaning the caller must fall back to [`py_str`].
+fn borrowed_py_str(value: Option<&PyValue>) -> Option<&str> {
+    match value {
+        None => Some(""),
+        Some(PyValue::Str(text)) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// Compare two envelope fields as Python compares their `str()` forms,
+/// without allocating when both sides borrow (the common string case).
+fn cmp_py_str(a: Option<&PyValue>, b: Option<&PyValue>) -> Ordering {
+    match (borrowed_py_str(a), borrowed_py_str(b)) {
+        (Some(left), Some(right)) => left.cmp(right),
+        _ => py_str(a).cmp(&py_str(b)),
+    }
+}
+
+/// Total order over events: `(str(emitted_at), str(event_id))`, compared
+/// without materialising owned keys for string fields.
+pub fn order_cmp(a: &RawEvent, b: &RawEvent) -> Ordering {
+    cmp_py_str(a.get("emitted_at"), b.get("emitted_at"))
+        .then_with(|| cmp_py_str(a.get("event_id"), b.get("event_id")))
 }
 
 /// A read refusal. Refusals are disjoint from validation results: none of
@@ -272,6 +317,12 @@ fn check_annotate(event: &RawEvent) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Validate one annotate event as metadata-only (the check [`union`]
+/// applies to every copy, exposed for streaming folds).
+pub fn check_annotate_event(event: &RawEvent) -> Result<(), Refusal> {
+    check_annotate(event)
+}
+
 /// Parse one ordinary stored line into a [`RawEvent`].
 ///
 /// Stored codec lines (carrying `legacy_row_codec`) must go through
@@ -299,26 +350,30 @@ pub fn parse_line(line: &str) -> Result<RawEvent, Refusal> {
 /// copy is compared against the first copy kept for its id. The result is
 /// in total order `(str(emitted_at), str(event_id))`.
 pub fn union(events: Vec<RawEvent>) -> Result<Vec<RawEvent>, Refusal> {
-    let mut first_identity: BTreeMap<String, String> = BTreeMap::new();
+    // Only identity hashes are retained (one per distinct id); the full
+    // written-pair encoding of each event is freed with the event.
+    let mut first_identity: HashMap<String, String> = HashMap::new();
     let mut kept: Vec<RawEvent> = Vec::new();
     for event in events {
         if event.kind() == Some(EventKind::RunAnnotate) {
             check_annotate(&event)?;
         }
-        let grouping = event.grouping_id();
-        match first_identity.get(&grouping) {
+        let grouping = event.grouping_key();
+        match first_identity.get(grouping.as_ref()) {
             None => {
-                first_identity.insert(grouping, event.identity());
+                first_identity.insert(grouping.into_owned(), event.identity_hash());
                 kept.push(event);
             }
             Some(first) => {
-                if *first != event.identity() {
-                    return Err(Refusal::ConflictingEventId { event_id: grouping });
+                if *first != event.identity_hash() {
+                    return Err(Refusal::ConflictingEventId {
+                        event_id: grouping.into_owned(),
+                    });
                 }
             }
         }
     }
-    kept.sort_by_cached_key(|event| event.order_key());
+    kept.sort_by(order_cmp);
     Ok(kept)
 }
 

@@ -7,15 +7,17 @@
 //! other version discards and rebuilds it. Nothing here is keyed by
 //! source-code hashes.
 
-use crate::event::{parse_line, union, RawEvent, Refusal};
-use crate::fold::fold_rows;
+use crate::event::{parse_line, EventKind, RawEvent, Refusal};
+use crate::fold::{build_correction_index, emit_terminal_row, row_line_and_hash, CorrectionTarget};
 use crate::pyjson::{dumps_sorted, parse, PyValue};
 use rusqlite::{params, Connection};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// Index schema version stored in the metadata table.
-pub const INDEX_VERSION: &str = "ci-hub-index/v1";
+/// Index schema version stored in the metadata table. `v2` stores sort
+/// keys and identity hashes beside each event so refolds stream in union
+/// order from disk instead of materialising the history.
+pub const INDEX_VERSION: &str = "ci-hub-index/v2";
 
 /// Read position in one shard: bytes consumed and the digest of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,9 +154,15 @@ CREATE TABLE events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   grouping_id TEXT NOT NULL,
   identity TEXT NOT NULL,
-  line TEXT NOT NULL
+  line TEXT NOT NULL,
+  sort_emitted TEXT NOT NULL,
+  sort_id TEXT NOT NULL,
+  event_id_str TEXT,
+  correct_candidate INTEGER NOT NULL
 );
 CREATE INDEX events_by_grouping ON events (grouping_id, seq);
+CREATE INDEX events_by_sort ON events (sort_emitted, sort_id, seq);
+CREATE INDEX events_by_str_id ON events (event_id_str, seq);
 CREATE TABLE rows_out (
   identity TEXT PRIMARY KEY,
   line TEXT NOT NULL,
@@ -203,7 +211,7 @@ impl Index {
         if !has_meta {
             conn.execute_batch(SCHEMA_SQL)?;
             conn.execute(
-                "INSERT INTO meta (key, value) VALUES ('index_version', ?1), ('authority', ?2), ('head', '')",
+                "INSERT INTO meta (key, value) VALUES ('index_version', ?1), ('authority', ?2), ('head', ''), ('rows_dirty', '0')",
                 params![INDEX_VERSION, authority],
             )?;
         }
@@ -236,7 +244,7 @@ impl Index {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA_SQL)?;
         conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('index_version', ?1), ('authority', ?2), ('head', '')",
+            "INSERT INTO meta (key, value) VALUES ('index_version', ?1), ('authority', ?2), ('head', ''), ('rows_dirty', '0')",
             params![INDEX_VERSION, authority],
         )?;
         Ok(Self {
@@ -285,35 +293,61 @@ impl Index {
         })
     }
 
-    /// Admit one batch of expanded events and advance to `next_cursor`.
-    ///
-    /// The batch is applied in one transaction: a conflicting `event_id`
-    /// body refuses the whole batch and stores nothing. Folded rows are
-    /// then rematerialized from every admitted event, so late arrivals
-    /// (older `emitted_at` in a new suffix) re-fold correctly. An empty
-    /// batch only records the new cursor; it never rematerializes, so
-    /// tailing in small pages should accumulate and apply once instead
-    /// of refolding per page.
-    pub fn apply(&mut self, batch: &[RawEvent], next_cursor: &Cursor) -> Result<()> {
-        let tx = self.conn.transaction()?;
+    /// Store one batch inside `tx` without refolding. Identical copies of
+    /// an admitted event collapse to the first copy; a conflicting body
+    /// refuses and (by transaction rollback) stores nothing. Returns how
+    /// many events were newly stored.
+    fn append_in_tx(
+        tx: &rusqlite::Transaction,
+        batch: &[RawEvent],
+        next_cursor: &Cursor,
+    ) -> Result<usize> {
+        let mut inserted = 0usize;
         for event in batch {
-            let grouping = event.grouping_id();
-            let identity = event.identity();
+            let grouping = event.grouping_key();
+            let identity = event.identity_hash();
             let first: Option<String> = tx
                 .query_row(
                     "SELECT identity FROM events WHERE grouping_id = ?1 ORDER BY seq LIMIT 1",
-                    params![grouping],
+                    params![grouping.as_ref()],
                     |row| row.get(0),
                 )
                 .ok();
             if let Some(first) = first {
                 if first != identity {
-                    return Err(Refusal::ConflictingEventId { event_id: grouping }.into());
+                    return Err(Refusal::ConflictingEventId {
+                        event_id: grouping.into_owned(),
+                    }
+                    .into());
                 }
+                continue;
             }
+            let (sort_emitted, sort_id) = event.order_key();
+            let event_id_str = event.get_str("event_id").filter(|s| !s.is_empty());
+            let correct_candidate = i64::from(
+                event.kind() == Some(EventKind::RunCorrect)
+                    && event.value.contains_key("legacy_row"),
+            );
             tx.execute(
-                "INSERT INTO events (grouping_id, identity, line) VALUES (?1, ?2, ?3)",
-                params![grouping, identity, event.line],
+                "INSERT INTO events (grouping_id, identity, line, sort_emitted, sort_id, event_id_str, correct_candidate) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    grouping.as_ref(),
+                    identity,
+                    event.line,
+                    sort_emitted,
+                    sort_id,
+                    event_id_str,
+                    correct_candidate
+                ],
+            )?;
+            inserted += 1;
+        }
+        if inserted > 0 {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES ('rows_dirty', '1') \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
             )?;
         }
         tx.execute(
@@ -328,46 +362,254 @@ impl Index {
                 params![path, pos.offset as i64, pos.prefix_sha256],
             )?;
         }
+        Ok(inserted)
+    }
+
+    /// Rematerialize folded rows inside `tx` by streaming admitted events
+    /// from disk in union order. Only correction rows, dedup hashes, and
+    /// one event/row at a time are retained; each raw event is dropped as
+    /// soon as its terminal row has been folded.
+    fn refold_in_tx(tx: &rusqlite::Transaction, workspace_root: &str) -> Result<()> {
+        let conn: &Connection = tx;
+        // Correction candidates are few; retain their lines, nothing else.
+        let candidate_lines: Vec<String> = {
+            let mut statement = conn.prepare(
+                "SELECT line FROM events WHERE correct_candidate = 1 \
+                 ORDER BY sort_emitted, sort_id, seq",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut candidates: Vec<RawEvent> = Vec::with_capacity(candidate_lines.len());
+        for line in &candidate_lines {
+            candidates.push(parse_line(line)?);
+        }
+        // Resolve every id the validation pass can ask about up front, so
+        // the pass itself is pure map lookups.
+        let mut wanted_known: HashSet<String> = HashSet::new();
+        let mut wanted_targets: HashSet<String> = HashSet::new();
+        for event in &candidates {
+            let reference = event
+                .get("enriches")
+                .filter(|v| v.truthy())
+                .or_else(|| event.get("supersedes"));
+            if let Some(id) = reference.and_then(|v| v.as_str()) {
+                wanted_known.insert(id.to_owned());
+            }
+            if let Some(id) = event.get_str("supersedes").filter(|s| !s.is_empty()) {
+                wanted_known.insert(id.to_owned());
+                wanted_targets.insert(id.to_owned());
+            }
+        }
+        let mut known_map: HashMap<String, bool> = HashMap::new();
+        for id in &wanted_known {
+            let found: bool = conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE event_id_str = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            known_map.insert(id.clone(), found);
+        }
+        let mut target_map: HashMap<String, CorrectionTarget> = HashMap::new();
+        for id in &wanted_targets {
+            let line: Option<String> = conn
+                .query_row(
+                    "SELECT line FROM events WHERE event_id_str = ?1 ORDER BY seq DESC LIMIT 1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(line) = line {
+                let target_event = parse_line(&line)?;
+                target_map.insert(id.clone(), CorrectionTarget::from_event(&target_event));
+            }
+        }
+        let corrections = build_correction_index(
+            candidates.iter(),
+            &|id| known_map.get(id).copied().unwrap_or(false),
+            &|id| target_map.get(id).cloned(),
+        )?;
+        drop(candidates);
+        drop(target_map);
+        drop(known_map);
+        conn.execute("DELETE FROM rows_out", [])?;
+        let mut select =
+            conn.prepare("SELECT line FROM events ORDER BY sort_emitted, sort_id, seq")?;
+        let mut insert = conn.prepare(
+            "INSERT INTO rows_out (identity, line, commit_id, run_id, host, finished_at, position) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        let mut rows = select.query([])?;
+        let mut seen_hashes: HashSet<String> = HashSet::new();
+        let mut position: i64 = 0;
+        while let Some(row) = rows.next()? {
+            let line: String = row.get(0)?;
+            let event = parse_line(&line)?;
+            let mut emitted: Option<(PyValue, String)> = None;
+            emit_terminal_row(
+                &corrections,
+                &mut seen_hashes,
+                &event,
+                workspace_root,
+                &mut |folded, text| {
+                    emitted = Some((folded, text));
+                },
+            )?;
+            // The raw event ends here; only its folded row (if any) lives on.
+            drop(event);
+            if let Some((folded, text)) = emitted {
+                let text_field = |key: &str| {
+                    folded
+                        .get(key)
+                        .and_then(PyValue::as_str)
+                        .map(ToOwned::to_owned)
+                };
+                let (_, hash) = row_line_and_hash(&folded);
+                insert.execute(params![
+                    hash,
+                    text,
+                    text_field("commit"),
+                    text_field("run_id"),
+                    text_field("host"),
+                    text_field("finished_at"),
+                    position,
+                ])?;
+                position += 1;
+            }
+        }
+        drop(rows);
+        drop(select);
+        drop(insert);
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('rows_dirty', '0') \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Admit one batch of expanded events and advance to `next_cursor`
+    /// without refolding. Tailing page by page therefore holds one page,
+    /// not the whole tail; call [`Index::refold`] once afterwards. A
+    /// conflicting `event_id` body refuses the whole batch and stores
+    /// nothing. Returns how many events were newly stored.
+    pub fn append_batch(&mut self, batch: &[RawEvent], next_cursor: &Cursor) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let inserted = Self::append_in_tx(&tx, batch, next_cursor)?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Whether admitted events have landed since the last refold (for
+    /// example pages stored by a load that was killed before refolding).
+    pub fn needs_refold(&self) -> Result<bool> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'rows_dirty'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(value.as_deref() == Some("1"))
+    }
+
+    /// Rematerialize folded rows from every admitted event, streaming from
+    /// disk so late arrivals (older `emitted_at` in a new suffix) re-fold
+    /// correctly at working-set memory.
+    pub fn refold(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        Self::refold_in_tx(&tx, &self.workspace_root.clone())?;
+        tx.commit()?;
+        self.refold_count += 1;
+        Ok(())
+    }
+
+    /// Admit one batch of expanded events and advance to `next_cursor`.
+    ///
+    /// The batch is applied in one transaction: a conflicting `event_id`
+    /// body refuses the whole batch and stores nothing. Folded rows are
+    /// then rematerialized from every admitted event, so late arrivals
+    /// (older `emitted_at` in a new suffix) re-fold correctly. An empty
+    /// batch only records the new cursor; it never rematerializes, so
+    /// tailing in small pages should accumulate and apply once instead
+    /// of refolding per page.
+    pub fn apply(&mut self, batch: &[RawEvent], next_cursor: &Cursor) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        Self::append_in_tx(&tx, batch, next_cursor)?;
         if batch.is_empty() {
             // Cursor-only advance: the materialized rows cannot change.
             tx.commit()?;
             return Ok(());
         }
-        // Rematerialize folded rows from the full admitted set.
-        let mut statement = tx.prepare("SELECT line FROM events ORDER BY seq")?;
-        let lines: Vec<String> = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        drop(statement);
-        let mut events: Vec<RawEvent> = Vec::with_capacity(lines.len());
-        for line in &lines {
-            events.push(parse_line(line)?);
-        }
-        let unioned = union(events)?;
-        let outcome = fold_rows(&unioned, &self.workspace_root)?;
-        tx.execute("DELETE FROM rows_out", [])?;
-        for (position, row) in outcome.rows.iter().enumerate() {
-            let text_field = |key: &str| {
-                row.get(key)
-                    .and_then(PyValue::as_str)
-                    .map(ToOwned::to_owned)
-            };
-            tx.execute(
-                "INSERT INTO rows_out (identity, line, commit_id, run_id, host, finished_at, position) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    dumps_sorted(row),
-                    outcome.lines[position],
-                    text_field("commit"),
-                    text_field("run_id"),
-                    text_field("host"),
-                    text_field("finished_at"),
-                    position as i64,
-                ],
-            )?;
-        }
+        Self::refold_in_tx(&tx, &self.workspace_root.clone())?;
         tx.commit()?;
         self.refold_count += 1;
+        Ok(())
+    }
+
+    /// Visit each folded row's canonical line in fold position order,
+    /// one line at a time (never a vector of the whole history).
+    pub fn for_each_row_line(&self, mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT line FROM rows_out ORDER BY position")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let line: String = row.get(0)?;
+            f(&line)?;
+        }
+        Ok(())
+    }
+
+    /// Visit each folded row in fold position order, parsing (and
+    /// dropping) one row at a time.
+    pub fn for_each_row(&self, mut f: impl FnMut(PyValue) -> Result<()>) -> Result<()> {
+        self.for_each_row_line(|line| {
+            let row = parse(line).map_err(|e| {
+                IndexError::Refused(Refusal::Malformed {
+                    reason: format!("stored row: {e}"),
+                })
+            })?;
+            f(row)
+        })
+    }
+
+    /// Visit folded rows grouped by commit (commits ascending, rows in
+    /// fold position order within each commit), holding one commit's
+    /// rows at a time. Rows without a string commit are skipped, as in
+    /// the slice grouping.
+    pub fn for_each_commit_rows(
+        &self,
+        mut f: impl FnMut(String, Vec<PyValue>) -> Result<()>,
+    ) -> Result<()> {
+        let mut statement = self.conn.prepare(
+            "SELECT commit_id, line FROM rows_out WHERE commit_id IS NOT NULL \
+             ORDER BY commit_id, position",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut current: Option<(String, Vec<PyValue>)> = None;
+        while let Some(row) = rows.next()? {
+            let commit: String = row.get(0)?;
+            let line: String = row.get(1)?;
+            let parsed = parse(&line).map_err(|e| {
+                IndexError::Refused(Refusal::Malformed {
+                    reason: format!("stored row: {e}"),
+                })
+            })?;
+            match &mut current {
+                Some((key, group)) if *key == commit => group.push(parsed),
+                _ => {
+                    if let Some((key, group)) = current.take() {
+                        f(key, group)?;
+                    }
+                    current = Some((commit, vec![parsed]));
+                }
+            }
+        }
+        if let Some((key, group)) = current.take() {
+            f(key, group)?;
+        }
         Ok(())
     }
 
@@ -376,12 +618,11 @@ impl Index {
         let mut statement = self
             .conn
             .prepare("SELECT line FROM rows_out WHERE commit_id = ?1 ORDER BY position")?;
-        let lines: Vec<String> = statement
-            .query_map(params![commit], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        let mut rows = Vec::with_capacity(lines.len());
-        for line in &lines {
-            rows.push(parse(line).map_err(|e| {
+        let mut rows_iter = statement.query(params![commit])?;
+        let mut rows = Vec::new();
+        while let Some(row) = rows_iter.next()? {
+            let line: String = row.get(0)?;
+            rows.push(parse(&line).map_err(|e| {
                 IndexError::Refused(Refusal::Malformed {
                     reason: format!("stored row: {e}"),
                 })
@@ -392,20 +633,11 @@ impl Index {
 
     /// Every folded row, in fold position order.
     pub fn all_rows(&self) -> Result<Vec<PyValue>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT line FROM rows_out ORDER BY position")?;
-        let lines: Vec<String> = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        let mut rows = Vec::with_capacity(lines.len());
-        for line in &lines {
-            rows.push(parse(line).map_err(|e| {
-                IndexError::Refused(Refusal::Malformed {
-                    reason: format!("stored row: {e}"),
-                })
-            })?);
-        }
+        let mut rows = Vec::new();
+        self.for_each_row(|row| {
+            rows.push(row);
+            Ok(())
+        })?;
         Ok(rows)
     }
 
@@ -415,19 +647,22 @@ impl Index {
         let mut out = String::new();
         out.push_str(&format!("index_version={INDEX_VERSION}\n"));
         out.push_str(&format!("cursor={}\n", dumps_sorted(&cursor.to_pyvalue())));
-        let mut statement = self
-            .conn
-            .prepare("SELECT grouping_id, identity, line FROM events ORDER BY seq")?;
-        let events: Vec<(String, String, String)> = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<std::result::Result<_, _>>()?;
-        drop(statement);
-        for (grouping, identity, line) in &events {
-            out.push_str(&format!("event {grouping} {identity} {line}\n"));
+        {
+            let mut statement = self
+                .conn
+                .prepare("SELECT grouping_id, identity, line FROM events ORDER BY seq")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let grouping: String = row.get(0)?;
+                let identity: String = row.get(1)?;
+                let line: String = row.get(2)?;
+                out.push_str(&format!("event {grouping} {identity} {line}\n"));
+            }
         }
-        for row in self.all_rows()? {
+        self.for_each_row(|row| {
             out.push_str(&format!("row {}\n", dumps_sorted(&row)));
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 

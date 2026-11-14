@@ -319,30 +319,49 @@ pub trait Store {
     fn fetch_object(&self, sha256: &str, max_bytes: u64) -> Result<FetchStream>;
 }
 
-/// Shared tail logic over whole shard byte strings.
+/// Shared tail logic over lazily loaded shards. At most one shard's
+/// bytes are held at a time: prefixes verify shard by shard (verified
+/// prefixes are remembered in `verified` for the caller's head), and
+/// shards the page never reaches are never loaded.
 ///
 /// `descends` says whether `current_head` descends from `cursor.head`
 /// (fresh cursors with an empty head always descend trivially). Returns
 /// the page plus reset bookkeeping per the contract's cursor rules.
+#[allow(clippy::too_many_arguments)]
 fn tail_shards(
     authority: &str,
     current_head: &str,
-    shards: &BTreeMap<String, Vec<u8>>,
+    paths: &[String],
+    sizes: &BTreeMap<String, u64>,
     cursor: &Cursor,
     descends: bool,
     limits: ReadLimits,
+    load: &dyn Fn(&str) -> Result<Vec<u8>>,
+    verified: &mut std::collections::HashSet<(String, u64, String)>,
 ) -> Result<ReadPage> {
     let fresh = cursor.head.is_empty();
     let mut reset: Option<ResetReason> = None;
     let mut starts: BTreeMap<String, u64> = BTreeMap::new();
-    for (path, bytes) in shards {
+    for path in paths {
         let Some(pos) = cursor.shards.get(path) else {
             starts.insert(path.clone(), 0);
             continue;
         };
-        let offset = pos.offset as usize;
-        let prefix_ok = offset <= bytes.len() && sha256_of(&bytes[..offset]) == pos.prefix_sha256;
+        let size = sizes.get(path).copied().unwrap_or(0);
+        let prefix_ok = if verified.contains(&(path.clone(), pos.offset, pos.prefix_sha256.clone()))
+        {
+            true
+        } else if pos.offset == 0 {
+            sha256_of(&[]) == pos.prefix_sha256
+        } else if pos.offset > size {
+            false
+        } else {
+            let bytes = load(path)?;
+            let offset = pos.offset as usize;
+            offset <= bytes.len() && sha256_of(&bytes[..offset]) == pos.prefix_sha256
+        };
         if prefix_ok {
+            verified.insert((path.clone(), pos.offset, pos.prefix_sha256.clone()));
             starts.insert(path.clone(), pos.offset);
         } else if descends && !fresh {
             return Err(StoreRefusal::new(
@@ -359,7 +378,7 @@ fn tail_shards(
         reset = Some(ResetReason::HeadRewrite);
     }
     for path in cursor.shards.keys() {
-        if !shards.contains_key(path) {
+        if !sizes.contains_key(path) {
             if descends && !fresh {
                 return Err(StoreRefusal::new(
                     RefusalClass::StoreRewrite,
@@ -375,43 +394,61 @@ fn tail_shards(
     let mut spent_bytes: u64 = 0;
     let mut more = false;
     let mut next_shards: BTreeMap<String, ShardPos> = BTreeMap::new();
-    for (path, bytes) in shards {
-        let mut position = starts.get(path).copied().unwrap_or(0) as usize;
-        if !more {
-            while position < bytes.len() {
-                // Lines are LF-terminated; a trailing partial line is not
-                // yet a stored event and stays unread.
-                let Some(newline) = bytes[position..].iter().position(|b| *b == b'\n') else {
-                    break;
-                };
-                let end = position + newline;
-                let line_bytes = &bytes[position..end];
-                let line = String::from_utf8_lossy(line_bytes).into_owned();
-                let cost = line.len() as u64;
-                if !events.is_empty()
-                    && (events.len() >= limits.max_events || spent_bytes + cost > limits.max_bytes)
-                {
-                    more = true;
-                    break;
-                }
-                if events.len() >= limits.max_events {
-                    more = true;
-                    break;
-                }
-                events.push(ShardEvent {
-                    shard: path.clone(),
-                    offset: position as u64,
-                    line,
-                });
-                spent_bytes += cost;
-                position = end + 1;
+    for path in paths {
+        let start = starts.get(path).copied().unwrap_or(0);
+        let size = sizes.get(path).copied().unwrap_or(0);
+        if more || start >= size {
+            // Page already full, or nothing unread: never load the shard.
+            // The position stays at its start and its prefix hash is the
+            // one already verified for that offset (empty at offset 0).
+            let prefix_sha256 = match cursor.shards.get(path) {
+                Some(pos) if pos.offset == start => pos.prefix_sha256.clone(),
+                _ => sha256_of(&[]),
+            };
+            next_shards.insert(
+                path.clone(),
+                ShardPos {
+                    offset: start,
+                    prefix_sha256,
+                },
+            );
+            continue;
+        }
+        let bytes = load(path)?;
+        let mut position = start as usize;
+        while position < bytes.len() {
+            // Lines are LF-terminated; a trailing partial line is not
+            // yet a stored event and stays unread.
+            let Some(newline) = bytes[position..].iter().position(|b| *b == b'\n') else {
+                break;
+            };
+            let end = position + newline;
+            let line_bytes = &bytes[position..end];
+            let line = String::from_utf8_lossy(line_bytes).into_owned();
+            let cost = line.len() as u64;
+            if !events.is_empty()
+                && (events.len() >= limits.max_events || spent_bytes + cost > limits.max_bytes)
+            {
+                more = true;
+                break;
             }
-            // A shard with unread complete lines left means more pages.
-            if !more && position < bytes.len() && bytes[position..].contains(&b'\n') {
-                // Only reachable when the byte budget stopped the page on
-                // its first line of this shard after prior shards filled it.
-                more = events.len() >= limits.max_events;
+            if events.len() >= limits.max_events {
+                more = true;
+                break;
             }
+            events.push(ShardEvent {
+                shard: path.clone(),
+                offset: position as u64,
+                line,
+            });
+            spent_bytes += cost;
+            position = end + 1;
+        }
+        // A shard with unread complete lines left means more pages.
+        if !more && position < bytes.len() && bytes[position..].contains(&b'\n') {
+            // Only reachable when the byte budget stopped the page on
+            // its first line of this shard after prior shards filled it.
+            more = events.len() >= limits.max_events;
         }
         next_shards.insert(
             path.clone(),
@@ -420,6 +457,7 @@ fn tail_shards(
                 prefix_sha256: sha256_of(&bytes[..position]),
             },
         );
+        // `bytes` drops here: one shard at a time.
     }
     Ok(ReadPage {
         events,
@@ -566,13 +604,26 @@ impl Store for MemoryStore {
     }
 
     fn read_from(&self, cursor: &Cursor, limits: ReadLimits) -> Result<ReadPage> {
+        let paths: Vec<String> = self.shards.keys().cloned().collect();
+        let sizes: BTreeMap<String, u64> = self
+            .shards
+            .iter()
+            .map(|(path, bytes)| (path.clone(), bytes.len() as u64))
+            .collect();
+        let shards = &self.shards;
+        let load =
+            |path: &str| -> Result<Vec<u8>> { Ok(shards.get(path).cloned().unwrap_or_default()) };
+        let mut verified = std::collections::HashSet::new();
         tail_shards(
             &self.id,
             &self.head_token(),
-            &self.shards,
+            &paths,
+            &sizes,
             cursor,
             self.descends(cursor),
             limits,
+            &load,
+            &mut verified,
         )
     }
 
@@ -656,6 +707,20 @@ impl FanOut {
     }
 }
 
+/// Per-head read cache for [`GitStore`]: shard inventory and sizes are
+/// discovered once per head, and verified prefixes stay verified while
+/// paging, so a sequential tail loads each shard's bytes at most once
+/// (plus one verification load on resume) instead of reloading every
+/// shard for every page.
+#[derive(Default)]
+struct GitCache {
+    head: String,
+    paths: Vec<String>,
+    sizes: BTreeMap<String, u64>,
+    verified: std::collections::HashSet<(String, u64, String)>,
+    descends: std::collections::HashMap<(String, String), bool>,
+}
+
 /// Git least-common-denominator connector (read side).
 ///
 /// Shards are read from git objects at one pinned ref, never from a working
@@ -669,6 +734,7 @@ pub struct GitStore {
     git_ref: String,
     shard_roots: Vec<String>,
     evidence_root: Option<PathBuf>,
+    cache: std::cell::RefCell<GitCache>,
 }
 
 impl GitStore {
@@ -686,6 +752,7 @@ impl GitStore {
             git_ref: git_ref.into(),
             shard_roots: vec!["ledger".to_owned(), "ledger-recovery".to_owned()],
             evidence_root: None,
+            cache: std::cell::RefCell::new(GitCache::default()),
         }
     }
 
@@ -769,6 +836,55 @@ impl GitStore {
         }
         Ok(shards)
     }
+
+    fn shard_size(&self, head: &str, path: &str) -> Result<u64> {
+        let out = self.git(&["cat-file", "-s", &format!("{head}:{path}")])?;
+        String::from_utf8_lossy(&out)
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| {
+                StoreRefusal::new(
+                    RefusalClass::Unavailable,
+                    format!("git cat-file -s failed for {path}"),
+                )
+            })
+    }
+
+    /// `(head, paths, sizes)` for the current head, discovered once and
+    /// reused while the head stands.
+    fn inventory(&self) -> Result<(String, Vec<String>, BTreeMap<String, u64>)> {
+        let head = self.head_commit()?;
+        {
+            let cache = self.cache.borrow();
+            if cache.head == head && !cache.paths.is_empty() {
+                return Ok((head, cache.paths.clone(), cache.sizes.clone()));
+            }
+        }
+        let paths = self.shard_paths(&head)?;
+        let mut sizes = BTreeMap::new();
+        for path in &paths {
+            sizes.insert(path.clone(), self.shard_size(&head, path)?);
+        }
+        let mut cache = self.cache.borrow_mut();
+        if cache.head != head {
+            cache.verified.clear();
+            cache.descends.clear();
+        }
+        cache.head = head.clone();
+        cache.paths = paths.clone();
+        cache.sizes = sizes.clone();
+        Ok((head, paths, sizes))
+    }
+
+    fn descends_cached(&self, cursor_head: &str, head: &str) -> bool {
+        let key = (cursor_head.to_owned(), head.to_owned());
+        if let Some(value) = self.cache.borrow().descends.get(&key) {
+            return *value;
+        }
+        let value = self.is_ancestor(cursor_head, head);
+        self.cache.borrow_mut().descends.insert(key, value);
+        value
+    }
 }
 
 /// Whether `path` names a ledger shard (`YYYY-MM[.part-NNNN].jsonl` under
@@ -849,11 +965,32 @@ impl Store for GitStore {
     }
 
     fn read_from(&self, cursor: &Cursor, limits: ReadLimits) -> Result<ReadPage> {
-        let head = self.head_commit()?;
-        let paths = self.shard_paths(&head)?;
-        let shards = self.shard_bytes(&head, &paths)?;
-        let descends = self.is_ancestor(&cursor.head, &head);
-        tail_shards(&self.id, &head, &shards, cursor, descends, limits)
+        let (head, paths, sizes) = self.inventory()?;
+        let descends = self.descends_cached(&cursor.head, &head);
+        let load_head = head.clone();
+        let load = |path: &str| -> Result<Vec<u8>> {
+            self.git(&["cat-file", "blob", &format!("{load_head}:{path}")])
+        };
+        let mut verified = {
+            let mut cache = self.cache.borrow_mut();
+            if cache.head != head {
+                cache.verified.clear();
+            }
+            std::mem::take(&mut cache.verified)
+        };
+        let page = tail_shards(
+            &self.id,
+            &head,
+            &paths,
+            &sizes,
+            cursor,
+            descends,
+            limits,
+            &load,
+            &mut verified,
+        );
+        self.cache.borrow_mut().verified = verified;
+        page
     }
 
     fn fetch_object(&self, sha256: &str, max_bytes: u64) -> Result<FetchStream> {

@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use local_ci_hub::digest::receipt_digest;
 use local_ci_hub::event::{check_events, is_fixture_event, union, Refusal};
 use local_ci_hub::expand::{expand_line_with, ExpandConfig, FileEvidence, NoEvidence};
-use local_ci_hub::fold::{rows_by_commit, terminal_lines_sorted};
+use local_ci_hub::fold::terminal_row;
 use local_ci_hub::index::{Cursor, Index};
 use local_ci_hub::pyjson::{dumps_sorted, PyValue};
 use local_ci_hub::store::{GitStore, ReadLimits, Role, Store};
@@ -128,12 +128,10 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
     let fixture_producers: BTreeSet<String> = cli.fixture_producer.iter().cloned().collect();
     let mut filtered_fixtures: usize = 0;
     let mut cursor = start;
-    // Tail the authority page by page, but admit the whole tail in ONE
-    // apply: Index::apply rematerializes the fold from every admitted
-    // event, so applying per page refolds the full history on each page
-    // of one load. Pages are still expanded and envelope-checked as they
-    // arrive, so refusals surface before anything is stored.
-    let mut pending: Vec<local_ci_hub::event::RawEvent> = Vec::new();
+    // Tail the authority page by page, admitting each page to the index
+    // as it arrives (one page in memory at a time), then refold once.
+    // Pages are expanded and envelope-checked before admission, so
+    // refusals surface before their page is stored.
     loop {
         let page = store
             .read_from(&cursor, ReadLimits::default())
@@ -161,8 +159,11 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
         if let Err(refusal) = check_events(&unioned) {
             refusal_exit(&refusal);
         }
-        pending.extend(unioned);
-        cursor = page.next_cursor.clone();
+        let next_cursor = page.next_cursor.clone();
+        index
+            .append_batch(&unioned, &next_cursor)
+            .map_err(|e| format!("{e}"))?;
+        cursor = next_cursor;
         if !page.more {
             break;
         }
@@ -170,7 +171,9 @@ fn load(cli: &Cli) -> Result<Loaded, String> {
     if filtered_fixtures > 0 {
         eprintln!("local-ci-hub: filtered {filtered_fixtures} fixture events");
     }
-    index.apply(&pending, &cursor).map_err(|e| format!("{e}"))?;
+    if index.needs_refold().map_err(|e| format!("{e}"))? {
+        index.refold().map_err(|e| format!("{e}"))?;
+    }
     Ok(Loaded {
         index,
         cursor,
@@ -273,34 +276,32 @@ fn main() {
         Command::Ledger {
             action: LedgerAction::Rows { terminals },
         } => {
-            let rows = match loaded.index.all_rows() {
-                Ok(rows) => rows,
-                Err(error) => {
+            if *terminals {
+                // Terminal lines are the working set; rows stream past.
+                let mut lines: Vec<String> = Vec::new();
+                if let Err(error) = loaded.index.for_each_row(|row| {
+                    lines.push(dumps_sorted(&terminal_row(&row)));
+                    Ok(())
+                }) {
                     eprintln!("local-ci-hub: {error}");
                     std::process::exit(2);
                 }
-            };
-            if *terminals {
-                for line in terminal_lines_sorted(&rows) {
+                lines.sort();
+                for line in &lines {
                     println!("{line}");
                 }
-            } else {
-                for row in &rows {
-                    println!("{}", dumps_sorted(row));
-                }
+            } else if let Err(error) = loaded.index.for_each_row_line(|line| {
+                println!("{line}");
+                Ok(())
+            }) {
+                eprintln!("local-ci-hub: {error}");
+                std::process::exit(2);
             }
         }
         Command::Ledger {
             action: LedgerAction::DigestRows,
         } => {
-            let rows = match loaded.index.all_rows() {
-                Ok(rows) => rows,
-                Err(error) => {
-                    eprintln!("local-ci-hub: {error}");
-                    std::process::exit(2);
-                }
-            };
-            for row in &rows {
+            if let Err(error) = loaded.index.for_each_row(|row| {
                 let object = PyValue::Object(vec![
                     (
                         "run_id".to_owned(),
@@ -308,27 +309,24 @@ fn main() {
                     ),
                     (
                         "digest".to_owned(),
-                        match receipt_digest(row) {
+                        match receipt_digest(&row) {
                             Some(digest) => PyValue::Str(digest),
                             None => PyValue::Null,
                         },
                     ),
                 ]);
                 println!("{}", dumps_sorted(&object));
+                Ok(())
+            }) {
+                eprintln!("local-ci-hub: {error}");
+                std::process::exit(2);
             }
         }
         Command::Ledger {
             action: LedgerAction::Verdicts,
         } => {
-            let rows = match loaded.index.all_rows() {
-                Ok(rows) => rows,
-                Err(error) => {
-                    eprintln!("local-ci-hub: {error}");
-                    std::process::exit(2);
-                }
-            };
             let active_policy = policy(&cli);
-            for (commit, commit_rows) in rows_by_commit(&rows) {
+            if let Err(error) = loaded.index.for_each_commit_rows(|commit, commit_rows| {
                 let assessment = assess(&commit_rows, &commit, &active_policy);
                 let verdict_text = match assessment.verdict {
                     Verdict::Qualified => "qualified",
@@ -345,6 +343,10 @@ fn main() {
                     ("verdict".to_owned(), PyValue::Str(verdict_text.to_owned())),
                 ]);
                 println!("{}", dumps_sorted(&object));
+                Ok(())
+            }) {
+                eprintln!("local-ci-hub: {error}");
+                std::process::exit(2);
             }
         }
     }
