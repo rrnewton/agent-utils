@@ -317,7 +317,9 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
         arg=blocks[0][:20],
         timeout=20_000)
-    check(page.locator("#control-pane").is_hidden(), "the call controls show over the reader")
+    # `#1515 page-update-reload-loses-controls`: the reader's transport
+    # pane stands over the reader in every state, read or no read.
+    check(page.locator("#control-pane").is_visible(), "the reader's controls do not stand over the reader")
 
     # The device/cloud toggle is the Documents view's too now, starting on the
     # server voice; one tap picks the device for the read that follows.

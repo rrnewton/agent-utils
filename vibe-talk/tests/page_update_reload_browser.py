@@ -29,6 +29,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from typing import cast
 
 from playwright.sync_api import Page, sync_playwright
 
@@ -64,18 +65,19 @@ def check(condition: bool, message: str) -> None:
 def free_port() -> int:
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
+    port = int(sock.getsockname()[1])
     sock.close()
     return port
 
 
-def call(base: str, method: str, path: str, token: str, body: dict | None = None) -> dict:
+def call(base: str, method: str, path: str, token: str,
+         body: dict[str, object] | None = None) -> dict[str, object]:
     req = urllib.request.Request(
         base + path, method=method,
         data=json.dumps(body).encode() if body is not None else None,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode() or "{}")
+        return cast(dict[str, object], json.loads(resp.read().decode() or "{}"))
 
 
 def assert_bar(page: Page, label: str, pane: bool) -> None:
@@ -155,7 +157,7 @@ def main() -> int:
             doc_key = ""
             while time.time() < deadline:
                 answer = call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)
-                docs = answer.get("documents", [])
+                docs = cast(list[dict[str, object]], answer.get("documents", []))
                 if len(docs) >= 1:
                     doc_key = str(docs[0].get("key") or docs[0].get("file_name") or "")
                     break

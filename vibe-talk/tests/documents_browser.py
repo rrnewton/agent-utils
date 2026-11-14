@@ -401,7 +401,9 @@ def main() -> int:
                     "Viewport events ride along.",
                 ], f"the wrapped items drew as {wrapped['items']}")
                 check(wrapped["spills"] == 0, "a wrapped tail spilled as its own paragraph")
-                check(page.locator("#control-pane").is_hidden(), "the call controls show over the reader")
+                # `#1515 page-update-reload-loses-controls`: the reader's
+                # transport pane stands over the reader in every state.
+                check(page.locator("#control-pane").is_visible(), "the reader's controls do not stand over the reader")
 
                 # The title is the source link (#1038): href, new tab, no opener.
                 title_link = page.locator("#doc-title a")
@@ -450,7 +452,12 @@ def main() -> int:
                 page.wait_for_function(
                     "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
                 top_before = page.evaluate("() => document.getElementById('scroll-area').scrollTop")
-                page.touchscreen.tap(30, 700)
+                # Inside the scroller, clear of the dock: the reader's pane
+                # stands there now (`#1515`), so a fixed phone coordinate
+                # would land on its controls instead of the document.
+                area_box = page.locator("#scroll-area").bounding_box()
+                check(area_box is not None, "the scroller has no box to tap in")
+                page.touchscreen.tap(area_box["x"] + 30, area_box["y"] + 40)
                 page.wait_for_function(
                     "() => document.getElementById('doc-outline-pop').hidden", timeout=20_000)
                 top_after = page.evaluate("() => document.getElementById('scroll-area').scrollTop")
