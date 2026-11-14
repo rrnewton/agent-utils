@@ -1388,6 +1388,39 @@ pub struct PinChange {
     pub revision: i64,
 }
 
+/// One explicit thread-pin state the owner set. `#1550 thread-list-pins`.
+///
+/// THREAD pins, separate from message pins ([`Pin`]): a thread pin keeps no
+/// snapshot, only the owner's choice. A bang-bound thread (its root is a
+/// `!@NAME` post, recorded by the bridge in `thread-bindings.json`, #917) is
+/// pinned by default with no row here; a row with `pinned: false` is the
+/// owner's unpin of such a thread, and it stays unpinned until re-pinned.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ThreadPinRecord {
+    /// The thread, in the provider-neutral namespace the page was served it in.
+    pub thread_id: String,
+    /// Whether the owner pinned it (`false` records an unpin of a default).
+    pub pinned: bool,
+}
+
+/// A channel's explicit thread-pin records, and the revision they are at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadPins {
+    /// Every explicit record, by thread id.
+    pub records: Vec<ThreadPinRecord>,
+    /// See [`StateStore::thread_pins_revision`].
+    pub revision: i64,
+}
+
+/// What one thread pin or unpin did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadPinChange {
+    /// Whether the call changed what is stored.
+    pub changed: bool,
+    /// The channel's revision after the call.
+    pub revision: i64,
+}
+
 /// Check a snapshot and bring it inside its bounds, returning it as it will be stored.
 ///
 /// The TEXT is cut rather than refused, at a character boundary, and marked `truncated`: the
@@ -2541,6 +2574,25 @@ pub trait StateStore: Send + Sync {
         channel: &ChannelId,
         message: &MessageId,
     ) -> Result<PinChange, StoreError>;
+
+    /// This channel's explicit thread-pin records. `#1550 thread-list-pins`.
+    ///
+    /// Separate from [`StateStore::pins`]: message pins keep snapshots of
+    /// messages; thread pins keep only the owner's pin choice per thread.
+    /// Bang-bound threads are pinned by default without a record; a record
+    /// with `pinned: false` is an unpin that sticks.
+    async fn thread_pins(&self, channel: &ChannelId) -> Result<ThreadPins, StoreError>;
+
+    /// The revision this channel's thread pins are at.
+    async fn thread_pins_revision(&self, channel: &ChannelId) -> Result<i64, StoreError>;
+
+    /// Set one thread's explicit pin state. Idempotent.
+    async fn set_thread_pin(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        pinned: bool,
+    ) -> Result<ThreadPinChange, StoreError>;
 
     /// This channel's bookmark and the revision it is at. `#240 reading-bookmark`.
     ///

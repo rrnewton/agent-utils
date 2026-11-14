@@ -195,7 +195,44 @@ export { createDraftQueries, createOutboxLoads } from "../core/outbox/index.ts";
 // outbox dispatch and take-back (#624 mu-readcore O2)
 export { createOutboxDispatch } from "../core/outbox/index.ts";
 export { createSendTakeBack } from "../view/channel/index.ts";
-export { createThreadList } from "../view/channel/index.ts";
+import { createThreadList as createThreadListView } from "../view/channel/index.ts";
+import type { ThreadList, ThreadListDependencies } from "../view/channel/index.ts";
+import { createWebPorts } from "../platform/web/index.ts";
+
+/**
+ * The thread list with its thread-pin transport filled in (`#1550
+ * thread-list-pins`): the composition point supplies the server API the view
+ * asks for, with the page's kept token, until the app composition root takes
+ * the wiring over. The store on the server stays the pins' only truth.
+ */
+export function createThreadList(deps: ThreadListDependencies): ThreadList {
+  const ports = createWebPorts();
+  const token = (): string => {
+    try {
+      return ports.deviceStorage.getItem("vibe-talk.token") || "";
+    } catch {
+      return "";
+    }
+  };
+  return createThreadListView({
+    ...deps,
+    readThreadPins: deps.readThreadPins ?? (async (channel: string) => {
+      const response = await ports.http.fetch(
+        `/api/v1/channels/${encodeURIComponent(channel)}/thread-pins`,
+        { method: "GET", headers: { authorization: `Bearer ${token()}` } },
+      );
+      if (!response.ok) throw new Error(`thread pins: ${response.status}`);
+      return JSON.parse(await response.text()) as { records: Array<{ thread_id: string; pinned: boolean }> };
+    }),
+    setThreadPin: deps.setThreadPin ?? (async (channel: string, threadId: string, pinned: boolean) => {
+      const response = await ports.http.fetch(
+        `/api/v1/channels/${encodeURIComponent(channel)}/thread-pins/${encodeURIComponent(threadId)}`,
+        { method: pinned ? "PUT" : "DELETE", headers: { authorization: `Bearer ${token()}` } },
+      );
+      if (!response.ok) throw new Error(`thread pin: ${response.status}`);
+    }),
+  });
+}
 export { createOfflineCache, createThreadStrip } from "../view/channel/index.ts";
 // scroll trace (#1144 scrollback-typing-jump part 2b)
 export { createScrollTrace, createScrollTraceControls } from "../view/channel/index.ts";

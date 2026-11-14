@@ -7520,6 +7520,36 @@ pub async fn unpin(
     Ok((channel, change))
 }
 
+/// One channel's explicit thread-pin records. Read scope. `#1550 thread-list-pins`.
+///
+/// SEPARATE from message pins ([`pins`]): thread pins keep no snapshot, and a
+/// bang-bound thread's default pin is the page's to derive from its root; this
+/// list is only what the owner chose, including an unpin of a default.
+pub async fn thread_pins(
+    state: &AppState,
+    channel_id: &str,
+) -> Result<(ChannelInfo, crate::store::ThreadPins), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let pins = state.store.thread_pins(&channel.id).await?;
+    Ok((channel, pins))
+}
+
+/// Set one thread's explicit pin state. Write scope. Idempotent: unpinning a
+/// bang-bound thread records `pinned: false`, so it stays unpinned.
+pub async fn set_thread_pin(
+    state: &AppState,
+    channel_id: &str,
+    thread_id: &str,
+    pinned: bool,
+) -> Result<(ChannelInfo, crate::store::ThreadPinChange), OpError> {
+    let channel = allowed(state, channel_id).await?;
+    let change = state
+        .store
+        .set_thread_pin(&channel.id, thread_id, pinned)
+        .await?;
+    Ok((channel, change))
+}
+
 /// The revision a channel's pins are at, for a read to carry, or `None` when it cannot be said.
 ///
 /// SOFT, unlike every other store read on the read path: a timeline read is how the owner reads

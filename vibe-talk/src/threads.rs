@@ -184,6 +184,29 @@ pub struct ThreadSummary {
     pub hue: Option<u16>,
 }
 
+/// The agent a thread is bang-bound to, from its root's text. `#1550 thread-list-pins`.
+///
+/// A `!@NAME` post opens a thread bound to that agent (#917
+/// chat-bang-commands; the bridge records it in `thread-bindings.json`, whose
+/// `thread_id` is the `!@` message's own thread and whose `root_message_id`
+/// is that message). The root this server serves IS that message, so the
+/// binding is readable from it without coupling this server to the bridge's
+/// state directory: the first whitespace-delimited word must be exactly
+/// `!@NAME` with `NAME` an agent name (lowercase, digits, hyphens, at most
+/// 32 bytes, starting with a letter — the registry's rule).
+#[must_use]
+pub fn bang_agent_of(root_content: &str) -> Option<&str> {
+    let first = root_content.split_whitespace().next()?;
+    let name = first.strip_prefix("!@")?;
+    let valid = !name.is_empty()
+        && name.len() <= 32
+        && name.as_bytes()[0].is_ascii_lowercase()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    valid.then_some(name)
+}
+
 /// Characters of a root's first line used as its thread title.
 pub const THREAD_TITLE_CHARS: usize = 80;
 

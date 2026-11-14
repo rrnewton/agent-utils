@@ -1506,6 +1506,71 @@
       "upstream": "none"
     }
   ],
+  "ThreadPinChangeResponse": [
+    {
+      "changed": true,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "pinned": true,
+      "revision": 1790000000000,
+      "thread_id": "300"
+    },
+    {
+      "changed": false,
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "pinned": false,
+      "revision": 1790000000000,
+      "thread_id": "300"
+    }
+  ],
+  "ThreadPinsResponse": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "records": [
+        {
+          "pinned": true,
+          "thread_id": "300"
+        },
+        {
+          "pinned": false,
+          "thread_id": "301"
+        }
+      ],
+      "revision": 1790000000000
+    },
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "records": [],
+      "revision": 0
+    }
+  ],
   "ThreadSummary": [
     {
       "id": "t1",

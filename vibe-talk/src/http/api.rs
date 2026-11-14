@@ -5435,6 +5435,9 @@ pub const PURGED: &[&str] = &[
     "noise_rules",
     "noise_exemptions",
     "pins",
+    // `#1550 thread-list-pins`.
+    "thread_pins",
+    "thread_pin_revisions",
     "bookmarks",
     "thread_hues",
     "voice_settings",
@@ -6431,6 +6434,55 @@ pub async fn pin_message(
         unpinned: change.unpinned,
         revision: change.revision,
         pins_notice: PINS_NOTICE,
+    })))
+}
+
+/// `GET /api/v1/channels/{channel_id}/thread-pins` — the owner's explicit thread pins.
+/// `#1550 thread-list-pins`. Read scope. Separate from message pins: no snapshots.
+pub async fn thread_pins(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let (channel, pins) = ops::thread_pins(&state, &channel_id).await?;
+    Ok(no_store(Json(crate::contract::ThreadPinsResponse {
+        channel,
+        records: pins.records,
+        revision: pins.revision,
+    })))
+}
+
+/// `PUT /api/v1/channels/{channel_id}/thread-pins/{thread_id}` — pin a thread. Idempotent.
+pub async fn pin_thread(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path((channel_id, thread_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let (channel, change) = ops::set_thread_pin(&state, &channel_id, &thread_id, true).await?;
+    Ok(no_store(Json(crate::contract::ThreadPinChangeResponse {
+        channel,
+        thread_id,
+        pinned: true,
+        changed: change.changed,
+        revision: change.revision,
+    })))
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/thread-pins/{thread_id}` — unpin a thread.
+/// Idempotent, and RECORDS the unpin: a bang-bound thread (pinned by default)
+/// stays unpinned until it is pinned again.
+pub async fn unpin_thread(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path((channel_id, thread_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let (channel, change) = ops::set_thread_pin(&state, &channel_id, &thread_id, false).await?;
+    Ok(no_store(Json(crate::contract::ThreadPinChangeResponse {
+        channel,
+        thread_id,
+        pinned: false,
+        changed: change.changed,
+        revision: change.revision,
     })))
 }
 

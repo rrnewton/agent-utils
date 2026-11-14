@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use super::{
     Bookmark, BookmarkAnchor, BookmarkChange, CachedSummary, ChannelAlias, ConversationId,
     ConversationSummary, PinChange, PinSnapshot, Pins, ReadMark, StateStore, StoreError,
-    SummaryKey, TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
-    UpstreamClearSetting,
+    SummaryKey, ThreadPinChange, ThreadPins, TranscriptCursor, TranscriptPage, Turn,
+    UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting,
 };
 use super::{HistoryMode, HistoryModeSetting};
 use crate::model::{ChannelId, MessageId};
@@ -310,6 +310,23 @@ impl StateStore for DisabledStore {
     }
 
     async fn unpin(&self, _: &ChannelId, _: &MessageId) -> Result<PinChange, StoreError> {
+        refuse()
+    }
+
+    async fn thread_pins(&self, _: &ChannelId) -> Result<ThreadPins, StoreError> {
+        refuse()
+    }
+
+    async fn thread_pins_revision(&self, _: &ChannelId) -> Result<i64, StoreError> {
+        refuse()
+    }
+
+    async fn set_thread_pin(
+        &self,
+        _: &ChannelId,
+        _: &str,
+        _: bool,
+    ) -> Result<ThreadPinChange, StoreError> {
         refuse()
     }
 

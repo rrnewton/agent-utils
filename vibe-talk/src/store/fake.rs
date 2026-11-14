@@ -29,9 +29,9 @@ use async_trait::async_trait;
 use super::{
     now_ms, Bookmark, BookmarkAnchor, BookmarkChange, CachedSummary, ChannelAlias, ConversationId,
     ConversationSummary, Pin, PinChange, PinSnapshot, Pins, ReadMark, RecordedTurn, Retention,
-    StateStore, StoreError, SummaryKey, TranscriptCursor, TranscriptPage, Turn,
-    UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting, MAX_PINS_PER_CHANNEL,
-    MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
+    StateStore, StoreError, SummaryKey, ThreadPinChange, ThreadPinRecord, ThreadPins,
+    TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
+    UpstreamClearSetting, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use super::{HistoryMode, HistoryModeSetting};
 use crate::model::{ChannelId, MessageId};
@@ -105,6 +105,10 @@ struct State {
     next_pin_seq: u64,
     /// Channel to its pin revision; absent is `0`, as a missing row is in the real store.
     pin_revisions: BTreeMap<String, i64>,
+    /// `(channel, thread)` to its explicit thread-pin state. `#1550 thread-list-pins`.
+    thread_pins: BTreeMap<(String, String), bool>,
+    /// Channel to its thread-pin revision.
+    thread_pin_revisions: BTreeMap<String, i64>,
     /// Channel to its upstream-clear setting. `#232 upstream-mark-read`.
     upstream_clear: BTreeMap<String, UpstreamClearSetting>,
     /// Channel to its own history mode. `#602 history-settings-and-limits`.
@@ -1335,6 +1339,73 @@ impl StateStore for FakeStore {
         })
     }
 
+    async fn thread_pins(&self, channel: &ChannelId) -> Result<ThreadPins, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let records = state
+            .thread_pins
+            .iter()
+            .filter(|((held, _), _)| held == channel.as_str())
+            .map(|((_, thread), pinned)| ThreadPinRecord {
+                thread_id: thread.clone(),
+                pinned: *pinned,
+            })
+            .collect();
+        let revision = state
+            .thread_pin_revisions
+            .get(channel.as_str())
+            .copied()
+            .unwrap_or(0);
+        Ok(ThreadPins { records, revision })
+    }
+
+    async fn thread_pins_revision(&self, channel: &ChannelId) -> Result<i64, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .thread_pin_revisions
+            .get(channel.as_str())
+            .copied()
+            .unwrap_or(0))
+    }
+
+    async fn set_thread_pin(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        pinned: bool,
+    ) -> Result<ThreadPinChange, StoreError> {
+        if thread_id.is_empty() || thread_id.chars().any(char::is_control) {
+            return Err(StoreError::BadId(
+                "a thread pin's thread id is not usable".to_owned(),
+            ));
+        }
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let slot = (channel.as_str().to_owned(), thread_id.to_owned());
+        let changed = state.thread_pins.get(&slot) != Some(&pinned);
+        if changed {
+            state.thread_pins.insert(slot, pinned);
+            let next = super::next_pin_revision(
+                state
+                    .thread_pin_revisions
+                    .get(channel.as_str())
+                    .copied()
+                    .unwrap_or(0),
+                now_ms(),
+            );
+            state
+                .thread_pin_revisions
+                .insert(channel.as_str().to_owned(), next);
+        }
+        let revision = state
+            .thread_pin_revisions
+            .get(channel.as_str())
+            .copied()
+            .unwrap_or(0);
+        Ok(ThreadPinChange { changed, revision })
+    }
+
     async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -1755,6 +1826,8 @@ impl StateStore for FakeStore {
         state.noise_exemptions.clear();
         state.pins.clear();
         state.pin_revisions.clear();
+        state.thread_pins.clear();
+        state.thread_pin_revisions.clear();
         state.bookmarks.clear();
         state.purges += 1;
         Ok(())

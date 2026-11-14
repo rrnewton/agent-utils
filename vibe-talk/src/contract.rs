@@ -1077,6 +1077,37 @@ pub struct PinChangeResponse {
     pub pins_notice: &'static str,
 }
 
+/// One channel's thread pins: `GET /api/v1/channels/{id}/thread-pins`. `#1550 thread-list-pins`.
+///
+/// THREAD pins, separate from message pins ([`PinsResponse`]): only the
+/// owner's explicit choices. A bang-bound thread is pinned by default with no
+/// record; a record with `pinned: false` is its unpin, and it stays unpinned.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ThreadPinsResponse {
+    /// The channel, as configured here.
+    pub channel: ChannelInfo,
+    /// Every explicit record, by thread id.
+    pub records: Vec<crate::store::ThreadPinRecord>,
+    /// The revision this list is at.
+    pub revision: i64,
+}
+
+/// What one thread pin or unpin did: `PUT`/`DELETE /api/v1/channels/{id}/thread-pins/{thread_id}`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ThreadPinChangeResponse {
+    /// The channel, as configured here.
+    pub channel: ChannelInfo,
+    /// The thread the call named.
+    pub thread_id: String,
+    /// Whether it is pinned now (its explicit state; a bang-bound thread
+    /// unpinned here stays unpinned by this record).
+    pub pinned: bool,
+    /// Whether the call changed anything.
+    pub changed: bool,
+    /// The channel's thread-pin revision after the call.
+    pub revision: i64,
+}
+
 /// One channel's bookmark, read or written: `GET`, `PUT` and `DELETE /api/v1/channels/{id}/bookmark`.
 /// `#240 reading-bookmark`.
 ///
@@ -1805,6 +1836,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<crate::threads::ThreadSummary>(),
         // `#206 pin-message`. Appended, so the roots before them keep their places.
         generator.subschema_for::<PinsResponse>(),
+        generator.subschema_for::<ThreadPinsResponse>(),
+        generator.subschema_for::<ThreadPinChangeResponse>(),
         generator.subschema_for::<PinChangeResponse>(),
         // `#232 upstream-mark-read`. Appended, for the same reason.
         generator.subschema_for::<UpstreamClearState>(),

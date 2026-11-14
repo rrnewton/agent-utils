@@ -543,6 +543,18 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/pins/{message_id}",
             axum::routing::put(api::pin_message).delete(api::unpin_message),
         )
+        // `#1550 thread-list-pins`. The owner's pinned THREADS, separate from
+        // message pins above: READ to list the explicit choices, WRITE to pin
+        // (PUT) or unpin (DELETE, which records the unpin so a bang-bound
+        // thread's default stays off), and NO MCP TOOL, for the same reason.
+        .route(
+            "/api/v1/channels/{channel_id}/thread-pins",
+            get(api::thread_pins),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/thread-pins/{thread_id}",
+            axum::routing::put(api::pin_thread).delete(api::unpin_thread),
+        )
         // `#240 reading-bookmark`. The owner's place in a channel's backlog, one per channel. READ
         // scope to see it, WRITE scope to move or clear it — a PUT or DELETE that may carry
         // `if_revision`, refused 409 when another device moved it first — and NO MCP TOOL, for the

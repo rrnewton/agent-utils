@@ -288,6 +288,9 @@ mod summaries;
 #[path = "thread_hues.rs"]
 mod thread_hues;
 
+#[path = "thread_pins.rs"]
+mod thread_pins;
+
 #[path = "thread_reads.rs"]
 mod thread_reads;
 

@@ -3070,6 +3070,85 @@
       ],
       "type": "object"
     },
+    "ThreadPinChangeResponse": {
+      "description": "What one thread pin or unpin did: `PUT`/`DELETE /api/v1/channels/{id}/thread-pins/{thread_id}`.",
+      "properties": {
+        "changed": {
+          "description": "Whether the call changed anything.",
+          "type": "boolean"
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel, as configured here."
+        },
+        "pinned": {
+          "description": "Whether it is pinned now (its explicit state; a bang-bound thread\nunpinned here stays unpinned by this record).",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The channel's thread-pin revision after the call.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "thread_id": {
+          "description": "The thread the call named.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel",
+        "thread_id",
+        "pinned",
+        "changed",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "ThreadPinRecord": {
+      "description": "One explicit thread-pin state the owner set. `#1550 thread-list-pins`.\n\nTHREAD pins, separate from message pins ([`Pin`]): a thread pin keeps no\nsnapshot, only the owner's choice. A bang-bound thread (its root is a\n`!@NAME` post, recorded by the bridge in `thread-bindings.json`, #917) is\npinned by default with no row here; a row with `pinned: false` is the\nowner's unpin of such a thread, and it stays unpinned until re-pinned.",
+      "properties": {
+        "pinned": {
+          "description": "Whether the owner pinned it (`false` records an unpin of a default).",
+          "type": "boolean"
+        },
+        "thread_id": {
+          "description": "The thread, in the provider-neutral namespace the page was served it in.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "pinned"
+      ],
+      "type": "object"
+    },
+    "ThreadPinsResponse": {
+      "description": "One channel's thread pins: `GET /api/v1/channels/{id}/thread-pins`. `#1550 thread-list-pins`.\n\nTHREAD pins, separate from message pins ([`PinsResponse`]): only the\nowner's explicit choices. A bang-bound thread is pinned by default with no\nrecord; a record with `pinned: false` is its unpin, and it stays unpinned.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel, as configured here."
+        },
+        "records": {
+          "description": "Every explicit record, by thread id.",
+          "items": {
+            "$ref": "#/$defs/ThreadPinRecord"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "description": "The revision this list is at.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "channel",
+        "records",
+        "revision"
+      ],
+      "type": "object"
+    },
     "ThreadSummary": {
       "description": "One thread in the thread list, independent of the underlying provider's channel model.",
       "properties": {
@@ -4292,6 +4371,12 @@
     },
     {
       "$ref": "#/$defs/PinsResponse"
+    },
+    {
+      "$ref": "#/$defs/ThreadPinsResponse"
+    },
+    {
+      "$ref": "#/$defs/ThreadPinChangeResponse"
     },
     {
       "$ref": "#/$defs/PinChangeResponse"

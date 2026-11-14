@@ -88,6 +88,10 @@ export interface ThreadListDependencies {
   cardView(choice: ThreadChoice): { mode: string; text: string };
   openReplyFromRow(row: HTMLElement): unknown;
   threadReplies(id: string, message: Message): { count: number | null; exact: boolean };
+  /** The channel's explicit thread-pin records (`#1550 thread-list-pins`), as the server lists them. Optional: without it the list reads and writes through the server API itself, with the page's kept token. */
+  readThreadPins?(channel: string): Promise<{ records: Array<{ thread_id: string; pinned: boolean }> }>;
+  /** Set one thread's pin on the server (`#1550 thread-list-pins`). Optional, as above. */
+  setThreadPin?(channel: string, threadId: string, pinned: boolean): Promise<unknown>;
 }
 
 /** The thread list's commands and questions. */
@@ -175,7 +179,82 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   }
 
   function threadLabel(choice: ThreadChoice, chars: number = THREAD_TITLE_CHARS): string {
-    return [threadFacts(choice as never) as string, threadName(choice, chars)].filter((part) => part !== "").join(" · ");
+    const agent = bangAgent(choice);
+    const name = agent ? `@${agent}` : threadName(choice, chars);
+    return [threadFacts(choice as never) as string, name].filter((part) => part !== "").join(" · ");
+  }
+
+  // Thread pins (`#1550 thread-list-pins`). The server's store is the truth:
+  // explicit records come from `GET .../thread-pins`; a bang-bound thread
+  // (root `!@NAME`, recorded by the bridge in `thread-bindings.json`, #917)
+  // is pinned by default, and a record with `pinned: false` is its unpin,
+  // which sticks. Never localStorage as the source of truth, never Slack.
+  let pinRecords = new Map<string, boolean>();
+  let pinChannel = "";
+  let pinLoadInFlight = "";
+
+  /** The agent thread `choice` is bang-bound to, from its root's `!@NAME`. */
+  function bangAgent(choice: ThreadChoice | null): string | null {
+    const content = choice && choice.root ? String((choice.root as { content?: unknown }).content || "") : "";
+    const first = content.split(/\s+/).find((word) => word !== "") || "";
+    const name = first.startsWith("!@") ? first.slice(2) : "";
+    const valid = name !== "" && name.length <= 32 && /^[a-z]$/.test(name[0] as string)
+      && [...name].every((ch) => /[a-z0-9-]/.test(ch));
+    return valid ? name : null;
+  }
+
+  /** Whether `choice` is pinned: its explicit record, else its bang default. */
+  function threadIsPinned(choice: ThreadChoice): boolean {
+    const explicit = pinRecords.get(choice.id);
+    if (explicit !== undefined) return explicit;
+    return bangAgent(choice) !== null;
+  }
+
+  async function readThreadPins(channel: string): Promise<{ records: Array<{ thread_id: string; pinned: boolean }> }> {
+    if (!deps.readThreadPins) return { records: [] };
+    return deps.readThreadPins(channel);
+  }
+
+  async function writeThreadPin(channel: string, threadId: string, pinned: boolean): Promise<void> {
+    if (!deps.setThreadPin) return;
+    await deps.setThreadPin(channel, threadId, pinned);
+  }
+
+  /** Read the channel's pin records once per channel; a landed read re-draws. */
+  function ensureThreadPins(): void {
+    const channel = String(deps.selectedChannelId());
+    if (!channel || pinChannel === channel || pinLoadInFlight === channel) return;
+    pinLoadInFlight = channel;
+    void readThreadPins(channel).then((payload) => {
+      pinRecords = new Map((payload.records || []).map((r) => [String(r.thread_id), Boolean(r.pinned)]));
+      pinChannel = channel;
+      renderThreadSelect();
+    }).catch(() => {
+      // No list: defaults alone (bang-bound pinned) still order the picker.
+    }).finally(() => {
+      if (pinLoadInFlight === channel) pinLoadInFlight = "";
+    });
+  }
+
+  /** Pin or unpin `choice` on the server, then re-draw. */
+  function toggleThreadPin(choice: ThreadChoice): void {
+    const channel = String(deps.selectedChannelId());
+    const next = !threadIsPinned(choice);
+    pinRecords.set(choice.id, next);
+    renderThreadSelect();
+    void writeThreadPin(channel, choice.id, next).catch(() => {
+      pinRecords.delete(choice.id);
+      renderThreadSelect();
+    });
+  }
+
+  /** Choices with pinned threads first; each group newest activity first. */
+  function orderedThreadChoices(): ThreadChoice[] {
+    const choices = threadChoices();
+    return [
+      ...choices.filter((choice) => threadIsPinned(choice)),
+      ...choices.filter((choice) => !threadIsPinned(choice)),
+    ];
   }
 
   function threadIndex(): Map<string, ThreadChoice> {
@@ -266,7 +345,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         options.push(["threads", "Thread list"]);
         if (deps.layoutFit()) options.push(["columns", "Two columns"]);
       }
-      const choices = threadChoices();
+      const choices = orderedThreadChoices();
       const shown = choices.slice(0, THREAD_SELECT_LIMIT);
       for (const choice of shown) options.push([`thread:${choice.id}`, threadLabel(choice)]);
       const open = openThreadChoice();
@@ -295,6 +374,133 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     if (select.title !== title) select.title = title;
     (deps.setTextIfChanged as (el: HTMLElement, text: string) => void)(leftEl("thread-select-note"), deps.threading() ? "" : why);
     if (deps.sideColumnUp()) deps.renderSideColumn();
+    mountThreadPickerPopup(select);
+    if (pickerPopup && !pickerPopup.hidden) drawThreadPickerPopup(select);
+  }
+
+  // The picker's own pop-up (`#1550 thread-list-pins`): the native select's
+  // menu cannot hold a pin button on each row, so a pointer press opens this
+  // list instead — fixed options first, then pinned threads, then recent
+  // threads, each group newest first. The select stays the value's owner:
+  // choosing a row sets it and fires its change, as a native pick does.
+  // Keyboard use keeps the native menu.
+  let pickerPopup: HTMLElement | null = null;
+  let pickerPopupMounted = false;
+
+  function pinButton(choice: ThreadChoice): HTMLButtonElement {
+    const pinned = threadIsPinned(choice);
+    const button = document.createElement("button");
+    button.setAttribute("type", "button");
+    button.className = "thread-pin";
+    const anySvg = typeof document.querySelector === "function" ? document.querySelector("svg") : null;
+    const ns = anySvg ? anySvg.namespaceURI : null;
+    const svg = (ns ? document.createElementNS(ns, "svg") : document.createElement("svg")) as unknown as SVGSVGElement;
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("class", "thread-pin-icon");
+    svg.setAttribute("fill", "currentColor");
+    svg.setAttribute("aria-hidden", "true");
+    const path = (ns ? document.createElementNS(ns, "path") : document.createElement("path")) as unknown as SVGPathElement;
+    path.setAttribute("d", "M16 9V4h1c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1h1v5c0 1.66-1.34 3-3 3H4c-.55 0-1 .45-1 1s.45 1 1 1h7v6c0 .55.45 1 1 1s1-.45 1-1v-6h7c.55 0 1-.45 1-1s-.45-1-1-1h-1c-1.66 0-3-1.34-3-3z");
+    svg.append(path);
+    button.append(svg);
+    button.setAttribute("aria-pressed", String(pinned));
+    const label = bangAgent(choice) ? `@${bangAgent(choice)}` : threadName(choice, Infinity);
+    button.setAttribute("aria-label", pinned ? `Unpin ${label}` : `Pin ${label}`);
+    button.title = button.getAttribute("aria-label") || "";
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleThreadPin(choice);
+    });
+    return button;
+  }
+
+  function drawThreadPickerPopup(select: HTMLSelectElement): void {
+    if (!pickerPopup) return;
+    const rows: HTMLElement[] = [];
+    const fixed: Array<[string, string]> = [["main", "Main"]];
+    if (deps.threading()) {
+      fixed.push(["flat", "All"]);
+      if (deps.threadListOffered()) {
+        fixed.push(["threads", "Thread list"]);
+        if (deps.layoutFit()) fixed.push(["columns", "Two columns"]);
+      }
+    }
+    for (const [value, label] of fixed) {
+      const row = document.createElement("button");
+      row.setAttribute("type", "button");
+      row.className = "thread-picker-row";
+      row.setAttribute("role", "option");
+      row.textContent = label;
+      row.addEventListener("click", () => choosePickerValue(select, value));
+      rows.push(row);
+    }
+    if (deps.threading()) {
+      const choices = orderedThreadChoices();
+      const shown = choices.slice(0, THREAD_SELECT_LIMIT);
+      const open = openThreadChoice();
+      const listed = open && !shown.some((choice) => choice.id === open.id) ? [...shown, open] : shown;
+      for (const choice of listed) {
+        const row = document.createElement("div");
+        row.className = "thread-picker-row thread-picker-thread";
+        row.setAttribute("role", "option");
+        if (threadIsPinned(choice)) row.setAttribute("data-pinned", "");
+        const openButton = document.createElement("button");
+        openButton.setAttribute("type", "button");
+        openButton.className = "thread-picker-open";
+        openButton.textContent = threadLabel(choice, Infinity);
+        openButton.addEventListener("click", () => choosePickerValue(select, `thread:${choice.id}`));
+        row.append(pinButton(choice), openButton);
+        rows.push(row);
+      }
+    }
+    pickerPopup.replaceChildren(...rows);
+  }
+
+  function choosePickerValue(select: HTMLSelectElement, value: string): void {
+    closeThreadPickerPopup();
+    if (select.value === value) return;
+    select.value = value;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function closeThreadPickerPopup(): void {
+    if (pickerPopup) pickerPopup.hidden = true;
+  }
+
+  function mountThreadPickerPopup(select: HTMLSelectElement): void {
+    if (pickerPopupMounted) return;
+    pickerPopupMounted = true;
+    const popup = document.createElement("div");
+    popup.className = "thread-picker-popup";
+    popup.setAttribute("role", "listbox");
+    popup.setAttribute("aria-label", "view");
+    popup.hidden = true;
+    document.documentElement.append(popup);
+    pickerPopup = popup;
+    select.addEventListener("pointerdown", (event?: PointerEvent) => {
+      if (select.disabled) return;
+      if (event && typeof event.preventDefault === "function") event.preventDefault();
+      ensureThreadPins();
+      drawThreadPickerPopup(select);
+      const rect = select.getBoundingClientRect();
+      popup.hidden = false;
+      popup.style.width = "min(320px, calc(100vw - 16px))";
+      const height = popup.offsetHeight;
+      const viewWidth = document.documentElement.clientWidth;
+      const viewHeight = document.documentElement.clientHeight;
+      const below = rect.bottom + 4;
+      const top = below + height <= viewHeight ? below : Math.max(8, rect.top - height - 4);
+      popup.style.top = `${top + window.scrollY}px`;
+      popup.style.left = `${Math.max(8, Math.min(rect.left, viewWidth - popup.offsetWidth - 8)) + window.scrollX}px`;
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (popup.hidden) return;
+      const target = event.target as Node;
+      if (!popup.contains(target) && target !== select) closeThreadPickerPopup();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeThreadPickerPopup();
+    });
   }
 
   function renderThreadHeading(): unknown {

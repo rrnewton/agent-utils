@@ -21,9 +21,10 @@ use vibe_talk::contract::{
     LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse,
     NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
-    TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
-    UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
-    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
+    ThreadPinChangeResponse, ThreadPinsResponse, TimelineResponse, TokenScope, TranscriptRole,
+    UpstreamClearAttemptView, UpstreamClearNowOutcome, UpstreamClearNowResponse,
+    UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame, VoicePostPrefix,
+    VoicePromptSettings, VoiceSend, VoiceSettings,
 };
 use vibe_talk::contract::{ChannelHistoryState, HistoryModeChoice, HistoryModeRequest};
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
@@ -839,6 +840,37 @@ fn samples() -> Value {
             }),
         ],
         "ThreadSummary": [to(&thread_summary(Some(plain.clone()))), to(&thread_summary(None))],
+        "ThreadPinsResponse": [
+            to(&ThreadPinsResponse {
+                channel: channel(),
+                records: vec![
+                    vibe_talk::store::ThreadPinRecord { thread_id: "300".into(), pinned: true },
+                    vibe_talk::store::ThreadPinRecord { thread_id: "301".into(), pinned: false },
+                ],
+                revision: 1_790_000_000_000,
+            }),
+            to(&ThreadPinsResponse {
+                channel: channel(),
+                records: Vec::new(),
+                revision: 0,
+            }),
+        ],
+        "ThreadPinChangeResponse": [
+            to(&ThreadPinChangeResponse {
+                channel: channel(),
+                thread_id: "300".into(),
+                pinned: true,
+                changed: true,
+                revision: 1_790_000_000_000,
+            }),
+            to(&ThreadPinChangeResponse {
+                channel: channel(),
+                thread_id: "300".into(),
+                pinned: false,
+                changed: false,
+                revision: 1_790_000_000_000,
+            }),
+        ],
         "PinsResponse": [
             to(&PinsResponse {
                 channel: channel(),

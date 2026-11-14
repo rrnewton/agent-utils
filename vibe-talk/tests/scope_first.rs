@@ -609,6 +609,26 @@ fn inventory() -> Vec<Route> {
             Write,
             Nothing,
         ),
+        // `#1550 thread-list-pins`: the owner's pinned threads, listed at read scope and
+        // changed at write; separate from the message pins above.
+        route(
+            "GET",
+            "/api/v1/channels/{channel_id}/thread-pins",
+            Read,
+            Nothing,
+        ),
+        route(
+            "PUT",
+            "/api/v1/channels/{channel_id}/thread-pins/{thread_id}",
+            Write,
+            Nothing,
+        ),
+        route(
+            "DELETE",
+            "/api/v1/channels/{channel_id}/thread-pins/{thread_id}",
+            Write,
+            Nothing,
+        ),
         // `#240 reading-bookmark`: the owner's place in a channel, seen at read scope and moved or
         // cleared at write.
         route(

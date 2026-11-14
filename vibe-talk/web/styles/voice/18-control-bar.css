@@ -330,6 +330,74 @@
   }
 }
 
+/* The thread picker's own pop-up (`#1550 thread-list-pins`): fixed options,
+   then pinned threads, then recent threads. The pin on each thread row's
+   left wears the documents star's dress (`#1306 doc-star-gold`): muted
+   outline off, filled gold on `--pin-*` on. */
+.thread-picker-popup {
+  position: absolute;
+  z-index: 60;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--panel, Canvas);
+  color: var(--ink, CanvasText);
+  border: 1px solid var(--edge, currentColor);
+  border-radius: 0.6rem;
+  padding: 0.3rem;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.thread-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  min-height: 40px;
+  padding: 0.3rem 0.4rem;
+  background: transparent;
+  color: inherit;
+  border: none;
+  border-radius: 0.4rem;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.thread-picker-open {
+  flex: 1 1 auto;
+  min-height: 40px;
+  background: transparent;
+  color: inherit;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-pin {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel, Canvas);
+  color: var(--muted, CanvasText);
+  border: 1px solid var(--edge, currentColor);
+  border-radius: 0.4rem;
+  cursor: pointer;
+}
+.thread-pin[aria-pressed="true"] {
+  background: var(--pin-bg, #3a3017);
+  color: var(--pin-ink, #f0c75e);
+  border-color: var(--pin-edge, #d4a63a);
+}
+.thread-pin-icon {
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+
 /* style.css dresses `select` and `input` but not `textarea`, so the prompt fields on the settings
    screen would otherwise be unstyled system boxes sitting between two that are not. */
 textarea {

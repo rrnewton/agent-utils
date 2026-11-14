@@ -37,9 +37,9 @@ use super::{
     now_ms, Bookmark, BookmarkAnchor, BookmarkChange, BookmarkPlace, CachedSummary, ChannelAlias,
     ConversationId, ConversationSummary, HistoryMode, HistoryModeSetting, Pin, PinChange,
     PinSnapshot, Pins, ReadMark, RecordedTurn, Retention, Speaker, StateStore, StoreError,
-    SummaryKey, TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
-    UpstreamClearResult, UpstreamClearSetting, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE,
-    MAX_TURN_CHARS,
+    SummaryKey, ThreadPinChange, ThreadPinRecord, ThreadPins, TranscriptCursor, TranscriptPage,
+    Turn, UpstreamClearAttempt, UpstreamClearMode, UpstreamClearResult, UpstreamClearSetting,
+    MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
 use crate::model::{ChannelId, MessageId, UserId};
 use crate::voice_agent::{EditedPrompt, OwnerPrompt};
@@ -513,6 +513,24 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (channel_id, thread_id)
     ) STRICT;
     ",
+    // v26 — the owner's thread pins. `#1550 thread-list-pins`. Separate from
+    // message `pins` (v10): no snapshot, only the pin choice per thread. A
+    // bang-bound thread needs no row (pinned by default); `pinned = 0` records
+    // its unpin. Ids only, no message text.
+    "
+    CREATE TABLE thread_pins (
+        channel_id TEXT    NOT NULL,
+        thread_id  TEXT    NOT NULL,
+        pinned     INTEGER NOT NULL CHECK (pinned IN (0, 1)),
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, thread_id)
+    ) STRICT;
+
+    CREATE TABLE thread_pin_revisions (
+        channel_id TEXT    PRIMARY KEY NOT NULL,
+        revision   INTEGER NOT NULL
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -872,6 +890,35 @@ fn bump_pin_revision(
     transaction
         .execute(
             "INSERT INTO pin_revisions (channel_id, revision) VALUES (?1, ?2)
+             ON CONFLICT(channel_id) DO UPDATE SET revision = excluded.revision",
+            rusqlite::params![channel, next],
+        )
+        .map_err(backend)?;
+    Ok(next)
+}
+
+/// The revision this channel's thread pins are at. `#1550 thread-list-pins`.
+fn thread_pin_revision(connection: &Connection, channel: &str) -> Result<i64, StoreError> {
+    Ok(connection
+        .query_row(
+            "SELECT revision FROM thread_pin_revisions WHERE channel_id = ?1",
+            [channel],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .unwrap_or(0))
+}
+
+/// Move this channel's thread-pin revision on, and return it.
+fn bump_thread_pin_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    channel: &str,
+) -> Result<i64, StoreError> {
+    let next = super::next_pin_revision(thread_pin_revision(transaction, channel)?, now_ms());
+    transaction
+        .execute(
+            "INSERT INTO thread_pin_revisions (channel_id, revision) VALUES (?1, ?2)
              ON CONFLICT(channel_id) DO UPDATE SET revision = excluded.revision",
             rusqlite::params![channel, next],
         )
@@ -2757,6 +2804,82 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn thread_pins(&self, channel: &ChannelId) -> Result<ThreadPins, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT thread_id, pinned FROM thread_pins WHERE channel_id = ?1 \
+                     ORDER BY thread_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([channel.as_str()], |row| {
+                    Ok(ThreadPinRecord {
+                        thread_id: row.get::<_, String>(0)?,
+                        pinned: row.get::<_, i64>(1)? != 0,
+                    })
+                })
+                .map_err(backend)?;
+            let records = rows.collect::<Result<Vec<_>, _>>().map_err(backend)?;
+            Ok(ThreadPins {
+                records,
+                revision: thread_pin_revision(connection, channel.as_str())?,
+            })
+        })
+        .await
+    }
+
+    async fn thread_pins_revision(&self, channel: &ChannelId) -> Result<i64, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| thread_pin_revision(connection, channel.as_str()))
+            .await
+    }
+
+    async fn set_thread_pin(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        pinned: bool,
+    ) -> Result<ThreadPinChange, StoreError> {
+        if thread_id.is_empty() || thread_id.chars().any(char::is_control) {
+            return Err(StoreError::BadId(
+                "a thread pin's thread id is not usable".to_owned(),
+            ));
+        }
+        let channel = channel.clone();
+        let thread_id = thread_id.to_owned();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let written = transaction
+                .execute(
+                    "INSERT INTO thread_pins (channel_id, thread_id, pinned, updated_ms) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(channel_id, thread_id) DO UPDATE SET pinned = excluded.pinned, \
+                        updated_ms = excluded.updated_ms \
+                     WHERE thread_pins.pinned IS NOT excluded.pinned",
+                    rusqlite::params![
+                        channel.as_str(),
+                        thread_id.as_str(),
+                        i64::from(pinned),
+                        now_ms()
+                    ],
+                )
+                .map_err(backend)?;
+            let revision = if written > 0 {
+                bump_thread_pin_revision(&transaction, channel.as_str())?
+            } else {
+                thread_pin_revision(&transaction, channel.as_str())?
+            };
+            transaction.commit().map_err(backend)?;
+            Ok(ThreadPinChange {
+                changed: written > 0,
+                revision,
+            })
+        })
+        .await
+    }
+
     async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| bookmark_row(connection, channel.as_str()))
@@ -3342,6 +3465,12 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM pin_revisions", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM thread_pins", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM thread_pin_revisions", [])
                 .map_err(backend)?;
             // The bookmarks, revisions and all, for the pins' reason: the next one starts from the
             // clock, past every revision a page may still hold. `#240 reading-bookmark`.
@@ -7558,7 +7687,7 @@ mod tests {
         // there are add tables, dropped here as their notes say.
         connection
             .execute_batch(
-                "DROP TABLE IF EXISTS discuss_records; DROP TABLE IF EXISTS reply_pointers; DROP TABLE IF EXISTS history_modes;
+                "DROP TABLE IF EXISTS thread_pins; DROP TABLE IF EXISTS thread_pin_revisions; DROP TABLE IF EXISTS discuss_records; DROP TABLE IF EXISTS reply_pointers; DROP TABLE IF EXISTS history_modes;
                  DROP TABLE IF EXISTS own_decided; ALTER TABLE dismissals DROP COLUMN own;
                  DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
                  DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;

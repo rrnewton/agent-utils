@@ -2473,6 +2473,75 @@ declare namespace VibeTalk {
   }
 
   /**
+   * What one thread pin or unpin did: `PUT`/`DELETE /api/v1/channels/{id}/thread-pins/{thread_id}`.
+   */
+  interface ThreadPinChangeResponse {
+    /**
+     * Whether the call changed anything.
+     */
+    changed: boolean;
+    /**
+     * The channel, as configured here.
+     */
+    channel: ChannelInfo;
+    /**
+     * Whether it is pinned now (its explicit state; a bang-bound thread
+     * unpinned here stays unpinned by this record).
+     */
+    pinned: boolean;
+    /**
+     * The channel's thread-pin revision after the call.
+     */
+    revision: number;
+    /**
+     * The thread the call named.
+     */
+    thread_id: string;
+  }
+
+  /**
+   * One explicit thread-pin state the owner set. `#1550 thread-list-pins`.
+   *
+   * THREAD pins, separate from message pins ([`Pin`]): a thread pin keeps no
+   * snapshot, only the owner's choice. A bang-bound thread (its root is a
+   * `!@NAME` post, recorded by the bridge in `thread-bindings.json`, #917) is
+   * pinned by default with no row here; a row with `pinned: false` is the
+   * owner's unpin of such a thread, and it stays unpinned until re-pinned.
+   */
+  interface ThreadPinRecord {
+    /**
+     * Whether the owner pinned it (`false` records an unpin of a default).
+     */
+    pinned: boolean;
+    /**
+     * The thread, in the provider-neutral namespace the page was served it in.
+     */
+    thread_id: string;
+  }
+
+  /**
+   * One channel's thread pins: `GET /api/v1/channels/{id}/thread-pins`. `#1550 thread-list-pins`.
+   *
+   * THREAD pins, separate from message pins ([`PinsResponse`]): only the
+   * owner's explicit choices. A bang-bound thread is pinned by default with no
+   * record; a record with `pinned: false` is its unpin, and it stays unpinned.
+   */
+  interface ThreadPinsResponse {
+    /**
+     * The channel, as configured here.
+     */
+    channel: ChannelInfo;
+    /**
+     * Every explicit record, by thread id.
+     */
+    records: ThreadPinRecord[];
+    /**
+     * The revision this list is at.
+     */
+    revision: number;
+  }
+
+  /**
    * One thread in the thread list, independent of the underlying provider's channel model.
    */
   interface ThreadSummary {
@@ -3195,6 +3264,8 @@ declare namespace VibeTalk {
     Message: Message;
     ThreadSummary: ThreadSummary;
     PinsResponse: PinsResponse;
+    ThreadPinsResponse: ThreadPinsResponse;
+    ThreadPinChangeResponse: ThreadPinChangeResponse;
     PinChangeResponse: PinChangeResponse;
     UpstreamClearState: UpstreamClearState;
     BookmarkResponse: BookmarkResponse;
