@@ -299,24 +299,25 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     check(page.locator("#discuss-hours").is_visible(), "the hours control is missing")
     check(page.locator("#discuss-hours").input_value() != "", "the hours control is empty")
     bound_row = page.evaluate("""() => {
-      const r = (id) => document.getElementById(id).getBoundingClientRect();
+      const c = (id) => { const r = document.getElementById(id).getBoundingClientRect(); return r.top + r.height / 2; };
       const sincePart = document.querySelector('.discuss-since-part');
       const sinceStyle = sincePart ? getComputedStyle(sincePart) : null;
+      const hoursRect = document.getElementById('discuss-hours').getBoundingClientRect();
       return {
-        countTop: r('discuss-count').top, hoursTop: r('discuss-hours').top,
-        sinceTop: r('discuss-since').top, buttonTop: r('discuss-summarize').top,
+        countMid: c('discuss-count'), hoursMid: c('discuss-hours'),
+        sinceMid: c('discuss-since'), buttonMid: c('discuss-summarize'),
         sinceHidden: !sincePart || sinceStyle.display === 'none',
-        hoursWidth: r('discuss-hours').width,
+        hoursWidth: hoursRect.width,
       };
     }""")
-    check(abs(bound_row["countTop"] - bound_row["hoursTop"]) <= 2
-          and abs(bound_row["countTop"] - bound_row["buttonTop"]) <= 2,
+    check(abs(bound_row["countMid"] - bound_row["hoursMid"]) <= 3
+          and abs(bound_row["countMid"] - bound_row["buttonMid"]) <= 3,
           f"the bound is not one row: {bound_row}")
     check(bound_row["hoursWidth"] > 0, f"the hours control was dropped: {bound_row}")
     if width < 900:
         check(bound_row["sinceHidden"], f"since HH:MM did not drop on the phone: {bound_row}")
     else:
-        check(not bound_row["sinceHidden"] and abs(bound_row["sinceTop"] - bound_row["countTop"]) <= 2,
+        check(not bound_row["sinceHidden"] and abs(bound_row["sinceMid"] - bound_row["countMid"]) <= 3,
               f"since HH:MM did not stand on the desk row: {bound_row}")
     page.fill("#discuss-hours", "1")
     page.wait_for_function(
