@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-record-completeness: the cached record withholds owner thread replies as in doubt'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -27,3 +27,7 @@ Keep the serving rules for pages (a dropped offer may have been an edit or delet
 # Notes
 
 Owner 062, 11-14 10:56 AM ET: a record or CLI that misses prompts is a top-priority bug. Sibling lane mu-prompts owns #1528 (recap flat walk) and #1529 (`vibe-talk prompts --hours K`, cache-only); this lane owns what makes the cache itself incomplete or "in doubt", plus the audit. No consumer names, host names or local paths are recorded here.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 3bca55bc (gated head 7f9e3493). Search hands out held whole-text rows observed before a channel-wide drop, flagged `stale` with `dropped_ms` on the wire and "N may be stale (channel had a dropped update at HH:MM ET)" in the CLI; withheld remains only for blocked threads and push snippets. Page serves unchanged. Every drop path records its reason. Reads that may show flagged rows: `vibe-talk search`, server search, cache-only `prompts` (#1529). Audit: all 13 acceptance replies held, none missing; wrkviz cross-check: no (Muse prompts all `author_kind` unknown; bridge headers unparsed) — follow-up: parse `[from ... via slack/agentctl/agent-teams]` and `[liaison -> ...]` headers, and narrow the channel mark to a per-scope drop record (schema change). Deployed instance: gap closes at once on deploy (rows already held), flags clear as scopes re-read (relist/backfill, no added Slack calls).
