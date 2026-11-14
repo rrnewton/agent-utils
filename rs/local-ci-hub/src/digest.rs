@@ -270,7 +270,12 @@ fn identity_json(value: &PyValue) -> Option<String> {
     let mut out = String::from("{");
     let mut first = true;
     for key in IDENTITY_KEYS {
-        emit(&mut out, &mut first, key, &json_string(req_str(value, key)?));
+        emit(
+            &mut out,
+            &mut first,
+            key,
+            &json_string(req_str(value, key)?),
+        );
     }
     out.push('}');
     Some(out)
@@ -340,7 +345,12 @@ fn comparison_json(value: &PyValue) -> Option<String> {
         "strictness",
         &json_string(req_str(value, "strictness")?),
     );
-    emit(&mut out, &mut first, "display_name", &opt_str_json(value, "display_name")?);
+    emit(
+        &mut out,
+        &mut first,
+        "display_name",
+        &opt_str_json(value, "display_name")?,
+    );
     emit(
         &mut out,
         &mut first,
@@ -377,7 +387,12 @@ fn comparison_json(value: &PyValue) -> Option<String> {
         "full_trace",
         "exact_remainder",
     ] {
-        emit(&mut out, &mut first, key, &req_bool(value, key)?.to_string());
+        emit(
+            &mut out,
+            &mut first,
+            key,
+            &req_bool(value, key)?.to_string(),
+        );
     }
     emit(
         &mut out,
@@ -392,7 +407,12 @@ fn comparison_json(value: &PyValue) -> Option<String> {
         &str_list_json(value, "canonicalizations")?,
     );
     for key in ["ignore_lines", "skip_commit", "skip_detlog"] {
-        emit(&mut out, &mut first, key, &req_bool(value, key)?.to_string());
+        emit(
+            &mut out,
+            &mut first,
+            key,
+            &req_bool(value, key)?.to_string(),
+        );
     }
     out.push('}');
     Some(out)
@@ -445,7 +465,12 @@ fn verdict_json(value: &PyValue) -> Option<String> {
                 Some(counts) if exact_keys(counts, &["left", "right"]) => {
                     let mut text = String::from("{");
                     let mut inner = true;
-                    emit(&mut text, &mut inner, "left", &req_u64(counts, "left")?.to_string());
+                    emit(
+                        &mut text,
+                        &mut inner,
+                        "left",
+                        &req_u64(counts, "left")?.to_string(),
+                    );
                     emit(
                         &mut text,
                         &mut inner,
@@ -479,14 +504,25 @@ fn verdict_json(value: &PyValue) -> Option<String> {
 fn binding_json(value: &PyValue) -> Option<String> {
     if !exact_keys(
         value,
-        &["run_id", "producer", "series_cell", "tree", "selected_attempt"],
+        &[
+            "run_id",
+            "producer",
+            "series_cell",
+            "tree",
+            "selected_attempt",
+        ],
     ) {
         return None;
     }
     let mut out = String::from("{");
     let mut first = true;
     for key in ["run_id", "producer", "series_cell", "tree"] {
-        emit(&mut out, &mut first, key, &json_string(req_str(value, key)?));
+        emit(
+            &mut out,
+            &mut first,
+            key,
+            &json_string(req_str(value, key)?),
+        );
     }
     emit(
         &mut out,
@@ -499,12 +535,22 @@ fn binding_json(value: &PyValue) -> Option<String> {
 }
 
 fn cell_json(value: &PyValue) -> Option<String> {
-    let keys: Vec<&str> = match value.as_object() {
-        Some(pairs) => pairs.iter().map(|(key, _)| key.as_str()).collect(),
-        None => return None,
-    };
-    let base = ["lane", "category", "test", "mode", "backend", "cell_verdict"];
-    let shape_ok = keys.iter().all(|key| base.contains(key) || *key == "evidence_binding")
+    let keys: Vec<&str> = value
+        .as_object()?
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    let base = [
+        "lane",
+        "category",
+        "test",
+        "mode",
+        "backend",
+        "cell_verdict",
+    ];
+    let shape_ok = keys
+        .iter()
+        .all(|key| base.contains(key) || *key == "evidence_binding")
         && base.iter().all(|key| keys.contains(key));
     if !shape_ok {
         return None;
@@ -512,7 +558,12 @@ fn cell_json(value: &PyValue) -> Option<String> {
     let mut out = String::from("{");
     let mut first = true;
     for key in IDENTITY_KEYS {
-        emit(&mut out, &mut first, key, &json_string(req_str(value, key)?));
+        emit(
+            &mut out,
+            &mut first,
+            key,
+            &json_string(req_str(value, key)?),
+        );
     }
     emit(
         &mut out,
@@ -521,7 +572,12 @@ fn cell_json(value: &PyValue) -> Option<String> {
         &verdict_json(value.get("cell_verdict")?)?,
     );
     if let Some(binding) = value.get("evidence_binding") {
-        emit(&mut out, &mut first, "evidence_binding", &binding_json(binding)?);
+        emit(
+            &mut out,
+            &mut first,
+            "evidence_binding",
+            &binding_json(binding)?,
+        );
     }
     out.push('}');
     Some(out)
@@ -532,11 +588,11 @@ fn cell_json(value: &PyValue) -> Option<String> {
 /// depth (evidence, artifact, identities, cells, verdicts, bindings);
 /// any other shape keeps the generic sorted-key form, exactly as the
 /// typed reader's retained/raw fallback serializes it.
-fn cell_results_canonical(value: &PyValue) -> Option<String> {
+fn cell_results_canonical(value: &PyValue, head_field: &str) -> Option<String> {
     let typed = (|| -> Option<String> {
-        const KEYS: [&str; 9] = [
+        let keys: [&str; 9] = [
             "run_id",
-            "hermit_sha",
+            head_field,
             "source_tree_dirty",
             "selected_count",
             "recorded_count",
@@ -545,7 +601,7 @@ fn cell_results_canonical(value: &PyValue) -> Option<String> {
             "selected",
             "cells",
         ];
-        if !exact_keys(value, &KEYS) {
+        if !exact_keys(value, &keys) {
             return None;
         }
         let artifact = value.get("artifact")?;
@@ -595,12 +651,17 @@ fn cell_results_canonical(value: &PyValue) -> Option<String> {
         };
         let mut out = String::from("{");
         let mut first = true;
-        emit(&mut out, &mut first, "run_id", &json_string(req_str(value, "run_id")?));
         emit(
             &mut out,
             &mut first,
-            "hermit_sha",
-            &json_string(req_str(value, "hermit_sha")?),
+            "run_id",
+            &json_string(req_str(value, "run_id")?),
+        );
+        emit(
+            &mut out,
+            &mut first,
+            head_field,
+            &json_string(req_str(value, head_field)?),
         );
         emit(
             &mut out,
@@ -801,6 +862,13 @@ fn admission_identity_ok(row: &PyValue) -> bool {
 /// hidden-identity check). `None` means no digest exists; it is never a
 /// different digest.
 pub fn receipt_canonical_json(row: &PyValue) -> Option<String> {
+    receipt_canonical_json_with(row, "validated_head_sha")
+}
+
+/// Canonical receipt-row JSON with the deployment's validated-head
+/// field name for typed cell evidence (deployment vocabulary arrives
+/// as data, never as a literal in the clause logic).
+pub fn receipt_canonical_json_with(row: &PyValue, head_field: &str) -> Option<String> {
     if !row.is_object() || !admission_identity_ok(row) {
         return None;
     }
@@ -883,7 +951,7 @@ pub fn receipt_canonical_json(row: &PyValue) -> Option<String> {
             }
             "cell_results" => match row.get(field) {
                 None | Some(PyValue::Null) => Some("null".to_owned()),
-                Some(value) => Some(cell_results_canonical(value)?),
+                Some(value) => Some(cell_results_canonical(value, head_field)?),
             },
             "test_results" => match row.get(field) {
                 None | Some(PyValue::Null) => None,
@@ -931,4 +999,9 @@ pub fn receipt_canonical_json(row: &PyValue) -> Option<String> {
 /// when the row has no digest.
 pub fn receipt_digest(row: &PyValue) -> Option<String> {
     receipt_canonical_json(row).map(|text| sha256_hex(text.as_bytes()))
+}
+
+/// Receipt digest with the deployment's validated-head field name.
+pub fn receipt_digest_with(row: &PyValue, head_field: &str) -> Option<String> {
+    receipt_canonical_json_with(row, head_field).map(|text| sha256_hex(text.as_bytes()))
 }

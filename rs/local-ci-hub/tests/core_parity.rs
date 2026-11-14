@@ -231,7 +231,7 @@ fn receipt_canonical_nested_typed_cell_results_use_struct_order() {
           \"selected\":[{\"test\":\"t1\",\"backend\":\"b1\",\"lane\":\"l1\",\"mode\":\"m1\",\"category\":\"c1\"}],\
           \"artifact\":{\"row_count\":3,\"sha256\":\"s\",\"path\":\"a/b.jsonl\"},\
           \"population_sha256\":\"pop\",\"recorded_count\":1,\"selected_count\":1,\
-          \"source_tree_dirty\":false,\"hermit_sha\":\"hhhh\",\"run_id\":\"run-1\"},\
+          \"source_tree_dirty\":false,\"validated_head_sha\":\"hhhh\",\"run_id\":\"run-1\"},\
           \"coverage\":{\"artifact\":{\"path\":\"cov.json\",\"sha256\":\"cs\",\"row_count\":9},\
           \"planned_test_nodes\":20,\"executed_test_nodes\":20,\"zero_executed_nodes\":[],\"absent_nodes\":[]},\
           \"gates\":[{\"name\":\"g1\",\"result\":\"pass\",\"attempts\":[{\"attempt\":1,\"real_seconds\":1.5,\"nested\":{\"y\":1,\"x\":\"café\"}}]}]}",
@@ -241,7 +241,7 @@ fn receipt_canonical_nested_typed_cell_results_use_struct_order() {
     // Evidence struct order, artifact struct order, identity order.
     assert!(
         canonical.contains(
-            "\"cell_results\":{\"run_id\":\"run-1\",\"hermit_sha\":\"hhhh\",\"source_tree_dirty\":false,\
+            "\"cell_results\":{\"run_id\":\"run-1\",\"validated_head_sha\":\"hhhh\",\"source_tree_dirty\":false,\
              \"selected_count\":1,\"recorded_count\":1,\"population_sha256\":\"pop\",\
              \"artifact\":{\"path\":\"a/b.jsonl\",\"sha256\":\"s\",\"row_count\":3},\
              \"selected\":[{\"lane\":\"l1\",\"category\":\"c1\",\"test\":\"t1\",\"mode\":\"m1\",\"backend\":\"b1\"}]"
@@ -270,15 +270,12 @@ fn receipt_canonical_nested_typed_cell_results_use_struct_order() {
 fn receipt_canonical_untyped_cell_results_keep_sorted_form() {
     // An unknown key defeats the typed shape: the whole value falls
     // back to the generic sorted-key form.
-    let row = parse(
-        "{\"cell_results\":{\"run_id\":\"run-1\",\"future_field\":{\"z\":1,\"a\":2}}}",
-    )
-    .unwrap();
+    let row = parse("{\"cell_results\":{\"run_id\":\"run-1\",\"future_field\":{\"z\":1,\"a\":2}}}")
+        .unwrap();
     let canonical = receipt_canonical_json(&row).expect("row canonicalizes");
     assert!(
-        canonical.contains(
-            "\"cell_results\":{\"future_field\":{\"a\":2,\"z\":1},\"run_id\":\"run-1\"}"
-        ),
+        canonical
+            .contains("\"cell_results\":{\"future_field\":{\"a\":2,\"z\":1},\"run_id\":\"run-1\"}"),
         "{canonical}"
     );
 }

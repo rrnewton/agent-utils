@@ -8,7 +8,7 @@
 //! 2 no-result or cannot-tell, 75 could-not-run.
 
 use clap::{Parser, Subcommand};
-use local_ci_hub::digest::receipt_digest;
+use local_ci_hub::digest::receipt_digest_with;
 use local_ci_hub::event::{check_events, is_fixture_event, union, Refusal};
 use local_ci_hub::expand::{expand_line_with, ExpandConfig, FileEvidence, NoEvidence};
 use local_ci_hub::fold::terminal_row;
@@ -45,6 +45,10 @@ struct Cli {
     /// excluded after the union (repeatable).
     #[arg(long, global = true)]
     fixture_producer: Vec<String>,
+    /// `cell_results` field naming the validated head for typed
+    /// evidence canonicalization (default: `validated_head_sha`).
+    #[arg(long, global = true, default_value = "validated_head_sha")]
+    evidence_head_field: String,
     /// Index file path (default: ephemeral in-memory index).
     #[arg(long, global = true)]
     index: Option<PathBuf>,
@@ -309,7 +313,7 @@ fn main() {
                     ),
                     (
                         "digest".to_owned(),
-                        match receipt_digest(&row) {
+                        match receipt_digest_with(&row, &cli.evidence_head_field) {
                             Some(digest) => PyValue::Str(digest),
                             None => PyValue::Null,
                         },
