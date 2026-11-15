@@ -162,6 +162,7 @@ test("`#624 voice-page-modularity`: the screen's sliders, steps, reload and grip
   const log = [];
   const nodes = {};
   const target = (id) => (nodes[id] ||= { id, value: `${id} value`, listeners: [],
+    blur() { log.push(`blur ${id}`); },
     addEventListener(type, listener) { this.listeners.push({ type, listener }); log.push(`listen ${id} ${type}`); },
     removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); } });
   const fire = (id, type, event = {}) => nodes[id].listeners.filter((one) => one.type === type).forEach((one) => one.listener(event));
@@ -192,9 +193,9 @@ test("`#624 voice-page-modularity`: the screen's sliders, steps, reload and grip
     "listen msg-scale-larger click", "listen collapsed-lines input", "listen collapsed-lines-smaller click", "listen collapsed-lines-larger click",
     "listen card-max-lines input", "listen page-update click", "show build", "listen card-max-lines-smaller click",
     "listen card-max-lines-larger click", "listen quote-read-percent input", "listen quote-read-percent-smaller click",
-    "listen quote-read-percent-larger click", "listen mark-read-first-percent input", "listen mark-read-first-percent-smaller click",
-    "listen mark-read-first-percent-larger click", "listen mark-read-long-words input", "listen mark-read-long-words-smaller click",
-    "listen mark-read-long-words-larger click", "listen width-grip pointerdown", "listen width-grip pointermove", "listen width-grip pointerup",
+    "listen quote-read-percent-larger click", "listen mark-read-first-percent change", "listen mark-read-first-percent keydown",
+    "listen mark-read-long-words change", "listen mark-read-long-words keydown",
+    "listen width-grip pointerdown", "listen width-grip pointermove", "listen width-grip pointerup",
     "listen width-grip pointercancel", "listen width-grip keydown"], "a listener was added out of the page's order, or the build said elsewhere");
   log.length = 0;
   // A slider says its value as it is when it moves, not as it was at the mount.
@@ -204,7 +205,13 @@ test("`#624 voice-page-modularity`: the screen's sliders, steps, reload and grip
     nodes[id].value = now;
     fire(id, "input");
   }
-  for (const id of ["msg-scale", "collapsed-lines", "card-max-lines", "quote-read-percent", "mark-read-first-percent", "mark-read-long-words"]) {
+  // The first-share fields commit on change, and Enter blurs so the change lands (#1562).
+  fire("mark-read-first-percent", "change");
+  fire("mark-read-long-words", "change");
+  fire("mark-read-first-percent", "keydown", { key: "Enter" });
+  fire("mark-read-long-words", "keydown", { key: "Enter" });
+  fire("mark-read-first-percent", "keydown", { key: "a" });
+  for (const id of ["msg-scale", "collapsed-lines", "card-max-lines", "quote-read-percent"]) {
     fire(`${id}-smaller`, "click");
     fire(`${id}-larger`, "click");
   }
@@ -214,8 +221,8 @@ test("`#624 voice-page-modularity`: the screen's sliders, steps, reload and grip
   fire("width-grip", "pointerup", { n: "up" });
   fire("width-grip", "pointercancel", { n: "cancel" });
   fire("width-grip", "keydown", { n: "ArrowLeft" });
-  assert.deepStrictEqual(log, ["width 72", "size 110", "lines 5", "card 4", "quote 60", "first 40", "long 250", "size step -1", "size step 1", "lines step -1", "lines step 1", "card step -1", "card step 1",
-    "quote step -1", "quote step 1", "first step -1", "first step 1", "long step -1", "long step 1", "reload", "grip down down", "grip move move", "grip up", "grip up", "grip key ArrowLeft"]);
+  assert.deepStrictEqual(log, ["width 72", "size 110", "lines 5", "card 4", "quote 60", "first 40", "long 250", "blur mark-read-first-percent", "blur mark-read-long-words", "size step -1", "size step 1", "lines step -1", "lines step 1", "card step -1", "card step 1",
+    "quote step -1", "quote step 1", "reload", "grip down down", "grip move move", "grip up", "grip up", "grip key ArrowLeft"]);
   controls.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
@@ -577,6 +584,63 @@ test("`#1398 reading-width-handle-gate`: the handle shows only past the default 
   assert.equal(effectiveReadingWidth(54, false), 120, "a squeezed column still applied the remembered width");
   assert.equal(effectiveReadingWidth(54, true), 54, "a wide column did not apply the remembered width");
   assert.equal(effectiveReadingWidth(120, false), 120);
+});
+
+test("`#1562 settings-long-message-share-inputs`: the first-share fields commit typed numbers clamped, restore the previous value when emptied, and grey out with the guard", () => {
+  const { mountMessagePreferences } = VIEW_SETTINGS;
+  const els = {};
+  const el = (id) => (els[id] ||= { id, value: "", checked: false, disabled: false, hidden: false, textContent: "",
+    attrs: new Map(), setAttribute(k, v) { this.attrs.set(k, String(v)); },
+    removeAttribute(k) { this.attrs.delete(k); }, getAttribute(k) { return this.attrs.get(k) ?? null; } });
+  const keptStore = new Map();
+  const clamp = (v, lo, hi, dflt) => {
+    const t = typeof v === "string" ? v.trim() : v;
+    if (t === "" || t === null || t === undefined || !Number.isFinite(Number(t))) return dflt;
+    return Math.min(hi, Math.max(lo, Math.round(Number(t))));
+  };
+  let prefs;
+  prefs = mountMessagePreferences({
+    lookup: el,
+    deviceSettings: () => ({ keep: (s, n) => keptStore.set(s.key, n), keptAs: (s, n) => keptStore.get(s.key) === n }),
+    status: () => {},
+    persistCollapsedLines: () => true, changeCollapsedLines: (v) => v,
+    persistCardMaxLines: () => true, changeCardMaxLines: (v) => v,
+    applyQuoteReadPercent: (v) => clamp(v, 0, 100, 5),
+    applyMarkReadOnReply: () => {}, applyMarkReadQuoteGuard: () => {}, applyMarkReadFoldGuard: () => {},
+    applyMarkReadNonquote: () => {}, applyMarkReadFinalGuard: () => {}, applyMarkReadFirstGuard: () => {},
+    applyMarkReadFirstPercent: (v) => { const n = clamp(v, 0, 100, 50); prefs.markRead.renderFirstPercent(n); return n; },
+    applyMarkReadLongWords: (v) => { const n = clamp(v, 0, 5000, 0); prefs.markRead.renderLongWords(n); return n; },
+    applyInAppLinks: () => {}, redrawMessageLinks: () => {}, applySummarizeCollapsed: () => {},
+    applyRichHeaders: () => {}, applyMarkOwnRead: () => {}, applyHideEmptyMessages: () => {},
+    redrawHiddenEmptyMessages: () => {}, applyCombineMessages: () => {}, regroupChannelRows: () => {},
+    chooseOpenInView: () => {}, storedOpenInView: () => "", chooseAfterDone: () => {}, storedAfterDone: () => "",
+  });
+  prefs.markRead.renderFirstPercent(50);
+  prefs.markRead.renderLongWords(0);
+  assert.equal(el("mark-read-first-percent").value, "50");
+  assert.equal(el("mark-read-long-words").value, "0");
+  assert.equal(prefs.markRead.firstPercentChanged("32"), 32);
+  assert.equal(el("mark-read-first-percent").value, "32");
+  assert.match(el("mark-read-first-percent-state").textContent, /first 32% of a message over 0 words/);
+  assert.equal(el("mark-read-first-percent").getAttribute("aria-invalid"), null);
+  // Past the bound the field snaps to it and says so, never silently.
+  assert.equal(prefs.markRead.firstPercentChanged("150"), 100);
+  assert.equal(el("mark-read-first-percent").value, "100");
+  assert.equal(el("mark-read-first-percent").getAttribute("aria-invalid"), "true");
+  // Emptied, the previous value comes back; nothing new is kept.
+  assert.equal(prefs.markRead.firstPercentChanged(""), 100);
+  assert.equal(el("mark-read-first-percent").value, "100");
+  assert.match(el("mark-read-first-percent-state").textContent, /^Kept the first 100%/);
+  assert.equal(prefs.markRead.longWordsChanged("99999"), 5000);
+  assert.equal(el("mark-read-long-words").value, "5000");
+  assert.equal(prefs.markRead.longWordsChanged("abc"), 5000, "a non-number did not restore the previous count");
+  // The guard off greys both fields out; on lets them be typed in again.
+  prefs.markRead.render(true, false, true, true, true, false);
+  assert.equal(el("mark-read-first-percent").disabled, true);
+  assert.equal(el("mark-read-long-words").disabled, true);
+  prefs.markRead.render(true, false, true, true, true, true);
+  assert.equal(el("mark-read-first-percent").disabled, false);
+  assert.equal(el("mark-read-long-words").disabled, false);
 });
 
 test("`#1398 reading-width-handle-gate`: the handle stands on the message column's own edge, never the screen's middle", () => {

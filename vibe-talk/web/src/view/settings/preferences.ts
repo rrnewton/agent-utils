@@ -252,58 +252,86 @@ export function mountMessagePreferences(deps: MessagePreferencesDependencies): M
     deps.status(on ? "a quote in the first share of a long message leaves it unread." : "a quote in the first share of a long message marks it read.");
   }
 
+  // The last value each first-share field showed, so an emptied or non-numeric
+  // field restores it instead of jumping to a default (#1562).
+  let firstPercentShown: number | null = null;
+  let longWordsShown: number | null = null;
+
+  function sayFirstShareSaved(kept: boolean): void {
+    const percent = firstPercentShown ?? 50;
+    const words = longWordsShown ?? 0;
+    deps.lookup("mark-read-first-percent-state").textContent = kept
+      ? `Saved \u2014 the first ${percent}% of a message over ${words} words.`
+      : `This browser refused to store it, so it will be forgotten when you reload. Until then the first ${percent}% of a message over ${words} words.`;
+  }
+
+  function sayFirstShareKept(): void {
+    const percent = firstPercentShown ?? 50;
+    const words = longWordsShown ?? 0;
+    deps.lookup("mark-read-first-percent-state").textContent =
+      `Kept the first ${percent}% of a message over ${words} words \u2014 enter a whole number.`;
+  }
+
   function renderMarkReadFirstPercent(n: number): void {
+    firstPercentShown = n;
     (deps.lookup("mark-read-first-percent") as HTMLInputElement).value = String(n);
-    (deps.lookup("mark-read-first-percent-smaller") as HTMLButtonElement).disabled = n <= 0;
-    (deps.lookup("mark-read-first-percent-larger") as HTMLButtonElement).disabled = n >= 100;
   }
 
   function markReadFirstPercentChanged(value: unknown): number {
+    const input = deps.lookup("mark-read-first-percent") as HTMLInputElement;
+    const text = typeof value === "string" ? value.trim() : value;
+    if (text === "" || text === null || text === undefined || (typeof text !== "number" && !Number.isFinite(Number(text)))) {
+      renderMarkReadFirstPercent(firstPercentShown ?? 50);
+      input.setAttribute("aria-invalid", "true");
+      sayFirstShareKept();
+      return firstPercentShown ?? 50;
+    }
+    const raw = Number(text);
     const n = deps.applyMarkReadFirstPercent(value);
+    if (raw !== n) input.setAttribute("aria-invalid", "true");
+    else input.removeAttribute("aria-invalid");
     let kept = false;
     try {
       deps.deviceSettings().keep(DEVICE_SETTINGS.markReadFirstPercent, n);
       kept = deps.deviceSettings().keptAs(DEVICE_SETTINGS.markReadFirstPercent, n);
     } catch (_error) { kept = false; }
-    deps.lookup("mark-read-first-percent-state").textContent = kept
-      ? `Saved \u2014 the first ${n}% of a long message.`
-      : `This browser refused to store it, so it will be forgotten when you reload. Until then the first ${n}% of a long message.`;
+    sayFirstShareSaved(kept);
     return n;
   }
 
   function stepMarkReadFirstPercent(direction: 1 | -1): void {
-    const button = deps.lookup(direction > 0 ? "mark-read-first-percent-larger" : "mark-read-first-percent-smaller") as HTMLButtonElement;
-    const held = document.activeElement === button;
-    const now = Number((deps.lookup("mark-read-first-percent") as HTMLInputElement).value) || 0;
-    markReadFirstPercentChanged(now + direction);
-    if (held && button.disabled) deps.lookup("mark-read-first-percent").focus();
+    markReadFirstPercentChanged((firstPercentShown ?? 50) + direction);
   }
 
   function renderMarkReadLongWords(n: number): void {
+    longWordsShown = n;
     (deps.lookup("mark-read-long-words") as HTMLInputElement).value = String(n);
-    (deps.lookup("mark-read-long-words-smaller") as HTMLButtonElement).disabled = n <= 0;
-    (deps.lookup("mark-read-long-words-larger") as HTMLButtonElement).disabled = n >= 5000;
   }
 
   function markReadLongWordsChanged(value: unknown): number {
+    const input = deps.lookup("mark-read-long-words") as HTMLInputElement;
+    const text = typeof value === "string" ? value.trim() : value;
+    if (text === "" || text === null || text === undefined || (typeof text !== "number" && !Number.isFinite(Number(text)))) {
+      renderMarkReadLongWords(longWordsShown ?? 0);
+      input.setAttribute("aria-invalid", "true");
+      sayFirstShareKept();
+      return longWordsShown ?? 0;
+    }
+    const raw = Number(text);
     const n = deps.applyMarkReadLongWords(value);
+    if (raw !== n) input.setAttribute("aria-invalid", "true");
+    else input.removeAttribute("aria-invalid");
     let kept = false;
     try {
       deps.deviceSettings().keep(DEVICE_SETTINGS.markReadLongWords, n);
       kept = deps.deviceSettings().keptAs(DEVICE_SETTINGS.markReadLongWords, n);
     } catch (_error) { kept = false; }
-    deps.lookup("mark-read-long-words-state").textContent = kept
-      ? `Saved \u2014 a message over ${n} words is long.`
-      : `This browser refused to store it, so it will be forgotten when you reload. Until then a message over ${n} words is long.`;
+    sayFirstShareSaved(kept);
     return n;
   }
 
   function stepMarkReadLongWords(direction: 1 | -1): void {
-    const button = deps.lookup(direction > 0 ? "mark-read-long-words-larger" : "mark-read-long-words-smaller") as HTMLButtonElement;
-    const held = document.activeElement === button;
-    const now = Number((deps.lookup("mark-read-long-words") as HTMLInputElement).value) || 0;
-    markReadLongWordsChanged(now + direction * 10);
-    if (held && button.disabled) deps.lookup("mark-read-long-words").focus();
+    markReadLongWordsChanged((longWordsShown ?? 0) + direction * 10);
   }
 
   return {

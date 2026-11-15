@@ -1883,60 +1883,33 @@
                             <input id="mark-read-first-guard" type="checkbox" checked />
                             Not in the first share of a long message
                           </label>
-                          <div class="msg-scale-row">
-                            <button
-                              id="mark-read-first-percent-smaller"
-                              class="secondary step-button"
-                              type="button"
-                              aria-label="A smaller first share"
-                              aria-controls="mark-read-first-percent"
-                              title="A smaller first share"
-                            >−</button>
-                            <input
+                          <p class="first-share-line">
+                            Not in the first
+                            <span class="first-share-field"><input
                               id="mark-read-first-percent"
-                              type="range"
-                              min="0"
-                              max="100"
-                              step="1"
+                              type="text"
+                              inputmode="numeric"
+                              autocomplete="off"
+                              data-lpignore="true"
+                              data-1p-ignore="true"
+                              data-form-type="other"
                               aria-label="percent of a long message that counts as its first share"
-                            />
-                            <button
-                              id="mark-read-first-percent-larger"
-                              class="secondary step-button"
-                              type="button"
-                              aria-label="A larger first share"
-                              aria-controls="mark-read-first-percent"
-                              title="A larger first share"
-                            >+</button>
-                          </div>
-                          <p id="mark-read-first-percent-state" class="hint" aria-live="polite"></p>
-                          <div class="msg-scale-row">
-                            <button
-                              id="mark-read-long-words-smaller"
-                              class="secondary step-button"
-                              type="button"
-                              aria-label="Fewer words count as long"
-                              aria-controls="mark-read-long-words"
-                              title="Fewer words count as long"
-                            >−</button>
-                            <input
+                              aria-describedby="mark-read-first-percent-state"
+                            />%</span>
+                            of a msg over
+                            <span class="first-share-field"><input
                               id="mark-read-long-words"
-                              type="range"
-                              min="0"
-                              max="5000"
-                              step="1"
+                              type="text"
+                              inputmode="numeric"
+                              autocomplete="off"
+                              data-lpignore="true"
+                              data-1p-ignore="true"
+                              data-form-type="other"
                               aria-label="words that make a message long"
-                            />
-                            <button
-                              id="mark-read-long-words-larger"
-                              class="secondary step-button"
-                              type="button"
-                              aria-label="More words count as long"
-                              aria-controls="mark-read-long-words"
-                              title="More words count as long"
-                            >+</button>
-                          </div>
-                          <p id="mark-read-long-words-state" class="hint" aria-live="polite"></p>
+                              aria-describedby="mark-read-first-percent-state"
+                            /> words</span>
+                          </p>
+                          <p id="mark-read-first-percent-state" class="hint" aria-live="polite"></p>
                         </div>
                       </div>
                     </div>

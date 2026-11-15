@@ -317,6 +317,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1562 settings-long-message-share-inputs` in the browser engine: the first-share
+  # guard's two numbers as one typeable sentence at phone and desktop widths.
+  - group: check
+    job: first-share-inputs-browser
+    desc: the first-share sentence commits typed numbers, snaps past its bounds, restores when emptied, and greys out with its guard, in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/first_share_inputs_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#369 pairing-link` in the browser engine: a fresh phone-sized browser opens a pairing link, the
   # code leaves the address and is redeemed once in a request body without a bearer token, the token is
   # stored and the main screen comes up; a second fresh browser opening the same link is told it expired

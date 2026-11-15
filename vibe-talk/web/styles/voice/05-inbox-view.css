@@ -1925,6 +1925,48 @@ body .side-card-row[data-linked="true"] {
   gap: 0.5rem;
 }
 
+/* `#1562 settings-long-message-share-inputs`. The first-share guard's two numbers as one
+   typeable sentence: it wraps between words, and a field never splits from its unit. */
+.first-share-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+  margin: 0.5rem 0;
+  font-size: 0.82rem;
+}
+
+.first-share-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  white-space: nowrap;
+}
+
+.first-share-field input {
+  flex: 0 0 auto;
+  min-width: 0;
+  box-sizing: content-box;
+  padding: 0.2rem 0.1rem;
+  text-align: center;
+}
+
+#mark-read-first-percent {
+  width: 3ch;
+}
+
+#mark-read-long-words {
+  width: 4ch;
+}
+
+.first-share-field input[aria-invalid="true"] {
+  border-color: var(--warn);
+}
+
+.first-share-field input:disabled {
+  opacity: 0.55;
+}
+
 .msg-scale-row #msg-scale,
 .msg-scale-row #collapsed-lines {
   flex: 1 1 auto;

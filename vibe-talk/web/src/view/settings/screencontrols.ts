@@ -25,7 +25,7 @@ export interface ScreenControlsDependencies {
   /** How much of a quoted message is read aloud, from its slider, and a step. */
   quoteReadPercentChanged(value: string): unknown;
   stepQuoteReadPercent(direction: -1 | 1): unknown;
-  /** The first share of a long message, and how long is long, from their sliders and steps. */
+  /** The first share of a long message, and how long is long, from their number fields (#1562). */
   markReadFirstPercentChanged(value: string): unknown;
   stepMarkReadFirstPercent(direction: -1 | 1): unknown;
   markReadLongWordsChanged(value: string): unknown;
@@ -64,12 +64,14 @@ export function mountScreenControls(deps: ScreenControlsDependencies): ScreenCon
   listen<Event>(el("quote-read-percent"), "input", () => deps.quoteReadPercentChanged(value("quote-read-percent")));
   listen<Event>(el("quote-read-percent-smaller"), "click", () => deps.stepQuoteReadPercent(-1));
   listen<Event>(el("quote-read-percent-larger"), "click", () => deps.stepQuoteReadPercent(1));
-  listen<Event>(el("mark-read-first-percent"), "input", () => deps.markReadFirstPercentChanged(value("mark-read-first-percent")));
-  listen<Event>(el("mark-read-first-percent-smaller"), "click", () => deps.stepMarkReadFirstPercent(-1));
-  listen<Event>(el("mark-read-first-percent-larger"), "click", () => deps.stepMarkReadFirstPercent(1));
-  listen<Event>(el("mark-read-long-words"), "input", () => deps.markReadLongWordsChanged(value("mark-read-long-words")));
-  listen<Event>(el("mark-read-long-words-smaller"), "click", () => deps.stepMarkReadLongWords(-1));
-  listen<Event>(el("mark-read-long-words-larger"), "click", () => deps.stepMarkReadLongWords(1));
+  listen<Event>(el("mark-read-first-percent"), "change", () => deps.markReadFirstPercentChanged(value("mark-read-first-percent")));
+  listen<KeyboardEvent>(el("mark-read-first-percent"), "keydown", (event) => {
+    if (event.key === "Enter") (el("mark-read-first-percent") as HTMLInputElement).blur();
+  });
+  listen<Event>(el("mark-read-long-words"), "change", () => deps.markReadLongWordsChanged(value("mark-read-long-words")));
+  listen<KeyboardEvent>(el("mark-read-long-words"), "keydown", (event) => {
+    if (event.key === "Enter") (el("mark-read-long-words") as HTMLInputElement).blur();
+  });
   const grip = el("width-grip");
   listen<PointerEvent>(grip, "pointerdown", (event) => deps.gripDown(event));
   listen<PointerEvent>(grip, "pointermove", (event) => deps.gripMove(event));

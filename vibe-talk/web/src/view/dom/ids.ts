@@ -386,14 +386,9 @@ export interface ElementById {
   "mark-read-final-guard": HTMLInputElement;
   "mark-read-first-guard": HTMLInputElement;
   "mark-read-first-percent": HTMLInputElement;
-  "mark-read-first-percent-larger": HTMLButtonElement;
-  "mark-read-first-percent-smaller": HTMLButtonElement;
   "mark-read-first-percent-state": HTMLParagraphElement;
   "mark-read-fold-guard": HTMLInputElement;
   "mark-read-long-words": HTMLInputElement;
-  "mark-read-long-words-larger": HTMLButtonElement;
-  "mark-read-long-words-smaller": HTMLButtonElement;
-  "mark-read-long-words-state": HTMLParagraphElement;
   "mark-read-nonquote": HTMLInputElement;
   "mark-read-on-reply": HTMLSelectElement;
   "mark-read-options": HTMLDivElement;
