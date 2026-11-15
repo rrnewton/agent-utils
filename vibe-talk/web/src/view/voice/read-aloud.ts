@@ -3500,9 +3500,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     } else {
       releaseMediaSession();
     }
-    // `#1587`: a read starting (autoplay's next message included) brings its row into
-    // the band — after the redraw above, whose scroll-keeping would otherwise undo it.
-    if (!isDocument) { const row = readingRowsOf(id)[0]; if (row) followReading(row); }
+    // `#1588`: a fresh read starting (autoplay's next message included) brings its row
+    // into the band — after the redraw above, whose scroll-keeping would otherwise
+    // undo it. A step, jump or recovery restart (first/recovery/hold) is the reader's
+    // own move: following there would pull a scrolled-away reader back and drop the
+    // jump-to-reading chip (`#837`).
+    if (!isDocument && first === 0 && recovery === 0 && !hold) { const row = readingRowsOf(id)[0]; if (row) followReading(row); }
     const begun = startPlayer(first);
     // A jump made while held cues this block up held (`#434 read-aloud-pause`): the hold lands in
     // the same tick the player starts, before a streamed part's cushion or an element's first
