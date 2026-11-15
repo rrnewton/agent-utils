@@ -12588,6 +12588,347 @@ def test_abort_create_still_refuses_modified_submodule_content(
     assert target.is_dir()
 
 
+def _create_with_failed_submodule_init(
+    tmp_path: Path, *, break_component: bool = False
+) -> tuple[Path, Path, Path]:
+    """A create whose submodule-init hook really failed (#1431).
+
+    `broken` records a submodule URL that does not exist, so the hook's
+    `git submodule update --init --recursive` fails for real and the
+    journal records the hook at `failed` with its return code. Git
+    clones every top-level submodule before checking any out, so the
+    good `component` is left cloned but never checked out (its tracked
+    files deleted in the worktree) while `broken` was never cloned at
+    all: the partial-init dirt, with every gitlink at its recorded
+    commit. With `break_component`, `component`'s URL is gone too, so
+    nothing is cloned and the checkout carries no status dirt.
+    """
+
+    project, repository, _remote = make_project(
+        tmp_path, post_provision_hooks=(_PARTIAL_INIT_HOOK,)
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(tmp_path / "component.git"),
+        "broken",
+    )
+    git(
+        repository,
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.broken.url",
+        str(tmp_path / "missing-submodule.git"),
+    )
+    # The slot is a linked worktree: it reads submodule URLs from the
+    # shared .git/config, so register the same gone URL there.
+    git(
+        repository,
+        "config",
+        "submodule.broken.url",
+        str(tmp_path / "missing-submodule.git"),
+    )
+    if break_component:
+        git(
+            repository,
+            "config",
+            "-f",
+            ".gitmodules",
+            "submodule.component.url",
+            str(tmp_path / "missing-component.git"),
+        )
+        git(
+            repository,
+            "config",
+            "submodule.component.url",
+            str(tmp_path / "missing-component.git"),
+        )
+    git(repository, "add", ".gitmodules")
+    git(repository, "commit", "-m", "record submodules whose upstreams are gone")
+    git(repository, "push", "origin", "main")
+    failed = create(project)
+    assert failed.returncode != 0, failed.stderr
+    assert "post-provision hook" in failed.stderr
+    journal = create_journal_path(project)
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    failure = wrkslots._as_mapping(raw["hook_failure"], "test hook failure")
+    assert failure["status"] == "failed"
+    assert failure["checkout"] == "product"
+    assert failure["hook_index"] == 0
+    assert failure["command"] == _PARTIAL_INIT_HOOK
+    returncode = failure["returncode"]
+    assert isinstance(returncode, int) and returncode != 0
+    target = checkout(project)
+    assert target.is_dir()
+    if break_component:
+        assert not (target / "component" / ".git").exists()
+    else:
+        # Cloned but never checked out; `broken` was never cloned.
+        assert (target / "component" / ".git").is_file()
+        assert not (target / "component" / "component.txt").exists()
+        assert not (target / "broken" / ".git").exists()
+    return project, journal, target
+
+
+def test_abort_create_forgives_a_failed_submodule_init_hook(
+    tmp_path: Path,
+) -> None:
+    # #1431: a submodule-init hook that ran and failed (rc != 0) leaves
+    # the same partial-init dirt as one killed mid-run; abort forgives
+    # it instead of blocking every later retirement of the slot.
+    project, journal, target = _create_with_failed_submodule_init(tmp_path)
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+
+
+def test_abort_create_forgives_a_failed_to_start_submodule_init_hook(
+    tmp_path: Path,
+) -> None:
+    # #1431: the same forgiveness when the journal holds the init hook
+    # at `failed-to-start` over partial-init dirt.
+    project, journal, target = _create_with_failed_submodule_init(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    changed = dict(raw)
+    changed["hook_failure"] = {
+        "checkout": "product",
+        "hook_index": 0,
+        "command": _PARTIAL_INIT_HOOK,
+        "status": "failed-to-start",
+        "detail": "test: hook process could not start",
+    }
+    wrkslots._write_journal(config, changed, journal_path=journal)
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+
+
+def test_abort_create_accepts_a_failed_init_that_cloned_nothing(
+    tmp_path: Path,
+) -> None:
+    # #1431: when every submodule URL is gone the failed init clones
+    # nothing and leaves no status dirt; abort already retires it.
+    project, journal, target = _create_with_failed_submodule_init(
+        tmp_path, break_component=True
+    )
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+
+
+def test_abort_create_forgives_failed_init_hook_after_task_scope_ended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # #1431: the failed-init forgiveness also retires a create whose
+    # task scope has ended. Resume refuses at the scope recheck (the
+    # abort branch runs before it), while --abort-create still reaches
+    # a clean abort over the partial-init dirt.
+    project, journal, target = _create_with_failed_submodule_init(tmp_path)
+    _attach_task_scope_to_interrupted_journal(project, journal)
+    journal_before = journal.read_bytes()
+    invocation_directory = tmp_path / "systemd-units"
+    invocation_directory.mkdir()
+    monkeypatch.setattr(
+        wrkslots, "_systemd_invocation_directory", lambda: invocation_directory
+    )
+    recover_argv = [
+        "--project-root",
+        str(project),
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+
+    resumed = wrkslots.main(recover_argv)
+    captured = capsys.readouterr()
+    assert resumed == 3
+    assert "task scope" in captured.err
+    assert journal.read_bytes() == journal_before
+    assert target.is_dir()
+
+    aborted = wrkslots.main([*recover_argv, "--slot", "slot01", "--abort-create"])
+    captured = capsys.readouterr()
+    assert aborted == 0, captured.err
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+
+
+def test_abort_create_still_refuses_a_failed_non_init_hook(
+    tmp_path: Path,
+) -> None:
+    # #1431: only the submodule-init hook's failure is forgiven. Here
+    # the init hook completed and a later hook failed over dirt of the
+    # same deletions-only shape; abort still refuses and preserves.
+    project, repository, _remote = make_project(
+        tmp_path, post_provision_hooks=(_PARTIAL_INIT_HOOK,)
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project, post_provision_hooks=[_PARTIAL_INIT_HOOK, "false"]
+    )
+    failed = create(project)
+    assert failed.returncode != 0, failed.stderr
+    journal = create_journal_path(project)
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    failure = wrkslots._as_mapping(raw["hook_failure"], "test hook failure")
+    assert failure["status"] == "failed"
+    assert failure["hook_index"] == 1
+    assert failure["command"] == "false"
+    target = checkout(project)
+    git(target / "component", "rm", "-q", "component.txt")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "source state is dirty" in aborted.stderr
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+    assert not (target / "component" / "component.txt").exists()
+
+
+def test_abort_create_still_refuses_a_moved_gitlink_after_failed_init(
+    tmp_path: Path,
+) -> None:
+    # #1431: a gitlink recorded at another commit is authored movement,
+    # even over a failed submodule-init hook.
+    project, journal, target = _create_with_failed_submodule_init(tmp_path)
+    component = target / "component"
+    git(component, "reset", "--hard", "-q", "HEAD")
+    tree = git(component, "rev-parse", "HEAD^{tree}").stdout.strip()
+    moved = git(
+        component, "commit-tree", tree, "-p", "HEAD", "-m", "moved"
+    ).stdout.strip()
+    git(component, "checkout", "-q", moved)
+    git(target, "add", "component")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
+def test_abort_create_still_refuses_authored_dirt_after_failed_init(
+    tmp_path: Path,
+) -> None:
+    # #1431: one authored file in the superproject keeps the refusal,
+    # even over a failed submodule-init hook.
+    project, journal, target = _create_with_failed_submodule_init(tmp_path)
+    (target / "seed.txt").write_text("authored\n", encoding="utf-8")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "source state is dirty" in aborted.stderr
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
+def test_abort_create_still_refuses_edited_submodule_content_after_failed_init(
+    tmp_path: Path,
+) -> None:
+    # #1431: edited (not deleted) content inside a submodule refuses,
+    # even over a failed submodule-init hook.
+    project, journal, target = _create_with_failed_submodule_init(tmp_path)
+    component = target / "component"
+    git(component, "reset", "--hard", "-q", "HEAD")
+    (component / "component.txt").write_text("edited\n", encoding="utf-8")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
 def test_recover_repopulates_an_unpopulated_submodule_checkout(tmp_path: Path) -> None:
     """#881: recover repopulates a wholesale-unpopulated checkout, then verifies."""
     project, _journal, leaf = _interrupted_create_with_populated_submodules(tmp_path)
