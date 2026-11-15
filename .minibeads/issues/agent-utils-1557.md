@@ -1,6 +1,6 @@
 ---
 title: "discord-split-merge-regression: a Discord post split at the cap is not combined on the page"
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-15T12:11:00.000000000+00:00
@@ -78,3 +78,5 @@ plus a three-chunk fixture cut at the 2,000-char cap; and
 are one row on screen while another author's message and a later post keep their own
 rows. The 5-second window is unchanged: the plugin posts the chunks back to back, so
 they fall well inside it.
+
+Landed as a62a5ba5 on main (gated at 7baf1676, owner priority, validate green).
