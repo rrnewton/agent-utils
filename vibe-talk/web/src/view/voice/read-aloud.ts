@@ -1980,7 +1980,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * scrolls never pause it, and a reader dragging or flicking is never fought
    * because only highlight advances scroll, never a timer.
    */
-  function followReading(target: { getBoundingClientRect(): DOMRect } | null) {
+  function followReading(target: { getBoundingClientRect(): DOMRect } | null, centreDeadzonePx = 0) {
     const playing = nowPlaying;
     if (!playing || playing.paused || !target || typeof target.getBoundingClientRect !== "function") return;
     let area: HTMLElement | null = null;
@@ -2005,6 +2005,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (followPause.paused(playing.id, inFollowBand(rect.top, rect.bottom, band))) return;
     const delta = followDelta(rect.top, rect.bottom, band);
     if (delta === 0) return;
+    // Near enough to centre already (a jump just centred this row, #837): leave it
+    // exactly where that act put it rather than re-centring by a few pixels.
+    if (centreDeadzonePx > 0 && Math.abs(delta) <= centreDeadzonePx && rect.top >= port.top && rect.bottom <= port.bottom) return;
     followPause.noteOwnScroll();
     // The stylesheet's word on motion, as the column glide reads it (`--column-glide`
     // on #screen-main): "auto" for a reduced-motion reader, smooth otherwise. The
@@ -2294,7 +2297,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       try { area = deps.el("scroll-area"); } catch (_error) { area = null; }
       const portH = area && typeof area.getBoundingClientRect === "function" ? area.getBoundingClientRect().bottom - area.getBoundingClientRect().top : 0;
       const rowRect = followRow.getBoundingClientRect();
-      followReading(portH > 0 && rowRect.bottom - rowRect.top > portH ? litSentenceRange : followRow);
+      followReading(portH > 0 && rowRect.bottom - rowRect.top > portH ? litSentenceRange : followRow, 24);
     }
   }
 
@@ -2473,7 +2476,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       if (!reading && row.getAttribute("data-reading-marked") === null) continue;
       // `#1587`: a new message or block brings its row into the band; the sentence
       // light refines from there. With no sentence light this is the only follow.
-      if (reading) followReading(row);
+      if (reading) followReading(row, 24);
       markReadingBlock(row);
       const named = childByClass(row, "msg-author");
       if (named && reading && row.getAttribute("data-reading") === "true") named.textContent = readingLabel();
