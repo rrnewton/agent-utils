@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Short references in a message, in real Chromium at 1280x800 and 390x852.
 
-`#1565 vibe-talk-short-ref-links`. The server draws `:thread:060` as a marked
-thread link, `:email:1846` as a marked message link, `:issue:1565` as a tracker
-link, and an unresolvable reference as plain text with a dotted underline
-(tested in `src/render.rs`); this walk hands the page bodies as the server
-writes them and checks the taps: a thread link drills into the thread, a
-message link highlights its message in Main, and the unknown reference is no
-link at all.
+`#1565 vibe-talk-short-ref-links`, `#1607 short-ref-emoji-render`. The server
+draws `:thread:060` as a marked thread link labelled `🧵060`, `:email:1846`
+as a marked message link labelled `✉️1846`, `:issue:1565` as a tracker link
+keeping its written label, and an unresolvable reference as plain `🧵999`
+with a dotted underline (tested in `src/render.rs`); this walk hands the page
+bodies as the server writes them and checks the taps: a thread link drills
+into the thread, a message link highlights its message in Main, and the
+unknown reference is no link at all.
 
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
@@ -54,13 +55,13 @@ class ShortRefApi(fixture.FakeApi):
         html = (
             '<p>see <a href="?c=' + CHAN + '&v=thread&t=spaces%2FA%2Fthreads%2Fone" '
             f'data-msg="{mark(CHAN, "", THREAD)}" data-shortref="thread" '
-            'target="_blank" rel="noopener noreferrer nofollow">:thread:060</a> and '
+            'target="_blank" rel="noopener noreferrer nofollow">🧵060</a> and '
             f'<a href="?c={CHAN}&v=all&m=discord:{CHAN}:201" '
             f'data-msg="{mark(CHAN, "201")}" data-shortref="email" '
-            'target="_blank" rel="noopener noreferrer nofollow">:email:1846</a> and '
+            'target="_blank" rel="noopener noreferrer nofollow">✉️1846</a> and '
             '<a href="https://tracker.example.invalid/issues/1565" '
             'target="_blank" rel="noopener noreferrer nofollow">:issue:1565</a> and '
-            '<span class="shortref-unknown">:thread:999</span></p>\n'
+            '<span class="shortref-unknown">🧵999</span></p>\n'
         )
         citing = message(3, "see :thread:060 and :email:1846 and :issue:1565 and :thread:999")
         citing["content_html"] = html
@@ -236,9 +237,9 @@ def short_ref_walk(desk: Desk, api: ShortRefApi) -> None:
         overflow: document.documentElement.scrollWidth - window.innerWidth,
       };
     }""")
-    desk.check(found["thread"] == ":thread:060", f"the thread reference is not a link: {found}")
-    desk.check(found["email"] == ":email:1846", f"the message reference is not a link: {found}")
-    desk.check(found["unknown"] == ":thread:999" and found["unknownIsLink"] is False,
+    desk.check(found["thread"] == "🧵060", f"the thread reference is not a link: {found}")
+    desk.check(found["email"] == "✉️1846", f"the message reference is not a link: {found}")
+    desk.check(found["unknown"] == "🧵999" and found["unknownIsLink"] is False,
                f"the unknown reference is not plain text: {found}")
     desk.check(found["issue"] == "https://tracker.example.invalid/issues/1565",
                f"the issue reference does not use the template: {found}")

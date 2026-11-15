@@ -229,6 +229,10 @@ mod tests {
             ":ok:go",
             "done:tada:",
             "_:crab:",
+            // A reference's emoji and number are drawn by the reference
+            // renderer (`#1607`), never by loosening this rule.
+            ":thread:1234",
+            ":crab:123",
         ] {
             assert_eq!(shortcodes(text), text, "{text:?}");
         }

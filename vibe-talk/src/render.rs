@@ -251,8 +251,10 @@ impl SearchText {
     /// link-url-chip`). `render-5`: a link written as a bare reference to its own thread
     /// (`#5275`, `PR 5275`) drawn by that thread's `REPO#N` label (`#1058 pr-name-enrichment`);
     /// the name a page label may also carry is never indexed, so no fetched text is in this
-    /// version's key and rebuilding under it fetches nothing.
-    pub const VERSION: &'static str = "render-6";
+    /// version's key and rebuilding under it fetches nothing. `render-7`: a thread or
+    /// message short reference drawn as its emoji and number (`#1607
+    /// short-ref-emoji-render`).
+    pub const VERSION: &'static str = "render-7";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -2745,6 +2747,9 @@ const SHORTREF_HOST: &str = "https://shortrefs.invalid";
 /// resolves, and marked where it does not. See [`crate::short_refs`]. Text inside a link is
 /// left as it is, and so is what `refused` holds; code is not text here. A reference that
 /// resolves to nothing stays plain text under [`SHORTREF_UNKNOWN_CLASS`], never a wrong link.
+/// Thread and message references are DRAWN as the emoji and number Slack draws
+/// ([`short_ref_label`], `#1607 short-ref-emoji-render`); what was written still travels
+/// beside the drawn body, so Copy text copies it as written.
 /// Answers what the links made may add to the HTML, as [`link_references`] does.
 fn link_short_refs<'a>(
     arena: &'a Arena<'a>,
@@ -2777,9 +2782,10 @@ fn link_short_refs<'a>(
                 );
             }
             let shown = &text[token.start..token.end];
+            let label = short_ref_label(token.kind, shown);
             let made: &'a AstNode<'a> = match short_ref_url(&refs, token.kind, token.number) {
                 Some(url) => {
-                    added += LINK_MARKUP + 2 * url.len() + shown.len();
+                    added += LINK_MARKUP + 2 * url.len() + label.len();
                     let link: &'a AstNode<'a> = arena.alloc(
                         NodeValue::Link(Box::new(comrak::nodes::NodeLink {
                             url,
@@ -2787,12 +2793,12 @@ fn link_short_refs<'a>(
                         }))
                         .into(),
                     );
-                    link.append(arena.alloc(NodeValue::Text(shown.to_owned().into()).into()));
+                    link.append(arena.alloc(NodeValue::Text(label.into()).into()));
                     link
                 }
                 None => arena.alloc(
                     NodeValue::Raw(format!(
-                        "<span class=\"{SHORTREF_UNKNOWN_CLASS}\">{shown}</span>"
+                        "<span class=\"{SHORTREF_UNKNOWN_CLASS}\">{label}</span>"
                     ))
                     .into(),
                 ),
@@ -2808,6 +2814,19 @@ fn link_short_refs<'a>(
         node.detach();
     }
     added
+}
+
+/// How a short reference is drawn: a thread as 🧵 and its number, a message as ✉️ and
+/// its number — the standard emoji `thread` and `email` name in `slack/emoji_names.tsv`,
+/// which is how Slack itself draws `:thread:NNNN` and `:email:NNNN`. The digits keep the
+/// form they were written in. An issue has no standard emoji, so it keeps its written
+/// form. `#1607 short-ref-emoji-render`.
+fn short_ref_label(kind: ShortRefKind, shown: &str) -> String {
+    match kind {
+        ShortRefKind::Thread => format!("🧵{}", &shown[":thread:".len()..]),
+        ShortRefKind::Email => format!("✉️{}", &shown[":email:".len()..]),
+        ShortRefKind::Issue => shown.to_owned(),
+    }
 }
 
 /// Which short reference a token is.
@@ -5721,6 +5740,10 @@ mod search_text_tests {
             "render-6",
             "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
         ),
+        (
+            "render-7",
+            "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
+        ),
     ];
 
     fn corpus_digest() -> String {
@@ -6537,6 +6560,12 @@ mod short_ref_tests {
     #[test]
     fn short_references_draw_as_marked_links() {
         let html = drawn("see :thread:060 and :email:1847 and :issue:1565");
+        // `#1607 short-ref-emoji-render`: a thread or message reference is drawn
+        // as its emoji and number, as Slack draws it; an issue has no Slack
+        // emoji and keeps its written form.
+        assert!(html.contains(">🧵060<"), "{html}");
+        assert!(html.contains(">✉️1847<"), "{html}");
+        assert!(html.contains(">:issue:1565<"), "{html}");
         assert!(html.contains("data-shortref=\"thread\""), "{html}");
         assert!(html.contains("data-shortref=\"email\""), "{html}");
         assert!(
@@ -6558,7 +6587,10 @@ mod short_ref_tests {
     fn unknown_short_references_stay_plain_and_marked() {
         let html = drawn("see :thread:999 and :email:9999");
         assert!(html.contains("class=\"shortref-unknown\""), "{html}");
-        assert!(html.contains(":thread:999"), "{html}");
+        // Drawn as emoji and number here too, only unlinked and dotted.
+        assert!(html.contains("🧵999"), "{html}");
+        assert!(html.contains("✉️9999"), "{html}");
+        assert!(!html.contains(":thread:999"), "{html}");
         assert!(!html.contains("data-shortref"), "{html}");
     }
 
@@ -6567,5 +6599,17 @@ mod short_ref_tests {
         let html = drawn("`:thread:060`");
         assert!(!html.contains("data-shortref"), "{html}");
         assert!(html.contains(":thread:060"), "{html}");
+        assert!(!html.contains("🧵"), "{html}");
+    }
+
+    #[test]
+    fn other_shortcodes_touching_digits_stay_as_written() {
+        // Only the three reference kinds are drawn as emoji and number; the
+        // general rule (`slack::emoji`) is untouched by this change.
+        let html = drawn("see :crab:123 and :wave:42");
+        assert!(html.contains(":crab:123"), "{html}");
+        assert!(html.contains(":wave:42"), "{html}");
+        assert!(!html.contains("data-shortref"), "{html}");
+        assert!(!html.contains("shortref-unknown"), "{html}");
     }
 }
