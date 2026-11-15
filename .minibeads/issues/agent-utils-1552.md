@@ -1,12 +1,12 @@
 ---
 title: 'discuss-docked-height-drag: drag the "Discuss agent" title bar to resize the docked pane'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-11-14T19:10:00.000000000+00:00
-updated_at: 2026-11-14T19:10:00.000000000+00:00
+updated_at: 2026-11-15T01:02:00.000000000+00:00
 ---
 
 # Description
@@ -90,3 +90,11 @@ Owner UI request 073; prior work reused: #1186 (splitter drag shape),
 #1531 (the slim "Discuss agent" bar that becomes the handle),
 #1527 (bottom Summarize bar, untouched inside the pane), #1398 (width
 handle, untouched).
+
+## Resolution
+
+Landed 429cad63 (gated 16ad3746, gate pass 2026-11-15T00:42:47Z, owner
+priority). Deployed 2026-11-14 7:45 PM ET; the 15-minute health watch
+passed (no errors, no restarts). Not covered: a physical finger drag
+on a device (the tested mouse drag uses the same pointer-event path);
+the desktop side-docked column keeps its existing width drag.
