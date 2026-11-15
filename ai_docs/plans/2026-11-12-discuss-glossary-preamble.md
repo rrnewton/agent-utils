@@ -146,6 +146,105 @@ Low priority at a 1–2.5k-token preamble, and not cheaply checkable today:
   nothing. If token accounting later exposes cached-token counts,
   re-measure then; do not build session reuse for this preamble size.
 
+## Owner 094: id lookup and an agentic definer, under the broader glossary effort
+
+Status: design only, awaiting the owner's go (Owner 094, 2026-11-15). No
+build is authorised by this section. The unknown-terms log that motivates
+it holds 9 runs and 42 distinct terms; the latest run's unknowns were
+mostly tracking ids (`S5b`, `S5c-2`, `GO1`, `T-REAL`, `L1`, `CAS`). The
+owner's direction is that anything sophisticated here belongs to the
+broader glossary, labelling, topic-classification and summarization
+effort, not to Discuss alone. Discuss is one consumer of that shared
+glossary; this section specifies two candidate sources for it and where
+they sit. The pipeline placement is designed in the [voice-overview
+plan §4–§5](2026-11-07-voice-overview/README.md) and the snapshot and
+convergence design in [shared vocabulary](2026-11-08-shared-vocabulary/README.md);
+both link back here.
+
+### (a) Deterministic candidate selection: look the id up where it was introduced
+
+The weekly sweep in (b) above counts sightings in the log, docs, commits
+and issues. For tracking ids that rarely helps: an id is coined once,
+in one message or one transcript line, and then used bare. The
+deterministic step therefore adds a targeted lookup before any model is
+asked to define anything:
+
+- **Corpora, in order.** (1) The full message history for the channels
+  in scope, searched further back than the Discuss warm-up window (the
+  warm-up window is a prompt budget, not a search bound). (2) Agent
+  transcripts: the session logs the hosts already keep for their coding
+  agents (interactive and headless sessions alike), searched as text.
+  Both corpora are already retained for other reasons; no new capture
+  is proposed.
+- **Hit selection.** For each unresolved term, collect exact,
+  case-insensitive sightings and prefer the *introducing* one: the
+  earliest message or line that defines the id in place — patterns such
+  as `S5b = …`, `S5b: …`, “S5b (… )”, or a sentence that expands or
+  names what the id tracks — over later bare uses. Keep the introducing
+  sentence plus a small window of surrounding context as the evidence
+  record. If no introducing sighting exists, keep the earliest sighting
+  and mark the candidate `context-only`.
+- **Output.** A candidate is `{term, evidence refs, introducing text if
+  any, sighting count}` — evidence, not a definition. It enters the same
+  review queue as the (b) sweep's candidates; nothing is served from a
+  raw hit without the definition and acceptance steps below.
+- **Privacy and scope limits.** Search stays inside the deployment's
+  own retained history and transcripts; only the introducing sentence
+  and its immediate context leave the corpus, never whole transcripts.
+  No host, channel or consumer names are written into this repository:
+  corpus locations are consumer configuration, named beside the other
+  consumer state. Terms whose only evidence is text the owner never
+  saw stay proposal-only until accepted (the shared-vocabulary
+  bootstrap rule), so an id coined between agents cannot silently
+  become owner-facing vocabulary.
+- **Cost.** Exact-match text search over retained logs; no model call.
+  The expensive failure mode is an unbounded history scan per term, so
+  the lookup is batched per glossary run (one pass per corpus, all
+  unresolved terms at once) and bounded by a configurable lookback.
+  Expected cost is negligible next to one definition call.
+
+### (b) Agentic definer: propose cited definitions for the residue
+
+Whatever (a) cannot resolve — no introducing sighting, or only
+`context-only` evidence — goes to an agent acting as a glossary
+collaborator, not as an oracle:
+
+- **Task.** Given the term, its sighting contexts from (a), and access
+  to the same corpora (message history, transcripts, docs, commits,
+  issues), propose a one-line definition in the Layer 1/Layer 2 format,
+  or answer `insufficient-evidence`.
+- **Citations are mandatory.** Every proposed definition carries the
+  source refs it rests on (message, transcript line, doc, commit or
+  issue). A proposal without a citable source is not written to the
+  queue. The definer must never invent an expansion or a meaning: an
+  uncited guess is worse than an unknown term, for the same reason (b)
+  above gives for unreviewed definitions.
+- **Acceptance gate.** Proposals land as `proposed` in the shared
+  glossary store and are published only on acceptance by the owner or
+  a designated curator. Acceptance, rejection and edits are recorded
+  with the citations, so a wrong gloss can be traced to its evidence.
+  Nothing the definer writes is served to Discuss, injected into a
+  prompt header, or published in a snapshot before that gate.
+- **Where the output goes.** An accepted definition is an ordinary
+  glossary entry: it flows to the Discuss warm-up (Layer 1 or 2 by the
+  routing rule in (b) above), to the published snapshot, and to every
+  other consumer on the same terms as a human-written entry. The
+  definer is a writer into the gate, never a publisher.
+
+### Placement: shared glossary first, Discuss second
+
+Both steps feed the one shared glossary store (voice-overview §4.2):
+(a) is a deterministic candidate source alongside the unknown-term
+frequencies, docs, commits and issues already listed in (b); (b) is the
+definition step for candidates that have evidence but no gloss, behind
+the same acceptance gate and epoch publication as every other writer.
+Discuss then consumes the result exactly as designed above — primer
+first, project glossary second, inside the existing warm-up budget —
+with no Discuss-private definition path. Building either step for
+Discuss alone, with its own store or its own acceptance rule, is
+explicitly out of scope; if the broader effort reorders its stages,
+these two move with it.
+
 ## Acceptance for the eventual build
 
 - Generator emits Layer 2 deterministically from a registry snapshot

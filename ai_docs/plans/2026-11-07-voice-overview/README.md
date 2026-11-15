@@ -611,6 +611,34 @@ Rename keeps the old slug as an alias forever (stored labels, search and your
 spoken references keep resolving); merge resolves at read time; split is
 "create new + owner-approved re-assignment suggestions", never automatic.
 
+### 4.6 Owner 094: id lookup and an agentic definer in this pipeline
+
+Design only, awaiting the owner's go (Owner 094, 2026-11-15); specified
+in the [Discuss glossary plan, "Owner 094"](../2026-11-12-discuss-glossary-preamble.md).
+Two additions, both writers into the §4.2 gate and nothing more:
+
+- **Deterministic id lookup (candidate selection).** Before any model
+  defines a term, unresolved terms and tracking ids are looked up
+  exactly across the full message history (further back than any
+  warm-up window) and the retained agent transcripts, preferring the
+  introducing sighting (`S5b = …`). This sits with the other
+  deterministic candidate sources in §5.1 — before the batched message
+  labels, alongside the exact-rule labels — and emits evidence records,
+  not definitions. It is the cheap first pass that keeps ids coined
+  once, in one message or transcript line, from reaching a model
+  undefined.
+- **Agentic definer (definition proposals).** Terms the lookup leaves
+  unresolved go to an agent collaborator that proposes a one-line
+  definition with cited sources, or `insufficient-evidence` — never an
+  invented gloss. It sits where §5.3 already puts definition work
+  (same-thing adjudication and coinage definition, call 5): after
+  candidate selection, before publication. Proposals enter the store
+  as `proposed` and publish only through the §4.2 acceptance gate
+  (owner or curator) at a glossary epoch, exactly like batch and
+  just-in-time coinage. Discuss, the page and the voice agent then read
+  the result as ordinary accepted vocabulary; there is no
+  Discuss-private path around the gate.
+
 ## 5. The labelling and summarization pipeline
 
 ### 5.1 When to compute: hybrid, precompute the stable layers

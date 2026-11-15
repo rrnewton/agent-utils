@@ -7,7 +7,7 @@ assignee: mu-discussgloss
 labels:
 - vibe-talk
 created_at: 2026-11-12T19:31:00+00:00
-updated_at: 2026-11-12T19:31:00+00:00
+updated_at: 2026-11-15T15:10:00+00:00
 ---
 
 # Description
@@ -31,3 +31,5 @@ See the plan file. Layer 1 (stable systems primer, ~2,000 chars, consumer-held) 
 # Notes
 
 [watermelon-full-preview] #1394 discuss-glossary-preamble, mu-discussgloss. Stays open pending the owner's go.
+
+[watermelon-full-preview] 2026-11-15 (ET): Owner 094 folded in as design only, awaiting the owner's go — deterministic id lookup across the full message history and retained agent transcripts, plus an agentic definer proposing cited definitions into the shared acceptance gate. Specified in the plan's "Owner 094" section; placed in the broader pipeline in the voice-overview plan §4.6 and the shared-vocabulary plan ("Owner 094" under §5). No build authorised. #1394 discuss-glossary-preamble.

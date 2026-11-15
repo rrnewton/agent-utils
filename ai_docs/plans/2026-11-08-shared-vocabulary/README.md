@@ -195,6 +195,24 @@ This also keeps the privacy boundary simple: nothing enters the published
 snapshot whose evidence is solely owner-invisible text without an explicit
 acceptance step (Q16).
 
+### Owner 094: id lookup and an agentic definer
+
+Design only, awaiting the owner's go (Owner 094, 2026-11-15); specified
+in the [Discuss glossary plan, "Owner 094"](../2026-11-12-discuss-glossary-preamble.md)
+and placed in the labelling pipeline in the [voice-overview plan
+§4.6](../2026-11-07-voice-overview/README.md). In this document's terms:
+the deterministic id lookup (full message history and retained agent
+transcripts, introducing sighting preferred) is one more *proposal*
+source under the bootstrap rule above — transcript evidence proposes,
+it never publishes — and the agentic definer is a proposal writer into
+the same §4.2 acceptance gate, its definitions carrying cited sources
+and publishing only on owner or curator acceptance. Accepted entries
+then flow through the one published snapshot (§1) to every consumer —
+Discuss warm-up, bridge header, lookup CLI — with no Discuss-private
+store, gate or snapshot. Neither step changes the snapshot format or
+the store's writer rules; both wait for the same go as the rest of
+this design.
+
 ## 6. Minimal first step, and what to measure
 
 1. Snapshot v1 writer in vibe-talk (accepted entries only, epoch file beside
