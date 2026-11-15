@@ -1977,7 +1977,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    */
   function followReading(target: { getBoundingClientRect(): DOMRect } | null) {
     const playing = nowPlaying;
-    if (!playing || playing.paused || !target) return;
+    if (!playing || playing.paused || !target || typeof target.getBoundingClientRect !== "function") return;
     let area: HTMLElement | null = null;
     try { area = deps.el("scroll-area"); } catch (_error) { area = null; }
     if (!area || typeof area.getBoundingClientRect !== "function") return;
