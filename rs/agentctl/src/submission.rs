@@ -100,6 +100,13 @@ pub const FIRST_RETRY: Duration = Duration::from_millis(500);
 pub const MAX_RETRY: Duration = Duration::from_secs(4);
 /// Screen polling interval while waiting.
 pub const POLL: Duration = Duration::from_millis(100);
+/// Delay after a verified submission before its one re-check of the
+/// composer: long enough for the harness to redraw a prompt it took and
+/// then returned, short enough to cost one second of pane lock per send.
+pub const RECHECK_DELAY: Duration = Duration::from_secs(1);
+/// Longest wait for a re-staged prompt to leave the composer again after
+/// the re-check's single key press.
+pub const RECHECK_VERIFY: Duration = Duration::from_secs(3);
 /// Longest extra wait for printed evidence once weaker evidence has proved a submission.
 ///
 /// A busy agent shows its running-turn marker before the key and after it, so that marker proves
@@ -362,8 +369,9 @@ impl SubmitTimeouts {
     /// The longest one submission may hold the pane's locks (typing, submit
     /// and verify together): every phase deadline it may consume, summed —
     /// the composer wait once per draft recovery plus one, the stage window
-    /// and its grace, the submit window with its printed-evidence grace, and
-    /// one bounded draft-recovery press sequence per recovery. Enforced in
+    /// and its grace, the submit window with its printed-evidence grace,
+    /// one bounded draft-recovery press sequence per recovery, and the
+    /// delayed re-check after a verified submission. Enforced in
     /// [`submit_verified`] against the caller's clock, so no admission holds
     /// the pane lock longer, whatever phase stalls (#1683
     /// pane-lock-held-by-stuck-sender). The pane admission itself adds at
@@ -376,6 +384,8 @@ impl SubmitTimeouts {
             + self.submit
             + PRINT_GRACE
             + DRAFT_SUBMIT_TIMEOUT * (MAX_DRAFT_RECOVERIES + 1)
+            + RECHECK_DELAY
+            + RECHECK_VERIFY
     }
 }
 
@@ -1410,6 +1420,78 @@ fn note_region_recovered(queue: &std::path::Path, id: &str, evidence: &str) {
     }
 }
 
+/// One delayed re-check after a verified submission (owner suggestion,
+/// #1683): a harness can take a prompt, prove the submission, and then
+/// put the text back in its composer (Claude Code does at a tool
+/// boundary), where it would hold every later prompt until the stranded
+/// or stale paths notice. After [`RECHECK_DELAY`], if the composer still
+/// holds exactly the prompt just sent — composer-shaped when a reader
+/// parses the screen, a lower-region match when none does, and never
+/// while a question, a menu or a picker shows — press the submission key
+/// once and watch it leave for up to [`RECHECK_VERIFY`]. Anything else
+/// (an empty composer, foreign text, an unreadable screen) is left
+/// exactly as it is: this is never a blind Enter, and the verified
+/// outcome stands whatever the re-check finds.
+fn recheck_submitted(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    text: &str,
+    runtime: &dyn AgentRuntime,
+) {
+    if runtime.cancelled() {
+        return;
+    }
+    runtime.sleep(RECHECK_DELAY);
+    if runtime.cancelled() {
+        return;
+    }
+    let Ok(screen) = terminal.read_screen(pane_id) else {
+        return;
+    };
+    if blocked(harness, &screen) {
+        return;
+    }
+    let config = crate::paste_backstop::BackstopConfig::default();
+    match composer_view(harness, &screen) {
+        Some(view) => {
+            if composer_draft(&view).is_none() || !composer_is_this_text(&view, text) {
+                return;
+            }
+            let key = submit_key(harness, &view, runtime);
+            if terminal.send_keys(pane_id, key).is_err() {
+                return;
+            }
+        }
+        None => {
+            if crate::paste_backstop::match_region(text, &screen, &config).is_none() {
+                return;
+            }
+            let key = runtime.followup_key().unwrap_or("Enter");
+            if terminal.send_keys(pane_id, key).is_err() {
+                return;
+            }
+        }
+    }
+    let deadline = runtime.monotonic() + RECHECK_VERIFY;
+    loop {
+        runtime.sleep(POLL);
+        if runtime.cancelled() || runtime.monotonic() >= deadline {
+            return;
+        }
+        let Ok(screen) = terminal.read_screen(pane_id) else {
+            return;
+        };
+        let staged = match composer_view(harness, &screen) {
+            Some(view) => composer_draft(&view).is_some() && composer_is_this_text(&view, text),
+            None => crate::paste_backstop::match_region(text, &screen, &config).is_some(),
+        };
+        if !staged {
+            return;
+        }
+    }
+}
+
 fn unix_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2002,6 +2084,9 @@ pub fn submit_verified(
                         clear = view.is_some();
                         observed = view.map(|view| (view, screen, read_at));
                     }
+                    // One delayed re-check: a prompt the harness took and
+                    // then put back must not wait for the next pass (#1683).
+                    recheck_submitted(terminal, pane_id, harness, text, runtime);
                     return Ok(Submission::Verified(receipt));
                 }
             }
@@ -5128,7 +5213,7 @@ mod tests {
         // The first read after the key proved the submission. The reads that then looked for
         // printed evidence, for `PRINT_GRACE`, sent no key.
         assert_eq!(receipt.elapsed, POLL);
-        assert_eq!(took, POLL + PRINT_GRACE);
+        assert_eq!(took, POLL + PRINT_GRACE + RECHECK_DELAY);
         assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
     }
 
@@ -5246,7 +5331,7 @@ mod tests {
         assert!(receipt.printed, "{receipt:?}");
         // Reads 100 ms apart: the fourth after the key showed the prompt.
         assert_eq!(receipt.elapsed, 4 * POLL);
-        assert_eq!(took, 4 * POLL);
+        assert_eq!(took, 4 * POLL + RECHECK_DELAY);
         assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
     }
 
@@ -5267,7 +5352,7 @@ mod tests {
             "agent queue marker appeared (\"Press up to edit queued messages\")"
         );
         assert!(receipt.printed, "{receipt:?}");
-        assert_eq!((receipt.elapsed, took), (POLL, POLL));
+        assert_eq!((receipt.elapsed, took), (POLL, POLL + RECHECK_DELAY));
     }
 
     #[test]
@@ -5287,7 +5372,7 @@ mod tests {
             receipt.evidence,
             "agent queue marker appeared (\"Press up to edit queued messages\")"
         );
-        assert_eq!((receipt.elapsed, took), (POLL, POLL));
+        assert_eq!((receipt.elapsed, took), (POLL, POLL + RECHECK_DELAY));
         assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
     }
 
@@ -5301,7 +5386,7 @@ mod tests {
         );
         let (receipt, took) = submit_frames(&frames, "run the tests");
         assert!(!receipt.printed && receipt.settled, "{receipt:?}");
-        assert_eq!(took, POLL + PRINT_GRACE);
+        assert_eq!(took, POLL + PRINT_GRACE + RECHECK_DELAY);
         assert_eq!(*frames.keys.lock().unwrap(), ["Enter"]);
     }
 
@@ -5340,7 +5425,7 @@ mod tests {
         );
         let (receipt, took) = submit_frames(&frames, "run the tests");
         assert!(!receipt.printed, "{receipt:?}");
-        assert_eq!(took, POLL + PRINT_GRACE);
+        assert_eq!(took, POLL + PRINT_GRACE + RECHECK_DELAY);
     }
 
     #[test]
@@ -5353,7 +5438,7 @@ mod tests {
         let (receipt, took) = submit_frames(&frames, "run the tests");
         assert_eq!(receipt.evidence, "agent started reporting an active turn");
         assert!(receipt.printed, "{receipt:?}");
-        assert_eq!((receipt.elapsed, took), (POLL, POLL));
+        assert_eq!((receipt.elapsed, took), (POLL, POLL + RECHECK_DELAY));
     }
 
     #[test]
@@ -5527,7 +5612,7 @@ mod tests {
         let (receipt, took) = submit_frames(&frames, claude_busy::PROMPT);
         assert_eq!(receipt.evidence, "agent reports an active turn");
         assert!(!receipt.printed, "{receipt:?}");
-        assert_eq!(took, POLL + PRINT_GRACE);
+        assert_eq!(took, POLL + PRINT_GRACE + RECHECK_DELAY);
     }
 
     #[test]
@@ -6132,8 +6217,8 @@ mod tests {
 
     /// #1683: the in-lock hold bound is the summed phase deadlines, a
     /// number a reader can check: composer waits per recovery, the 10 s
-    /// stage window with no grace, the submit window, and one bounded
-    /// recovery press sequence per recovery.
+    /// stage window with no grace, the submit window, one bounded
+    /// recovery press sequence per recovery, and the delayed re-check.
     #[test]
     fn the_in_lock_hold_bound_is_the_sum_of_its_phases() {
         let timeouts = in_lock_timeouts();
@@ -6145,11 +6230,67 @@ mod tests {
                 + timeouts.submit
                 + PRINT_GRACE
                 + DRAFT_SUBMIT_TIMEOUT * (MAX_DRAFT_RECOVERIES + 1)
+                + RECHECK_DELAY
+                + RECHECK_VERIFY
         );
         assert_eq!(in_lock_hold_bound(), timeouts.hold_bound());
         // 15 s composer waits and 15 s recovery sequences, four each,
-        // around a 10 s stage and a 60 s submit: three minutes twelve.
-        assert_eq!(in_lock_hold_bound(), Duration::from_secs(192));
+        // around a 10 s stage and a 60 s submit, plus the 1 s + 3 s
+        // re-check: three minutes sixteen.
+        assert_eq!(in_lock_hold_bound(), Duration::from_secs(196));
+    }
+
+    /// #1683: the delayed re-check submits a prompt the harness put back
+    /// in its composer after the verified submission — one extra key,
+    /// and the prompt is still typed exactly once by the send itself.
+    #[test]
+    fn a_recheck_submits_a_prompt_put_back_in_the_composer() {
+        let text = format!("{LANE}\nfirst finding\nsecond finding\nthird finding");
+        let screen = FakeScreen::new("claude", false);
+        screen.leave_draft(&text);
+        let clock = Clock::default();
+        recheck_submitted(&screen, "w1:p1", "claude", &text, &clock);
+        assert_eq!(screen.state().keys, ["Enter"]);
+        assert_eq!(screen.state().submitted, [text]);
+        assert!(screen.state().composer.is_empty());
+    }
+
+    /// #1683: the re-check is never a blind Enter: an empty composer and
+    /// a foreign draft both get no key.
+    #[test]
+    fn a_recheck_presses_nothing_on_a_clean_or_foreign_composer() {
+        let text = format!("{LANE}\nfirst finding\nsecond finding\nthird finding");
+        let clean = FakeScreen::new("claude", false);
+        recheck_submitted(&clean, "w1:p1", "claude", &text, &Clock::default());
+        assert!(clean.state().keys.is_empty());
+
+        let foreign = FakeScreen::new("claude", false);
+        foreign.leave_draft("a person's own half-written note");
+        recheck_submitted(&foreign, "w1:p1", "claude", &text, &Clock::default());
+        assert!(foreign.state().keys.is_empty());
+        assert_eq!(foreign.state().composer, "a person's own half-written note");
+    }
+
+    /// #1683: the re-check also fires where only the lower region shows
+    /// the returned prompt (no composer reader parses the screen).
+    #[test]
+    fn a_recheck_submits_a_prompt_visible_only_in_the_lower_region() {
+        let text = format!("{LANE}\nfirst finding\nsecond finding\nthird finding");
+        let screen = RegionScreen::stuck(&text);
+        recheck_submitted(&screen, "w1:p1", "claude", &text, &Clock::default());
+        assert_eq!(screen.keys(), ["Enter"]);
+        assert!(screen.pastes().is_empty());
+    }
+
+    /// #1683: a clean verified send gets no re-check key: the only Enter
+    /// is the submission itself.
+    #[test]
+    fn a_clean_verified_send_gets_no_recheck_key() {
+        let screen = FakeScreen::new("claude", false);
+        let (outcome, _elapsed) = submit_with(&screen, "the brief", SubmitTimeouts::default());
+        receipt(outcome);
+        assert_eq!(screen.state().keys, ["Enter"]);
+        assert_eq!(screen.state().pastes, ["the brief"]);
     }
 
     /// #989 agentctl-own-draft-submit: a failed-queue digest a pass typed into a busy Claude

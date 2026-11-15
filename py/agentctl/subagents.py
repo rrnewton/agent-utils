@@ -4227,6 +4227,11 @@ class ManagedAgents:
         """Report live state or a visible probe error, preserving every durable record."""
         record = self._load(name)
         result = self._status_record(record)
+        # Name a terminal another registry also records (#1683): two registries
+        # driving one pane is easy to miss from either side.
+        shared_terminals = self._shared_terminal_findings([record])
+        if shared_terminals:
+            result["shared_terminals"] = shared_terminals
         # A live lane whose conversation was never captured cannot be
         # revived after a reboot; flag it while it can still be bound (#948).
         if (record.lifecycle == "running"
@@ -7036,6 +7041,74 @@ class ManagedAgents:
                 f"pane {pane_id} no longer holds this agent: " + "; ".join(failures)
             )
 
+    def _shared_terminal_findings(
+        self, records: builtins.list[AgentRecord],
+    ) -> builtins.list[dict[str, object]]:
+        """Agents in another registry that record the same pane or terminal as an agent here.
+
+        The sibling registries are the ones this registry's ``restore.json`` names under
+        ``also_registered`` (the chat-bridge shape). Two registries driving one pane serialise
+        only at the pane lock, and each side's draft recovery sees only its own typed text, so
+        doctor names the pairing wherever it finds it. Read-only; an unreadable sibling
+        registry is skipped, never a doctor failure.
+        """
+        try:
+            config = json.loads((self.registry / "restore.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(config, dict) or config.get("schema") != "agentctl-restore/v1":
+            return []
+        also_registered = config.get("also_registered", [])
+        if not isinstance(also_registered, list):
+            return []
+        siblings: builtins.list[tuple[Path, str]] = []
+        for entry in also_registered:
+            if not isinstance(entry, dict):
+                return []
+            registry, name = entry.get("registry"), entry.get("name")
+            if not isinstance(registry, str) or not isinstance(name, str):
+                return []
+            if not Path(registry).is_absolute():
+                return []
+            try:
+                _name(name)
+            except AgentDeliveryError:
+                return []
+            siblings.append((Path(registry), name))
+
+        found: builtins.list[dict[str, object]] = []
+        for other_registry, other_name in siblings:
+            try:
+                claims = ManagedAgents(self.client, other_registry)._peer_claims("")()
+            except Exception:
+                continue
+            for name, pane, terminal in claims:
+                if name != other_name:
+                    continue
+                for record in records:
+                    same_pane = record.pane_id == pane
+                    same_terminal = (
+                        terminal is not None
+                        and record.terminal_id is not None
+                        and record.terminal_id == terminal
+                    )
+                    if not same_pane and not same_terminal:
+                        continue
+                    found.append({
+                        "finding": "terminal-shared-across-registries",
+                        "agent": record.name,
+                        "other_agent": name,
+                        "pane_id": record.pane_id,
+                        "terminal_id": record.terminal_id,
+                        "detail": (
+                            f"agent '{record.name}' here and agent '{name}' in another "
+                            "registry both record this pane; two registries driving one "
+                            "pane serialise only at the pane lock, and each side's draft "
+                            "recovery sees only its own typed text"
+                        ),
+                    })
+        return found
+
     def doctor(self, *, repair_labels: bool = False) -> dict[str, object]:
         """Compare every registry record with live Herdr state; read-only unless repairing labels."""
         rows: list[dict[str, object]] = []
@@ -7075,6 +7148,7 @@ class ManagedAgents:
             for key in (record.pane_id, record.terminal_id):
                 if key is not None:
                     claims.setdefault(key, []).append(record.name)
+        shared_terminals = self._shared_terminal_findings(records)
         for record in records:
             if record.workspace_id in missing_workspaces:
                 findings = ["workspace-missing"]
@@ -7092,6 +7166,8 @@ class ManagedAgents:
             if any(len(claims.get(key, [])) > 1 for key in (record.pane_id, record.terminal_id)
                    if key is not None):
                 findings.append("duplicate-claim")
+            if any(entry["agent"] == record.name for entry in shared_terminals):
+                findings.append("terminal-shared-across-registries")
             row: dict[str, object] = {"name": record.name, "adapter": record.adapter,
                                       "pane_id": record.pane_id, "findings": findings}
             if (repair_labels and findings
@@ -7115,9 +7191,13 @@ class ManagedAgents:
                 workspace_findings.append({"finding": "unmanaged-tab", "tab_id": tab_id,
                                            "label": label})
         clean = (not registry_findings
-                 and all(not row["findings"] or row.get("repaired") is True for row in rows)
+                 and all(not row["findings"]
+                         or row["findings"] == ["terminal-shared-across-registries"]
+                         or row.get("repaired") is True
+                         for row in rows)
                  and all(item["finding"] == "unmanaged-tab" for item in workspace_findings))
         return {"clean": clean, "records": rows, "registry": registry_findings,
+                "shared_terminals": shared_terminals,
                 "workspace": workspace_findings,
                 "journals": [{"old": journal["old"], "new": journal["new"]} for journal in journals]}
 

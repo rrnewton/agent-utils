@@ -651,10 +651,16 @@ differential lockstep for the interactive core, but it is not identical:
   Rust edition first.
 - The lower-region recovery for an unparseable composer (#1683) covers
   the prompt being delivered (`_region_match` and `_flush_region_draft`
-  in `py/agentctl/submission.py`, Claude Code and Codex); recovering
-  any typed draft, and the stale-composer clear, remain Rust-only.
-  The pane-lock hold bound is summed from the phase timeouts in both
-  editions (`SubmitTimeouts::hold_bound`, `hold_bound_seconds`).
+  in `py/agentctl/submission.py`, Claude Code and Codex), as does the
+  delayed re-check after a verified submission (`_recheck_after_verify`
+  there, `recheck_submitted` in the Rust edition); recovering any
+  typed draft, and the stale-composer clear, remain Rust-only. The
+  pane-lock hold bound is summed from the phase timeouts in both
+  editions (`SubmitTimeouts::hold_bound`, `hold_bound_seconds`). The
+  doctor and status warning for a terminal another registry also
+  records (`terminal-shared-across-registries`, #1683) is mirrored
+  here: both editions read the sibling registries named by
+  `restore.json`.
 - Its headless workers are a different mechanism — resumable Codex, AGY,
   and Muse structured turns driven per turn (`py/agentctl/foreign/`),
   not the Rust wrapper's persistent Claude process. The user guide's

@@ -116,3 +116,21 @@ here), #720 agentctl-muse-stale-draft (typed-draft recovery), #1546
 agentctl-unsubmitted-paste-backstop, #1560
 harness-agnostic-stuck-paste-backstop (landed 8b508396; no lock bound),
 #1561 harness-support-matrix.
+
+Landed first as the commit above. A second commit on this issue adds:
+
+- The owner's delayed re-check (suggested on the day): after a verified
+  submission, one delayed re-read; if the composer again holds exactly
+  the prompt just sent, one Enter and a short verify — never a blind
+  Enter, and nothing when the composer is clean, foreign, or blocked.
+- A regression test that the host-wide target lock is keyed by the
+  resolved pane, not by agent name or registry (checked against the
+  incident: the lock file in the bridge log is the pane digest), so two
+  registries whose agents record the same pane serialise on one file.
+- A doctor and status warning, `terminal-shared-across-registries`,
+  when another registry named in `restore.json` records the same pane
+  or terminal: two registries driving one pane is deliberate in the
+  bridge shape, so it is reported, and the doctor report stays clean.
+  Attribution stays strict per queue — no registry submits text another
+  registry typed; the foreign-draft stale clear already covers that
+  text.

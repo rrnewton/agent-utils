@@ -654,6 +654,8 @@ def _submit_key(harness: str, view: ComposerView) -> str:
 # first and last _REGION_ANCHOR characters both appear, in order. The
 # match must end within _REGION_TAIL_ROWS content rows of the bottom, so
 # a submitted prompt echoed into the transcript never counts.
+_RECHECK_DELAY_SECONDS = 1.0
+_RECHECK_VERIFY_SECONDS = 3.0
 _REGION_ROWS = 24
 _REGION_ANCHOR = 40
 _REGION_SHORT_MAX = 80
@@ -761,13 +763,88 @@ def _flush_region_draft(
             next_press = now + wait
 
 
+def _holds_exactly(view: ComposerView, text: str) -> bool:
+    """Whether the composer holds exactly `text`, or its paste placeholder."""
+    solid = _compact(view.composer_solid)
+    wanted = _compact(text)
+    if solid and (solid == wanted or (len(solid) >= 16 and solid in wanted)):
+        return True
+    match = re.search(r"\[Pasted text #\d+ \+(\d+) lines\]", view.composer)
+    if match and int(match.group(1)) in {
+        max(0, len(text.splitlines()) - 1),
+        text.count("\n"),
+        len(text.splitlines()),
+    }:
+        return True
+    return f"[Pasted Content {len(text)} chars]" in view.composer
+
+
+def _recheck_after_verify(
+    terminal: PromptTerminal,
+    pane_id: str,
+    harness: str,
+    text: str,
+    *,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+) -> None:
+    """One delayed re-check after a verified submission (#1683).
+
+    A harness can take a prompt, prove the submission, and then put the
+    text back in its composer, where it would hold every later prompt.
+    After a short delay, if the composer still holds exactly the prompt
+    just sent — composer-shaped when a reader parses the screen, a
+    lower-region match when none does — press the submission key once
+    and watch it leave. Anything else is left exactly as it is: never a
+    blind Enter, and the verified outcome stands whatever is found.
+    """
+    sleep(_RECHECK_DELAY_SECONDS)
+    try:
+        screen = terminal.read_screen(pane_id)
+    except HerdrUnavailable:
+        return
+    view = composer_view(harness, screen)
+    if view is not None:
+        if composer_is_empty(view) or not _holds_exactly(view, text):
+            return
+        terminal.send_keys(pane_id, _submit_key(harness, view))
+    elif _region_match(text, screen):
+        terminal.send_keys(pane_id, "Enter")
+    else:
+        return
+    deadline = monotonic() + _RECHECK_VERIFY_SECONDS
+    while True:
+        sleep(POLL_SECONDS)
+        if monotonic() >= deadline:
+            return
+        try:
+            screen = terminal.read_screen(pane_id)
+        except HerdrUnavailable:
+            return
+        view = composer_view(harness, screen)
+        staged = (
+            _holds_exactly(view, text)
+            if view is not None
+            else _region_match(text, screen)
+        )
+        if not staged:
+            return
+
+
 def hold_bound_seconds(
     *, composer_timeout: float, stage_timeout: float, submit_timeout: float
 ) -> float:
     """The longest one submission may hold the pane's locks (#1683):
-    the composer wait, the stage window and the submit window, summed.
-    This edition has no draft-recovery sequences, so none are counted."""
-    return composer_timeout + stage_timeout + submit_timeout
+    the composer wait, the stage window and the submit window, summed,
+    plus the delayed re-check after a verified submission. This edition
+    has no draft-recovery sequences, so none are counted."""
+    return (
+        composer_timeout
+        + stage_timeout
+        + submit_timeout
+        + _RECHECK_DELAY_SECONDS
+        + _RECHECK_VERIFY_SECONDS
+    )
 
 
 def submit_verified(
@@ -930,6 +1007,9 @@ def submit_verified(
             left_composer = True
             evidence = _corroborated(before, view, text)
             if evidence is not None:
+                _recheck_after_verify(
+                    terminal, pane_id, harness, text, sleep=sleep, monotonic=monotonic
+                )
                 return SubmissionReceipt(key, presses, round(now - started, 3), evidence)
         if now >= submit_deadline:
             state = (

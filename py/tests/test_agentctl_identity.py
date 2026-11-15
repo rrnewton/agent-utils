@@ -599,6 +599,44 @@ def test_doctor_reports_duplicate_claims(tmp_path: Path, monkeypatch: pytest.Mon
     assert "duplicate-claim" in findings["worker"] and "duplicate-claim" in findings["other"]
 
 
+def test_doctor_names_a_terminal_shared_with_another_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake, pane = _started(tmp_path, monkeypatch)
+    worker = manager.get("worker")
+
+    # The bridge-shaped sibling: another registry whose agent record names the same
+    # pane and terminal.
+    other_registry = tmp_path / "bridge-registry"
+    other_agent = other_registry / "agents" / "bridge-coordinator"
+    other_agent.mkdir(parents=True, mode=0o700)
+    (other_agent / "agent.json").write_text(json.dumps({
+        "name": "bridge-coordinator",
+        "pane_id": pane,
+        "terminal_id": worker.terminal_id,
+    }), encoding="utf-8")
+    (manager.registry / "restore.json").write_text(json.dumps({
+        "schema": "agentctl-restore/v1",
+        "also_registered": [{
+            "registry": str(other_registry),
+            "name": "bridge-coordinator",
+        }],
+    }), encoding="utf-8")
+
+    report = manager.doctor()
+    assert "terminal-shared-across-registries" in _findings(report)["worker"]
+    shared = cast(list[dict[str, object]], report["shared_terminals"])
+    assert len(shared) == 1
+    assert shared[0]["agent"] == "worker"
+    assert shared[0]["other_agent"] == "bridge-coordinator"
+    assert report["clean"] is True
+
+    status = manager.status("worker")
+    status_shared = cast(list[dict[str, object]], status["shared_terminals"])
+    assert len(status_shared) == 1
+    assert status_shared[0]["other_agent"] == "bridge-coordinator"
+
+
 def test_doctor_reports_an_incomplete_rename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake, _pane = _started(tmp_path, monkeypatch, "old")
     monkeypatch.setattr(fake, "rename_tab", lambda tab, label: (_ for _ in ()).throw(

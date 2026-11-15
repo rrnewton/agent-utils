@@ -7893,6 +7893,42 @@ mod tests {
     }
 
     #[test]
+    fn two_agents_on_one_pane_contend_on_the_one_pane_keyed_lock() {
+        // #1683 pane-lock-held-by-stuck-sender: the host-wide target lock
+        // is keyed by the resolved pane, never by agent name or registry,
+        // so two registries whose agents record the same pane (a chat
+        // bridge's coordinator and the project's coordinator) serialise
+        // on one lock file. Every caller passes the pane id it resolved;
+        // the lock these two drains take is that one file.
+        let pane = "w9:p9-1683-shared";
+        let held = lock_target(pane, "first registry drain").expect("first takes the lock");
+        let error = lock_target_within(pane, "second registry drain", Duration::from_millis(300))
+            .err()
+            .expect("the second registry waits on the same lock");
+        assert!(
+            error.to_string().contains("held by another sender"),
+            "{error}"
+        );
+        drop(held);
+        let _lock = lock_target_within(pane, "second registry drain", Duration::from_secs(5))
+            .expect("the released lock is free");
+        // A different pane is a different lock, named by its pane digest.
+        assert_ne!(
+            pane_lock_digest(pane),
+            pane_lock_digest("w9:p10-1683-shared")
+        );
+        let paths = target_lock_paths(pane).expect("target lock paths");
+        assert!(
+            paths[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&pane_lock_digest(pane)),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
     fn explicit_send_reserves_ids_under_the_delivery_transition_lock() {
         let directory = TestDirectory::new("explicit-send-reservation");
         let fake = FakeAgent::new(&["idle"]);

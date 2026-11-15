@@ -866,6 +866,63 @@ fn doctor_reports_drift_read_only_and_repairs_only_presentation() {
     assert_eq!(label(&fixture, "tab"), "retitled-by-hand");
 }
 
+/// #1683: two registries recording one terminal (a chat bridge's
+/// coordinator and the project's) is named by doctor, as a warning the
+/// pairing is deliberate, so the report stays clean.
+#[test]
+fn doctor_names_a_terminal_shared_with_another_registry() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let worker = record(&fixture, "worker");
+    let pane_id = worker["pane_id"].as_str().unwrap().to_owned();
+    let terminal_id = worker["terminal_id"].as_str().unwrap().to_owned();
+
+    // The bridge-shaped sibling: another registry whose agent record
+    // names the same pane and terminal.
+    let other = fixture.root.join("bridge-registry");
+    let other_agent = other.join("agents").join("bridge-coordinator");
+    DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&other_agent)
+        .unwrap();
+    agent::atomic_json(
+        &other_agent.join("agent.json"),
+        &json!({
+            "name": "bridge-coordinator",
+            "pane_id": pane_id,
+            "terminal_id": terminal_id,
+        }),
+    )
+    .unwrap();
+    agent::atomic_json(
+        &registry(&fixture).join("restore.json"),
+        &json!({
+            "schema": "agentctl-restore/v1",
+            "also_registered": [
+                {"registry": other.to_string_lossy(), "name": "bridge-coordinator"}
+            ],
+        }),
+    )
+    .unwrap();
+
+    let report = fixture.manager().doctor(false).unwrap();
+    assert!(
+        findings(&report, "worker").contains(&"terminal-shared-across-registries".to_owned()),
+        "{report}"
+    );
+    let shared = report["shared_terminals"].as_array().unwrap();
+    assert_eq!(shared.len(), 1, "{report}");
+    assert_eq!(shared[0]["agent"], "worker");
+    assert_eq!(shared[0]["other_agent"], "bridge-coordinator");
+    assert_eq!(report["clean"], true, "reported, not a fault: {report}");
+
+    let status = fixture.manager().status("worker").unwrap();
+    let shared = status["shared_terminals"].as_array().unwrap();
+    assert_eq!(shared.len(), 1, "{status}");
+    assert_eq!(shared[0]["other_agent"], "bridge-coordinator");
+}
+
 #[test]
 fn doctor_finds_missing_panes_legacy_records_and_unmanaged_tabs() {
     let fixture = Fixture::new();

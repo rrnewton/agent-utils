@@ -1730,7 +1730,54 @@ def test_a_submitted_echo_high_in_the_transcript_is_never_flushed() -> None:
 def test_hold_bound_is_the_sum_of_the_phase_timeouts() -> None:
     from agentctl.submission import hold_bound_seconds
 
+    # The three phase timeouts plus the 1 s + 3 s delayed re-check.
     assert (
         hold_bound_seconds(composer_timeout=15.0, stage_timeout=10.0, submit_timeout=60.0)
-        == 85.0
+        == 89.0
     )
+
+
+def test_a_recheck_submits_a_prompt_put_back_in_the_composer() -> None:
+    # #1683: the delayed re-check submits a prompt the harness put back
+    # after the verified submission, with one extra key.
+    from agentctl.submission import _recheck_after_verify
+
+    text = "first finding\nsecond finding\nthird finding\nfourth finding"
+    agent = FakeAgent("claude")
+    agent.composer = text
+    clock = Clock()
+    _recheck_after_verify(
+        agent, "w1:p1", "claude", text, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+    assert agent.keys == ["Enter"]
+    assert agent.submitted == [text]
+    assert agent.composer == ""
+
+
+def test_a_recheck_presses_nothing_on_a_clean_or_foreign_composer() -> None:
+    # #1683: never a blind Enter.
+    from agentctl.submission import _recheck_after_verify
+
+    text = "first finding\nsecond finding"
+    clean = FakeAgent("claude")
+    clock = Clock()
+    _recheck_after_verify(
+        clean, "w1:p1", "claude", text, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+    assert clean.keys == []
+
+    foreign = FakeAgent("claude")
+    foreign.composer = "a person's own half-written note"
+    _recheck_after_verify(
+        foreign, "w1:p1", "claude", text, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+    assert foreign.keys == []
+    assert foreign.composer == "a person's own half-written note"
+
+
+def test_a_clean_verified_send_gets_no_recheck_key() -> None:
+    agent = FakeAgent("claude")
+    receipt = _submit(agent, "the brief")
+    assert receipt is not None
+    assert agent.keys == ["Enter"]
+    assert agent.pastes == ["the brief"]

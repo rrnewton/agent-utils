@@ -9416,6 +9416,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 *claims.entry(key).or_default() += 1;
             }
         }
+        let shared_terminals = self.shared_terminal_findings(&records);
         for record in &records {
             let mut findings = if self.require_record_backend(record).is_err() {
                 // This census cannot see the other backend's panes; say
@@ -9443,6 +9444,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 .any(|key| claims.get(key).copied().unwrap_or(0) > 1)
             {
                 findings.push("duplicate-claim");
+            }
+            if shared_terminals
+                .iter()
+                .any(|entry| entry["agent"] == record.name)
+            {
+                findings.push("terminal-shared-across-registries");
             }
             let mut row = json!({
                 "name": record.name,
@@ -9491,10 +9498,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let clean = registry_findings.is_empty()
             && rows.iter().all(|row| {
                 // A re-executed viewer is reported, not a fault: `stop` still closes its pane.
+                // A terminal shared across registries is likewise reported, not a fault:
+                // the pairing is deliberate (a chat bridge), and doctor's job is to name it.
                 row["findings"].as_array().is_some_and(|findings| {
-                    findings
-                        .iter()
-                        .all(|finding| finding == "viewer-reexecuted")
+                    findings.iter().all(|finding| {
+                        finding == "viewer-reexecuted"
+                            || finding == "terminal-shared-across-registries"
+                    })
                 }) || row["repaired"] == true
             })
             && workspace_findings
@@ -9504,12 +9514,62 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "clean": clean,
             "records": rows,
             "registry": registry_findings,
+            "shared_terminals": shared_terminals,
             "workspace": workspace_findings,
             "journals": journals
                 .iter()
                 .map(|journal| json!({"old": journal.old, "new": journal.new}))
                 .collect::<Vec<_>>(),
         }))
+    }
+
+    /// Agents in another registry — one this registry's `restore.json`
+    /// names under `also_registered`, the chat-bridge shape — that record
+    /// the same pane or terminal as an agent here (#1683
+    /// pane-lock-held-by-stuck-sender). Two registries driving one pane
+    /// serialise only at the pane lock, and each side's draft recovery
+    /// sees only its own typed text, so the pairing is named wherever
+    /// doctor finds it. Read-only; an unreadable sibling registry is
+    /// skipped, never a doctor failure.
+    fn shared_terminal_findings(&self, records: &[AgentRecord]) -> Vec<Value> {
+        let Ok(config) = crate::restore::RestoreConfig::load(&self.registry) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        for other in &config.also_registered {
+            let Ok(claims) = registry_claims(&other.registry, "") else {
+                continue;
+            };
+            for (name, pane, terminal) in claims {
+                if name != other.name {
+                    continue;
+                }
+                for record in records {
+                    let same_pane = record.pane_id.as_deref() == Some(pane.as_str());
+                    let same_terminal = terminal.is_some()
+                        && record.terminal_id.is_some()
+                        && record.terminal_id == terminal;
+                    if !same_pane && !same_terminal {
+                        continue;
+                    }
+                    found.push(json!({
+                        "finding": "terminal-shared-across-registries",
+                        "agent": record.name,
+                        "other_agent": name,
+                        "pane_id": record.pane_id,
+                        "terminal_id": record.terminal_id,
+                        "detail": format!(
+                            "agent '{}' here and agent '{}' in another registry both record \
+                             this pane; two registries driving one pane serialise only at \
+                             the pane lock, and each side's draft recovery sees only its \
+                             own typed text",
+                            record.name, name
+                        ),
+                    }));
+                }
+            }
+        }
+        found
     }
 
     fn doctor_findings(
@@ -11454,6 +11514,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     pub fn status(&self, agent_name: &str) -> Result<Value> {
         let record = self.load(agent_name)?;
         let mut result = self.status_record(&record)?;
+        // Name a terminal another registry also records (#1683): two
+        // registries driving one pane is easy to miss from either side.
+        let shared_terminals = self.shared_terminal_findings(std::slice::from_ref(&record));
+        if !shared_terminals.is_empty() {
+            result["shared_terminals"] = json!(shared_terminals);
+        }
         // A live lane whose conversation was never captured cannot be
         // revived after a reboot; flag it while it can still be bound (#948).
         if record.lifecycle == "running"
