@@ -10,7 +10,7 @@ updated_at: 2026-11-15T16:51:49.921963859+00:00
 # Description
 
 ## Goal
-Route agent-teams cross-host messages through a Discord channel (#agent-teams-relay, channel id 1566504459499217097) the same way they already route through the Slack bridge. The owner wants the DeepScry teams' hosts to use it: newton-fedora's bot is DeepscryCoder2 (user id 1545796614826889226), and the peer host's bot is DeepScryCoder1 (user id 1532416065114607829).
+Route agent-teams cross-host messages through a Discord channel (#agent-teams-relay, channel id 1566504459499217097) the same way they already route through the Slack bridge. The owner wants a consumer team's two hosts to use it: the first host's bot has user id 1545796614826889226, and the peer host's bot has user id 1532416065114607829.
 
 ## What already exists
 - rs/agent-teams/src/relay.rs is provider-neutral: "A provider only has to report the poster's stable sender ID and let a bridge post into the channel; Slack, Discord, or the deterministic fake all qualify". Envelopes travel in a fenced JSON block, receipts are posted in the envelope's thread, and ledger `accept` dedupes.
@@ -29,11 +29,11 @@ Route agent-teams cross-host messages through a Discord channel (#agent-teams-re
 4. A live end-to-end check between two hosts, plus a deterministic fake-provider test.
 
 ## Evidence
-On 11/15 a Codex agent on newton-fedora read and posted to channel 1566504459499217097 through the Discord REST API with the existing bot token (HTTP 200). Bot permissions in that channel are therefore fine.
+On 11/15 a Codex agent on the first host read and posted to channel 1566504459499217097 through the Discord REST API with the existing bot token (HTTP 200). Bot permissions in that channel are therefore fine.
 
 ## Related
 - agent-utils-496 agentctl-team-messaging (closed)
 - agent-utils-1490 agent-teams-relay-to-queue-delay (open)
 - agent-utils-1553 codex-footer-composer
 
-A newton-fedora agent is drafting a first cut on branch `discord-relay-transport` (draft PR in this repo; link to follow). The owning team should treat that as input, not as a design commitment.
+An agent on the first host is drafting a first cut on branch `discord-relay-transport` (draft PR in this repo; link to follow). The owning team should treat that as input, not as a design commitment.
