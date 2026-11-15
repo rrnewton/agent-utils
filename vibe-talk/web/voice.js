@@ -2654,6 +2654,7 @@ const rowLinksOwner = createRowLinks({
   linkKinds,
   byId: el,
   messageLinks: (message) => messageLinks(message),
+  wireMessageLinks,
   renderedHtmlOf,
   rawTextOf,
   searchOpen: () => searchField.open(),

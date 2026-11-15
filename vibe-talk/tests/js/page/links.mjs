@@ -218,6 +218,65 @@ test("`#1082 documents-back-chain`: a document link in a message opens the reade
     `Back put the linking message at ${back.getBoundingClientRect().top}, not ${before.top}`);
 });
 
+test("`#329 vibe-talk-docs-view`: GitHub markdown links in Links mode open Documents, with modified clicks left to the browser", async () => {
+  const key = "github:octo/widgets@main:docs/guide.md";
+  const href = "https://github.com/octo/widgets/blob/main/docs/guide.md";
+  const page = newPage(new Map(), SCRIPT);
+  page.documents = [{ key, title: "The guide", content: "# The guide\n", outline: ["The guide"] }];
+  await signIn(page);
+  await showDiscord(page, [docLinkMessage("300", key, href)]);
+  await showLinks(page);
+  const anchor = linkIn(rowWithId(page, "300").linkView.node);
+  assert.equal((await tapLink(page, anchor, { ctrlKey: true })).prevented, false);
+  assert.equal((await tapLink(page, anchor)).prevented, true);
+  await untilDeepLink(page, () => !page.el("docs-reader").hidden && page.el("doc-title").text().includes("The guide"));
+  assert.equal(page.tab(), "docs");
+});
+
+test("`#329 vibe-talk-docs-view`: an unmarked GitHub markdown link opens Documents and Back returns to its message", async () => {
+  const key = "github:octo/widgets@main:docs/guide.md";
+  const href = "https://github.com/octo/widgets/blob/main/docs/guide.md";
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
+  page.documents = [{ key, title: "The guide", content: "# The guide\n\nAll the words.\n", outline: ["The guide"] }];
+  // `linkedThreadData`'s tall channel, its message-link swapped for a document one.
+  const data = linkedThreadData();
+  const at = data.messages.findIndex((m) => m.id === "300");
+  const stamp = data.messages[at].timestamp;
+  data.messages[at] = docLinkMessage("300", key, href);
+  data.messages[at].content_html = data.messages[at].content_html.replace(` data-doc="${key}"`, "");
+  data.messages[at].timestamp = stamp;
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.settle();
+  const area = page.el("scroll-area");
+  const row = rowWithId(page, "300");
+  assert.ok(row, "fixture: the message with the document link is not drawn");
+  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - 40;
+  await area.dispatch("scroll");
+  await page.settle();
+  const before = { length: page.history.length, top: rowWithId(page, "300").getBoundingClientRect().top };
+  assert.ok(area.scrollTop > 0, "fixture: the reader is not scrolled up to the link");
+
+  const tap = await tapLink(page, linkIn(rowWithId(page, "300")));
+  assert.equal(tap.prevented, true, "the document link was left to the browser");
+  await untilDeepLink(page, () => !page.el("docs-reader").hidden && page.el("doc-title").text().includes("The guide"));
+  assert.equal(page.tab(), "docs", "the document link did not open the Documents view");
+  assert.equal(page.history.length - before.length, 1, "the document jump did not push exactly one entry");
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "jump" }, "the document open is not one jump level over the channel");
+
+  await page.browserBack();
+  await untilDeepLink(page, () => !page.el("pane-discord").hidden && statusText(page) === "Back where you were.");
+  assert.equal(page.left, false, "Back from the document left the app");
+  assert.equal(page.tab(), "discord", "Back landed on the documents list, not the channel it came from");
+  assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
+  const back = rowWithId(page, "300");
+  assert.ok(back, "the linking message is not drawn after Back");
+  assert.ok(Math.abs(back.getBoundingClientRect().top - before.top) <= 1,
+    `Back put the linking message at ${back.getBoundingClientRect().top}, not ${before.top}`);
+});
+
 test("`#1326 doc-link-bare-url`: document links in a bullet in a thread reply — a bare one ending its sentence and a parenthesised one — open the reader, and a modified tap still leaves", async () => {
   const bareKey = "github:octo/widgets@main:ai_docs/design.md";
   const bareHref = "https://github.com/octo/widgets/blob/main/ai_docs/design.md";

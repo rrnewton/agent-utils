@@ -11600,6 +11600,26 @@ choose **coding agent** on its row, or put the id that row shows beside it into 
 `coding_agent_user_ids`. `#488 slack-app-agents`: a choice in Settings is kept on the server with the
 owner's other settings, so every device draws the account the same way.
 
+## Linked documents
+
+The Documents view lists files mentioned in messages this server has read. A normal click on a
+GitHub `blob` link (including `.md` and `.markdown`), in a message or Links mode, opens its reader; Ctrl/Cmd-click keeps the
+browser's new-tab behavior. Discovery works with the optional message cache off. Read a channel
+or older pages to discover their links, then reopen Documents. Refresh checks files already fetched;
+it does not crawl channel history. The index persists beside the configured storage database.
+
+Public GitHub files need no credential. Private repositories require a token with read access to
+that repository, configured as `[documents] github_token_file = "/absolute/path/to/token"`, or
+`VIBE_TALK_GITHUB_TOKEN_FILE=/absolute/path/to/token`. GitHub can return 404 for missing permissions
+as well as a missing file; check repository access before assuming the file was deleted.
+
+For `scripts/run.sh`, place the token file in the launcher's mounted data directory, restrict its
+host permissions to its owner, and set `VIBE_TALK_GITHUB_TOKEN_FILE=/var/lib/vibe-talk/github-token`
+in the launcher environment file. The path names the file **inside the container**; the launcher
+passes that path, not the token value. The server reads it at startup. A TOML deployment may instead
+use `github_token_command` to obtain a token; configure only one source. No GitHub credential is
+included in the image.
+
 ## Running the tests
 
 ```bash

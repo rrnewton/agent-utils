@@ -146,6 +146,7 @@ write_config() {  # write_config FILE [omit-var]
     echo "VIBE_TALK_IMAGE_NAME=$TEST_IMAGE_NAME" >> "$file"
     echo "VIBE_TALK_IMAGE_TAG=$TEST_IMAGE_TAG" >> "$file"
     echo "VIBE_TALK_HOST_PORT=$TEST_PORT" >> "$file"
+    echo "VIBE_TALK_GITHUB_TOKEN_FILE=/var/lib/vibe-talk/github-token" >> "$file"
 }
 
 GOOD_CONFIG="$TMPDIR_TEST/good.env"
@@ -287,6 +288,8 @@ grep -q '(dry run).*build -t '"$TEST_IMAGE_NAME:$TEST_IMAGE_TAG" <<< "$out" || f
 grep -q '(dry run).*run -d .*-p 127.0.0.1:'"$TEST_PORT" <<< "$out" || fail "dry run did not print the run command"
 grep -q 'set: .*VIBE_TALK_DISCORD_BOT_TOKEN' <<< "$out" || fail "dry run does not report which variables are set"
 ok "a valid config reaches build and run (dry run), reporting variables by name"
+grep -q -- '-e VIBE_TALK_GITHUB_TOKEN_FILE' <<< "$out" || fail "document credential file is not passed to the container"
+ok "the GitHub credential file path reaches the container"
 # The sibling Rust workspace must be visible to Cargo inside the image build.
 buildline="$(grep '(dry run).*build -t ' <<< "$out")"
 context="${buildline##* }"

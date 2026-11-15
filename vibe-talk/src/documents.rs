@@ -1,10 +1,10 @@
-//! The document index: a fold over the cached messages. `#628 documents-index-server`.
+//! The document index: a fold over observed messages. `#628 documents-index-server`.
 //!
 //! Design: `ai_docs/transient/2026-10-26-documents-view/README.md`, as decided by the
 //! owner on 2026-10-28. Every message with a link recognised as a document registers
 //! that document candidate (existence only); nothing is fetched eagerly. The index is
-//! a pure function of the cached messages, maintained incrementally as messages are
-//! cached (live, backfill, edit, delete) and rebuilt or loaded at startup. It caches
+//! maintained incrementally from message observations (reads, live, backfill, edit,
+//! delete), even when the optional message cache is off, and loaded or rebuilt at startup. It caches
 //! `document key -> mentions (when/where)`, never document contents; fetched contents
 //! live in a separate bounded cache, persisted beside the fold
 //! (`documents-fetched.json`) so a restart does not lose what was downloaded.
@@ -977,6 +977,9 @@ pub enum FetchError {
     /// No fetcher serves this kind yet.
     #[error("no fetcher for {0} documents yet")]
     Unsupported(&'static str),
+    /// The document is absent or the configured credential cannot see it.
+    #[error("{0}")]
+    NotFound(String),
     /// The source refused or failed.
     #[error("fetch failed: {0}")]
     Failed(String),
@@ -1454,8 +1457,8 @@ impl GithubFetcher {
             // fetch it from its new home; otherwise say where it was lost.
             let moved = self.moved_path(entry).await;
             let Some(new_path) = moved else {
-                return Err(FetchError::Failed(format!(
-                    "not found at {} (moved or deleted)",
+                return Err(FetchError::NotFound(format!(
+                    "not found at {} (missing, moved, or private). For a private repository, configure documents.github_token_file or VIBE_TALK_GITHUB_TOKEN_FILE with a token that can read it",
                     entry.locator.path
                 )));
             };
@@ -1464,8 +1467,8 @@ impl GithubFetcher {
             let moved_url = self.url(&moved_entry)?;
             let moved_response = self.send_get(&moved_url).await?;
             if !moved_response.status().is_success() {
-                return Err(FetchError::Failed(format!(
-                    "not found at {} (moved or deleted)",
+                return Err(FetchError::NotFound(format!(
+                    "not found at {} (missing, moved, or private). For a private repository, configure documents.github_token_file or VIBE_TALK_GITHUB_TOKEN_FILE with a token that can read it",
                     entry.locator.path
                 )));
             }

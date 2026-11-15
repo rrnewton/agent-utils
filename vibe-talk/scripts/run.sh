@@ -251,6 +251,7 @@ OPTIONAL_VARS=(
     VIBE_TALK_APP_SHORT_NAME
     VIBE_TALK_SKIP_STARTUP_PROBE
     VIBE_TALK_STORAGE_PATH
+    VIBE_TALK_GITHUB_TOKEN_FILE
     RUST_LOG
 )
 # Settings for this launcher itself (not for the server). They may be set in the same config file.

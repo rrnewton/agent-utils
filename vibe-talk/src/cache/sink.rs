@@ -598,6 +598,8 @@ impl ReadStart {
 /// poller's seed), and the owner may turn the cache off and on again meanwhile: the handle the
 /// fill began on must then go, and its lock on the file with it, or the fresh file could not
 /// open. A fill whose cache has gone offers nothing; its stamp was for that file anyway.
+/// A fill begun with no cache may instead feed the document index alone; it never queues
+/// message rows or claims coverage in the cache.
 #[derive(Debug)]
 pub struct Fill {
     grant: FillGrant,
@@ -616,6 +618,7 @@ pub struct Fill {
     armed: bool,
     arrivals: Weak<Arrivals>,
     documents: Option<Arc<crate::documents::Index>>,
+    documents_only: bool,
 }
 
 /// Fold one queued observation into the document index. `#628 documents-index-server`.
@@ -888,6 +891,15 @@ impl Fill {
     /// What is offered is noted by id, with who offered it, for the shadow's diagnostics: one
     /// brief lock, never a wait ([`Arrivals::note`]).
     fn offer(self, observations: Vec<Observation>) -> bool {
+        if self.documents_only {
+            if let Some(index) = &self.documents {
+                for observation in &observations {
+                    fold_documents(index, &self.channel, observation);
+                }
+            }
+            // No message-cache observation was queued.
+            return false;
+        }
         let Some(cache) = self.cache.upgrade() else {
             return false;
         };
@@ -2033,45 +2045,66 @@ impl Sink {
     }
 
     /// Begin a fill of `channel` under `grant`, before its upstream read starts. `None` means
-    /// nothing the read sees is offered: there is no cache, or the channel is not one the server
-    /// answers for.
+    /// nothing the read sees is offered: neither a cache nor a document index is available,
+    /// or the channel is not one the server answers for. Without a message cache, observations
+    /// feed only the document index and never claim to have queued cached message rows.
     ///
     /// When the sink is not armed, or the provider's account has not been checked against the
     /// file open now (or the provider is suspended, or mismatched), the fill offers deletions alone
     /// ([`Fill::writes_rows`] is `false`): see the module documentation.
     #[must_use]
     pub fn begin(&self, grant: &FillGrant, channel: &ChannelId) -> Option<Fill> {
-        let cache = self.cache()?;
+        let cache = self.cache();
         let (route, armed) = {
             let routes = self.state.routes();
             (routes.fills.get(channel)?.clone(), routes.armed)
         };
-        let rows = armed && State::may_fill(&self.state, &route.key, &cache);
+        let documents = self
+            .state
+            .documents
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        // Document discovery is available with the optional message cache off.
+        // Still require a routed channel, an armed sink, and the caller's fill grant.
+        if cache.is_none() && (!armed || documents.is_none()) {
+            return None;
+        }
+        let rows = armed
+            && cache
+                .as_ref()
+                .is_some_and(|cache| State::may_fill(&self.state, &route.key, cache));
         let chan = ChanKey::new(route.key, channel.as_str());
-        let stamp = cache.stamp(&chan);
-        let observed_ms = cache.now_ms();
+        let stamp = cache.as_ref().map_or(
+            Stamp {
+                generation: 0,
+                epoch: 0,
+                scope_epoch: 0,
+            },
+            |cache| cache.stamp(&chan),
+        );
+        let observed_ms = cache.as_ref().map_or_else(
+            || jiff::Timestamp::now().as_millisecond(),
+            |cache| cache.now_ms(),
+        );
         Some(Fill {
             grant: *grant,
             channel: channel.clone(),
             chan,
             stamp,
             observed_ms,
-            cache: Arc::downgrade(&cache),
+            cache: cache.as_ref().map_or_else(Weak::new, Arc::downgrade),
+            documents_only: cache.is_none(),
             shape: route.shape,
             recent_via_flat: route.recent_via_flat,
             rows,
             armed,
             arrivals: Arc::downgrade(&self.state.arrivals),
-            documents: self
-                .state
-                .documents
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone(),
+            documents,
         })
     }
 
-    /// Feed the document fold index from every fill this sink queues.
+    /// Feed the document fold index from queued fills, or observations when the cache is off.
     /// `#628 documents-index-server`.
     pub fn set_documents(&self, index: Arc<crate::documents::Index>) {
         *self
