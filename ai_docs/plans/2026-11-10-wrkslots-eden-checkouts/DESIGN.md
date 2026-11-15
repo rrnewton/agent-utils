@@ -234,9 +234,11 @@ configured cap at 10 per host (error "maximum number of Eden clones
 (10) reached", freed by `eden rm` because the cap counts configured
 checkouts) and the guard at WARN 75% / ALERT 85% of allocated
 metadata. Design change: the host cap becomes a wrkslots config
-value (`eden_host_cap`, default 10 once in-image slots exist),
-counted host-wide exactly as designed above; 3 remains only the
-transitional owner setting until the trial proves isolation. The
+value (`eden_host_cap`). #1566 eden-cap-outer-only redefines it as
+the cap on OUTER checkouts only (outside the worktrees image, by
+path containment in the image mount or its recorded bind roots);
+in-image checkouts are bounded by the image's disk and reported
+separately in status/doctor. The
 report's older owner count gate of 1 is superseded by this owner
 input and must be reconciled by the coordinator, not coded around.
 

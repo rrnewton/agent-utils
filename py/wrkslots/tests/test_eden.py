@@ -1184,3 +1184,115 @@ def test_doctor_flags_a_mismatched_eden_mount(
     findings = wrkslots_cli._eden_discovery_doctor_findings(config, states)
     assert len(findings) == 1
     assert findings[0]["kind"] == "eden-discovery-mismatch"
+
+
+def test_partition_splits_outer_in_image_and_dedupes_aliases(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "image"
+    (image / "s1").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(image, target_is_directory=True)
+    mounts = (
+        "/host/one",
+        str(image / "s1" / "checkout"),
+        str(alias / "s1" / "checkout"),
+    )
+
+    outer, in_image = eden.partition_checkouts(mounts, (str(image),))
+
+    assert outer == ("/host/one",)
+    assert in_image == (str(image / "s1" / "checkout"),)
+
+
+def test_cap_ignores_in_image_and_refuses_at_outer_cap() -> None:
+    outer = ("/host/one", "/host/two")
+    in_image = ("/img/a/checkout", "/img/b/checkout")
+    eden.assert_under_cap(outer, 3, in_image)
+
+    with pytest.raises(eden.EdenError) as caught:
+        eden.assert_under_cap((*outer, "/host/three"), 3, in_image)
+
+    message = str(caught.value)
+    assert "outer" in message and "/host/one" in message
+    assert "in-image not counted" in message and "/img/a/checkout" in message
+
+
+def _image_config(tmp_path: Path, **overrides: object) -> wrkslots_cli.Config:
+    from wrkslots import worktreesimage
+
+    values: dict[str, object] = dict(
+        config_path=tmp_path / ".wrkslots.yml",
+        root=tmp_path,
+        worktrees=tmp_path / "slots",
+        control=tmp_path / "ctrl",
+        machine="node-a",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=tmp_path / "live.py",
+        worktrees_image=worktreesimage.WorktreesImageSettings(
+            relative_path="worktrees.img", size_bytes=1024**3
+        ),
+        worktrees_image_state=worktreesimage.MOUNTED,
+    )
+    values.update(overrides)
+    return wrkslots_cli.Config(**values)  # type: ignore[arg-type]
+
+
+def test_eden_image_roots_cover_mount_binds_and_validate(
+    tmp_path: Path,
+) -> None:
+    from wrkslots import worktreesimage
+
+    config = _image_config(tmp_path)
+    worktreesimage.save_bind_records(
+        config.control,
+        {
+            "s1": worktreesimage.BindRecord(
+                subvolume="s1", target=str(config.worktrees / "s1")
+            )
+        },
+    )
+
+    roots = wrkslots_cli._eden_image_roots(config)
+
+    assert str(worktreesimage.image_mount_dir(config.control)) in roots
+    assert str(worktreesimage.validate_external_dir(config.worktrees)) in roots
+    assert str(config.worktrees / "s1") in roots
+
+
+def test_eden_image_roots_fail_safe_when_unknown(tmp_path: Path) -> None:
+    from wrkslots import worktreesimage
+
+    assert wrkslots_cli._eden_image_roots(
+        _image_config(tmp_path, worktrees_image=None)
+    ) == ()
+    assert wrkslots_cli._eden_image_roots(
+        _image_config(tmp_path, worktrees_image_state=worktreesimage.NOT_MOUNTED)
+    ) == ()
+    config = _image_config(tmp_path)
+    config.control.mkdir(parents=True)
+    worktreesimage.record_path(config.control).write_text("not json")
+    assert wrkslots_cli._eden_image_roots(config) == ()
+
+
+def test_eden_cap_report_counts_both(tmp_path: Path) -> None:
+    config = _image_config(tmp_path)
+    image = config.control / ".slots-image"
+    runner = _fake_runner(
+        {"/state-a": (0, f"/host/one\n{image}/s1/checkout\n", "")}
+    )
+
+    report = wrkslots_cli._eden_cap_report(
+        config, runner=runner, cmdlines=(), known=("/state-a",)
+    )
+
+    assert report == {
+        "cap": 3,
+        "outer": 1,
+        "in_image": 1,
+        "total": 2,
+        "outer_mounts": ["/host/one"],
+        "in_image_mounts": [f"{image}/s1/checkout"],
+    }

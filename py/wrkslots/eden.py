@@ -11,11 +11,14 @@ runner. Nothing here creates or removes a checkout by itself.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-#: Per-host cap on Eden checkouts, set by the owner for this host.
+#: Per-host cap on OUTER Eden checkouts (#1566). Checkouts inside the
+#: worktrees image are bounded by the image's disk and are reported
+#: separately, never counted here.
 HOST_CAP = 3
 
 #: Fixed markers stored in the git-shaped fields of an Eden row. The
@@ -113,13 +116,57 @@ def count_checkouts(runner: Runner, config_dirs: Sequence[str]) -> tuple[str, ..
     return tuple(mounts)
 
 
-def assert_under_cap(mounts: Sequence[str], cap: int = HOST_CAP) -> None:
-    """Refuse when the host already holds ``cap`` Eden checkouts."""
+def partition_checkouts(
+    mounts: Sequence[str], image_roots: Sequence[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split mounts into (outer, in-image) by path containment (#1566).
+
+    Symlinks are resolved on both sides, so an alias into the image
+    counts in-image and an alias out counts outer; the same checkout
+    reported under two alias spellings counts once. Bind mounts are
+    invisible to path resolution, so callers must pass recorded bind
+    targets as roots; image content bound to an unrecorded host path
+    then still counts outer, which is the conservative direction.
+    Empty ``image_roots`` counts every mount outer.
+    """
+
+    roots = tuple(os.path.realpath(root) for root in image_roots)
+    outer: list[str] = []
+    in_image: list[str] = []
+    seen: set[str] = set()
+    for mount in mounts:
+        resolved = os.path.realpath(mount)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if any(is_inside(resolved, root) for root in roots):
+            in_image.append(mount)
+        else:
+            outer.append(mount)
+    return tuple(outer), tuple(in_image)
+
+
+def assert_under_cap(
+    mounts: Sequence[str],
+    cap: int = HOST_CAP,
+    in_image: Sequence[str] = (),
+) -> None:
+    """Refuse when the host already holds ``cap`` OUTER checkouts.
+
+    ``mounts`` is the outer list; ``in_image`` mounts never count
+    against the cap and are named in the refusal so flooding cannot
+    hide behind them.
+    """
 
     if len(mounts) >= cap:
+        extra = (
+            f"; in-image not counted: {len(in_image)}: " + ", ".join(in_image)
+            if in_image
+            else ""
+        )
         raise EdenError(
-            f"host Eden cap reached: {len(mounts)} checkout(s) at cap {cap}: "
-            + ", ".join(mounts)
+            f"host Eden cap reached: {len(mounts)} outer checkout(s) "
+            f"at cap {cap}: " + ", ".join(mounts) + extra
         )
 
 

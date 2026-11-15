@@ -38308,6 +38308,94 @@ def _eden_known_config_dirs(config: Config) -> tuple[str, ...]:
     return tuple(known)
 
 
+def _eden_image_roots(config: Config) -> tuple[str, ...]:
+    """Path roots whose Eden checkouts live inside the worktrees image.
+
+    Fail-safe (#1566): no image, an unmounted image or unreadable bind
+    records give no roots, so every checkout counts against the outer
+    cap exactly as before. Recorded bind targets are roots because
+    path resolution cannot see bind mounts (the Eden mount string is
+    the canonical slot path, which a bind targets).
+    """
+
+    settings = config.worktrees_image
+    if settings is None or config.worktrees_image_state != worktreesimage.MOUNTED:
+        return ()
+    try:
+        records = worktreesimage.load_bind_records(config.control)
+    except (OSError, ValueError, worktreesimage.WorktreesImageError):
+        return ()
+    roots = {
+        str(settings.mount_point(config.control, config.worktrees)),
+        str(worktreesimage.image_mount_dir(config.control)),
+        str(worktreesimage.validate_external_dir(config.worktrees)),
+    }
+    validate_dir = worktreesimage.validate_external_dir(config.worktrees)
+    for slot, record in records.items():
+        if record.target:
+            roots.add(record.target)
+        else:
+            roots.add(str(config.worktrees / slot))
+            roots.add(str(validate_dir / slot))
+    return tuple(sorted(roots))
+
+
+def _eden_cap_report(
+    config: Config,
+    runner: eden.Runner | None = None,
+    cmdlines: Sequence[str] | None = None,
+    known: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Outer/in-image Eden checkout counts against the host cap (#1566)."""
+
+    if runner is None:
+        runner = _eden_runner
+    if cmdlines is None:
+        read_cmdlines: list[str] = []
+        for cmdline in Path("/proc").glob("*/cmdline"):
+            try:
+                read_cmdlines.append(
+                    cmdline.read_bytes().replace(b"\0", b" ").decode(
+                        "utf-8", "replace"
+                    )
+                )
+            except OSError:
+                continue
+        cmdlines = read_cmdlines
+    if known is None:
+        known = _eden_known_config_dirs(config)
+    dirs = eden.discover_config_dirs(cmdlines, known)
+    mounts = eden.count_checkouts(runner, dirs)
+    outer, in_image = eden.partition_checkouts(mounts, _eden_image_roots(config))
+    return {
+        "cap": config.eden_host_cap,
+        "outer": len(outer),
+        "in_image": len(in_image),
+        "total": len(outer) + len(in_image),
+        "outer_mounts": list(outer),
+        "in_image_mounts": list(in_image),
+    }
+
+
+def _eden_cap_section(
+    config: Config, states: Sequence[ActiveState]
+) -> dict[str, object] | None:
+    """Cap report for status/doctor; only Eden projects pay the probe."""
+
+    has_eden = any(
+        checkout.vcs == "eden"
+        for state in states
+        for record in state.slots
+        for checkout in record.checkouts
+    )
+    if not has_eden:
+        return None
+    try:
+        return _eden_cap_report(config)
+    except (eden.EdenError, OSError) as exc:
+        return {"error": str(exc)}
+
+
 def _edenfs_unit_name(config_dir: str) -> str:
     """The per-slot daemon unit: ``edenfs@<escaped state dir>.service`` (#1423)."""
 
@@ -38333,18 +38421,13 @@ def _eden_create_plan(
 
 
 def _assert_eden_host_cap(config: Config) -> None:
-    """Refuse at the host Eden cap; reads daemon state, writes nothing."""
+    """Refuse at the OUTER host Eden cap (#1566); writes nothing."""
 
-    cmdlines: list[str] = []
-    for cmdline in Path("/proc").glob("*/cmdline"):
-        try:
-            cmdlines.append(cmdline.read_bytes().replace(b"\0", b" ").decode("utf-8", "replace"))
-        except OSError:
-            continue
-    dirs = eden.discover_config_dirs(cmdlines, _eden_known_config_dirs(config))
     try:
-        mounts = eden.count_checkouts(_eden_runner, dirs)
-        eden.assert_under_cap(mounts, config.eden_host_cap)
+        report = _eden_cap_report(config)
+        outer = cast("list[str]", report["outer_mounts"])
+        in_image = cast("list[str]", report["in_image_mounts"])
+        eden.assert_under_cap(outer, config.eden_host_cap, in_image)
     except eden.EdenError as exc:
         raise Refusal(str(exc)) from exc
 
@@ -52175,6 +52258,26 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
             "rerun with a larger bound if a full scan is required"
         )
         states, findings, rows = [], [], []
+    eden_section = (
+        _eden_cap_section(config, states) if partial_detail is None else None
+    )
+    if (
+        eden_section is not None
+        and eden_section.get("error") is None
+        and cast("int", eden_section["outer"]) >= cast("int", eden_section["cap"])
+    ):
+        findings.append(
+            _operational_finding(
+                "eden-cap",
+                None,
+                config.machine,
+                f"host Eden cap reached: {eden_section['outer']} outer "
+                f"checkout(s) at cap {eden_section['cap']} "
+                f"({eden_section['in_image']} in-image not counted); "
+                "remove an outer Eden checkout or raise "
+                "configuration.eden_host_cap",
+            )
+        )
     cap = config.max_active_slots
     wt_scope = (
         f"skipped: {config.worktrees_image_skipped}"
@@ -52198,6 +52301,7 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
                     "control_dir": str(config.control),
                     "layout": config.layout,
                     **({"worktrees_image": wt_scope} if wt_scope is not None else {}),
+                    **({"eden": eden_section} if eden_section is not None else {}),
                     **({"machine": machine_note} if machine_note is not None else {}),
                     "machines": [state.machine for state in states],
                     "event_counts": {
@@ -52228,6 +52332,16 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         )
         if wt_scope is not None:
             print(f"worktrees-image: {wt_scope}")
+        if eden_section is not None:
+            if eden_section.get("error") is not None:
+                print(f"eden: error: {eden_section['error']}")
+            else:
+                print(
+                    f"eden: outer={eden_section['outer']} "
+                    f"cap={eden_section['cap']} "
+                    f"in-image={eden_section['in_image']} "
+                    f"total={eden_section['total']}"
+                )
         if machine_note is not None:
             print(f"machine: {machine_note}")
         counts: dict[str, int] = {}
@@ -52389,6 +52503,9 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             "rerun with a larger bound if a full scan is required"
         )
         states, storage_inconsistencies, records, journals = [], (), [], []
+    eden_section = (
+        _eden_cap_section(config, states) if partial_detail is None else None
+    )
     if tearing_down and not _VERBOSE_DIAGNOSTICS.get():
         print(
             f"wrkslots: {len(tearing_down)} tearing-down PID namespaces ignored",
@@ -52415,6 +52532,7 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
                     "harness_checkouts": [
                         v["slot"] for v in records if v.get("harness_checkout") is True
                     ],
+                    **({"eden": eden_section} if eden_section is not None else {}),
                     **(
                         {"partial": True, "scan_timeout": partial_detail}
                         if partial_detail is not None
@@ -52436,6 +52554,16 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         f"registry_storage={'INCONSISTENT' if storage_inconsistencies else 'CONSISTENT'} "
         f"inconsistencies={len(storage_inconsistencies)}"
     )
+    if eden_section is not None:
+        if eden_section.get("error") is not None:
+            print(f"eden: error: {eden_section['error']}")
+        else:
+            print(
+                f"eden: outer={eden_section['outer']} "
+                f"cap={eden_section['cap']} "
+                f"in-image={eden_section['in_image']} "
+                f"total={eden_section['total']}"
+            )
     if journals:
         for journal in journals:
             print(f"RECOVERY REQUIRED: {journal}")
