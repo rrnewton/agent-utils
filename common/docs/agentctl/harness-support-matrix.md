@@ -80,6 +80,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Raw messages (no sender header) | supported | supported | supported | partial | supported (Claude only) |
 | Goal commands | supported | supported | supported | none | partial |
 | Skill installation | supported | supported | supported | none | n/a |
+| Boxed launch (`--slot`, userns) | none | none | supported | none | n/a |
 | Transient-failure recovery | supported | supported | none | none | none |
 | Stalled-goal resume | none | supported | none | none | none |
 
@@ -561,6 +562,34 @@ sender header (#609 sender-header-mandatory;
   (`muse skills install`), with its receipt checked.
 - **Unknown TUI**: none — there is no known skill directory, and the
   install refuses the harness by name.
+
+### Boxed launch (`--slot`, userns)
+
+Launching into a wrkslots slot box (`agentctl start --slot …`;
+isolation in `rs/agentctl/src/subagents.rs`, boxed form per adapter in
+`rs/agentctl/src/harness/mod.rs`). Inside a user-namespace box every
+harness launcher's own sandbox entry fails (it sets its effective UID
+to root; the box maps no inner root), so a boxed launch must run the
+harness without that step — the box is the sandbox.
+
+- **Muse**: supported (#1583 boxed-muse-lane-identity). The adapter's
+  boxed form runs the runtime beside the launcher with its shell
+  sandbox disabled (`boxed_executable`, `boxed_arguments` in
+  `rs/agentctl/src/harness/muse.rs`; launch in
+  `rs/agentctl/src/client.rs`). A missing runtime fails the launch
+  loudly, naming the path looked for. The Python edition mirrors this
+  (`boxed_runtime`, `boxed_arguments` in `py/agentctl/client.py`).
+  Verified live: start, send, read, stop in a user-namespace box.
+- **Claude Code**: none under userns — its native binary performs the
+  failing step itself, and its sandbox-disable flag refuses inside
+  the box view. Limits-only `cgroup` boxing works (no mount view).
+  Root isolation is refused for Muse's sibling reason below.
+- **Codex**: none under userns — same launcher failure. A runtime
+  beside its launcher exists, but Codex launches through the terminal
+  host, not a pane command agentctl owns; root-relay boxing exists
+  for Codex (and Claude Code) and is the current mount-sandboxed
+  route for them.
+- **Unknown TUI**: none — no boxed form is declared.
 
 ### Transient-failure recovery; stalled-goal resume
 

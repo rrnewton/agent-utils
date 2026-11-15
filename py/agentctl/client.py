@@ -231,6 +231,27 @@ def muse_auto_review_idle_composer(screen: str) -> bool:
     return modes == ("Auto-review",)
 
 
+def boxed_runtime(executable: str) -> str | None:
+    """The runtime beside the ``muse`` launcher (``muse.real``), else ``None``."""
+    if os.path.basename(executable) != "muse":
+        return None
+    return os.path.join(os.path.dirname(executable), "muse.real")
+
+
+def boxed_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
+    """``arguments`` with Muse's shell sandbox disabled, unless already disabled.
+
+    Inside a slot box the box is the sandbox; the launcher passes the same
+    flag itself when it forks the runtime unboxed.
+    """
+    result = tuple(arguments)
+    if not any(item == "--disable-sandbox" or item.startswith("--disable-sandbox=") for item in result):
+        # An option: before any trailing `resume <id>` subcommand, never after.
+        at = len(result) - 2 if len(result) >= 2 and result[-2] == "resume" else len(result)
+        result = (*result[:at], "--disable-sandbox", *result[at:])
+    return result
+
+
 def muse_verified_process_idle_composer(screen: str) -> bool:
     """Recognize an idle editor after exact live-Muse process verification."""
     return _muse_editor_idle(_muse_composer_regions(screen, require_header=False))
@@ -2163,6 +2184,7 @@ class HerdrClient:
         self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
         *, timeout: float = 30.0,
         on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+        boxed: bool = False,
     ) -> CustomProcessIdentity:
         """Launch and verify a custom TUI through one exact Herdr pane.
 
@@ -2173,6 +2195,18 @@ class HerdrClient:
         if not 0 < timeout <= 300:
             raise ValueError("agent startup timeout must be between 0 and 300 seconds")
         executable = self._harness_executable(kind)
+        if boxed and kind == "muse":
+            # The launcher dies on seteuid inside a userns box (#1583); run the
+            # runtime beside it. The box is the sandbox.
+            runtime = boxed_runtime(executable)
+            if runtime is None or not os.path.isfile(runtime):
+                raise HerdrUnavailable(
+                    f"boxed muse launch needs its runtime at {runtime}, beside the "
+                    f"launcher {executable}; the slot box replaces the harness "
+                    "sandbox, so no launcher fallback is safe"
+                )
+            executable = runtime
+            arguments = boxed_arguments(arguments)
         try:
             descriptor = os.open(executable, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         except OSError as exc:
@@ -2236,6 +2270,17 @@ class HerdrClient:
         self.verify_custom_harness(pane_id, kind, observed)
         self.report_pane_agent(pane_id, kind, "idle")
         return observed
+
+    def start_pane_agent_in_box(
+        self, name: str, kind: str, pane_id: str, arguments: Sequence[str] = (),
+        *, timeout: float = 30.0,
+        on_observed: Callable[[CustomProcessIdentity], None] | None = None,
+    ) -> CustomProcessIdentity:
+        """[`start_pane_agent`] inside a slot box (the box is the sandbox)."""
+        return self.start_pane_agent(
+            name, kind, pane_id, arguments,
+            timeout=timeout, on_observed=on_observed, boxed=True,
+        )
 
     def agent_prompt(
         self, pane_id: str, text: str, *, expect_terminal: str | None = None,

@@ -2186,6 +2186,50 @@ impl HerdrClient {
         timeout: Duration,
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
     ) -> Result<()> {
+        self.start_pane_agent_boxed(
+            _name,
+            kind,
+            pane_id,
+            arguments,
+            timeout,
+            persist_identity,
+            false,
+        )
+    }
+
+    /// [`Self::start_pane_agent`] inside a slot box: the adapter's boxed
+    /// executable and arguments replace the launcher's (the box is the sandbox).
+    pub fn start_pane_agent_in_box(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        arguments: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+    ) -> Result<()> {
+        self.start_pane_agent_boxed(
+            name,
+            kind,
+            pane_id,
+            arguments,
+            timeout,
+            persist_identity,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_pane_agent_boxed(
+        &self,
+        _name: &str,
+        kind: &str,
+        pane_id: &str,
+        arguments: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> Result<()>,
+        boxed: bool,
+    ) -> Result<()> {
         if timeout.is_zero() || timeout > Duration::from_secs(300) {
             return Err(AdapterError::unavailable(
                 "agent startup timeout must be between 0 and 300 seconds",
@@ -2201,7 +2245,32 @@ impl HerdrClient {
                 "custom harness name must contain lowercase ASCII letters, digits, or hyphens",
             ));
         }
-        let executable = pin_harness_executable(resolve_harness_executable(kind)?)?;
+        let resolved = resolve_harness_executable(kind)?;
+        let (executable, arguments) = if boxed {
+            let adapter = crate::harness::adapter(kind);
+            let boxed_path = adapter.and_then(|adapter| adapter.boxed_executable(&resolved));
+            let boxed_path = match boxed_path {
+                Some(path) if path.is_file() => path,
+                Some(path) => {
+                    return Err(AdapterError::unavailable(format!(
+                        "boxed {kind} launch needs its runtime at {}, beside the launcher {}; \
+                         the slot box replaces the harness sandbox, so no launcher fallback is safe",
+                        path.display(),
+                        resolved.display()
+                    )));
+                }
+                None => resolved.clone(),
+            };
+            let executable = pin_harness_executable(boxed_path)?;
+            let arguments = adapter.map_or_else(
+                || arguments.to_vec(),
+                |adapter| adapter.boxed_arguments(arguments.to_vec()),
+            );
+            (executable, arguments)
+        } else {
+            (pin_harness_executable(resolved)?, arguments.to_vec())
+        };
+        let arguments = arguments.as_slice();
         let mut command = vec![executable.path.display().to_string()];
         command.extend_from_slice(arguments);
         let line = shell_join(&command)?;

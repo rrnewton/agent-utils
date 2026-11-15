@@ -1088,6 +1088,18 @@ pub trait ManagedApi: AgentApi {
             "custom pane harness launch is unavailable",
         ))
     }
+    /// [`Self::start_pane_agent`] inside a slot box (the box is the sandbox).
+    fn start_pane_agent_in_box(
+        &self,
+        name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        self.start_pane_agent(name, harness, pane, args, timeout, persist_identity)
+    }
     /// Run one literal executable in a fresh shell pane and pin it as the foreground process.
     fn start_pane_command(
         &self,
@@ -1581,6 +1593,25 @@ impl ManagedApi for HerdrClient {
         persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
     ) -> crate::error::Result<()> {
         HerdrClient::start_pane_agent(self, name, harness, pane, args, timeout, persist_identity)
+    }
+    fn start_pane_agent_in_box(
+        &self,
+        name: &str,
+        harness: &str,
+        pane: &str,
+        args: &[String],
+        timeout: Duration,
+        persist_identity: &mut dyn FnMut(CustomProcessIdentity) -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        HerdrClient::start_pane_agent_in_box(
+            self,
+            name,
+            harness,
+            pane,
+            args,
+            timeout,
+            persist_identity,
+        )
     }
     fn start_pane_command(
         &self,
@@ -10064,6 +10095,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             None => (cwd, None),
         };
+        // Record the boxed form of the arguments, so status and revive replay
+        // what actually ran (#1583: the box replaces the harness sandbox).
+        if slot_isolation.as_deref() == Some("userns") {
+            if let Some(adapter) = crate::harness::adapter(&options.harness) {
+                arguments = adapter.boxed_arguments(arguments);
+            }
+        }
         if launch_env.is_some() && relay_command.is_some() {
             return Err(fail(LAUNCH_ENV_RELAY_REFUSAL));
         }
@@ -10892,21 +10930,37 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             let agent_name = record.name.clone();
             let harness = record.harness.clone();
             let arguments = record.arguments.clone();
-            self.client.start_pane_agent(
-                &agent_name,
-                &harness,
-                &pane_id,
-                &arguments,
-                options.startup_timeout,
-                &mut |identity| {
-                    record.custom_process_identity = Some(identity);
-                    self.save(record).map_err(|error| {
-                        crate::error::AdapterError::unavailable(format!(
-                            "cannot persist custom process identity: {error}"
-                        ))
-                    })
-                },
-            )?;
+            // A userns slot box withholds the launcher's seteuid step (#1583):
+            // run the adapter's boxed form (for Muse, its runtime directly).
+            let in_box =
+                slot_command.is_some() && record.slot_isolation.as_deref() == Some("userns");
+            let mut persist = |identity: CustomProcessIdentity| {
+                record.custom_process_identity = Some(identity);
+                self.save(record).map_err(|error| {
+                    crate::error::AdapterError::unavailable(format!(
+                        "cannot persist custom process identity: {error}"
+                    ))
+                })
+            };
+            if in_box {
+                self.client.start_pane_agent_in_box(
+                    &agent_name,
+                    &harness,
+                    &pane_id,
+                    &arguments,
+                    options.startup_timeout,
+                    &mut persist,
+                )?;
+            } else {
+                self.client.start_pane_agent(
+                    &agent_name,
+                    &harness,
+                    &pane_id,
+                    &arguments,
+                    options.startup_timeout,
+                    &mut persist,
+                )?;
+            }
             record.pane_reported_by_agentctl = true;
             self.save(record)?;
             let screen = self.client.read(&pane_id, "visible", Some(200))?;
@@ -12755,17 +12809,31 @@ its drain would also type, so it was not queued",
             )?;
         }
         let mut pinned: Option<crate::client::CustomProcessIdentity> = None;
-        self.client.start_pane_agent(
-            agent_name,
-            &record.harness,
-            &pane_id,
-            &arguments,
-            Duration::from_secs(60),
-            &mut |identity| {
-                pinned = Some(identity);
-                Ok(())
-            },
-        )?;
+        // A boxed pane restarts in its box too (#1583, see `launch`).
+        let in_box = record.slot.is_some() && record.slot_isolation.as_deref() == Some("userns");
+        let mut capture = |identity: crate::client::CustomProcessIdentity| {
+            pinned = Some(identity);
+            Ok(())
+        };
+        if in_box {
+            self.client.start_pane_agent_in_box(
+                agent_name,
+                &record.harness,
+                &pane_id,
+                &arguments,
+                Duration::from_secs(60),
+                &mut capture,
+            )?;
+        } else {
+            self.client.start_pane_agent(
+                agent_name,
+                &record.harness,
+                &pane_id,
+                &arguments,
+                Duration::from_secs(60),
+                &mut capture,
+            )?;
+        }
         let _ = pinned;
         // Re-anchor here, then in every sibling registry pinning this pane.
         let mut anchored = vec![self.registry.display().to_string()];
@@ -18326,6 +18394,44 @@ pub(crate) mod tests {
         assert!(calls[1].ends_with(&format!(
             "transfer-owner s1 --agent slot-agent --owner-pid {pid} --expected-generation 3"
         )));
+    }
+
+    #[test]
+    fn userns_boxed_muse_records_its_sandbox_disabled_arguments() {
+        // #1583: a userns-boxed Muse launch records the boxed arguments (its
+        // shell sandbox off; the box is the sandbox), so revive replays them.
+        let fixture = Fixture::new();
+        let executable = fake_wrkslots(&fixture.root, &fixture.root, "ok");
+        let project = fixture.root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let status = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    slot: Some(SlotLaunch {
+                        slot: "s1".to_owned(),
+                        isolation: Some("userns".to_owned()),
+                        project: Some(project),
+                        executable: Some(executable),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(status["lifecycle"], "running", "{status}");
+        assert!(
+            status["arguments"]
+                .as_array()
+                .is_some_and(|arguments| arguments
+                    .iter()
+                    .any(|value| value == "--disable-sandbox")),
+            "{status}"
+        );
     }
 
     #[test]

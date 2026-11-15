@@ -71,6 +71,20 @@ impl HarnessAdapter for Muse {
         Some(vec!["--reasoning-effort".to_owned(), effort.to_owned()])
     }
 
+    /// Inside a userns slot box the `muse` launcher dies setting its effective
+    /// UID to root (the box maps no inner root), so a boxed launch runs the
+    /// runtime beside it (`muse.real`) directly. The box is the sandbox.
+    fn boxed_executable(&self, executable: &Path) -> Option<PathBuf> {
+        boxed_runtime(executable)
+    }
+
+    /// The runtime runs without its shell sandbox inside a box (see
+    /// [`Self::boxed_executable`]); the launcher passes the same flag itself
+    /// when it forks the runtime unboxed.
+    fn boxed_arguments(&self, arguments: Vec<String>) -> Vec<String> {
+        boxed_arguments(arguments)
+    }
+
     /// Muse has no resume of a conversation agentctl names (#741): a fresh start is the
     /// recorded arguments with no selector; Muse mints its own session, recorded at anchor.
     fn fresh_arguments(&self, rest: Vec<String>, _conversation: &str) -> Option<Vec<String>> {
@@ -145,6 +159,32 @@ impl HarnessAdapter for Muse {
             .filter_map(|lock| Some(lock.parent()?.join("session.jsonl")))
             .collect()
     }
+}
+
+/// The runtime beside the `muse` launcher (`muse.real` next to `muse`), when
+/// `executable` is that launcher. Any other executable has no boxed runtime.
+pub(crate) fn boxed_runtime(executable: &Path) -> Option<PathBuf> {
+    if executable.file_name()? != "muse" {
+        return None;
+    }
+    Some(executable.with_file_name("muse.real"))
+}
+
+/// `arguments` with Muse's shell sandbox disabled, unless already disabled.
+/// The flag is an option, so it goes before any trailing `resume <id>`
+/// subcommand, never after it.
+pub(crate) fn boxed_arguments(mut arguments: Vec<String>) -> Vec<String> {
+    if !arguments.iter().any(|argument| {
+        argument == "--disable-sandbox" || argument.starts_with("--disable-sandbox=")
+    }) {
+        let at = if arguments.len() >= 2 && arguments[arguments.len() - 2] == "resume" {
+            arguments.len() - 2
+        } else {
+            arguments.len()
+        };
+        arguments.insert(at, "--disable-sandbox".to_owned());
+    }
+    arguments
 }
 
 /// Muse's journal for `hints`: `<sessions>/YYYY/MM/DD/<session>/session.jsonl`, `<sessions>`
@@ -499,6 +539,39 @@ fn collapse(text: &str) -> String {
 mod tests {
     use super::super::transcript::{Activity, Hints, ToolLimit};
     use super::*;
+
+    #[test]
+    fn boxed_launch_runs_the_runtime_with_its_sandbox_disabled() {
+        // #1583: the launcher dies on seteuid inside a userns box; the runtime
+        // beside it runs, with the shell sandbox off (the box is the sandbox).
+        assert_eq!(
+            boxed_runtime(Path::new("/opt/muse_code/muse")).as_deref(),
+            Some(Path::new("/opt/muse_code/muse.real"))
+        );
+        assert_eq!(boxed_runtime(Path::new("/opt/muse_code/muse.real")), None);
+        assert_eq!(boxed_runtime(Path::new("/usr/bin/other")), None);
+        assert_eq!(
+            boxed_arguments(vec!["--trust-workspace".to_owned()]),
+            ["--trust-workspace", "--disable-sandbox"]
+        );
+        assert_eq!(
+            boxed_arguments(vec!["--disable-sandbox".to_owned()]),
+            ["--disable-sandbox"]
+        );
+        assert_eq!(
+            boxed_arguments(vec!["--disable-sandbox=true".to_owned()]),
+            ["--disable-sandbox=true"]
+        );
+        assert_eq!(
+            boxed_arguments(vec![
+                "--model".to_owned(),
+                "m".to_owned(),
+                "resume".to_owned(),
+                "id-1".to_owned()
+            ]),
+            ["--model", "m", "--disable-sandbox", "resume", "id-1"]
+        );
+    }
 
     const FIXTURE: &str = include_str!("../../testdata/transcripts/muse.jsonl");
     /// 2026-10-27T10:00:00Z, the fixture's first entry.

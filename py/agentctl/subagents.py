@@ -36,6 +36,7 @@ from agentctl.client import (
     HerdrClient,
     Pane,
     PaneShellProof,
+    boxed_arguments,
     herdr_error_code,
     muse_effort_word,
     muse_idle_composer,
@@ -3586,6 +3587,9 @@ class ManagedAgents:
                 )
                 relay_executable = executable
                 slot_command = None
+            elif effective_isolation == "userns" and harness == "muse":
+                # Record the boxed arguments (#1583: the box is the sandbox).
+                arguments = boxed_arguments(arguments)
         if launch_env is not None and relay_command is not None:
             raise AgentDeliveryError(_LAUNCH_ENV_RELAY_REFUSAL)
         with self._lock(name):
@@ -3716,10 +3720,26 @@ class ManagedAgents:
                 record.custom_process_identity = identity
                 self._save(record)
 
-            self.client.start_pane_agent(
-                name, harness, record.pane_id, arguments,
-                timeout=startup_timeout, on_observed=persist_identity,
-            )
+            if slot_command is not None and record.slot_isolation == "userns":
+                # Mirrors the Rust trait default: clients without a boxed
+                # launch keep the plain one (the arguments already carry
+                # the boxed form recorded at start).
+                start_in_box = getattr(self.client, "start_pane_agent_in_box", None)
+                if start_in_box is not None:
+                    start_in_box(
+                        name, harness, record.pane_id, arguments,
+                        timeout=startup_timeout, on_observed=persist_identity,
+                    )
+                else:
+                    self.client.start_pane_agent(
+                        name, harness, record.pane_id, arguments,
+                        timeout=startup_timeout, on_observed=persist_identity,
+                    )
+            else:
+                self.client.start_pane_agent(
+                    name, harness, record.pane_id, arguments,
+                    timeout=startup_timeout, on_observed=persist_identity,
+                )
             record.pane_reported_by_agentctl = True
             self._save(record)
             screen = self.client.read(

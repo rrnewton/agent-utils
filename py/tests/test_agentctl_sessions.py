@@ -1421,7 +1421,8 @@ def _profile_resume_native_report(
     )),
     ("muse", "--image=profile attachment.png", (
         "--model", "chosen-model", "--reasoning-effort", "high",
-        "--image=profile attachment.png", "resume", "selected-conversation",
+        "--image=profile attachment.png", "--disable-sandbox",
+        "resume", "selected-conversation",
     )),
 ])
 def test_profile_resume_cli_preserves_policy_and_boxes_the_selected_native_launch(

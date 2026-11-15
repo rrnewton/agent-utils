@@ -147,6 +147,19 @@ pub trait HarnessAdapter: Sync {
         false
     }
 
+    /// The executable to run instead of `executable` inside a slot box, when the
+    /// harness's normal launcher cannot start there. The box is the sandbox, so a
+    /// launcher whose own sandbox setup needs privileges the box withholds is
+    /// bypassed for its runtime directly. `None` keeps `executable`.
+    fn boxed_executable(&self, _executable: &std::path::Path) -> Option<PathBuf> {
+        None
+    }
+
+    /// `arguments` adjusted for a slot-boxed launch (see [`Self::boxed_executable`]).
+    fn boxed_arguments(&self, arguments: Vec<String>) -> Vec<String> {
+        arguments
+    }
+
     // Screen.
 
     /// Whether [`crate::submission::submit_verified`] can read this harness's composer.
