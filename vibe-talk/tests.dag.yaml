@@ -55,8 +55,8 @@
 # have since returned behaviour-only.
 # check.offline-cache-phone-browser was quarantined under the same label on 2026-11-11 after
 # its second gate red and has since returned on the same proof bar (20/20 saturated runs at
-# the phone and desktop profiles; tracking is #1250's Notes). No check remains disabled
-# here. Each returns only as a
+# the phone and desktop profiles; tracking is #1250's Notes). check.scroll-soak-browser is
+# disabled under the same label since 2026-11-15 (#1589 scroll-soak-load-flake). Each returns only as a
 # behaviour-only check proved under load (#1248
 # fold-latency-behaviour-verdict is the pattern; fold-latency, keyboard and
 # keyboard-hides-bar stay enabled under it).
@@ -1936,10 +1936,15 @@ steps:
   # (--strict asserts; TODO(#1210) flip when green). First runs 2026-11-10, summaries off: anchor within
   # 0.4px everywhere; near-foot thread-reply snap 18px at both sizes; desk thread card resort shift 0.068.
   # Summaries on (--summaries on): summaries landing shifted 0.22-0.24 at both sizes.
+  # DISABLED UNTIL ROBUST under `disabled-optin` (#1589 scroll-soak-load-flake; owner
+  # rule 346): the phone folded-demote act moves the anchor 28.1px under host load and
+  # failed three unrelated owner-UI gates the same way, on unchanged code. It stays
+  # runnable by hand (`make -C vibe-talk scroll-soak-browser`, or validate
+  # --include-disabled) and returns only on the re-enable bar in #1589.
   - group: check
     job: scroll-soak-browser
     desc: a reader parked mid-Main is sampled every frame for 60 s of background updates (live messages and replies, edits above and below, reactions incl. a folded card, read state, the Newest recount and the poll; summaries off), each update's anchor movement and layout shift reported separately beside the recorded baseline, plus a near-foot slack coda, in current Chromium at 393x852 and 1280x800 (--strict; the anchor within a pixel at every frame, at most one painted correction per act, no writes in an idle act)
-    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
     cmd: cd vibe-talk && python3 tests/scroll_soak_browser.py --strict
     jobs_flag: ""
     deps: [setup.contract-tools]
