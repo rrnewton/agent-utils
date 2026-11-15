@@ -1146,9 +1146,6 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
 
   /** Stop whatever is playing and forget it. Safe to call when nothing is. */
   function stopReading() {
-    // `#1588`: a stopped read forgets a reader-scroll pause; a sentence light that
-    // merely goes out mid-read (clearReadingSentence) must not.
-    followPause.reset();
     // Invalidate every read in flight, not only the one that is audible. A fetch that has not come
     // back yet is still going to build a player unless its ticket is stale.
     readingTicket += 1;
