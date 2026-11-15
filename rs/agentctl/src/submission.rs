@@ -358,6 +358,34 @@ impl Default for SubmitTimeouts {
     }
 }
 
+impl SubmitTimeouts {
+    /// The longest one submission may hold the pane's locks (typing, submit
+    /// and verify together): every phase deadline it may consume, summed —
+    /// the composer wait once per draft recovery plus one, the stage window
+    /// and its grace, the submit window with its printed-evidence grace, and
+    /// one bounded draft-recovery press sequence per recovery. Enforced in
+    /// [`submit_verified`] against the caller's clock, so no admission holds
+    /// the pane lock longer, whatever phase stalls (#1683
+    /// pane-lock-held-by-stuck-sender). The pane admission itself adds at
+    /// most one pacing interval on top of this bound.
+    #[must_use]
+    pub fn hold_bound(&self) -> Duration {
+        self.composer * (MAX_DRAFT_RECOVERIES + 1)
+            + self.stage
+            + self.stage_grace
+            + self.submit
+            + PRINT_GRACE
+            + DRAFT_SUBMIT_TIMEOUT * (MAX_DRAFT_RECOVERIES + 1)
+    }
+}
+
+/// The hold bound of a submission made under the pane's locks: the drain's
+/// [`in_lock_timeouts`] summed by [`SubmitTimeouts::hold_bound`].
+#[must_use]
+pub fn in_lock_hold_bound() -> Duration {
+    in_lock_timeouts().hold_bound()
+}
+
 /// One screen split around the agent's composer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComposerView {
@@ -1147,7 +1175,8 @@ fn blocked(harness: &str, screen: &str) -> bool {
 /// draft counts as submitted once the composer has stayed empty for [`DRAFT_SETTLE`]; the queue
 /// records note the recovery. Any other draft may be a person typing: nothing is pressed.
 ///
-/// `Ok(None)`: the composer is empty, not recognisable, or holds a draft agentctl did not type.
+/// `Ok(None)`: the composer is empty, not recognisable with no typed prompt
+/// in its lower region, or holds a draft agentctl did not type.
 /// `Ok(Some(evidence))`: a draft agentctl typed was submitted. An error: such a draft is still
 /// in the composer after [`DRAFT_SUBMIT_TIMEOUT`], or a read or key failed.
 pub(crate) fn recover_typed_draft(
@@ -1166,8 +1195,15 @@ pub(crate) fn recover_typed_draft(
             Ok(composer_view(harness, &screen))
         })
     };
-    let Ok(Some(view)) = read()? else {
+    let Ok(view) = read()? else {
         return Ok(None);
+    };
+    let Some(view) = view else {
+        // No harness reader recognises this screen, so the composer-shaped
+        // match above can never see the draft: match the pane's lower
+        // region against the typed records instead (#1683).
+        let screen = terminal.read_screen(pane_id)?;
+        return recover_region_draft(terminal, pane_id, harness, queue, runtime, &screen);
     };
     let Some(draft) = composer_draft(&view) else {
         return Ok(None);
@@ -1246,6 +1282,134 @@ pub(crate) fn recover_typed_draft(
     }
 }
 
+/// How long after typing a prompt may still be recovered from the pane's
+/// lower region: the backstop's expiry, so both recoveries remember the
+/// same prompts.
+const REGION_RECOVERY_LOOKBACK: Duration = Duration::from_secs(2 * 3600);
+
+/// Submit a draft agentctl typed when no harness reader recognises the
+/// screen (#1683 pane-lock-held-by-stuck-sender): the composer's own
+/// matcher can never see such a draft, which is how one notice held a
+/// coordinator pane for 107 minutes. The pane's visible lower region is
+/// fuzzy-matched against the prompts the queue records as typed (the
+/// #1560 backstop's rules); a match is ours, so it gets the submission
+/// key — never while a question, a menu or a picker shows — and counts
+/// as submitted once the match has left the region and stayed gone for
+/// [`DRAFT_SETTLE`]. The record is noted recovered, so the drain marks
+/// it delivered rather than lost and never types it again.
+///
+/// `Ok(None)`: the region matches no typed prompt. An error: a matched
+/// draft is still in the region after [`DRAFT_SUBMIT_TIMEOUT`], or a
+/// read or key failed.
+fn recover_region_draft(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    queue: &std::path::Path,
+    runtime: &dyn AgentRuntime,
+    screen: &str,
+) -> Result<Option<String>> {
+    if blocked(harness, screen) {
+        return Ok(None);
+    }
+    let config = crate::paste_backstop::BackstopConfig::default();
+    let prompts =
+        crate::paste_backstop::delivered_prompts(queue, unix_seconds(), REGION_RECOVERY_LOOKBACK);
+    let Some(prompt) = prompts.iter().find(|prompt| {
+        crate::paste_backstop::match_region(&prompt.text, screen, &config).is_some()
+    }) else {
+        return Ok(None);
+    };
+    let typed = format!("prompt {}", prompt.id);
+    let key = runtime.followup_key().unwrap_or("Enter");
+    terminal.send_keys(pane_id, key)?;
+    let pressed = runtime.monotonic();
+    let mut presses: u32 = 1;
+    let mut wait = FIRST_RETRY;
+    let mut next_press = pressed.saturating_add(wait);
+    let mut gone_since: Option<Duration> = None;
+    loop {
+        runtime.sleep(POLL);
+        if runtime.cancelled() {
+            return Err(AdapterError::cancelled(format!(
+                "pane {pane_id}: delivery was cancelled while submitting an unsent draft {typed}"
+            )));
+        }
+        let current = terminal.read_screen(pane_id)?;
+        let now = runtime.monotonic();
+        if blocked(harness, &current) {
+            let evidence = format!(
+                "submitted an unsent draft {typed} that {harness} had left in its composer, \
+                 matched in the pane's lower region ({presses} {key} key press(es)), \
+                 after which it asked a question"
+            );
+            note_region_recovered(queue, &prompt.id, &evidence);
+            return Ok(Some(evidence));
+        }
+        if crate::paste_backstop::match_region(&prompt.text, &current, &config).is_none() {
+            let since = *gone_since.get_or_insert(now);
+            if now.saturating_sub(since) >= DRAFT_SETTLE {
+                let evidence = format!(
+                    "submitted an unsent draft {typed} that {harness} had left in its composer, \
+                     matched in the pane's lower region ({presses} {key} key press(es))"
+                );
+                note_region_recovered(queue, &prompt.id, &evidence);
+                return Ok(Some(evidence));
+            }
+            continue;
+        }
+        gone_since = None;
+        if now.saturating_sub(pressed) >= DRAFT_SUBMIT_TIMEOUT {
+            return Err(AdapterError::unavailable(format!(
+                "pane {pane_id}: the {harness} composer holds an unsent draft {typed}; it is \
+                 still in the pane's lower region after {presses} {key} key press(es)"
+            )));
+        }
+        if presses < DRAFT_PRESSES && now >= next_press {
+            terminal.send_keys(pane_id, key)?;
+            presses += 1;
+            wait = (wait * 2).min(MAX_RETRY);
+            next_press = now.saturating_add(wait);
+        }
+    }
+}
+
+/// Note the queue record `id` recovered, as
+/// [`crate::stale_draft::note_recovered`] does for a composer-matched
+/// draft: the drain then treats the prompt as delivered, never lost,
+/// and never types it again.
+fn note_region_recovered(queue: &std::path::Path, id: &str, evidence: &str) {
+    for phase in ["processed", "failed", "inbox", "inbox.v2"] {
+        let Ok(entries) = std::fs::read_dir(queue.join(phase)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Ok(serde_json::Value::Object(mut document)) =
+                crate::agent::read_private_json(&path)
+            else {
+                continue;
+            };
+            if document.get("id").and_then(serde_json::Value::as_str) != Some(id) {
+                continue;
+            }
+            document.insert(
+                "draft_recovered_at".to_owned(),
+                serde_json::json!(unix_seconds()),
+            );
+            document.insert(
+                "draft_recovered_evidence".to_owned(),
+                serde_json::json!(evidence),
+            );
+            let _ = crate::agent::atomic_json(&path, &serde_json::Value::Object(document));
+            return;
+        }
+    }
+}
+
 fn unix_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1295,7 +1459,12 @@ pub fn submit_verified(
         ));
     }
     let mut composer_deadline = runtime.monotonic() + timeouts.composer;
+    // No admission holds the pane lock past this, whatever phase stalls
+    // (#1683); see `SubmitTimeouts::hold_bound`.
+    let hold_deadline = runtime.monotonic() + timeouts.hold_bound();
     let mut recovered: u32 = 0;
+    // Whether the lower-region recovery ran against an unparseable screen.
+    let mut region_recovery_tried = false;
     // What the last recovery of a draft agentctl typed did: submitted it, or failed to.
     let mut recovery: Option<std::result::Result<String, String>> = None;
     let (screen, before) = 'baseline: loop {
@@ -1411,6 +1580,37 @@ pub fn submit_verified(
                 }
             }
             break (screen, before);
+        }
+        // No harness reader recognises this screen. A draft agentctl typed
+        // may still be visible in the pane's lower region; submit it from
+        // there instead of refusing every delivery until someone clears
+        // the composer by hand (#1683).
+        if !region_recovery_tried && recovered < MAX_DRAFT_RECOVERIES {
+            region_recovery_tried = true;
+            if let Some(queue) = runtime.typed_prompts_queue() {
+                let outcome = recover_typed_draft(terminal, pane_id, harness, &queue, runtime);
+                if !matches!(outcome, Ok(None)) {
+                    recovered = match outcome {
+                        Ok(_) => recovered + 1,
+                        Err(_) => MAX_DRAFT_RECOVERIES,
+                    };
+                    recovery = Some(
+                        outcome
+                            .map(Option::unwrap_or_default)
+                            .map_err(|error| error.to_string()),
+                    );
+                    composer_deadline = runtime.monotonic() + timeouts.composer;
+                    region_recovery_tried = false;
+                    continue 'baseline;
+                }
+            }
+        }
+        if runtime.monotonic() >= hold_deadline {
+            return refuse(format!(
+                "pane {pane_id}: submission exceeded the {:.1}s admission hold bound; \
+                 nothing was typed",
+                timeouts.hold_bound().as_secs_f64()
+            ));
         }
         if runtime.monotonic() >= composer_deadline || runtime.cancelled() {
             // A grid that stayed ansi-blank while Herdr still proves the harness
@@ -1879,6 +2079,30 @@ pub fn clear_composer(
         &|screen| {
             composer_view(harness, screen)
                 .map(|view| (composer_content(&view), composer_is_empty(&view)))
+        },
+        runtime,
+    )
+}
+
+/// [`clear_composer`] when no harness reader recognises the screen
+/// (#1683): the editor is the pane's visible lower region, and the
+/// composer counts as empty once the region holds no text. Used by the
+/// stale-composer clear for a draft it could only ever observe there.
+pub fn clear_region(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    runtime: &dyn AgentRuntime,
+) -> std::result::Result<u32, String> {
+    let config = crate::paste_backstop::BackstopConfig::default();
+    clear_editor(
+        terminal,
+        pane_id,
+        harness,
+        &|screen| {
+            let text = crate::paste_backstop::region_text(screen, &config).unwrap_or_default();
+            let empty = text.trim().is_empty();
+            Some((text, empty))
         },
         runtime,
     )
@@ -5726,6 +5950,206 @@ mod tests {
                 .contains("typed by agentctl for lane-a"),
             "{record}"
         );
+    }
+
+    /// A pane no harness composer reader recognises (#1683): the visible
+    /// screen is plain transcript rows, and a draft shows only as text in
+    /// the lower region. Pressing Enter swaps in the screen the harness
+    /// draws once the draft is submitted (the text as a user turn, with
+    /// the agent's output under it).
+    struct RegionScreen {
+        screen: std::sync::Mutex<String>,
+        submitted: String,
+        keys: std::sync::Mutex<Vec<String>>,
+        pastes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RegionScreen {
+        fn stuck(draft: &str) -> Self {
+            Self {
+                screen: std::sync::Mutex::new(format!(
+                    "• earlier output\n• more output\n{draft}\n"
+                )),
+                submitted: format!(
+                    "• earlier output\n• more output\n❯ {draft}\n\
+                     • the agent is working on it\n• still working\n\
+                     • output line three\n• output line four\n• output line five\n"
+                ),
+                keys: std::sync::Mutex::new(Vec::new()),
+                pastes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.keys.lock().expect("region keys").clone()
+        }
+
+        fn pastes(&self) -> Vec<String> {
+            self.pastes.lock().expect("region pastes").clone()
+        }
+    }
+
+    impl PromptTerminal for RegionScreen {
+        fn read_screen(&self, _pane_id: &str) -> Result<String> {
+            Ok(self.screen.lock().expect("region screen").clone())
+        }
+
+        fn send_text(&self, _pane_id: &str, text: &str) -> Result<()> {
+            self.pastes
+                .lock()
+                .expect("region pastes")
+                .push(text.to_owned());
+            Ok(())
+        }
+
+        fn send_keys(&self, _pane_id: &str, keys: &str) -> Result<()> {
+            self.keys.lock().expect("region keys").push(keys.to_owned());
+            if keys == "Enter" {
+                *self.screen.lock().expect("region screen") = self.submitted.clone();
+            }
+            Ok(())
+        }
+    }
+
+    /// Record `text` in the queue's inbox as a prompt an earlier pass typed
+    /// and left stranded, as the drain writes it.
+    fn stranded_region_record(queue: &TypedQueue, id: &str, text: &str) {
+        let inbox = queue.0.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        crate::agent::atomic_json(
+            &inbox.join(format!("{id}.json")),
+            &serde_json::json!({
+                "id": id,
+                "text": text,
+                "typed_as": text,
+                "stranded_at": unix_seconds(),
+            }),
+        )
+        .unwrap();
+    }
+
+    fn region_record(queue: &TypedQueue, id: &str) -> serde_json::Value {
+        crate::agent::read_private_json(&queue.0.join(format!("inbox/{id}.json"))).unwrap()
+    }
+
+    /// #1683 pane-lock-held-by-stuck-sender: a draft agentctl typed that no
+    /// composer reader can see (the screen will not parse) is still ours:
+    /// it is submitted from the pane's lower region, never retyped, and
+    /// its record is noted recovered so the drain marks it delivered
+    /// rather than lost.
+    #[test]
+    fn a_typed_draft_on_an_unparseable_screen_is_submitted_from_the_lower_region() {
+        let lane = format!("{LANE}\nfirst finding\nsecond finding\nthird finding");
+        let queue = TypedQueue::new("region-stranded");
+        stranded_region_record(&queue, "lane", &lane);
+        let screen = RegionScreen::stuck(&lane);
+        assert!(
+            composer_view("claude", &screen.read_screen("w1:p1").unwrap()).is_none(),
+            "the premise: no composer reader recognises this screen"
+        );
+        let clock = Clock {
+            queue: Some(queue.0.clone()),
+            ..Clock::default()
+        };
+        let evidence = recover_typed_draft(&screen, "w1:p1", "claude", &queue.0, &clock)
+            .unwrap()
+            .expect("the draft is ours and is submitted");
+        assert!(evidence.contains("lower region"), "{evidence}");
+        assert_eq!(screen.keys(), ["Enter"]);
+        assert!(screen.pastes().is_empty(), "the draft is never retyped");
+        let record = region_record(&queue, "lane");
+        assert!(record["draft_recovered_at"].is_number(), "{record}");
+        assert!(
+            record["draft_recovered_evidence"]
+                .as_str()
+                .unwrap()
+                .contains("lower region"),
+            "{record}"
+        );
+    }
+
+    /// #1683 (the incident's shape): one sender's paste is stranded where
+    /// only the lower region shows it. The next (owner) delivery submits
+    /// that draft first, types nothing over it, and — once the composer
+    /// parses again — delivers its own prompt, typed exactly once, all
+    /// inside the in-lock hold bound.
+    #[test]
+    fn an_owner_prompt_behind_a_region_only_draft_gets_through_within_the_hold_bound() {
+        let lane = format!("{LANE}\nfirst finding\nsecond finding\nthird finding");
+        let queue = TypedQueue::new("region-owner");
+        stranded_region_record(&queue, "lane", &lane);
+        let owner = format!("{OWNER}\nstatus?");
+
+        // First pass: the composer will not parse, so nothing is typed —
+        // but the stranded draft is submitted out of the way first.
+        let screen = RegionScreen::stuck(&lane);
+        let clock = Clock {
+            queue: Some(queue.0.clone()),
+            ..Clock::default()
+        };
+        let started = clock.monotonic();
+        let outcome = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            &owner,
+            in_lock_timeouts(),
+            &clock,
+        )
+        .unwrap();
+        assert!(matches!(outcome, Submission::NotStaged(_)), "{outcome:?}");
+        assert!(
+            clock.monotonic() - started <= in_lock_timeouts().hold_bound(),
+            "the pass stayed inside the hold bound"
+        );
+        assert_eq!(screen.keys(), ["Enter"], "one Enter submits the draft");
+        assert!(
+            screen.pastes().is_empty(),
+            "the owner prompt is never typed over the draft"
+        );
+        assert!(
+            region_record(&queue, "lane")["draft_recovered_at"].is_number(),
+            "the stranded record is delivered, not lost"
+        );
+
+        // Second pass: the composer parses again and is empty; the owner
+        // prompt delivers, typed exactly once.
+        let screen = FakeScreen::new("claude", false);
+        let clock = Clock {
+            queue: Some(queue.0.clone()),
+            ..Clock::default()
+        };
+        receipt(submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            &owner,
+            in_lock_timeouts(),
+            &clock,
+        ));
+        assert_eq!(taken(&screen), [owner]);
+    }
+
+    /// #1683: the in-lock hold bound is the summed phase deadlines, a
+    /// number a reader can check: composer waits per recovery, the 10 s
+    /// stage window with no grace, the submit window, and one bounded
+    /// recovery press sequence per recovery.
+    #[test]
+    fn the_in_lock_hold_bound_is_the_sum_of_its_phases() {
+        let timeouts = in_lock_timeouts();
+        assert_eq!(
+            timeouts.hold_bound(),
+            timeouts.composer * (MAX_DRAFT_RECOVERIES + 1)
+                + timeouts.stage
+                + timeouts.stage_grace
+                + timeouts.submit
+                + PRINT_GRACE
+                + DRAFT_SUBMIT_TIMEOUT * (MAX_DRAFT_RECOVERIES + 1)
+        );
+        assert_eq!(in_lock_hold_bound(), timeouts.hold_bound());
+        // 15 s composer waits and 15 s recovery sequences, four each,
+        // around a 10 s stage and a 60 s submit: three minutes twelve.
+        assert_eq!(in_lock_hold_bound(), Duration::from_secs(192));
     }
 
     /// #989 agentctl-own-draft-submit: a failed-queue digest a pass typed into a busy Claude

@@ -8931,10 +8931,13 @@ impl DeliveryWatch {
             .collect();
         self.composer_blocked = entries.iter().any(|entry| {
             entry.phase == RequestPhase::Pending
-                && entry
-                    .reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains(chat_runtime::COMPOSER_PREVIEW_MARKER))
+                && entry.reason.as_deref().is_some_and(|reason| {
+                    // A draft preview, or no recognisable composer at all:
+                    // either may be an occupied composer, so the
+                    // stale-composer watch runs (#1683).
+                    reason.contains(chat_runtime::COMPOSER_PREVIEW_MARKER)
+                        || reason.contains(chat_runtime::COMPOSER_UNRECOGNISED_MARKER)
+                })
         });
         let alarm = DeliveryAlarm::new(&entries, now_millis, self.timing.stall_after);
         // Each record is read on its own, so one that cannot be read does not hold back the

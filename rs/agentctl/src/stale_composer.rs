@@ -11,6 +11,10 @@
 //!
 //! The draft's text goes only to the backup file and to that notice: every log line describes
 //! it by its length.
+//!
+//! A screen no harness reader recognises is observed through the pane's visible lower region
+//! instead, so an occupied but unparseable composer starts the same unchanged clock (#1683
+//! pane-lock-held-by-stuck-sender); the backup of such a draft holds that region text.
 
 use std::fs;
 use std::io::Write as _;
@@ -170,6 +174,14 @@ pub trait ComposerPane {
         let _ = harness;
         None
     }
+    /// The draft visible in the pane's lower region when no harness composer
+    /// reader recognises `screen` (#1683): the text an unsubmitted paste
+    /// shows there, or `None` when the region holds no text. The default
+    /// cannot read one.
+    fn region_draft(&self, screen: &str) -> Option<String> {
+        let _ = screen;
+        None
+    }
 }
 
 /// What one [`StaleComposer::step`] did.
@@ -197,11 +209,14 @@ pub enum Step {
     Failed(String),
 }
 
-/// A draft being watched: its text and when it was first seen with that text.
+/// A draft being watched: its text, when it was first seen with that text,
+/// and whether a harness composer reader parsed it (`false`: the lower
+/// region is all that shows it, #1683).
 #[derive(Clone, Debug)]
 struct Watched {
     text: String,
     since: Instant,
+    parseable: bool,
 }
 
 /// The stale-composer clear for one `chat run`.
@@ -279,15 +294,38 @@ impl StaleComposer {
                 return Step::Held(format!("the pane could not be read: {error}"));
             }
         };
-        let Some(text) = composer_text(&observation.harness, &observation.screen) else {
-            if self.watched.take().is_some() {
-                log(
-                    "agentctl: stale composer: the composer no longer holds the draft; \
-                     it is no longer watched"
-                        .to_owned(),
-                );
+        // The draft is read from the composer's own reader when the screen
+        // parses, and from the pane's lower region when it does not, so an
+        // occupied but unparseable composer starts the clock either way
+        // (#1683). A parseable, empty composer is no draft, whatever the
+        // region holds: the transcript tail is not a draft.
+        let (text, parseable) = match composer_text(&observation.harness, &observation.screen) {
+            Some(text) => (text, true),
+            None if submission::composer_view(&observation.harness, &observation.screen)
+                .is_some() =>
+            {
+                if self.watched.take().is_some() {
+                    log(
+                        "agentctl: stale composer: the composer no longer holds the draft; \
+                         it is no longer watched"
+                            .to_owned(),
+                    );
+                }
+                return Step::Idle;
             }
-            return Step::Idle;
+            None => match pane.region_draft(&observation.screen) {
+                Some(text) => (text, false),
+                None => {
+                    if self.watched.take().is_some() {
+                        log(
+                            "agentctl: stale composer: the composer no longer holds the draft; \
+                             it is no longer watched"
+                                .to_owned(),
+                        );
+                    }
+                    return Step::Idle;
+                }
+            },
         };
         match &self.watched {
             Some(watched) if watched.text == text => {}
@@ -305,7 +343,11 @@ impl StaleComposer {
                     describe(&text),
                     duration_words(self.window)
                 ));
-                self.watched = Some(Watched { text, since: now });
+                self.watched = Some(Watched {
+                    text,
+                    since: now,
+                    parseable,
+                });
                 return Step::Watching;
             }
         }
@@ -337,9 +379,16 @@ impl StaleComposer {
         if let Some(reason) = busy(&observation) {
             return Step::Held(format!("the draft is due, but {reason}"));
         }
-        if composer_text(&observation.harness, &observation.screen).as_deref()
-            != Some(watched.text.as_str())
-        {
+        let current = match composer_text(&observation.harness, &observation.screen) {
+            Some(text) => Some(text),
+            None if submission::composer_view(&observation.harness, &observation.screen)
+                .is_some() =>
+            {
+                None
+            }
+            None => pane.region_draft(&observation.screen),
+        };
+        if current.as_deref() != Some(watched.text.as_str()) {
             self.watched = None;
             log(format!(
                 "agentctl: stale composer: pane {} composer changed just before it was due; \
@@ -389,12 +438,21 @@ impl StaleComposer {
             backup.display(),
             pane.pane_id()
         ));
-        let cleared = submission::clear_composer(
-            pane.terminal(),
-            pane.pane_id(),
-            &observation.harness,
-            runtime,
-        );
+        let cleared = if watched.parseable {
+            submission::clear_composer(
+                pane.terminal(),
+                pane.pane_id(),
+                &observation.harness,
+                runtime,
+            )
+        } else {
+            submission::clear_region(
+                pane.terminal(),
+                pane.pane_id(),
+                &observation.harness,
+                runtime,
+            )
+        };
         drop(lock);
         match cleared {
             Ok(keys) => log(format!(
@@ -608,6 +666,13 @@ impl ComposerPane for HerdrComposerPane<'_> {
             Ok(None) => None,
             Err(error) => Some(Err(error.to_string())),
         }
+    }
+
+    fn region_draft(&self, screen: &str) -> Option<String> {
+        crate::paste_backstop::region_text(
+            screen,
+            &crate::paste_backstop::BackstopConfig::default(),
+        )
     }
 }
 
@@ -933,6 +998,179 @@ mod tests {
             "nothing was saved and deleted"
         );
         assert!(harness.transport.posted.is_empty(), "no clear notice");
+    }
+
+    /// A pane no harness composer reader recognises (#1683): the draft
+    /// shows only in the visible lower region. Enter submits it (the
+    /// submitted screen draws it as a user turn with output under it);
+    /// a clearing key empties the region.
+    struct RegionPane {
+        screen: Mutex<String>,
+        submitted: String,
+        keys: Mutex<Vec<String>>,
+        typed_queue: Option<PathBuf>,
+    }
+
+    impl RegionPane {
+        fn stuck(draft: &str) -> Self {
+            Self {
+                screen: Mutex::new(format!("• earlier output\n• more output\n{draft}\n")),
+                submitted: format!(
+                    "• earlier output\n• more output\n❯ {draft}\n\
+                     • the agent is working on it\n• still working\n\
+                     • output line three\n• output line four\n• output line five\n"
+                ),
+                keys: Mutex::new(Vec::new()),
+                typed_queue: None,
+            }
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.keys.lock().unwrap().clone()
+        }
+    }
+
+    impl ComposerPane for RegionPane {
+        fn observe(&self) -> Result<PaneObservation, String> {
+            Ok(PaneObservation {
+                status: "idle".to_owned(),
+                harness: "claude".to_owned(),
+                screen: self.screen.lock().unwrap().clone(),
+            })
+        }
+
+        fn lock(&self) -> Result<Box<dyn std::any::Any>, String> {
+            Ok(Box::new(()))
+        }
+
+        fn terminal(&self) -> &dyn PromptTerminal {
+            self
+        }
+
+        fn pane_id(&self) -> &str {
+            "w1:p1"
+        }
+
+        fn flush_own_draft(&self, harness: &str) -> Option<Result<String, String>> {
+            let queue = self.typed_queue.as_deref()?;
+            match submission::recover_typed_draft(self, "w1:p1", harness, queue, &Clock::default())
+            {
+                Ok(Some(evidence)) => Some(Ok(evidence)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error.to_string())),
+            }
+        }
+
+        fn region_draft(&self, screen: &str) -> Option<String> {
+            crate::paste_backstop::region_text(
+                screen,
+                &crate::paste_backstop::BackstopConfig::default(),
+            )
+        }
+    }
+
+    impl PromptTerminal for RegionPane {
+        fn read_screen(&self, _pane_id: &str) -> crate::error::Result<String> {
+            Ok(self.screen.lock().unwrap().clone())
+        }
+
+        fn send_text(&self, _pane_id: &str, _text: &str) -> crate::error::Result<()> {
+            Ok(())
+        }
+
+        fn send_keys(&self, _pane_id: &str, keys: &str) -> crate::error::Result<()> {
+            self.keys.lock().unwrap().push(keys.to_owned());
+            if keys == "Enter" {
+                *self.screen.lock().unwrap() = self.submitted.clone();
+            }
+            if keys == "ctrl+u" {
+                *self.screen.lock().unwrap() = String::new();
+            }
+            Ok(())
+        }
+    }
+
+    /// A queue holding one prompt agentctl typed, for the region tests.
+    fn typed_region_queue(directory: &TestDirectory, id: &str, text: &str) -> PathBuf {
+        let queue = directory.0.join("queue");
+        let processed = queue.join("processed");
+        fs::create_dir_all(&processed).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        crate::agent::atomic_json(
+            &processed.join(format!("{id}.json")),
+            &serde_json::json!({"id": id, "text": text, "inflight_at": now}),
+        )
+        .unwrap();
+        queue
+    }
+
+    /// #1683: an own draft only the lower region shows is submitted with
+    /// Enter — never backed up, never cleared — and its record is noted
+    /// recovered.
+    #[test]
+    fn an_own_draft_on_an_unparseable_screen_is_submitted_not_cleared() {
+        let draft = "[from lane-a via agentctl · reply: agentctl send lane-a]\n\
+                     first finding\nsecond finding\nthird finding";
+        let mut harness = Harness::new("region-own");
+        let queue = typed_region_queue(&harness.directory, "lane", draft);
+        let mut pane = RegionPane::stuck(draft);
+        pane.typed_queue = Some(queue.clone());
+        assert!(
+            composer_text("claude", &pane.screen.lock().unwrap()).is_none(),
+            "the premise: no composer reader recognises this screen"
+        );
+        assert_eq!(harness.step(&pane, 0), Step::Watching);
+        let Step::Flushed(evidence) = harness.step(&pane, 30) else {
+            panic!("expected a flush: {:?}", harness.logged);
+        };
+        assert!(evidence.contains("lower region"), "{evidence}");
+        assert_eq!(pane.keys(), ["Enter"]);
+        assert!(harness.backups().is_empty(), "ours is never backed up");
+        assert!(harness.transport.posted.is_empty(), "no notice is posted");
+        let record = crate::agent::read_private_json(&queue.join("processed/lane.json")).unwrap();
+        assert!(record["draft_recovered_at"].is_number(), "{record}");
+    }
+
+    /// #1683: a foreign draft only the lower region shows starts the
+    /// stale clock at once, is never cleared before the window, and is
+    /// then backed up (with the visible text) and cleared.
+    #[test]
+    fn a_foreign_draft_on_an_unparseable_screen_is_backed_up_and_cleared_after_the_wait() {
+        let draft = "note to self: hold the deploy until the rerun lands";
+        let pane = RegionPane::stuck(draft);
+        let mut harness = Harness::new("region-foreign");
+        assert_eq!(harness.step(&pane, 0), Step::Watching);
+        assert_eq!(harness.step(&pane, 29), Step::Watching);
+        assert!(pane.keys().is_empty(), "never cleared before the window");
+        assert!(harness.backups().is_empty());
+
+        let Step::Cleared { backup, notice } = harness.step(&pane, 30) else {
+            panic!("expected a clear: {:?}", harness.logged);
+        };
+        assert!(notice.is_some());
+        let saved = fs::read_to_string(&backup).unwrap();
+        assert!(saved.contains(draft), "{saved}");
+        assert_eq!(harness.transport.posted.len(), 1);
+        assert!(harness.transport.posted[0].1.contains(draft));
+        assert_eq!(harness.step(&pane, 31), Step::Idle);
+    }
+
+    /// #1683: a screen with no text at all starts no clock.
+    #[test]
+    fn an_empty_unparseable_screen_is_idle() {
+        let pane = RegionPane {
+            screen: Mutex::new(String::new()),
+            submitted: String::new(),
+            keys: Mutex::new(Vec::new()),
+            typed_queue: None,
+        };
+        let mut harness = Harness::new("region-empty");
+        assert_eq!(harness.step(&pane, 0), Step::Idle);
+        assert_eq!(harness.step(&pane, 90), Step::Idle);
+        assert!(pane.keys().is_empty());
     }
 
     #[test]

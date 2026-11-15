@@ -646,6 +646,130 @@ def _submit_key(harness: str, view: ComposerView) -> str:
     return "Enter"
 
 
+# The pane's lower region, for matching a typed prompt no composer reader
+# can see (#1683): the last rows of the screen, normalised by dropping
+# box-drawing and prompt glyphs and removing every whitespace character,
+# the same normalisation the watcher backstop uses. A short prompt
+# matches whole; a longer one matches when its
+# first and last _REGION_ANCHOR characters both appear, in order. The
+# match must end within _REGION_TAIL_ROWS content rows of the bottom, so
+# a submitted prompt echoed into the transcript never counts.
+_REGION_ROWS = 24
+_REGION_ANCHOR = 40
+_REGION_SHORT_MAX = 80
+_REGION_TAIL_ROWS = 4
+_REGION_PRESSES = 3
+_REGION_SETTLE_SECONDS = 3.0
+
+
+def _is_box_drawing(character: str) -> bool:
+    return "─" <= character <= "╿" or "▀" <= character <= "▟"
+
+
+def _normalise_region(text: str) -> str:
+    rows = []
+    for row in text.splitlines():
+        body = row.lstrip(" \t❯›>◆●⏺")
+        rows.append(
+            "".join(
+                character
+                for character in body
+                if not character.isspace() and not _is_box_drawing(character)
+            )
+        )
+    return "".join(rows)
+
+
+def _region_match(text: str, screen: str) -> bool:
+    """Whether `text` shows in the screen's lower region, still unsubmitted."""
+    rows = screen.splitlines()[-_REGION_ROWS:]
+    if not rows:
+        return False
+    normalised = [_normalise_region(row) for row in rows]
+    joined = "".join(normalised)
+    needle = _normalise_region(text)
+    if not needle:
+        return False
+    if len(needle) <= _REGION_SHORT_MAX:
+        at = joined.find(needle)
+        if at < 0:
+            return False
+        end = at + len(needle)
+    else:
+        head_at = joined.find(needle[:_REGION_ANCHOR])
+        if head_at < 0:
+            return False
+        tail_at = joined.find(needle[-_REGION_ANCHOR:], head_at + _REGION_ANCHOR)
+        if tail_at < 0:
+            return False
+        end = tail_at + _REGION_ANCHOR
+    offsets = []
+    position = 0
+    for row in normalised:
+        offsets.append((position, position + len(row)))
+        position += len(row)
+    end_row = max(index for index, (start, _) in enumerate(offsets) if start < end)
+    last_content = max(index for index, row in enumerate(rows) if row.strip())
+    return last_content - end_row <= _REGION_TAIL_ROWS
+
+
+def _flush_region_draft(
+    terminal: PromptTerminal,
+    pane_id: str,
+    text: str,
+    *,
+    sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    deadline: float,
+) -> SubmissionReceipt | None:
+    """Submit our own prompt visible only in the pane's lower region.
+
+    The composer will not parse, so no composer-shaped match can see the
+    draft (#1683). It is ours — it is this very prompt, typed by an
+    earlier pass — so it gets Enter, never a retype, and counts as
+    submitted once the match has left the region and stayed gone.
+    `None` when the draft is still there at `deadline`.
+    """
+    started = monotonic()
+    terminal.send_keys(pane_id, "Enter")
+    presses = 1
+    wait = FIRST_RETRY_SECONDS
+    next_press = monotonic() + wait
+    gone_since: float | None = None
+    while True:
+        sleep(POLL_SECONDS)
+        now = monotonic()
+        if now >= deadline:
+            return None
+        if not _region_match(text, terminal.read_screen(pane_id)):
+            if gone_since is None:
+                gone_since = now
+            if now - gone_since >= _REGION_SETTLE_SECONDS:
+                return SubmissionReceipt(
+                    "Enter",
+                    presses,
+                    round(now - started, 3),
+                    "stranded prompt flushed with Enter; the composer was not "
+                    "recognisable, matched in the pane's lower region",
+                )
+            continue
+        gone_since = None
+        if presses < _REGION_PRESSES and now >= next_press:
+            terminal.send_keys(pane_id, "Enter")
+            presses += 1
+            wait = min(wait * 2, MAX_RETRY_SECONDS)
+            next_press = now + wait
+
+
+def hold_bound_seconds(
+    *, composer_timeout: float, stage_timeout: float, submit_timeout: float
+) -> float:
+    """The longest one submission may hold the pane's locks (#1683):
+    the composer wait, the stage window and the submit window, summed.
+    This edition has no draft-recovery sequences, so none are counted."""
+    return composer_timeout + stage_timeout + submit_timeout
+
+
 def submit_verified(
     terminal: PromptTerminal,
     pane_id: str,
@@ -678,7 +802,15 @@ def submit_verified(
         raise PromptNotStaged(
             "prompt text contains NUL or terminal escape characters; nothing was typed"
         )
+    # No admission holds the pane lock past this, whatever phase stalls
+    # (#1683); see hold_bound_seconds.
+    hold_deadline = monotonic() + hold_bound_seconds(
+        composer_timeout=composer_timeout,
+        stage_timeout=stage_timeout,
+        submit_timeout=submit_timeout,
+    )
     composer_deadline = monotonic() + composer_timeout
+    region_tried = False
     while True:
         try:
             screen = terminal.read_screen(pane_id)
@@ -696,6 +828,26 @@ def submit_verified(
         before = composer_view(harness, screen)
         if before is not None:
             break
+        # No composer reader recognises this screen. Our own prompt, typed
+        # by an earlier pass, may still show in the lower region: submit
+        # it from there instead of refusing every later delivery (#1683).
+        if not region_tried and _region_match(text, screen):
+            region_tried = True
+            receipt = _flush_region_draft(
+                terminal,
+                pane_id,
+                text,
+                sleep=sleep,
+                monotonic=monotonic,
+                deadline=min(hold_deadline, monotonic() + submit_timeout),
+            )
+            if receipt is not None:
+                return receipt
+        if monotonic() >= hold_deadline:
+            raise PromptNotStaged(
+                f"pane {pane_id}: submission exceeded the admission hold bound; "
+                "nothing was typed"
+            )
         if monotonic() >= composer_deadline:
             raise PromptNotStaged(
                 f"pane {pane_id} does not show a recognisable {harness} composer "
@@ -727,6 +879,11 @@ def submit_verified(
         view = composer_view(harness, terminal.read_screen(pane_id))
         if view is not None and _staged(view, text, placeholders_before):
             break
+        if monotonic() >= hold_deadline:
+            raise HerdrUnavailable(
+                f"pane {pane_id}: submission exceeded the admission hold bound "
+                "after typing; outcome is unknown"
+            )
         if monotonic() >= stage_deadline:
             raise HerdrUnavailable(
                 f"pane {pane_id}: pasted prompt was not observed in the {harness} composer "
@@ -744,6 +901,11 @@ def submit_verified(
     while True:
         sleep(POLL_SECONDS)
         now = monotonic()
+        if now >= hold_deadline:
+            raise HerdrUnavailable(
+                f"pane {pane_id}: submission exceeded the admission hold bound; "
+                "outcome is unknown"
+            )
         view = composer_view(harness, terminal.read_screen(pane_id))
         if view is not None and _staged(view, text, placeholders_before):
             left_composer = False

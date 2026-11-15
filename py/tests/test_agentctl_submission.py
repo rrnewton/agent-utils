@@ -1653,3 +1653,84 @@ def test_a_long_prompt_codex_holds_for_its_next_tool_call_is_printed_evidence() 
     # A preview Codex already showed before typing is not evidence about this prompt.
     assert _corroborated(after, after, _HELD_PROMPT) != HELD_PROMPT_EVIDENCE
     assert codex_pending_previews("  ↳ Coordinator: queueing an owner request") == []
+
+
+class _RegionScreen:
+    """A pane no composer reader recognises (#1683): plain transcript
+    rows, with a draft only as text in the lower region. Enter swaps in
+    the screen drawn once the draft is submitted (the text as a user
+    turn, with the agent's output under it)."""
+
+    def __init__(self, draft: str) -> None:
+        self.screen = f"• earlier output\n• more output\n{draft}\n"
+        self.submitted = (
+            f"• earlier output\n• more output\n❯ {draft}\n"
+            "• the agent is working on it\n• still working\n"
+            "• output line three\n• output line four\n• output line five\n"
+        )
+        self.keys: list[str] = []
+        self.pastes: list[str] = []
+
+    def read_screen(self, pane_id: str) -> str:
+        del pane_id
+        return self.screen
+
+    def send_text(self, pane_id: str, text: str) -> None:
+        del pane_id
+        self.pastes.append(text)
+
+    def send_keys(self, pane_id: str, keys: str) -> None:
+        del pane_id
+        self.keys.append(keys)
+        if keys == "Enter":
+            self.screen = self.submitted
+
+
+def test_a_prompt_visible_only_in_the_lower_region_is_flushed_not_retyped() -> None:
+    # #1683: an earlier pass typed this prompt where only the lower
+    # region shows it. It is submitted with Enter, never retyped.
+    text = (
+        "[from lane-a via agentctl · reply: agentctl send lane-a]\n"
+        "first finding\nsecond finding\nthird finding"
+    )
+    screen = _RegionScreen(text)
+    assert composer_view("claude", screen.read_screen("w1:p1")) is None
+    clock = Clock()
+    receipt = submit_verified(
+        screen, "w1:p1", "claude", text, sleep=clock.sleep, monotonic=clock.monotonic
+    )
+    assert receipt.key == "Enter" and receipt.key_presses == 1
+    assert "lower region" in receipt.evidence
+    assert screen.keys == ["Enter"] and screen.pastes == []
+
+
+def test_a_submitted_echo_high_in_the_transcript_is_never_flushed() -> None:
+    # The position guard: the same text echoed as a user turn, with the
+    # agent's output under it, is not a stuck draft.
+    text = (
+        "[from lane-a via agentctl · reply: agentctl send lane-a]\n"
+        "first finding\nsecond finding\nthird finding"
+    )
+    screen = _RegionScreen(text)
+    screen.screen = screen.submitted
+    clock = Clock()
+    with pytest.raises(PromptNotStaged, match="recognisable claude composer"):
+        submit_verified(
+            screen,
+            "w1:p1",
+            "claude",
+            text,
+            composer_timeout=2.0,
+            sleep=clock.sleep,
+            monotonic=clock.monotonic,
+        )
+    assert screen.keys == [] and screen.pastes == []
+
+
+def test_hold_bound_is_the_sum_of_the_phase_timeouts() -> None:
+    from agentctl.submission import hold_bound_seconds
+
+    assert (
+        hold_bound_seconds(composer_timeout=15.0, stage_timeout=10.0, submit_timeout=60.0)
+        == 85.0
+    )

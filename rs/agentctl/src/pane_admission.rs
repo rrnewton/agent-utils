@@ -7,6 +7,16 @@
 //! and each admission is audit-logged. The closure runs while the lock is
 //! held; it must type into an empty composer and confirm submission before
 //! returning (see `submission::submit_verified`).
+//!
+//! The lock is never held long: waiting for it is bounded (see
+//! [`PaneAdmission::acquire`]), the pacing sleep is one interval, and the
+//! closure's own phases are bounded by
+//! `submission::SubmitTimeouts::hold_bound` — for a drain under the pane's
+//! locks, `submission::in_lock_hold_bound` (#1683
+//! pane-lock-held-by-stuck-sender). A sender whose prompt cannot be
+//! observed releases the lock and leaves the prompt stranded in the
+//! queue records, recoverable by a later pass, instead of waiting under
+//! the lock.
 
 use std::fs::OpenOptions;
 use std::io::Write;

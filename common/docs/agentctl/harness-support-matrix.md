@@ -181,17 +181,27 @@ in `rs/agentctl/src/stale_draft.rs`.
   see a draft that is not there is fixed (#1553, landed 8a0d30a5), so
   Codex drafts attribute and flush like Claude Code's.
 - **Muse**: supported (the Muse editor reader; #1546).
-- **Unknown TUI**: partial — report only. The sweep cannot read an
-  unknown editor, so a stranded prompt there becomes a `draft:
-  unreadable` blocked finding, never a flush. The queued send itself
-  retries with Enter only, never re-typing (#850).
-- **In progress for every harness**: a harness-agnostic backstop that
-  submits any text-visible stuck paste, so no per-harness reader is
-  needed for the common case (#1560, mu-genbackstop). Placeholder-only
-  pastes (`[Pasted Content N chars]`, `[Pasted text #K +M lines]`) show
-  no screen text to match, so they stay with the per-harness readers.
-  Whichever of #1560 and this document lands later updates this row in
-  its own commit.
+- **Unknown TUI**: partial — report only from the per-harness sweep,
+  which cannot read an unknown editor, so a stranded prompt there
+  becomes a `draft: unreadable` blocked finding from that layer. The
+  harness-agnostic watcher backstop below does submit a text-visible
+  stuck paste there. The queued send itself retries with Enter only,
+  never re-typing (#850).
+- **Every harness, landed**: a harness-agnostic backstop that submits
+  any text-visible stuck paste, so no per-harness reader is needed for
+  the common case (#1560; `rs/agentctl/src/paste_backstop.rs`, pressed
+  from the watcher's sweep). Placeholder-only pastes (`[Pasted Content
+  N chars]`, `[Pasted text #K +M lines]`) show no screen text to match,
+  so they stay with the per-harness readers. Since #1683 the same
+  lower-region match also runs in the delivery path
+  (`recover_typed_draft` in `rs/agentctl/src/submission.rs`): a
+  delivery whose screen no composer reader recognises submits a typed
+  draft from the region and notes its record recovered, and the chat
+  bridge's stale-composer sweep reads the region when no composer
+  parses, so an occupied but unparseable composer starts its clock —
+  ours is submitted, a foreign draft is backed up and cleared only
+  after the stale window. The region path presses Enter; on a busy
+  Codex that steers, as Enter always does there.
 
 This is the row the owner did not know diverged: the backstop grew up
 Claude-first, reached Muse in #1546, and an unrecognised TUI still gets
@@ -639,6 +649,12 @@ differential lockstep for the interactive core, but it is not identical:
   adapters are likewise Claude and Codex only
   (`py/agentctl/harness_tui/`). Muse delivery refinements land in the
   Rust edition first.
+- The lower-region recovery for an unparseable composer (#1683) covers
+  the prompt being delivered (`_region_match` and `_flush_region_draft`
+  in `py/agentctl/submission.py`, Claude Code and Codex); recovering
+  any typed draft, and the stale-composer clear, remain Rust-only.
+  The pane-lock hold bound is summed from the phase timeouts in both
+  editions (`SubmitTimeouts::hold_bound`, `hold_bound_seconds`).
 - Its headless workers are a different mechanism — resumable Codex, AGY,
   and Muse structured turns driven per turn (`py/agentctl/foreign/`),
   not the Rust wrapper's persistent Claude process. The user guide's

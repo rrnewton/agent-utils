@@ -328,6 +328,27 @@ pub fn match_region(prompt: &str, screen: &str, config: &BackstopConfig) -> Opti
     Some(RegionMatch { end_row })
 }
 
+/// The visible text of the screen's lower region, up to its last content
+/// row: the rows a stuck paste would sit in, without footer or hint chrome
+/// below a blank or rule row. `None` when the region holds no text.
+///
+/// This is the observation that needs no parseable composer (#1683
+/// pane-lock-held-by-stuck-sender): the stale-composer sweep reads a draft
+/// from it when no harness composer reader recognises the screen, watches
+/// it unchanged, and backs it up verbatim if it has to be cleared.
+pub fn region_text(screen: &str, config: &BackstopConfig) -> Option<String> {
+    let rows = region_rows(screen, config);
+    let last = last_content_row(&rows)?;
+    let mut text: Vec<&str> = rows[..=last].iter().map(|row| row.trim_end()).collect();
+    while text.first().is_some_and(|row| row.trim().is_empty()) {
+        text.remove(0);
+    }
+    if text.iter().all(|row| row.trim().is_empty()) {
+        return None;
+    }
+    Some(text.join("\n"))
+}
+
 /// A fingerprint of the screen's lower region that changes only when its
 /// text does: normalised like a match, with digit runs collapsed to one
 /// digit (a timer or clock ticking) and spinner glyphs removed, so a stuck

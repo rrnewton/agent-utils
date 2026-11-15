@@ -20268,6 +20268,10 @@ fn bounded_detail(value: &str, maximum: usize) -> String {
 // What a refusal to type over the agent's draft says just before it quotes the start of the draft.
 pub(crate) const COMPOSER_PREVIEW_MARKER: &str = "composer already holds unsubmitted text ";
 
+// What a refusal says when the pane shows no recognisable composer at all:
+// the composer may still be occupied, just unparseable (#1683).
+pub(crate) const COMPOSER_UNRECOGNISED_MARKER: &str = "does not show a recognisable ";
+
 /// `detail` with every quoted composer draft replaced by `(text not shown)`. A refusal to type
 /// over text in the agent's composer quotes the start of that text, which is the agent's or a
 /// person's words, so logs and status show the refusal without it. When the quote is missing, or
