@@ -51,6 +51,28 @@ for (const name of ["createVoiceCall", "createVoiceTranscript", "createReadAloud
   });
 }
 
+test("`#1587 autoplay-follow-scroll`: the band is the middle third; only a highlight outside it scrolls, centred; reduced motion jumps; a reader scroll pauses following until the highlight is back in the band or another read starts", () => {
+  const { followBand, followDelta, followBehavior, inFollowBand, createFollowPause } = VIEW_VOICE;
+  const band = followBand(0, 900);
+  assert.deepEqual(band, { top: 300, bottom: 600 });
+  assert.equal(inFollowBand(320, 500, band), true);
+  assert.equal(inFollowBand(100, 200, band), false);
+  assert.equal(followDelta(320, 500, band), 0, "a highlight in the band scrolled");
+  assert.equal(followDelta(700, 760, band), 280, "a highlight below the band was not centred");
+  assert.equal(followDelta(0, 60, band), -420, "a highlight above the band was not centred");
+  assert.equal(followBehavior(false), "smooth");
+  assert.equal(followBehavior(true), "auto");
+  const pause = createFollowPause();
+  pause.noteOwnScroll();
+  pause.noteScroll("m1");
+  assert.equal(pause.paused("m1", false), false, "the follow's own scroll paused following");
+  pause.noteScroll("m1");
+  assert.equal(pause.paused("m1", false), true, "the reader's scroll did not pause following");
+  assert.equal(pause.paused("m1", true), false, "following stayed paused with the highlight back in the band");
+  pause.noteScroll("m1");
+  assert.equal(pause.paused("m2", false), false, "following stayed paused into the next read");
+});
+
 test("`#886 voice-page-autoplay`: off by default and kept; on, a read heard to its end goes on to the next unread row below it in its view, and stops at the end or when halted", async () => {
   const { createAutoplay, AUTOPLAY_WORDS } = VIEW_VOICE;
   const toggle = { attributes: {}, getAttribute(name) { return this.attributes[name] ?? null; }, setAttribute(name, value) { this.attributes[name] = value; } };

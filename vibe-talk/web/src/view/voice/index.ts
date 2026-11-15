@@ -7,6 +7,8 @@ export { createReadingJump } from "./readingjump.ts";
 export type { ReadingJump, ReadingJumpDependencies } from "./readingjump.ts";
 export type { HeldSentence, ReadAloud, ReadAloudDependencies, ScreenBox } from "./read-aloud.ts";
 export { AUTOPLAY_WORDS, createAutoplay } from "./autoplay.ts";
+export { createFollowPause, followBand, followBehavior, followDelta, inFollowBand } from "./followscroll.ts";
+export type { FollowPause } from "./followscroll.ts";
 export type { Autoplay, AutoplayDependencies } from "./autoplay.ts";
 export { mountReadControls } from "./readcontrols.ts";
 export type { ReadControls, ReadControlsDependencies } from "./readcontrols.ts";

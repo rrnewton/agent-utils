@@ -6,6 +6,7 @@ import { cardRootOf, idsOf, rowMessages, rowSeen } from "../../view/channel/inde
 import { browserSpeechFailure } from "../../present/notices/index.ts";
 import { isNoise } from "../../present/rows/index.ts";
 import { childByClass } from "../../view/dom/index.ts";
+import { createFollowPause, followBand, followBehavior, followDelta, inFollowBand } from "./followscroll.ts";
 import type { Message } from "../../contract/index.ts";
 import type { ApiRequestOptions } from "../../core/api/index.ts";
 import type { DeviceSettings, ReadAudioSource } from "../../core/settings/index.ts";
@@ -1960,6 +1961,54 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   let heldSentence: HeldSentence | null = null;
   /** `#821`. What the held words are drawn in (their range, or their block), to find them again at React's press. */
   let heldAnchor: { getBoundingClientRect(): DOMRect } | null = null;
+  /** `#1587 autoplay-follow-scroll`: whether the reader's own scroll has paused following, and the port watched for it. */
+  const followPause = createFollowPause();
+  let followPort: HTMLElement | null = null;
+
+  /**
+   * `#1587 autoplay-follow-scroll`. Keep what is being read in the middle third of the
+   * visible list: called as the sentence light advances and at every block boundary
+   * (a new message under autoplay starts there). The port is `#scroll-area` as laid
+   * out — docked Discuss ends it at the panel's top (`#1526`) — so its rect is the
+   * band's port with no panel math. A scroll of the reader's own pauses following
+   * until the highlight is back in the band or another read starts; the follow's own
+   * scrolls never pause it, and a reader dragging or flicking is never fought
+   * because only highlight advances scroll, never a timer.
+   */
+  function followReading(target: { getBoundingClientRect(): DOMRect } | null) {
+    const playing = nowPlaying;
+    if (!playing || playing.paused || !target) return;
+    let area: HTMLElement | null = null;
+    try { area = deps.el("scroll-area"); } catch (_error) { area = null; }
+    if (!area || typeof area.getBoundingClientRect !== "function") return;
+    if (followPort !== area) {
+      followPort = area;
+      if (typeof area.addEventListener === "function") {
+        area.addEventListener("scroll", () => { if (nowPlaying) followPause.noteScroll(nowPlaying.id); }, { passive: true });
+      }
+    }
+    const port = area.getBoundingClientRect();
+    if (port.bottom <= port.top) return;
+    const band = followBand(port.top, port.bottom);
+    const rect = target.getBoundingClientRect();
+    if (rect.bottom <= rect.top && rect.right <= rect.left) return;
+    if (followPause.paused(playing.id, inFollowBand(rect.top, rect.bottom, band))) return;
+    const delta = followDelta(rect.top, rect.bottom, band);
+    if (delta === 0) return;
+    followPause.noteOwnScroll();
+    // The stylesheet's word on motion, as the column glide reads it (`--column-glide`
+    // on #screen-main): "auto" for a reduced-motion reader, smooth otherwise. The
+    // script never asks the media query itself.
+    let glide = "";
+    try {
+      const main = deps.el("screen-main");
+      const style = typeof getComputedStyle === "function" && main ? getComputedStyle(main) : null;
+      glide = style ? String(style.getPropertyValue("--column-glide")).trim() : "";
+    } catch (_error) { glide = ""; }
+    const behavior = followBehavior(glide === "auto");
+    if (typeof area.scrollBy === "function") area.scrollBy({ top: delta, behavior });
+    else area.scrollTop += delta;
+  }
 
   function sentenceHighlightSupported() {
     return typeof CSS !== "undefined" && CSS !== null && Boolean(CSS.highlights) &&
@@ -2134,6 +2183,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
 
   /** Take the sentence light off, and stop looking for the next one. */
   function clearReadingSentence() {
+    followPause.reset();
     if (sentenceTimer !== null) clearTimeout(sentenceTimer);
     sentenceTimer = null;
     litSentence = "";
@@ -2225,6 +2275,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     litSentenceNodes = lit.map((one) => one!.sentences[0]!.from[0]!);
     litSentenceRange = ranges[0] || null;
     litSentenceText = litSentenceRange ? wordsOf(litSentenceRange.toString()) : "";
+    followReading(litSentenceRange);
   }
 
   /** Text as it reads: each run of spaces one, the ends trimmed. */
@@ -2394,12 +2445,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * the steering strip. Cheap, so it runs at every boundary rather than redrawing the lists.
    */
   function showReadingPosition() {
+    // `#1587`: a block boundary lifts a reader-scroll pause; following resumes here.
+    followPause.lift();
     // `#1330 doc-read-highlight`: a document read's surface is told at the same boundaries.
     showDocumentBlock();
     // `#540 read-aloud-desktop`: in every list a row of the read is drawn in, the cards' list included.
     for (const row of READABLE_LISTS.flatMap(listRows)) {
       const reading = nowPlaying !== null && row.getAttribute("data-id") === nowPlaying!.id;
       if (!reading && row.getAttribute("data-reading-marked") === null) continue;
+      // `#1587`: a new message or block brings its row into the band; the sentence
+      // light refines from there. With no sentence light this is the only follow.
+      if (reading) followReading(row);
       markReadingBlock(row);
       const named = childByClass(row, "msg-author");
       if (named && reading && row.getAttribute("data-reading") === "true") named.textContent = readingLabel();
@@ -3436,6 +3492,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     } else {
       releaseMediaSession();
     }
+    // `#1587`: a read starting (autoplay's next message included) brings its row into
+    // the band — after the redraw above, whose scroll-keeping would otherwise undo it.
+    if (!isDocument) { const row = readingRowsOf(id)[0]; if (row) followReading(row); }
     const begun = startPlayer(first);
     // A jump made while held cues this block up held (`#434 read-aloud-pause`): the hold lands in
     // the same tick the player starts, before a streamed part's cushion or an element's first
