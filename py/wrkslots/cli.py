@@ -1582,6 +1582,11 @@ class ArchiveState:
         compare=False,
         repr=False,
     )
+    quarantined_records: tuple[dict[str, object], ...] = dataclasses.field(
+        default_factory=tuple,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -8631,8 +8636,22 @@ def _active_to_obj(state: ActiveState) -> dict[str, object]:
     }
 
 
+class _ArchiveQuarantine(StateError):
+    """One archived record in a shape this reader does not know (#1582).
+
+    The record is contained in its slot but its exact layout is not one
+    this build was taught; readers quarantine and report it and carry
+    on, while a Git checkout outside its slot still refuses outright.
+    """
+
+
 def _archive_from_obj(
-    config: Config, value: object, selected: str, label_prefix: str
+    config: Config,
+    value: object,
+    selected: str,
+    label_prefix: str,
+    *,
+    quarantine_unknown: bool = True,
 ) -> ArchiveState:
     raw = _as_mapping(value, label_prefix)
     _exact_keys(raw, {"schema", "machine", "revision", "records"}, set(), "archive state")
@@ -8644,25 +8663,44 @@ def _archive_from_obj(
             f"archive state machine mismatch: filename says {selected}, content says {actual_machine}"
         )
     records: list[dict[str, object]] = []
+    quarantined: list[dict[str, object]] = []
     archive_ids: set[str] = set()
     archived_slots: set[str] = set()
     for index, item in enumerate(_as_list(raw["records"], "archive state.records")):
         mapping = _as_mapping(item, f"archive state.records[{index}]")
         label = f"archive state.records[{index}]"
-        _archive_record_from_obj(
-            config,
-            mapping,
-            selected,
-            label,
-            label_prefix,
-            archive_ids,
-            archived_slots,
-        )
+        try:
+            _archive_record_from_obj(
+                config,
+                mapping,
+                selected,
+                label,
+                label_prefix,
+                archive_ids,
+                archived_slots,
+            )
+        except _ArchiveQuarantine as exc:
+            if not quarantine_unknown:
+                raise StateError(str(exc)) from exc
+            quarantined.append(
+                {
+                    "slot": mapping.get("slot")
+                    if isinstance(mapping.get("slot"), str)
+                    else None,
+                    "archive_id": mapping.get("archive_id")
+                    if isinstance(mapping.get("archive_id"), str)
+                    else None,
+                    "reason": str(exc),
+                    "record": dict(mapping),
+                }
+            )
+            continue
         records.append(dict(mapping))
     return ArchiveState(
         machine=actual_machine,
         revision=_as_int(raw["revision"], "archive state.revision"),
         records=tuple(records),
+        quarantined_records=tuple(quarantined),
     )
 
 
@@ -8769,6 +8807,14 @@ def _archive_record_from_obj(
         _as_str(limitation, f"{label}.limitations[{limitation_index}]")
     if not _as_str(mapping["continuation"], f"{label}.continuation"):
         raise StateError(f"{label} has no continuation")
+    for raw_checkout in _as_list(mapping["checkouts"], f"{label}.checkouts"):
+        raw_mapping = _as_mapping(raw_checkout, f"{label}.checkouts")
+        raw_vcs = raw_mapping.get("vcs", "git")
+        if raw_vcs not in ("git", "eden"):
+            raise _ArchiveQuarantine(
+                f"{label} checkout {raw_mapping.get('name')} uses a VCS "
+                f"this reader does not know: {raw_vcs!r}"
+            )
     checkouts = tuple(
         _checkout_from_obj(value, f"{label}.checkouts[{checkout_index}]")
         for checkout_index, value in enumerate(
@@ -8812,6 +8858,20 @@ def _archive_record_from_obj(
             for candidate in candidates
         }
         if checkout.path not in expecteds:
+            candidate_paths = {
+                candidate.relative_to(config.root).as_posix()
+                for candidate in candidates
+            }
+            contained = any(
+                checkout.path == candidate
+                or checkout.path.startswith(candidate + "/")
+                for candidate in candidate_paths
+            )
+            if checkout.vcs != "git" and contained:
+                raise _ArchiveQuarantine(
+                    f"{label} checkout {checkout.name} path uses a layout "
+                    f"this reader does not know: {checkout.path!r}"
+                )
             raise StateError(
                 f"{label} checkout {checkout.name} path escaped its archived slot"
             )
@@ -8874,8 +8934,28 @@ def _archive_to_obj(state: ArchiveState) -> dict[str, object]:
         "schema": SCHEMA,
         "machine": state.machine,
         "revision": state.revision,
-        "records": list(state.records),
+        "records": [
+            *state.records,
+            *(
+                entry["record"]
+                for entry in state.quarantined_records
+                if isinstance(entry.get("record"), dict)
+            ),
+        ],
     }
+
+
+def _quarantined_to_obj(state: ArchiveState) -> list[dict[str, object]]:
+    """Report quarantined archived records without their payloads (#1582)."""
+
+    return [
+        {
+            "slot": entry.get("slot"),
+            "archive_id": entry.get("archive_id"),
+            "reason": entry.get("reason"),
+        }
+        for entry in state.quarantined_records
+    ]
 
 
 def _event_directory(config: Config, machine: str | None = None) -> Path:
@@ -9405,6 +9485,9 @@ class _ReplayFold:
     absent_agent_recoveries: set[tuple[str, int, str]] = dataclasses.field(
         default_factory=set
     )
+    quarantined_records: list[dict[str, object]] = dataclasses.field(
+        default_factory=list
+    )
     # First record for each distinct input of _assert_record_paths, in log order.
     path_checks: dict[tuple[object, ...], ActiveRecord] = dataclasses.field(
         default_factory=dict
@@ -9421,6 +9504,7 @@ class _ReplayFold:
             set(self.archived_slots),
             set(self.absent_validate_recoveries),
             set(self.absent_agent_recoveries),
+            list(self.quarantined_records),
             dict(self.path_checks),
         )
 
@@ -9642,6 +9726,7 @@ def _fold_archive_record_event(
     archived_slots: set[str],
     absent_validate_recoveries: set[tuple[str, int, str]],
     absent_agent_recoveries: set[tuple[str, int, str]],
+    quarantined_records: list[dict[str, object]] | None = None,
 ) -> int:
     """Fold one archive-state-recorded payload into derived state; return its revision.
 
@@ -9700,6 +9785,19 @@ def _fold_archive_record_event(
         machine,
         "append-only derived archive state",
     )
+    if parsed.quarantined_records:
+        if quarantined_records is not None:
+            quarantined_records.extend(parsed.quarantined_records)
+        entry = parsed.quarantined_records[0]
+        qid = entry.get("archive_id")
+        if isinstance(qid, str):
+            if qid in archive_ids:
+                raise StateError(f"duplicate archive_id in append-only events: {qid}")
+            archive_ids.add(qid)
+        if slot in archived_slots:
+            raise StateError(f"duplicate archived slot in append-only events: {slot}")
+        archived_slots.add(slot)
+        return revision
     parsed_record = dict(parsed.records[0])
     archive_id = _as_str(
         parsed_record.get("archive_id"), "append-only archive record archive_id"
@@ -9787,6 +9885,7 @@ def _states_from_events(
     archived_slots = fold.archived_slots
     absent_validate_recoveries = fold.absent_validate_recoveries
     absent_agent_recoveries = fold.absent_agent_recoveries
+    quarantined_records = fold.quarantined_records
     path_checks = fold.path_checks
     for event in events[start:]:
         payload = _as_mapping(event["payload"], "append-only event.payload")
@@ -9821,13 +9920,22 @@ def _states_from_events(
             }
             archive_revision = archive.revision
             archive_records = [dict(record) for record in archive.records]
+            quarantined_records = list(archive.quarantined_records)
             archive_ids = {
                 _as_str(record.get("archive_id"), "archive record archive_id")
                 for record in archive.records
+            } | {
+                _as_str(entry.get("archive_id"), "archive record archive_id")
+                for entry in archive.quarantined_records
+                if isinstance(entry.get("archive_id"), str)
             }
             archived_slots = {
                 _as_str(record.get("slot"), "archive record slot")
                 for record in archive.records
+            } | {
+                _as_str(entry.get("slot"), "archive record slot")
+                for entry in archive.quarantined_records
+                if isinstance(entry.get("slot"), str)
             }
         elif kind == "active-state-recorded":
             if active_revision is None:
@@ -9854,6 +9962,7 @@ def _states_from_events(
                 archived_slots,
                 absent_validate_recoveries,
                 absent_agent_recoveries,
+                quarantined_records,
             )
     if active_revision is None or archive_revision is None:
         raise StateError("append-only event log has no complete imported state")
@@ -9881,6 +9990,7 @@ def _states_from_events(
                 archived_slots,
                 absent_validate_recoveries,
                 absent_agent_recoveries,
+                quarantined_records,
                 path_checks,
             ),
         )
@@ -9892,6 +10002,7 @@ def _states_from_events(
             tuple(archive_records),
             frozenset(absent_validate_recoveries),
             frozenset(absent_agent_recoveries),
+            tuple(quarantined_records),
         ),
     )
 
@@ -9978,6 +10089,7 @@ def _assert_archive_events_replayable(
             candidate = _as_mapping(
                 json.loads(json.dumps(payload)), "append-only archive-record event"
             )
+            candidate_quarantined: list[dict[str, object]] = []
             revision = _fold_archive_record_event(
                 config,
                 machine,
@@ -9988,7 +10100,10 @@ def _assert_archive_events_replayable(
                 archived_slots,
                 validate_recoveries,
                 agent_recoveries,
+                candidate_quarantined,
             )
+            if candidate_quarantined:
+                raise StateError(str(candidate_quarantined[0].get("reason")))
     except _LockBusy:
         raise
     except Refusal as exc:
@@ -53961,6 +54076,7 @@ def _append_archive_once(
         records=(*archive.records, entry),
         absent_validate_recoveries=archive.absent_validate_recoveries,
         absent_agent_recoveries=archive.absent_agent_recoveries,
+        quarantined_records=archive.quarantined_records,
     )
     _write_archive_state(
         config,
@@ -84357,6 +84473,7 @@ def _append_absent_validate_archives(
         },
         state.machine,
         "absent-validation-row derived archive",
+        quarantine_unknown=False,
     )
     recovery_identities = set(state.absent_validate_recoveries)
     recovery_identities.update(
@@ -84367,6 +84484,10 @@ def _append_absent_validate_archives(
         updated,
         absent_validate_recoveries=frozenset(recovery_identities),
         absent_agent_recoveries=state.absent_agent_recoveries,
+        quarantined_records=(
+            *state.quarantined_records,
+            *updated.quarantined_records,
+        ),
     )
     payloads = [
         {

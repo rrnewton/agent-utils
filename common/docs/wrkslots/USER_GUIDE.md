@@ -2292,6 +2292,12 @@ the compatibility snapshots before completion. Every archive keeps the establish
 records physical storage as removed (its disposition at archive time), and states that the validation
 outcome remains unknown. Rerunning the same command or plain `wrkslots recover --coordinator-pid
 PID` resumes safely. Do not infer a validation result or run number from this registry repair.
+
+Archive readers tolerate newer record shapes (#1582): an archived record whose checkout is
+contained in its slot but uses a VCS or layout this build does not know is quarantined and
+reported (`quarantined_records`), and the rest of the archive still loads. A Git checkout
+outside its slot still refuses the load by name. Archive writers must not emit a new record
+shape until the reader-side acceptance has shipped.
 Cross-user process evidence uses passwordless `sudo -n` with fixed root-owned `find` and `grep`
 binaries and refuses if that read-only census is unavailable or incomplete. Use `--format json` when
 another tool needs the typed per-row outcome.

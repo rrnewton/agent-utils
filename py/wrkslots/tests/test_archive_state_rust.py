@@ -90,7 +90,9 @@ def _archive(*records: dict[str, object]) -> dict[str, object]:
 def _expected(root: Path) -> dict[str, object]:
     config = wrkslots_cli._load_config(str(root), None)
     state = wrkslots_cli._load_archive_snapshot(config)
-    return wrkslots_cli._archive_to_obj(state)
+    expected = wrkslots_cli._archive_to_obj(state)
+    expected["quarantined_records"] = wrkslots_cli._quarantined_to_obj(state)
+    return expected
 
 
 def _rust(root: Path) -> subprocess.CompletedProcess[str]:
@@ -178,6 +180,38 @@ def _eden_record() -> dict[str, object]:
     return record
 
 
+def test_parse_archive_quarantines_an_unknown_vcs_record(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    unknown = _record("slot-unknown", "agent-unknown")
+    cast(list[dict[str, object]], unknown["checkouts"])[0]["vcs"] = "fossil"
+    cast(list[dict[str, object]], unknown["checkouts"])[0]["path"] = (
+        "worktrees/slot-unknown/repo"
+    )
+    _write_archive(root, _archive(_record("slot-a", "agent-a"), unknown))
+    config = wrkslots_cli._load_config(str(root), None)
+    state = wrkslots_cli._load_archive_snapshot(config)
+    assert [row["slot"] for row in state.records] == ["slot-a"]
+    assert [row["slot"] for row in state.quarantined_records] == ["slot-unknown"]
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+
+
+def test_parse_archive_still_refuses_a_git_escape(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    escaped = _record("slot-a", "agent-a")
+    cast(list[dict[str, object]], escaped["checkouts"])[0]["path"] = (
+        "worktrees/elsewhere/repo"
+    )
+    _write_archive(root, _archive(escaped, _record("slot-b", "agent-b")))
+    with pytest.raises(Exception) as caught:
+        _expected(root)
+    assert "path escaped its archived slot" in str(caught.value)
+    result = _rust(root)
+    assert result.returncode == 1
+    assert "path escaped its archived slot" in result.stderr
+
+
 def test_parse_archive_matches_python_with_an_eden_record(tmp_path: Path) -> None:
     root = _root(tmp_path)
     config_path = root / ".wrkslots.yml"
@@ -186,7 +220,14 @@ def test_parse_archive_matches_python_with_an_eden_record(tmp_path: Path) -> Non
             "heartbeat_ttl_seconds: 60\n", "layout: flat\nheartbeat_ttl_seconds: 60\n"
         )
     )
-    archive = _archive(_eden_record())
+    exact = _eden_record()
+    exact["slot"] = "edenimg-t1"
+    exact["agent"] = "muse-edenimg"
+    exact["archive_id"] = f"node-a:edenimg-t1:1:{FINISHED}"
+    cast(list[dict[str, object]], exact["checkouts"])[0]["path"] = (
+        "worktrees/validate/edenimg-t1/checkout"
+    )
+    archive = _archive(_eden_record(), exact)
     _write_archive(root, archive)
     # Flat layout keeps its control files beside worktrees/, not inside.
     (root / "ARCHIVED.node-a.json").write_text(json.dumps(archive))

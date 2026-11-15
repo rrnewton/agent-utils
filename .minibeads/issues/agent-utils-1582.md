@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-archive-forward-compat: old readers must tolerate newer archive shapes'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -66,3 +66,13 @@ Proposed rule, both halves:
 Related: #1183 (archived rows keep created paths), the Eden
 absent-row disposal that first emitted the shape, #1568 report
 cross-version section.
+
+## Resolution
+
+[watermelon-full-preview] Reader-side tolerance landed (mu-archivefix): both archive
+validators quarantine one contained record in a shape they do not know (unknown VCS, or a
+non-Git checkout at a contained but unknown layout) and report it as `quarantined_records`;
+the rest of the archive loads. A Git checkout outside its slot still refuses by name.
+Writers stay strict (a candidate the reader would quarantine refuses before append).
+Exact edenimg-t1 shape replay verified in Python and Rust; differential covers quarantine
+and escape. Writers-wait rule recorded in the user guide.

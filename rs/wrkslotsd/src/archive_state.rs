@@ -50,9 +50,11 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
         ));
     }
     let mut records: Vec<Value> = Vec::new();
+    let mut quarantined: Vec<Value> = Vec::new();
+    let mut quarantined_raw: Vec<Value> = Vec::new();
     let mut archive_ids: Vec<String> = Vec::new();
     let mut archived_slots: Vec<String> = Vec::new();
-    for (index, item) in as_list(&raw["records"], "archive state.records")?
+    'records: for (index, item) in as_list(&raw["records"], "archive state.records")?
         .iter()
         .enumerate()
     {
@@ -178,6 +180,22 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
         if as_str(&mapping["continuation"], &format!("{label}.continuation"))?.is_empty() {
             return Err(format!("{label} has no continuation"));
         }
+        for raw_checkout in as_list(&mapping["checkouts"], &format!("{label}.checkouts"))? {
+            let raw_map = as_mapping(raw_checkout, &format!("{label}.checkouts"))?;
+            let raw_vcs = raw_map.get("vcs").and_then(Value::as_str).unwrap_or("git");
+            if raw_vcs != "git" && raw_vcs != "eden" {
+                quarantined.push(json!({
+                    "slot": slot,
+                    "archive_id": archive_id,
+                    "reason": format!(
+                        "{label} checkout {} uses a VCS this reader does not know: '{raw_vcs}'",
+                        raw_map.get("name").and_then(Value::as_str).unwrap_or("")
+                    ),
+                }));
+                quarantined_raw.push(item.clone());
+                continue 'records;
+            }
+        }
         let mut checkouts = Vec::new();
         for (checkout_index, item) in as_list(&mapping["checkouts"], &format!("{label}.checkouts"))?
             .iter()
@@ -225,7 +243,7 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
             let slot_path = slot_directory(cfg, &slot, &slot_type)?;
             let alt_slot_path = cfg.worktrees.join("validate").join(&slot);
             let mut expecteds = Vec::new();
-            for candidate in [slot_path, alt_slot_path] {
+            for candidate in [slot_path.clone(), alt_slot_path.clone()] {
                 // Eden mounts live at <slot>/checkout; pre-fix rows
                 // recorded the legacy form too, and both stay valid.
                 if checkout.vcs == "eden" {
@@ -239,6 +257,22 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
                 expecteds.push(posix_relative(&cfg.root, &destination)?);
             }
             if !expecteds.iter().any(|expected| &checkout.path == expected) {
+                let contained = [slot_path.clone(), alt_slot_path.clone()].iter().any(|candidate| {
+                    let rel = posix_relative(&cfg.root, candidate).unwrap_or_default();
+                    checkout.path == rel || checkout.path.starts_with(&format!("{rel}/"))
+                });
+                if checkout.vcs != "git" && contained {
+                    quarantined.push(json!({
+                        "slot": slot,
+                        "archive_id": archive_id,
+                        "reason": format!(
+                            "{label} checkout {} path uses a layout this reader does not know: '{}'",
+                            checkout.name, checkout.path
+                        ),
+                    }));
+                    quarantined_raw.push(item.clone());
+                    continue 'records;
+                }
                 return Err(format!(
                     "{label} checkout {} path escaped its archived slot",
                     checkout.name
@@ -254,11 +288,14 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
         records.push(item.clone());
     }
     let revision = as_int(&raw["revision"], "archive state.revision", 0)?;
+    let mut all_records = records;
+    all_records.extend(quarantined_raw);
     Ok(json!({
         "schema": SCHEMA,
         "machine": actual_machine,
         "revision": revision,
-        "records": records,
+        "records": all_records,
+        "quarantined_records": quarantined,
     }))
 }
 
