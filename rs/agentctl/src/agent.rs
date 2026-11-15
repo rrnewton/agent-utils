@@ -1945,14 +1945,21 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         Some(bounded) => bounded,
         None => runtime,
     };
-    // A lock wait this drain gives up on — its lock bound passed, or
-    // its runtime was cancelled — has typed nothing, and every prompt
-    // it might have typed is durable in this queue: that is Pending,
-    // whichever of the drain's locks the wait was for. Passing a
-    // cancelled wait through as an untyped delivery error instead
-    // would make the same unsubmitted state report differently
-    // depending on which lock happened to be contended.
+    // Whether this drain has begun typing a prompt yet. A lock wait
+    // given up on before that — its lock bound passed, or its
+    // runtime was cancelled — has typed nothing, and every prompt
+    // it might have typed is durable in this queue: that is
+    // Pending, whichever of the drain's locks the wait was for.
+    // Passing such a wait through as an untyped delivery error
+    // instead would make the same unsubmitted state report
+    // differently depending on which lock happened to be contended.
+    // Once typing may have happened, the error stands as it is: a
+    // typed prompt reported pending could be typed again.
+    let typing_started = std::cell::Cell::new(false);
     let lock_limit = |error: AgentError| {
+        if typing_started.get() {
+            return error;
+        }
         if runtime.cancelled() {
             return AgentError::Pending(UndeliveredMessage {
                 message: format!(
@@ -2491,6 +2498,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                         // Typing runs without the queue lock (#1480); the
                         // members are claimed in `inflight/` under fresh claims.
                         drop(queue_lock);
+                        typing_started.set(true);
                         let outcome = deliver_one(
                             client,
                             &info,
@@ -2796,6 +2804,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             // Typing runs without the queue lock (#1480); the item is claimed
             // in `inflight/` under its claim lock.
             drop(queue_lock);
+            typing_started.set(true);
             let outcome = deliver_one(
                 client,
                 &info,
