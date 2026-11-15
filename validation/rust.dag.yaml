@@ -142,6 +142,19 @@ steps:
     hint: *rust_test_hint
 
   - group: chat-subscription
+    job: discord
+    desc: chat-subscription Discord provider Rust tests (fake transport, no network)
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p chat-subscription-discord ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-agentctl]
+    timeout: 9600
+    cpu_timeout: 1200
+    hint: *rust_test_hint
+
+  - group: chat-subscription
     job: slack
     desc: chat-subscription Slack provider Rust tests
     cmd: >-

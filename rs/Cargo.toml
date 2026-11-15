@@ -16,6 +16,7 @@ members = [
     "chat-subscription-plugin",
     "chat-subscription-fake",
     "chat-subscription-slack",
+    "chat-subscription-discord",
     "wrkslotsd",
     "wrkviz",
     "gh-paced",

@@ -230,6 +230,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-subscription-discord"
+version = "0.1.0"
+dependencies = [
+ "chat-subscription",
+ "chat-subscription-plugin",
+ "serde_json",
+]
+
+[[package]]
 name = "chat-subscription-fake"
 version = "0.1.0"
 dependencies = [
