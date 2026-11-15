@@ -1997,7 +1997,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         }, { passive: true });
       }
     }
-    const port = area.getBoundingClientRect();
+    const rect0 = area.getBoundingClientRect();
+    // The client box, as the jump-to-reading centre is measured: the border box
+    // would centre a few pixels off where scrollIntoView puts a row.
+    const port = { top: rect0.top + (area.clientTop || 0), bottom: rect0.top + (area.clientTop || 0) + area.clientHeight };
     if (port.bottom <= port.top) return;
     const band = followBand(port.top, port.bottom);
     const rect = target.getBoundingClientRect();
@@ -2295,7 +2298,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (followRow && litSentenceRange) {
       let area: HTMLElement | null = null;
       try { area = deps.el("scroll-area"); } catch (_error) { area = null; }
-      const portH = area && typeof area.getBoundingClientRect === "function" ? area.getBoundingClientRect().bottom - area.getBoundingClientRect().top : 0;
+      const portH = area ? area.clientHeight : 0;
       const rowRect = followRow.getBoundingClientRect();
       followReading(portH > 0 && rowRect.bottom - rowRect.top > portH ? litSentenceRange : followRow, 24);
     }
