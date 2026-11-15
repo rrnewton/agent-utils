@@ -229,12 +229,16 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
   /**
    * `ios-keyboard-send`. Stand a Send where the reader can always reach it: in the corner above
    * the keyboard, like the new-line key (`#575`), for whichever sending box holds the focus —
-   * but only while that box's own Send stands outside the visual viewport, under the keyboard
-   * or above its pan, so the two never stand together. Its foot is the keyboard's top, counted
-   * from the visual viewport (`offsetTop + height`, `#610`) up from the layout viewport's foot,
-   * and said again on every measure, which the viewport's own resize and scroll already ask
-   * for: as Safari pans and the keyboard changes size the Send follows it. No keyboard, no
-   * sending box, or the row's Send already on screen, and it stands down.
+   * but only while no part of that box's own Send stands in the visual viewport, under the
+   * keyboard or above its pan, so the two never stand together (`#1680
+   * inline-reply-keyboard-clutter`: the reply in the stream is never fitted, so its row can
+   * straddle the keyboard's top, half on screen; a fully-inside test stood the corner Send
+   * over that visible half, and the owner saw two Sends overlapping). Its foot is the
+   * keyboard's top, counted from the visual viewport (`offsetTop + height`, `#610`) up from
+   * the layout viewport's foot, and said again on every measure, which the viewport's own
+   * resize and scroll already ask for: as Safari pans and the keyboard changes size the Send
+   * follows it. No keyboard, no sending box, or any part of the row's Send on screen, and it
+   * stands down: the focused field's own row is the one Send.
    */
   function renderCornerSend(shown: boolean, field: Element | null, viewport: Viewport | null): void {
     const button = typeof deps.cornerSend === "function" ? deps.cornerSend() : null;
@@ -252,7 +256,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
         const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0)
           : deps.innerHeight() || 0;
         const viewTop = viewport ? Number(viewport.offsetTop) || 0 : 0;
-        const onScreen = rect.bottom > rect.top && rect.bottom <= keysTop + 1 && rect.top >= viewTop - 1;
+        const onScreen = rect.bottom > rect.top && rect.bottom > viewTop && rect.top < keysTop;
         show = !onScreen;
       } else show = true;
       if (show) {
@@ -457,6 +461,12 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     noteKeyboardReader,
     settleOnScroll() {
       if (onScreenKeyboard.settling && onScreenKeyboard.fitted) settleKeyboardFit(onScreenKeyboard.fitted);
+      // `#1680 inline-reply-keyboard-clutter`. The browser's own reveal scroll, which shows
+      // the focused box as the keyboard comes up, moves the row's Send after the measure
+      // that stood the corner Send: say again which Send stands, from where the row now is.
+      if (onScreenKeyboard.cornerField) {
+        renderCornerSend(onScreenKeyboard.shown, deps.activeElement(), deps.viewport());
+      }
     },
     noteComposerInput(field) {
       if (onScreenKeyboard.fitted !== field || onScreenKeyboard.inputDue) return;

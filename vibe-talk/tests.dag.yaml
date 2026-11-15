@@ -2501,6 +2501,28 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1680 inline-reply-keyboard-clutter` in the browser engine, at 393x852 by touch with the
+  # on-screen keyboard simulated as Chrome on Android lays it out (the viewport 336px shorter)
+  # and at 1280x800 with a mouse: replying, exactly one Send stands (the reply's own, never
+  # overlapped by the Send at the keyboard's top), the floating jump chips stand down with
+  # Undo kept at the top, the reply's row is compact on one line with its helper text away,
+  # and the keyboard going down brings the chips and the text back; in the main composer the
+  # corner Send alone stands over the keys; on a desk none of it applies.
+  - group: check
+    job: reply-keyboard-clutter-browser
+    desc: one Send only, no floating chips and a compact reply row while the keyboard is up, all back as it goes, in current Chromium at 393x852 by touch and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/reply_keyboard_clutter_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#300 reply-marks-read` in the browser engine, at 1280x800 in two columns with a mouse and the keys:
   # Reply docked in the left column on a Main message and in the right on a thread's reply, sent with
   # Enter, each marks the message it answers Done on the server, asks the provider to mark it

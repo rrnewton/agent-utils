@@ -840,6 +840,47 @@ test("ios-keyboard-send: a Send stands at the keyboard's top while the row's own
   assert.equal(corner.hidden, true, "the corner Send outlived the keyboard");
 });
 
+test("inline-reply-keyboard-clutter: no corner Send over a reply Send already half on screen", () => {
+  const { createOnScreenKeyboard } = VIEW_COMPOSER;
+  const root = { clientWidth: 390, clientHeight: 844, setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };
+  const corner = { id: "keyboard-send", hidden: true, style: {} };
+  // The reply's Send, straddling the keyboard's top at 460: its upper half on screen, its
+  // lower half under the keys. The reply in the stream is never fitted, so this is where it
+  // rests while its box is written in (`#1680`, the owner's screenshot).
+  let sendRect = { top: 430, bottom: 474 };
+  let pressed = 0;
+  const normal = { id: "reply-send", disabled: false, getBoundingClientRect: () => sendRect, click() { pressed += 1; } };
+  const field = { tagName: "TEXTAREA", id: "reply-text", type: "textarea", isContentEditable: false, getClientRects: () => [{}] };
+  const els = { "read-speed-box": { id: "read-speed-box" }, "speed-popover": { hidden: true },
+    "keyboard-debug": { checked: false }, "keyboard-debug-readout": { hidden: true, style: {} } };
+  const keyboard = createOnScreenKeyboard({
+    clock: { setTimeout: () => 0, clearTimeout: () => {} },
+    lookup: (id) => els[id] || { id, getClientRects: () => [] }, el: (id) => els[id],
+    viewport: () => ({ height: 460, scale: 1, offsetTop: 0 }), innerHeight: () => 844, scrollY: () => 0, root: () => root,
+    activeElement: () => field, virtualKeyboard: () => undefined, computedStyle: () => null,
+    closeSpeedPopover: () => {}, nudge: () => {}, toFoot: () => {},
+    cornerSend: () => corner,
+    normalSend: () => normal,
+  });
+  keyboard.noteKeyboard();
+  assert.equal(corner.hidden, true, "a second Send stood over the reply's Send, half of it already on screen");
+  assert.equal(keyboard.pressCornerSend(), false, "a hidden corner Send still sent the reply");
+  assert.equal(pressed, 0);
+  // Scrolled wholly under the keyboard, the reply's Send is the corner Send's to press.
+  sendRect = { top: 700, bottom: 744 };
+  keyboard.noteKeyboard();
+  assert.equal(corner.hidden, false, "no Send stood above the keyboard with the reply's own wholly under it");
+  assert.equal(keyboard.pressCornerSend(), true, "the corner Send did not press the reply's own Send");
+  assert.equal(pressed, 1);
+  // The browser's reveal scroll then brings the reply's Send up under it: the corner Send
+  // stands down on the scroll itself, with no new measure of the keyboard.
+  sendRect = { top: 400, bottom: 444 };
+  keyboard.settleOnScroll();
+  assert.equal(corner.hidden, true, "the corner Send stood on over the reply's Send the reveal scroll brought up");
+  assert.equal(keyboard.pressCornerSend(), false);
+  assert.equal(pressed, 1);
+});
+
 test("ios-keyboard-send: the call's box gets no corner Send, its own standing in the dock over the keyboard", () => {
   const { createOnScreenKeyboard } = VIEW_COMPOSER;
   const root = { clientWidth: 390, clientHeight: 844, setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };

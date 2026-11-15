@@ -465,6 +465,49 @@
     grid-row: 2;
     grid-column: 1 / -1;
   }
+
+  /* `#1680 inline-reply-keyboard-clutter`. No floating chips over the form while the keyboard
+     is up: the jump chips (to the newest, to the bookmark, to the unread, to the reading), the
+     Draft chip and Back to reply stand down, and the chips row moves to the top of the list,
+     where the three Undo chips (a dismissal, a dismissed send, a removed bookmark) stay
+     reachable without covering the box being written in or its row. The chips' own hidden
+     state is untouched, so the whole row stands again at the list's foot, exactly as it was
+     drawn, the moment the keyboard goes down or the field loses the focus. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #scroll-tools {
+    bottom: auto;
+    top: 0.35rem;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #scroll-tools > :is(#jump-newest, #jump-bookmark, #jump-unread, #jump-reading, #draft-chip, #back-to-reply) {
+    display: none;
+  }
+
+  /* `#1680`. The reply in the stream, compact while it is being written: no helper text, and
+     one line holding Post to main as a small toggle at its start and Cancel and Send reply at
+     its end. The destination line and the target's id come back with the keyboard down; a
+     state line with something to say (a send that failed) still shows. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose #reply-target-meta,
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose #reply-destination {
+    display: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose #reply-state:empty {
+    display: none;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose .reply-actions {
+    flex-wrap: nowrap;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose #reply-to-main-row {
+    margin-inline-end: auto;
+    font-size: 0.8rem;
+    white-space: nowrap;
+  }
+
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose .reply-actions > button {
+    white-space: nowrap;
+  }
 }
 
 /* The caveat that used to be a paragraph in the transcript: one clause, attached to the action it
