@@ -463,6 +463,7 @@ impl Harness {
     /// What naming needs, reading through the counting client.
     fn deps(&self) -> ThreadDeps {
         ThreadDeps {
+            cache: None,
             chat: self.counting.clone(),
             ..ThreadDeps::from_state(&self.state)
         }
@@ -1088,6 +1089,7 @@ async fn the_queues_together_hold_at_most_the_global_cap() {
     let h = harness();
     let names = Arc::new(ThreadNames::new());
     let deps = ThreadDeps {
+        cache: None,
         chat: h.counting.clone(),
         ..ThreadDeps::from_state(&h.state)
     };

@@ -283,6 +283,7 @@ impl ChatClient for Plain {
 /// What naming needs, reading through `chat`.
 fn deps(chat: Arc<dyn ChatClient>, summarizer: Arc<FakeSummarizer>) -> ThreadDeps {
     ThreadDeps {
+        cache: None,
         chat,
         store: Arc::new(FakeStore::new()),
         summarizer,
@@ -1334,4 +1335,79 @@ async fn reading_twenty_slack_threads_reads_each_once_instead_of_twice() {
             ]
         );
     }
+}
+
+/// The cache as naming sees it in these tests: the thread whole, as `Plain` holds it.
+struct HeldCache(Arc<Plain>);
+
+#[async_trait]
+impl vibe_talk::summarize::threads::ThreadCache for HeldCache {
+    async fn whole(
+        &self,
+        channel: &ChannelId,
+        snapshot: &ThreadSummary,
+    ) -> Option<Vec<Message>> {
+        self.0.read(channel, &snapshot.id, 50).ok().map(|page| page.messages)
+    }
+}
+
+fn deps_cached(
+    chat: Arc<dyn ChatClient>,
+    summarizer: Arc<FakeSummarizer>,
+    plain: &Arc<Plain>,
+) -> ThreadDeps {
+    ThreadDeps {
+        cache: Some(Arc::new(HeldCache(Arc::clone(plain)))),
+        ..deps(chat, summarizer)
+    }
+}
+
+/// `#1563`: a thread the cache proves whole is named with no upstream read at all.
+#[tokio::test(start_paused = true)]
+async fn a_thread_held_whole_is_named_from_the_cache_with_no_upstream_read() {
+    let plain = Arc::new(Plain::default());
+    let summarizer = Arc::new(FakeSummarizer::naming_threads());
+    let deps = deps_cached(
+        Arc::clone(&plain) as Arc<dyn ChatClient>,
+        Arc::clone(&summarizer),
+        &plain,
+    );
+    let names = Arc::new(ThreadNames::new());
+    let chan = channel("F0000000006");
+    plain.seed(&chan, "f", &[3]);
+    list(&names, &deps, &plain, &chan, true).await;
+    settle(&names, 1).await;
+    assert_eq!(plain.take(), Vec::<String>::new(), "naming read upstream for a held thread");
+    let shown = list(&names, &deps, &plain, &chan, false).await;
+    assert!(shown.threads.iter().all(|thread| thread.display_name.is_some()),
+        "the held thread was not named: {:?}", shown.threads);
+}
+
+/// `#1563`: a channel paused for upstream still names its held threads from the cache.
+#[tokio::test(start_paused = true)]
+async fn a_paused_channel_still_names_from_the_cache() {
+    let plain = Arc::new(Plain::default());
+    let summarizer = Arc::new(FakeSummarizer::naming_threads());
+    let upstream_deps = deps(
+        Arc::clone(&plain) as Arc<dyn ChatClient>,
+        Arc::clone(&summarizer),
+    );
+    let names = Arc::new(ThreadNames::new());
+    let chan = channel("G0000000007");
+    plain.seed(&chan, "g", &[3]);
+    plain.fail("g00");
+    list(&names, &upstream_deps, &plain, &chan, true).await;
+    settle(&names, 0).await;
+    assert_eq!(plain.take().len(), 1, "the failing read did not happen");
+    assert_eq!(names.health_counts().paused_channels, 1, "the channel is not paused");
+    // A held thread falls due in the paused channel: the cache names it, upstream untouched.
+    let cached_deps = deps_cached(
+        Arc::clone(&plain) as Arc<dyn ChatClient>,
+        Arc::clone(&summarizer),
+        &plain,
+    );
+    plain.seed(&chan, "g", &[3, 3]);
+    list(&names, &cached_deps, &plain, &chan, true).await;
+    settle(&names, 1).await;
+    assert_eq!(plain.take(), Vec::<String>::new(), "the paused channel was read upstream");
 }

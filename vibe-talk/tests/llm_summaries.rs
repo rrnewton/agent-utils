@@ -1250,6 +1250,7 @@ async fn an_active_thread_keeps_its_sentence_row_alive_with_its_name() {
         vibe_talk::store::sqlite::SqliteStore::open(&file, Default::default()).expect("open"),
     );
     let deps = ThreadDeps {
+        cache: None,
         store: store.clone(),
         ..ThreadDeps::from_state(&h.state)
     };

@@ -477,6 +477,8 @@ fn now_seconds() -> i64 {
 pub struct ThreadDeps {
     /// Where the thread's messages are read from.
     pub chat: Arc<dyn ChatClient>,
+    /// The server's own message copy, for naming from what is already held (`#1563`).
+    pub cache: Option<Arc<dyn ThreadCache>>,
     /// Where records are filed.
     pub store: Arc<dyn StateStore>,
     /// Who names the thread.
@@ -493,6 +495,7 @@ impl ThreadDeps {
     pub fn from_state(state: &crate::state::AppState) -> Self {
         Self {
             chat: Arc::clone(&state.chat),
+            cache: Some(Arc::new(SinkThreadCache(Arc::clone(&state.message_cache)))),
             store: Arc::clone(&state.store),
             summarizer: Arc::clone(&state.summarizer),
             version: Arc::clone(&state.summary_version),
@@ -563,6 +566,8 @@ struct ChannelQueue {
     paused_until: Option<Instant>,
     /// Consecutive provider-failure pauses with no successful naming between. `#1564`.
     consecutive_pauses: u64,
+    /// Threads the cache proved it does not hold during this pause (`#1563`).
+    held_misses: HashSet<String>,
     /// The token of the one worker serving this queue, when one is. A worker whose token this no
     /// longer holds stops, and files nothing it was still naming: that is how taking the channel
     /// off the list stops it.
@@ -711,13 +716,20 @@ impl NamesState {
             return None;
         }
         let now = Instant::now();
-        Some(
-            [queue.last_read.map(|at| at + interval), queue.paused_until]
-                .into_iter()
-                .flatten()
-                .max()
-                .unwrap_or(now),
-        )
+        // The pause gates only threads the cache does not hold: a paused channel's
+        // held threads are still taken and named from the cache (`#1563`).
+        let mut ready = queue.last_read.map_or(now, |at| at + interval);
+        if let Some(until) = queue.paused_until.filter(|until| *until > now) {
+            if !queue.waiting.is_empty()
+                && queue
+                    .waiting
+                    .keys()
+                    .all(|thread| queue.held_misses.contains(thread))
+            {
+                ready = ready.max(until);
+            }
+        }
+        Some(ready)
     }
 
     /// Take `channel`'s waiting thread of greatest [`Rank`], and start its read budget now.
@@ -727,13 +739,21 @@ impl NamesState {
         overdue_after: Duration,
     ) -> Option<(String, Waiting)> {
         let queue = self.channels.get_mut(channel)?;
+        // While paused, a thread the cache does not hold is not taken again: it was
+        // already tried this pause, and taking it first for ever would starve the
+        // held threads behind it and spin the worker (`#1563`).
+        let paused = queue
+            .paused_until
+            .is_some_and(|until| until > Instant::now());
         let thread = queue
             .waiting
             .iter()
+            .filter(|(thread, _)| !(paused && queue.held_misses.contains(*thread)))
             .max_by_key(|(_, waiting)| waiting.rank(overdue_after))
             .map(|(thread, _)| thread.clone())?;
         let waiting = queue.waiting.remove(&thread)?;
-        queue.last_read = Some(Instant::now());
+        // The read budget is spent only by an upstream read, in `name_turn`: a thread
+        // named from the cache consumes no interval (`#1563`).
         self.naming.insert(
             (channel.clone(), thread.clone()),
             InFlight {
@@ -791,6 +811,9 @@ impl Drop for WorkerRelease {
 
 /// Why one naming turn did not file a name.
 enum TurnFailure {
+    /// The channel is paused and the cache does not hold this thread: it waits in its
+    /// queue for the pause to end, neither failed nor read (`#1563`).
+    Paused,
     /// The chat provider failed the read: an HTTP 5xx, a read that never completed or took longer
     /// than [`NAMING_READ_TIMEOUT`], or a rate limit the client could not wait out. Pauses the
     /// whole channel for [`CHANNEL_PAUSE`].
@@ -1499,6 +1522,15 @@ impl ThreadNames {
             // The channel was taken off the list while the thread was being named, or the
             // thread is under the summary threshold and its pause is already recorded.
             Ok(None) => return,
+            Err(TurnFailure::Paused) => {
+                state
+                    .channels
+                    .entry(key.0.clone())
+                    .or_default()
+                    .waiting
+                    .insert(key.1.clone(), waiting);
+                return;
+            }
             Err(failure) => failure,
         };
         state
@@ -1517,6 +1549,7 @@ impl ThreadNames {
                 let queue = state.channels.entry(key.0.clone()).or_default();
                 queue.paused_until = Some(Instant::now() + CHANNEL_PAUSE);
                 queue.consecutive_pauses += 1;
+                queue.held_misses.clear();
             }
             TurnFailure::Gone => {
                 tracing::info!("a thread queued for naming no longer exists; it was not named");
@@ -1532,6 +1565,7 @@ impl ThreadNames {
                 retry_after_seconds = RETRY_AFTER_FAILURE.as_secs(),
                 "a thread could not be named"
             ),
+            TurnFailure::Paused => unreachable!("paused threads are requeued above"),
         }
     }
 
@@ -1559,6 +1593,35 @@ impl ThreadNames {
                 .map_err(TurnFailure::Other)?
                 .map(|filed| filed.name),
         };
+        // Cache-first (`#1563`): a proven-whole copy already held names the thread
+        // with no upstream call — no interval spent, no pause triggered or waited out.
+        if let Some(cached) = cached_thread(deps, channel, snapshot).await {
+            return self
+                .name_from(channel, token, waiting, kept, cached, None, false)
+                .await;
+        }
+        // The channel is paused after a provider failure: the upstream read waits it
+        // out, as before; this thread is simply left for a later read to queue again.
+        let paused = self
+            .lock()
+            .channels
+            .get(channel)
+            .and_then(|queue| queue.paused_until)
+            .is_some_and(|until| until > Instant::now());
+        if paused {
+            let mut state = self.lock();
+            state
+                .channels
+                .entry(channel.clone())
+                .or_default()
+                .held_misses
+                .insert(snapshot.id.clone());
+            return Err(TurnFailure::Paused);
+        }
+        {
+            let mut state = self.lock();
+            state.channels.entry(channel.clone()).or_default().last_read = Some(Instant::now());
+        }
         let request = TimelineRequest {
             view: TimelineView::Thread,
             thread_id: Some(snapshot.id.clone()),
@@ -1617,22 +1680,6 @@ impl ThreadNames {
                 in_flight.copy = read_copy.clone();
             }
         }
-        // `#522 thread-card-max-lines`: whether the root is too long for its card, by the root
-        // this read returned where it returned one, else by the copy the page showed.
-        let long_root = {
-            let read_root = page
-                .thread
-                .as_ref()
-                .and_then(|thread| thread.root.as_ref())
-                .or_else(|| {
-                    page.messages.iter().find(|message| {
-                        message.thread.as_ref().is_some_and(|thread| thread.is_root)
-                    })
-                })
-                .or(snapshot.root.as_ref());
-            let max_lines = self.card_max_lines_for(deps, [read_root]).await;
-            root_overflows_card(read_root, max_lines)
-        };
         let mut messages: Vec<Message> = Vec::new();
         if let Some(root) = page.thread.and_then(|thread| thread.root) {
             messages.push(root);
@@ -1642,12 +1689,41 @@ impl ThreadNames {
                 messages.push(message);
             }
         }
+        self.name_from(channel, token, waiting, kept, messages, read_copy, behind)
+            .await
+    }
+
+    /// Ask the model for a name from `messages` (the cache's proven copy or the upstream
+    /// read) and file it; shared by both sources so neither can drift (`#1563`).
+    #[allow(clippy::too_many_arguments)]
+    async fn name_from(
+        &self,
+        channel: &ChannelId,
+        token: u64,
+        waiting: &Waiting,
+        kept: Option<String>,
+        mut messages: Vec<Message>,
+        read_copy: Option<ThreadSummary>,
+        behind: bool,
+    ) -> Result<Option<ThreadRecord>, TurnFailure> {
+        let deps = &waiting.deps;
+        let snapshot = &waiting.snapshot;
         messages.retain(|message| !message.content.trim().is_empty());
         if messages.is_empty() {
             return Err(TurnFailure::Other(SummaryError::Shape(
                 "the thread has no text to name it by".to_owned(),
             )));
         }
+        // `#522 thread-card-max-lines`: whether the root is too long for its card.
+        let long_root = {
+            let read_root = messages
+                .iter()
+                .find(|message| is_root(message))
+                .or_else(|| messages.first())
+                .or(snapshot.root.as_ref());
+            let max_lines = self.card_max_lines_for(deps, [read_root]).await;
+            root_overflows_card(read_root, max_lines)
+        };
         // How many messages the sentence would be filed at, worked out before the model is
         // asked because the summary threshold below turns on it. Never fewer than the most
         // replies a page showed while the thread waited, before the read began: a write-scope
@@ -1766,6 +1842,78 @@ impl ThreadNames {
         }
         Ok(Some(record))
     }
+}
+
+/// Where naming reads a thread the server already holds (`#1563`): the cache's
+/// proven-whole copy at its turn, before any upstream read is considered.
+#[async_trait::async_trait]
+pub trait ThreadCache: Send + Sync {
+    /// The thread whole, root first, when the copy held proves it; `None` otherwise.
+    async fn whole(&self, channel: &ChannelId, snapshot: &ThreadSummary) -> Option<Vec<Message>>;
+}
+
+/// The message cache as a [`ThreadCache`]: `whole_thread`'s coverage and freshness
+/// proof decides, exactly as for a page read.
+struct SinkThreadCache(Arc<crate::cache::Sink>);
+
+#[async_trait::async_trait]
+impl ThreadCache for SinkThreadCache {
+    async fn whole(&self, channel: &ChannelId, snapshot: &ThreadSummary) -> Option<Vec<Message>> {
+        let root = snapshot.root.clone()?;
+        let reply_count = snapshot
+            .reply_count
+            .or_else(|| root.thread.as_ref().and_then(|thread| thread.reply_count))?;
+        let cache = self.0.cache()?;
+        let chan = self.0.chan_key(channel)?;
+        let thread_id = snapshot.id.clone();
+        tokio::task::spawn_blocking(move || {
+            use crate::cache::Scope;
+            let want = usize::try_from(reply_count)
+                .unwrap_or(usize::MAX)
+                .saturating_add(2);
+            let rows = cache
+                .newest(&chan, &Scope::Thread(thread_id.clone()), want)
+                .served()?;
+            let root_row = rows.iter().find(|row| is_root(&row.message))?;
+            let latest = rows
+                .iter()
+                .filter(|row| !is_root(&row.message))
+                .max_by_key(|row| row.created_ms)?
+                .message
+                .id
+                .clone();
+            let says = crate::held_replies::RootSays {
+                thread_id,
+                root_id: root_row.message.id.clone(),
+                root_ms: root_row.created_ms,
+                reply_count,
+                latest_reply: latest,
+            };
+            // `cache::held::HELD_FRESH_MS`: a read begun within fifteen minutes stands.
+            let replies = cache
+                .whole_thread(&chan, &says, 15 * 60 * 1000)
+                .served()??;
+            let mut messages = vec![root];
+            for message in replies {
+                if !messages.iter().any(|kept| kept.id == message.id) {
+                    messages.push(message);
+                }
+            }
+            crate::model::sort_oldest_first(&mut messages);
+            Some(messages)
+        })
+        .await
+        .ok()?
+    }
+}
+
+/// The cache's proven-whole copy of `snapshot`'s thread, root first, when held (`#1563`).
+async fn cached_thread(
+    deps: &ThreadDeps,
+    channel: &ChannelId,
+    snapshot: &ThreadSummary,
+) -> Option<Vec<Message>> {
+    deps.cache.as_ref()?.whole(channel, snapshot).await
 }
 
 /// A thread's last activity as a page gave it, for ordering a queue. One that cannot be read
