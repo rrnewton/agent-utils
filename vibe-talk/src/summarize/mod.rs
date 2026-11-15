@@ -74,6 +74,7 @@ pub mod claude_session;
 pub mod counters;
 pub mod discuss;
 pub mod fake;
+pub mod health;
 pub mod messages_api;
 pub mod meta_gateway;
 pub mod rate_limit;
@@ -411,6 +412,14 @@ pub trait Summarizer: Send + Sync {
         None
     }
 
+    /// Fallback-chain and loud-failure health, when this backend tracks it. `#1564`.
+    ///
+    /// `None` (the default) means this backend keeps no such state; diagnostics then reports
+    /// an empty, healthy surface rather than inventing one.
+    fn summarizer_health(&self) -> Option<health::SummarizerHealthReport> {
+        None
+    }
+
     /// Whether this backend can name threads with [`Summarizer::name_thread`].
     ///
     /// `false` by default, and then nothing asks: a thread list served by a backend that cannot
@@ -733,6 +742,7 @@ mod tests {
             timeout_secs: crate::config::DEFAULT_LLM_TIMEOUT_SECS,
             requests_per_minute: crate::config::DEFAULT_LLM_REQUESTS_PER_MINUTE,
             burst: crate::config::DEFAULT_LLM_BURST,
+            fallback_cooldown_seconds: crate::config::DEFAULT_FALLBACK_COOLDOWN_SECONDS,
         }
     }
 
@@ -1079,7 +1089,7 @@ mod tests {
         // `#1324 per-kind-summarizer-model`: an override changes the EFFECTIVE model of its
         // kind, so it moves the cache key; without one the key is byte-identical to before.
         let overridden = with_llm(|l| {
-            l.models.message = Some("other-model".to_owned());
+            l.models.message = vec!["other-model".to_owned()];
         });
         assert_ne!(
             base,

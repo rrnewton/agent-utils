@@ -5620,3 +5620,28 @@ test("`#249 search-highlight`: with rich headers off the words a header restates
   assert.equal(builtSince(page, made, "mark"), 0, "the switch marked the hits again");
   assert.match(cssBlock(':root[data-rich-headers="off"] .rh-head'), /display: none/);
 });
+
+test("a degraded summariser shows one health banner naming the model in use", async () => {
+  // `#1564`: the warning comes from client-config, names the fallback model, and is the
+  // page's one health surface (no second banner for thread naming).
+  const page = newPage();
+  page.summarizerWarning =
+    "using muse-spark-1.4-internal for message: small-elk-internal failed: gateway refused";
+  await signIn(page);
+  await showDiscord(page, [message({ id: "7000000000000000002", content: longMessage("deploy") })]);
+  const banner = page.el("summarizer-health-banner");
+  assert.equal(banner.hidden, false, "the health banner stayed hidden while degraded");
+  assert.match(
+    page.el("summarizer-health-detail").textContent,
+    /muse-spark-1\.4-internal/,
+    "the banner does not name the model in use",
+  );
+  const healthy = newPage();
+  await signIn(healthy);
+  await showDiscord(healthy, [message({ id: "7000000000000000002", content: longMessage("deploy") })]);
+  assert.equal(
+    healthy.el("summarizer-health-banner").hidden,
+    true,
+    "a healthy server showed the health banner",
+  );
+});

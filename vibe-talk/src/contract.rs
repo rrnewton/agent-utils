@@ -225,6 +225,10 @@ pub struct ClientConfigResponse {
     /// every long row fail one request at a time. Absent means summaries may work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summaries_unavailable: Option<String>,
+    /// Loud summariser-health headline naming the model in use and why, when summaries are
+    /// degraded. `#1564`. Absent when healthy; the page shows it as one persistent banner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarizer_warning: Option<String>,
     /// Whether this server names threads and sums them up. `#528 thread-card-markdown-and-cap`.
     ///
     /// The page reads it as "a summary is coming": a thread whose first message is too long for

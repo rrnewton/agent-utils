@@ -887,7 +887,7 @@ impl LlmDialect {
 /// per-message lines a catch-up is built from) and `side_agent` (the catch-up side agent)
 /// are read from the same `[summaries.llm.models]` table by the catch-up consumers, so one
 /// deployment names every kind's model in one place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SummaryKind {
     /// One message summary.
     Message,
@@ -920,32 +920,41 @@ impl SummaryKind {
     }
 }
 
-/// Per-kind model overrides from `[summaries.llm.models]`. `#1324 per-kind-summarizer-model`.
+/// Per-kind model overrides from `[summaries.llm.models]`. `#1324 per-kind-summarizer-model`,
+/// `#1564 summarizer-loud-failure-and-fallback-chain`.
 ///
-/// Each absent kind falls back to [`LlmConfig::model`], so a section without the table
-/// means exactly what it always meant.
+/// Each value is an ordered FALLBACK CHAIN: a single string is a one-element chain, and
+/// `["small-elk-internal", "muse-spark-1.4-internal"]` tries the first and falls back to
+/// the next on failure. Each absent kind falls back to [`LlmConfig::model`], so a section
+/// without the table means exactly what it always meant.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KindModels {
-    /// Model for [`SummaryKind::Message`].
-    pub message: Option<String>,
-    /// Model for [`SummaryKind::ThreadName`].
-    pub thread_name: Option<String>,
-    /// Model for [`SummaryKind::Digest`].
-    pub digest: Option<String>,
-    /// Model for [`SummaryKind::SideAgent`].
-    pub side_agent: Option<String>,
+    /// Chain for [`SummaryKind::Message`]; empty means no override.
+    pub message: Vec<String>,
+    /// Chain for [`SummaryKind::ThreadName`]; empty means no override.
+    pub thread_name: Vec<String>,
+    /// Chain for [`SummaryKind::Digest`]; empty means no override.
+    pub digest: Vec<String>,
+    /// Chain for [`SummaryKind::SideAgent`]; empty means no override.
+    pub side_agent: Vec<String>,
 }
 
 impl KindModels {
-    /// The override named for `kind`, if any.
+    /// The override chain named for `kind` (empty when absent).
+    #[must_use]
+    pub fn chain(&self, kind: SummaryKind) -> &[String] {
+        match kind {
+            SummaryKind::Message => &self.message,
+            SummaryKind::ThreadName => &self.thread_name,
+            SummaryKind::Digest => &self.digest,
+            SummaryKind::SideAgent => &self.side_agent,
+        }
+    }
+
+    /// The primary override named for `kind`, if any.
     #[must_use]
     pub fn get(&self, kind: SummaryKind) -> Option<&str> {
-        match kind {
-            SummaryKind::Message => self.message.as_deref(),
-            SummaryKind::ThreadName => self.thread_name.as_deref(),
-            SummaryKind::Digest => self.digest.as_deref(),
-            SummaryKind::SideAgent => self.side_agent.as_deref(),
-        }
+        self.chain(kind).first().map(String::as_str)
     }
 
     /// Whether any kind names its own model.
@@ -953,7 +962,7 @@ impl KindModels {
     pub fn any(&self) -> bool {
         SummaryKind::ALL
             .iter()
-            .any(|kind| self.get(*kind).is_some())
+            .any(|kind| !self.chain(*kind).is_empty())
     }
 }
 
@@ -1035,18 +1044,41 @@ pub struct LlmConfig {
     pub requests_per_minute: u32,
     /// How many calls may go out back to back before the per-minute pace applies.
     pub burst: u32,
+    /// How long a failed chain model is skipped before it is retried, in seconds.
+    /// `#1564 summarizer-loud-failure-and-fallback-chain`.
+    pub fallback_cooldown_seconds: u64,
 }
 
+/// Default cool-down for a failed fallback-chain model, in seconds. `#1564`.
+pub const DEFAULT_FALLBACK_COOLDOWN_SECONDS: u64 = 300;
+
 impl LlmConfig {
-    /// The model to ask for `kind`: its `[summaries.llm.models]` override, else `model`.
+    /// The model to ask first for `kind`: its `[summaries.llm.models]` primary, else `model`.
     /// `#1324 per-kind-summarizer-model`.
     #[must_use]
     pub fn model_for(&self, kind: SummaryKind) -> &str {
         self.models.get(kind).unwrap_or(&self.model)
     }
 
+    /// The ordered fallback chain for `kind`: its override chain, else `[model]`.
+    /// `#1564 summarizer-loud-failure-and-fallback-chain`.
+    #[must_use]
+    pub fn chain_for(&self, kind: SummaryKind) -> Vec<String> {
+        let chain = self.models.chain(kind);
+        if chain.is_empty() {
+            vec![self.model.clone()]
+        } else {
+            chain.to_vec()
+        }
+    }
+
     /// The per-kind models as one cache-key segment, or `None` when no kind is overridden
     /// (so a section without `[summaries.llm.models]` keeps its existing cache keys).
+    ///
+    /// `#1564`: the segment renders the CONFIGURED chain (`message=a>b`), never the runtime
+    /// active model, so a fallback switch keeps every cached summary reachable; only editing
+    /// the chain in configuration changes the version. A one-element chain renders as
+    /// `message=a`, byte-identical to the pre-chain form.
     #[must_use]
     pub fn models_segment(&self) -> Option<String> {
         if !self.models.any() {
@@ -1055,7 +1087,7 @@ impl LlmConfig {
         Some(
             SummaryKind::ALL
                 .iter()
-                .map(|kind| format!("{}={}", kind.as_str(), self.model_for(*kind)))
+                .map(|kind| format!("{}={}", kind.as_str(), self.chain_for(*kind).join(">")))
                 .collect::<Vec<_>>()
                 .join("|"),
         )
@@ -2177,6 +2209,7 @@ struct FileLlm {
     timeout_secs: Option<u64>,
     requests_per_minute: Option<u32>,
     burst: Option<u32>,
+    fallback_cooldown_seconds: Option<u64>,
     /// Declared only to be REFUSED by name: a secret does not belong inline. Typed as a raw value
     /// so the refusal never has to parse, hold or print it.
     api_key: Option<toml::Value>,
@@ -2184,14 +2217,22 @@ struct FileLlm {
     bearer_token: Option<toml::Value>,
 }
 
+/// One `[summaries.llm.models]` value as written: a name or an ordered chain. `#1564`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum FileChain {
+    One(String),
+    Many(Vec<String>),
+}
+
 /// `[summaries.llm.models]` as written. See [`KindModels`].
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileKindModels {
-    message: Option<String>,
-    thread_name: Option<String>,
-    digest: Option<String>,
-    side_agent: Option<String>,
+    message: Option<FileChain>,
+    thread_name: Option<FileChain>,
+    digest: Option<FileChain>,
+    side_agent: Option<FileChain>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3501,21 +3542,40 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         Ok(())
     };
     identifier("model", &model, "._@")?;
-    // `#1324 per-kind-summarizer-model`: each override is a model name on the same terms.
-    let kind_model =
-        |kind: SummaryKind, value: Option<String>| -> Result<Option<String>, ConfigError> {
-            let Some(value) = text(value) else {
-                return Ok(None);
+    // `#1324 per-kind-summarizer-model`, `#1564`: each override is a chain of model names on
+    // the same terms; a single string is a one-element chain.
+    let kind_chain =
+        |kind: SummaryKind, value: Option<FileChain>| -> Result<Vec<String>, ConfigError> {
+            let names: Vec<String> = match value {
+                None => return Ok(Vec::new()),
+                Some(FileChain::One(one)) => vec![one],
+                Some(FileChain::Many(many)) => many,
             };
-            identifier(&format!("models.{}", kind.as_str()), &value, "._@")?;
-            Ok(Some(value))
+            if names.is_empty() {
+                return Err(invalid(
+                    &format!("models.{}", kind.as_str()),
+                    "names no model; give one model name or a non-empty fallback chain".to_owned(),
+                ));
+            }
+            let mut chain = Vec::with_capacity(names.len());
+            for name in names {
+                let Some(name) = text(Some(name)) else {
+                    return Err(invalid(
+                        &format!("models.{}", kind.as_str()),
+                        "names an empty model; every chain entry must name a model".to_owned(),
+                    ));
+                };
+                identifier(&format!("models.{}", kind.as_str()), &name, "._@")?;
+                chain.push(name);
+            }
+            Ok(chain)
         };
     let file_models = file.models.unwrap_or_default();
     let models = KindModels {
-        message: kind_model(SummaryKind::Message, file_models.message)?,
-        thread_name: kind_model(SummaryKind::ThreadName, file_models.thread_name)?,
-        digest: kind_model(SummaryKind::Digest, file_models.digest)?,
-        side_agent: kind_model(SummaryKind::SideAgent, file_models.side_agent)?,
+        message: kind_chain(SummaryKind::Message, file_models.message)?,
+        thread_name: kind_chain(SummaryKind::ThreadName, file_models.thread_name)?,
+        digest: kind_chain(SummaryKind::Digest, file_models.digest)?,
+        side_agent: kind_chain(SummaryKind::SideAgent, file_models.side_agent)?,
     };
     let project = text(file.project);
     let region = text(file.region);
@@ -3806,6 +3866,15 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
             format!("{timeout_secs} is outside 1 to 600 seconds"),
         ));
     }
+    let fallback_cooldown_seconds = file
+        .fallback_cooldown_seconds
+        .unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECONDS);
+    if fallback_cooldown_seconds > 86_400 {
+        return Err(invalid(
+            "fallback_cooldown_seconds",
+            format!("{fallback_cooldown_seconds} is over a day; a failed model must be retried within a day"),
+        ));
+    }
     let requests_per_minute = file
         .requests_per_minute
         .unwrap_or(DEFAULT_LLM_REQUESTS_PER_MINUTE);
@@ -3845,6 +3914,7 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         timeout_secs,
         requests_per_minute,
         burst,
+        fallback_cooldown_seconds,
     })
 }
 

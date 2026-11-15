@@ -100,6 +100,7 @@ pub struct ClaudeSessionSummarizer {
     config: LlmConfig,
     pool: Arc<Pool>,
     policy: String,
+    health: std::sync::Arc<super::health::SummarizerHealth>,
 }
 
 impl ClaudeSessionSummarizer {
@@ -116,21 +117,50 @@ impl ClaudeSessionSummarizer {
             idle: Mutex::new(HashMap::new()),
             config: config.clone(),
         });
+        let health = std::sync::Arc::new(super::health::SummarizerHealth::new(
+            std::time::Duration::from_secs(config.fallback_cooldown_seconds),
+        ));
         Self {
             config,
             pool,
             policy,
+            health,
         }
     }
 
     async fn complete(&self, kind: SummaryKind, prompt: &str) -> Result<String, SummaryError> {
-        let model = self.config.model_for(kind).to_owned();
-        self.pool.complete(&model, prompt).await
+        // Over the kind's fallback chain, as on the HTTP backends. `#1564`.
+        let chain = self.config.chain_for(kind);
+        let order = self.health.order(kind, &chain, std::time::Instant::now());
+        let mut last: Option<SummaryError> = None;
+        for (index, model) in order.iter().enumerate() {
+            match self.pool.complete(model, prompt).await {
+                Ok(text) => {
+                    self.health
+                        .record_success(kind, model, std::time::Instant::now());
+                    return Ok(text);
+                }
+                Err(error) => {
+                    self.health.cool(kind, model, std::time::Instant::now());
+                    if let Some(next) = order.get(index + 1) {
+                        self.health.note_switch(kind, model, next, &error);
+                    }
+                    last = Some(error);
+                }
+            }
+        }
+        let error = last.unwrap_or(SummaryError::NotConfigured("summaries.llm.models"));
+        self.health
+            .record_all_failed(kind, &error, std::time::Instant::now());
+        Err(error)
     }
 }
 
 #[async_trait]
 impl Summarizer for ClaudeSessionSummarizer {
+    fn summarizer_health(&self) -> Option<super::health::SummarizerHealthReport> {
+        Some(self.health.report(std::time::Instant::now()))
+    }
     fn describe(&self) -> &'static str {
         "Claude session"
     }

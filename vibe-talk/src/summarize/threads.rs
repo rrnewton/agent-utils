@@ -561,6 +561,8 @@ struct ChannelQueue {
     last_read: Option<Instant>,
     /// Until when no thread here is read, after a provider failure.
     paused_until: Option<Instant>,
+    /// Consecutive provider-failure pauses with no successful naming between. `#1564`.
+    consecutive_pauses: u64,
     /// The token of the one worker serving this queue, when one is. A worker whose token this no
     /// longer holds stops, and files nothing it was still naming: that is how taking the channel
     /// off the list stops it.
@@ -898,6 +900,46 @@ impl ThreadNames {
             self.card_max_lines(deps).await
         } else {
             MIN_CARD_MAX_LINES
+        }
+    }
+
+    /// Naming-starvation counters for the one health surface (`summarizer_health.thread_naming`
+    /// in diagnostics). `#1564`, counters agreed with `#1563`: loud when threads stay unnamed
+    /// over an hour or pauses run to three in a row on any channel.
+    #[must_use]
+    pub fn health_counts(&self) -> super::health::ThreadNamingHealth {
+        let state = self.lock();
+        let now = Instant::now();
+        let mut unnamed_due = 0u64;
+        let mut overdue_unnamed = 0u64;
+        for queue in state.channels.values() {
+            for waiting in queue.waiting.values() {
+                if waiting.prior.is_none() {
+                    unnamed_due += 1;
+                    if waiting.queued_at.elapsed() > Duration::from_secs(3600) {
+                        overdue_unnamed += 1;
+                    }
+                }
+            }
+        }
+        let paused_channels = state
+            .channels
+            .values()
+            .filter(|queue| queue.paused_until.is_some_and(|until| until > now))
+            .count() as u64;
+        let max_consecutive_pauses = state
+            .channels
+            .values()
+            .map(|queue| queue.consecutive_pauses)
+            .max()
+            .unwrap_or(0);
+        let loud = overdue_unnamed > 0 || max_consecutive_pauses >= 3;
+        super::health::ThreadNamingHealth {
+            unnamed_due,
+            overdue_unnamed,
+            paused_channels,
+            max_consecutive_pauses,
+            state: if loud { "degraded" } else { "ok" }.to_owned(),
         }
     }
 
@@ -1429,6 +1471,9 @@ impl ThreadNames {
         let failure = match outcome {
             Ok(Some(record)) => {
                 state.failed.remove(&key);
+                if let Some(queue) = state.channels.get_mut(&key.0) {
+                    queue.consecutive_pauses = 0;
+                }
                 state.named += 1;
                 // The read at its turn, or what a page showed since: never the copy it was queued
                 // with, which a page may have shown out of date long before its turn.
@@ -1469,11 +1514,9 @@ impl ThreadNames {
                     "a thread-naming read failed at the chat provider; no thread in this channel \
                      is read for naming until the pause ends"
                 );
-                state
-                    .channels
-                    .entry(key.0.clone())
-                    .or_default()
-                    .paused_until = Some(Instant::now() + CHANNEL_PAUSE);
+                let queue = state.channels.entry(key.0.clone()).or_default();
+                queue.paused_until = Some(Instant::now() + CHANNEL_PAUSE);
+                queue.consecutive_pauses += 1;
             }
             TurnFailure::Gone => {
                 tracing::info!("a thread queued for naming no longer exists; it was not named");

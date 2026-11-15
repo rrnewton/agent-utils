@@ -45,6 +45,7 @@ export interface ClientConfigLike {
   token_scope?: unknown;
   client_settings_supported?: boolean;
   summaries_unavailable?: string;
+  summarizer_warning?: string;
   replay_enabled?: boolean;
   transcript_records_supported?: boolean;
   replay_unavailable?: string;
@@ -235,6 +236,13 @@ export function createClientConfig(deps: ClientConfigDependencies): ClientConfig
     deps.channelDirectory.setCapability("repliesInThread", config.replies_in_thread === true);
     deps.summaryRows.setDisabledByServer(
       typeof config.summaries_unavailable === "string" ? config.summaries_unavailable.trim() : "");
+    // `#1564`: one persistent health banner naming the model in use; only the server clears it.
+    {
+      const warning = typeof config.summarizer_warning === "string" ? config.summarizer_warning.trim() : "";
+      deps.el("summarizer-health-detail").textContent =
+        warning ? `Summaries may be incomplete \u2014 ${warning}` : "";
+      deps.el("summarizer-health-banner").hidden = !warning;
+    }
     if (deps.summaryRows.disabledByServer() && deps.summaryRows.mode()) deps.setSummaryMode(false);
     // ...and back on when the server can summarise again and the owner's setting still says so.
     else if (!deps.summaryRows.disabledByServer() && !deps.summaryRows.mode() && deps.storedSummarizeCollapsed()) deps.setSummaryMode(true);

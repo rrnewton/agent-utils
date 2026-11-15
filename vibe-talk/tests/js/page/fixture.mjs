@@ -2199,6 +2199,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         providers: page.providers,
         // Absent unless a test says the server cannot summarise at all.
         summaries_unavailable: page.summariesUnavailable,
+        summarizer_warning: page.summarizerWarning,
         token_scope: page.tokenScope,
         // `#196 auto-read-noise`. Absent when a test sets it to `undefined`, as an older server
         // (or one whose store is failing) sends it.

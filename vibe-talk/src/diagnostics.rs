@@ -179,6 +179,27 @@ pub struct DiagnosticsReport {
     /// table or no file open. `#595 cache-full-history`; see [`crate::backfill::history`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_history: Option<crate::backfill::HistoryReport>,
+    /// Summariser fallback-chain and loud-failure health, with thread-naming starvation
+    /// folded in: the ONE health surface (`#1564`, agreed with `#1563`).
+    pub summarizer_health: crate::summarize::health::SummarizerHealthReport,
+}
+
+/// The one summariser health report: the backend's fallback state merged with thread-naming
+/// starvation counters. `#1564`.
+#[must_use]
+pub fn summarizer_health(state: &AppState) -> crate::summarize::health::SummarizerHealthReport {
+    let base = state.summarizer.summarizer_health().unwrap_or(
+        crate::summarize::health::SummarizerHealthReport {
+            overall: "ok".to_owned(),
+            headline: None,
+            per_kind: Vec::new(),
+            thread_naming: crate::summarize::health::ThreadNamingHealth {
+                state: "ok".to_owned(),
+                ..Default::default()
+            },
+        },
+    );
+    crate::summarize::health::merge_thread_naming(base, state.thread_names.health_counts())
 }
 
 /// Redact every secret this deployment holds out of a string.
@@ -390,6 +411,7 @@ pub async fn run(state: &AppState) -> DiagnosticsReport {
         recent_view_shadow: crate::recent_view::report(state),
         // Read after the checks, so the calls this report just made are counted too.
         upstream: upstream(state),
+        summarizer_health: summarizer_health(state),
         message_cache: state.message_cache.report().await,
         cache_history: {
             let state = state.clone();

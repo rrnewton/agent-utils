@@ -516,6 +516,9 @@ in-app-links-browser:
 # the block scrolling in its own box, and a row whose summary failed keeps its Done grey and its
 # Unarchive, with only a small muted label. Pass WEB_ROOT=dir to run it against another copy of the
 # page, and SCREENSHOTS=dir to keep a PNG of each state.
+summarizer-health-browser:
+	python3 tests/summarizer_health_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
 message-summaries-browser:
 	python3 tests/message_summaries_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 

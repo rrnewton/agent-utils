@@ -64,7 +64,10 @@ fn the_side_agent_model_comes_from_the_models_table_or_falls_back() {
     )
     .expect("valid");
     let llm = named.summaries.llm.expect("read");
-    assert_eq!(llm.models.side_agent.as_deref(), Some("big-model"));
+    assert_eq!(
+        llm.models.get(crate::config::SummaryKind::SideAgent),
+        Some("big-model")
+    );
     assert_eq!(llm.model_for(SummaryKind::SideAgent), "big-model");
     assert_eq!(
         llm.model, "small-model",
@@ -747,5 +750,47 @@ fn claude_session_keys_are_refused_on_other_backends_and_vice_versa() {
             "[summaries.llm]\nbackend = \"claude_session\"\npool_size = 3\n"
         )),
         "summaries.llm.pool_size"
+    );
+}
+
+#[test]
+fn model_chains_read_strings_and_lists_and_keep_order() {
+    // `#1564`: a single string is a one-element chain; a list keeps its order.
+    let single = load(
+        "[summaries.llm]\napi_key_file = \"/k\"\n[summaries.llm.models]\nmessage = \"only-model\"\n",
+    )
+    .expect("valid");
+    let llm = single.summaries.llm.expect("read");
+    assert_eq!(
+        llm.chain_for(crate::config::SummaryKind::Message),
+        vec!["only-model".to_owned()]
+    );
+    let chained = load(
+        "[summaries.llm]\napi_key_file = \"/k\"\n[summaries.llm.models]\n\
+         message = [\"small-elk-internal\", \"muse-spark-1.4-internal\"]\n",
+    )
+    .expect("valid");
+    let llm = chained.summaries.llm.expect("read");
+    assert_eq!(
+        llm.chain_for(crate::config::SummaryKind::Message),
+        vec![
+            "small-elk-internal".to_owned(),
+            "muse-spark-1.4-internal".to_owned()
+        ]
+    );
+    assert_eq!(
+        llm.model_for(crate::config::SummaryKind::Message),
+        "small-elk-internal"
+    );
+    // The cache segment renders the configured chain; a one-element chain is byte-identical
+    // to the pre-chain form.
+    assert!(llm
+        .models_segment()
+        .expect("segment")
+        .contains("message=small-elk-internal>muse-spark-1.4-internal"));
+    // An empty chain names nothing and is refused.
+    assert!(
+        load("[summaries.llm]\napi_key_file = \"/k\"\n[summaries.llm.models]\nmessage = []\n")
+            .is_err()
     );
 }

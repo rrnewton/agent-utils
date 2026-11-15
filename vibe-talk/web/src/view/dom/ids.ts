@@ -674,6 +674,8 @@ export interface ElementById {
   "summarise": HTMLButtonElement;
   "summarise-label": HTMLSpanElement;
   "summarize-collapsed": HTMLInputElement;
+  "summarizer-health-banner": HTMLDivElement;
+  "summarizer-health-detail": HTMLSpanElement;
   "summary-note": HTMLParagraphElement;
   "talk": HTMLButtonElement;
   "talk-label": HTMLSpanElement;

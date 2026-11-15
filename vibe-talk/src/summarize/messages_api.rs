@@ -118,8 +118,19 @@ impl<'a> MessagesRequest<'a> {
     /// The body `config`'s dialect sends for one instruction and one prompt.
     #[must_use]
     pub fn new(config: &'a LlmConfig, kind: SummaryKind, system: &'a str, prompt: &'a str) -> Self {
+        Self::with_model(config, config.model_for(kind), system, prompt)
+    }
+
+    /// The body asking `model` explicitly: one attempt of a fallback chain. `#1564`.
+    #[must_use]
+    pub fn with_model(
+        config: &'a LlmConfig,
+        model: &'a str,
+        system: &'a str,
+        prompt: &'a str,
+    ) -> Self {
         let (model, anthropic_version) = match config.dialect {
-            LlmDialect::Anthropic => (Some(config.model_for(kind)), None),
+            LlmDialect::Anthropic => (Some(model), None),
             LlmDialect::Vertex => (None, Some(VERTEX_ANTHROPIC_VERSION)),
         };
         Self {
@@ -138,6 +149,12 @@ impl<'a> MessagesRequest<'a> {
 /// Where `config`'s dialect sends a request.
 #[must_use]
 pub fn endpoint(config: &LlmConfig, kind: SummaryKind) -> String {
+    endpoint_for_model(config, config.model_for(kind))
+}
+
+/// Where a request asking `model` is sent (Vertex names the model in the path). `#1564`.
+#[must_use]
+pub fn endpoint_for_model(config: &LlmConfig, model: &str) -> String {
     match config.dialect {
         LlmDialect::Anthropic => format!("{}/v1/messages", config.base_url),
         LlmDialect::Vertex => format!(
@@ -145,7 +162,7 @@ pub fn endpoint(config: &LlmConfig, kind: SummaryKind) -> String {
             config.base_url,
             config.project.as_deref().unwrap_or_default(),
             config.region.as_deref().unwrap_or_default(),
-            config.model_for(kind)
+            model
         ),
     }
 }
@@ -195,6 +212,7 @@ pub struct LlmStats {
 pub struct MessagesApiSummarizer {
     config: LlmConfig,
     policy_input: String,
+    health: std::sync::Arc<super::health::SummarizerHealth>,
     limiter: RateLimiter,
     client: Mutex<Option<(Fingerprint, reqwest::Client)>>,
     token: tokio::sync::Mutex<Option<(Instant, Secret)>>,
@@ -247,9 +265,13 @@ impl MessagesApiSummarizer {
             policy_input.push_str(&format!("\nmodels={models}"));
         }
         let limiter = RateLimiter::new(config.requests_per_minute, config.burst);
+        let health = std::sync::Arc::new(super::health::SummarizerHealth::new(
+            Duration::from_secs(config.fallback_cooldown_seconds),
+        ));
         Self {
             config,
             policy_input,
+            health,
             limiter,
             client: Mutex::new(None),
             token: tokio::sync::Mutex::new(None),
@@ -348,11 +370,48 @@ impl MessagesApiSummarizer {
         *self.token.lock().await = None;
     }
 
-    /// One call: wait for a slot, send, and retry what the provider asked to be retried.
+    /// One call over the kind's fallback chain. `#1564` (see the gateway backend).
     async fn complete(
         &self,
         priority: Priority,
         kind: SummaryKind,
+        system: &str,
+        prompt: &str,
+    ) -> Result<String, SummaryError> {
+        let chain = self.config.chain_for(kind);
+        let order = self.health.order(kind, &chain, std::time::Instant::now());
+        let mut last: Option<SummaryError> = None;
+        for (index, model) in order.iter().enumerate() {
+            match self
+                .complete_with_model(priority, kind, model, system, prompt)
+                .await
+            {
+                Ok(text) => {
+                    self.health
+                        .record_success(kind, model, std::time::Instant::now());
+                    return Ok(text);
+                }
+                Err(error) => {
+                    self.health.cool(kind, model, std::time::Instant::now());
+                    if let Some(next) = order.get(index + 1) {
+                        self.health.note_switch(kind, model, next, &error);
+                    }
+                    last = Some(error);
+                }
+            }
+        }
+        let error = last.unwrap_or(SummaryError::NotConfigured("summaries.llm.models"));
+        self.health
+            .record_all_failed(kind, &error, std::time::Instant::now());
+        Err(error)
+    }
+
+    /// One call to one model: wait for a slot, send, and retry what was asked to be retried.
+    async fn complete_with_model(
+        &self,
+        priority: Priority,
+        kind: SummaryKind,
+        model: &str,
         system: &str,
         prompt: &str,
     ) -> Result<String, SummaryError> {
@@ -381,7 +440,7 @@ impl MessagesApiSummarizer {
                     }
                 )));
             }
-            match self.send(kind, system, prompt).await {
+            match self.send(kind, model, system, prompt).await {
                 Attempt::Answered(text) => {
                     tracing::debug!(
                         attempts = attempt + 1,
@@ -416,14 +475,14 @@ impl MessagesApiSummarizer {
     }
 
     /// One HTTP request and its interpretation.
-    async fn send(&self, kind: SummaryKind, system: &str, prompt: &str) -> Attempt {
+    async fn send(&self, kind: SummaryKind, model: &str, system: &str, prompt: &str) -> Attempt {
         let client = match self.client() {
             Ok(client) => client,
             Err(error) => return Attempt::Failed(error),
         };
-        let body = MessagesRequest::new(&self.config, kind, system, prompt);
+        let body = MessagesRequest::with_model(&self.config, model, system, prompt);
         let mut request = client
-            .post(endpoint(&self.config, kind))
+            .post(endpoint_for_model(&self.config, model))
             .timeout(Duration::from_secs(self.config.timeout_secs))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&body);
@@ -859,6 +918,10 @@ fn excerpt(text: &str) -> String {
 
 #[async_trait]
 impl Summarizer for MessagesApiSummarizer {
+    fn summarizer_health(&self) -> Option<super::health::SummarizerHealthReport> {
+        Some(self.health.report(std::time::Instant::now()))
+    }
+
     fn describe(&self) -> &'static str {
         match self.config.dialect {
             LlmDialect::Anthropic => {

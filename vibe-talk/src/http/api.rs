@@ -821,7 +821,7 @@ fn validate_ingest_id(field: &str, value: &str, max_bytes: usize) -> Result<(), 
 /// and `startup_probe` says why, as `probe pending (rate limited, retry in 12s)`
 /// (`#718 vt-startup-probe-restart`).
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
-    Json(health_body(state.startup_probe.phase()))
+    Json(health_body(&state))
 }
 
 /// `GET /readyz` — readiness: 200 once the startup channel probe has passed (or was skipped),
@@ -834,15 +834,23 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (code, Json(health_body(phase)))
+    (code, Json(health_body(&state)))
 }
 
-fn health_body(phase: crate::probe::StartupPhase) -> serde_json::Value {
+fn health_body(state: &AppState) -> serde_json::Value {
+    let phase = state.startup_probe.phase();
+    // Unauthenticated on purpose: overall + headline only (no per-kind detail), so a deploy
+    // watch on loopback can grep summariser health without a token. `#1564`.
+    let health = crate::diagnostics::summarizer_health(state);
     serde_json::json!({
         "status": phase.status(),
         "service": "vibe-talk",
         "version": env!("CARGO_PKG_VERSION"),
         "startup_probe": phase.describe(),
+        "summarizer": {
+            "overall": health.overall,
+            "headline": health.headline,
+        },
     })
 }
 
@@ -1053,6 +1061,14 @@ pub async fn client_config(
             .is_some_and(crate::config::ProviderConfig::coding_agents_named_only),
         providers,
         summaries_unavailable: state.summarizer.unavailable_reason(),
+        summarizer_warning: {
+            let health = crate::diagnostics::summarizer_health(&state);
+            if health.overall == "ok" {
+                None
+            } else {
+                health.headline
+            }
+        },
         // `#528 thread-card-markdown-and-cap`: only where a summary can come for this caller: a
         // summariser that works, and the write scope, the only one whose reads queue a naming.
         thread_names_supported: scope >= Scope::Write

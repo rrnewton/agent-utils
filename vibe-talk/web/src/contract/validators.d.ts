@@ -844,6 +844,11 @@ export interface ClientConfigResponse {
    */
   summaries_unavailable?: string | null;
   /**
+   * Loud summariser-health headline naming the model in use and why, when summaries are
+   * degraded. `#1564`. Absent when healthy; the page shows it as one persistent banner.
+   */
+  summarizer_warning?: string | null;
+  /**
    * Whether this server names threads and sums them up. `#528 thread-card-markdown-and-cap`.
    *
    * The page reads it as "a summary is coming": a thread whose first message is too long for

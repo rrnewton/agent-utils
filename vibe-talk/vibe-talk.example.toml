@@ -791,11 +791,13 @@ enabled = true
 # timeout_secs = 30
 # requests_per_minute = 15
 # burst = 3
+# fallback_cooldown_seconds = 300                  # a failed chain model is skipped this long
 # [summaries.llm.models]                          # optional per-kind models (#1324); an
-# message = "small-elk-internal"                   # absent kind uses model above. This is a
-# thread_name = "small-elk-internal"               # preview id that may be withdrawn; rollback
-# digest = "muse-spark-1.4-internal"               # is deleting these override lines.
-# side_agent = "muse-spark-1.4-internal"
+# message = "small-elk-internal"                   # absent kind uses model above. Each value
+# thread_name = "small-elk-internal"               # may be an ordered fallback chain (#1564),
+# digest = "muse-spark-1.4-internal"               # e.g. ["small-elk-internal",
+# side_agent = "muse-spark-1.4-internal"           # "muse-spark-1.4-internal"]: on failure the
+#                                                  # next is tried when one fails.
 #
 # A warm persistent Claude session (tools off), kept started so summaries pay no cold
 # startup (#1331 claude-session-summarizer):

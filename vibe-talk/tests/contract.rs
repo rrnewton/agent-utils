@@ -303,6 +303,7 @@ fn client_config(
             },
         ],
         summaries_unavailable: (!full).then(|| "elevenlabs.api_key is not configured".into()),
+        summarizer_warning: None,
         thread_names_supported: full,
         discuss_available: full,
         token_scope: scope,

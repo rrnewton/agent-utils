@@ -296,10 +296,10 @@ async fn each_kind_sends_its_own_effective_model() {
     .await;
     let mut config = gateway(&mock);
     config.models = KindModels {
-        message: Some("kind-message-model".to_owned()),
-        thread_name: Some("kind-thread-model".to_owned()),
-        digest: None,
-        side_agent: None,
+        message: vec!["kind-message-model".to_owned()],
+        thread_name: vec!["kind-thread-model".to_owned()],
+        digest: Vec::new(),
+        side_agent: Vec::new(),
     };
     let under = MetaGatewaySummarizer::new(config);
     summarise(&under, "a wall of text").await.expect("answers");
@@ -503,4 +503,125 @@ fn a_tool_calls_body_parses_to_calls_and_a_text_body_to_text() {
         text,
         crate::summarize::discuss::ModelStep::Text("done".to_owned())
     );
+}
+
+// ---- `#1564` fallback chain against the fake gateway ----
+
+fn failing(status: u16, body: &str) -> Reply {
+    Reply {
+        status,
+        headers: vec![("content-type", "application/json".to_owned())],
+        body: body.to_owned(),
+    }
+}
+
+fn chained(mock: &Mock) -> LlmConfig {
+    let mut config = gateway(mock);
+    config.fallback_cooldown_seconds = 0;
+    config.models.message = vec!["primary-model".to_owned(), "backup-model".to_owned()];
+    config
+}
+
+#[tokio::test]
+async fn a_primary_error_switches_to_the_next_model() {
+    let mock = Mock::start(vec![
+        failing(500, "gateway exploded"),
+        Reply::text("Summarised by the backup."),
+    ])
+    .await;
+    let under = MetaGatewaySummarizer::new(chained(&mock));
+    let summary = summarise(&under, "a wall of text")
+        .await
+        .expect("backup answers");
+    assert_eq!(summary, "Summarised by the backup.");
+    let sent = mock.captured();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].body["model"], "primary-model");
+    assert_eq!(sent[1].body["model"], "backup-model");
+    let health = under.summarizer_health().expect("health tracked");
+    assert_eq!(health.per_kind[0].active_model, "backup-model");
+}
+
+#[tokio::test]
+async fn a_withdrawn_model_answer_switches() {
+    let mock = Mock::start(vec![
+        failing(
+            404,
+            r#"{"error":{"message":"model not found: primary-model"}}"#,
+        ),
+        Reply::text("Named by the backup."),
+    ])
+    .await;
+    let under = MetaGatewaySummarizer::new(chained(&mock));
+    summarise(&under, "a wall of text")
+        .await
+        .expect("backup answers");
+    assert_eq!(mock.captured()[1].body["model"], "backup-model");
+}
+
+#[tokio::test]
+async fn all_models_failing_goes_loud_after_the_threshold() {
+    let mock = Mock::start(vec![failing(500, "down"); 6]).await;
+    let under = MetaGatewaySummarizer::new(chained(&mock));
+    for _ in 0..3 {
+        assert!(summarise(&under, "a wall of text").await.is_err());
+    }
+    let health = under.summarizer_health().expect("health tracked");
+    assert_eq!(health.overall, "degraded");
+    assert!(
+        health
+            .headline
+            .as_deref()
+            .unwrap_or("")
+            .contains("primary-model"),
+        "{health:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_primary_is_retried_after_the_cooldown() {
+    let mock = Mock::start(vec![
+        failing(500, "down"),
+        Reply::text("Backup answer."),
+        Reply::text("Primary again."),
+    ])
+    .await;
+    let under = MetaGatewaySummarizer::new(chained(&mock));
+    assert_eq!(
+        summarise(&under, "one").await.expect("backup"),
+        "Backup answer."
+    );
+    // Cooldown is zero in this config, so the next request tries the primary first again.
+    assert_eq!(
+        summarise(&under, "two").await.expect("primary"),
+        "Primary again."
+    );
+    let captured = mock.captured();
+    let models: Vec<&str> = captured
+        .iter()
+        .map(|sent| sent.body["model"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(models, ["primary-model", "backup-model", "primary-model"]);
+}
+
+#[tokio::test]
+async fn one_blip_gives_no_health_warning() {
+    let mock = Mock::start(vec![
+        failing(500, "down"),
+        failing(500, "down"),
+        Reply::text("Recovered."),
+    ])
+    .await;
+    let under = MetaGatewaySummarizer::new(chained(&mock));
+    assert!(
+        summarise(&under, "one").await.is_err(),
+        "both models failed once"
+    );
+    assert_eq!(
+        summarise(&under, "two").await.expect("answers"),
+        "Recovered."
+    );
+    let health = under.summarizer_health().expect("health tracked");
+    assert_eq!(health.overall, "ok");
+    assert!(health.headline.is_none());
 }
