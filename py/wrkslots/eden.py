@@ -261,6 +261,174 @@ def is_inside(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
+#: Sapling store features whose content is fetched on demand: a backing
+#: carrying either is a lazy store, so later reads may go to its upstream.
+LAZY_REQUIRES = frozenset({"lazychangelog", "remotefilelog"})
+
+
+def backing_repo_problem(path: Path) -> str | None:
+    """Why ``path`` is not a self-contained Sapling backing repo, or None.
+
+    Filesystem-only (no sl/eden execution), so create can fail closed
+    before writing anything and tests need no daemon.
+    """
+
+    if not path.exists():
+        return f"eden backing repo not seeded: {path}"
+    if path.is_symlink() or not path.is_dir():
+        return f"eden backing repo is not a directory: {path}"
+    if not (path / ".hg" / "requires").is_file() or not (path / ".hg" / "store").is_dir():
+        return f"not a Sapling backing repo: {path} (no .hg/requires or .hg/store)"
+    if (path / ".hg" / "sharedpath").exists():
+        return f"eden backing repo is a shared clone, not a self-contained store: {path}"
+    return None
+
+
+def _hgrc_default_path(hgrc: Path) -> str | None:
+    """The ``[paths] default`` value in an hgrc, tolerating %include lines."""
+
+    try:
+        lines = hgrc.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    in_paths = False
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("["):
+            in_paths = line == "[paths]"
+            continue
+        if in_paths and "=" in line:
+            key, _, value = line.partition("=")
+            if key.strip() == "default":
+                return value.strip() or None
+    return None
+
+
+def backing_facts(path: Path) -> dict[str, object]:
+    """Observable backing facts for seed reports: laziness and upstream.
+
+    A lazy store (either lazy feature in its requires files) still
+    fetches commit/file content from its default path on demand,
+    exactly like the host backing it was cloned from; reports must
+    say so instead of implying the copy is complete.
+    """
+
+    requires: list[str] = []
+    for name in (path / ".hg" / "requires", path / ".hg" / "store" / "requires"):
+        try:
+            requires.extend(
+                line.strip()
+                for line in name.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                if line.strip()
+            )
+        except OSError:
+            continue
+    return {
+        "requires": tuple(requires),
+        "lazy": bool(LAZY_REQUIRES.intersection(requires)),
+        "default_path": _hgrc_default_path(path / ".hg" / "hgrc"),
+    }
+
+
+def measure_tree(path: Path) -> tuple[int, int]:
+    """(total bytes, file count) under ``path`` without following symlinks."""
+
+    total = 0
+    files = 0
+    for directory, _subdirs, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(directory, name)).st_size
+            except OSError:
+                continue
+            files += 1
+    return total, files
+
+
+def _set_hgrc_default_path(hgrc: Path, value: str) -> None:
+    """Set ``[paths] default`` in an hgrc, preserving every other line."""
+
+    try:
+        lines = hgrc.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    out: list[str] = []
+    in_paths = False
+    done = False
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("["):
+            if in_paths and not done:
+                out.append(f"default = {value}")
+                done = True
+            in_paths = line == "[paths]"
+            out.append(raw)
+            continue
+        if in_paths and "=" in line and line.partition("=")[0].strip() == "default":
+            if not done:
+                out.append(f"default = {value}")
+                done = True
+            continue
+        out.append(raw)
+    if not done:
+        if not in_paths:
+            out.append("[paths]")
+        out.append(f"default = {value}")
+    hgrc.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def seed_backing_repo(runner: Runner, source: Path, staging: Path) -> None:
+    """Clone ``source`` into ``staging`` and prove the copy stands alone.
+
+    A local no-update clone (this Sapling build has no ``clone --pull``);
+    across filesystems the store files are copied, never hardlinked.
+    A clone records its source as the default path, so that is reset
+    to the source repo's own upstream: the published backing then has
+    the host backing's shape (full copied store, upstream only for
+    future lazy fetches). Refuses (staging kept for inspection) when
+    the clone cannot be made to stand alone. The caller owns the
+    staging directory, the atomic rename into place, and reporting.
+    """
+
+    problem = backing_repo_problem(source)
+    if problem is not None:
+        raise EdenError(problem)
+    source_default_obj = backing_facts(source)["default_path"]
+    source_default = (
+        source_default_obj if isinstance(source_default_obj, str) else None
+    )
+    rc, stdout, stderr = runner(
+        ["sl", "clone", "-U", str(source), str(staging)]
+    )
+    if rc != 0:
+        raise EdenError(
+            f"sl clone of the backing repo failed: "
+            f"{stderr.strip() or stdout.strip() or 'sl clone failed'}"
+        )
+    problem = backing_repo_problem(staging)
+    if problem is not None:
+        raise EdenError(problem)
+    if backing_facts(staging)["default_path"] == str(source):
+        if source_default is None or source_default == str(source):
+            raise EdenError(
+                f"seeded backing at {staging} still names its source "
+                f"{source} as the default path and the source records no "
+                "upstream to take over; not publishing it (staging kept "
+                "for inspection)"
+            )
+        _set_hgrc_default_path(staging / ".hg" / "hgrc", source_default)
+    rc, stdout, stderr = runner(
+        ["sl", "-R", str(staging), "log", "-l", "1", "-T", "{node}"]
+    )
+    if rc != 0 or not stdout.strip():
+        raise EdenError(
+            f"seeded backing at {staging} does not read standalone: "
+            f"{stderr.strip() or stdout.strip() or 'sl log failed'}"
+        )
+
+
 def provision_checkout(
     runner: Runner,
     config_dir: str,

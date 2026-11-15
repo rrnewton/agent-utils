@@ -1327,3 +1327,99 @@ def test_image_convert_refuses_an_eden_slot(tmp_path: Path) -> None:
 
     with pytest.raises(wrkslots_cli.Refusal, match="Eden"):
         imagecmd._verify_checkouts(config, record)
+
+
+def _fake_backing(root: Path, *, default: str | None = "fb:source-repo") -> Path:
+    (root / ".hg" / "store").mkdir(parents=True)
+    (root / ".hg" / "requires").write_text("remotefilelog\nstore\n")
+    (root / ".hg" / "store" / "requires").write_text("lazychangelog\n")
+    (root / ".hg" / "store" / "data.bin").write_bytes(b"x" * 100)
+    lines = "" if default is None else f"[paths]\ndefault = {default}\n"
+    (root / ".hg" / "hgrc").write_text(lines)
+    return root
+
+
+def test_backing_repo_problem_variants(tmp_path: Path) -> None:
+    missing = tmp_path / "absent"
+    assert "not seeded" in (eden.backing_repo_problem(missing) or "")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert "not a Sapling backing repo" in (eden.backing_repo_problem(plain) or "")
+    good = _fake_backing(tmp_path / "good")
+    assert eden.backing_repo_problem(good) is None
+    (good / ".hg" / "sharedpath").write_text("/elsewhere\n")
+    assert "shared clone" in (eden.backing_repo_problem(good) or "")
+
+
+def test_backing_facts_report_lazy_store_and_default(tmp_path: Path) -> None:
+    good = _fake_backing(tmp_path / "good")
+    facts = eden.backing_facts(good)
+    assert facts["lazy"] is True
+    assert facts["default_path"] == "fb:source-repo"
+    assert "lazychangelog" in facts["requires"]  # type: ignore[operator]
+    total, files = eden.measure_tree(good)
+    assert total >= 100 and files >= 4
+
+
+def test_seed_clone_argv_and_default_rewrite(tmp_path: Path) -> None:
+    source = _fake_backing(tmp_path / "source")
+    staging = tmp_path / "staging"
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv: Sequence[str]) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if tuple(argv[:2]) == ("sl", "clone"):
+            _fake_backing(Path(argv[-1]), default=str(source))
+            return 0, "", ""
+        return 0, "a" * 40 + "\n", ""
+
+    eden.seed_backing_repo(run, source, staging)
+
+    assert calls[0] == ("sl", "clone", "-U", str(source), str(staging))
+    assert calls[1][:3] == ("sl", "-R", str(staging))
+    facts = eden.backing_facts(staging)
+    assert facts["default_path"] == "fb:source-repo"
+
+
+def test_seed_refuses_when_clone_stays_pointed_at_source(tmp_path: Path) -> None:
+    source = _fake_backing(tmp_path / "source", default=None)
+    staging = tmp_path / "staging"
+
+    def run(argv: Sequence[str]) -> tuple[int, str, str]:
+        if tuple(argv[:2]) == ("sl", "clone"):
+            _fake_backing(Path(argv[-1]), default=str(source))
+            return 0, "", ""
+        return 0, "a" * 40 + "\n", ""
+
+    with pytest.raises(eden.EdenError, match="source"):
+        eden.seed_backing_repo(run, source, staging)
+
+
+def test_create_eden_refuses_backing_mismatch_before_writing(
+    tmp_path: Path,
+) -> None:
+    from wrkslots import worktreesimage
+
+    config = wrkslots_cli.Config(
+        config_path=tmp_path / ".wrkslots.yml",
+        root=tmp_path,
+        worktrees=tmp_path / "slots",
+        control=tmp_path / "ctrl",
+        machine="node-a",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=tmp_path / "live.py",
+        worktrees_image=worktreesimage.WorktreesImageSettings(
+            relative_path="worktrees.img",
+            size_bytes=1024**3,
+            eden_backing_repo="source-repo",
+        ),
+        worktrees_image_state=worktreesimage.MOUNTED,
+    )
+    args = argparse.Namespace(eden=["main=/elsewhere/repo"], eden_rev=[])
+    with pytest.raises(wrkslots_cli.Refusal, match="eden_backing_repo"):
+        wrkslots_cli._eden_create_plan(config, args)
+    args = argparse.Namespace(eden=["main=source-repo"], eden_rev=[])
+    with pytest.raises(wrkslots_cli.Refusal, match="not seeded"):
+        wrkslots_cli._eden_create_plan(config, args)

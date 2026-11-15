@@ -31,6 +31,39 @@ def test_settings_defaults() -> None:
     assert settings.filesystem == "btrfs"
     assert settings.mount == "kernel"
     assert settings.image_file(Path("/proj")) == Path("/proj/worktrees.img")
+    assert settings.eden_backing_repo is None
+
+
+def test_parse_qgroup_referenced() -> None:
+    text = (
+        "qgroupid         rfer         excl     max_rfer     max_excl  groupid\n"
+        "0/256        16384        16384        none         none     ---\n"
+        "0/257      1048576       999424        none         none     ---\n"
+    )
+    assert worktreesimage._parse_qgroup_referenced(text, "0/256") == 16384
+    assert worktreesimage._parse_qgroup_referenced(text, "0/999") is None
+
+
+def test_settings_accept_eden_backing_repo() -> None:
+    settings = worktreesimage.settings_from_obj(
+        {"path": "worktrees.img", "size_bytes": 2 * GIB, "eden_backing_repo": "source-repo"}
+    )
+    assert settings.eden_backing_repo == "source-repo"
+    control = Path("/proj/worktrees")
+    slots = Path("/proj/worktrees/slots")
+    root = worktreesimage.eden_backing_root(settings.mount_point(control, slots))
+    assert worktreesimage.eden_backing_repo_path(
+        settings.mount_point(control, slots), "source-repo"
+    ) == root / "source-repo"
+    assert root == control / ".slots-image" / ".eden-backing"
+
+
+@pytest.mark.parametrize("name", ["", "a/b", "..", ".", "validate", "a b", 7])
+def test_settings_refuse_bad_eden_backing_repo(name: object) -> None:
+    with pytest.raises(worktreesimage.WorktreesImageError, match="eden_backing_repo"):
+        worktreesimage.settings_from_obj(
+            {"path": "worktrees.img", "size_bytes": 2 * GIB, "eden_backing_repo": name}
+        )
 
 
 def test_settings_refuse_fuse_honestly() -> None:

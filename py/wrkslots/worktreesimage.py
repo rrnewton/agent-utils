@@ -60,6 +60,11 @@ QUOTA_MODES = ("simple", "full")
 #: at ``<managed-root>/validate/<slot>`` (see ``validate_external_dir``).
 VALIDATE_SUBDIR = "validate"
 
+#: Name of the in-image Eden backing directory: a top-level subvolume of
+#: its own holding one directory per backing repo (#1567). It is never a
+#: slot (the dot prefix cannot be a slot name) and never removed with one.
+EDEN_BACKING_SUBDIR = ".eden-backing"
+
 #: Mount classification states (see ``classify_mount``).
 MOUNTED = "mounted"
 NOT_MOUNTED = "not-mounted"
@@ -90,6 +95,11 @@ class WorktreesImageSettings:
     machines: tuple[str, ...] | None = None
     mount_at: str = MOUNT_AT_BINDS
     quota_mode: str = "simple"
+    #: In-image Eden backing repo name (#1567): the single-component
+    #: directory name under ``.eden-backing/`` every Eden slot in this
+    #: project's image must clone from. None keeps caller-supplied
+    #: backing paths (the historical behaviour).
+    eden_backing_repo: str | None = None
 
     def applies_on(self, machine: str) -> bool:
         """Whether this section applies on the host named ``machine``."""
@@ -150,6 +160,14 @@ WORKTREES_IMAGE_DOCS: dict[str, str] = {
         "where the kernel and btrfs-progs support them, else full qgroups) or full. "
         "Mounting never changes an existing image's mode; status reports the active one."
     ),
+    "eden_backing_repo": (
+        "Optional name of the one Eden backing repository inside the image "
+        "(<image mount>/.eden-backing/<name>, its own subvolume outside every "
+        "slot). When set, create --eden accepts only that name or its resolved "
+        "in-image path and refuses anything else, so Eden metadata stays in "
+        "the image. Seed it with `wrkslots worktrees-image seed-eden-backing`; "
+        "absent keeps caller-supplied backing paths."
+    ),
 }
 
 
@@ -169,6 +187,7 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
             "machines",
             "mount_at",
             "quota_mode",
+            "eden_backing_repo",
         }
     )
     if unknown:
@@ -231,6 +250,22 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
         raise WorktreesImageError(
             f"configuration.worktrees_image.quota_mode must be one of {', '.join(QUOTA_MODES)}, not {quota_mode!r}"
         )
+    eden_backing = value.get("eden_backing_repo")
+    if eden_backing is not None:
+        # Validated on every host like `machines`: one plain directory
+        # component, never the validation entry or a traversal.
+        if (
+            not isinstance(eden_backing, str)
+            or not eden_backing
+            or eden_backing != eden_backing.strip()
+            or "/" in eden_backing
+            or eden_backing in {".", "..", VALIDATE_SUBDIR}
+            or any(char.isspace() for char in eden_backing)
+        ):
+            raise WorktreesImageError(
+                "configuration.worktrees_image.eden_backing_repo must be one "
+                "plain directory name (no path separators, spaces, or 'validate')"
+            )
     return WorktreesImageSettings(
         relative_path=candidate.as_posix(),
         size_bytes=size,
@@ -240,6 +275,7 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
         machines=tuple(machines) if machines is not None else None,
         mount_at=str(mount_at),
         quota_mode=str(quota_mode),
+        eden_backing_repo=str(eden_backing) if eden_backing is not None else None,
     )
 
 
@@ -295,6 +331,32 @@ def validate_image_dir(slots_dir: Path) -> Path:
     """The validation storage directory inside the mounted image."""
 
     return slots_dir / VALIDATE_SUBDIR
+
+
+def eden_backing_root(mount_point: Path) -> Path:
+    """The in-image Eden backing root: a top-level entry of the mount (#1567)."""
+
+    return mount_point / EDEN_BACKING_SUBDIR
+
+
+def eden_backing_repo_path(mount_point: Path, name: str) -> Path:
+    """One in-image Eden backing repo inside :func:`eden_backing_root`."""
+
+    return eden_backing_root(mount_point) / name
+
+
+def ensure_eden_backing_root(mount_point: Path) -> Path:
+    """Create the backing root as its own subvolume if absent (no quota).
+
+    Bounded by the image itself; a per-slot quota must never cap the
+    store every slot shares. Never removed with a slot: every slot
+    deletion path names only that slot's own subvolume or path.
+    """
+
+    root = eden_backing_root(mount_point)
+    if not root.exists():
+        create_slot_subvolume(root, None)
+    return root
 
 
 def validate_external_dir(slots_dir: Path) -> Path:
@@ -379,6 +441,37 @@ def _run(argv: list[str], *, sudo: bool = False) -> subprocess.CompletedProcess[
         detail = (result.stderr or result.stdout).strip()
         raise WorktreesImageError(f"{' '.join(command)} failed: {detail}")
     return result
+
+
+def _parse_qgroup_referenced(text: str, qgroupid: str) -> int | None:
+    """Referenced bytes for one qgroup from raw ``qgroup show`` output."""
+
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == qgroupid:
+            try:
+                return int(fields[1])
+            except ValueError:
+                return None
+    return None
+
+
+def qgroup_referenced_bytes(mount_point: Path, subvolume: Path) -> int | None:
+    """Referenced bytes of one subvolume, or None when unavailable."""
+
+    try:
+        rootid = _run(
+            ["btrfs", "inspect-internal", "rootid", str(subvolume)]
+        ).stdout.strip()
+        output = _run(
+            ["btrfs", "qgroup", "show", "-re", "--raw", str(mount_point)],
+            sudo=True,
+        ).stdout
+    except WorktreesImageError:
+        return None
+    if not rootid.isdigit():
+        return None
+    return _parse_qgroup_referenced(output, f"0/{rootid}")
 
 
 def _quotas_enabled(mount_point: Path) -> bool:
@@ -1079,4 +1172,17 @@ def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings)
         stat = image_file.stat()
         report["apparent_bytes"] = stat.st_size
         report["allocated_bytes"] = stat.st_blocks * 512
+    if settings.eden_backing_repo is not None:
+        from wrkslots import eden
+
+        backing_path = eden_backing_repo_path(mount_point, settings.eden_backing_repo)
+        problem = (
+            eden.backing_repo_problem(backing_path) if state == MOUNTED else None
+        )
+        report["eden_backing"] = {
+            "configured_name": settings.eden_backing_repo,
+            "path": str(backing_path),
+            "present": backing_path.is_dir() if state == MOUNTED else False,
+            "repo_ok": problem is None and state == MOUNTED,
+        }
     return report

@@ -88,6 +88,7 @@ def _expected(
             None
             if config.worktrees_image is None
             else {
+                "eden_backing_repo": config.worktrees_image.eden_backing_repo,
                 "fs": config.worktrees_image.filesystem,
                 "machines": (
                     None

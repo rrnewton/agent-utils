@@ -707,7 +707,8 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
                     | "slot_quota_bytes"
                     | "machines"
                     | "mount_at"
-                    | "quota_mode",
+                    | "quota_mode"
+                    | "eden_backing_repo",
             )
         })
         .collect();
@@ -815,7 +816,29 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
             json!(parsed)
         }
     };
+    let eden_backing_repo = match section.get("eden_backing_repo") {
+        None | Some(Value::Null) => Value::Null,
+        Some(value) => {
+            let invalid = || {
+                "configuration.worktrees_image.eden_backing_repo must be one plain directory name (no path separators, spaces, or 'validate')"
+                    .to_owned()
+            };
+            let Some(name) = value.as_str() else {
+                return Err(invalid());
+            };
+            if name.is_empty()
+                || name.trim() != name
+                || name.contains('/')
+                || matches!(name, "." | ".." | "validate")
+                || name.chars().any(char::is_whitespace)
+            {
+                return Err(invalid());
+            }
+            json!(name)
+        }
+    };
     Ok(json!({
+        "eden_backing_repo": eden_backing_repo,
         "fs": filesystem,
         "machines": machines,
         "mount": mount,

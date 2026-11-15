@@ -233,6 +233,48 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     wt_grow.set_defaults(handler=_cmd_wt_image_grow)
     wt_trim = wt_actions.add_parser("trim", help="return freed guest blocks to the host (fstrim)")
     wt_trim.set_defaults(handler=_cmd_wt_image_trim)
+    wt_seed = wt_actions.add_parser(
+        "seed-eden-backing",
+        help="seed the configured in-image Eden backing repo from a host backing repo (dry run by default)",
+        description=(
+            "Clone the host Eden backing repository named by --from into the "
+            "image at <image mount>/.eden-backing/<eden_backing_repo> (its own "
+            "subvolume, outside every slot, never removed with a slot), so "
+            "Eden slots keep their metadata inside the image (#1567). This is "
+            "a coordinator operation: run it deliberately, never from a lane. "
+            "The default is a dry run: it measures the source, checks the "
+            "image free space, and prints the exact clone command and report "
+            "fields, writing nothing; --yes performs the clone into a staging "
+            "directory, proves the copy stands alone (its default path reset "
+            "to the source's own upstream, a standalone sl log read, no "
+            "shared-store reference), and only then renames it into place. "
+            "A lazy store still fetches content from that upstream on demand, "
+            "exactly like the host backing; the report says so. Deleting a "
+            "seeded backing is manual and out of scope: remove every Eden "
+            "slot first, then delete its subvolume by hand."
+        ),
+        epilog=(
+            "examples:\n"
+            "  wrkslots worktrees-image seed-eden-backing --from ~/local/.eden-backing-repos/source-repo\n"
+            "  wrkslots worktrees-image seed-eden-backing --from ~/local/.eden-backing-repos/source-repo --yes\n"
+            "  wrkslots worktrees-image seed-eden-backing --from ~/local/.eden-backing-repos/source-repo --format json"
+        ),
+        formatter_class=formatter,
+    )
+    wt_seed.add_argument(
+        "--from", dest="source", required=True, metavar="PATH",
+        help="host Eden backing repository to clone from (absolute path)",
+    )
+    wt_seed.add_argument(
+        "--yes", action="store_true",
+        help="perform the seed (default: dry run - measure and report only)",
+    )
+    wt_seed.add_argument(
+        "--clean-staging", action="store_true",
+        help="with --yes: remove leftover .seeding-<name>-* staging dirs first",
+    )
+    wt_seed.add_argument("--format", choices=("human", "json"), default="human")
+    wt_seed.set_defaults(handler=_cmd_wt_seed_eden_backing)
     wt_migrate_layout = wt_actions.add_parser(
         "migrate-layout",
         help="switch the image between per-slot binds and mounting at the slots directory",
@@ -908,6 +950,161 @@ def _cmd_wt_image_trim(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_wt_seed_eden_backing(args: argparse.Namespace) -> int:
+    """Seed the in-image Eden backing repo; dry run unless --yes (#1567)."""
+
+    import time
+    from typing import cast
+
+    from wrkslots import cli, eden
+
+    config, settings = _wt_settings(args)
+    if settings.eden_backing_repo is None:
+        raise _refuse(
+            "configuration.worktrees_image.eden_backing_repo is not set; name "
+            "the in-image backing repo there before seeding it"
+        )
+    if config.worktrees_image_state != worktreesimage.MOUNTED:
+        raise _refuse(
+            f"worktrees image is {config.worktrees_image_state}; run "
+            "'wrkslots worktrees-image mount' first"
+        )
+    source = Path(args.source).expanduser()
+    if not source.is_absolute():
+        raise _refuse(f"--from must be an absolute path: {args.source!r}")
+    problem = eden.backing_repo_problem(source)
+    if problem is not None:
+        raise _refuse(problem)
+    name = settings.eden_backing_repo
+    mount_point = settings.mount_point(config.control, config.worktrees)
+    root = worktreesimage.eden_backing_root(mount_point)
+    final = worktreesimage.eden_backing_repo_path(mount_point, name)
+    staging_prefix = f".seeding-{name}-"
+    staging_name = f"{staging_prefix}{secrets.token_hex(4)}"
+    leftovers = (
+        sorted(
+            entry.name
+            for entry in root.iterdir()
+            if entry.name.startswith(staging_prefix)
+        )
+        if root.is_dir()
+        else []
+    )
+    source_bytes, source_files = eden.measure_tree(source)
+    facts = eden.backing_facts(source)
+    free_before = shutil.disk_usage(mount_point).free
+    report: dict[str, object] = {
+        "dry_run": not args.yes,
+        "source": str(source),
+        "source_bytes": source_bytes,
+        "source_files": source_files,
+        "lazy_store": facts["lazy"],
+        "requires": [
+            str(item)
+            for item in cast("tuple[str, ...]", facts["requires"])
+        ],
+        "upstream_default_path": facts["default_path"],
+        "destination": str(final),
+        "already_seeded": final.exists(),
+        "staging_leftovers": leftovers,
+        "image_free_bytes_before": free_before,
+        "seed_command": ["sl", "clone", "-U", str(source), str(root / staging_name)],
+        "note": (
+            "a lazy store still fetches content from its upstream on demand, "
+            "exactly like the host backing"
+            if facts["lazy"]
+            else "store is not lazy by its requires markers"
+        ),
+    }
+    if not args.yes:
+        if args.format == "json":
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"dry run: would seed {final} from {source}")
+            print(f"source_bytes={source_bytes} source_files={source_files}")
+            print(f"lazy_store={facts['lazy']} upstream={facts['default_path']}")
+            print(f"image_free_bytes={free_before}")
+            print(f"command: {' '.join(report['seed_command'])}")  # type: ignore[arg-type]
+            print(f"note: {report['note']}")
+            if final.exists():
+                print("already seeded: destination exists; --yes would refuse")
+        return 0
+    if final.exists():
+        raise _refuse(f"eden backing already seeded at {final}; refusing to overwrite")
+    if leftovers and not args.clean_staging:
+        raise _refuse(
+            f"leftover seed staging in {root}: {', '.join(leftovers)}; "
+            "inspect it, then rerun with --clean-staging to remove only those"
+        )
+    if free_before < source_bytes:
+        raise _refuse(
+            f"image has {free_before} free bytes at {mount_point}, less than "
+            f"the source's {source_bytes}; grow the image first"
+        )
+    started = time.monotonic()
+    with cli._mutation_locks(config, args.wait_lock):
+        state = cli._load_active(config)
+        in_use = sorted(
+            record.slot
+            for record in state.slots
+            for checkout in record.checkouts
+            if checkout.vcs == "eden" and checkout.repository == str(final)
+        )
+        if in_use:
+            raise _refuse(
+                f"active Eden slots already name {final}: {', '.join(in_use)}; "
+                "seeding under a live checkout is refused"
+            )
+        try:
+            worktreesimage.ensure_eden_backing_root(mount_point)
+            if args.clean_staging:
+                for leftover in leftovers:
+                    shutil.rmtree(root / leftover)
+            staging = root / staging_name
+            eden.seed_backing_repo(cli._eden_runner, source, staging)
+            if os.stat(staging).st_dev == os.stat(source).st_dev:
+                raise _refuse(
+                    "seeded copy shares a device with its source, so its "
+                    "store files may be hardlinks; not publishing it "
+                    f"(staging kept at {staging})"
+                )
+            os.rename(staging, final)
+            descriptor = os.open(root, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except (eden.EdenError, worktreesimage.WorktreesImageError, OSError) as exc:
+            raise _refuse(str(exc)) from exc
+    dest_bytes, dest_files = eden.measure_tree(final)
+    report.update(
+        {
+            "dry_run": False,
+            "dest_bytes": dest_bytes,
+            "dest_files": dest_files,
+            "wall_seconds": round(time.monotonic() - started, 3),
+            "image_free_bytes_after": shutil.disk_usage(mount_point).free,
+            "qgroup_referenced_bytes": worktreesimage.qgroup_referenced_bytes(
+                mount_point, root
+            ),
+        }
+    )
+    if args.format == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"seeded {final} from {source}")
+        print(f"source_bytes={source_bytes} dest_bytes={dest_bytes}")
+        print(f"wall_seconds={report['wall_seconds']}")
+        print(
+            f"image_free_bytes before={free_before} "
+            f"after={report['image_free_bytes_after']}"
+        )
+        print(f"qgroup_referenced_bytes={report['qgroup_referenced_bytes']}")
+        print(f"lazy_store={facts['lazy']} upstream={facts['default_path']}")
+        print(f"note: {report['note']}")
+    return 0
+
+
 def _lock_slot_checkouts(config: "cli.Config", slot: str, slot_type: str) -> None:
     """Take wrkslots' image Git lock on every checkout of one slot row.
 
@@ -1428,7 +1625,8 @@ def _migrate_layout_to_binds(
             )
     _layout_unknown_entries(
         config.worktrees,
-        {record.slot for record in agents} | {worktreesimage.VALIDATE_SUBDIR},
+        {record.slot for record in agents}
+        | {worktreesimage.VALIDATE_SUBDIR, worktreesimage.EDEN_BACKING_SUBDIR},
         what=f"slots directory {config.worktrees}",
     )
     validate_dir = cli._validate_slots_directory(config)

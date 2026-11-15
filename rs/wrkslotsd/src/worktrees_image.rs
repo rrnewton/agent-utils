@@ -37,6 +37,7 @@ pub(crate) struct WorktreesImageSettings {
     pub(crate) machines: Option<Vec<String>>,
     pub(crate) mount_at: String,
     pub(crate) quota_mode: String,
+    pub(crate) eden_backing_repo: Option<String>,
 }
 
 impl WorktreesImageSettings {
@@ -135,6 +136,7 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
         "machines",
         "mount_at",
         "quota_mode",
+        "eden_backing_repo",
     ];
     let mut unknown: Vec<&String> = map
         .keys()
@@ -251,6 +253,27 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
             Some(parsed)
         }
     };
+    let eden_backing_repo = match map.get("eden_backing_repo") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let invalid = || {
+                "configuration.worktrees_image.eden_backing_repo must be one plain directory name (no path separators, spaces, or 'validate')"
+                    .to_string()
+            };
+            let Some(name) = value.as_str() else {
+                return Err(invalid());
+            };
+            if name.is_empty()
+                || name.trim() != name
+                || name.contains('/')
+                || matches!(name, "." | ".." | "validate")
+                || name.chars().any(char::is_whitespace)
+            {
+                return Err(invalid());
+            }
+            Some(name.to_string())
+        }
+    };
     Ok(WorktreesImageSettings {
         relative_path: raw_path.replace('\\', "/"),
         size_bytes: size.unwrap_or_default(),
@@ -260,6 +283,7 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
         machines,
         mount_at: mount_at.to_string(),
         quota_mode: quota_mode.to_string(),
+        eden_backing_repo,
     })
 }
 
@@ -1041,6 +1065,22 @@ pub(crate) fn status_report_with_quota(
             report.insert("allocated_bytes".into(), json!(meta.blocks() * 512));
         }
     }
+    if let Some(name) = &settings.eden_backing_repo {
+        let backing_path = mount_dir.join(".eden-backing").join(name);
+        let repo_ok = state == MOUNTED
+            && backing_path.join(".hg/requires").is_file()
+            && backing_path.join(".hg/store").is_dir()
+            && !backing_path.join(".hg/sharedpath").exists();
+        report.insert(
+            "eden_backing".into(),
+            json!({
+                "configured_name": name,
+                "path": backing_path.to_string_lossy(),
+                "present": state == MOUNTED && backing_path.is_dir(),
+                "repo_ok": repo_ok,
+            }),
+        );
+    }
     Value::Object(report)
 }
 
@@ -1101,6 +1141,7 @@ fn render_report_json(report: &Value) -> String {
         "validate_bind",
         "apparent_bytes",
         "allocated_bytes",
+        "eden_backing",
         "lock_missing",
         "lock_check_error",
     ];
@@ -1114,11 +1155,18 @@ fn render_report_json(report: &Value) -> String {
                         let inner: Vec<String> = map
                             .iter()
                             .map(|(k, v)| {
-                                format!(
-                                    "    {}: {}",
-                                    py_str(k),
-                                    py_str(v.as_str().unwrap_or_default())
-                                )
+                                let rendered = match v {
+                                    Value::Bool(flag) => {
+                                        if *flag {
+                                            "true".to_string()
+                                        } else {
+                                            "false".to_string()
+                                        }
+                                    }
+                                    Value::String(text) => py_str(text),
+                                    other => other.to_string(),
+                                };
+                                format!("    {}: {}", py_str(k), rendered)
                             })
                             .collect();
                         format!("{{\n{}\n  }}", inner.join(",\n"))
@@ -1862,6 +1910,7 @@ mod tests {
             machines: None,
             mount_at: "binds".to_string(),
             quota_mode: "simple".to_string(),
+            eden_backing_repo: None,
         };
         let ctx = WtCtx {
             root: &root,
@@ -2024,6 +2073,7 @@ mod tests {
             machines: None,
             mount_at: "binds".to_string(),
             quota_mode: "simple".to_string(),
+            eden_backing_repo: None,
         };
         let ctx = WtCtx {
             root: &root,

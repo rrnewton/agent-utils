@@ -5409,6 +5409,23 @@ def _remove_slot_directory(config: Config, path: Path) -> None:
     refusal wording.
     """
 
+    if _is_eden_backing_entry(config, path):
+        raise Refusal(
+            f"refusing to remove the in-image Eden backing root as a slot: {path}"
+        )
+    settings = config.worktrees_image
+    if settings is not None and eden.is_inside(
+        str(path),
+        str(
+            worktreesimage.eden_backing_root(
+                settings.mount_point(config.control, config.worktrees)
+            )
+        ),
+    ):
+        raise Refusal(
+            f"refusing to remove inside the in-image Eden backing root: {path}"
+        )
+
     image = _slot_image_at(config, path)
     if image is None:
         bind_slot = _worktrees_bind_slot(config, path)
@@ -11921,6 +11938,7 @@ def _registry_storage_inconsistencies(
                 and not entry.name.startswith("EVENTS.")
                 and entry != config.control / "wrkslots"
                 and not _is_representation_directory(config, entry)
+                and not _is_eden_backing_entry(config, entry)
                 and not (
                     slot_type == "agent"
                     and _is_validate_storage_entry(config, entry)
@@ -15068,6 +15086,7 @@ def _assert_registry_storage_consistent(
             and not entry.name.startswith("EVENTS.")
             and entry != config.control / "wrkslots"
             and not _is_representation_directory(config, entry)
+            and not _is_eden_backing_entry(config, entry)
             and not (
                 slot_type == "agent"
                 and _is_validate_storage_entry(config, entry)
@@ -22400,6 +22419,17 @@ def _validate_image_directory(config: Config) -> Path:
 
 def _is_validate_storage_entry(config: Config, entry: Path) -> bool:
     return entry in (_validate_slots_directory(config), _validate_image_directory(config))
+
+
+def _is_eden_backing_entry(config: Config, entry: Path) -> bool:
+    """The in-image Eden backing root (#1567): storage, never a slot."""
+
+    settings = config.worktrees_image
+    if settings is None:
+        return False
+    return entry == worktreesimage.eden_backing_root(
+        settings.mount_point(config.control, config.worktrees)
+    )
 
 
 def _slot_roots(config: Config) -> dict[str, Path]:
@@ -37797,6 +37827,95 @@ def _eden_discovery_doctor_findings(
     return findings
 
 
+def _eden_backing_doctor_findings(
+    config: Config, states: Sequence[ActiveState]
+) -> list[dict[str, object]]:
+    """Doctor findings for the in-image Eden backing (#1567), read-only."""
+
+    settings = config.worktrees_image
+    findings: list[dict[str, object]] = []
+    if settings is not None and settings.eden_backing_repo is not None:
+        name = settings.eden_backing_repo
+        if config.worktrees_image_state != worktreesimage.MOUNTED:
+            findings.append(
+                _operational_finding(
+                    "eden-backing",
+                    None,
+                    config.machine,
+                    "configuration.worktrees_image.eden_backing_repo="
+                    f"{name!r} cannot be checked: worktrees image is "
+                    f"{config.worktrees_image_state}; remedy: "
+                    "wrkslots worktrees-image mount",
+                )
+            )
+        else:
+            mount_point = settings.mount_point(config.control, config.worktrees)
+            resolved = worktreesimage.eden_backing_repo_path(mount_point, name)
+            problem = eden.backing_repo_problem(resolved)
+            if problem is not None:
+                findings.append(
+                    _operational_finding(
+                        "eden-backing",
+                        None,
+                        config.machine,
+                        f"{problem}; remedy: wrkslots worktrees-image "
+                        "seed-eden-backing --from <host backing repo>",
+                    )
+                )
+            root = worktreesimage.eden_backing_root(mount_point)
+            if root.is_dir():
+                for entry in sorted(root.iterdir(), key=lambda item: item.name):
+                    if entry.name.startswith(f".seeding-{name}-"):
+                        findings.append(
+                            _operational_finding(
+                                "eden-backing",
+                                None,
+                                config.machine,
+                                f"interrupted seed staging left at {entry}; "
+                                "inspect it, then rerun seed-eden-backing "
+                                "--yes --clean-staging",
+                            )
+                        )
+    for state in states:
+        if state.machine != config.machine:
+            continue
+        for record in state.slots:
+            for checkout in record.checkouts:
+                if checkout.vcs != "eden":
+                    continue
+                if _is_eden_backing_entry(
+                    config, Path(checkout.repository).parent
+                ) or (
+                    settings is not None
+                    and eden.is_inside(
+                        checkout.repository,
+                        str(
+                            worktreesimage.eden_backing_root(
+                                settings.mount_point(
+                                    config.control, config.worktrees
+                                )
+                            )
+                        ),
+                    )
+                ):
+                    continue
+                for root_path in _slot_roots(config).values():
+                    if eden.is_inside(checkout.repository, str(root_path)):
+                        finding = _operational_finding(
+                            "eden-backing",
+                            record.slot,
+                            record.machine,
+                            "Eden backing repository "
+                            f"{checkout.repository} lives inside slot "
+                            "storage; backings belong outside slots (host "
+                            "store or the in-image .eden-backing root)",
+                        )
+                        finding["checkout"] = checkout.name
+                        findings.append(finding)
+                        break
+    return findings
+
+
 def _shared_submodule_doctor_findings(
     config: Config, states: Sequence[ActiveState]
 ) -> list[dict[str, object]]:
@@ -38403,7 +38522,50 @@ def _edenfs_unit_name(config_dir: str) -> str:
     return f"edenfs@{escaped}.service"
 
 
+def _resolve_eden_backing(config: Config, given: str) -> str:
+    """Resolve a create --eden backing against the in-image rule (#1567).
+
+    Unconfigured: the caller-supplied path stands. Configured: the
+    given name or its resolved in-image path is accepted and
+    normalised to the resolved path; anything else refuses before
+    anything is written (validate, never silently override: a
+    switched backing would orphan local-store-only commits). Create
+    never seeds; an unseeded backing refuses naming the seed verb.
+    """
+
+    settings = config.worktrees_image
+    if settings is None or settings.eden_backing_repo is None:
+        return given
+    if config.worktrees_image_state != worktreesimage.MOUNTED:
+        raise Refusal(
+            "configuration.worktrees_image.eden_backing_repo is set but the "
+            f"worktrees image is {config.worktrees_image_state}; run "
+            "'wrkslots worktrees-image mount' first"
+        )
+    mount_point = settings.mount_point(config.control, config.worktrees)
+    resolved = worktreesimage.eden_backing_repo_path(
+        mount_point, settings.eden_backing_repo
+    )
+    if given not in {settings.eden_backing_repo, str(resolved)}:
+        raise Refusal(
+            f"create --eden backing {given!r} does not match "
+            "configuration.worktrees_image.eden_backing_repo "
+            f"{settings.eden_backing_repo!r} (in-image: {resolved}); pass "
+            f"main={settings.eden_backing_repo} or main={resolved}, or unset "
+            "eden_backing_repo to use an external backing"
+        )
+    problem = eden.backing_repo_problem(resolved)
+    if problem is not None:
+        raise Refusal(
+            f"{problem}; seed it with 'wrkslots worktrees-image "
+            "seed-eden-backing --from <host backing repo>' (dry run by "
+            "default), then retry"
+        )
+    return str(resolved)
+
+
 def _eden_create_plan(
+    config: Config,
     args: argparse.Namespace,
 ) -> tuple[str, str, str | None]:
     """Validate the single --eden assignment; writes nothing."""
@@ -38417,7 +38579,7 @@ def _eden_create_plan(
     unknown = sorted(set(rev_map) - set(eden_map))
     if unknown:
         raise Refusal(f"Eden revision supplied for unknown checkout: {', '.join(unknown)}")
-    return name, backing, rev_map.get(name)
+    return name, _resolve_eden_backing(config, backing), rev_map.get(name)
 
 
 def _assert_eden_host_cap(config: Config) -> None:
@@ -38760,7 +38922,7 @@ def _provision_eden_slot(
     journal.
     """
 
-    name, backing, requested_rev = _eden_create_plan(args)
+    name, backing, requested_rev = _eden_create_plan(config, args)
     config_dir = slot_path / ".eden-state"
     mount = slot_path / "checkout"
     in_slot_targets: list[str] = []
@@ -39093,7 +39255,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         if getattr(args, "eden", None):
             if getattr(args, "repo", None) or getattr(args, "branch", None):
                 raise Refusal("create --eden cannot combine with --repo/--branch")
-            checkout_name, backing, requested_rev = _eden_create_plan(args)
+            checkout_name, backing, requested_rev = _eden_create_plan(config, args)
             _assert_eden_host_cap(config)
             created_at = _utc_now()
             operation_id = uuid.uuid4().hex
@@ -49056,6 +49218,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 or entry.is_symlink()
                 or entry.name.startswith("EVENTS.")
                 or _is_validate_storage_entry(config, entry)
+                or _is_eden_backing_entry(config, entry)
                 or _is_representation_directory(config, entry)
                 or entry.name in registered_slots
             ):
@@ -52197,6 +52360,7 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         findings.extend(_shared_submodule_doctor_findings(config, states))
         findings.extend(_harness_checkout_doctor_findings(config, states))
         findings.extend(_eden_discovery_doctor_findings(config, states))
+        findings.extend(_eden_backing_doctor_findings(config, states))
         doctor_records = [record for state in states for record in state.slots]
         doctor_liveness = cache.owner_liveness(config, doctor_records)
         rows = [

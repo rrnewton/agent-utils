@@ -135,6 +135,7 @@ fn render_wt_report(report: &Value) -> String {
         "validate_bind",
         "apparent_bytes",
         "allocated_bytes",
+        "eden_backing",
     ];
     let parts: Vec<String> = keys
         .iter()

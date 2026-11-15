@@ -89,6 +89,7 @@ pub(crate) const WORKTREES_IMAGE_DOCS: &[(&str, &str)] = &[
     ("machines", "Optional list of machine names (the configuration's machine identity) the worktrees image applies on. A host not listed behaves exactly as if the section were absent, so the section is safe to commit: the image exists on the named hosts only. Absent means every host."),
     ("mount_at", "Where the image mounts: binds (default; mounted beside the control files, one bind mount per slot) or worktrees_dir (mounted at the slots directory, slot subvolumes as its top-level entries, no binds). Change it only with `wrkslots worktrees-image migrate-layout`."),
     ("quota_mode", "Quota accounting for a new image: simple (default; btrfs simple quotas where the kernel and btrfs-progs support them, else full qgroups) or full. Mounting never changes an existing image's mode; status reports the active one."),
+    ("eden_backing_repo", "Optional name of the one Eden backing repository inside the image (<image mount>/.eden-backing/<name>, its own subvolume outside every slot). When set, create --eden accepts only that name or its resolved in-image path and refuses anything else, so Eden metadata stays in the image. Seed it with `wrkslots worktrees-image seed-eden-backing`; absent keeps caller-supplied backing paths."),
 ];
 
 pub(crate) const OPTIONAL_KEYS: &[&str] = &[
