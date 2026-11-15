@@ -590,7 +590,8 @@ impl HttpSlackClient {
         }
         // `#617 cold-load-first-paint`: within the method's ceiling, by priority. A person's request
         // and live work wait for room within their budget; naming, crawl work and a read the cache
-        // stands in for are refused at once.
+        // stands in for are refused at once. `#1682 slack-rate-limit-budget`: so are the page's
+        // background reads (`poll`, `side`), at their own half of the ceiling.
         let ceiling = self.calls_per_minute.get(method).copied();
         loop {
             let wait = {
@@ -611,7 +612,7 @@ impl HttpSlackClient {
                     }
                 }
             };
-            if priority <= super::budget::Priority::Background
+            if priority <= super::budget::Priority::Page
                 || patience == Patience::BestEffort
                 || *waited + wait > RATE_LIMIT_BUDGET
             {

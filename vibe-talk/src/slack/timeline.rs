@@ -380,6 +380,26 @@ enum Replies {
 /// once the ones before it cost nothing; until then the page is told its replies are not all in All.
 pub const FLAT_UPSTREAM_THREADS: usize = 10;
 
+/// How many threads one Flat read for the page's background poll or thread pane
+/// (`poll`, `side`) may read upstream that cost a call (`#1682
+/// slack-rate-limit-budget`). A poll repeats every few seconds and the cache
+/// stands in for it, so it reads the most recently active few and leaves the
+/// rest — the page says they were not read just now — for the next poll, once
+/// the ones it did read cost nothing (`flat_free`). A read a person is waiting
+/// on, and every server read, keeps [`FLAT_UPSTREAM_THREADS`].
+pub const FLAT_PAGE_UPSTREAM_THREADS: usize = 3;
+
+/// The page cap stays below the whole cap, or it would cap nothing.
+const _: () = assert!(FLAT_PAGE_UPSTREAM_THREADS < FLAT_UPSTREAM_THREADS);
+
+/// The costly-thread cap of one Flat read made for `reason`.
+pub fn flat_upstream_cap(reason: ReadReason) -> usize {
+    match super::budget::Priority::of(reason) {
+        super::budget::Priority::Page => FLAT_PAGE_UPSTREAM_THREADS,
+        _ => FLAT_UPSTREAM_THREADS,
+    }
+}
+
 /// How long the thread list's scan of a conversation's newest history answers its steps back
 /// ("Older threads…"): a minute. `#611 timeline-read-failures`: the scan is up to
 /// [`THREAD_SCAN_PAGES`] requests, and every step back made it again. Only steps back: a newest
@@ -788,7 +808,9 @@ impl HttpSlackClient {
         let source = crate::held_replies::current();
         // `#611 timeline-read-failures`. A thread whose replies cannot be read is left out, not the
         // whole page failed; after a rate limit no further thread of this read is asked for; and at
-        // most `FLAT_UPSTREAM_THREADS` threads that cost a call are read.
+        // most `FLAT_UPSTREAM_THREADS` threads that cost a call are read — fewer for the page's
+        // background reads (`flat_upstream_cap`, `#1682 slack-rate-limit-budget`).
+        let upstream_cap = flat_upstream_cap(ReadReason::current());
         let stopped = std::sync::atomic::AtomicBool::new(false);
         let costly = std::sync::atomic::AtomicUsize::new(0);
         let reads: Vec<_> = roots
@@ -809,8 +831,7 @@ impl HttpSlackClient {
                     }
                     let ordering = std::sync::atomic::Ordering::SeqCst;
                     if !self.flat_free(conversation, root)
-                        && (stopped.load(ordering)
-                            || costly.fetch_add(1, ordering) >= FLAT_UPSTREAM_THREADS)
+                        && (stopped.load(ordering) || costly.fetch_add(1, ordering) >= upstream_cap)
                     {
                         return Replies::Skipped;
                     }
@@ -1914,7 +1935,7 @@ fn encode_directory(cursor: &DirectoryCursor) -> Result<String, ChatError> {
 mod tests {
     use serde_json::json;
 
-    use super::{root_says_replies_after, Raw};
+    use super::{flat_upstream_cap, root_says_replies_after, Raw};
 
     fn root(fields: serde_json::Value) -> Raw {
         let mut value = json!({"type": "message", "ts": "1700000000.000100", "text": "root"});
@@ -1944,5 +1965,31 @@ mod tests {
         assert_eq!(root_says_replies_after(&unnamed, i64::MAX), None);
         let blank = root(json!({"reply_count": 3, "latest_reply": ""}));
         assert_eq!(root_says_replies_after(&blank, i64::MAX), None);
+    }
+
+    /// `#1682 slack-rate-limit-budget`: a page-poll Flat read fans out to fewer
+    /// costly threads than a read a person is waiting on; the threads it skips
+    /// are picked up by the next poll, once the ones it read cost nothing.
+    #[test]
+    fn a_page_poll_flat_read_fans_out_to_fewer_threads_than_a_person_s_read() {
+        use super::{FLAT_PAGE_UPSTREAM_THREADS, FLAT_UPSTREAM_THREADS};
+        use crate::read_reason::ReadReason;
+        assert_eq!(
+            flat_upstream_cap(ReadReason::Poll),
+            FLAT_PAGE_UPSTREAM_THREADS
+        );
+        assert_eq!(
+            flat_upstream_cap(ReadReason::Side),
+            FLAT_PAGE_UPSTREAM_THREADS
+        );
+        for reason in [
+            ReadReason::Enter,
+            ReadReason::Live,
+            ReadReason::Untagged,
+            ReadReason::LivePoll,
+            ReadReason::Relist,
+        ] {
+            assert_eq!(flat_upstream_cap(reason), FLAT_UPSTREAM_THREADS, "{reason}");
+        }
     }
 }

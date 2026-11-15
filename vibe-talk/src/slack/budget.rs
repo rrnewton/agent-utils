@@ -19,6 +19,9 @@
 //! * **interactive** — the page's reads, speech, a voice agent's tools, and anything that says
 //!   nothing of what it is for (an untagged request may be a person's);
 //! * **live** — the live poller, relist, the reachability probe, the reply-mark check;
+//! * **page** — the page's background poll and its thread pane (`poll`, `side`): the reads the
+//!   message cache stands in for, capped at half of each method's ceiling so they cannot spend
+//!   the room live work and a person's read need (`#1682 slack-rate-limit-budget`);
 //! * **background** — thread naming and a summary's window;
 //! * **crawl** — backfill and the shadow's check.
 //!
@@ -116,9 +119,14 @@ pub fn gives_way(method: &str) -> bool {
 
 /// Whether a read at `priority` that gives way makes only one try while the provider is limiting:
 /// it never waits out a `Retry-After`, its own or another's. Live work, naming and crawl work.
+/// Page work is not one-try: with no cache standing in for it, it waits out a short limit like
+/// a person's read; the reads the cache does stand in for give up through `hurried` instead.
 #[must_use]
 pub fn one_try_while_limiting(priority: Priority) -> bool {
-    priority <= Priority::Live
+    matches!(
+        priority,
+        Priority::Crawl | Priority::Background | Priority::Live
+    )
 }
 
 /// How long a write waits before its next try, having been sent `attempts` times and refused
@@ -144,8 +152,10 @@ pub enum WhileLimiting {
 
 /// What a read that gives way ([`gives_way`]) at `priority` does while the provider is limiting: a
 /// write goes; naming and crawl work pause; live work goes ([`one_try_while_limiting`]) except
-/// while a send is in flight; a person's read the message cache would answer (`hurried`) pauses,
-/// and any other holds for a send in flight.
+/// while a send is in flight; a read the message cache would answer (`hurried`) — a person's or
+/// the page's background read alike — pauses, and any other such read holds for a send in
+/// flight. So a page read with no cache standing in for it waits out a short limit like a
+/// person's does; only its ceiling share and its hurried pauses are smaller.
 #[must_use]
 pub fn while_limiting(priority: Priority, hurried: bool, writes_in_flight: bool) -> WhileLimiting {
     match priority {
@@ -153,9 +163,9 @@ pub fn while_limiting(priority: Priority, hurried: bool, writes_in_flight: bool)
         Priority::Crawl | Priority::Background => WhileLimiting::Pause,
         Priority::Live if writes_in_flight => WhileLimiting::Pause,
         Priority::Live => WhileLimiting::Go,
-        Priority::Interactive if hurried => WhileLimiting::Pause,
-        Priority::Interactive if writes_in_flight => WhileLimiting::HoldForWrites,
-        Priority::Interactive => WhileLimiting::Go,
+        Priority::Page | Priority::Interactive if hurried => WhileLimiting::Pause,
+        Priority::Page | Priority::Interactive if writes_in_flight => WhileLimiting::HoldForWrites,
+        Priority::Page | Priority::Interactive => WhileLimiting::Go,
     }
 }
 
@@ -166,6 +176,9 @@ pub enum Priority {
     Crawl,
     /// Thread naming and a summary's window.
     Background,
+    /// The page's background poll and thread pane: what the message cache stands in for, held
+    /// to half of each method's ceiling (`#1682 slack-rate-limit-budget`).
+    Page,
     /// What keeps the page current without being asked: the live poller, relist, the probe.
     Live,
     /// What a person is waiting on.
@@ -182,6 +195,7 @@ impl Priority {
             ReadReason::Write => Self::Write,
             ReadReason::Backfill | ReadReason::Shadow => Self::Crawl,
             ReadReason::Naming | ReadReason::SummaryWindow => Self::Background,
+            ReadReason::Poll | ReadReason::Side => Self::Page,
             ReadReason::Relist
             | ReadReason::Probe
             | ReadReason::ReplyMark
@@ -194,15 +208,15 @@ impl Priority {
 impl Priority {
     /// How many requests of a method with `ceiling` a minute may have been sent in the last minute,
     /// by everyone, for a request at this priority to go: the whole ceiling for a person's request
-    /// and live work, three quarters for naming and summaries, half for crawl work. So what
-    /// keeps the page current always has room the rest cannot take. A write is never held to a
-    /// ceiling; this is its whole for completeness.
+    /// and live work, three quarters for naming and summaries, half for the page's background
+    /// reads and for crawl work. So what keeps the page current always has room the rest cannot
+    /// take. A write is never held to a ceiling; this is its whole for completeness.
     #[must_use]
     pub fn share(self, ceiling: usize) -> usize {
         match self {
             Self::Write | Self::Interactive | Self::Live => ceiling,
             Self::Background => (ceiling * 3 / 4).max(1),
-            Self::Crawl => (ceiling / 2).max(1),
+            Self::Page | Self::Crawl => (ceiling / 2).max(1),
         }
     }
 }
@@ -474,7 +488,10 @@ mod tests {
 
     #[test]
     fn a_person_s_read_comes_first_then_live_work_then_naming_then_backfill() {
-        assert_eq!(Priority::of(ReadReason::Side), Priority::Interactive);
+        // `#1682 slack-rate-limit-budget`: the page's background poll and thread pane are
+        // page work, below live work; a read a person is waiting on stays interactive.
+        assert_eq!(Priority::of(ReadReason::Poll), Priority::Page);
+        assert_eq!(Priority::of(ReadReason::Side), Priority::Page);
         assert_eq!(Priority::of(ReadReason::Counts), Priority::Interactive);
         // An untagged request may be a person's send.
         assert_eq!(Priority::of(ReadReason::Untagged), Priority::Interactive);
@@ -484,7 +501,8 @@ mod tests {
         assert_eq!(Priority::of(ReadReason::Backfill), Priority::Crawl);
         assert_eq!(Priority::of(ReadReason::Shadow), Priority::Crawl);
         assert!(Priority::Interactive > Priority::Live);
-        assert!(Priority::Live > Priority::Background);
+        assert!(Priority::Live > Priority::Page);
+        assert!(Priority::Page > Priority::Background);
         assert!(Priority::Background > Priority::Crawl);
         // `#699 vt-send-priority`: a post and the reads it makes first come before a person's read.
         assert_eq!(Priority::of(ReadReason::Write), Priority::Write);
@@ -512,8 +530,16 @@ mod tests {
         );
         assert_eq!(while_limiting(Priority::Live, false, false), Go);
         assert_eq!(while_limiting(Priority::Live, false, true), Pause);
+        // `#1682 slack-rate-limit-budget`: page work follows a person's read here — a
+        // hurried one (the cache stands in for it) pauses, an unhurried one goes or
+        // holds for a send — and it is not one-try, so an unhurried page read waits
+        // out a short limit.
+        assert_eq!(while_limiting(Priority::Page, true, false), Pause);
+        assert_eq!(while_limiting(Priority::Page, false, false), Go);
+        assert_eq!(while_limiting(Priority::Page, false, true), HoldForWrites);
         // Live work, naming and crawl work make one try; a person's read waits as before.
         assert!(one_try_while_limiting(Priority::Live));
+        assert!(!one_try_while_limiting(Priority::Page));
         assert!(one_try_while_limiting(Priority::Crawl));
         assert!(!one_try_while_limiting(Priority::Interactive));
         // Only the reads that drain the bucket give way; lookups never do.
@@ -578,6 +604,38 @@ mod tests {
         );
         assert_eq!(
             sent.ceiling_wait(METHOD, Priority::Interactive, 20, now + WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn page_reads_stop_at_half_the_ceiling_and_leave_the_rest_to_live_and_interactive() {
+        // `#1682 slack-rate-limit-budget`: ten page reads of a method with a ceiling of
+        // twenty spend the page share; the next page read waits (and is refused at once by
+        // the caller) while live work and a person's read still go.
+        const METHOD: &str = "conversations.replies";
+        let now = Instant::now();
+        let mut sent = Sent::default();
+        for _ in 0..10 {
+            sent.record(METHOD, Priority::Page, now);
+        }
+        assert!(sent.ceiling_wait(METHOD, Priority::Page, 20, now).is_some());
+        assert_eq!(sent.ceiling_wait(METHOD, Priority::Live, 20, now), None);
+        assert_eq!(
+            sent.ceiling_wait(METHOD, Priority::Interactive, 20, now),
+            None
+        );
+        // The shares themselves: page and crawl half, naming three quarters, the rest whole.
+        assert_eq!(Priority::Page.share(20), 10);
+        assert_eq!(Priority::Background.share(20), 15);
+        assert_eq!(Priority::Live.share(20), 20);
+        // Another method's allowance is its own, and a minute later the count has gone.
+        assert_eq!(
+            sent.ceiling_wait("conversations.history", Priority::Page, 20, now),
+            None
+        );
+        assert_eq!(
+            sent.ceiling_wait(METHOD, Priority::Page, 20, now + WINDOW),
             None
         );
     }
