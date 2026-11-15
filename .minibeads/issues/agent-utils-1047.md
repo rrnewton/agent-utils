@@ -1,11 +1,12 @@
 ---
 title: 'documents-list-order: newest first, live, with mention jumps and Back'
-status: open
+status: closed
 priority: 1
 issue_type: task
 external_ref: gh-313
 created_at: 2026-11-08T03:56:24.148372742+00:00
-updated_at: 2026-11-08T03:56:24.148372742+00:00
+updated_at: 2026-11-15T17:47:04.000000000+00:00
+closed_at: 2026-11-15T17:47:04.000000000+00:00
 ---
 
 # Description
@@ -27,3 +28,7 @@ Newest at top with mentioned-ago times; pull and live refresh; mention jump with
 ## Notes
 
 [watermelon-full-preview] mu-docview. Number confirmed by its issue-only commit on main before citing.
+
+## Resolution
+
+[watermelon-full-preview] Delivered on main by a73cad8afadfbfd8e02e65f59ab3c6e2e0bbe479 (Documents live, with mention jumps and a Back level) and 472d5c003826e6591860f72e05d5e072c6e7f09b (mention-jump Back): mentioned-ago times, scroll paging, drag/live refresh, mention jumps, the render-side title guard, and Back from the reader. Covered by vibe-talk/tests/js/view/documents.test.mjs and the browser walk in vibe-talk/tests/documents_browser.py. Supersession: the newest-at-top order in the acceptance criteria was later deliberately reversed to newest-at-the-bottom by 60e0e36ecacb77bcecb0f907ca68f319f320f85f under #1079 documents-chronological (closed), matching the message views; that decision supersedes the ordering sentence here rather than leaving it outstanding. Closed during GitHub triage (Request 098) alongside GitHub #313.

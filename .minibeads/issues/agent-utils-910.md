@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-undeclared-nested-submodule: removal accepts or bundles a nested submodule the primary no longer declares'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-05T22:24:35.078892251+00:00
-updated_at: 2026-11-05T22:24:35.078892251+00:00
+updated_at: 2026-11-15T17:47:04.000000000+00:00
+closed_at: 2026-11-15T17:47:04.000000000+00:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ A precursor refusal, "source submodule is not a Git root", came for nested submo
 # Notes
 
 Reported by the lead on 2026-11-05 at 5:21 PM ET (P1, wrkslots reclaim on the lead host; about 48 GB was blocked across two dead slots). Related: #864 (nested unlisted module salvage). Assigned to the dedicated wrkslots lane.
+
+## Resolution
+
+[watermelon-full-preview] Delivered on main by fae1ebce0ccab8749e12fd0ecec2fc42741ada50 (with #871 wrkslots-unlisted-module-salvage): a nested submodule the primary no longer declares, or never initialised, is judged by the slot copy's own recorded remote instead of refusing. Acceptance tests in py/wrkslots/tests/test_lifecycle.py: test_remove_accepts_nested_submodule_the_primary_dropped_when_remote_verified (remote-verified receipt), test_remove_bundles_nested_submodule_the_primary_dropped_when_unpublished, and test_remove_skips_an_uninitialised_nested_submodule. The refuse-naming criterion is covered strictly by #1255 wrkslots-private-history-refusal (67d1b0d43c48d0d28c934008f38b2f963d72b1c0): test_remove_refuses_unpushed_private_history_with_counts and test_remove_refuses_private_history_no_ref_names refuse on this fixture naming counts and refs, including commits only a reflog or no name holds. Note the deliberate stricter semantics from #1255: private history on side refs refuses by default and bundles only under --archive-private-history, rather than bundling automatically. Closed during GitHub triage (Request 098) alongside GitHub #300 and #301.

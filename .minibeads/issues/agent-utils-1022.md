@@ -1,11 +1,12 @@
 ---
 title: 'documents-view-client: three-way selector, Documents list and reader draft'
-status: open
+status: closed
 priority: 1
 issue_type: task
 external_ref: gh-309
 created_at: 2026-11-07T17:47:48.041198347+00:00
-updated_at: 2026-11-07T17:47:48.041198347+00:00
+updated_at: 2026-11-15T17:47:04.000000000+00:00
+closed_at: 2026-11-15T17:47:04.000000000+00:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ New modules under vibe-talk/web/src/view/documents/ (list, reader, safe escaped 
 ## Notes
 
 [watermelon-full-preview] Filed by mu-docview. Draft lands as its own commit after #624 batch 78 (888124cc); mu-refactor rebases over the mount.
+
+## Resolution
+
+[watermelon-full-preview] Delivered on main by cb07ed26117c6ac8de3cb1a5d6c92aeb96fdb2f3 (the Documents view, its reader and the three-way view selector). Modules live under vibe-talk/web/src/view/documents/; tests in vibe-talk/tests/js/view/documents.test.mjs cover the Voice/Channel/Documents rotation, inert rendering of a malicious document, deep links, and Ctrl+5 entry. Selector presentation has since evolved to a three-cell tab row while tapping through; rotation, labels, and direct choice are preserved and tested. The broader design tracker #629 remains open separately. Closed during GitHub triage (Request 098) alongside GitHub #309.

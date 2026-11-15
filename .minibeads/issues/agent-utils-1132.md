@@ -1,10 +1,11 @@
 ---
 title: 'restore-already-restored-truth: a rerun in the same boot replays recorded outcomes instead of reading as a fresh success'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T13:45:50.286593800+00:00
-updated_at: 2026-11-09T13:45:55.614924813+00:00
+updated_at: 2026-11-15T17:47:04.000000000+00:00
+closed_at: 2026-11-15T17:47:04.000000000+00:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ The recorded report is read from the per-registry restore-reports location, so o
 # Notes
 
 Scope gap (d) from the 2026-11-09 reboot restore; the restore agent's note names the same slug. Touches the same-boot short-circuit and exit mapping in both agentctl editions plus the host table's replay rendering. Depends on the per-registry report location so the replay reads the right file.
+
+## Resolution
+
+[watermelon-full-preview] Delivered on main by 92628aeed62ef2c169a9376dc5b31f9b03f8d1a0 (replay the recorded restore report on a same-boot rerun), with per-registry report location in 4d465ba54115944d8f2990be96a8c6939d2de018. A non-force rerun returns the recorded payload labelled already-restored with replayed=true, and restore_exit_code follows the recorded run (0 clean, 74 complete with refused lanes, 75 incomplete). Tests in rs/agentctl/src/subagents/tests/restore.rs: restore_exit_code_follows_the_recorded_run, restore_refuses_an_ambiguous_muse_lane_per_lane_and_carries_on (drives the real restore entry point twice and asserts the replayed refused row keeps its reason), and restore_manager_restart_same_boot_runs_for_real_and_then_replays_the_new_epoch. Closed during GitHub triage (Request 098) alongside GitHub #318.

@@ -1,11 +1,12 @@
 ---
 title: 'documents-moved-fallback: find a moved document by file name on a branch 404'
-status: open
+status: closed
 priority: 1
 issue_type: task
 external_ref: gh-312
 created_at: 2026-11-08T00:38:00.546193208+00:00
-updated_at: 2026-11-08T00:38:00.546193208+00:00
+updated_at: 2026-11-15T17:47:04.000000000+00:00
+closed_at: 2026-11-15T17:47:04.000000000+00:00
 ---
 
 # Description
@@ -27,3 +28,7 @@ Moved document fetches and shows 'moved to <new path>' on the row and in the rea
 ## Notes
 
 [watermelon-full-preview] mu-docview. Number to be confirmed by its issue-only commit on main before citing.
+
+## Resolution
+
+[watermelon-full-preview] Delivered on main by 2e035c9ed6c7d22107b56645706e8a3b5c248ca1 (fetch a moved document from its new home). On a branch-ref 404 the fetcher looks the file name up in the repository tree (vibe-talk/src/documents.rs) and fetches the single match, marking it moved. Fake-GitHub tests in vibe-talk/tests/documents.rs: a_moved_document_fetches_from_its_new_home, a_missing_or_ambiguous_document_says_not_found, and a_commit_ref_never_looks_in_the_tree. Closed during GitHub triage (Request 098) alongside GitHub #312.
