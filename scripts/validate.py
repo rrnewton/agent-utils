@@ -191,6 +191,8 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # and Python workspaces merely to reach the repository-wide mypy invocation.
     ("vibe-talk/scripts/", frozenset({VIBE_TALK})),
     ("vibe-talk/", frozenset({VIBE_TALK})),
+    # The root container-context filter exists only for the vibe-talk image build.
+    (".dockerignore", frozenset({VIBE_TALK})),
     # Shared workspace manifests and test configuration can affect every component. Tool-owned
     # source below these paths is resolved through validation/components.json instead.
     # Workspace dependency, feature, and profile changes can alter both implementations' runtime
@@ -1612,6 +1614,7 @@ def self_test() -> int:
             )
 
     expect(["vibe-talk/src/ops.rs"], {VIBE_TALK}, "a vibe-talk change must not drag in the workspace contract")
+    expect([".dockerignore"], {VIBE_TALK}, "the root container-context filter belongs to the vibe-talk image build")
     expect(["vibe-talk/web/voice.js", "vibe-talk/README.md"], {VIBE_TALK, VIBE_TALK_PAGE}, "a page file plus a vibe-talk doc selects both the page group and the full vibe-talk group")
     expect(["vibe-talk/web/src/present/card.js"], {VIBE_TALK_PAGE}, "a page-only change selects the page group, not the operator and formatting checks")
     expect(["vibe-talk/web/voice.js", "rs/tick-hub/src/lib.rs"], {VIBE_TALK_PAGE, RUST}, "a cross-area change is the union of both areas", {"tick-hub"})
