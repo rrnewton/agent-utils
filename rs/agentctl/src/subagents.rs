@@ -12637,6 +12637,26 @@ its drain would also type, so it was not queued",
         }
     }
 
+    /// Press one bare Enter in `agent_name`'s pane (#1560
+    /// harness-agnostic-stuck-paste-backstop): the watcher backstop's only
+    /// action, taken only after it matched the pane's lower region against
+    /// a prompt agentctl delivered. No composer is read here — that is the
+    /// point of the general path; the lifecycle lock, the input-allowed
+    /// check and the recipient check are the same guards a typed prompt
+    /// passes.
+    pub fn press_enter(&self, agent_name: &str) -> Result<String> {
+        let _lock = self.lock(agent_name)?;
+        let record = self.load(agent_name)?;
+        record.input_allowed()?;
+        self.checked(&record)?;
+        let pane_id = record
+            .pane_id
+            .clone()
+            .ok_or_else(|| fail(format!("agent {agent_name} has no pane")))?;
+        self.client.send_keys(&pane_id, "Enter")?;
+        Ok(format!("pressed Enter in {agent_name}'s pane {pane_id}"))
+    }
+
     /// Force a redraw of `agent_name`'s TUI (recovery ladder step 2):
     /// SIGWINCH to the pinned harness process makes every harness here
     /// repaint; the screen is re-read and returned as evidence.

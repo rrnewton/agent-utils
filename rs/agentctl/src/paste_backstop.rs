@@ -1,0 +1,463 @@
+//! The harness-agnostic stuck-paste backstop (#1560): one general watcher
+//! path that submits a delivered prompt sitting unsubmitted in any pane,
+//! whatever TUI draws it.
+//!
+//! The per-harness composer readers (`submission::composer_view`, the Muse
+//! editor reader) know where one harness draws its input box; an unknown
+//! TUI, and any busy layout a reader cannot split, has no such reader, so a
+//! sweep gated on them never presses Enter there (#1546). This module needs
+//! no composer recognition: it remembers the prompts agentctl delivered
+//! (its own queue records), reads the pane's visible lower region as screen
+//! text only, and fuzzy-matches the two.
+//!
+//! Match rule: both sides are normalised by dropping box-drawing and prompt
+//! glyphs and removing every whitespace character (a TUI wraps a long line
+//! at any character, inside a word as well as between words, and the screen
+//! does not say which, so wrapping and re-flow cannot hide a stuck paste).
+//! A prompt of at most [`BackstopConfig::short_max`] normalised characters
+//! matches only whole; a longer one matches when its first and last
+//! [`BackstopConfig::anchor`] normalised characters both appear, in order.
+//! Three guards keep a submitted prompt from ever counting, because every
+//! TUI echoes a submitted prompt into its transcript:
+//!
+//! * Position: the match must end within the last
+//!   [`BackstopConfig::tail_rows`] content rows of the region, ignoring
+//!   footer and hint rows below a blank or rule row. A stuck paste sits at
+//!   the bottom; an echoed prompt has the agent's output after it.
+//! * Static screen: the normalised region, with digit runs and spinner
+//!   glyphs neutralised, must be identical across the polls that count. A
+//!   working agent's screen changes; a stuck paste does not.
+//! * Busy: where a harness reader knows the agent is working, the caller
+//!   holds (see `sweep_paste_backstop` in `agent_watch`).
+//!
+//! A long paste drawn only as a placeholder (`[Pasted Content N chars]`,
+//! `[Pasted text #K +M lines]`) has no text on screen to match, so it stays
+//! with the per-harness readers; this backstop covers every text-visible
+//! stuck paste, on every harness including an unknown one.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+use std::time::Duration;
+
+use serde_json::Value;
+
+/// Knobs for the backstop, in one place so tests drive poll counts and fake
+/// times instead of wall-clock budgets. The production defaults are sized
+/// so a normal submit never triggers: submission clears the lower region
+/// within a poll or two, long before three polls spanning 45 s accumulate.
+#[derive(Clone, Copy, Debug)]
+pub struct BackstopConfig {
+    /// Visible rows read at the bottom of the pane.
+    pub region_rows: usize,
+    /// Consecutive matching polls required before a press.
+    pub polls: u32,
+    /// Minimum span those polls must cover.
+    pub span: Duration,
+    /// Enter presses per prompt before the pane is reported blocked.
+    pub max_presses: u32,
+    /// Minimum time between two presses for one prompt.
+    pub press_spacing: Duration,
+    /// How long after delivery a prompt may still be pressed.
+    pub expire: Duration,
+    /// Normalised characters matched at each end of a long prompt.
+    pub anchor: usize,
+    /// Longest normalised prompt matched whole instead of by anchors.
+    pub short_max: usize,
+    /// Content rows below the match end that still count as the bottom.
+    pub tail_rows: usize,
+}
+
+impl Default for BackstopConfig {
+    fn default() -> Self {
+        Self {
+            region_rows: 24,
+            polls: 3,
+            span: Duration::from_secs(45),
+            max_presses: 3,
+            press_spacing: Duration::from_secs(20),
+            expire: Duration::from_secs(2 * 3600),
+            anchor: 40,
+            short_max: 80,
+            tail_rows: 4,
+        }
+    }
+}
+
+/// One prompt agentctl delivered, from its queue records: the only texts
+/// the backstop may ever match, so someone else's text cannot be submitted
+/// by construction.
+#[derive(Clone, Debug)]
+pub struct DeliveredPrompt {
+    /// The queue message ID.
+    pub id: String,
+    /// The text as typed (`typed_as`, else the queued `text`).
+    pub text: String,
+    /// When it was typed, in Unix seconds.
+    pub typed_at: f64,
+}
+
+/// Whether `text` is one agentctl framed: a sender header, one of its own
+/// `[agentctl ...]` notices, or a batch of queued messages. Mirrors the
+/// framing rule the stale-draft attribution uses.
+fn framed(text: &str) -> bool {
+    let first = text.lines().next().unwrap_or_default();
+    crate::sender_header::parse(first).is_some()
+        || first.starts_with("[agentctl ")
+        || first
+            .strip_suffix(" queued messages:")
+            .is_some_and(|count| {
+                !count.is_empty() && count.bytes().all(|value| value.is_ascii_digit())
+            })
+}
+
+/// The prompts agentctl typed for the agent whose queue is at `queue`,
+/// newest first, typed within `lookback` of `now` (Unix seconds). Typed
+/// lanes are `processed/` and `failed/` (typed at `inflight_at`); a pending
+/// prompt a pass left stranded (its record carries `stranded_at`) was typed
+/// too and may be drawn late. A prompt quarantined as typed into the wrong
+/// program never counts.
+pub fn delivered_prompts(queue: &Path, now: f64, lookback: Duration) -> Vec<DeliveredPrompt> {
+    let oldest = now - lookback.as_secs_f64();
+    let mut found: Vec<DeliveredPrompt> = Vec::new();
+    for (phase, stranded) in [
+        ("processed", false),
+        ("failed", false),
+        ("inbox", true),
+        ("inbox.v2", true),
+    ] {
+        let Ok(entries) = std::fs::read_dir(queue.join(phase)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Ok(Value::Object(document)) = crate::agent::read_private_json(&path) else {
+                continue;
+            };
+            if document.get("probable_misroute") == Some(&Value::Bool(true)) {
+                continue;
+            }
+            let typed_at = if stranded {
+                if document.get("stranded_at").is_none_or(Value::is_null) {
+                    continue;
+                }
+                document.get("stranded_at").and_then(Value::as_f64)
+            } else {
+                document.get("inflight_at").and_then(Value::as_f64)
+            };
+            let Some(typed_at) = typed_at.filter(|at| *at >= oldest && *at <= now + 1.0) else {
+                continue;
+            };
+            let Some(id) = document.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let text = ["typed_as", "text"]
+                .iter()
+                .filter_map(|field| document.get(*field).and_then(Value::as_str))
+                .find(|text| framed(text));
+            let Some(text) = text else {
+                continue;
+            };
+            found.push(DeliveredPrompt {
+                id: id.to_owned(),
+                text: text.to_owned(),
+                typed_at,
+            });
+        }
+    }
+    found.sort_by(|left, right| right.typed_at.total_cmp(&left.typed_at));
+    found.dedup_by(|next, kept| next.id == kept.id);
+    found.truncate(20);
+    found
+}
+
+/// Box-drawing characters a TUI frames its composer with: decoration, never
+/// prompt text.
+fn is_box_drawing(value: char) -> bool {
+    ('\u{2500}'..='\u{257f}').contains(&value) || ('\u{2580}'..='\u{259f}').contains(&value)
+}
+
+/// `text` with the `sent:` field (whose stated delay depends on when the
+/// prompt was typed) taken out of every sender header in it, as the
+/// stale-draft matcher does: the screen may redraw a header the queue
+/// recorded at a different second.
+fn without_sent_fields(compacted: &str) -> String {
+    let mut out = String::with_capacity(compacted.len());
+    let mut rest = compacted;
+    while let Some(start) = rest.find("[from") {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = tail.find(']') else {
+            out.push_str(tail);
+            return out;
+        };
+        let header = &tail[..end];
+        match header.find("·sent:") {
+            Some(at) => {
+                let after = &header[at + "·sent:".len()..];
+                out.push_str(&header[..at]);
+                out.push_str(after.find('·').map_or("", |next| &after[next..]));
+            }
+            None => out.push_str(header),
+        }
+        out.push(']');
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One screen row normalised for matching or fingerprinting: leading prompt
+/// glyphs dropped, box-drawing dropped, every whitespace character removed.
+fn normalise_row(row: &str) -> String {
+    let body = row.trim_start_matches(|value: char| {
+        value.is_whitespace() || matches!(value, '❯' | '›' | '>' | '◆' | '●' | '⏺')
+    });
+    without_sent_fields(
+        &body
+            .chars()
+            .filter(|value| !value.is_whitespace() && !is_box_drawing(*value))
+            .collect::<String>(),
+    )
+}
+
+/// A prompt normalised the same way rows are.
+fn normalise_prompt(text: &str) -> String {
+    text.lines().map(normalise_row).collect::<Vec<_>>().join("")
+}
+
+/// The last `region_rows` rows of `screen`, as plain text rows.
+fn region_rows(screen: &str, config: &BackstopConfig) -> Vec<String> {
+    let plain = crate::harness_tui::plain(screen);
+    let lines: Vec<&str> = plain.lines().collect();
+    let start = lines.len().saturating_sub(config.region_rows);
+    lines[start..]
+        .iter()
+        .map(|line| (*line).to_owned())
+        .collect()
+}
+
+/// Whether `row` ends the content: blank after normalisation, or a rule a
+/// TUI draws under its composer. Footer and hint rows below such a row are
+/// chrome, not content.
+fn is_separator(row: &str) -> bool {
+    row.is_empty()
+        || row
+            .chars()
+            .all(|value| is_box_drawing(value) || matches!(value, '-' | '=' | '_'))
+}
+
+/// The row index of the last content row in `rows`: the last non-blank row,
+/// moved above the first blank-or-rule separator found scanning up from
+/// the bottom, so a footer below the composer's bottom rule (or a terminals
+/// panel below a rule) never counts as content after a stuck paste.
+fn last_content_row(rows: &[String]) -> Option<usize> {
+    let mut last = rows.len();
+    while last > 0 && rows[last - 1].trim().is_empty() {
+        last -= 1;
+    }
+    if last == 0 {
+        return None;
+    }
+    let mut index = last - 1;
+    loop {
+        if is_separator(&rows[index]) && index + 1 < last {
+            // Everything below this separator is chrome.
+            let mut above = index;
+            while above > 0 && rows[above - 1].trim().is_empty() {
+                above -= 1;
+            }
+            return (above > 0).then_some(above - 1);
+        }
+        if index == 0 {
+            return Some(last - 1);
+        }
+        index -= 1;
+    }
+}
+
+/// Where a delivered prompt matches in a screen, by the row its match ends
+/// on. `None` when it does not match, or when it matches only as an echoed
+/// transcript prompt with content after it (the position guard).
+pub struct RegionMatch {
+    /// Row the match ends on, within the region.
+    pub end_row: usize,
+}
+
+/// Fuzzy-match `prompt` (a delivered prompt's raw text) against the visible
+/// lower region of `screen`, under the module's match and position rules.
+pub fn match_region(prompt: &str, screen: &str, config: &BackstopConfig) -> Option<RegionMatch> {
+    let rows = region_rows(screen, config);
+    let normalised: Vec<String> = rows.iter().map(|row| normalise_row(row)).collect();
+    // Character offsets of each row in the joined normalised region.
+    let mut offsets: Vec<(usize, usize)> = Vec::with_capacity(normalised.len());
+    let mut joined = String::new();
+    for row in &normalised {
+        offsets.push((joined.len(), joined.len() + row.len()));
+        joined.push_str(row);
+    }
+    let needle = normalise_prompt(prompt);
+    if needle.is_empty() {
+        return None;
+    }
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let end_char = if needle_chars.len() <= config.short_max {
+        joined.find(&needle).map(|at| at + needle.len())
+    } else {
+        let head: String = needle_chars[..config.anchor].iter().collect();
+        let tail: String = needle_chars[needle_chars.len() - config.anchor..]
+            .iter()
+            .collect();
+        let head_at = joined.find(&head)?;
+        joined[head_at + head.len()..]
+            .find(&tail)
+            .map(|at| head_at + head.len() + at + tail.len())
+    }?;
+    // Map the match end (a byte offset) back to its row.
+    let end_row = offsets
+        .iter()
+        .rposition(|(start, end)| end_char > *start && end_char <= *end)
+        .or_else(|| offsets.iter().rposition(|(_, end)| *end <= end_char))?;
+    let last_content = last_content_row(&rows)?;
+    if end_row > last_content || last_content - end_row > config.tail_rows {
+        return None;
+    }
+    Some(RegionMatch { end_row })
+}
+
+/// A fingerprint of the screen's lower region that changes only when its
+/// text does: normalised like a match, with digit runs collapsed to one
+/// digit (a timer or clock ticking) and spinner glyphs removed, so a stuck
+/// paste behind a ticking clock still counts as a static screen while any
+/// real output resets the count.
+pub fn static_fingerprint(screen: &str, config: &BackstopConfig) -> u64 {
+    let rows = region_rows(screen, config);
+    let mut stable = String::new();
+    for row in &rows {
+        let mut previous_digit = false;
+        for value in row.chars() {
+            if ('\u{2800}'..='\u{28ff}').contains(&value)
+                || matches!(value, '◐' | '◑' | '◒' | '◓' | '◔' | '◕')
+            {
+                continue;
+            }
+            if value.is_ascii_digit() {
+                if !previous_digit {
+                    stable.push('0');
+                }
+                previous_digit = true;
+            } else {
+                previous_digit = false;
+                stable.push(value);
+            }
+        }
+        stable.push('\n');
+    }
+    let normalised = normalise_row(&stable);
+    let mut hasher = DefaultHasher::new();
+    normalised.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROMPT: &str = "[from lane-a via agentctl · reply: agentctl send lane-a]\nfirst line of the message\nsecond line follows here\nafter. Needs your disposition (ledger-tree file). Details in the queue.";
+
+    fn config() -> BackstopConfig {
+        BackstopConfig::default()
+    }
+
+    #[test]
+    fn wrapped_and_reflowed_text_still_matches() {
+        // The same prompt wrapped at another width, with box-drawing and a
+        // prompt glyph the queue record does not have.
+        let screen = "◆ earlier work\n────────────────\n❯ [from lane-a via agentctl · reply: agentctl send\n  lane-a] first line of the message second line\n  follows here after. Needs your disposition\n  (ledger-tree file). Details in the queue.\n────────────────\n  model · context left\n";
+        assert!(match_region(PROMPT, screen, &config()).is_some());
+    }
+
+    #[test]
+    fn foreign_text_does_not_match() {
+        let screen = "❯ a person's own half-written note about the ledger\n────────────────\n";
+        assert!(match_region(PROMPT, screen, &config()).is_none());
+        // A short shared phrase is not a match either: a short prompt counts
+        // only whole, a long one only by both anchors.
+        let screen = "❯ first line of the message\n────────────────\n";
+        assert!(match_region(PROMPT, screen, &config()).is_none());
+    }
+
+    #[test]
+    fn an_echoed_prompt_with_output_after_it_does_not_match() {
+        // Submitted: the prompt sits in the transcript with the agent's
+        // finished output below it, on an idle pane.
+        let screen = "❯ [from lane-a via agentctl · reply: agentctl send lane-a]\nfirst line of the message\nsecond line follows here\nafter. Needs your disposition (ledger-tree file). Details in the queue.\n● I read the ledger and filed the disposition.\n  The queue now holds two items.\n  Both are ready for review.\n  Nothing else is pending.\n  Closing the turn now.\n";
+        assert!(match_region(PROMPT, screen, &config()).is_none());
+    }
+
+    #[test]
+    fn a_short_prompt_matches_only_whole() {
+        let prompt = "short task: check the gate";
+        let screen = "❯ short task: check the gate\n────\n";
+        assert!(match_region(prompt, screen, &config()).is_some());
+        let screen = "❯ short task: check\n────\n";
+        assert!(match_region(prompt, screen, &config()).is_none());
+    }
+
+    #[test]
+    fn a_footer_below_the_composer_rule_is_not_content_after() {
+        let screen = "❯ first line of the message second line follows here after. Needs your disposition (ledger-tree file). Details in the queue.\n────────────────\n  GPT · /work · ← for agents · ? for shortcuts\n";
+        // The one-line prompt on screen is the delivered prompt wrapped onto
+        // one row; head and tail anchors both show above the rule.
+        let prompt = "first line of the message second line follows here after. Needs your disposition (ledger-tree file). Details in the queue.";
+        assert!(match_region(prompt, screen, &config()).is_some());
+    }
+
+    #[test]
+    fn a_ticking_clock_and_spinner_keep_the_fingerprint() {
+        let stuck = "❯ first line of the message\n────\n⠋ working 1:24\n";
+        let later = "❯ first line of the message\n────\n⠙ working 1:25\n";
+        assert_eq!(
+            static_fingerprint(stuck, &config()),
+            static_fingerprint(later, &config())
+        );
+        let changed = "❯ first line of the message\n● new output arrived\n────\n⠙ working 1:25\n";
+        assert_ne!(
+            static_fingerprint(stuck, &config()),
+            static_fingerprint(changed, &config())
+        );
+    }
+
+    #[test]
+    fn delivered_prompts_reads_only_framed_typed_records() {
+        use std::os::unix::fs::DirBuilderExt;
+        let queue = std::env::temp_dir().join(format!("agentctl-backstop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(queue.join("processed"))
+            .unwrap();
+        crate::agent::atomic_json(
+            &queue.join("processed/lane.json"),
+            &serde_json::json!({"id": "lane", "text": PROMPT,
+                                "inflight_at": 1_000.0}),
+        )
+        .unwrap();
+        crate::agent::atomic_json(
+            &queue.join("processed/foreign.json"),
+            &serde_json::json!({"id": "foreign", "text": "typed by a person",
+                                "inflight_at": 1_000.0}),
+        )
+        .unwrap();
+        let found = delivered_prompts(&queue, 1_100.0, Duration::from_secs(3600));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].id, "lane");
+        // Outside the lookback it is no longer a candidate.
+        assert!(delivered_prompts(&queue, 9_999.0, Duration::from_secs(3600)).is_empty());
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+}

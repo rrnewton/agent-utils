@@ -970,6 +970,11 @@ struct WatchState {
     /// agentctl-paste-tail-flush), by agent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     draft_sweeps: BTreeMap<String, DraftSweep>,
+    /// Stuck delivered prompts under the harness-agnostic backstop
+    /// (#1560), by agent: persisted so the poll count, press cap and
+    /// blocked report survive watcher restarts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    general_backstop: BTreeMap<String, BackstopEntry>,
     /// Recovery-ladder episodes (phase 2), by agent: persisted so the
     /// bounded escalation survives watcher restarts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1203,6 +1208,24 @@ struct DraftSweep {
     blocked_reported: bool,
 }
 
+/// One agent's stuck delivered prompt under the harness-agnostic backstop
+/// (#1560): which prompt, when its match run began, how many consecutive
+/// static polls matched, how many Enters were pressed or failed, and
+/// whether the cap's BLOCKED notice was sent.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct BackstopEntry {
+    prompt_id: String,
+    first_matched: f64,
+    polls: u32,
+    presses: u32,
+    failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_press_at: Option<f64>,
+    region_hash: u64,
+    blocked_reported: bool,
+    held_reported: bool,
+}
+
 /// An owner (chat-bridge) request waiting undelivered in a registered agent's queue.
 #[derive(Clone, Debug)]
 pub struct WaitingOwnerPrompt {
@@ -1431,6 +1454,14 @@ pub trait Notifier {
     fn flush_draft(&mut self, agent: &str) -> Result<String> {
         let _ = agent;
         Err(fail("this notifier cannot flush editor drafts"))
+    }
+    /// Press one bare Enter in `agent`'s pane, with no composer reading:
+    /// the harness-agnostic backstop's only action (#1560). The caller has
+    /// already proved the stuck text is a prompt agentctl delivered. The
+    /// default cannot act, only report.
+    fn press_enter(&mut self, agent: &str) -> Result<String> {
+        let _ = agent;
+        Err(fail("this notifier cannot press Enter"))
     }
     /// Recovery ladder step 1: submit a stranded draft of ours (bare Enter).
     fn ladder_sweep(&mut self, agent: &str) -> Result<String> {
@@ -3704,6 +3735,34 @@ fn watch_agents_once(
         now,
         options,
     );
+    // Harness-agnostic backstop (#1560), the primary stuck-paste path, on
+    // the same screens; the per-harness sweep above is its refinement, so
+    // an agent it just flushed is recorded here but not pressed again.
+    let flushed_agents: BTreeSet<String> = draft_sweeps
+        .iter()
+        .filter(|row| row["action"] == "flushed")
+        .filter_map(|row| row["agent"].as_str().map(str::to_owned))
+        .collect();
+    let paste_backstop = sweep_paste_backstop(
+        probe,
+        notifier,
+        state,
+        observations
+            .iter()
+            .filter_map(|row| {
+                row.screen.clone().map(|screen| {
+                    (
+                        row.name.clone(),
+                        screen,
+                        row.harness.clone().unwrap_or_default(),
+                    )
+                })
+            })
+            .collect(),
+        &flushed_agents,
+        now,
+        options,
+    );
     let ladder = run_recovery_ladder(probe, notifier, state, &observations, now, options);
     let status_requests = report_status_requests(probe, notifier, state, &went_idle, now, options);
     // Agent-teams health (#721): declaration red flags, undeliverable notices, and the
@@ -3782,6 +3841,7 @@ fn watch_agents_once(
         "owner_waits": owner_waits,
         "quarantines": quarantines,
         "draft_sweeps": draft_sweeps,
+        "paste_backstop": paste_backstop,
         "ladder": ladder,
         "status_requests": status_requests,
         "team_declarations": team_flags,
@@ -3898,17 +3958,40 @@ fn check_blocked(
             )
         })
         .collect();
-    let draft_sweeps = sweep_editor_drafts(probe, notifier, state, editor_screens, now, options);
+    let draft_sweeps =
+        sweep_editor_drafts(probe, notifier, state, editor_screens.clone(), now, options);
+    // The general backstop runs on the quick check too (#1560), on the
+    // same screens; an agent the sweep just flushed is not pressed again.
+    let flushed_agents: BTreeSet<String> = draft_sweeps
+        .iter()
+        .filter(|row| row["action"] == "flushed")
+        .filter_map(|row| row["agent"].as_str().map(str::to_owned))
+        .collect();
+    let paste_backstop = sweep_paste_backstop(
+        probe,
+        notifier,
+        state,
+        editor_screens,
+        &flushed_agents,
+        now,
+        options,
+    );
     // The coordinator has no episode memory here either: its dedicated check
     // runs on the quick cadence too, so its prompt pages within minutes (#1158).
     let coordinator_blocked = report_coordinator_blocked(probe, notifier, state, now, options);
     let retry_due = state.batches.iter().any(|batch| !batch.retry.waiting(now));
-    if found.is_empty() && draft_sweeps.is_empty() && !retry_due && coordinator_blocked.is_none() {
+    if found.is_empty()
+        && draft_sweeps.is_empty()
+        && paste_backstop.is_empty()
+        && !retry_due
+        && coordinator_blocked.is_none()
+    {
         return None;
     }
     let notice = flush_notices(state, notifier, now, options);
     Some(json!({"checked_at": now, "found": found, "notice": notice,
                 "coordinator_blocked": coordinator_blocked,
+                "paste_backstop": paste_backstop,
                 "draft_sweeps": draft_sweeps}))
 }
 
@@ -4812,6 +4895,232 @@ fn sweep_editor_drafts(
                 rows.push(row);
             }
         }
+    }
+    rows
+}
+
+/// The harness-agnostic stuck-paste backstop (#1560): the primary path
+/// that submits a stuck delivered prompt in every pane, whatever TUI draws
+/// it. The per-harness sweep above runs first on the same screens and
+/// stays a refinement: it confirms faster and reads paste placeholders,
+/// but a reader that cannot parse never gates this path, which needs only
+/// screen text (see [`crate::paste_backstop`]).
+///
+/// A delivered prompt that fuzzy-matches at the bottom of the pane on
+/// [`BackstopConfig::polls`] consecutive polls spanning at least
+/// [`BackstopConfig::span`], with the screen static between them, gets one
+/// Enter, at most [`BackstopConfig::max_presses`] per prompt, spaced out;
+/// every press is noticed, and a prompt still stuck after the cap raises
+/// one BLOCKED notice naming the pane. A prompt clears once its text
+/// leaves the lower region. Enter is never pressed for text agentctl did
+/// not deliver (the match set is its own queue records), nor while an
+/// approval, permission or picker prompt shows, nor while a harness
+/// reader knows the agent is busy.
+fn sweep_paste_backstop(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    screens: Vec<(String, String, String)>,
+    flushed: &BTreeSet<String>,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    use crate::paste_backstop::{
+        delivered_prompts, match_region, static_fingerprint, BackstopConfig,
+    };
+    let config = BackstopConfig::default();
+    let mut rows = Vec::new();
+    // A stuck paste blocks the pane it sits in, so no notice about it goes
+    // there (#844).
+    let no_jams = BTreeSet::new();
+    for (agent, screen, harness) in screens {
+        let Some(queue) = probe.agent_queue(&agent) else {
+            state.general_backstop.remove(&agent);
+            continue;
+        };
+        let candidates = delivered_prompts(&queue, now, config.expire);
+        let matched = candidates.iter().find_map(|prompt| {
+            match_region(&prompt.text, &screen, &config).map(|found| (prompt, found))
+        });
+        let Some((prompt, _found)) = matched else {
+            if let Some(entry) = state.general_backstop.remove(&agent) {
+                rows.push(json!({"agent": agent, "id": entry.prompt_id,
+                                 "backstop": "consumed"}));
+            }
+            continue;
+        };
+        let prompt_id = prompt.id.clone();
+        // Busy guard: a harness reader that knows a turn is running holds
+        // the backstop; the echoed prompt in its transcript is not stuck.
+        if crate::submission::running_turn(&screen) == Some(true) {
+            if let Some(entry) = state.general_backstop.get_mut(&agent) {
+                entry.polls = 0;
+                entry.first_matched = now;
+            }
+            rows.push(json!({"agent": agent, "id": prompt_id,
+                             "backstop": "held-busy"}));
+            continue;
+        }
+        // Approval guard (#671 path): Enter must never answer an approval,
+        // permission or picker prompt. When unsure, notice and don't press.
+        let approval = approval_prompt_line(&screen).or_else(|| {
+            let harness = (!harness.is_empty()).then_some(harness.as_str());
+            blocked_finding_for(&screen, harness)
+                .and_then(|(kind, detail)| (kind == EpisodeKind::ApprovalPrompt).then_some(detail))
+        });
+        if let Some(detail) = approval {
+            let entry = state
+                .general_backstop
+                .entry(agent.clone())
+                .or_insert_with(|| BackstopEntry {
+                    prompt_id: prompt_id.clone(),
+                    first_matched: now,
+                    polls: 0,
+                    presses: 0,
+                    failures: 0,
+                    last_press_at: None,
+                    region_hash: 0,
+                    blocked_reported: false,
+                    held_reported: false,
+                });
+            entry.polls = 0;
+            entry.first_matched = now;
+            let mut row = json!({"agent": agent, "id": prompt_id,
+                                 "backstop": "held-approval", "detail": detail});
+            if !options.check_only && !entry.held_reported {
+                entry.held_reported = true;
+                let _ = tell_about(
+                    notifier,
+                    &agent,
+                    &no_jams,
+                    &format!(
+                        "agentctl watch backstop held: a prompt agentctl delivered to \
+                         {agent} looks stuck in its pane, but an approval or permission \
+                         prompt is showing ({detail}); nothing was pressed. Answer it in \
+                         {agent}'s pane, then the backstop will submit the prompt."
+                    ),
+                    &format!("gen-backstop-held:{agent}:{prompt_id}"),
+                    options,
+                );
+                row["noticed"] = json!(true);
+            }
+            rows.push(row);
+            continue;
+        }
+        let region_hash = static_fingerprint(&screen, &config);
+        let entry = state
+            .general_backstop
+            .entry(agent.clone())
+            .or_insert_with(|| BackstopEntry {
+                prompt_id: prompt_id.clone(),
+                first_matched: now,
+                polls: 0,
+                presses: 0,
+                failures: 0,
+                last_press_at: None,
+                region_hash,
+                blocked_reported: false,
+                held_reported: false,
+            });
+        if entry.prompt_id != prompt_id {
+            *entry = BackstopEntry {
+                prompt_id: prompt_id.clone(),
+                first_matched: now,
+                polls: 0,
+                presses: 0,
+                failures: 0,
+                last_press_at: None,
+                region_hash,
+                blocked_reported: false,
+                held_reported: false,
+            };
+        }
+        // Static guard: any real screen change restarts the poll run.
+        if entry.region_hash != region_hash {
+            entry.region_hash = region_hash;
+            entry.polls = 1;
+            entry.first_matched = now;
+        } else {
+            entry.polls = entry.polls.saturating_add(1);
+        }
+        let span = (now - entry.first_matched).max(0.0);
+        let due = entry.polls >= config.polls && span >= config.span.as_secs_f64();
+        let spaced = entry
+            .last_press_at
+            .is_none_or(|at| now - at >= config.press_spacing.as_secs_f64());
+        if options.check_only {
+            rows.push(json!({"agent": agent, "id": prompt_id, "backstop": "ours",
+                             "action": if due { "due" } else { "waiting" },
+                             "polls": entry.polls, "span_seconds": span,
+                             "presses": entry.presses}));
+            continue;
+        }
+        if entry.presses >= config.max_presses || entry.failures >= config.max_presses {
+            let mut row = json!({"agent": agent, "id": prompt_id,
+                                 "backstop": "blocked", "presses": entry.presses,
+                                 "failures": entry.failures});
+            if !entry.blocked_reported {
+                entry.blocked_reported = true;
+                let pane = probe.agent_pane(&agent).unwrap_or_else(|| "?".to_owned());
+                let _ = tell_about(
+                    notifier,
+                    &agent,
+                    &no_jams,
+                    &format!(
+                        "BLOCKED: a prompt agentctl delivered to {agent} (message \
+                         {prompt_id}) is still unsubmitted in pane {pane} after {} \
+                         Enter press(es); deliveries to {agent} are blocked. Press \
+                         Enter in {agent}'s pane, or clear the text if it is yours.",
+                        entry.presses
+                    ),
+                    &format!("gen-backstop-blocked:{agent}:{prompt_id}"),
+                    options,
+                );
+                row["blocked"] = json!(true);
+            }
+            rows.push(row);
+            continue;
+        }
+        if due && spaced && !flushed.contains(&agent) {
+            match notifier.press_enter(&agent) {
+                Ok(evidence) => {
+                    entry.presses += 1;
+                    entry.last_press_at = Some(now);
+                    entry.polls = 0;
+                    entry.first_matched = now;
+                    let presses = entry.presses;
+                    let _ = tell_about(
+                        notifier,
+                        &agent,
+                        &no_jams,
+                        &format!(
+                            "agentctl watch backstop pressed Enter on a stuck prompt \
+                             agentctl had delivered to {agent} (message {prompt_id}, \
+                             press {presses} of {}): {evidence}",
+                            config.max_presses
+                        ),
+                        &format!("gen-backstop:{agent}:{prompt_id}:{presses}"),
+                        options,
+                    );
+                    rows.push(json!({"agent": agent, "id": prompt_id,
+                                     "backstop": "pressed", "presses": presses,
+                                     "detail": evidence}));
+                }
+                Err(error) => {
+                    entry.failures += 1;
+                    entry.last_press_at = Some(now);
+                    rows.push(json!({"agent": agent, "id": prompt_id,
+                                     "backstop": "press-failed",
+                                     "failures": entry.failures,
+                                     "detail": error.to_string()}));
+                }
+            }
+            continue;
+        }
+        rows.push(json!({"agent": agent, "id": prompt_id, "backstop": "ours",
+                         "action": "waiting", "polls": entry.polls,
+                         "span_seconds": span, "presses": entry.presses,
+                         "end_row": _found.end_row}));
     }
     rows
 }
@@ -6384,6 +6693,10 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
         ManagedAgents::new(self.client, &self.registry)?.flush_stale_draft(agent)
     }
 
+    fn press_enter(&mut self, agent: &str) -> Result<String> {
+        ManagedAgents::new(self.client, &self.registry)?.press_enter(agent)
+    }
+
     fn ladder_redraw(&mut self, agent: &str) -> Result<String> {
         ManagedAgents::new(self.client, &self.registry)?.redraw_pane(agent)
     }
@@ -7852,6 +8165,10 @@ mod tests {
         flushes: Vec<String>,
         /// Whether every flush attempt fails (#731).
         flush_fails: bool,
+        /// Agents the general backstop pressed Enter in (#1560).
+        presses: Vec<String>,
+        /// Whether every backstop press fails (#1560).
+        press_fails: bool,
         /// Notices withdrawn so a newer one replaces them, as (recipient, message ID) (#840).
         withdrawn: Vec<(String, String)>,
         /// The outcome every withdrawal reports (default `set_aside`) (#844).
@@ -7912,6 +8229,15 @@ mod tests {
                 Err(fail("the Enter did not clear the editor"))
             } else {
                 Ok("submitted the draft agentctl typed".to_owned())
+            }
+        }
+
+        fn press_enter(&mut self, agent: &str) -> Result<String> {
+            self.presses.push(agent.to_owned());
+            if self.press_fails {
+                Err(fail("the pane refused the key"))
+            } else {
+                Ok("pressed Enter".to_owned())
             }
         }
 
@@ -8420,6 +8746,284 @@ mod tests {
         );
         assert_eq!(rows[0]["draft"], "unattributed", "{rows:?}");
         assert!(notifier.flushes.is_empty(), "{:?}", notifier.flushes);
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    // #1560 harness-agnostic-stuck-paste-backstop: fake-pane fixtures for
+    // the general path. Screens are plain text shapes per TUI; the queue
+    // (sweep_queue) proves what agentctl delivered. Polls are driven by
+    // fake `now` values, never by sleeping.
+    fn backstop_screen(harness: &str, prompt: &str) -> String {
+        let divider = "─".repeat(40);
+        match harness {
+            "claude" => {
+                let mut lines = vec!["● earlier work".to_owned(), divider.clone()];
+                for (index, line) in prompt.lines().enumerate() {
+                    lines.push(if index == 0 {
+                        format!("❯ {line}")
+                    } else {
+                        format!("  {line}")
+                    });
+                }
+                lines.push(divider);
+                lines.push("  model-x · context left".to_owned());
+                lines.join("\n")
+            }
+            "codex" => {
+                let mut lines = vec!["• earlier work".to_owned()];
+                for (index, line) in prompt.lines().enumerate() {
+                    lines.push(if index == 0 {
+                        format!("› {line}")
+                    } else {
+                        format!("  {line}")
+                    });
+                }
+                lines.push("  GPT · /work · ← for agents".to_owned());
+                lines.join("\n")
+            }
+            "muse" => sweep_muse_screen(prompt),
+            _ => {
+                let mut lines = vec!["??? some other TUI".to_owned()];
+                for (index, line) in prompt.lines().enumerate() {
+                    lines.push(if index == 0 {
+                        format!("> {line}")
+                    } else {
+                        line.to_owned()
+                    });
+                }
+                lines.push("[type a message, Enter to send]".to_owned());
+                lines.join("\n")
+            }
+        }
+    }
+
+    fn run_backstop(
+        probe: &mut SweepProbe,
+        notifier: &mut RecordingNotifier,
+        state: &mut WatchState,
+        screens: Vec<(String, String, String)>,
+        nows: &[f64],
+    ) -> Vec<Value> {
+        let mut rows = Vec::new();
+        for now in nows {
+            rows = sweep_paste_backstop(
+                probe,
+                notifier,
+                state,
+                screens.clone(),
+                &BTreeSet::new(),
+                *now,
+                &options(),
+            );
+        }
+        rows
+    }
+
+    #[test]
+    fn a_stuck_paste_is_pressed_then_consumed_on_every_tui_shape() {
+        for harness in ["claude", "codex", "muse", "unknown-tui"] {
+            let queue = sweep_queue(&format!("backstop-{harness}"), 1_000.0);
+            let stuck = backstop_screen(harness, SWEEP_PROMPT);
+            let mut probe = SweepProbe {
+                queue: queue.clone(),
+                screens: vec![("worker".into(), stuck.clone(), harness.into())],
+            };
+            let mut notifier = RecordingNotifier::default();
+            let mut state = WatchState::default();
+            let screens = vec![("worker".to_owned(), stuck, harness.to_owned())];
+            // Three static polls spanning over 45 s: one press, noticed.
+            let rows = run_backstop(
+                &mut probe,
+                &mut notifier,
+                &mut state,
+                screens,
+                &[1_120.0, 1_180.0, 1_240.0],
+            );
+            assert_eq!(rows[0]["backstop"], "pressed", "{harness}: {rows:?}");
+            assert_eq!(notifier.presses, ["worker"], "{harness}");
+            assert!(
+                notifier
+                    .urgent
+                    .iter()
+                    .any(|id| id == "gen-backstop:worker:lane:1"),
+                "{harness}: {:?}",
+                notifier.urgent
+            );
+            // The prompt is consumed: its text leaves the lower region and
+            // the remembered prompt clears with no further press.
+            let cleared =
+                "◆ earlier work\n────────────────\n❯ \n────────────────\n  model-x · context left\n"
+                    .to_owned();
+            let screens = vec![("worker".to_owned(), cleared, harness.to_owned())];
+            let rows = run_backstop(&mut probe, &mut notifier, &mut state, screens, &[1_300.0]);
+            assert_eq!(rows[0]["backstop"], "consumed", "{harness}: {rows:?}");
+            assert_eq!(notifier.presses.len(), 1, "{harness}");
+            assert!(state.general_backstop.is_empty(), "{harness}");
+            let _ = std::fs::remove_dir_all(&queue);
+        }
+    }
+
+    #[test]
+    fn a_normal_submit_and_foreign_text_are_never_pressed() {
+        let queue = sweep_queue("backstop-normal", 1_000.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: Vec::new(),
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        // Seen once, then gone (a normal submit): no press, no residue.
+        let stuck = backstop_screen("claude", SWEEP_PROMPT);
+        let screens = vec![("worker".to_owned(), stuck, "claude".to_owned())];
+        run_backstop(&mut probe, &mut notifier, &mut state, screens, &[1_120.0]);
+        let cleared =
+            "◆ earlier work\n────────────────\n❯ \n────────────────\n  model-x · context left\n"
+                .to_owned();
+        let screens = vec![("worker".to_owned(), cleared, "claude".to_owned())];
+        run_backstop(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            &[1_180.0, 1_240.0, 1_300.0],
+        );
+        assert!(notifier.presses.is_empty());
+        assert!(state.general_backstop.is_empty());
+        // Someone else's text at the bottom, however long it sits: the
+        // match set is only what agentctl delivered, so no press.
+        let foreign =
+            "● work\n─\n❯ a person's own half-written note\n  that agentctl never sent\n─\n";
+        let screens = vec![("worker".to_owned(), foreign.to_owned(), "claude".to_owned())];
+        run_backstop(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            &[1_400.0, 1_460.0, 1_520.0, 1_580.0],
+        );
+        assert!(notifier.presses.is_empty());
+        assert!(state.general_backstop.is_empty());
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn an_approval_prompt_on_screen_means_no_press() {
+        let queue = sweep_queue("backstop-approval", 1_000.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: Vec::new(),
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut screen = backstop_screen("claude", SWEEP_PROMPT);
+        screen.push_str("Do you want to proceed?\n❯ 1. Yes\n  2. No\n");
+        let screens = vec![("worker".to_owned(), screen, "claude".to_owned())];
+        let rows = run_backstop(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            &[1_120.0, 1_180.0, 1_240.0, 1_300.0],
+        );
+        assert_eq!(rows[0]["backstop"], "held-approval", "{rows:?}");
+        assert!(notifier.presses.is_empty());
+        assert!(
+            notifier
+                .urgent
+                .iter()
+                .any(|id| id == "gen-backstop-held:worker:lane"),
+            "{:?}",
+            notifier.urgent
+        );
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn the_press_cap_is_reached_then_blocked_is_reported_once() {
+        let queue = sweep_queue("backstop-cap", 1_000.0);
+        let stuck = backstop_screen("unknown-tui", SWEEP_PROMPT);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), stuck.clone(), "unknown-tui".into())],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = vec![("worker".to_owned(), stuck, "unknown-tui".to_owned())];
+        // Three presses, each needing a fresh run of three static polls.
+        let mut nows: Vec<f64> = Vec::new();
+        let mut at = 1_120.0;
+        for _ in 0..3 {
+            nows.extend([at, at + 60.0, at + 120.0]);
+            at += 180.0;
+        }
+        run_backstop(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens.clone(),
+            &nows,
+        );
+        assert_eq!(notifier.presses.len(), 3, "{:?}", notifier.presses);
+        // Still stuck after the cap: one BLOCKED notice, no more presses.
+        let rows = run_backstop(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            &[at, at + 60.0],
+        );
+        assert_eq!(rows[0]["backstop"], "blocked", "{rows:?}");
+        assert_eq!(notifier.presses.len(), 3);
+        let blocked: Vec<&String> = notifier
+            .urgent
+            .iter()
+            .filter(|id| id.starts_with("gen-backstop-blocked:"))
+            .collect();
+        assert_eq!(blocked.len(), 1, "{:?}", notifier.urgent);
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn an_echoed_prompt_on_a_working_pane_is_never_pressed() {
+        // Submitted and working: our prompt is echoed in the transcript,
+        // the agent's output follows it, and the spinner changes each poll.
+        let queue = sweep_queue("backstop-echo", 1_000.0);
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: Vec::new(),
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        for (index, now) in [1_120.0, 1_180.0, 1_240.0, 1_300.0].into_iter().enumerate() {
+            let spinner = ["⠋", "⠙", "⠹", "⠸"][index % 4];
+            let screen = format!(
+                "❯ {SWEEP_PROMPT}\n● Working on the ledger now.\n  Reading the queue file.\n  Checking each entry in turn.\n{spinner} working · esc to interrupt\n"
+            );
+            let screens = vec![("worker".to_owned(), screen, "claude".to_owned())];
+            run_backstop(&mut probe, &mut notifier, &mut state, screens, &[now]);
+        }
+        assert!(notifier.presses.is_empty(), "{:?}", notifier.presses);
+        assert!(
+            !notifier
+                .urgent
+                .iter()
+                .any(|id| id.starts_with("gen-backstop-blocked:")),
+            "{:?}",
+            notifier.urgent
+        );
+        // Echoed with finished output on an idle pane: no press either.
+        let screen = format!(
+            "❯ {SWEEP_PROMPT}\n● I read the ledger and filed the disposition.\n  The queue now holds two items.\n  Both are ready for review.\n  Nothing else is pending.\n  Closing the turn now.\n"
+        );
+        let screens = vec![("worker".to_owned(), screen, "claude".to_owned())];
+        run_backstop(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            &[1_400.0, 1_460.0, 1_520.0, 1_580.0],
+        );
+        assert!(notifier.presses.is_empty());
         let _ = std::fs::remove_dir_all(&queue);
     }
 

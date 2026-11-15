@@ -38,6 +38,7 @@ pub mod lineage;
 pub mod lock_wait;
 pub(crate) mod mcp;
 pub mod pane_admission;
+pub(crate) mod paste_backstop;
 pub mod plugins;
 pub(crate) mod profiles;
 pub mod progress_metric;
