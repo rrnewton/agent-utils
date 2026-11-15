@@ -83186,14 +83186,25 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                 journal = _absent_validate_batch_journal(config, input_sha256, planned, coordinator)
                 _write_journal(config, journal)
                 _interrupt_for_test("after-absent-validate-batch-journal")
-                _recover_absent_validate_rows(
-                    config,
-                    _journal_path(config),
-                    journal,
-                    coordinator,
-                    safety_prechecked=True,
-                    census_prechecked=census_prechecked,
-                )
+                try:
+                    _recover_absent_validate_rows(
+                        config,
+                        _journal_path(config),
+                        journal,
+                        coordinator,
+                        safety_prechecked=True,
+                        census_prechecked=census_prechecked,
+                    )
+                except Refusal:
+                    # A refusal that wrote nothing must not strand the
+                    # journal it just wrote (#1554): release it only
+                    # when every registry row is unchanged, so a
+                    # refusal after any archive or ACTIVE write keeps
+                    # its journal for replay.
+                    after_states, after_archives = _validate_global_state(config)
+                    if _global_rows(after_states, after_archives) == before:
+                        _clear_journal(config, journal)
+                    raise
                 after_states, after_archives = _validate_global_state(config)
                 target_slots = {item.slot for item in requested}
                 if {

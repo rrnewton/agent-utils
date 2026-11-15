@@ -945,3 +945,104 @@ def test_successful_eden_create_registers_and_clears_its_journal(
     assert state.slots[0].checkouts[0].vcs == "eden"
     assert sorted(config.control.glob("CREATE.*.journal")) == []
     assert daemon.daemon_writes() == []
+
+
+# ------------------- absent-batch journal release (#1554)
+
+
+def test_replayed_absent_batch_journal_disposes_an_eden_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A journal left by a refused apply replays to completion (#1554A2)."""
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+    _write_row(config, record)
+    input_path = root / "absent-validate-rows.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "rows": [
+                    {
+                        "machine": "node-a",
+                        "slot": record.slot,
+                        "generation": record.generation,
+                        "record_sha256": wrkslots_cli._record_sha256(record),
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(wrkslots_cli, "_short_hostname", lambda: "node-a")
+    monkeypatch.setattr(wrkslots_cli, "_absent_validate_process_snapshot", lambda: ())
+    monkeypatch.setattr(
+        wrkslots_cli, "_absent_validate_privileged_path_match", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(wrkslots_cli, "_user_systemd_snapshot", lambda: ())
+    # The journal a refused apply leaves behind, byte for byte.
+    input_sha256, requested = wrkslots_cli._read_absent_validate_rows_input(
+        config, str(input_path)
+    )
+    planned = wrkslots_cli._plan_absent_validate_rows(config, requested)
+    coordinator = wrkslots_cli._read_process_identity(os.getpid())
+    journal = wrkslots_cli._absent_validate_batch_journal(
+        config, input_sha256, planned, coordinator
+    )
+    wrkslots_cli._write_journal(config, journal)
+    journal_path = wrkslots_cli._journal_path(config)
+    assert journal_path.exists()
+
+    assert wrkslots_cli._cmd_recover_absent_validate_rows(
+        _absent_args(root, input_path, apply=True)
+    ) == 0
+
+    assert "outcome=recovered" in capsys.readouterr().out
+    assert not journal_path.exists()
+    assert wrkslots_cli._load_active(config).slots == ()
+    assert [row["slot"] for row in wrkslots_cli._load_archive(config).records] == [
+        "edenstuck"
+    ]
+
+def test_refused_fresh_apply_releases_its_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+    _write_row(config, record)
+    input_path = root / "absent-validate-rows.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "rows": [
+                    {
+                        "machine": "node-a",
+                        "slot": record.slot,
+                        "generation": record.generation,
+                        "record_sha256": wrkslots_cli._record_sha256(record),
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(wrkslots_cli, "_short_hostname", lambda: "node-a")
+    monkeypatch.setattr(wrkslots_cli, "_absent_validate_process_snapshot", lambda: ())
+    monkeypatch.setattr(
+        wrkslots_cli, "_absent_validate_privileged_path_match", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(wrkslots_cli, "_user_systemd_snapshot", lambda: ())
+
+    def refused(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        raise wrkslots_cli.Refusal("nothing was written")
+
+    monkeypatch.setattr(wrkslots_cli, "_recover_absent_validate_rows", refused)
+    with pytest.raises(wrkslots_cli.Refusal, match="nothing was written"):
+        wrkslots_cli._cmd_recover_absent_validate_rows(
+            _absent_args(root, input_path, apply=True)
+        )
+    assert not wrkslots_cli._journal_path(config).exists()
+    assert [row.slot for row in wrkslots_cli._load_active(config).slots] == ["edenstuck"]
