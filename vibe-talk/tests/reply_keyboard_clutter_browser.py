@@ -117,18 +117,25 @@ def keyboard(desk: Desk, up: bool) -> Json:
     return state(desk)
 
 
+def coord(rect: Json, key: str) -> float:
+    assert isinstance(rect, dict)
+    value = rect[key]
+    assert isinstance(value, (int, float))
+    return float(value)
+
+
 def in_viewport(found: Json, part: str) -> bool:
     """Any part of `part`'s rect stands in the visible viewport (its top edge at 0 here)."""
     rect = found[part]
     if not isinstance(rect, dict):
         return False
-    return number(found, "viewport") > 0 and float(rect["bottom"]) > 0 and float(rect["top"]) < number(found, "viewport")
+    return number(found, "viewport") > 0 and coord(rect, "bottom") > 0 and coord(rect, "top") < number(found, "viewport")
 
 
 def overlap(a: Json, b: Json) -> bool:
     assert isinstance(a, dict) and isinstance(b, dict)
-    return (float(a["left"]) < float(b["right"]) and float(b["left"]) < float(a["right"])
-            and float(a["top"]) < float(b["bottom"]) and float(b["top"]) < float(a["bottom"]))
+    return (coord(a, "left") < coord(b, "right") and coord(b, "left") < coord(a, "right")
+            and coord(a, "top") < coord(b, "bottom") and coord(b, "top") < coord(a, "bottom"))
 
 
 def phone_walk(desk: Desk) -> None:
