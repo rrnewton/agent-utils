@@ -88906,7 +88906,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
     args = parser.parse_args(values)
-    if getattr(args, "command", None) in _PARENT_DEATH_COMMANDS:
+    if isinstance(getattr(args, "command", None), str) and args.command in _PARENT_DEATH_COMMANDS:
         _install_parent_death_signal()
     _bind_held_config_lock(held_config_lock, args)
     # The raw words, for handlers that must know which side of `--` a word was on.
