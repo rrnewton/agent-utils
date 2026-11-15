@@ -56,6 +56,8 @@ impl Scratch {
         let bridge = BridgeState::initialize(
             &state,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -1037,6 +1039,8 @@ fn chat_publish_removes_the_file_once_posted_and_keeps_it_when_refused() {
     BridgeState::initialize(
         &state,
         BridgeConfiguration {
+            slack_workspace_url: None,
+            issue_url_template: None,
             unknown: Default::default(),
             subscription_plugin: "fixture".to_owned(),
             subscription_environment: Vec::new(),

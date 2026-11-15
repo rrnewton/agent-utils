@@ -749,6 +749,17 @@ pub struct BridgeConfiguration {
     /// Per-channel Slack outbound format, overriding `slack_format`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slack_format_by_channel: BTreeMap<String, SlackFormat>,
+    /// Slack workspace origin (`https://acme.slack.com`) thread permalinks are
+    /// built on, locally and without a provider call (#658
+    /// chat-bridge-permalinks). Absent, no thread link is ever formed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack_workspace_url: Option<String>,
+    /// Issue link template holding exactly one `{n}` placeholder, such as
+    /// `https://github.com/OWNER/REPO/blob/main/.minibeads/issues/agent-utils-{n}.md`
+    /// or `https://github.com/OWNER/REPO/issues/{n}` (#658). Absent, issue
+    /// tokens in replies stay plain text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_url_template: Option<String>,
     /// Chat relay channels: peer posts there are dispatched to a command,
     /// never typed. See [`RelayChannelConfig`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1023,6 +1034,19 @@ impl BridgeConfiguration {
         }
         if let Some(labels) = &self.labels {
             labels.validate()?;
+        }
+        if let Some(workspace) = &self.slack_workspace_url {
+            if crate::chat_links::workspace_origin(workspace).is_none() {
+                return Err(ChatRuntimeError::invalid(
+                    "slack_workspace_url must be one https:// origin, such as \
+                     https://acme.slack.com",
+                ));
+            }
+        }
+        if let Some(template) = &self.issue_url_template {
+            if let Some(problem) = crate::chat_links::issue_template_problem(template) {
+                return Err(ChatRuntimeError::invalid(problem));
+            }
         }
         for entry in &self.relay_channels {
             validate_single_line(&entry.channel, "relay channel", MAX_AGENT_LABEL_BYTES)?;
@@ -9343,6 +9367,9 @@ impl BridgeState {
         acknowledgements.insert("acked".to_owned(), Value::from(0));
         let now_millis = unix_millis();
         let mut records = self.request_records()?;
+        // Read once for every request's short number in the report below; an
+        // unreadable record leaves the numbers null, never fails the status.
+        let alias_record = self.read_reply_aliases().ok();
         records.sort_by(|(left, _), (right, _)| {
             (left.admitted_at_millis, &left.key).cmp(&(right.admitted_at_millis, &right.key))
         });
@@ -9397,6 +9424,13 @@ impl BridgeState {
             stages.insert(stage.to_owned(), Value::from(count.saturating_add(1)));
             requests.push(serde_json::json!({
                 "key": record.key,
+                // The request's short number and its thread's ready permalink
+                // beside it (#658), each null when it has none.
+                "reply_alias": alias_record
+                    .as_ref()
+                    .and_then(|aliases| aliases.alias_of(&record.key))
+                    .map(crate::chat_links::thread_label),
+                "thread_permalink": self.message_thread_permalink(&record.message),
                 "phase": request_phase_name(&record.phase),
                 "stage": stage,
                 "admitted_at_millis": record.admitted_at_millis,
@@ -10817,18 +10851,28 @@ the chat, so write no reply markers.",
         // the limit. Every marker here is followed on its row by more text, so no row the prompt
         // wraps into is a marker line unless the terminal is narrower than the marker and a word.
         // Several replies stay welcome, split by time and by topic (#435 chat-reply-splitting).
-        let (reply_id, numbering) = match self.reveal_reply_alias(key, screen) {
+        let (reply_id, numbering, alias_number) = match self.reveal_reply_alias(key, screen) {
             Ok(alias) => (
                 format_reply_alias(alias),
                 "send several replies when that helps (progress updates, one reply per topic), \
 each in its own pair.",
+                Some(alias),
             ),
             Err(_) => (
                 format!("{}_{}", record.reply_nonce, record.next_reply_ordinal),
                 "send several replies when that helps (progress updates, one reply per topic), \
 adding one to the last number in both lines for each later reply.",
+                None,
             ),
         };
+        // The thread's ready permalink beside its number (#658): the agent
+        // copies the link, never a bare id the owner cannot open.
+        if let (Some(alias), Some(link)) = (alias_number, self.message_thread_permalink(message)) {
+            fields.push(format!(
+                "thread {} {link}",
+                crate::chat_links::thread_label(alias)
+            ));
+        }
         let executable = || env::current_exe();
         // Decided for this delivery, from the target served now (#896): a target whose replies
         // the bridge does not read from a transcript or session history gets the command only.
@@ -11392,11 +11436,15 @@ complete record.\n",
         let now = unix_millis();
         let label = single_line(&self.config.agent_label);
         let mut entries = Vec::new();
+        let mut permalink: Option<String> = None;
         {
             let _snapshot = self.lock_state_snapshot()?;
             for (request, _) in self.request_records()? {
                 if request.message.thread_id != thread_id {
                     continue;
+                }
+                if permalink.is_none() {
+                    permalink = self.message_thread_permalink(&request.message);
                 }
                 let admitted = request.admitted_at_millis;
                 let message_id = single_line(&request.message.message_id);
@@ -11455,14 +11503,19 @@ complete record.\n",
         let total = entries.len();
         let shown = total.min(usize::try_from(last).unwrap_or(usize::MAX));
         let thread = single_line(thread_id);
+        // The thread's ready permalink beside its id (#658), when one builds.
+        let link = permalink
+            .as_deref()
+            .map(|url| format!(" · {url}"))
+            .unwrap_or_default();
         let mut output = match (total, shown) {
-            (0, _) => format!("Thread {thread}: the bridge retains no messages for it.\n"),
-            (1, _) => format!("Thread {thread}: 1 retained message.\n"),
+            (0, _) => format!("Thread {thread}{link}: the bridge retains no messages for it.\n"),
+            (1, _) => format!("Thread {thread}{link}: 1 retained message.\n"),
             (total, shown) if shown == total => {
-                format!("Thread {thread}: {total} retained messages, oldest first.\n")
+                format!("Thread {thread}{link}: {total} retained messages, oldest first.\n")
             }
             (total, shown) => format!(
-                "Thread {thread}: the last {shown} of {total} retained messages, oldest first.\n"
+                "Thread {thread}{link}: the last {shown} of {total} retained messages, oldest first.\n"
             ),
         };
         output.push_str(
@@ -12364,6 +12417,68 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
     pub fn thread_of_request(&self, key: &str) -> Result<String> {
         let _snapshot = self.lock_state_snapshot()?;
         Ok(self.read_request(key)?.message.thread_id)
+    }
+
+    /// The Slack permalink of `message`'s thread, built locally from the
+    /// configured workspace origin and the ids the bridge already holds
+    /// (#658). `None` when no workspace is configured or the ids are not
+    /// Slack-shaped: then the thread is named by number alone, never by a
+    /// guessed link.
+    fn message_thread_permalink(&self, message: &SavedMessage) -> Option<String> {
+        let workspace = self.config.slack_workspace_url.as_deref()?;
+        // A thread reply's root is its `thread_id`; a top-level message is its
+        // own root. Trying both, in that order, lets either record shape name
+        // the thread; the builder refuses anything not `ts`-shaped.
+        crate::chat_links::slack_thread_permalink(
+            workspace,
+            &message.channel_id,
+            &message.thread_id,
+        )
+        .or_else(|| {
+            crate::chat_links::slack_thread_permalink(
+                workspace,
+                &message.channel_id,
+                &message.message_id,
+            )
+        })
+    }
+
+    /// Every assigned reply alias's thread permalink, from local state alone.
+    /// Aliases whose thread builds no permalink are absent, which the renderer
+    /// reports as an unresolvable token rather than a wrong link.
+    fn thread_link_map(&self) -> std::collections::BTreeMap<u64, String> {
+        let mut links = std::collections::BTreeMap::new();
+        let Ok(aliases) = self.read_reply_aliases() else {
+            return links;
+        };
+        for entry in &aliases.aliases {
+            if let Ok(request) = self.read_request(&entry.request_key) {
+                if let Some(link) = self.message_thread_permalink(&request.message) {
+                    links.insert(entry.alias, link);
+                }
+            }
+        }
+        links
+    }
+
+    /// Render `body`'s link tokens for the wire: the rendered text and the
+    /// warnings for tokens that stayed plain. Resolution reads only local
+    /// state; the send proceeds either way.
+    fn render_outbound_links(&self, body: &str) -> (String, Vec<String>) {
+        let links = self.thread_link_map();
+        let rendered = crate::chat_links::render_reply_links(
+            body,
+            &|alias| links.get(&alias).cloned(),
+            self.config.issue_url_template.as_deref(),
+        );
+        (rendered.text, rendered.warnings)
+    }
+
+    /// The link warnings a reply with `body` would earn, without sending it:
+    /// `agentctl chat reply` prints them so the author hears at once.
+    #[must_use]
+    pub fn reply_link_warnings(&self, body: &str) -> Vec<String> {
+        self.render_outbound_links(body).1
     }
 
     /// The page `agentctl chat help REPLY_ID` prints for request `key` of this state (#707
@@ -14388,7 +14503,15 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         // `operation_conflict`, when the thread's parent is a channel-level event rather
         // than a message) is never retried as-is: it used to be retried on every pass,
         // hundreds of times, and the reply never posted.
-        let body_text = outbound_text(&self.config.agent_label, &reply.body);
+        // Link tokens become Slack link markup on the wire only (#658): the
+        // stored reply keeps the agent's own text, so retries render the same
+        // and `chat sent` shows what the agent wrote. Unresolvable tokens
+        // stay plain; the warnings reach the service log, never the owner.
+        let (linked_body, link_warnings) = self.render_outbound_links(&reply.body);
+        for warning in &link_warnings {
+            eprintln!("agentctl: chat reply link: {warning}");
+        }
+        let body_text = outbound_text(&self.config.agent_label, &linked_body);
         let mut fallback = reply.send_fallback_request_id.is_some();
         let mut active_request_id = reply
             .send_fallback_request_id
@@ -21419,6 +21542,98 @@ pub(crate) mod tests {
         (state, key, root)
     }
 
+    /// #658 chat-bridge-permalinks: a captured reply's link tokens post as
+    /// Slack link markup, built locally; the stored reply keeps the agent's
+    /// text, plain numbers are untouched, and the prompt names the thread's
+    /// ready permalink beside its number.
+    #[test]
+    fn a_captured_reply_with_link_tokens_posts_link_markup() {
+        let root = temporary("thread-links");
+        let mut configuration = config_without_reaction();
+        configuration.channel_ids = vec!["C0123ABCD".to_owned()];
+        configuration.slack_workspace_url = Some("https://acme.slack.com".to_owned());
+        configuration.issue_url_template =
+            Some("https://github.com/OWNER/REPO/issues/{n}".to_owned());
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let message = InboundMessage::new(
+            ChannelId::new("C0123ABCD").expect("channel"),
+            MessageId::new("1700000000.000100").expect("message"),
+            ThreadId::new("1700000000.000100").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "please look",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("delivery-1").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery");
+        let key = state
+            .admit_batch(&batch)
+            .expect("admission")
+            .new_request_keys
+            .into_iter()
+            .next()
+            .expect("key");
+        let prompt = state.prompt(&key, "").expect("prompt");
+        assert!(
+            prompt
+                .contains("thread 001 https://acme.slack.com/archives/C0123ABCD/p1700000000000100"),
+            "{prompt}"
+        );
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route");
+        assert_eq!(route.identifier, "001");
+        state
+            .capture_replies(
+                &key,
+                "<CHAT_REPLY_001>\nSee [[thread:001]], [[issue:658]] and [[thread:999]]; plain 060 and #658 stay.\n</CHAT_REPLY_001>",
+            )
+            .expect("capture reply");
+        // The stored reply is the agent's own text, tokens and all.
+        assert!(state
+            .read_reply(&key, 1)
+            .expect("stored reply")
+            .body
+            .contains("[[thread:001]]"));
+        let mut transport = FakeReplyTransport::default();
+        assert!(state
+            .publish_one(&key, &mut transport)
+            .expect("sent")
+            .is_some());
+        assert_eq!(transport.submissions.len(), 1);
+        let posted = &transport.submissions[0].2;
+        assert!(
+            posted.contains("<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|001>"),
+            "{posted}"
+        );
+        assert!(
+            posted.contains("<https://github.com/OWNER/REPO/issues/658|#658>"),
+            "{posted}"
+        );
+        assert!(
+            posted.contains("and 999; plain 060 and #658 stay."),
+            "{posted}"
+        );
+        // `chat status` names the same number and link for the request.
+        let status = state.status().expect("status");
+        assert_eq!(status["requests"][0]["reply_alias"], json!("001"));
+        assert_eq!(
+            status["requests"][0]["thread_permalink"],
+            json!("https://acme.slack.com/archives/C0123ABCD/p1700000000000100")
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
     /// #781 chat-no-stale-replies-on-restart: a reply left unsent across a restart and older
     /// than the bound is held at start, listed and not sent, until the coordinator sends it; a
     /// fresh one is not held; a dropped one is never sent.
@@ -22078,6 +22293,8 @@ pub(crate) mod tests {
 
     pub(crate) fn config() -> BridgeConfiguration {
         BridgeConfiguration {
+            slack_workspace_url: None,
+            issue_url_template: None,
             unknown: Default::default(),
             subscription_plugin: "fixture".to_owned(),
             subscription_environment: Vec::new(),
@@ -43822,7 +44039,9 @@ agentctl chat sent 001\nIf you have trouble, run: agentctl chat help 001"
                     "replies_captured",
                     "replies_closed",
                     "replies_sent",
+                    "reply_alias",
                     "stage",
+                    "thread_permalink",
                 ]
             );
         }

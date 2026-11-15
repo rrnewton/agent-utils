@@ -12,6 +12,7 @@ pub mod chat_event_sink;
 pub(crate) mod chat_events;
 pub(crate) mod chat_history;
 pub mod chat_launch;
+pub(crate) mod chat_links;
 pub mod chat_lookup;
 pub mod chat_runtime;
 pub mod chat_service;

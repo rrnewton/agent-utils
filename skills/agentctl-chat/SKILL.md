@@ -224,7 +224,21 @@ vibe-talk search "runner offline" --channel "lead team" --since 2026-10-30 --lim
 Run it where the server runs, with the server's `--config` and environment (the READ token
 and addresses come from that configuration; never print the token). Each hit line carries
 the message's permalink in its own service and its vibe-talk deep link; quote those links
-in the reply. The lines after the hits say how far back each channel was searched: search
+in the reply.
+
+## Link threads and issues, never bare numbers
+
+Never show the owner a bare internal id: not a thread number like `(060)`, not a reply
+alias, not a bare `#658`. A request prompt's header prints its thread's ready permalink
+beside its number (`thread 060 https://…`); paste that link, or cite the thread with the
+token `[[thread:060]]` (the number exactly as the prompt and `agentctl chat thread 060`
+write it) anywhere in a reply: the bridge renders it as a clickable link to that Slack
+thread. Cite a tracker issue the same way, as `[[issue:658]]`. Plain numbers and bare
+`#658` are never rewritten — they mean other things too often to guess — so the token is
+the only short form that links. A token whose number the bridge cannot resolve from its
+own state stays plain text and is reported as a warning (`agentctl chat reply` prints it;
+captured replies log it), so fix the number rather than leaving the owner a dead
+reference. Inside code fences and inline code the tokens stay literal, as written. The lines after the hits say how far back each channel was searched: search
 covers only what the server's cache holds, a recent window until full-history retention
 lands, so when a channel's reach is partial, say so in the reply ("searched back to …;
 older discussion is outside the cached window") rather than presenting the hits as the

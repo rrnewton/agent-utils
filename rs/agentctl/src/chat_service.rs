@@ -9733,6 +9733,8 @@ mod tests {
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -11400,6 +11402,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: vec!["AGENTCTL_TEST_CERT_PATH".to_owned()],
@@ -12050,6 +12054,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -12126,6 +12132,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -12200,6 +12208,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -12300,6 +12310,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -12391,6 +12403,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -12833,6 +12847,8 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -14652,6 +14668,8 @@ esac
     #[test]
     fn service_join_ceiling_includes_the_configured_outbound_operation() {
         let configuration = BridgeConfiguration {
+            slack_workspace_url: None,
+            issue_url_template: None,
             unknown: Default::default(),
             subscription_plugin: "fixture".to_owned(),
             subscription_environment: Vec::new(),
@@ -15123,6 +15141,8 @@ esac
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
@@ -16948,6 +16968,8 @@ esac
         BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),

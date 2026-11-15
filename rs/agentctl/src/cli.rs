@@ -6661,6 +6661,13 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                     (resolved.state, key)
                 }
             };
+            // Link tokens that will stay plain are the author's to fix, so say
+            // so now (#658); the reply itself is still stored and sent.
+            if let Ok(bridge) = crate::chat_runtime::BridgeState::inspect(&state) {
+                for warning in bridge.reply_link_warnings(&body) {
+                    eprintln!("agentctl: warning: {warning}");
+                }
+            }
             match crate::chat_service::reply_checked(
                 &state,
                 &key,

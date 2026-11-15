@@ -2856,6 +2856,22 @@ The dry-run comparison harness is
 it posts nothing, and its live mode refuses without an explicit test channel
 and coordinator approval.
 
+Thread and issue links. Two configuration keys name where links point, and both are
+optional: `slack_workspace_url` is the Slack workspace origin (for example
+`"slack_workspace_url": "https://acme.slack.com"`), and `issue_url_template` is an
+https address holding exactly one `{n}` placeholder (for example
+`"issue_url_template": "https://github.com/OWNER/REPO/blob/main/.minibeads/issues/agent-utils-{n}.md"`,
+or `…/issues/{n}` for a plain issue tracker). With them, a request prompt's header
+prints its thread's permalink beside its number, `agentctl chat thread` and the
+per-request `reply_alias`/`thread_permalink` fields of `agentctl chat status` name
+the same link, and the reply tokens `[[thread:060]]` and `[[issue:658]]` render as
+clickable links. Permalinks are built locally from the configured origin, the
+channel id and the thread root `ts`; no provider call is made to form one, and a
+part that cannot be read forms no link. Plain numbers and bare `#658` are never
+rewritten. An unresolvable token stays plain text and is reported as a warning by
+`agentctl chat reply` (captured replies log it). Without the keys, numbers stay
+plain, exactly as before.
+
 Resource names. The channel is the Slack conversation ID (`C…`). A message is
 `C…/messages/<ts>`, a thread is `C…/threads/<root ts>`, and a reaction receipt
 is `C…/messages/<ts>/reactions/<name>`. A sender is the Slack user ID (`U…`), so

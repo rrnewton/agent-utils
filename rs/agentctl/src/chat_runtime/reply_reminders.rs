@@ -678,6 +678,8 @@ mod tests {
         let state = BridgeState::initialize(
             &root,
             BridgeConfiguration {
+                slack_workspace_url: None,
+                issue_url_template: None,
                 unknown: Default::default(),
                 subscription_plugin: "fixture".to_owned(),
                 subscription_environment: Vec::new(),
