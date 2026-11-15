@@ -38,15 +38,17 @@ export function followBehavior(reducedMotion: boolean): "smooth" | "auto" {
  * highlight is back in the band or a different read starts; a programmatic follow
  * scroll never pauses it.
  */
-export function createFollowPause() {
+export function createFollowPause(now: () => number = () => Date.now()) {
   let pausedFor: string | null = null;
-  let ownScroll = false;
+  let ownScrollAt = Number.NEGATIVE_INFINITY;
   return {
-    /** The follow is about to scroll: the scroll event it causes is not the reader's. */
-    noteOwnScroll(): void { ownScroll = true; },
-    /** A scroll event on the port: the reader's own scroll pauses following. */
+    /** The follow is about to scroll: the scroll event it promptly causes is not the reader's. */
+    noteOwnScroll(): void { ownScrollAt = now(); },
+    /** A scroll event on the port: the reader's own scroll pauses following. A follow's
+     *  own event is only recognised promptly — a stale flag must not swallow a later
+     *  scroll of the reader's (the jump-chip walk scrolls away and waits). */
     noteScroll(readId: string): void {
-      if (ownScroll) { ownScroll = false; return; }
+      if (now() - ownScrollAt < 1000) { ownScrollAt = Number.NEGATIVE_INFINITY; return; }
       pausedFor = readId;
     },
     paused(readId: string, targetInBand: boolean): boolean {
@@ -54,9 +56,7 @@ export function createFollowPause() {
       if (pausedFor !== readId || targetInBand) { pausedFor = null; return false; }
       return true;
     },
-    /** A block boundary: following resumes even where the reader had paused it. */
-    lift(): void { pausedFor = null; },
-    reset(): void { pausedFor = null; ownScroll = false; },
+    reset(): void { pausedFor = null; ownScrollAt = Number.NEGATIVE_INFINITY; },
   };
 }
 

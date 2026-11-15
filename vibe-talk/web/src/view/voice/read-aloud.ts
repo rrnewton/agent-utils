@@ -2445,8 +2445,6 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * the steering strip. Cheap, so it runs at every boundary rather than redrawing the lists.
    */
   function showReadingPosition() {
-    // `#1587`: a block boundary lifts a reader-scroll pause; following resumes here.
-    followPause.lift();
     // `#1330 doc-read-highlight`: a document read's surface is told at the same boundaries.
     showDocumentBlock();
     // `#540 read-aloud-desktop`: in every list a row of the read is drawn in, the cards' list included.

@@ -28,8 +28,8 @@ next message begins), `showReadingSentence` (sentence advance) and
 `showReadingPosition` (block boundary). The port is `#scroll-area` as laid
 out — with Discuss docked it ends at the panel's top edge (#1526), so no
 panel-specific math is needed. Pause rule: a scroll the follow did not
-cause pauses following until the highlight is back in the band, the next
-block boundary, or another read starts; the follow's own scrolls never
+cause pauses following until the highlight is back in the band or another
+read starts; the follow's own scrolls never
 pause it, and nothing scrolls on a timer, so a reader dragging or flicking
 is never fought. No `voice.js` / `src/app/main.js` edit: the highlight and
 read-start signals already live in `read-aloud.ts`.
