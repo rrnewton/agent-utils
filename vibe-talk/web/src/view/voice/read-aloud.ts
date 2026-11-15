@@ -2285,7 +2285,17 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     litSentenceNodes = lit.map((one) => one!.sentences[0]!.from[0]!);
     litSentenceRange = ranges[0] || null;
     litSentenceText = litSentenceRange ? wordsOf(litSentenceRange.toString()) : "";
-    followReading(litSentenceRange);
+    // `#1588`: follow the row while it fits the port (a jump centres the row, #837, and
+    // centring its first sentence would pull it off centre); only a row taller than
+    // the port is followed by its sentence, which drifts down inside it.
+    const followRow = readingRowsOf(playing.id)[0] || null;
+    if (followRow && litSentenceRange) {
+      let area: HTMLElement | null = null;
+      try { area = deps.el("scroll-area"); } catch (_error) { area = null; }
+      const portH = area && typeof area.getBoundingClientRect === "function" ? area.getBoundingClientRect().bottom - area.getBoundingClientRect().top : 0;
+      const rowRect = followRow.getBoundingClientRect();
+      followReading(portH > 0 && rowRect.bottom - rowRect.top > portH ? litSentenceRange : followRow);
+    }
   }
 
   /** Text as it reads: each run of spaces one, the ends trimmed. */
