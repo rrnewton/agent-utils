@@ -62197,7 +62197,18 @@ def _submodule_partial_init(vcs: _GitVcs, submodule: Path) -> bool:
             return False
         xy, sub = parts[1], parts[2]
         if sub.startswith("S"):
-            if parts[3:6] != ["160000", "160000", "160000"] or parts[6] != parts[7]:
+            recorded = parts[3:6] == ["160000", "160000", "160000"] and (
+                parts[6] == parts[7]
+            )
+            # A clone that was never checked out has an empty index:
+            # its gitlinks appear as staged deletions with zeroed
+            # index/worktree modes and a zero index commit (#1431).
+            never_checked_out = (
+                xy == "D."
+                and parts[3:6] == ["160000", "000000", "000000"]
+                and set(parts[7]) == {"0"}
+            )
+            if not (recorded or never_checked_out):
                 return False
             if not _submodule_partial_init(vcs, submodule / parts[8]):
                 return False
@@ -62206,8 +62217,35 @@ def _submodule_partial_init(vcs: _GitVcs, submodule: Path) -> bool:
     return True
 
 
+def _hook_runs_submodule_init(command: object) -> bool:
+    """Whether a post-provision hook command runs a submodule init.
+
+    Only that hook's failure can leave nothing but partial submodule
+    init behind (#1431); a failed hook of any other kind can leave
+    authored or arbitrary output, so `_abort_create` forgives dirt
+    only when the journal's failed hook is this one. Token-based, so
+    spellings like `git -c protocol.file.allow=always submodule update
+    --init --recursive` match; an unparseable command never does.
+    """
+
+    if not isinstance(command, str):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    for index in range(len(tokens) - 1):
+        if (
+            tokens[index] == "submodule"
+            and tokens[index + 1] == "update"
+            and "--init" in tokens[index + 2 :]
+        ):
+            return True
+    return False
+
+
 def _hook_partial_init_dirt(vcs: _GitVcs, destination: Path, status: str) -> bool:
-    """Whether checkout dirt is only the running hook's partial init (#1337).
+    """Whether checkout dirt is only the create hook's partial init (#1337).
 
     Every status line must be a submodule whose gitlink is unchanged
     (recorded commit in HEAD and index, mode 160000 throughout) with no
@@ -62256,15 +62294,21 @@ def _abort_create(
     recorded_by_name = {checkout.name: checkout for checkout in recorded_created}
     # #1337: only the checkout whose hook the journal holds at `running`
     # may carry that hook's partial submodule init into an abort.
+    # #1431: a submodule-init hook that ran and failed, or could not
+    # start, leaves the same partial init; a failed hook of any other
+    # kind can leave authored output, so its dirt still refuses.
     hook_checkout: str | None = None
     if journal_payload is not None:
         failure = journal_payload.get("hook_failure")
-        if (
-            isinstance(failure, Mapping)
-            and failure.get("status") == "running"
-            and isinstance(failure.get("checkout"), str)
+        if isinstance(failure, Mapping) and isinstance(
+            failure.get("checkout"), str
         ):
-            hook_checkout = failure["checkout"]
+            status = failure.get("status")
+            if status == "running" or (
+                status in {"failed", "failed-to-start"}
+                and _hook_runs_submodule_init(failure.get("command"))
+            ):
+                hook_checkout = failure["checkout"]
     if config.layout == "nested" and slot_path.exists():
         if not slot_path.is_dir() or slot_path.is_symlink():
             raise Refusal(f"cannot abort unsafe slot path: {slot_path}")
