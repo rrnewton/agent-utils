@@ -1296,3 +1296,34 @@ def test_eden_cap_report_counts_both(tmp_path: Path) -> None:
         "outer_mounts": ["/host/one"],
         "in_image_mounts": [f"{image}/s1/checkout"],
     }
+
+
+def test_slot_view_accepts_an_eden_slot_without_git_directories(
+    tmp_path: Path,
+) -> None:
+    from wrkslots import imagecmd
+
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+    slot_path = wrkslots_cli._slot_directory(config, record.slot, "validate")
+    (slot_path / "checkout").mkdir(parents=True)
+    _write_row(config, record)
+
+    view = imagecmd.slot_view(config, record.slot, "validate")
+
+    assert view.slot_path == slot_path
+    assert view.git_directories == ()
+
+
+def test_image_convert_refuses_an_eden_slot(tmp_path: Path) -> None:
+    from wrkslots import imagecmd
+
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+
+    with pytest.raises(wrkslots_cli.Refusal, match="Eden"):
+        imagecmd._verify_checkouts(config, record)

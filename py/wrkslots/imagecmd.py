@@ -305,7 +305,10 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "control directory (registry and other slots) always read-only, so registry commands "
             "such as heartbeat run outside the box; and, with protect_system, every other mount "
             "read-only. The box is the "
-            "same for plain-worktree and image-backed slots. Defaults come from "
+            "same for plain-worktree and image-backed slots. An Eden slot binds only the "
+            "slot itself (<slot>/checkout and <slot>/.eden-state, whose socket reaches the "
+            "per-slot daemon outside the box); its backing repository is deliberately not "
+            "bound. Defaults come from "
             "configuration.sandbox (see `wrkslots sandbox show-config`); list options ADD to "
             "the configured lists."
         ),
@@ -1768,7 +1771,14 @@ def _checkout_paths(config: "cli.Config", record: "cli.ActiveRecord") -> list[tu
 
     rows: list[tuple[Path, Path, str]] = []
     for checkout in record.checkouts:
-        _relative, repository = cli._stored_repository_path(config, checkout.repository)
+        if checkout.vcs == "eden":
+            # An Eden checkout's repository is its backing repo: judged by
+            # the Eden rule create trusts, never the Git sibling rule (#1569).
+            repository = cli._eden_backing_repository(checkout.repository)
+        else:
+            _relative, repository = cli._stored_repository_path(
+                config, checkout.repository
+            )
         path = cli._stored_path(config, checkout.path, "checkout path")
         rows.append((repository, path, checkout.head))
     return rows
@@ -1777,6 +1787,12 @@ def _checkout_paths(config: "cli.Config", record: "cli.ActiveRecord") -> list[tu
 def _verify_checkouts(config: "cli.Config", record: "cli.ActiveRecord") -> None:
     from wrkslots import cli
 
+    if any(checkout.vcs == "eden" for checkout in record.checkouts):
+        raise _refuse(
+            "image convert does not support Eden checkouts: an Eden mount "
+            "is never copied into or out of a slot image; remove the slot "
+            "through the ordinary Eden lifecycle instead"
+        )
     vcs = cli._GitVcs()
     for repository, path, _head in _checkout_paths(config, record):
         vcs.verify_existing_worktree(repository, path)
@@ -1957,7 +1973,15 @@ def slot_view(
     vcs = cli._GitVcs()
     common_directory = _isolated_common_directory if isolated_git else vcs.common_directory
     git_directories: list[Path] = []
-    for repository, path, _head in _checkout_paths(config, record):
+    for checkout, (repository, path, _head) in zip(
+        record.checkouts, _checkout_paths(config, record), strict=True
+    ):
+        if checkout.vcs == "eden":
+            # No Git directory to bind: the box binds only the slot itself
+            # (<slot>/checkout and <slot>/.eden-state, whose socket reaches
+            # the per-slot daemon outside the box). The backing repo is
+            # deliberately not bound (#1569).
+            continue
         common = common_directory(path if path.exists() else repository)
         if common not in git_directories:
             git_directories.append(common)
@@ -2007,7 +2031,11 @@ def _project_git_directories(config: "cli.Config", state: "cli.ActiveState") -> 
         if (child / ".git").exists():
             add(child)
     for record in state.slots:
-        for repository, path, _head in _checkout_paths(config, record):
+        for checkout, (repository, path, _head) in zip(
+            record.checkouts, _checkout_paths(config, record), strict=True
+        ):
+            if checkout.vcs == "eden":
+                continue
             add(path if path.exists() else repository)
     return found
 
