@@ -286,6 +286,45 @@ _CREATE_JOURNAL_OPTIONAL = frozenset(
         "harness_checkout_reason",
     }
 )
+_CREATE_EDEN_KIND = "create-eden"
+_EDEN_CREATE_JOURNAL_REQUIRED = frozenset(
+    {
+        "schema",
+        "kind",
+        "machine",
+        "slot",
+        "agent",
+        "task",
+        "purpose",
+        "slot_type",
+        "created_at",
+        "heartbeat_at",
+        "heartbeat_ttl_seconds",
+        "owner",
+        "coordinator_lease",
+        "operation_id",
+        "eden",
+    }
+)
+_EDEN_CREATE_JOURNAL_OPTIONAL = frozenset(
+    {"x", "task_scope", "harness_checkout_reason"}
+)
+_EDEN_CREATE_EDEN_REQUIRED = frozenset(
+    {
+        "checkout_name",
+        "backing",
+        "requested_rev",
+        "slot_path",
+        "config_dir",
+        "mount",
+        "unit",
+        "phase",
+        "detail",
+        "in_slot_targets",
+        "derived_targets",
+    }
+)
+_EDEN_CREATE_PHASES = frozenset({"provisioning", "cleanup-failed"})
 _IMPORT_JOURNAL_REQUIRED = frozenset(
     {"schema", "kind", "machine", "slot", "record"}
 )
@@ -10205,7 +10244,7 @@ def _operation_event_journal_path(
     slot = _validate_name(
         _as_str(payload.get("slot"), "append-only operation slot"), "slot"
     )
-    if operation == "create" and name.startswith("CREATE."):
+    if operation in {"create", _CREATE_EDEN_KIND} and name.startswith("CREATE."):
         expected = _create_journal_path(config, slot, machine)
     elif operation == "finish" and name.startswith("FINISH."):
         expected = _finish_journal_path(config, slot, machine)
@@ -11943,6 +11982,7 @@ def _validate_journal_shape(
         raw,
         {
             "create": "create journal",
+            _CREATE_EDEN_KIND: "eden create journal",
             "import-existing": "import journal",
             "finish": "finish journal",
             "legacy-validate-remove": "legacy validate removal journal",
@@ -11955,7 +11995,7 @@ def _validate_journal_shape(
         }.get(kind, "recovery journal"),
     )
     expected_paths = {_journal_path(config, machine)}
-    if kind == "create":
+    if kind in {"create", _CREATE_EDEN_KIND}:
         expected_paths.add(_create_journal_path(config, slot, machine))
     elif kind == "finish":
         expected_paths.add(_finish_journal_path(config, slot, machine))
@@ -12029,6 +12069,8 @@ def _validate_journal_shape(
             _as_str(raw["operation_id"], "create journal.operation_id"),
         ):
             raise StateError("create journal has an invalid operation_id")
+    elif kind == _CREATE_EDEN_KIND:
+        _parse_eden_create_journal(config, raw)
     elif kind == "import-existing":
         _exact_keys(raw, _IMPORT_JOURNAL_REQUIRED, _JOURNAL_EXTENSION_KEYS, "import journal")
         record = _record_from_obj(raw["record"], "import journal.record")
@@ -12308,6 +12350,9 @@ def _scoped_operation_journal_opens(
 
     if operation == "finish":
         return journal.get("phase") == "prepared"
+    if operation == _CREATE_EDEN_KIND:
+        eden_raw = journal.get("eden")
+        return isinstance(eden_raw, Mapping) and eden_raw.get("phase") == "provisioning"
     return journal.get("created") == [] and journal.get("hook_progress") == 0
 
 
@@ -12514,7 +12559,7 @@ def _roll_forward_lagging_scoped_journals(config: Config) -> None:
         except (Refusal, StateError):
             continue
         operation = raw.get("kind")
-        if operation not in {"create", "finish"}:
+        if operation not in {"create", _CREATE_EDEN_KIND, "finish"}:
             continue
         machine = raw.get("machine")
         slot = raw.get("slot")
@@ -12523,7 +12568,7 @@ def _roll_forward_lagging_scoped_journals(config: Config) -> None:
         try:
             expected = (
                 _create_journal_path(config, slot, machine)
-                if operation == "create"
+                if operation in {"create", _CREATE_EDEN_KIND}
                 else _finish_journal_path(config, slot, machine)
             )
         except (Refusal, StateError):
@@ -12576,6 +12621,44 @@ def _scoped_create_journal_completed(
     return completed
 
 
+def _scoped_eden_create_journal_completed(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    states: Sequence[ActiveState] | None = None,
+) -> bool:
+    """Event-first provenance for an Eden create journal (#1558)."""
+
+    machine = _as_str(raw["machine"], "eden create journal.machine")
+    slot = _validate_name(_as_str(raw["slot"], "eden create journal.slot"), "slot")
+    if path != _create_journal_path(config, slot, machine):
+        raise StateError("scoped eden create journal filename does not match its target")
+    completed = _scoped_operation_journal_completed(
+        config, path, raw, _CREATE_EDEN_KIND
+    )
+    if completed:
+        fields = _parse_eden_create_journal(config, raw)
+        selected_states = (
+            tuple(states)
+            if states is not None
+            else tuple(_load_all_active(config, require_repository=False))
+        )
+        matches = [
+            record
+            for state in selected_states
+            if state.machine == machine
+            for record in state.slots
+            if record.slot == slot
+        ]
+        if len(matches) != 1 or not _eden_record_matches_journal(
+            config, matches[0], fields
+        ):
+            raise StateError(
+                "completed scoped eden create journal has no exact durable ACTIVE row"
+            )
+    return completed
+
+
 def _validate_journal_provenance(
     config: Config,
     path: Path,
@@ -12595,6 +12678,8 @@ def _validate_journal_provenance(
         return False
     if raw.get("kind") == "create":
         return _scoped_create_journal_completed(config, path, raw, states)
+    if raw.get("kind") == _CREATE_EDEN_KIND:
+        return _scoped_eden_create_journal_completed(config, path, raw, states)
     if raw.get("kind") == "finish":
         machine = _as_str(raw["machine"], "finish journal.machine")
         slot = _validate_name(_as_str(raw["slot"], "finish journal.slot"), "slot")
@@ -13073,6 +13158,82 @@ def _standalone_mismatch_busy(
     return _JournalBusy(kind=raw.get("kind"), pid=owner.pid, journal=path.name)
 
 
+def _classify_eden_create_journal(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    identity: _RegularFileIdentity,
+    completed: bool,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+) -> _CreateJournalClassification:
+    """Classify one Eden create journal without Git proofs (#1558)."""
+
+    fields = _parse_eden_create_journal(config, raw)
+    owner = _identity_from_obj(raw["owner"], "eden create journal.owner")
+    coordinator = _identity_from_obj(
+        raw["coordinator_lease"], "eden create journal.coordinator_lease"
+    )
+    coordinator_state, coordinator_detail = _process_state(coordinator)
+    owner_state, owner_detail = _create_journal_owner_state(owner, coordinator_state)
+    if not completed:
+        if "indeterminate" in {owner_state, coordinator_state}:
+            raise Refusal(
+                f"eden create journal for slot {fields.slot!r} process state is "
+                f"indeterminate: owner={owner_state} ({owner_detail}); "
+                f"coordinator={coordinator_state} ({coordinator_detail})"
+            )
+        if owner is not None and (
+            owner_state != coordinator_state or owner_state not in {"live", "dead"}
+        ):
+            raise Refusal(
+                f"eden create journal for slot {fields.slot!r} has disagreeing "
+                f"process state: owner={owner_state} ({owner_detail}); "
+                f"coordinator={coordinator_state} ({coordinator_detail})"
+            )
+        if any(
+            record.slot == fields.slot for state in states for record in state.slots
+        ):
+            raise StateError(
+                f"eden create journal for slot {fields.slot!r} has already "
+                "reached ACTIVE publication"
+            )
+    if any(
+        record.get("slot") == fields.slot
+        for archive in archives
+        for record in archive.records
+    ):
+        raise StateError(
+            f"eden create journal for slot {fields.slot!r} conflicts with an archive"
+        )
+    rebound, rebound_identity = _read_regular_file_identity(
+        path, "recovery journal", 1024 * 1024
+    )
+    if (
+        rebound_identity != identity
+        or _strict_json_object(rebound, "recovery journal") != raw
+    ):
+        raise Refusal(f"eden create journal changed while it was classified: {path}")
+    return _CreateJournalClassification(
+        path,
+        identity,
+        config.machine,
+        fields.slot,
+        fields.agent,
+        fields.slot_type,
+        fields.slot_path,
+        (),
+        (),
+        (),
+        (),
+        owner_state,
+        owner_detail,
+        coordinator_state,
+        coordinator_detail,
+        "completed-create" if completed else f"{owner_state}-incomplete-create",
+    )
+
+
 def _classify_create_journal(
     config: Config,
     path: Path,
@@ -13092,6 +13253,10 @@ def _classify_create_journal(
         if busy is not None:
             raise busy from error
         raise
+    if raw.get("kind") == _CREATE_EDEN_KIND:
+        return _classify_eden_create_journal(
+            config, path, raw, identity, completed, states, archives
+        )
     if raw.get("kind") != "create":
         if (
             requested_slot is not None
@@ -13300,7 +13465,7 @@ def _all_journal_row(
         )
     elif not raw:
         blocks = "unknown"
-    elif kind == "create":
+    elif kind in {"create", _CREATE_EDEN_KIND}:
         blocks = "create-same-slot-agent-path"
     elif owner_state == "live":
         blocks = "concurrent-mutations"
@@ -14305,6 +14470,13 @@ def _assert_create_journal_classifications_stable(
                 raise Refusal(
                     f"create journal liveness changed while it was classified: {row.path}"
                 )
+        if raw.get("kind") == _CREATE_EDEN_KIND:
+            fields = _parse_eden_create_journal(config, raw)
+            if fields.slot_path != row.slot_path:
+                raise Refusal(
+                    f"eden create journal target changed while it was classified: {row.path}"
+                )
+            continue
         (
             _machine,
             _slot,
@@ -14337,7 +14509,9 @@ def _assert_interrupted_creates_unrelated(
     for row in rows:
         if row.slot == slot:
             raise Refusal(
-                f"interrupted create already targets slot {slot!r}; recover that exact slot"
+                f"interrupted create already targets slot {slot!r}; recover "
+                f"that exact slot with 'wrkslots recover --slot {slot} "
+                "--coordinator-pid PID' (add --abort-create to roll it back)"
             )
         if slot_type == row.slot_type == "agent" and row.agent == agent:
             raise Refusal(
@@ -35873,7 +36047,7 @@ def _pending_journal_for_path(
 def _journal_actor_identities(raw: Mapping[str, object]) -> list[ProcessIdentity]:
     identities: list[ProcessIdentity] = []
     try:
-        if raw.get("kind") == "create":
+        if raw.get("kind") in {"create", _CREATE_EDEN_KIND}:
             for field in ("owner", "coordinator_lease"):
                 identity = _identity_from_obj(raw.get(field), f"create journal.{field}")
                 if identity is not None:
@@ -35983,7 +36157,7 @@ def _journal_blocker(
     # A create or import journal records its slot owner and coordinator,
     # not the process writing it; their liveness is adjudicated by the
     # create classification, never as this gate's busy actor (#1367).
-    if raw.get("kind") not in {"create", "import-existing"}:
+    if raw.get("kind") not in {"create", _CREATE_EDEN_KIND, "import-existing"}:
         for identity in identities:
             state, _detail = _process_state(identity)
             if state == "live":
@@ -36111,7 +36285,7 @@ def _journal_path_for_slot(config: Config, slot: str) -> Path:
                 )
             raw = pending
         _validate_journal_shape(config, path, raw)
-        if raw.get("kind") in {"create", "finish"} and raw.get("slot") == slot:
+        if raw.get("kind") in {"create", _CREATE_EDEN_KIND, "finish"} and raw.get("slot") == slot:
             matches.append(path)
     if not matches:
         raise Refusal(f"no interrupted mutation is recorded for slot {slot!r}")
@@ -38018,12 +38192,17 @@ def _eden_known_config_dirs(config: Config) -> tuple[str, ...]:
     return tuple(known)
 
 
-def _provision_eden_slot(
-    config: Config,
+def _edenfs_unit_name(config_dir: str) -> str:
+    """The per-slot daemon unit: ``edenfs@<escaped state dir>.service`` (#1423)."""
+
+    escaped = config_dir.lstrip("/").replace("-", "\\x2d").replace("/", "-")
+    return f"edenfs@{escaped}.service"
+
+
+def _eden_create_plan(
     args: argparse.Namespace,
-    slot_path: Path,
-) -> Checkout:
-    """Clone the Eden checkout for a create; refuse on any bad proof."""
+) -> tuple[str, str, str | None]:
+    """Validate the single --eden assignment; writes nothing."""
 
     eden_map = _assignments(args.eden, "Eden checkout")
     rev_map = _assignments(args.eden_rev, "Eden revision")
@@ -38034,6 +38213,12 @@ def _provision_eden_slot(
     unknown = sorted(set(rev_map) - set(eden_map))
     if unknown:
         raise Refusal(f"Eden revision supplied for unknown checkout: {', '.join(unknown)}")
+    return name, backing, rev_map.get(name)
+
+
+def _assert_eden_host_cap(config: Config) -> None:
+    """Refuse at the host Eden cap; reads daemon state, writes nothing."""
+
     cmdlines: list[str] = []
     for cmdline in Path("/proc").glob("*/cmdline"):
         try:
@@ -38046,29 +38231,364 @@ def _provision_eden_slot(
         eden.assert_under_cap(mounts, config.eden_host_cap)
     except eden.EdenError as exc:
         raise Refusal(str(exc)) from exc
-    slot_path.parent.mkdir(parents=True, exist_ok=True)
-    if config.worktrees_image is not None:
-        # Mirror born-in-image git provisioning: bind layout creates the
-        # subvolume inside the image and binds it at the slot path.
-        if config.worktrees_image.direct:
-            if args.slot_type == "validate":
-                worktreesimage.ensure_validate_bind(config.worktrees)
-            worktreesimage.create_slot_subvolume(
-                slot_path, config.worktrees_image.slot_quota_bytes
+
+
+class _EdenProvisionFailure(Refusal):
+    """An Eden provisioning failure after the create journal was written (#1558).
+
+    ``cleaned`` is True when the slot's daemon was stopped, its mount
+    verified gone, and the storage the create made was removed; the
+    caller then clears the journal (fully rolled back).  Otherwise the
+    journal stays for ``recover --abort-create`` and ``problems`` names
+    what could not be undone.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cleaned: bool,
+        problems: Sequence[str] = (),
+        in_slot_targets: Sequence[str] = (),
+        derived_targets: Sequence[str] = (),
+    ) -> None:
+        super().__init__(message)
+        self.cleaned = cleaned
+        self.problems = tuple(problems)
+        self.in_slot_targets = tuple(in_slot_targets)
+        self.derived_targets = tuple(derived_targets)
+
+
+@dataclasses.dataclass(frozen=True)
+class _EdenCreateFields:
+    """Validated contents of one Eden create journal (#1558)."""
+
+    slot: str
+    agent: str
+    slot_type: str
+    checkout_name: str
+    backing: str
+    requested_rev: str | None
+    slot_path: Path
+    config_dir: str
+    mount: str
+    unit: str
+    phase: str
+    detail: str | None
+    in_slot_targets: tuple[str, ...]
+    derived_targets: tuple[str, ...]
+
+
+def _eden_create_journal_payload(
+    config: Config,
+    args: argparse.Namespace,
+    owner: ProcessIdentity | None,
+    task_scope: TaskScopeIdentity | None,
+    coordinator_lease: ProcessIdentity,
+    slot_path: Path,
+    checkout_name: str,
+    backing: str,
+    requested_rev: str | None,
+    *,
+    created_at: str,
+    operation_id: str,
+    phase: str = "provisioning",
+    detail: str | None = None,
+    in_slot_targets: Sequence[str] = (),
+    derived_targets: Sequence[str] = (),
+) -> dict[str, object]:
+    config_dir = str(slot_path / ".eden-state")
+    value: dict[str, object] = {
+        "schema": SCHEMA,
+        "kind": _CREATE_EDEN_KIND,
+        "machine": config.machine,
+        "slot": args.slot,
+        "agent": args.agent,
+        "task": args.task,
+        "purpose": args.purpose,
+        "slot_type": args.slot_type,
+        "created_at": created_at,
+        "heartbeat_at": created_at,
+        "heartbeat_ttl_seconds": config.heartbeat_ttl_seconds,
+        "owner": _identity_to_obj(owner),
+        "coordinator_lease": _identity_to_obj(coordinator_lease),
+        "operation_id": operation_id,
+        "eden": {
+            "checkout_name": checkout_name,
+            "backing": backing,
+            "requested_rev": requested_rev,
+            "slot_path": str(slot_path),
+            "config_dir": config_dir,
+            "mount": str(slot_path / "checkout"),
+            "unit": _edenfs_unit_name(config_dir),
+            "phase": phase,
+            "detail": detail,
+            "in_slot_targets": list(in_slot_targets),
+            "derived_targets": list(derived_targets),
+        },
+    }
+    if task_scope is not None:
+        value["task_scope"] = _task_scope_to_obj(task_scope)
+    reason = getattr(args, "harness_checkout_reason", None)
+    if reason:
+        value["harness_checkout_reason"] = reason
+    return value
+
+
+def _parse_eden_create_journal(
+    config: Config, raw: Mapping[str, object]
+) -> _EdenCreateFields:
+    """Validate one Eden create journal and name its exact targets (#1558)."""
+
+    _journal_forward_compatible(raw, "eden create journal")
+    _exact_keys(
+        raw, _EDEN_CREATE_JOURNAL_REQUIRED, _EDEN_CREATE_JOURNAL_OPTIONAL,
+        "eden create journal",
+    )
+    if raw.get("kind") != _CREATE_EDEN_KIND:
+        raise StateError("eden create journal has the wrong kind")
+    machine = _as_str(raw["machine"], "eden create journal.machine")
+    if machine != config.machine:
+        raise StateError("eden create journal belongs to another machine")
+    slot = _validate_name(_as_str(raw["slot"], "eden create journal.slot"), "slot")
+    agent = _validate_name(_as_str(raw["agent"], "eden create journal.agent"), "agent")
+    if not _as_str(raw["task"], "eden create journal.task") or not _as_str(
+        raw["purpose"], "eden create journal.purpose"
+    ):
+        raise StateError("eden create journal has an empty task or purpose")
+    slot_type = _as_str(raw["slot_type"], "eden create journal.slot_type")
+    if slot_type not in SLOT_TYPES:
+        raise StateError("eden create journal has an invalid slot type")
+    _parse_timestamp(
+        _as_str(raw["created_at"], "eden create journal.created_at"),
+        "eden create journal.created_at",
+    )
+    _parse_timestamp(
+        _as_str(raw["heartbeat_at"], "eden create journal.heartbeat_at"),
+        "eden create journal.heartbeat_at",
+    )
+    if _as_int(
+        raw["heartbeat_ttl_seconds"], "eden create journal.heartbeat_ttl_seconds",
+        minimum=1,
+    ) != config.heartbeat_ttl_seconds:
+        raise StateError("eden create journal heartbeat TTL differs from configuration")
+    owner = _identity_from_obj(raw["owner"], "eden create journal.owner")
+    task_scope = (
+        None
+        if "task_scope" not in raw
+        else _task_scope_from_obj(raw["task_scope"], "eden create journal.task_scope")
+    )
+    _assert_task_scope_matches_owner(task_scope, owner, "eden create journal.task_scope")
+    if _identity_from_obj(
+        raw["coordinator_lease"], "eden create journal.coordinator_lease"
+    ) is None:
+        raise StateError("eden create journal has no coordinator lease")
+    if not re.fullmatch(
+        r"[0-9a-f]{32}",
+        _as_str(raw["operation_id"], "eden create journal.operation_id"),
+    ):
+        raise StateError("eden create journal has an invalid operation_id")
+    eden_raw = _as_mapping(raw["eden"], "eden create journal.eden")
+    _exact_keys(eden_raw, _EDEN_CREATE_EDEN_REQUIRED, set(), "eden create journal.eden")
+    checkout_name = _validate_name(
+        _as_str(eden_raw["checkout_name"], "eden create journal.eden.checkout_name"),
+        "checkout name",
+    )
+    backing = _as_str(eden_raw["backing"], "eden create journal.eden.backing")
+    if not backing:
+        raise StateError("eden create journal.eden.backing is empty")
+    requested_rev = eden_raw["requested_rev"]
+    if requested_rev is not None and not isinstance(requested_rev, str):
+        raise StateError("eden create journal.eden.requested_rev must be a string or null")
+    slot_path = _slot_directory(config, slot, slot_type)
+    if _as_str(eden_raw["slot_path"], "eden create journal.eden.slot_path") != str(slot_path):
+        raise StateError("eden create journal.eden.slot_path does not match its slot")
+    config_dir = str(slot_path / ".eden-state")
+    if _as_str(eden_raw["config_dir"], "eden create journal.eden.config_dir") != config_dir:
+        raise StateError("eden create journal.eden.config_dir does not match its slot")
+    mount = str(slot_path / "checkout")
+    if _as_str(eden_raw["mount"], "eden create journal.eden.mount") != mount:
+        raise StateError("eden create journal.eden.mount does not match its slot")
+    unit = _edenfs_unit_name(config_dir)
+    if _as_str(eden_raw["unit"], "eden create journal.eden.unit") != unit:
+        raise StateError("eden create journal.eden.unit does not match its config dir")
+    phase = _as_str(eden_raw["phase"], "eden create journal.eden.phase")
+    if phase not in _EDEN_CREATE_PHASES:
+        raise StateError("eden create journal.eden.phase is unknown")
+    detail = eden_raw["detail"]
+    if detail is not None and not isinstance(detail, str):
+        raise StateError("eden create journal.eden.detail must be a string or null")
+    in_slot_targets = tuple(
+        _as_str(item, "eden create journal.eden.in_slot_targets item")
+        for item in _as_list(
+            eden_raw["in_slot_targets"], "eden create journal.eden.in_slot_targets"
+        )
+    )
+    for target_name in in_slot_targets:
+        _validate_name(target_name, "eden in-slot target")
+    derived_targets = tuple(
+        _as_str(item, "eden create journal.eden.derived_targets item")
+        for item in _as_list(
+            eden_raw["derived_targets"], "eden create journal.eden.derived_targets"
+        )
+    )
+    return _EdenCreateFields(
+        slot=slot,
+        agent=agent,
+        slot_type=slot_type,
+        checkout_name=checkout_name,
+        backing=backing,
+        requested_rev=requested_rev,
+        slot_path=slot_path,
+        config_dir=config_dir,
+        mount=mount,
+        unit=unit,
+        phase=phase,
+        detail=detail,
+        in_slot_targets=in_slot_targets,
+        derived_targets=derived_targets,
+    )
+
+
+def _eden_record_matches_journal(
+    config: Config, record: ActiveRecord, fields: _EdenCreateFields
+) -> bool:
+    if record.slot != fields.slot or record.slot_type != fields.slot_type:
+        return False
+    if len(record.checkouts) != 1:
+        return False
+    checkout = record.checkouts[0]
+    return (
+        checkout.vcs == "eden"
+        and checkout.name == fields.checkout_name
+        and checkout.repository == fields.backing
+        and _stored_path(config, checkout.path, "checkout path") == Path(fields.mount)
+    )
+
+
+def _eden_leftover_lines(fields: _EdenCreateFields) -> list[str]:
+    return [
+        f"eden leftover: config dir: {fields.config_dir}",
+        f"eden leftover: mount: {fields.mount}",
+        f"eden leftover: unit: {fields.unit}",
+        "eden leftover: run 'wrkslots recover --abort-create "
+        f"--slot {fields.slot}' to finish the removal",
+    ]
+
+
+def _eden_stop_slot_daemon(
+    runner: eden.Runner, config_dir: str, mount: str
+) -> tuple[str, ...]:
+    """Stop only the daemon owning ``config_dir``; verify its mount is gone."""
+
+    runner(["eden", "--config-dir", config_dir, "remove", "-y", mount])
+    runner(["eden", "--config-dir", config_dir, "stop"])
+    rc, stdout, stderr = runner(["eden", "--config-dir", config_dir, "list"])
+    if rc != 0:
+        return (
+            f"cannot verify Eden removal in {config_dir}: "
+            f"{stderr.strip() or stdout.strip() or 'eden list failed'}",
+        )
+    if mount in eden.parse_mount_list(stdout):
+        return (f"mount still listed by eden: {mount}",)
+    return ()
+
+
+def _eden_remove_slot_storage(
+    config: Config,
+    slot_path: Path,
+    in_slot_targets: Sequence[str],
+    derived_targets: Sequence[str],
+) -> tuple[str, ...]:
+    """Remove only the storage one Eden create made; refuse anything else."""
+
+    expected = {".eden-state", "checkout", *in_slot_targets}
+    if slot_path.is_symlink() or (slot_path.exists() and not slot_path.is_dir()):
+        return (f"slot path is unsafe: {slot_path}",)
+    if slot_path.exists():
+        entries = {entry.name for entry in slot_path.iterdir()}
+        unexpected = sorted(entries - expected)
+        if unexpected:
+            return (
+                f"slot {slot_path} holds unexpected entries: "
+                f"{', '.join(unexpected)}",
             )
-        else:
-            mount_dir = worktreesimage.image_mount_dir(config.control)
-            worktreesimage.create_slot_subvolume(
-                mount_dir / args.slot, config.worktrees_image.slot_quota_bytes
-            )
-            worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
-    else:
-        slot_path.mkdir()
+        for name in sorted(entries):
+            entry = slot_path / name
+            if entry.is_symlink() or not entry.is_dir():
+                return (f"slot entry is unsafe: {entry}",)
+    for target in derived_targets:
+        derived = Path(target)
+        if derived.is_symlink() and not eden.is_inside(
+            os.path.realpath(derived), str(slot_path)
+        ):
+            return (f"derived redirection is not this slot's symlink: {derived}",)
+    problems: list[str] = []
+    for target in derived_targets:
+        derived = Path(target)
+        try:
+            if derived.is_symlink():
+                derived.unlink()
+        except OSError as exc:
+            problems.append(f"cannot remove derived redirection {derived}: {exc}")
+    if slot_path.exists():
+        for name in sorted({entry.name for entry in slot_path.iterdir()}):
+            try:
+                shutil.rmtree(slot_path / name)
+            except OSError as exc:
+                problems.append(f"cannot remove slot entry {slot_path / name}: {exc}")
+        if not problems:
+            try:
+                _remove_slot_directory(config, slot_path)
+            except OSError as exc:
+                problems.append(f"cannot remove slot directory {slot_path}: {exc}")
+    return tuple(problems)
+
+
+def _provision_eden_slot(
+    config: Config,
+    args: argparse.Namespace,
+    slot_path: Path,
+) -> tuple[Checkout, tuple[str, ...], tuple[str, ...]]:
+    """Clone the Eden checkout for a create; roll back on any failure (#1558).
+
+    The caller has already validated the assignment, checked the host
+    cap, and written the create journal.  Every failure after the slot
+    directory is made stops this slot's own daemon (only ever through
+    its own ``--config-dir``), verifies the mount gone, and removes the
+    storage this create made; the outcome rides on
+    :class:`_EdenProvisionFailure` so the caller can clear or keep the
+    journal.
+    """
+
+    name, backing, requested_rev = _eden_create_plan(args)
     config_dir = slot_path / ".eden-state"
     mount = slot_path / "checkout"
+    in_slot_targets: list[str] = []
+    derived_targets: list[str] = []
+    daemon_started = False
     try:
+        slot_path.parent.mkdir(parents=True, exist_ok=True)
+        if config.worktrees_image is not None:
+            # Mirror born-in-image git provisioning: bind layout creates the
+            # subvolume inside the image and binds it at the slot path.
+            if config.worktrees_image.direct:
+                if args.slot_type == "validate":
+                    worktreesimage.ensure_validate_bind(config.worktrees)
+                worktreesimage.create_slot_subvolume(
+                    slot_path, config.worktrees_image.slot_quota_bytes
+                )
+            else:
+                mount_dir = worktreesimage.image_mount_dir(config.control)
+                worktreesimage.create_slot_subvolume(
+                    mount_dir / args.slot, config.worktrees_image.slot_quota_bytes
+                )
+                worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
+        else:
+            slot_path.mkdir()
+        daemon_started = True
         info, redirections = eden.provision_checkout(
-            _eden_runner, str(config_dir), backing, str(mount), rev_map.get(name)
+            _eden_runner, str(config_dir), backing, str(mount), requested_rev
         )
         for item in redirections:
             if eden.is_inside(item.target, str(slot_path)):
@@ -38087,13 +38607,18 @@ def _provision_eden_slot(
                     f"redirection {item.repo_path} target escapes the slot and "
                     f"is not a fresh empty directory: {item.target}"
                 ) from exc
+            # A fresh clone's derived parent under host scratch does not
+            # exist yet; create it before the symlink (#1558).
+            derived.parent.mkdir(parents=True, exist_ok=True)
             in_slot = slot_path / f"{item.repo_path}-target"
             in_slot.mkdir(exist_ok=True)
+            in_slot_targets.append(in_slot.name)
             _eden_runner(
                 ["eden", "--config-dir", str(config_dir), "redirect", "unmount",
                  "--mount", str(mount)]
             )
             derived.symlink_to(in_slot, target_is_directory=True)
+            derived_targets.append(str(derived))
             rc, _out, stderr = _eden_runner(
                 ["eden", "--config-dir", str(config_dir), "redirect", "fixup",
                  "--mount", str(mount)]
@@ -38110,9 +38635,38 @@ def _provision_eden_slot(
                 raise Refusal(
                     f"redirection {item.repo_path} is not backed by the slot image"
                 )
-    except eden.EdenError as exc:
-        raise Refusal(str(exc)) from exc
-    return Checkout(
+    except Exception as exc:
+        if isinstance(exc, Refusal):
+            message = str(exc)
+        elif isinstance(exc, eden.EdenError):
+            message = str(exc)
+        else:
+            message = f"Eden create failed: {exc}"
+        problems: tuple[str, ...] = ()
+        if daemon_started:
+            problems = _eden_stop_slot_daemon(
+                _eden_runner, str(config_dir), str(mount)
+            )
+        if not problems:
+            problems = _eden_remove_slot_storage(
+                config, slot_path, in_slot_targets, derived_targets
+            )
+        if problems:
+            raise _EdenProvisionFailure(
+                f"{message}; Eden cleanup incomplete: {'; '.join(problems)}",
+                cleaned=False,
+                problems=problems,
+                in_slot_targets=in_slot_targets,
+                derived_targets=derived_targets,
+            ) from exc
+        raise _EdenProvisionFailure(
+            f"{message}; the slot's Eden daemon was stopped and the "
+            "storage this create made was removed",
+            cleaned=True,
+            in_slot_targets=in_slot_targets,
+            derived_targets=derived_targets,
+        ) from exc
+    checkout = Checkout(
         name=name,
         path=_checkout_path_for_layout(
             config, args.slot, name, args.slot_type, config.layout, vcs="eden"
@@ -38127,6 +38681,7 @@ def _provision_eden_slot(
         containing_remote_refs=(),
         vcs="eden",
     )
+    return checkout, tuple(in_slot_targets), tuple(derived_targets)
 
 
 def _assert_harness_create_allowed(config: Config, args: argparse.Namespace) -> None:
@@ -38327,12 +38882,89 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _assert_create_disk_space(config, args.override_disk_floor)
         slot_path = _slot_directory(config, args.slot, args.slot_type)
         if slot_path.exists() or slot_path.is_symlink():
+            if _create_journal_path(config, args.slot).exists():
+                raise Refusal(
+                    f"slot path already exists: {slot_path}; an interrupted "
+                    f"create is journaled for slot {args.slot!r}. remedy: run "
+                    f"'wrkslots recover --abort-create --slot {args.slot} "
+                    "--coordinator-pid PID' to roll it back, then retry"
+                )
             raise Refusal(f"slot path already exists: {slot_path}")
         if getattr(args, "eden", None):
             if getattr(args, "repo", None) or getattr(args, "branch", None):
                 raise Refusal("create --eden cannot combine with --repo/--branch")
-            checkout = _provision_eden_slot(config, args, slot_path)
+            checkout_name, backing, requested_rev = _eden_create_plan(args)
+            _assert_eden_host_cap(config)
             created_at = _utc_now()
+            operation_id = uuid.uuid4().hex
+            journal_path = _create_journal_path(config, args.slot)
+            event_writer = (
+                _event_writer(config, config.machine)
+                if local is None
+                else local.writer(config)
+            )
+            journal_payload = _eden_create_journal_payload(
+                config,
+                args,
+                owner,
+                task_scope,
+                coordinator_lease,
+                slot_path,
+                checkout_name,
+                backing,
+                requested_rev,
+                created_at=created_at,
+                operation_id=operation_id,
+            )
+            # The journal is durable before the daemon starts (#1558):
+            # it names the slot path, config dir and mount, so a failure
+            # the inline rollback cannot finish stays recoverable.
+            _write_journal(
+                config,
+                journal_payload,
+                event_writer=event_writer,
+                journal_path=journal_path,
+            )
+            try:
+                checkout, made_in_slot, made_derived = _provision_eden_slot(
+                    config, args, slot_path
+                )
+            except _EdenProvisionFailure as failure:
+                if failure.cleaned:
+                    _clear_journal(
+                        config,
+                        journal_payload,
+                        event_writer=event_writer,
+                        journal_path=journal_path,
+                    )
+                    raise
+                fields = _parse_eden_create_journal(config, journal_payload)
+                failed_payload = _eden_create_journal_payload(
+                    config,
+                    args,
+                    owner,
+                    task_scope,
+                    coordinator_lease,
+                    slot_path,
+                    checkout_name,
+                    backing,
+                    requested_rev,
+                    created_at=created_at,
+                    operation_id=operation_id,
+                    phase="cleanup-failed",
+                    detail=str(failure),
+                    in_slot_targets=failure.in_slot_targets,
+                    derived_targets=failure.derived_targets,
+                )
+                _write_journal(
+                    config,
+                    failed_payload,
+                    event_writer=event_writer,
+                    journal_path=journal_path,
+                )
+                for line in _eden_leftover_lines(fields):
+                    print(line, file=sys.stderr)
+                raise
             record = ActiveRecord(
                 slot=args.slot,
                 agent=args.agent,
@@ -38358,11 +38990,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 )
             except StateError as exc:
                 raise Refusal(str(exc)) from exc
-            event_writer = (
-                _event_writer(config, config.machine)
-                if local is None
-                else local.writer(config)
-            )
             _write_active_state(
                 config,
                 _append_record(state, record),
@@ -38375,6 +39002,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 },
                 event_writer=event_writer,
                 previous=None if local is None else local.active,
+            )
+            _clear_journal(
+                config,
+                journal_payload,
+                event_writer=event_writer,
+                journal_path=journal_path,
             )
             return record, _registry_storage_inconsistencies(config, states)
         plan = _create_plan(config, args, vcs)
@@ -61936,6 +62569,74 @@ def _verify_created_checkouts(
             check(name, repository_path, path)
 
 
+def _abort_eden_create(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    fields: _EdenCreateFields,
+) -> None:
+    """Roll back one Eden create journal; remove only what it names (#1558)."""
+
+    problems = _eden_stop_slot_daemon(_eden_runner, fields.config_dir, fields.mount)
+    if not problems:
+        problems = _eden_remove_slot_storage(
+            config, fields.slot_path, fields.in_slot_targets, fields.derived_targets
+        )
+    if problems:
+        leftover = "; ".join(_eden_leftover_lines(fields))
+        raise Refusal(
+            f"cannot abort eden create for slot {fields.slot}: "
+            f"{'; '.join(problems)}; {leftover}"
+        )
+    _clear_journal(config, raw, journal_path=path)
+    print(
+        f"recovered eden create: aborted slot={fields.slot}; stopped its "
+        "daemon and removed the storage the create made"
+    )
+
+
+def _recover_eden_create(
+    config: Config,
+    path: Path,
+    raw: Mapping[str, object],
+    state: ActiveState,
+    recovery_actor: ProcessIdentity,
+    *,
+    abort_create: bool,
+) -> None:
+    """Recover one Eden create journal in its own branch (#1558)."""
+
+    del recovery_actor
+    fields = _parse_eden_create_journal(config, raw)
+    existing = next((item for item in state.slots if item.slot == fields.slot), None)
+    if existing is not None:
+        if abort_create:
+            raise Refusal(
+                f"cannot abort eden create for slot {fields.slot}: its "
+                "ACTIVE row is already durable"
+            )
+        if not _eden_record_matches_journal(config, existing, fields):
+            raise StateError(
+                f"eden create journal for slot {fields.slot} does not match "
+                "its durable ACTIVE record"
+            )
+        _clear_journal(config, raw, journal_path=path)
+        print(
+            f"recovered eden create: active state was durable; cleared "
+            f"journal for {fields.slot}"
+        )
+        return
+    if not abort_create:
+        leftover = "; ".join(_eden_leftover_lines(fields))
+        raise Refusal(
+            f"eden create for slot {fields.slot} cannot be resumed; "
+            f"inspect it, then run 'wrkslots recover --abort-create "
+            f"--slot {fields.slot} --coordinator-pid PID' to roll it back; "
+            f"{leftover}"
+        )
+    _abort_eden_create(config, path, raw, fields)
+
+
 def _recover_create(
     config: Config,
     path: Path,
@@ -83467,7 +84168,21 @@ def _cmd_recover(
         state = _load_active(
             config, require_repository=kind != "finish"
         )
-        if kind == "create":
+        if kind == _CREATE_EDEN_KIND:
+            if args.retry_running_hook:
+                raise Refusal(
+                    "--retry-running-hook applies only to git create journals"
+                )
+            _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+            _recover_eden_create(
+                config,
+                path,
+                raw,
+                state,
+                coordinator,
+                abort_create=args.abort_create,
+            )
+        elif kind == "create":
             _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
             _recover_create(
                 config,
