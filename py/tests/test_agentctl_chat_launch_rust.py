@@ -95,6 +95,22 @@ else:
 """
 
 
+def _die_with_parent(parent_pid: int) -> None:
+    # Nothing the fixture starts may outlive its test process: if the
+    # pytest is killed (SIGKILL included), the kernel delivers SIGKILL
+    # to the child, whose own launch-gate children carry the same
+    # parent-death lifeline onward to the bridge and the harness
+    # (#857). Without this, a killed gate step left a `chat run`
+    # reparented to init for 34 hours, and the pane shell loop for days.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+    if libc.prctl(1, int(signal.SIGKILL), 0, 0, 0) != 0:
+        os.kill(os.getpid(), signal.SIGKILL)
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
 class Fixture:
     def __init__(self, tmp_path: Path) -> None:
         self.agentctl, self.plugin_binary = _binaries()
@@ -152,9 +168,19 @@ class Fixture:
             )
         )
         self.config.chmod(0o600)
+        shell_parent_pid = os.getpid()
+
+        def shell_preexec() -> None:
+            os.setsid()
+            # The pane shell carries the same parent-death lifeline as
+            # the launcher: its command line names no fixture path, so
+            # a SIGKILLed pytest used to leave this loop behind for
+            # days, found only by its working directory (#857).
+            _die_with_parent(shell_parent_pid)
+
         self.shell = subprocess.Popen(
             ["/bin/bash", "-c", "while true; do sleep 5; done"],
-            preexec_fn=os.setsid,
+            preexec_fn=shell_preexec,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -194,19 +220,7 @@ class Fixture:
         parent_pid = os.getpid()
 
         def die_with_parent() -> None:
-            # The launcher must not outlive this test process: if the outer
-            # pytest is killed (SIGKILL included), the kernel delivers
-            # SIGKILL to the launcher, whose own launch-gate children carry
-            # the same parent-death lifeline onward to the bridge and the
-            # harness (#857). Without this, a killed gate step left a
-            # `chat run` reparented to init for 34 hours.
-            libc = ctypes.CDLL(None, use_errno=True)
-            if os.getppid() != parent_pid:
-                os.kill(os.getpid(), signal.SIGKILL)
-            if libc.prctl(1, int(signal.SIGKILL), 0, 0, 0) != 0:
-                os.kill(os.getpid(), signal.SIGKILL)
-            if os.getppid() != parent_pid:
-                os.kill(os.getpid(), signal.SIGKILL)
+            _die_with_parent(parent_pid)
 
         return subprocess.Popen(
             [
@@ -280,14 +294,17 @@ def fixture(tmp_path: Path) -> Generator[Fixture, None, None]:
 
 
 def _wait_for(
-    predicate: Callable[[], bool], timeout: float = 30.0, interval: float = 0.1
+    predicate: Callable[[], bool], timeout: float = 300.0, interval: float = 0.1
 ) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    # The timeout is a hang guard, never the verdict (owner rule 346):
+    # the predicate is the verdict, and the guard is generous enough
+    # that a starved thread on a hot host still gets scheduled.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if predicate():
             return True
         time.sleep(interval)
-    return False
+    return predicate()
 
 
 def test_launch_refuses_python_format_config(fixture: Fixture, tmp_path: Path) -> None:
@@ -295,7 +312,7 @@ def test_launch_refuses_python_format_config(fixture: Fixture, tmp_path: Path) -
     legacy.write_text(json.dumps({"space": "spaces/test", "allowed_senders": ["users/o"]}))
     legacy.chmod(0o600)
     process = fixture.launch(config=legacy)
-    stdout, stderr = process.communicate(timeout=120)
+    stdout, stderr = process.communicate(timeout=300)
     assert process.returncode == 1
     assert "Python-format chat config" in stderr
     assert "chat init" in stderr
@@ -310,7 +327,7 @@ def test_launch_refuses_python_polling_state(fixture: Fixture) -> None:
         json.dumps({"version": 1, "config": {"space": "spaces/test", "target": {}}})
     )
     process = fixture.launch()
-    _stdout, stderr = process.communicate(timeout=120)
+    _stdout, stderr = process.communicate(timeout=300)
     assert process.returncode == 1
     assert "Python polling bridge state" in stderr
     assert "chat init" in stderr
@@ -319,7 +336,7 @@ def test_launch_refuses_python_polling_state(fixture: Fixture) -> None:
 
 def test_launch_refuses_outside_herdr_pane(fixture: Fixture) -> None:
     process = fixture.launch(extra_env={"HERDR_ENV": "0"})
-    _stdout, stderr = process.communicate(timeout=120)
+    _stdout, stderr = process.communicate(timeout=300)
     assert process.returncode == 1
     assert "must run inside the Herdr shell pane" in stderr
 
@@ -331,7 +348,7 @@ def test_launch_returns_coordinator_exit_code(fixture: Fixture) -> None:
     assert (fixture.registry / "agents" / "coordinator" / "agent.json").exists()
     assert (fixture.state / "bridge.json").exists()
     assert (fixture.state / "bridge.log").exists()
-    assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 120)
+    assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 300)
 
 
 def test_launch_sigterm_stops_both_children(fixture: Fixture) -> None:
@@ -340,23 +357,42 @@ def test_launch_sigterm_stops_both_children(fixture: Fixture) -> None:
     harness_pid = int((fixture.control / "harness.pid").read_text())
     assert _wait_for(lambda: bool(fixture.processes_with(str(fixture.state))), 300)
     process.send_signal(signal.SIGTERM)
-    _stdout, _stderr = process.communicate(timeout=120)
+    _stdout, _stderr = process.communicate(timeout=300)
     assert process.returncode == 0
-    assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 120)
-    assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 120)
+    assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 300)
+    assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 300)
 
 
 def test_launch_sigterm_exits_within_a_few_seconds(fixture: Fixture) -> None:
     # Regression: admission work (pane flock / late-paste polling) must
-    # never keep `chat run` alive until systemd's stop timeout. Exit is
-    # the condition; the generous communicate bound only reports a hang
-    # (owner rule 346: no wall-clock verdict).
+    # never keep `chat run` alive until systemd's stop timeout. The
+    # promptness verdict is the bridge's own stop line: a clean stop
+    # logs "chat run stopped … after the termination request", while a
+    # stop the termination guard had to abandon logs "did not stop
+    # within". Exit plus those lines are the conditions; every bound
+    # here only reports a hang (owner rule 346: no wall-clock verdict).
     process = fixture.launch()
     assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 300)
-    assert _wait_for(lambda: bool(fixture.processes_with(str(fixture.state))), 300)
+    # The bridge itself, not any process naming the state: the
+    # launcher's own argv carries --bridge-state too.
+    assert _wait_for(lambda: bool(fixture.bridge_processes()), 300)
     process.send_signal(signal.SIGTERM)
-    _stdout, _stderr = process.communicate(timeout=120)
+    _stdout, _stderr = process.communicate(timeout=300)
     assert process.returncode == 0
+    log = fixture.state / "bridge.log"
+
+    def stopped_cleanly() -> bool:
+        if not log.exists():
+            return False
+        text = log.read_text()
+        return "chat run stopped" in text or "did not stop within" in text
+
+    assert _wait_for(stopped_cleanly, 300), (
+        log.read_text()[-3000:] if log.exists() else "no bridge log"
+    )
+    text = log.read_text()
+    assert "chat run stopped" in text, text[-3000:]
+    assert "did not stop within" not in text, text[-3000:]
 
 
 def _process_gone(pid: int) -> bool:
@@ -406,13 +442,30 @@ def test_run_sigterm_with_a_delivery_in_flight_exits_within_five_seconds(
             "no request was admitted: "
             + (log.read_text()[-3000:] if log.exists() else "no bridge log")
         )
-        # The owner loop starts delivering the request at once, and each attempt waits for the
-        # pane's composer, or hangs in Herdr's typing call, for longer than this.
-        time.sleep(2)
+        # Delivery is in flight once the request record is stamped
+        # with a delivery start: the attempt then waits for the
+        # pane's composer, or hangs in the fake Herdr's typing call,
+        # either of which outlasts the moment it takes to send
+        # SIGTERM next. Waiting on that stamp, not on a sleep, is
+        # what puts SIGTERM inside the delivery on a loaded host too.
+        def delivery_started() -> bool:
+            for path in admitted():
+                try:
+                    record = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if record.get("delivery_started_at_millis") is not None:
+                    return True
+            return False
+
+        assert _wait_for(delivery_started, 300), (
+            "delivery never started: "
+            + (log.read_text()[-3000:] if log.exists() else "no bridge log")
+        )
         os.kill(bridge, signal.SIGTERM)
         # Exit is the condition; the generous bound only reports a hang
         # (owner rule 346: no wall-clock verdict).
-        assert _wait_for(lambda: _process_gone(bridge), 120)
+        assert _wait_for(lambda: _process_gone(bridge), 300)
         status = subprocess.run(
             [
                 str(fixture.agentctl),
@@ -423,7 +476,7 @@ def test_run_sigterm_with_a_delivery_in_flight_exits_within_five_seconds(
             env=fixture.env(),
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=300,
         )
         assert "first message" not in status.stdout or "delivered" not in status.stdout, status.stdout
         requests = admitted()
@@ -433,14 +486,17 @@ def test_run_sigterm_with_a_delivery_in_flight_exits_within_five_seconds(
             assert record.get("delivered_at_millis") is None, record
     finally:
         process.send_signal(signal.SIGTERM)
-        process.communicate(timeout=120)
+        process.communicate(timeout=300)
 
 
 def test_run_sigterm_with_a_plugin_that_ignores_close_exits_within_five_seconds(
     fixture: Fixture, tmp_path: Path
 ) -> None:
-    # #870 agentctl-service-slow-stop: a provider plugin that never answers Close makes the stop
-    # report "plugin required forced shutdown"; `chat run` still exits within 5 s of SIGTERM.
+    # #870 agentctl-service-slow-stop: a provider plugin that never answers Close is shut
+    # down by force and the stop still ends. The verdict is the forced path's own log line
+    # (the termination guard's "did not stop within", or the plugin host's "required forced
+    # shutdown") plus the process being gone — never seconds measured by this test process,
+    # which a loaded host can starve (owner rule 346).
     config = tmp_path / "stalling.json"
     document = json.loads(fixture.config.read_text())
     document["subscription_environment"] = ["CHAT_SUBSCRIPTION_FAKE_STALL"]
@@ -452,17 +508,23 @@ def test_run_sigterm_with_a_plugin_that_ignores_close_exits_within_five_seconds(
         bridge = fixture.bridge_processes()[0]
         log = fixture.state / "bridge.log"
         assert _wait_for(
-            lambda: log.exists() and "subscribed without a saved cursor" in log.read_text(), 60
+            lambda: log.exists() and "subscribed without a saved cursor" in log.read_text(), 300
         ), (log.read_text()[-3000:] if log.exists() else "no bridge log")
-        time.sleep(1)
-        started = time.monotonic()
         os.kill(bridge, signal.SIGTERM)
-        assert _wait_for(lambda: _process_gone(bridge), 120)
-        took = time.monotonic() - started
-        assert took < 5, f"chat run took {took:.1f}s to stop: {log.read_text()[-2000:]}"
+        assert _wait_for(lambda: _process_gone(bridge), 300)
+
+        def forced_stop_logged() -> bool:
+            if not log.exists():
+                return False
+            text = log.read_text()
+            return "did not stop within" in text or "required forced shutdown" in text
+
+        assert _wait_for(forced_stop_logged, 300), (
+            log.read_text()[-3000:] if log.exists() else "no bridge log"
+        )
     finally:
         process.send_signal(signal.SIGTERM)
-        process.communicate(timeout=120)
+        process.communicate(timeout=300)
 
 
 def _children(pid: int) -> list[int]:
@@ -507,14 +569,14 @@ def test_run_sigterm_during_startup_exits_within_five_seconds(
             time.sleep(0.5)
         os.kill(bridge, signal.SIGTERM)
         # Exit is the condition; the generous bound only reports a hang.
-        assert _wait_for(lambda: _process_gone(bridge), 120)
+        assert _wait_for(lambda: _process_gone(bridge), 300)
         # It stopped by itself: the termination guard, which abandons a stop after 4 s, did
         # not have to end it.
         text = log.read_text() if log.exists() else ""
         assert "did not stop within" not in text, text[-2000:]
     finally:
         process.send_signal(signal.SIGTERM)
-        process.communicate(timeout=120)
+        process.communicate(timeout=300)
 
 
 def test_launch_agent_label_override_is_persisted(fixture: Fixture) -> None:
@@ -558,12 +620,12 @@ def test_launch_bridge_killed_first_is_an_error_and_stops_coordinator(
         )
         return bool(bridges)
 
-    assert _wait_for(find_bridge, 60)
+    assert _wait_for(find_bridge, 300)
     os.kill(bridges[0], signal.SIGKILL)
     _stdout, stderr = process.communicate(timeout=300)
     assert process.returncode == 1
     assert "chat bridge exited" in stderr
-    assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 120)
+    assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 300)
 
 
 _OUTER_KILL_HELPER = '''
@@ -593,7 +655,7 @@ def test_outer_fixture_sleeps(tmp_path):
         )
         return bool(bridges)
 
-    assert module._wait_for(find_bridge, 60)
+    assert module._wait_for(find_bridge, 300)
     Path(os.environ["CHAT_LAUNCH_MARKER"]).write_text(
         json.dumps(
             {
@@ -631,6 +693,24 @@ def test_killing_outer_pytest_leaves_no_chat_run(tmp_path: Path) -> None:
     )
     record: dict[str, object] = {}
 
+    def names_tree(pid: int) -> bool:
+        # A process names this fixture's tree in its command line, or
+        # only by sitting in it: the fixture's pane shell loop and the
+        # harness's sleeper carry no fixture path in their argv, so a
+        # command-line match alone let shell loops survive for days,
+        # found only by their working directory. A deleted working
+        # directory still counts.
+        entry = Path(f"/proc/{pid}")
+        try:
+            if str(tmp_path).encode() in (entry / "cmdline").read_bytes():
+                return True
+            cwd = os.readlink(entry / "cwd")
+        except OSError:
+            return False
+        cwd = cwd.removesuffix(" (deleted)")
+        root = str(tmp_path)
+        return cwd == root or cwd.startswith(root + "/")
+
     def survivors() -> list[int]:
         # Every process still naming this fixture's tree: the bridge, the harness, the launcher,
         # and anything they started, such as the subscription plugin's supervisor, which carries
@@ -640,7 +720,6 @@ def test_killing_outer_pytest_leaves_no_chat_run(tmp_path: Path) -> None:
             if not entry.name.isdigit() or int(entry.name) == os.getpid():
                 continue
             try:
-                cmdline = (entry / "cmdline").read_bytes()
                 state = next(
                     (line for line in (entry / "status").read_text().splitlines()
                      if line.startswith("State:")),
@@ -648,7 +727,7 @@ def test_killing_outer_pytest_leaves_no_chat_run(tmp_path: Path) -> None:
                 )
             except OSError:
                 continue
-            if str(tmp_path).encode() in cmdline and "zombie" not in state:
+            if "zombie" not in state and names_tree(int(entry.name)):
                 found.append(int(entry.name))
         return found
 
@@ -656,20 +735,20 @@ def test_killing_outer_pytest_leaves_no_chat_run(tmp_path: Path) -> None:
         assert _wait_for(lambda: marker.exists(), 300), "outer pytest never launched its fixture"
         record = json.loads(marker.read_text())
         outer.kill()  # SIGKILL to the pytest process only, as a killed gate step does.
-        outer.wait(timeout=120)
+        outer.wait(timeout=300)
         assert _wait_for(lambda: not survivors(), 300), (
             f"fixture processes survived the outer kill: {survivors()} ({record})"
         )
     finally:
         if outer.poll() is None:
             outer.kill()
-            outer.wait(timeout=120)
+            outer.wait(timeout=300)
         # Whatever the verdict, nothing this test started outlives it. Each pid is checked to
         # still name this test's temporary tree just before it is killed, so a reused pid is
         # never hit.
         for pid in survivors():
             try:
-                if str(tmp_path).encode() in Path(f"/proc/{pid}/cmdline").read_bytes():
+                if names_tree(pid):
                     os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
