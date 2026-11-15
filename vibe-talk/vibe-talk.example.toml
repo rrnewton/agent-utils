@@ -357,6 +357,15 @@ backend = "elevenlabs"
 #   { pattern = '\bD([0-9]{6,})\b', url = 'https://review.example.invalid/D$1' },
 #   { pattern = '\bT([0-9]{6,})\b', url = 'https://tasks.example.invalid/T$1' },
 # ]
+# Short references in message text (`#1565 vibe-talk-short-ref-links`): the chat bridges'
+# short-refs.json files (agentctl-short-refs/v1), one per bridge state directory, read-only
+# and re-read when one changes, resolving :thread:NNNN and :email:NNNN into thread and
+# message links. The path is configured, never hard-coded; absent, short references stay
+# plain text. None by default.
+# short_refs_files = ["/home/you/.local/state/agentctl-bridge/short-refs.json"]
+# Where :issue:NNNN in message text points: an https template holding exactly one {n}.
+# Absent, issue references stay plain text.
+# issue_url_template = "https://tracker.example.invalid/issues/{n}"
 # A GitHub pull request, issue or discussion drawn as REPO#N also carries the thread's name
 # (#1058 pr-name-enrichment): a bare address or a link written only as its number ("#5275",
 # "PR 5275", "REPO#5275") reads "REPO#5275 repair-the-sprocket". Names are learned in the

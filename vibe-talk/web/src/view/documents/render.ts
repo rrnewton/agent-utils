@@ -369,7 +369,7 @@ function renderInline(
             resolved.anchor === null ? "" : ` data-doc-anchor="${escapeHtml(resolved.anchor)}"`;
           out +=
             `<a href="${escapeHtml(resolved.url)}" data-doc="${escapeHtml(resolved.key)}"${anchorAttr} ` +
-            `title="Opens here — ${escapeHtml(resolved.url)}" rel="noopener noreferrer">${label}</a>`;
+            `title="Opens here" rel="noopener noreferrer">${label}</a>`;
         } else {
           out += `<a href="${escapeHtml(resolved.url)}" rel="noopener noreferrer">${label}</a>`;
         }

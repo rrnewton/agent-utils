@@ -326,6 +326,14 @@
   color: var(--accent);
 }
 
+/* An unresolvable short reference (`#1565 vibe-talk-short-ref-links`): plain text,
+   marked subtly so it is not mistaken for a link. */
+.md .shortref-unknown {
+  text-decoration: underline dotted;
+  text-underline-offset: 0.2em;
+  opacity: 0.75;
+}
+
 /* `#65 scrollback-paging`. Centred above the oldest message loaded, and absent when there is
    nothing older — the same rule Hang up follows. A control that is always there and usually inert
    teaches the eye to skip the place it lives in, and the place this lives in is the one the reader

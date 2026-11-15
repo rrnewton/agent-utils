@@ -605,6 +605,19 @@ pub struct RenderConfig {
     /// Reference ids drawn as links, checked when the configuration loads. Defaults to none.
     #[serde(default)]
     pub reference_links: Vec<crate::render::references::ReferenceLinkRule>,
+    /// The chat bridges' `short-refs.json` files (`agentctl-short-refs/v1`), read-only and
+    /// re-read when one changes, resolving `:thread:NNNN` and `:email:NNNN` in message text
+    /// (`#1565 vibe-talk-short-ref-links`). Each path names one bridge's file, in that
+    /// bridge's state directory; the path is configured, never hard-coded. Empty by
+    /// default, when short references stay plain text. See [`crate::short_refs`].
+    #[serde(default)]
+    pub short_refs_files: Vec<PathBuf>,
+    /// Where `:issue:NNNN` in message text points: an https template holding exactly one
+    /// `{n}` for the number, for example `https://tracker.example.invalid/issues/{n}`
+    /// (`#1565 vibe-talk-short-ref-links`). Absent, issue references stay plain text.
+    /// Checked when the configuration loads. See [`crate::short_refs`].
+    #[serde(default)]
+    pub issue_url_template: Option<String>,
     /// Whether a GitHub thread link drawn as `REPO#N` also carries the thread's name
     /// (`#1058 pr-name-enrichment`): the server learns names in the background through the
     /// `[documents]` GitHub token and proxy, under a strict request budget. On by default,
@@ -631,6 +644,8 @@ impl Default for RenderConfig {
         Self {
             single_newline: crate::render::SingleNewline::default(),
             reference_links: Vec::new(),
+            short_refs_files: Vec::new(),
+            issue_url_template: None,
             pr_names: true,
             pr_names_file: None,
             pr_names_cache_file: None,
@@ -647,6 +662,14 @@ fn render_checked(render: RenderConfig) -> Result<RenderConfig, ConfigError> {
             detail,
         },
     )?;
+    if let Some(template) = &render.issue_url_template {
+        if let Some(detail) = crate::short_refs::issue_template_problem(template) {
+            return Err(ConfigError::Invalid {
+                field: "render.issue_url_template".to_owned(),
+                detail,
+            });
+        }
+    }
     Ok(render)
 }
 

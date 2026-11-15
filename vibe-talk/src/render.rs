@@ -252,7 +252,7 @@ impl SearchText {
     /// (`#5275`, `PR 5275`) drawn by that thread's `REPO#N` label (`#1058 pr-name-enrichment`);
     /// the name a page label may also carry is never indexed, so no fetched text is in this
     /// version's key and rebuilding under it fetches nothing.
-    pub const VERSION: &'static str = "render-5";
+    pub const VERSION: &'static str = "render-6";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -308,8 +308,13 @@ impl crate::cache::SearchTextSource for SearchText {
         };
         // The configured reference links draw links of their own, whose addresses the index
         // holds: other rules, another index.
-        match references::reference_links().fingerprint() {
+        let rules = match references::reference_links().fingerprint() {
             Some(fingerprint) => format!("{rules}+refs-{fingerprint}"),
+            None => rules,
+        };
+        // Short references likewise: other resolutions, another index.
+        match crate::short_refs::fingerprint() {
+            Some(fingerprint) => format!("{rules}+shortrefs-{fingerprint}"),
             None => rules,
         }
     }
@@ -1161,9 +1166,23 @@ fn mark_message_links(html: &str) -> String {
         let Some(end) = rest[start..].find('"').map(|end| start + end) else {
             break;
         };
-        out.push_str(&rest[..=end]);
         let mut href = String::with_capacity(end - start);
         push_decoded(&mut href, &rest[start..end]);
+        // A short reference's internal address becomes the in-app address it names, marked
+        // like any message link, with its kind beside it. `#1565 vibe-talk-short-ref-links`.
+        if let Some((deep_link, target, kind)) = short_ref_link(&href) {
+            out.push_str(&rest[..start]);
+            out.push_str(&deep_link);
+            out.push_str(&rest[end..=end]);
+            out.push_str(&format!(
+                " {}=\"{}\" data-shortref=\"{kind}\"",
+                crate::message_links::ATTRIBUTE,
+                target.attribute()
+            ));
+            rest = &rest[end + 1..];
+            continue;
+        }
+        out.push_str(&rest[..=end]);
         if let Some(target) = crate::message_links::recognize(&href) {
             out.push_str(&format!(
                 " {}=\"{}\"",
@@ -1179,6 +1198,62 @@ fn mark_message_links(html: &str) -> String {
         rest = &rest[end + 1..];
     }
     out.push_str(rest);
+    out
+}
+
+/// A short reference's internal address (`SHORTREF_HOST`) read back into what it names: the
+/// in-app deep-link address for its `href`, the [`crate::message_links::Target`] for its
+/// `data-msg`, and its kind (`thread` or `email`) for `data-shortref`. The deep link is the
+/// fallback a browser follows when the page does not take the tap. `#1565`.
+fn short_ref_link(href: &str) -> Option<(String, crate::message_links::Target, &'static str)> {
+    let path = href.strip_prefix(SHORTREF_HOST)?;
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let target = |channel: &str, message: Option<&str>, thread: Option<&str>| {
+        crate::message_links::Target {
+            service: crate::message_links::Service::Slack,
+            channel: channel.to_owned(),
+            message: message.map(str::to_owned),
+            thread: thread.map(str::to_owned),
+        }
+    };
+    match parts.as_slice() {
+        ["thread", channel, root] if !root.is_empty() => Some((
+            format!(
+                "?c={}&v=thread&t={}",
+                short_ref_encode(channel),
+                short_ref_encode(root)
+            ),
+            target(channel, None, Some(root)),
+            "thread",
+        )),
+        ["message", channel, message, thread] if !message.is_empty() => {
+            let thread = (!thread.is_empty()).then_some(*thread);
+            let mut deep = format!(
+                "?c={}&v=all&m=slack:{}:{}",
+                short_ref_encode(channel),
+                short_ref_encode(channel),
+                short_ref_encode(message)
+            );
+            if let Some(thread) = thread {
+                deep.push_str(&format!(":{}", short_ref_encode(thread)));
+            }
+            Some((deep, target(channel, Some(message), thread), "email"))
+        }
+        _ => None,
+    }
+}
+
+/// `text` percent-encoded but for the unreserved characters, as a deep-link part.
+fn short_ref_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
     out
 }
 
@@ -2458,6 +2533,11 @@ pub const TAGS: [&str; 26] = [
 /// are [`RESTATED_CLASS`] and the highlighter's [`highlight::CLASSES`].
 pub const MENTION_CLASS: &str = "mention";
 
+/// The class on a short reference (`:thread:NNNN`, `:email:NNNN`, `:issue:NNNN`)
+/// that resolved to nothing: drawn as plain text with a subtle dotted underline,
+/// never as a wrong link. `#1565 vibe-talk-short-ref-links`.
+pub const SHORTREF_UNKNOWN_CLASS: &str = "shortref-unknown";
+
 /// The sanitizer, built once.
 ///
 /// From [`ammonia::Builder::empty`], so nothing is allowed that is not named here: no generic
@@ -2485,7 +2565,7 @@ fn sanitizer_builder<'a>() -> ammonia::Builder<'a> {
         .tag_attributes(HashMap::from([
             (
                 "a",
-                HashSet::from(["href", "title", crate::message_links::ATTRIBUTE, "data-doc"]),
+                HashSet::from(["href", "title", crate::message_links::ATTRIBUTE, "data-doc", "data-shortref"]),
             ),
             ("ol", HashSet::from(["start"])),
             ("input", HashSet::from(["checked"])),
@@ -2513,7 +2593,7 @@ fn sanitizer_builder<'a>() -> ammonia::Builder<'a> {
         .allowed_classes(HashMap::from([
             (
                 "span",
-                [MENTION_CLASS, RESTATED_CLASS]
+                [MENTION_CLASS, RESTATED_CLASS, SHORTREF_UNKNOWN_CLASS]
                     .into_iter()
                     .chain(highlight::CLASSES)
                     .collect(),
@@ -2648,6 +2728,163 @@ fn adjust<'a>(
     // Last, so every link the walks above made or kept is a link by now and its text is passed
     // over, and a mention is a chip rather than text.
     link_references(arena, root, &references::reference_links(), &refused)
+        + link_short_refs(arena, root, &refused)
+}
+
+/// The host short-reference links are first drawn on; [`mark_message_links`] rewrites every
+/// one into the in-app address it names before the page sees it, so this address itself is
+/// never followed. `#1565 vibe-talk-short-ref-links`.
+const SHORTREF_HOST: &str = "https://shortrefs.invalid";
+
+/// Every `:thread:NNNN`, `:email:NNNN` and `:issue:NNNN` in the words made a link where it
+/// resolves, and marked where it does not. See [`crate::short_refs`]. Text inside a link is
+/// left as it is, and so is what `refused` holds; code is not text here. A reference that
+/// resolves to nothing stays plain text under [`SHORTREF_UNKNOWN_CLASS`], never a wrong link.
+/// Answers what the links made may add to the HTML, as [`link_references`] does.
+fn link_short_refs<'a>(
+    arena: &'a Arena<'a>,
+    root: &'a AstNode<'a>,
+    refused: &HashSet<*const AstNode<'a>>,
+) -> usize {
+    const LINK_MARKUP: usize = 160;
+    let refs = crate::short_refs::short_refs();
+    let mut added = 0;
+    for node in root.descendants().collect::<Vec<_>>() {
+        let text = match &node.data.borrow().value {
+            NodeValue::Text(text)
+                if !inside_link(node) && !refused.contains(&std::ptr::from_ref(node)) =>
+            {
+                text.clone()
+            }
+            _ => continue,
+        };
+        let tokens = short_ref_tokens(&text);
+        if tokens.is_empty() {
+            continue;
+        }
+        let mut written = 0;
+        for token in tokens {
+            if token.start > written {
+                node.insert_before(
+                    arena.alloc(NodeValue::Text(text[written..token.start].to_owned().into()).into()),
+                );
+            }
+            let shown = &text[token.start..token.end];
+            let made: &'a AstNode<'a> = match short_ref_url(&refs, token.kind, token.number) {
+                Some(url) => {
+                    added += LINK_MARKUP + 2 * url.len() + shown.len();
+                    let link: &'a AstNode<'a> = arena.alloc(
+                        NodeValue::Link(Box::new(comrak::nodes::NodeLink {
+                            url,
+                            title: String::new(),
+                        }))
+                        .into(),
+                    );
+                    link.append(arena.alloc(NodeValue::Text(shown.to_owned().into()).into()));
+                    link
+                }
+                None => arena.alloc(
+                    NodeValue::Raw(format!(
+                        "<span class=\"{SHORTREF_UNKNOWN_CLASS}\">{shown}</span>"
+                    ))
+                    .into(),
+                ),
+            };
+            node.insert_before(made);
+            written = token.end;
+        }
+        if written < text.len() {
+            node.insert_before(
+                arena.alloc(NodeValue::Text(text[written..].to_owned().into()).into()),
+            );
+        }
+        node.detach();
+    }
+    added
+}
+
+/// Which short reference a token is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShortRefKind {
+    Thread,
+    Email,
+    Issue,
+}
+
+/// One short-reference token in a text node, by byte.
+struct ShortRefToken {
+    kind: ShortRefKind,
+    number: u64,
+    start: usize,
+    end: usize,
+}
+
+/// The short-reference tokens in `text`: `:thread:`, `:email:` or `:issue:` and its digits,
+/// not glued to a word before it. A number too large to read is no token.
+fn short_ref_tokens(text: &str) -> Vec<ShortRefToken> {
+    const KINDS: [(&str, ShortRefKind); 3] = [
+        (":thread:", ShortRefKind::Thread),
+        (":email:", ShortRefKind::Email),
+        (":issue:", ShortRefKind::Issue),
+    ];
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b':' {
+            let before_ok = at == 0
+                || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            if before_ok {
+                if let Some((prefix, kind)) = KINDS
+                    .iter()
+                    .find(|(prefix, _)| text[at..].starts_with(prefix))
+                {
+                    let digits_start = at + prefix.len();
+                    let mut end = digits_start;
+                    while end < bytes.len() && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                    if end > digits_start {
+                        if let Ok(number) = text[digits_start..end].parse::<u64>() {
+                            tokens.push(ShortRefToken { kind: *kind, number, start: at, end });
+                        }
+                        at = end;
+                        continue;
+                    }
+                }
+            }
+        }
+        at += text[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    tokens
+}
+
+/// The address a short reference links to, or `None` when it resolves to nothing: for a
+/// thread or a message, the internal address [`mark_message_links`] rewrites; for an
+/// issue, the configured template with its number.
+fn short_ref_url(
+    refs: &crate::short_refs::ShortRefs,
+    kind: ShortRefKind,
+    number: u64,
+) -> Option<String> {
+    match kind {
+        ShortRefKind::Issue => crate::short_refs::issue_url_configured(number),
+        ShortRefKind::Thread => refs.thread(number).map(|resolved| {
+            format!(
+                "{SHORTREF_HOST}/thread/{}/{}",
+                resolved.channel,
+                resolved.thread.unwrap_or_default()
+            )
+        }),
+        ShortRefKind::Email => refs.message(number).map(|resolved| {
+            format!(
+                "{SHORTREF_HOST}/message/{}/{}/{}",
+                resolved.channel,
+                resolved.message.unwrap_or_default(),
+                resolved.thread.unwrap_or_default()
+            )
+        }),
+    }
 }
 
 /// Every reference id `links` finds in the words made a link to where it names. See
@@ -5468,6 +5705,10 @@ mod search_text_tests {
             "render-5",
             "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
         ),
+        (
+            "render-6",
+            "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
+        ),
     ];
 
     fn corpus_digest() -> String {
@@ -6262,5 +6503,51 @@ mod message_link_tests {
         let (html, heading) = headed_body(&text, Markup::Discord, true, &|_| true, &[]);
         assert!(heading.is_some(), "{html}");
         assert!(html.contains(&format!("data-msg=\"{}\"", mark())), "{html}");
+    }
+}
+
+#[cfg(test)]
+mod short_ref_tests {
+    use super::{to_html, Markup};
+    use crate::short_refs::{ShortRefs, ShortRefsGuard};
+
+    const FIXTURE: &str = r#"{"schema":"agentctl-short-refs/v1","threads":[{"n":60,"channel":"C0123ABCD","root_ts":"1700000000.000100","root_message":"1700000000.000100"}],"messages":[{"n":1846,"channel":"C0123ABCD","message":"1700000000.000100","thread_root_ts":"1700000000.000100"},{"n":1847,"channel":"C0123ABCD","message":"1700000050.000300","thread_root_ts":"1700000000.000100"}]}"#;
+
+    fn drawn(text: &str) -> String {
+        let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        let _guard = ShortRefsGuard::set(
+            refs,
+            Some("https://tracker.example.invalid/issues/{n}".to_owned()),
+        );
+        to_html(text, Markup::Slack)
+    }
+
+    #[test]
+    fn short_references_draw_as_marked_links() {
+        let html = drawn("see :thread:060 and :email:1847 and :issue:1565");
+        assert!(html.contains("data-shortref=\"thread\""), "{html}");
+        assert!(html.contains("data-shortref=\"email\""), "{html}");
+        assert!(html.contains("data-msg=\"slack:C0123ABCD::1700000000.000100\""), "{html}");
+        assert!(html.contains("href=\"?c=C0123ABCD&v=thread&t=1700000000.000100\""), "{html}");
+        assert!(
+            html.contains("href=\"https://tracker.example.invalid/issues/1565\""),
+            "{html}"
+        );
+        assert!(!html.contains("shortrefs.invalid"), "{html}");
+    }
+
+    #[test]
+    fn unknown_short_references_stay_plain_and_marked() {
+        let html = drawn("see :thread:999 and :email:9999");
+        assert!(html.contains("class=\"shortref-unknown\""), "{html}");
+        assert!(html.contains(":thread:999"), "{html}");
+        assert!(!html.contains("data-shortref"), "{html}");
+    }
+
+    #[test]
+    fn short_references_in_code_stay_text() {
+        let html = drawn("`:thread:060`");
+        assert!(!html.contains("data-shortref"), "{html}");
+        assert!(html.contains(":thread:060"), "{html}");
     }
 }

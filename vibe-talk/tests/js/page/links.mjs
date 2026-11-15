@@ -109,7 +109,7 @@ test("`#543 in-app-message-links`: a marked link to a channel this app reads is 
   assert.ok(reply.hasAttribute("data-in-app"), "a link to a message here is not the app's");
   assert.equal(reply.text(), "#lead team › reply", "a link whose text was its address is not named by where it goes");
   assert.equal(reply.getAttribute("href"), REPLY_HREF, "the address under the link changed");
-  assert.match(reply.getAttribute("title"), /^Opens here — https:\/\/discord\.com\//);
+  assert.equal(reply.getAttribute("title"), "Opens here", "a link's tooltip carries its raw address");
   assert.ok(named.hasAttribute("data-in-app"));
   assert.equal(named.text(), "the plan", "a link its writer named lost the name");
   assert.ok(!other.hasAttribute("data-in-app"), "a link to a channel this app does not read was taken");

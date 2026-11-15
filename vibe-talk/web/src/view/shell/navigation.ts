@@ -1202,14 +1202,15 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
             jumpToDocumentLink(docKey, kid);
           }));
           kid.setAttribute("data-in-app", "");
-          kid.setAttribute("title", `Opens here — ${String(kid.getAttribute("href") || "")}`);
+          kid.setAttribute("title", "Opens here");
         }
         const ref = messageLinkRef(kid.getAttribute("data-msg"));
         if (!ref) continue;
+        const shortKind = kid.getAttribute("data-shortref");
         kid.addEventListener("click", deps.inThisColumn((event: Event) => onMessageLinkTap(ref, event as {
           ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number;
           preventDefault?: () => void; stopPropagation?: () => void;
-        })));
+        }, shortKind)));
         if (!keepsInApp(ref)) continue;
         const href = String(kid.getAttribute("href") || "");
         kid.setAttribute("data-in-app", "");
@@ -1217,7 +1218,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
           const label = messageLinkLabel(ref);
           kid.replaceChildren(document.createTextNode(label));
         }
-        kid.setAttribute("title", `Opens here — ${href}`);
+        kid.setAttribute("title", "Opens here");
       }
     };
     walk(box);
@@ -1230,12 +1231,59 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
   function onMessageLinkTap(ref: MessageLinkRef, event: {
     ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number;
     preventDefault?: () => void; stopPropagation?: () => void;
-  } | null): void {
+  } | null, shortKind?: string | null): void {
     if (!keepsInApp(ref)) return;
     if (event && (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || (event.button || 0) > 0)) return;
     if (event && typeof event.preventDefault === "function") event.preventDefault();
     if (event && typeof event.stopPropagation === "function") event.stopPropagation();
+    if (shortKind === "thread" || shortKind === "email") {
+      void deps.guardQuietly(jumpToShortRef)(shortKind, ref);
+      return;
+    }
     void deps.guardQuietly(jumpToMessageLink)(ref);
+  }
+
+  /**
+   * A tap on a short reference (`#1565 vibe-talk-short-ref-links`): a `:thread:` drills into
+   * its thread at the top — on the right in two columns, in the thread view otherwise — and
+   * an `:email:` highlights its message where the current view already shows it, else makes
+   * it visible by landing in All. Both reuse the message-link jump and its Back level.
+   */
+  async function jumpToShortRef(kind: string, ref: MessageLinkRef): Promise<void> {
+    if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") return undefined;
+    const here = String(deps.selectedChannelId() || "");
+    if (kind === "thread" && ref.thread && ref.channel === here) {
+      const now = channelPlace();
+      if (now && now.layout === "two") {
+        const spot = linkJumpSpot();
+        const under = linkJumps.top();
+        if (under && under.landed === null) under.landed = screenLevelsNow();
+        const jump: NavLinkJump = { spot, below: backLevels(), landed: null };
+        linkJumps.take(jump);
+        scheduleBackSync();
+        try {
+          arriveAtPlace({ screen: "main", channel: ref.channel, layout: "two", view: null, thread: null, origin: null, side: ref.thread });
+          deps.setStatus("Here is the linked thread.");
+        } finally {
+          if (jump.landed === null && linkJumps.holds(jump)) {
+            jump.landed = screenLevelsNow();
+            scheduleBackSync();
+          }
+        }
+        return undefined;
+      }
+    }
+    if (kind === "email" && ref.message && ref.channel === here && deps.rowHolding(ref.message)) {
+      const target = ref.message;
+      deepLinks.setFocus({ provider: String(deps.providerNameOf(ref.channel) || ref.service).toLowerCase(), channel: ref.channel, message: target, thread: ref.thread });
+      await deps.seekMessage(target, () => landOnDeepLink(target), () => false);
+      return undefined;
+    }
+    if (kind === "email") {
+      const spot = linkJumpSpot();
+      return deps.inColumn(deps.mainColumn(), () => jumpFromSpot(ref, spot, { view: "flat", center: true }));
+    }
+    return jumpToMessageLink(ref);
   }
 
   // The jumps taken by links: one owner in `core/navigation` (`createLinkJumps`).

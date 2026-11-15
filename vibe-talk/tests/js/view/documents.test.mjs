@@ -1435,7 +1435,7 @@ test("documents render: document links carry data-doc with the external href int
   assert.ok(
     html.includes('<a href="https://github.com/octo/widgets/blob/main/docs/guide/sibling.md" '
       + 'data-doc="github:octo/widgets@main:docs/guide/sibling.md" '
-      + 'title="Opens here — https://github.com/octo/widgets/blob/main/docs/guide/sibling.md" '
+      + 'title="Opens here" '
       + 'rel="noopener noreferrer">the sibling</a>'),
     `the relative document link was not rendered as a marked document link:\n${html}`,
   );

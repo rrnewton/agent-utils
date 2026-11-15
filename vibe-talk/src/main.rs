@@ -424,6 +424,12 @@ async fn main() -> anyhow::Result<()> {
         vibe_talk::render::references::ReferenceLinks::compile(&config.render.reference_links)
             .expect("reference links are checked when the configuration loads"),
     );
+    // `#1565 vibe-talk-short-ref-links`. The files are read lazily and re-read
+    // when one changes; a missing file resolves nothing.
+    vibe_talk::short_refs::set_short_refs(
+        config.render.short_refs_files.clone(),
+        config.render.issue_url_template.clone(),
+    );
 
     let providers: Arc<ChatRouter> = if args.fake_discord {
         tracing::warn!(

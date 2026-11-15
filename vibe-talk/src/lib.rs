@@ -112,6 +112,7 @@ pub mod send_approval;
 pub mod send_intent;
 pub mod send_refusal;
 pub mod server_search;
+pub mod short_refs;
 pub mod service_health;
 pub mod slack;
 pub mod speakable;
