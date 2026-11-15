@@ -11530,6 +11530,8 @@ def _image_slots_missing_lock(
             if not _record_in_worktrees_image(config, record, slot_path, bind_slots):
                 continue
             for checkout in record.checkouts:
+                if checkout.vcs == "eden":
+                    continue
                 path = _stored_path_reference(config, checkout.path, "checkout path")
                 _relative, repository = _stored_repository_path(
                     config, checkout.repository
@@ -14593,6 +14595,8 @@ def _foreign_checkouts_in_slot(
     for state in states:
         for active_record in state.slots:
             for checkout in active_record.checkouts:
+                if checkout.vcs == "eden":
+                    continue
                 try:
                     _relative, repository = _stored_repository_path(
                         config, checkout.repository
@@ -14731,6 +14735,8 @@ def _assert_no_cross_repository_target_registrations(
     for state in states:
         for active_record in state.slots:
             for checkout in active_record.checkouts:
+                if checkout.vcs == "eden":
+                    continue
                 try:
                     _relative, repository = _stored_repository_path(
                         config, checkout.repository
@@ -35275,6 +35281,8 @@ def _nested_worktree_accounting(
         for item in record.checkouts
     }
     for checkout in record.checkouts:
+        if checkout.vcs == "eden":
+            continue
         _relative, repository = _stored_repository_path(config, checkout.repository)
         for listed in sorted(vcs.listed_worktrees(repository)):
             if listed.absolute() in recorded:
@@ -36724,6 +36732,10 @@ def _assert_create_target_clear(
         for state in states
         for record in state.slots
         for checkout in record.checkouts
+        # Eden backing repos live outside the project and have no Git
+        # registration to compare (#1204); the checkout-path and
+        # slot-path overlaps above still cover Eden rows (#1554).
+        if checkout.vcs != "eden"
     }
     repositories.update(
         _stored_repository_path(config, item.repository)[1] for item in plan
@@ -42566,16 +42578,18 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
             owned.add(_slot_directory(config, record.slot, record.slot_type))
             for checkout in record.checkouts:
                 owned.add(_stored_path(config, checkout.path, "checkout path"))
-                repositories.add(_stored_repository_path(config, checkout.repository)[1])
+                if checkout.vcs != "eden":
+                    repositories.add(_stored_repository_path(config, checkout.repository)[1])
     for archive in archives:
         for raw_record in archive.records:
             for checkout_value in _as_list(
                 raw_record.get("checkouts", []), "archived record.checkouts"
             ):
                 checkout = _checkout_from_obj(checkout_value, "archived checkout")
-                repositories.add(
-                    _stored_repository_path(config, checkout.repository)[1]
-                )
+                if checkout.vcs != "eden":
+                    repositories.add(
+                        _stored_repository_path(config, checkout.repository)[1]
+                    )
     for raw in args.repository or ():
         candidate = Path(raw)
         repositories.add(candidate if candidate.is_absolute() else config.root / candidate)
@@ -74580,6 +74594,23 @@ def _absent_validate_row_paths(config: Config, record: ActiveRecord) -> tuple[Pa
     return tuple(dict.fromkeys(path.absolute() for path in paths))
 
 
+def _eden_backing_repository(raw: str) -> Path:
+    """Validate an Eden backing repository path on its own terms (#1554).
+
+    An Eden checkout's stored repository is the backing repository the
+    daemon cloned from.  It lives outside the project by design, so the
+    Git sibling rule must never judge it; what safety needs is a
+    canonical absolute path naming a directory.
+    """
+
+    candidate = Path(raw)
+    if not candidate.is_absolute() or raw != os.path.normpath(raw) or not candidate.name:
+        raise Refusal(
+            f"Eden backing repository must be a canonical absolute path: {raw!r}"
+        )
+    return candidate
+
+
 def _assert_absent_validate_rows_storage(
     config: Config, records: Sequence[ActiveRecord]
 ) -> tuple[tuple[ActiveRecord, tuple[Path, ...]], ...]:
@@ -74629,6 +74660,7 @@ def _assert_absent_validate_rows_storage(
         repository
         for record in records
         for checkout in record.checkouts
+        if checkout.vcs != "eden"
         for _stored, repository in (
             _stored_repository_path(config, checkout.repository),
         )
@@ -74639,6 +74671,11 @@ def _assert_absent_validate_rows_storage(
     }
     for record in records:
         for checkout in record.checkouts:
+            if checkout.vcs == "eden":
+                # No Git registration can name an Eden mount; the
+                # backing is validated as an Eden backing (#1554).
+                _eden_backing_repository(checkout.repository)
+                continue
             _stored, repository = _stored_repository_path(config, checkout.repository)
             path = _stored_path(
                 config, checkout.path, "validation checkout path"
@@ -82064,6 +82101,15 @@ def _absent_validate_batch_items(
     return cursor, tuple(result)
 
 
+def _forget_absent_validate_binds(config: Config, slots: Sequence[str]) -> None:
+    """Drop disposed absent rows' stale worktrees-image bind records (#1554)."""
+
+    bind_records = worktreesimage.load_bind_records(config.control)
+    for slot in slots:
+        if slot in bind_records:
+            worktreesimage.forget_bind(config.control, slot)
+
+
 def _recover_absent_validate_rows(
     config: Config,
     path: Path,
@@ -82233,6 +82279,7 @@ def _recover_absent_validate_rows(
     }
     if after != before:
         raise StateError("absent-validation-row recovery changed an unrelated registry row")
+    _forget_absent_validate_binds(config, [item.slot for item, _r, _e in items])
     _clear_journal(config, journal, event_writer=writer)
     return tuple(item for item, _record, _entry in items)
 

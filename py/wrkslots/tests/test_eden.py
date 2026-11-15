@@ -351,3 +351,208 @@ def test_parse_daemon_facts() -> None:
     assert eden.parse_orphaned_bytes('{"orphaned_redirections": 41}') == 41
     with pytest.raises(eden.EdenError):
         eden.parse_info("{}")
+
+
+# --------------------------------- absent Eden rows vs git scans (#1554)
+
+import argparse
+import os
+import subprocess
+
+
+def _git(cwd: Path, *args: str) -> None:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(
+        {
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+        }
+    )
+    subprocess.run(
+        [
+            "git", "-c", "user.email=test@example.invalid", "-c", "user.name=Test",
+            "-c", "commit.gpgsign=false", "-C", str(cwd), *args,
+        ],
+        capture_output=True, text=True, check=True, env=env, timeout=60,
+    )
+
+
+def _absent_project(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "project"
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees\n"
+        "layout: flat\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+    )
+    upstream = tmp_path / "upstream-repo"
+    upstream.mkdir()
+    _git(upstream, "init", "-q", "-b", "main")
+    (upstream / "file.txt").write_text("one\n")
+    _git(upstream, "add", "file.txt")
+    _git(upstream, "commit", "-q", "-m", "one")
+    _git(upstream, "remote", "add", "origin", str(upstream))
+    _git(upstream, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    return root, upstream
+
+
+def _eden_validate_record(
+    config: wrkslots_cli.Config, backing: str, slot: str = "edenstuck"
+) -> wrkslots_cli.ActiveRecord:
+    identity = wrkslots_cli._read_process_identity(os.getpid())
+    slot_path = wrkslots_cli._slot_directory(config, slot, "validate")
+    return wrkslots_cli.ActiveRecord(
+        slot=slot,
+        agent=f"agent-{slot}",
+        task="task-1",
+        purpose="testing",
+        slot_type="validate",
+        machine="node-a",
+        generation=1,
+        created_at="2026-11-15T00:00:00Z",
+        heartbeat_at="2026-11-15T00:00:00Z",
+        heartbeat_ttl_seconds=60,
+        owner=None,
+        coordinator_lease=identity,
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(
+            wrkslots_cli.Checkout(
+                name="main",
+                path=(slot_path / "checkout").relative_to(config.root).as_posix(),
+                repository=backing,
+                branch=eden.EDEN_BRANCH,
+                start_point=REV,
+                remote=eden.EDEN_REMOTE,
+                remote_url_sha256=DIGEST,
+                landed_ref=eden.EDEN_LANDED_REF,
+                head=REV,
+                containing_remote_refs=(),
+                vcs="eden",
+            ),
+        ),
+    )
+
+
+def _write_row(config: wrkslots_cli.Config, record: wrkslots_cli.ActiveRecord) -> None:
+    wrkslots_cli._ensure_state_shard(config)
+    state = wrkslots_cli._load_active(config)
+    wrkslots_cli._write_active_state(
+        config,
+        wrkslots_cli._append_record(state, record),
+        action="slot-created",
+        slot=record.slot,
+        evidence={
+            "slot_type": record.slot_type,
+            "coordinator_authorized": True,
+            "coordinator": wrkslots_cli._identity_to_obj(record.coordinator_lease),
+        },
+    )
+
+
+def _git_create_args(root: Path, **overrides: object) -> argparse.Namespace:
+    values: dict[str, object] = dict(
+        project_root=str(root), machine="node-a", slot="slot-b", slot_type="agent",
+        coordinator_authorized=True, agent="agent-new", task="task-1",
+        purpose="testing", owner_pid=os.getpid(), coordinator_pid=os.getpid(),
+        task_scope_unit=None, task_scope_invocation_id=None,
+        repo=["repo=../upstream-repo"], remote=[], remote_url=[],
+        branch=["repo=suite/new"], start=[], override_disk_floor=False,
+        representation="config", format="human", wait_lock=0.0,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_git_create_tolerates_an_absent_eden_validate_row(tmp_path: Path) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    _write_row(config, _eden_validate_record(config, backing))
+
+    assert wrkslots_cli._cmd_create(_git_create_args(root)) == 0
+
+
+def test_create_overlapping_an_eden_slot_still_refuses(tmp_path: Path) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    _write_row(config, _eden_validate_record(config, backing))
+
+    with pytest.raises(wrkslots_cli.Refusal):
+        wrkslots_cli._cmd_create(
+            _git_create_args(root, slot="edenstuck", slot_type="validate")
+        )
+
+
+def test_absent_validate_storage_accepts_an_eden_backing(tmp_path: Path) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+
+    rows = wrkslots_cli._assert_absent_validate_rows_storage(config, [record])
+
+    assert [row.slot for row, _paths in rows] == ["edenstuck"]
+
+
+def test_absent_validate_storage_refuses_a_git_non_sibling(tmp_path: Path) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    record = _eden_validate_record(
+        config, str(tmp_path / "eden-backing-repos" / "backing")
+    )
+    git_path = (
+        wrkslots_cli._slot_directory(config, "edenstuck", "validate")
+        .relative_to(config.root)
+        .as_posix()
+    )
+    git_record = dataclasses.replace(
+        record,
+        checkouts=(
+            dataclasses.replace(
+                record.checkouts[0], vcs="git", branch="main", path=git_path
+            ),
+        ),
+    )
+
+    with pytest.raises(wrkslots_cli.Refusal, match="direct sibling"):
+        wrkslots_cli._assert_absent_validate_rows_storage(config, [git_record])
+
+
+def test_absent_validate_storage_refuses_present_eden_storage(
+    tmp_path: Path,
+) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+    wrkslots_cli._slot_directory(config, "edenstuck", "validate").mkdir(parents=True)
+
+    with pytest.raises(wrkslots_cli.Refusal, match="still has physical storage"):
+        wrkslots_cli._assert_absent_validate_rows_storage(config, [record])
+
+
+def test_forget_absent_validate_binds_drops_only_named_slots(
+    tmp_path: Path,
+) -> None:
+    from wrkslots import worktreesimage
+
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    record_file = worktreesimage.record_path(config.control)
+    record_file.write_text(
+        '{"binds": {"edenstuck": "sub-a", "other": "sub-b"}}'
+    )
+
+    wrkslots_cli._forget_absent_validate_binds(config, ["edenstuck"])
+
+    assert set(worktreesimage.load_bind_records(config.control)) == {"other"}
