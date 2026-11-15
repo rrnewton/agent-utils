@@ -3,7 +3,7 @@ title: 'headless-muse: a Muse adapter for run-headless (muse serve first, exec+r
 status: open
 priority: 2
 issue_type: task
-assignee: mu-rsctl
+assignee: mu-musehl
 created_at: 2026-11-10T17:57:00.000000000+00:00
 updated_at: 2026-11-10T17:57:00.000000000+00:00
 ---
