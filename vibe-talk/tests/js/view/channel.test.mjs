@@ -2360,6 +2360,49 @@ test("`#624 voice-page-modularity`: entering a thread lands on its first unread 
   assert.equal(entry.landOnFirstUnread(), false, "a thread with nothing unread was landed somewhere");
 });
 
+test("`#1585 linked-message-always-expanded`: a thread landing opens the row it brings to the head, from the module alone", () => {
+  const { createThreadEntry, freshEntryState } = CHANNEL_VIEW;
+  const record = freshEntryState();
+  const list = { children: [] };
+  const area = { scrollTop: 0, clientHeight: 100, getBoundingClientRect: () => ({ top: 0, bottom: 100 }) };
+  const entry = createThreadEntry({
+    el: (id) => (id === "discord-log" ? list : id === "scroll-area" ? area : { hidden: true, getBoundingClientRect: () => ({ height: 0, top: 0, bottom: 0 }) }),
+    activeEntry: () => record,
+    channelContextKey: () => "ctx",
+    selection: () => ({ view: "thread", threadId: "t1" }),
+    channelViewsHas: () => true,
+    viewKey: () => "thread:t1",
+    applyReadRuns: () => {},
+    atBottom: () => false,
+    renderScrollTools: () => {},
+    requestVisibleSummaries: () => {},
+    floatingClearance: () => 0,
+    drawnTop: (row) => row.top,
+    openThreadRootId: () => null,
+    isOpenThreadRoot: () => false,
+    rowIsRead: () => true,
+    toFoot: () => {},
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; },
+    setJumpNewest: () => {},
+    screen: () => "main",
+    view: () => "discord",
+    pinsView: () => ({ only: false }),
+  });
+  let clicks = 0;
+  const head = {
+    top: 40, hidden: false, className: "", parentNode: list,
+    getAttribute: (name) => (name === "data-collapsed" ? "true" : null),
+    hasAttribute: () => false,
+    querySelector: (selector) => (selector === ".fold" ? { click: () => { clicks += 1; } } : null),
+    querySelectorAll: () => [],
+    getBoundingClientRect: () => ({ top: 40, height: 20, bottom: 60 }),
+  };
+  const first = { top: 80, hidden: false, className: "", parentNode: list, getAttribute: () => null, hasAttribute: () => false, getBoundingClientRect: () => ({ top: 80, height: 20, bottom: 100 }) };
+  entry.placeEntryLanding(head, first);
+  assert.equal(clicks, 1, "the head row was not opened by its own fold control");
+  assert.equal(record.landing.row, head, "the landing did not keep the head row");
+});
+
 test("`#624 voice-page-modularity`: the layout button says back to the thread list out of two columns chosen from it, and a narrow window is told so", () => {
   const { createTwoColumns } = CHANNEL_VIEW;
   const log = [];

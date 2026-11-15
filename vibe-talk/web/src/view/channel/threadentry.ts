@@ -9,6 +9,7 @@
 import { childByClass } from "../dom/index.ts";
 import { idsOf, shownRowFor } from "./rows.ts";
 import { REPLY_LANDING_GAP_PX } from "./replyarrows.ts";
+import { expandLandedRow } from "./fold.ts";
 import type { GestureStart } from "./sidecontrols.ts";
 
 /** A column's own record of entering a view (`freshEntryState`). */
@@ -295,6 +296,9 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
    * the first unread row `first`: `row` itself, or the one under the root.
    */
   function placeEntryLanding(row: HTMLElement, first: HTMLElement): void {
+    // `#1585 linked-message-always-expanded`. The row brought to the head — the thread's
+    // root, for a thread-root open — is shown in full, as the first unread below it is.
+    expandLandedRow(row);
     const area = deps.el("scroll-area");
     // By where the row starts, its date rule included: `#324 live-pill-covers-row`, see `drawnTop`.
     deps.nudge(area, deps.drawnTop(row) - deps.floatingClearance(area) - REPLY_LANDING_GAP_PX);
