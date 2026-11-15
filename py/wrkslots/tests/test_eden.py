@@ -358,6 +358,7 @@ def test_parse_daemon_facts() -> None:
 
 import argparse
 import os
+import shutil
 import subprocess
 
 
@@ -1046,3 +1047,89 @@ def test_refused_fresh_apply_releases_its_journal(
         )
     assert not wrkslots_cli._journal_path(config).exists()
     assert [row.slot for row in wrkslots_cli._load_active(config).slots] == ["edenstuck"]
+
+
+# ------------------------------- Eden validate remove flow (#1554B)
+
+
+class _StubEdenRemoval:
+    """Stubbed eden/sl runner for removal: one live mount, clean tree."""
+
+    def __init__(self, mount: Path) -> None:
+        self.mount = str(mount)
+        self.calls: list[tuple[str, ...]] = []
+        self.live = True
+
+    def __call__(self, argv: Sequence[str]) -> tuple[int, str, str]:
+        self.calls.append(tuple(argv))
+        if argv[0] == "sl":
+            if "status" in argv:
+                return (0, "", "")
+            return (0, REV, "")
+        rest = list(argv[3:] if len(argv) > 2 and argv[1] == "--config-dir" else argv[1:])
+        if rest[:1] == ["info"]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "mount": self.mount,
+                        "state_dir": "/state",
+                        "backing_repo": "/backing/repo",
+                        "checked_out_revision": REV,
+                    }
+                ),
+                "",
+            )
+        if rest[:2] == ["redirect", "list"]:
+            return (0, "[]", "")
+        if rest[:1] == ["du"] or "du" in argv:
+            return (0, '{"orphaned_redirections": 0}', "")
+        if rest[:1] == ["remove"]:
+            self.live = False
+            shutil.rmtree(self.mount, ignore_errors=True)
+            return (0, "", "")
+        if rest[:1] == ["list"]:
+            return (0, f"{self.mount}\n" if self.live else "", "")
+        return (0, "", "")
+
+
+def test_remove_of_an_eden_validate_slot_uses_no_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+    dead_owner = dataclasses.replace(
+        wrkslots_cli._read_process_identity(os.getpid()), pid=2_147_483_647
+    )
+    record = dataclasses.replace(record, owner=dead_owner)
+    _write_row(config, record)
+    slot_path = wrkslots_cli._slot_directory(config, "edenstuck", "validate")
+    mount = slot_path / "checkout"
+    (slot_path / ".eden-state").mkdir(parents=True)
+    mount.mkdir()
+    (slot_path / "buck-out-target").mkdir()
+    daemon = _StubEdenRemoval(mount)
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", daemon)
+
+    assert (
+        wrkslots_cli.main(
+            [
+                "--project-root", str(root),
+                "remove", "edenstuck",
+                "--coordinator-pid", str(os.getpid()),
+                "--expected-generation", "1",
+            ]
+        )
+        == 0
+    )
+
+    assert wrkslots_cli._load_active(config).slots == ()
+    assert [row["slot"] for row in wrkslots_cli._load_archive(config).records] == [
+        "edenstuck"
+    ]
+    assert not slot_path.exists()
+    config_dir = str(slot_path / ".eden-state")
+    assert ("eden", "--config-dir", config_dir, "remove", "-y", str(mount)) in daemon.calls
+    assert ("eden", "--config-dir", config_dir, "stop") in daemon.calls

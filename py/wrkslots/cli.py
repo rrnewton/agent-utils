@@ -34033,6 +34033,8 @@ def _uncommitted_handoff_paths(
     unprotected: set[str] = set()
     selected_checkouts = record.checkouts if checkouts is None else checkouts
     for checkout in selected_checkouts:
+        if checkout.vcs == "eden":
+            continue
         _moved, checkout_path = _checkout_at_slot(
             config, record, checkout, slot_path
         )
@@ -35648,6 +35650,8 @@ def _reclaim_preconditions(
     abandoned: set[str] = set()
     if record.slot_type == "validate" and _prepared_finish_journal(config, record):
         for checkout in record.checkouts:
+            if checkout.vcs == "eden":
+                continue
             checkout_path = _stored_path(config, checkout.path, "checkout path")
             _rel, checkout_repository = _stored_repository_path(
                 config, checkout.repository
@@ -35695,6 +35699,9 @@ def _reclaim_preconditions(
         )
     final: list[Checkout] = []
     for checkout in record.checkouts:
+        if checkout.vcs == "eden":
+            final.append(_assert_eden_checkout_safe(config, checkout))
+            continue
         path = _stored_path(config, checkout.path, "checkout path")
         _relative, repository = _stored_repository_path(config, checkout.repository)
         if checkout.name in abandoned:
@@ -54265,6 +54272,14 @@ def _archive_fenced_slot_residue(
     return destination
 
 
+def _record_is_eden(record: ActiveRecord) -> bool:
+    """Whether every checkout of ``record`` is an Eden checkout (#1554)."""
+
+    return bool(record.checkouts) and all(
+        item.vcs == "eden" for item in record.checkouts
+    )
+
+
 def _finish_remove_paths(
     config: Config,
     record: ActiveRecord,
@@ -54288,7 +54303,7 @@ def _finish_remove_paths(
     all_names = {item.name for item in record.checkouts}
     if not removed <= all_names:
         raise StateError("finish journal names a checkout that is not in the active record")
-    if record.checkouts and all(item.vcs == "eden" for item in record.checkouts):
+    if _record_is_eden(record):
         # Eden removal sequence (#1204): salvage, eden remove, verified
         # orphan checks, then slot storage teardown. The git path fence
         # must never rename a live FUSE mount, so this runs first.
@@ -54330,6 +54345,22 @@ def _finish_remove_paths(
             removed.add(checkout.name)
         journal["removed"] = sorted(removed)
         _write_journal(config, journal, journal_path=journal_path)
+        # The daemon is stopped and verified gone; clear the slot-local
+        # state the create made (.eden-state, the mount point, and the
+        # in-slot redirection targets) so the slot directory can go.
+        # Anything else refuses and stays for inspection (#1554).
+        if slot_path.is_dir() and not slot_path.is_symlink():
+            for entry in sorted(slot_path.iterdir()):
+                if (
+                    entry.name in {".eden-state", "checkout"}
+                    or entry.name.endswith("-target")
+                ) and entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    raise Refusal(
+                        f"Eden slot {record.slot} holds unexpected entry "
+                        f"{entry}; preserve it for inspection"
+                    )
         _remove_slot_directory(config, slot_path)
         return journal
     # A remove-agent-batch item whose budget is spent stops before its fence.
@@ -55044,6 +55075,8 @@ def _assert_physical_slot_removed(
             raise Refusal(
                 f"cannot archive slot {record.slot}: checkout still exists at {path}"
             )
+        if checkout.vcs == "eden":
+            continue
         _relative, repository = _stored_repository_path(config, checkout.repository)
         _moved, fenced_path = _checkout_at_slot(
             config, record, checkout, fenced_slot
@@ -55177,7 +55210,7 @@ def _begin_finish(
     )
     _write_journal(config, journal, journal_path=journal_path, event_writer=event_writer)
     _interrupt_for_test("after-finish-journal")
-    if defer_private_census or defer_deletion:
+    if (defer_private_census or defer_deletion) and not _record_is_eden(final_record):
         if defer_private_census and finish.private_cleanup is None:
             raise StateError("only a private cleanup can defer its fresh census")
         try:
