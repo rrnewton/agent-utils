@@ -2,9 +2,9 @@
 
 Starts the release binary with --fake-discord (a real server; only the chat
 upstream is fake), seeds a paste link and GitHub links through the reply
-route, reads the channel so the fold registers them, then drives the page at
-393x852 with real touch: an unfetched row fetches (the paste command serves
-a local file) and opens the reader; Fetch recent reports a result. The
+route, reads the channel so the fold registers them with the optional message
+cache absent, then drives the page at 393x852 with real touch: an unfetched
+row fetches (the paste command serves a local file) and opens the reader; Fetch recent reports a result. The
 GitHub raw base points at a local stub HTTP server the test starts, serving
 an index document whose links are relative (`#1081 documents-relative-links`):
 a tap on one opens the linked document in the reader though no message ever
@@ -106,6 +106,9 @@ class RawHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's API
         path = self.path.split("?", 1)[0]
+        if self.headers.get("Authorization") != "Bearer documents-test-github-token":
+            self.reply(404, b"not found")
+            return
         body = RAW_FILES.get(path)
         if body is not None:
             self.reply(200, body.encode())
@@ -280,14 +283,15 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="documents-check-") as tmp:
         work = Path(tmp)
         (work / "demo-doc").write_text(PASTE_BODY)
+        (work / "github-token").write_text("documents-test-github-token\n")
         (work / "vibe-talk.toml").write_text(
             f'[server]\nbind = "127.0.0.1:{port}"\n'
             '[discord]\nbot_token = "documents-check-bot-token-never-sent"\n'
             f'[auth]\nread_token = "{READ_TOKEN}"\nwrite_token = "{WRITE_TOKEN}"\n'
             f'[[channels]]\nid = "{CHANNEL}"\nlabel = "lead team"\nwritable = true\n'
             f'[storage]\npath = "{work}/store.sqlite3"\n'
-            f'[message_cache]\nenabled = true\npath = "{work}/cache.sqlite3"\n'
             '[documents]\n'
+            f'github_token_file = "{work}/github-token"\n'
             'paste_url_prefixes = ["https://paste.example/"]\n'
             'paste_command = ["/bin/cat", "--", "{}"]\n'
             f'github_raw_base = "{raw_base}"\n'
@@ -329,6 +333,25 @@ def main() -> int:
                 page = ctx.new_page()
                 page.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+                # A normal GitHub markdown link in a real rendered message opens here.
+                page.goto(base + "/", wait_until="load")
+                page.click("#view-switch")
+                link = page.locator('#discord-log a[data-doc="github:octo/widgets@main:docs/guide.md"]').first
+                link.wait_for(timeout=20_000)
+                link.click()
+                page.wait_for_function("document.getElementById('doc-title').textContent.includes('Guide index')")
+                check(page.locator("#docs-reader").is_visible(), "message link did not open Documents")
+                check(len(ctx.pages) == 1, "ordinary document click opened a browser tab")
+                page.click("#doc-back")
+                page.click("#search-toggle")
+                page.click("#links-filter")
+                page.locator('#discord-log .row-links a[href="https://github.com/octo/widgets/blob/main/docs/guide.md"]').first.click()
+                page.wait_for_function("!document.getElementById('docs-reader').hidden")
+                check("Guide index" in (page.locator("#doc-title").text_content() or ""),
+                      "Links mode did not open the document")
+                check(len(ctx.pages) == 1, "Links mode opened a browser tab")
+                # Leave the existing unfetched-list checks with fresh contents.
+                call(base, "DELETE", "/api/v1/documents/cache", WRITE_TOKEN)
                 page.goto(base + "/?v=docs", wait_until="load")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
                 check(page.locator("#documents-list .doc-card").count() == 3, "the list did not draw every row")

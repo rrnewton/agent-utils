@@ -21,7 +21,7 @@
 // dep is called only inside a returned function, never at creation. See NOTES.md (TDZ/ordering).
 
 import type { DeepLinkRef, MessageLinkRef } from "../../foundation/index.ts";
-import { messageLinkRef } from "../../foundation/index.ts";
+import { githubKeyForUrl, messageLinkRef } from "../../foundation/index.ts";
 import type { ClockPort } from "../../ports/index.ts";
 import { nodeWithin } from "../dom/index.ts";
 import type { Screens } from "./screens.ts";
@@ -1193,7 +1193,8 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
           walk(kid);
           continue;
         }
-        const docKey = kid.getAttribute("data-doc");
+        // Saved/locally rendered messages may predate the server's data-doc mark.
+        const docKey = kid.getAttribute("data-doc") || githubKeyForUrl(kid.getAttribute("href") || "");
         if (docKey) {
           kid.addEventListener("click", deps.inThisColumn((event: Event) => {
             const tap = event as { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number; preventDefault?: () => void };
@@ -1202,7 +1203,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
             jumpToDocumentLink(docKey, kid);
           }));
           kid.setAttribute("data-in-app", "");
-          kid.setAttribute("title", "Opens here");
+          if (!kid.getAttribute("title")) kid.setAttribute("title", "Opens here");
         }
         const ref = messageLinkRef(kid.getAttribute("data-msg"));
         if (!ref) continue;

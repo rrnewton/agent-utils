@@ -26,3 +26,5 @@ export {
   trimAddress,
 } from "./addresses.ts";
 export type { FoundLink } from "./addresses.ts";
+
+export { dotCount, githubKeyForUrl, validName } from "./documents.ts";

@@ -8670,6 +8670,9 @@ fn fetch_error(error: crate::documents::FetchError) -> ApiError {
             "document_not_fetchable",
             format!("no fetcher for {kind} documents yet"),
         ),
+        crate::documents::FetchError::NotFound(detail) => {
+            ApiError::new(StatusCode::NOT_FOUND, "document_not_found", detail)
+        }
         crate::documents::FetchError::Failed(detail) => {
             ApiError::new(StatusCode::BAD_GATEWAY, "document_fetch_failed", detail)
         }

@@ -75,6 +75,8 @@ pub const ENV_APP_SHORT_NAME: &str = "VIBE_TALK_APP_SHORT_NAME";
 /// Unset means this server keeps nothing between restarts, and says so rather than pretending.
 /// See [`crate::store`].
 pub const ENV_STORAGE_PATH: &str = "VIBE_TALK_STORAGE_PATH";
+/// File containing the GitHub credential used to fetch private documents.
+pub const ENV_GITHUB_TOKEN_FILE: &str = "VIBE_TALK_GITHUB_TOKEN_FILE";
 
 /// Environment variable turning conversation replay on or off (`1`/`true`/`yes`/`on`).
 pub const ENV_REPLAY_ENABLED: &str = "VIBE_TALK_REPLAY_ENABLED";
@@ -2690,7 +2692,12 @@ impl Config {
             summaries,
             replay,
             message_cache,
-            documents: documents_config(file.documents)?,
+            documents: documents_config(FileDocuments {
+                github_token_file: get(ENV_GITHUB_TOKEN_FILE)
+                    .map(str::to_owned)
+                    .or(file.documents.github_token_file),
+                ..file.documents
+            })?,
         })
     }
 }
@@ -5208,6 +5215,24 @@ label = "team"
 writable = true
 provider = "slack"
 "#;
+
+    #[test]
+    fn documents_token_file_can_be_set_by_the_container_environment() {
+        let cfg = Config::from_toml_and_env(
+            FULL,
+            &env(&[(ENV_GITHUB_TOKEN_FILE, "/var/lib/vibe-talk/github-token")]),
+        )
+        .expect("valid");
+        assert_eq!(
+            cfg.documents.github_token_file,
+            Some(PathBuf::from("/var/lib/vibe-talk/github-token"))
+        );
+        assert!(Config::from_toml_and_env(
+            FULL,
+            &env(&[(ENV_GITHUB_TOKEN_FILE, "relative-token")])
+        )
+        .is_err());
+    }
 
     #[test]
     fn documents_token_sources_are_alternatives() {

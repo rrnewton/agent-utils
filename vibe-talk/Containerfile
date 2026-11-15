@@ -1,6 +1,6 @@
 # Build and run vibe-talk under Podman (or Docker; nothing here is Podman-specific).
 #
-#   podman build -t vibe-talk -f vibe-talk/Containerfile vibe-talk
+#   podman build -t vibe-talk -f vibe-talk/Containerfile .
 #   podman run --rm -p 8080:8080 \
 #     -e VIBE_TALK_DISCORD_BOT_TOKEN=... -e VIBE_TALK_READ_TOKEN=... \
 #     -e VIBE_TALK_WRITE_TOKEN=... -e VIBE_TALK_CHANNELS='123:lead team:rw' \
@@ -15,9 +15,9 @@
 # VIBE_TALK_WEB_DIST only after checking it was built from the sources the Rust stage was given.
 FROM docker.io/library/node:22-bookworm-slim AS web
 WORKDIR /src
-COPY contract/package.json contract/package-lock.json ./contract/
+COPY vibe-talk/contract/package.json vibe-talk/contract/package-lock.json ./contract/
 RUN npm ci --prefix contract --no-audit --no-fund
-COPY web ./web
+COPY vibe-talk/web ./web
 RUN node web/build.mjs --out /web-dist
 
 FROM docker.io/library/rust:1-slim-bookworm AS build
@@ -30,7 +30,12 @@ WORKDIR /src
 # manifest — so a missing placeholder fails this stage before a single dependency is fetched.
 # `src/bin/mock_elevenlabs.rs` is the offline ElevenLabs substitute; it is built here only because
 # the manifest mentions it, and it is deliberately NOT copied into the runtime image below.
-COPY Cargo.toml Cargo.lock ./
+# Preserve the path dependency's real workspace inheritance. Only dependencies used by this
+# image are copied: a new path dependency needs an explicit COPY here or Cargo fails by name.
+# Cargo resolves these dependencies with vibe-talk/Cargo.lock, not the workspace's lockfile.
+COPY rs/Cargo.toml /rs/Cargo.toml
+COPY rs/claude-stream-session /rs/claude-stream-session
+COPY vibe-talk/Cargo.toml vibe-talk/Cargo.lock ./
 RUN mkdir -p src/bin \
     && printf '//! placeholder\nfn main() {}\n' > src/main.rs \
     && printf '//! placeholder for dependency caching\n' > src/lib.rs \
@@ -38,15 +43,15 @@ RUN mkdir -p src/bin \
     && cargo build --release --locked \
     && rm -rf src
 
-COPY src ./src
-COPY web ./web
-COPY prompts ./prompts
+COPY vibe-talk/src ./src
+COPY vibe-talk/web ./web
+COPY vibe-talk/prompts ./prompts
 # The highlighter's grammars, compiled into one syntax set by build.rs. Not needed above: without
 # build.rs the placeholder build has no build script, so its build dependencies wait for this one.
-COPY build.rs build_page.rs ./
-COPY syntaxes ./syntaxes
+COPY vibe-talk/build.rs vibe-talk/build_page.rs ./
+COPY vibe-talk/syntaxes ./syntaxes
 # The page, built above, and the lockfile build.rs checks it against.
-COPY contract/package-lock.json ./contract/
+COPY vibe-talk/contract/package-lock.json ./contract/
 COPY --from=web /web-dist ./web-dist
 ENV VIBE_TALK_WEB_DIST=/src/web-dist
 # Touch the entry points so cargo cannot reuse the placeholder build above. Only the server is

@@ -490,6 +490,42 @@ async fn cache_fills_fold_the_index() {
 }
 
 #[tokio::test]
+async fn documents_are_discovered_without_a_message_cache() {
+    let (mut state, fake) = testing::state();
+    assert!(state.message_cache.cache().is_none());
+    state.message_cache.arm();
+    let seeded = fake.seed_at(
+        &ChannelId(READ_CHANNEL.to_owned()),
+        "agent",
+        URL,
+        1_787_054_400_000,
+    );
+    state.replace_chat(Arc::new(testing::TimelineChat::new(fake.clone())));
+    let app = router(state.clone());
+    let uri = format!("/api/v1/channels/{READ_CHANNEL}/timeline?view=main&limit=50");
+    let (status, _) = call(&app, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        state.documents.index.is_empty(),
+        "read scope must not write the index"
+    );
+    let (status, body) = call(&app, "GET", &uri, Some(WRITE_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state.documents.index.len(),
+        1,
+        "cache-off reads must discover documents"
+    );
+    assert_eq!(state.documents.index.list()[0].key, KEY);
+    fake.edit(&seeded, "No document any more");
+    call(&app, "GET", &uri, Some(WRITE_TOKEN), None).await;
+    assert!(
+        state.documents.index.is_empty(),
+        "edits must remove old mentions"
+    );
+}
+
+#[tokio::test]
 async fn paste_documents_fetch_through_the_command_source() {
     let index = Arc::new(Index::new(vec!["https://paste.example/".to_owned()]));
     index.apply_message(
@@ -814,11 +850,38 @@ async fn a_missing_or_ambiguous_document_says_not_found() {
             .fetch(&old_entry("main"))
             .await
             .expect_err("must not fetch");
-        let FetchError::Failed(detail) = error else {
+        let FetchError::NotFound(detail) = error else {
             panic!("wrong failure: {error}");
         };
-        assert_eq!(detail, "not found at docs/old.md (moved or deleted)");
+        assert!(detail.contains("not found at docs/old.md"), "{detail}");
+        assert!(detail.contains("VIBE_TALK_GITHUB_TOKEN_FILE"), "{detail}");
     }
+}
+
+#[tokio::test]
+async fn a_private_or_missing_document_returns_an_actionable_client_error() {
+    let fake = fake_http_github(Vec::new());
+    let (mut state, _) = testing::state();
+    state.documents = Arc::new(Service::new(
+        Arc::new(Index::new(Vec::new())),
+        Arc::new(http_fetcher(&fake)),
+        100,
+        1 << 20,
+    ));
+    let (status, body) = call(
+        &router(state),
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": KEY })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "document_not_found");
+    assert!(body["detail"]
+        .as_str()
+        .unwrap()
+        .contains("VIBE_TALK_GITHUB_TOKEN_FILE"));
 }
 
 #[tokio::test]
@@ -829,7 +892,7 @@ async fn a_commit_ref_never_looks_in_the_tree() {
         .fetch(&old_entry(sha))
         .await
         .expect_err("must not fetch");
-    assert!(matches!(error, FetchError::Failed(_)));
+    assert!(matches!(error, FetchError::NotFound(_)));
     assert_eq!(
         fake.tree_hits.load(std::sync::atomic::Ordering::SeqCst),
         0,

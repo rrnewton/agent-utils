@@ -42,6 +42,7 @@ export interface LinkKindsLike {
 export interface RowLinksDependencies {
   readonly linkKinds: LinkKindsLike;
   byId(id: string): HTMLElement;
+  wireMessageLinks(box: Element): void;
   messageLinks(message: Message): Array<{ href: string; name: string }>;
   renderedHtmlOf(message: Message): string;
   rawTextOf(message: Message): string;
@@ -124,6 +125,7 @@ export function createRowLinks(deps: RowLinksDependencies): RowLinks {
       anchor.setAttribute("title", link.href);
       list.append(anchor);
     }
+    deps.wireMessageLinks(list);
     return list;
   }
 

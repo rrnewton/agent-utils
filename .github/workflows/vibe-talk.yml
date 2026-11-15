@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: build the container image
-        run: podman build -t vibe-talk:ci -f vibe-talk/Containerfile vibe-talk
+        run: podman build -t vibe-talk:ci -f vibe-talk/Containerfile .
       # Rootless container networking is the part of this job most likely to differ between a
       # laptop and a hosted runner, and a port that is unreachable there looks exactly like a
       # server that refused to start. Record what the runner actually provides, always, so that

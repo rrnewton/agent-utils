@@ -247,8 +247,11 @@ OPTIONAL_VARS=(
     VIBE_TALK_ELEVENLABS_API_BASE
     VIBE_TALK_PUBLIC_BASE_URL
     VIBE_TALK_TIMEZONE
+    VIBE_TALK_APP_NAME
+    VIBE_TALK_APP_SHORT_NAME
     VIBE_TALK_SKIP_STARTUP_PROBE
     VIBE_TALK_STORAGE_PATH
+    VIBE_TALK_GITHUB_TOKEN_FILE
     RUST_LOG
 )
 # Settings for this launcher itself (not for the server). They may be set in the same config file.
@@ -1364,7 +1367,8 @@ fi
 step "Building $IMAGE_REF from $VIBE_TALK_DIR/Containerfile"
 build_args=(build -t "$IMAGE_REF" -f "$VIBE_TALK_DIR/Containerfile")
 [ -n "$BUILD_NETWORK" ] && build_args+=(--network "$BUILD_NETWORK")
-build_args+=("$VIBE_TALK_DIR")
+# Path dependencies live beside vibe-talk; preserve that layout in the build context.
+build_args+=("$VIBE_TALK_DIR/..")
 if [ "$DRY_RUN" = 1 ]; then
     note "(dry run) $ENGINE ${build_args[*]}"
 else
