@@ -14,15 +14,15 @@ updated_at: 2026-11-15T12:08:06.535260796+00:00
 
     error: message 01794744462329112682-48065 remains pending without consuming a retry attempt:
     pane wD:p5 composer already holds unsubmitted text
-    "GPT-6.1-Sol medium · /deepscry-newton-fedora-MZ01GC9H · Read coordinator brief"; refusing to append to it; nothing was typed
+    "GPT-6.1-Sol medium · /<workspace-dir> · Read coordinator brief"; refusing to append to it; nothing was typed
 
-Before the first turn, the footer is "GPT-6.1-Sol medium · /deepscry-newton-fedora-MZ01GC9H". After a turn, Codex appends the thread title ("· Read coordinator brief"). Both forms are misread.
+Before the first turn, the footer is "GPT-6.1-Sol medium · /<workspace-dir>". After a turn, Codex appends the thread title ("· Read coordinator brief"). Both forms are misread.
 
 ## Screen at the time (idle, empty composer)
 
     › Ask Codex to do anything
 
-      GPT-6.1-Sol medium · /deepscry-newton-fedora-MZ01GC9H · Read coordinator brief
+      GPT-6.1-Sol medium · /<workspace-dir> · Read coordinator brief
       ← for agents · ? for shortcuts                       ⚠ 2 warnings · f2 to view
 
 ## Repro
@@ -39,4 +39,4 @@ codex 0.169.0 here refuses to start without `--no-daemon`: "daemon executable no
 ## Expected
 The footer line under the composer is not composer input. An idle Codex 0.169 pane accepts `agentctl send`, and the submit key reliably submits.
 
-Reported by the DeepScry newton-fedora coordinator, 2026-11-15 ~7:10am ET.
+Reported by a coordinator on the owner's external machine, 2026-11-15 ~7:10am ET.
