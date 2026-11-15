@@ -43222,16 +43222,34 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
                 owned.add(_stored_path(config, checkout.path, "checkout path"))
                 if checkout.vcs != "eden":
                     repositories.add(_stored_repository_path(config, checkout.repository)[1])
+    unresolvable_archives: list[dict[str, object]] = []
     for archive in archives:
         for raw_record in archive.records:
+            slot_value = raw_record.get("slot")
+            slot_name = slot_value if isinstance(slot_value, str) else None
             for checkout_value in _as_list(
                 raw_record.get("checkouts", []), "archived record.checkouts"
             ):
                 checkout = _checkout_from_obj(checkout_value, "archived checkout")
                 if checkout.vcs != "eden":
-                    repositories.add(
-                        _stored_repository_path(config, checkout.repository)[1]
-                    )
+                    try:
+                        repositories.add(
+                            _stored_repository_path(config, checkout.repository)[1]
+                        )
+                    except Refusal as exc:
+                        # #1433: an archived row whose source repository is
+                        # gone cannot own any live registration, so both the
+                        # report and the reap action read past it, naming it.
+                        # Active rows (resolved by the strict loader above)
+                        # and every other ambiguity keep refusing.
+                        skipped_row: dict[str, object] = {
+                            "machine": archive.machine,
+                            "slot": slot_name,
+                            "repository": checkout.repository,
+                            "reason": str(exc),
+                        }
+                        if skipped_row not in unresolvable_archives:
+                            unresolvable_archives.append(skipped_row)
     for raw in args.repository or ():
         candidate = Path(raw)
         repositories.add(candidate if candidate.is_absolute() else config.root / candidate)
@@ -43334,6 +43352,7 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
         "stray": rows,
         "retained": retained,
         "malformed_archives": malformed_archives,
+        "unresolvable_archives": unresolvable_archives,
     }
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -43349,6 +43368,12 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
             print(
                 f"MALFORMED-ARCHIVE: machine={item['machine']} "
                 f"slot={item['slot']} reason={item['reason']}"
+            )
+        for item in unresolvable_archives:
+            print(
+                f"UNRESOLVABLE-ARCHIVE: machine={item['machine']} "
+                f"slot={item['slot']} repository={item['repository']} "
+                f"reason={item['reason']}"
             )
     return 1 if args.apply and retained else 0
 

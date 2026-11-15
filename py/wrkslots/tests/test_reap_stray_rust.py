@@ -9,8 +9,16 @@ from pathlib import Path
 
 import pytest
 
+from wrkslots import cli as wrkslots_cli
 from wrkslots.tests.rust_binary import rust_wrkslotsd
-from wrkslots.tests.test_reap_stray_worktrees import _run, _stray
+from wrkslots.tests.test_reap_stray_worktrees import (
+    _active_record,
+    _archived_record,
+    _gone_archived_record,
+    _run,
+    _stray,
+    _write_registry,
+)
 from wrkslots.tests.test_create_text_rust import _fixture, _git
 
 
@@ -72,6 +80,59 @@ def test_reap_stray_plan_with_wrong_head_is_caught(tmp_path: Path) -> None:
     assert _norm(forged, rust_root) == _norm(result.stdout, rust_root)
     with pytest.raises(AssertionError):
         _assert_output_head(forged, upstream)
+
+
+def test_reap_stray_rust_report_skips_unresolvable_archive(tmp_path: Path) -> None:
+    # #1433: both editions name and skip an archived row whose source
+    # repository is gone in report mode, and refuse it with --apply.
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    _stray(tmp_path / "rust")
+    _stray(tmp_path / "oracle")
+    for root in (rust_root, oracle_root):
+        _write_registry(
+            root,
+            active=[],
+            archived=[
+                _archived_record("slot-old"),
+                _gone_archived_record("slot-gone"),
+            ],
+        )
+    rc, out = _run(oracle_root, apply=False)
+    assert rc == 0
+    result = _rust(rust_root, tmp_path / "rust" / "upstream-repo", apply=False, fmt="human")
+    assert result.returncode == 0, result.stderr
+    assert "UNRESOLVABLE-ARCHIVE: machine=node-a slot=slot-gone" in result.stdout
+    assert _norm(result.stdout, rust_root) == _norm(out, oracle_root)
+    # --apply skips and names it too, and still reaps the stray.
+    applied = _rust(rust_root, tmp_path / "rust" / "upstream-repo", apply=True, fmt="human")
+    assert applied.returncode == 0, applied.stderr
+    assert "UNRESOLVABLE-ARCHIVE: machine=node-a slot=slot-gone" in applied.stdout
+
+
+def test_reap_stray_rust_refuses_active_record_with_deleted_repository(
+    tmp_path: Path,
+) -> None:
+    # #1433: an active row whose repository is gone refuses in both
+    # editions and both modes.
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    _stray(tmp_path / "rust")
+    _stray(tmp_path / "oracle")
+    for root in (rust_root, oracle_root):
+        _write_registry(
+            root,
+            active=[_active_record("slot-live", "../gone-source")],
+            archived=[_gone_archived_record("slot-gone")],
+        )
+    for apply in (False, True):
+        with pytest.raises(wrkslots_cli.Refusal, match="does not exist"):
+            _run(oracle_root, apply=apply)
+        result = _rust(
+            rust_root, tmp_path / "rust" / "upstream-repo", apply=apply, fmt="human"
+        )
+        assert result.returncode != 0
+        assert "does not exist or cannot be resolved" in result.stderr
 
 
 def test_reap_stray_rust_apply_reaps(tmp_path: Path) -> None:
