@@ -1,12 +1,12 @@
 ---
 title: 'eden-cap-outer-only: count only outer checkouts against the host Eden cap'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - wrkslots
 created_at: 2026-11-15T14:10:00+00:00
-updated_at: 2026-11-15T14:10:00+00:00
+updated_at: 2026-11-15T20:45:00+00:00
 ---
 
 # Description
@@ -45,4 +45,14 @@ exhaustion stays isolated there (#1204 wrkslots-eden-checkouts).
 
 # Notes
 
-Resolution: (fill in at landing)
+## Resolution
+
+[watermelon-full-preview] Landed as 67be9216 on main (gated ab4a4fa4,
+combined tree verified after replay). `eden.partition_checkouts`
+splits mounts by resolved-path containment in the image roots
+(mount point, validation surface, recorded bind targets; aliases
+dedupe); the cap asserts on outer mounts only and names both sets;
+status/doctor emit the nested `eden` counts for Eden projects and
+doctor adds the `eden-cap` finding. Fail-safe count-all when image
+roots are unknown. Mount-table hardening against foreign content
+bound into a root remains out of scope as designed.
