@@ -1,0 +1,27 @@
+# tick-hub reminder: apply the wrkslots finisher plan (#1568).
+#
+# The systemd timer (wrkslots-finisher.timer in this directory) writes
+# a fresh dry-run report every hour. This reminder asks the
+# coordinator -- the one actor whose process tree can satisfy
+# removal's ancestry check -- to review that report and run the apply
+# form from its own shell:
+#
+#   wrkslots finisher --apply --coordinator-pid <coordinator pid>
+#
+# Merge this reminder into the host tick-hub config and point the
+# gate command at the host report path.
+
+description: |-
+  Prompt the coordinator to apply the hourly finisher dry-run plan.
+
+reminders:
+  - name: wrkslots_finisher
+    cadence_secs: 3600
+    gate:
+      cmd: test -s "$HOME/.local/state/wrkslots/finisher-report.json"
+      when: success
+      capture: false
+    emit:
+      kind: action
+      skill: wrkslots
+      title: review the finisher report and run wrkslots finisher --apply from the coordinator shell

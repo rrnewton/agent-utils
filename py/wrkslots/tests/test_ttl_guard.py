@@ -394,6 +394,43 @@ def test_hold_added_during_rescue_refused_at_recheck(
     assert slot_dir.exists()
 
 
+def test_teardown_refuses_occupied_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1576: a process still using the tree refuses teardown."""
+    config, record, _repo_path, _remote = _make_slot(tmp_path)
+    _patch_dead(monkeypatch)
+
+    def occupied(*_a: object, **_k: object) -> None:
+        raise cli.Refusal("live process 4242 uses slot: cwd=…; stop it and retry")
+
+    monkeypatch.setattr(cli, "_assert_slot_unused", occupied)
+    with pytest.raises(cli.Refusal, match="uses slot"):
+        cli._execute_ttl_slot_teardown(
+            config, record, now=NOW, thresholds=THRESHOLDS
+        )
+    assert (config.worktrees / "slot-f").exists()
+
+
+def test_teardown_refuses_unread_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1576: an unread handoff refuses teardown, as it refuses remove."""
+    config, record, _repo_path, _remote = _make_slot(tmp_path)
+    _patch_dead(monkeypatch)
+    monkeypatch.setattr(cli, "_assert_slot_unused", lambda *_a, **_k: None)
+
+    def unread(*_a: object, **_k: object) -> None:
+        raise cli.Refusal("slot slot-f contains an unread HANDOFF.md")
+
+    monkeypatch.setattr(cli, "_assert_handoff_read", unread)
+    with pytest.raises(cli.Refusal, match="unread HANDOFF"):
+        cli._execute_ttl_slot_teardown(
+            config, record, now=NOW, thresholds=THRESHOLDS
+        )
+    assert (config.worktrees / "slot-f").exists()
+
+
 @pytest.mark.ordinary_environment
 def test_heartbeat_succeeds_with_warning_for_nested_worktree(
     tmp_path: Path,

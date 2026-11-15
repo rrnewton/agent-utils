@@ -26852,6 +26852,28 @@ def _execute_ttl_slot_rescue(
     }
 
 
+def _assert_ttl_teardown_safe(config: Config, record: ActiveRecord) -> None:
+    """Remove-grade gates for TTL teardown (#1576).
+
+    Deletion needs more than the #1491 live/held guards: an unread
+    handoff and any process still using the tree (cwd, executable,
+    descriptors, mappings, mounts, cgroup) refuse exactly as they
+    refuse ``remove``.  Rescue alone keeps only the #1491 guards;
+    it deletes nothing.
+    """
+    _assert_ttl_not_blocked(config, record)
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
+    _assert_handoff_read(config, record, slot_path)
+    _assert_slot_unused(
+        slot_path,
+        _record_for_slot_use_check(
+            record,
+            validate_complete=record.slot_type == "validate",
+            allow_live_validate_owner=False,
+        ),
+    )
+
+
 def _execute_ttl_slot_teardown(
     config: Config,
     record: ActiveRecord,
@@ -26871,7 +26893,7 @@ def _execute_ttl_slot_teardown(
     ``remove`` refuses. Archiving the registry row stays with the
     removal machinery; this core is proven on fixture projects only.
     """
-    _assert_ttl_not_blocked(config, record)
+    _assert_ttl_teardown_safe(config, record)
     stage, _expired_at, _teardown_at = _ttl_slot_stage(record, now, thresholds)
     if stage != "teardown":
         raise Refusal(
@@ -27050,6 +27072,9 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
             f"slot {args.slot} is at TTL stage {stage}, not teardown; "
             "deterministic teardown runs only past the teardown rung"
         )
+    # #1576: deletion also needs the handoff and occupancy gates
+    # remove runs; checked again under the locks below.
+    _assert_ttl_teardown_safe(config, before)
     hook = (
         _command_ttl_hook(args.rescue_hook_command)
         if args.rescue_hook_command
@@ -27090,7 +27115,8 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
         current = _find_record(current_state, args.slot)
         # #1491 re-check under the locks: the owner could have appeared
         # or a hold could have been placed while the rescue ran lock-free.
-        _assert_ttl_not_blocked(config, current)
+        # #1576: the handoff and occupancy gates re-check with it.
+        _assert_ttl_teardown_safe(config, current)
         if current != before:
             raise Refusal(
                 f"slot {args.slot} changed in the registry while its rescue ran; "
@@ -43061,6 +43087,230 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
                 f"generation={item['generation']} reason={item['reason']}"
             )
     return 3 if could_not_determine else 0
+
+
+FINISHER_SCHEMA = 1
+
+
+def _finisher_plan(
+    config: Config,
+    wait_seconds: float,
+    thresholds: TtlThresholds,
+    now: dt.datetime,
+) -> dict[str, object]:
+    """Read-only finisher plan: queued, expired-unhanded, TTL rungs.
+
+    Gathering reuses the retirement candidate derivations verbatim, so
+    the plan can never name a target ``retire-pending`` would not
+    attempt, and every blocked candidate keeps its named reason.
+    """
+    queued = _current_retirement_candidates(config, wait_seconds)
+    would_retire: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    for candidate in queued:
+        entry: dict[str, object] = {
+            "machine": candidate.machine,
+            "slot": candidate.slot,
+            "generation": candidate.generation,
+            "via": "retirement-queue",
+        }
+        if candidate.machine != config.machine:
+            skipped.append(
+                {**entry, "reason": "recorded by a foreign machine shard"}
+            )
+        elif candidate.blocked_reason is not None:
+            skipped.append({**entry, "reason": candidate.blocked_reason})
+        else:
+            would_retire.append(entry)
+    actions: list[dict[str, object]] = []
+    expired = _expired_unhanded_candidates(
+        config,
+        wait_seconds,
+        exclude={
+            (candidate.machine, candidate.slot, candidate.generation)
+            for candidate in queued
+        },
+    )
+    for derived in expired:
+        entry = {
+            "machine": derived.machine,
+            "slot": derived.slot,
+            "generation": derived.generation,
+            "agent": derived.agent,
+            "via": "expired-unhanded",
+        }
+        if derived.classification == "attemptable":
+            would_retire.append(entry)
+        elif derived.classification == "action":
+            actions.append({**entry, "reason": derived.reason})
+        else:
+            skipped.append({**entry, "reason": derived.reason})
+    planned = {(str(item["machine"]), str(item["slot"])) for item in would_retire}
+    state = _load_active_snapshot(config, require_repository=False)
+    ttl_rows: list[dict[str, object]] = []
+    for row in _ttl_report_rows(config, state, now, thresholds, only_overdue=True):
+        if row["stage"] != "teardown":
+            continue
+        if (config.machine, str(row["slot"])) in planned:
+            continue
+        ttl_rows.append(
+            {
+                "machine": config.machine,
+                "slot": row["slot"],
+                "agent": row["agent"],
+                "stage": row["stage"],
+                "blocked": row["blocked"],
+                "teardown_at": row["teardown_at"],
+                "via": "ttl-teardown",
+            }
+        )
+    frozen = _retire_freeze(config)
+    return {
+        "schema": FINISHER_SCHEMA,
+        "machine": config.machine,
+        "frozen": None
+        if frozen is None
+        else {"reason": frozen[0], "source": frozen[1]},
+        "would_retire": would_retire,
+        "ttl_teardown_candidates": ttl_rows,
+        "actions": actions,
+        "skipped": skipped,
+    }
+
+
+def _finisher_run_captured(argv: list[str]) -> tuple[int, dict[str, object] | None]:
+    """Run one existing handler with parser defaults; capture its JSON."""
+    parsed = _build_parser().parse_args(argv)
+    parsed.raw_arguments = argv
+    handler = parsed.handler
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = int(handler(parsed))
+    except Refusal as exc:
+        return 3, {"status": "refused", "reason": str(exc)}
+    text = buffer.getvalue().strip()
+    payload: dict[str, object] | None = None
+    if text:
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            decoded = None
+        if isinstance(decoded, dict):
+            payload = decoded
+        else:
+            payload = {"output": text}
+    return code, payload
+
+
+def _cmd_finisher(args: argparse.Namespace) -> int:
+    """Bounded scheduled retirement: dry-run plan, or guarded apply.
+
+    Dry-run is the default and mutates nothing.  Apply delegates to
+    ``retire-pending`` (ordinary remove per target, every guard
+    intact) and therefore needs the coordinator ancestry that remove
+    already requires; an unattended timer can only ever produce the
+    dry-run report until a scoped delegation exists.  TTL teardown
+    stays report-only here: the finisher applies only remove-grade
+    paths, and a teardown candidate is an operator decision.
+    """
+    if args.limit <= 0 or args.limit > RETIRE_PENDING_LIMIT:
+        raise Refusal(f"--limit must be between 1 and {RETIRE_PENDING_LIMIT}")
+    if args.apply and args.coordinator_pid is None:
+        raise Refusal(
+            "finisher --apply requires --coordinator-pid; run it from the "
+            "coordinator's process tree (removal enforces that ancestry), "
+            "or use the dry-run report from an unattended timer"
+        )
+    config = _load_config(args.project_root, args.machine)
+    thresholds = _ttl_thresholds(
+        args.warn_after_seconds,
+        args.alarm_after_seconds,
+        args.stop_after_seconds,
+        args.teardown_after_seconds,
+    )
+    now = (
+        _parse_timestamp(args.now, "--now")
+        if args.now is not None
+        else dt.datetime.now(dt.timezone.utc)
+    )
+    wait_seconds = args.wait_lock if args.wait_lock > 0 else 5.0
+    plan = _finisher_plan(config, wait_seconds, thresholds, now)
+    would_retire = cast(list[dict[str, object]], plan["would_retire"])
+    if not args.apply:
+        report: dict[str, object] = {
+            **plan,
+            "dry_run": True,
+            "would_retire": would_retire[: args.limit],
+            "deferred_by_limit": would_retire[args.limit :],
+        }
+        _emit_finisher_report(report, args.format)
+        return 0
+    _assert_not_retire_frozen(config, "finisher")
+    global_argv: list[str] = []
+    if args.project_root is not None:
+        global_argv += ["--project-root", str(args.project_root)]
+    if args.machine is not None:
+        global_argv += ["--machine", str(args.machine)]
+    retire_argv = global_argv + [
+        "retire-pending",
+        "--limit",
+        str(args.limit),
+        "--coordinator-pid",
+        str(args.coordinator_pid),
+        "--include-expired-unhanded",
+        "--format",
+        "json",
+    ]
+    if args.coordinator_authorized:
+        retire_argv.append("--coordinator-authorized")
+    if args.archive_private_history:
+        retire_argv.append("--archive-private-history")
+    if args.archive_drifted_checkouts:
+        retire_argv.append("--archive-drifted-checkouts")
+    code, retire_payload = _finisher_run_captured(retire_argv)
+    report = {
+        **plan,
+        "dry_run": False,
+        "retire_pending": retire_payload,
+    }
+    _emit_finisher_report(report, args.format)
+    return code
+
+
+def _emit_finisher_report(report: dict[str, object], output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return
+    mode = "dry-run" if report.get("dry_run") else "apply"
+    would = cast(list[dict[str, object]], report.get("would_retire", []))
+    print(f"finisher mode={mode} would_retire={len(would)}")
+    if report.get("frozen") is not None:
+        print(f"FROZEN: {report['frozen']}")
+    for item in would:
+        print(
+            f"WOULD_RETIRE: {item['machine']}/{item['slot']} "
+            f"generation={item['generation']} via={item['via']}"
+        )
+    for item in cast(list[dict[str, object]], report.get("actions", [])):
+        print(
+            f"ACTION: {item['machine']}/{item['slot']} "
+            f"generation={item['generation']} reason={item['reason']}"
+        )
+    for item in cast(
+        list[dict[str, object]], report.get("ttl_teardown_candidates", [])
+    ):
+        print(
+            f"TTL_CANDIDATE: {item['machine']}/{item['slot']} "
+            f"stage={item['stage']} blocked={item['blocked']}"
+        )
+    for item in cast(list[dict[str, object]], report.get("skipped", [])):
+        print(
+            f"SKIPPED: {item['machine']}/{item['slot']} "
+            f"generation={item['generation']} reason={item['reason']}"
+        )
+    if not report.get("dry_run"):
+        print(f"retire_pending={json.dumps(report.get('retire_pending'), sort_keys=True)}")
 
 
 RETIRE_FREEZE_MARKER = "RETIRE_FREEZE"
@@ -86831,6 +87081,89 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="batch result format (default: human); json includes typed per-target outcomes",
     )
     retire_pending.set_defaults(handler=_cmd_retire_pending)
+
+    finisher = subparsers.add_parser(
+        "finisher",
+        description=(
+            "Bounded scheduled retirement for dead slots (#1568). Dry-run by "
+            "default: report queued and expired-unhanded retirement candidates "
+            "plus TTL teardown-rung candidates, with every skipped slot's named "
+            "reason, and change nothing. With --apply, delegate to "
+            "retire-pending (ordinary remove per target; every liveness, hold, "
+            "process-use, salvage, and path-fence guard still runs). Apply "
+            "needs --coordinator-pid in the invoking process ancestry, exactly "
+            "as remove does, so an unattended timer produces the dry-run report "
+            "and a coordinator-descended runner applies it. TTL teardown "
+            "candidates are reported, never applied by the finisher: "
+            "teardown rescues to dated refs under its own policy and "
+            "stays an explicit operator decision."
+        ),
+        help="report (default) or apply bounded scheduled slot retirement",
+        formatter_class=_HelpFormatter,
+    )
+    finisher.add_argument(
+        "--limit",
+        type=int,
+        default=8,
+        metavar="N",
+        help=f"maximum targets to plan or attempt, 1 through {RETIRE_PENDING_LIMIT} (default: 8)",
+    )
+    finisher.add_argument(
+        "--apply",
+        action="store_true",
+        help="attempt the planned retirements via retire-pending (default: dry-run report only)",
+    )
+    finisher.add_argument(
+        "--coordinator-pid",
+        type=int,
+        default=None,
+        metavar="PID",
+        help="live coordinator PID for --apply; must be in the invoking process ancestry",
+    )
+    finisher.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="record coordinator authorization with each removal attempt (see retire-pending)",
+    )
+    finisher.add_argument(
+        "--archive-private-history",
+        action="store_true",
+        help="as for retire-pending: " + _ARCHIVE_PRIVATE_HISTORY_HELP,
+    )
+    finisher.add_argument(
+        "--archive-drifted-checkouts",
+        action="store_true",
+        help="as for retire-pending: " + _ARCHIVE_DRIFTED_CHECKOUTS_HELP,
+    )
+    finisher.add_argument(
+        "--now",
+        metavar="ISO8601",
+        default=None,
+        help="timestamp to judge TTL rungs against (default: current UTC time); tests pass a fixed value",
+    )
+    finisher.add_argument(
+        "--warn-after-seconds", type=int, default=_TTL_WARN_AFTER_SECONDS, metavar="SECONDS",
+        help=f"TTL warn rung in seconds past expiry (default: {_TTL_WARN_AFTER_SECONDS})",
+    )
+    finisher.add_argument(
+        "--alarm-after-seconds", type=int, default=_TTL_ALARM_AFTER_SECONDS, metavar="SECONDS",
+        help=f"TTL alarm rung in seconds past expiry (default: {_TTL_ALARM_AFTER_SECONDS})",
+    )
+    finisher.add_argument(
+        "--stop-after-seconds", type=int, default=_TTL_STOP_AFTER_SECONDS, metavar="SECONDS",
+        help=f"TTL stop rung in seconds past expiry (default: {_TTL_STOP_AFTER_SECONDS})",
+    )
+    finisher.add_argument(
+        "--teardown-after-seconds", type=int, default=_TTL_TEARDOWN_AFTER_SECONDS, metavar="SECONDS",
+        help=f"TTL teardown rung in seconds past expiry (default: {_TTL_TEARDOWN_AFTER_SECONDS})",
+    )
+    finisher.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="report format (default: human)",
+    )
+    finisher.set_defaults(handler=_cmd_finisher)
 
 
     freeze = subparsers.add_parser(

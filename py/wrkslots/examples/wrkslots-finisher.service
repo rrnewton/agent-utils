@@ -1,0 +1,14 @@
+[Unit]
+Description=wrkslots finisher dry-run report (no slots are removed)
+After=network.target
+
+[Service]
+Type=oneshot
+# Dry-run only. Removal requires the coordinator PID in the invoking
+# process ancestry, which a systemd user service can never have, so
+# this unit writes the plan a coordinator-descended runner applies
+# with: wrkslots finisher --apply --coordinator-pid <pid>
+# Set WRKSLOTS_BIN and PROJECT_ROOT for the host before enabling.
+Environment=WRKSLOTS_BIN=%h/worktrees/wrkslots
+Environment=PROJECT_ROOT=%h
+ExecStart=/bin/sh -c 'mkdir -p %h/.local/state/wrkslots && "$WRKSLOTS_BIN" --project-root "$PROJECT_ROOT" finisher --format json > %h/.local/state/wrkslots/finisher-report.json.tmp && mv %h/.local/state/wrkslots/finisher-report.json.tmp %h/.local/state/wrkslots/finisher-report.json'

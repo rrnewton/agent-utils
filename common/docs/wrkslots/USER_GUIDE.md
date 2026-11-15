@@ -1136,6 +1136,20 @@ or path-fence race retains the slot in the queue. Successful archived removal cl
 Attempt events rotate attempted entries behind never-attempted and less-recently-attempted
 entries, so one retained slot cannot starve the rest of a bounded queue.
 
+Nothing runs that queue on a schedule by itself. `wrkslots finisher` is the scheduled runner:
+with no flags it is a dry run that reports the queued and expired-unhanded candidates it would
+attempt, the TTL teardown-rung candidates, and every skipped slot with its named reason, changing
+nothing. `wrkslots finisher --apply --limit N --coordinator-pid PID` delegates to
+`retire-pending` (including expired-unhanded slots), so every removal guard still runs and the
+coordinator-ancestry requirement still applies: run the apply form from the coordinator's own
+process tree. An unattended timer can only produce the dry-run report. Example user units and a
+tick-hub reminder that prompts the coordinator to apply the hourly report ship in
+`py/wrkslots/examples/` (`wrkslots-finisher.service`, `wrkslots-finisher.timer`,
+`tick-hub-finisher.yaml`); enable them per host only after reviewing the first dry-run report.
+TTL teardown candidates are reported, never applied by the finisher: teardown rescues to dated
+refs under its own policy and stays an explicit operator decision. Teardown itself refuses a
+live owner, a hold, an unread handoff, and any process still using the tree.
+
 When a live lane goes on using a slot its predecessor handed off for removal, the coordinator --
 not the lane -- voids the queued entry with `wrkslots supersede-handoff SLOT --agent AGENT
 --owner-pid PID --expected-generation N --coordinator-pid PID --coordinator-authorized --reason
