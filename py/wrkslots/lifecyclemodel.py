@@ -21,7 +21,7 @@ Two questions are answered mechanically:
   are deliberately excluded from the scheduled set: a state that
   needs one is a named manual terminal, not a finisher obligation.
 
-Fixes and historical bugs are scenario constants, never state, so a
+Fixes and regression toggles are scenario constants, never state, so a
 baseline run reproduces each observed leak class as a reachable
 liveness counterexample and single-fix runs show which fix closes it.
 The TLA+ text in ``spec/WrkslotsLifecycle.tla`` mirrors this action
@@ -73,6 +73,7 @@ BUG_APPLY_JOURNAL = "apply-journal"
 
 
 class State(NamedTuple):
+    """One abstract slot state; field values are documented inline."""
     row: str  # absent | active | archived
     storage: str  # absent | present
     truth: str  # alive | dead (environment truth about the owner)
@@ -94,6 +95,7 @@ class State(NamedTuple):
 
 @dataclasses.dataclass(frozen=True)
 class Scenario:
+    """Constants for one exploration: slot kind, flags, toggles."""
     slot_type: str = "agent"  # agent | validate
     vcs: str = "git"  # git | eden (subject slot)
     other_journal: int = 0  # another slot's blocking journal exists
@@ -104,6 +106,7 @@ class Scenario:
 
 
 def initial_states(sc: Scenario) -> tuple[State, ...]:
+    """Start states: no row and no storage, plus stray storage."""
     pub = "proven" if sc.slot_type == "agent" else "unproven"
     base = State(
         row="absent",
@@ -130,6 +133,7 @@ def initial_states(sc: Scenario) -> tuple[State, ...]:
 
 
 def is_terminal(s: State) -> bool:
+    """Whether the slot is fully retired (archived, storage gone)."""
     return s.row == "archived" and s.storage == "absent"
 
 
@@ -150,6 +154,7 @@ def _owner_ok(s: State) -> bool:
 
 
 def remove_guards(s: State, sc: Scenario, *, archive: bool, drift_ok: bool) -> bool:
+    """Whether ordinary removal may fire under the given variants."""
     if s.row != "active" or s.storage != "present":
         return False
     if _journal_blocked(s, sc) or not _authorized(s, sc):
@@ -191,6 +196,7 @@ def _archive(s: State, *, via_ttl: bool = False) -> State:
 # person), human (discretionary judgment), sched (finisher policy or an
 # automatic fix transition; the liveness edge set also includes Tick).
 def successors(s: State, sc: Scenario) -> list[tuple[str, str, State]]:
+    """Every enabled transition as (action name, edge kind, next)."""
     out: list[tuple[str, str, State]] = []
 
     def add(name: str, kind: str, nxt: State) -> None:
@@ -430,12 +436,14 @@ def in_liveness_domain(s: State) -> bool:
 
 @dataclasses.dataclass
 class Exploration:
+    """Reachable graph for one scenario, with check helpers."""
     scenario: Scenario
     states: set[State]
     edges: dict[State, list[tuple[str, str, State]]]
     parent: dict[State, tuple[State, str] | None]
 
     def trace(self, target: State) -> list[str]:
+        """Shortest action-name path from a start state to target."""
         steps: list[str] = []
         cur: State | None = target
         while cur is not None:
@@ -464,6 +472,7 @@ class Exploration:
         return good
 
     def liveness_failures(self) -> list[State]:
+        """Domain states with no scheduled path to a terminal."""
         good = self.scheduled_reachable_terminals()
         return sorted(
             (s for s in self.states if in_liveness_domain(s) and s not in good),
@@ -471,9 +480,11 @@ class Exploration:
         )
 
     def safety_violations(self) -> list[State]:
+        """Reachable states whose safety ghost recorded a violation."""
         return sorted((s for s in self.states if s.viol != "none"), key=repr)
 
     def classes(self) -> dict[str, int]:
+        """Reachable-state counts per primary leak class."""
         counts: dict[str, int] = {}
         for s in self.states:
             key = why_stayed(s, self.scenario)
@@ -482,6 +493,7 @@ class Exploration:
 
 
 def explore(sc: Scenario) -> Exploration:
+    """Explore every state reachable under one scenario."""
     starts = initial_states(sc)
     states: set[State] = set(starts)
     parent: dict[State, tuple[State, str] | None] = {s: None for s in starts}

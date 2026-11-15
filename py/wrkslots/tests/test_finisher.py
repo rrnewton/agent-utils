@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+from typing import cast
 
 import pytest
 
@@ -141,19 +142,18 @@ def test_finisher_plan_partitions_candidates(
     monkeypatch.setattr(cli, "_retire_freeze", lambda _config: None)
     thresholds = cli._ttl_thresholds(0, 86_400, 172_800, 259_200)
     plan = cli._finisher_plan(config, 1.0, thresholds, NOW)
-    assert [item["slot"] for item in plan["would_retire"]] == [
-        "queued-ok",
-        "expired-ok",
-    ]
-    skipped = {item["slot"]: item["reason"] for item in plan["skipped"]}
+    would = cast(list[dict[str, object]], plan["would_retire"])
+    assert [item["slot"] for item in would] == ["queued-ok", "expired-ok"]
+    skipped_rows = cast(list[dict[str, object]], plan["skipped"])
+    skipped = {str(item["slot"]): str(item["reason"]) for item in skipped_rows}
     assert skipped["queued-held"] == "slot is held: keep"
     assert "foreign" in skipped["queued-foreign"]
-    assert [item["slot"] for item in plan["actions"]] == ["expired-unread"]
+    action_rows = cast(list[dict[str, object]], plan["actions"])
+    assert [item["slot"] for item in action_rows] == ["expired-unread"]
     # A slot already planned for retirement is not listed twice as a
     # TTL candidate, and a pre-teardown rung is never a candidate.
-    assert [item["slot"] for item in plan["ttl_teardown_candidates"]] == [
-        "ttl-only"
-    ]
+    ttl_rows = cast(list[dict[str, object]], plan["ttl_teardown_candidates"])
+    assert [item["slot"] for item in ttl_rows] == ["ttl-only"]
     assert plan["frozen"] is None
 
 

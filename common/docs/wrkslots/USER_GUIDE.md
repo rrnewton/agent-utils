@@ -1143,9 +1143,9 @@ nothing. `wrkslots finisher --apply --limit N --coordinator-pid PID` delegates t
 `retire-pending` (including expired-unhanded slots), so every removal guard still runs and the
 coordinator-ancestry requirement still applies: run the apply form from the coordinator's own
 process tree. An unattended timer can only produce the dry-run report. Example user units and a
-tick-hub reminder that prompts the coordinator to apply the hourly report ship in
-`py/wrkslots/examples/` (`wrkslots-finisher.service`, `wrkslots-finisher.timer`,
-`tick-hub-finisher.yaml`); enable them per host only after reviewing the first dry-run report.
+scheduled-tick reminder that prompts the coordinator to apply the hourly report ship with the
+package examples (`wrkslots-finisher.service`, `wrkslots-finisher.timer`, and the tick
+reminder file beside them); enable them per host only after reviewing the first dry-run report.
 TTL teardown candidates are reported, never applied by the finisher: teardown rescues to dated
 refs under its own policy and stays an explicit operator decision. Teardown itself refuses a
 live owner, a hold, an unread handoff, and any process still using the tree.
