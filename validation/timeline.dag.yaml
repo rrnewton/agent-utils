@@ -50,6 +50,22 @@ steps:
       rss_baseline_bytes: 1073741824
 
   - group: browser
+    job: port-picker
+    desc: prove the fixture port falls back when its derived port is busy
+    cmd: >-
+      cd py/tests/js/browser &&
+      ../../../../scripts/with-node22 node --test --test-reporter=spec port-picker.test.cjs
+    jobs_flag: ""
+    deps: [setup.browser-deps]
+    labels: [validation-timeline, component-wrkviz]
+    timeout: 600
+    cpu_timeout: 120
+    hint:
+      est_duration_s: 5
+      classification: latency-bound
+      rss_baseline_bytes: 536870912
+
+  - group: browser
     job: functional
     desc: drive timeline interactions in Chromium
     # This graph already supplies containment. Calling the tool Makefile here would start a

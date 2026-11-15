@@ -6,15 +6,18 @@ const { defineConfig } = require("@playwright/test");
 // No fixed port (#1252): derive the port from this checkout's path, so
 // parallel gates in different checkouts never collide on one fixed port,
 // while every process that loads this config in one run agrees on it.
-// Pin AGENT_TIMELINE_E2E_PORT to choose a specific port.
-const crypto = require("crypto");
+// The derived port is a preference, not a promise (#1687): when an
+// unrelated program already holds it, the picker falls back to an ephemeral
+// port instead of failing every check at bind time. The picked port is
+// written back to AGENT_TIMELINE_E2E_PORT so spawned processes that load
+// this config agree on it. Pin AGENT_TIMELINE_E2E_PORT to choose a port.
+const { derivedPort, pickPort } = require("./port-picker.cjs");
 
-function derivedPort() {
-  const digest = crypto.createHash("sha256").update(__dirname).digest();
-  return 21000 + (digest.readUInt16BE(0) % 18000);
-}
-
-const port = Number(process.env.AGENT_TIMELINE_E2E_PORT || derivedPort());
+const port = pickPort({
+  pinned: process.env.AGENT_TIMELINE_E2E_PORT,
+  preferred: derivedPort(__dirname),
+});
+process.env.AGENT_TIMELINE_E2E_PORT = String(port);
 const baseURL = "http://127.0.0.1:" + port;
 
 module.exports = defineConfig({
