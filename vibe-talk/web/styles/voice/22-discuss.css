@@ -776,11 +776,15 @@ stay its owner's (#1524). The pane itself already ends above the
  * bar is its height handle — ns-resize cursor, no touch scrolling from the bar
  * (the drag must not scroll the page or the list underneath), and a focus ring
  * for its separator keys. Buttons in the bar keep their own pointer cursor. */
-/* `#1556 discuss-drag-grip-mark`: the three-line handle that makes the
- * #1552 drag discoverable. Hidden by default; the media block below shows
- * it under exactly the conditions where the bar drags (phone regime, pane
- * at half height) — never on the maximized/full sheet, the desk overlay or
- * the side-docked column, where the bar does not resize anything. It is a
+/* `#1556 discuss-drag-grip-mark`, placed by `#1584 discuss-grip-left`:
+ * the three-line handle that makes the #1552 drag discoverable stands at
+ * the left end of the bar, first in the flex row, so its left edge aligns
+ * with the bar's content padding and the bar's `align-items: center`
+ * centres it vertically; the row gap keeps it clear of the title text at
+ * any width. Hidden by default; the media block below shows it under
+ * exactly the conditions where the bar drags (phone regime, pane at half
+ * height) — never on the maximized/full sheet, the desk overlay or the
+ * side-docked column, where the bar does not resize anything. It is a
  * plain flex child of the bar, so it can shrink but never overlap the
  * title or the buttons, and a press on it reaches the bar's own pointer
  * handler: the grip is part of the drag target, not a separate hit area.
@@ -789,11 +793,10 @@ stay its owner's (#1524). The pane itself already ends above the
  * accent while the bar is being dragged or hovered on a fine pointer. */
 .discuss-grip {
   display: none;
-  order: 1;
   flex: 0 1 34px;
   min-width: 18px;
   height: 12px;
-  margin-inline: auto;
+  align-self: center;
   border-radius: 6px;
   color: #9aa3b2;
   opacity: 0.85;

@@ -21,6 +21,10 @@ scroller does not move. Condition waits only — no fixed sleeps.
 on the draggable half-height bar at 390px (and still clears the title and
 buttons at 320px), that a drag starting on the grip resizes the pane, and
 that no grip shows on the full-height sheet or the desk overlay.
+
+`#1584 discuss-grip-left`: the grip stands at the left end of the bar —
+its left edge on the bar's content padding, clear of and left of the
+title, vertically centred in the bar — at 390px and at 320px.
 """
 
 import json
@@ -212,21 +216,33 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
           f"opening Discuss did not give the list its own upper area: {before} -> {geo}")
 
     # `#1556 discuss-drag-grip-mark`: the grip shows where the bar drags and
-    # crowds neither the title nor the buttons.
+    # crowds neither the title nor the buttons. `#1584 discuss-grip-left`:
+    # it stands at the bar's left end, on the content padding, left of the
+    # title, vertically centred in the bar.
     grip = page.evaluate("""() => {
       const g = document.querySelector('.discuss-grip');
+      const head = document.getElementById('discuss-head');
       const t = document.querySelector('.discuss-title').getBoundingClientRect();
       const a = document.getElementById('discuss-actions').getBoundingClientRect();
       const r = g.getBoundingClientRect();
+      const hb = head.getBoundingClientRect();
+      const padLeft = parseFloat(getComputedStyle(head).paddingLeft);
       const over = (b) => Math.max(0, Math.min(r.right, b.right) - Math.max(r.left, b.left)) *
         Math.max(0, Math.min(r.bottom, b.bottom) - Math.max(r.top, b.top));
       return {display: getComputedStyle(g).display, w: r.width, h: r.height,
-              overTitle: over(t), overActions: over(a)};
+              overTitle: over(t), overActions: over(a),
+              leftGap: r.left - (hb.left + padLeft),
+              titleGap: t.left - r.right,
+              centreOff: Math.abs((r.top + r.bottom) / 2 - (hb.top + hb.bottom) / 2)};
     }""")
     check(grip["display"] != "none" and grip["w"] >= 18 and grip["h"] > 0,
           f"the grip is not visible on the draggable docked bar: {grip}")
     check(grip["overTitle"] == 0 and grip["overActions"] == 0,
           f"the grip overlaps the title or the buttons: {grip}")
+    check(abs(grip["leftGap"]) <= 2 and grip["titleGap"] >= 4,
+          f"the grip is not at the bar's left end, clear of the title: {grip}")
+    check(grip["centreOff"] <= 2,
+          f"the grip is not vertically centred in the bar: {grip}")
 
     # `#1552`: drag the "Discuss agent" title bar up: the pane grows, the
     # list shrinks, the choice is kept on the device, and a tap on a bar
@@ -299,13 +315,22 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
       const g = document.querySelector('.discuss-grip').getBoundingClientRect();
       const t = document.querySelector('.discuss-title').getBoundingClientRect();
       const a = document.getElementById('discuss-actions').getBoundingClientRect();
+      const head = document.getElementById('discuss-head');
+      const hb = head.getBoundingClientRect();
+      const padLeft = parseFloat(getComputedStyle(head).paddingLeft);
       const over = (b) => Math.max(0, Math.min(g.right, b.right) - Math.max(g.left, b.left)) *
         Math.max(0, Math.min(g.bottom, b.bottom) - Math.max(g.top, b.top));
-      return {w: g.width, overTitle: over(t), overActions: over(a)};
+      return {w: g.width, overTitle: over(t), overActions: over(a),
+              leftGap: g.left - (hb.left + padLeft),
+              titleGap: t.left - g.right,
+              centreOff: Math.abs((g.top + g.bottom) / 2 - (hb.top + hb.bottom) / 2)};
     }""")
     check(grip320["w"] >= 18 and grip320["overTitle"] == 0
           and grip320["overActions"] == 0,
           f"the grip crowds the bar at 320px: {grip320}")
+    check(abs(grip320["leftGap"]) <= 2 and grip320["titleGap"] >= 4
+          and grip320["centreOff"] <= 2,
+          f"the grip is not at the left end, centred, at 320px: {grip320}")
     page.set_viewport_size({"width": width, "height": height})
     import os
     if os.environ.get("DISCUSS_SHOT_DIR"):
