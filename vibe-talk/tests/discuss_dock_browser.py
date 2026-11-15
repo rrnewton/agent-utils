@@ -16,6 +16,11 @@ that row fully inside the visible list area with the panel still open, the
 full-height sheet and the closed state still work, and the scroller takes
 its full height back on close. On the desk the overlay is unchanged: the
 scroller does not move. Condition waits only — no fixed sleeps.
+
+`#1556 discuss-drag-grip-mark`: the walk also asserts the grip mark shows
+on the draggable half-height bar at 390px (and still clears the title and
+buttons at 320px), that a drag starting on the grip resizes the pane, and
+that no grip shows on the full-height sheet or the desk overlay.
 """
 
 import json
@@ -206,6 +211,23 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     check(geo["areaHeight"] < before,
           f"opening Discuss did not give the list its own upper area: {before} -> {geo}")
 
+    # `#1556 discuss-drag-grip-mark`: the grip shows where the bar drags and
+    # crowds neither the title nor the buttons.
+    grip = page.evaluate("""() => {
+      const g = document.querySelector('.discuss-grip');
+      const t = document.querySelector('.discuss-title').getBoundingClientRect();
+      const a = document.getElementById('discuss-actions').getBoundingClientRect();
+      const r = g.getBoundingClientRect();
+      const over = (b) => Math.max(0, Math.min(r.right, b.right) - Math.max(r.left, b.left)) *
+        Math.max(0, Math.min(r.bottom, b.bottom) - Math.max(r.top, b.top));
+      return {display: getComputedStyle(g).display, w: r.width, h: r.height,
+              overTitle: over(t), overActions: over(a)};
+    }""")
+    check(grip["display"] != "none" and grip["w"] >= 18 and grip["h"] > 0,
+          f"the grip is not visible on the draggable docked bar: {grip}")
+    check(grip["overTitle"] == 0 and grip["overActions"] == 0,
+          f"the grip overlaps the title or the buttons: {grip}")
+
     # `#1552`: drag the "Discuss agent" title bar up: the pane grows, the
     # list shrinks, the choice is kept on the device, and a tap on a bar
     # button is not a drag (the full toggle below still works).
@@ -233,6 +255,23 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
           f"the dragged height was not kept per device: {dragged}")
     check(abs(dragged["areaBottom"] - dragged["panelTop"]) <= 2,
           f"the scroller no longer ends at the dragged pane's top: {dragged}")
+    # `#1556`: a drag that starts on the grip itself resizes too — the grip
+    # is part of the bar's drag target, not a separate tiny hit area.
+    grip_box = page.locator(".discuss-grip").bounding_box()
+    if grip_box is None:
+        raise AssertionError("the grip has no box to drag")
+    gx, gy = grip_box["x"] + grip_box["width"] / 2, grip_box["y"] + grip_box["height"] / 2
+    grip_before = page.evaluate(
+        "() => Number(document.getElementById('discuss-head')"
+        ".getAttribute('aria-valuenow'))")
+    page.mouse.move(gx, gy)
+    page.mouse.down()
+    page.mouse.move(gx, gy + 50, steps=10)
+    page.mouse.up()
+    page.wait_for_function(
+        f"() => Number(document.getElementById('discuss-head')"
+        f".getAttribute('aria-valuenow')) <= {grip_before} - 4",
+        timeout=20_000)
     # Keyboard: the focused bar resizes with the arrows.
     page.locator("#discuss-head").focus()
     page.keyboard.press("ArrowDown")
@@ -250,6 +289,24 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
         f"() => document.getElementById('discuss-head')"
         f".getAttribute('aria-valuenow') === '{kept_now}'",
         timeout=20_000)
+    # `#1556` at 320px: the grip still shows and still clears the ends.
+    page.set_viewport_size({"width": 320, "height": 700})
+    page.wait_for_function(
+        "() => getComputedStyle(document.querySelector('.discuss-grip'))"
+        ".display !== 'none'",
+        timeout=20_000)
+    grip320 = page.evaluate("""() => {
+      const g = document.querySelector('.discuss-grip').getBoundingClientRect();
+      const t = document.querySelector('.discuss-title').getBoundingClientRect();
+      const a = document.getElementById('discuss-actions').getBoundingClientRect();
+      const over = (b) => Math.max(0, Math.min(g.right, b.right) - Math.max(g.left, b.left)) *
+        Math.max(0, Math.min(g.bottom, b.bottom) - Math.max(g.top, b.top));
+      return {w: g.width, overTitle: over(t), overActions: over(a)};
+    }""")
+    check(grip320["w"] >= 18 and grip320["overTitle"] == 0
+          and grip320["overActions"] == 0,
+          f"the grip crowds the bar at 320px: {grip320}")
+    page.set_viewport_size({"width": width, "height": height})
     import os
     if os.environ.get("DISCUSS_SHOT_DIR"):
         page.screenshot(path=f"{os.environ['DISCUSS_SHOT_DIR']}/discuss-drag-phone.png")
@@ -315,6 +372,11 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
         "() => document.getElementById('discuss-panel')"
         ".getBoundingClientRect().height >= innerHeight * 0.75",
         timeout=20_000)
+    # `#1556`: no grip where the bar does not drag (the full-height sheet).
+    page.wait_for_function(
+        "() => getComputedStyle(document.querySelector('.discuss-grip'))"
+        ".display === 'none'",
+        timeout=20_000)
     page.click("#discuss-full-toggle")
     page.wait_for_function(
         "() => document.getElementById('discuss-panel')"
@@ -346,6 +408,10 @@ def walk_desk(page: Page, base: str, width: int, height: int) -> None:
     }""")
     check(after == {**before, "position": "absolute"},
           f"the desk overlay changed: {before} -> {after}")
+    # `#1556`: no grip on the desk overlay, where the bar never resizes.
+    grip_desk = page.evaluate(
+        "() => getComputedStyle(document.querySelector('.discuss-grip')).display")
+    check(grip_desk == "none", f"the grip shows on the desk overlay: {grip_desk}")
     page.click("#discuss-summarize")
     page.wait_for_selector("#discuss-answer a", state="attached", timeout=20_000)
     page.locator("#discuss-answer .discuss-collapse-bar button").first.click()

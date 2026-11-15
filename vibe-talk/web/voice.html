@@ -404,6 +404,13 @@
             <div id="discuss-head" class="discuss-head" role="separator" aria-orientation="horizontal" tabindex="0"
                  aria-label="Discuss pane height" aria-valuemin="20" aria-valuemax="85" aria-valuenow="50">
               <span class="discuss-title">Discuss agent</span>
+              <!-- `#1556 discuss-drag-grip-mark`: the drag affordance on the
+                   bar. Purely presentational (aria-hidden, no handler of its
+                   own): a press on it bubbles to the bar's own #1552 pointer
+                   handler, so the grip is part of the drag target. Its
+                   visibility in 22-discuss.css mirrors exactly where that
+                   drag is live. -->
+              <span class="discuss-grip" aria-hidden="true"></span>
               <div id="discuss-actions" class="discuss-actions">
                 <button id="discuss-dock-toggle" class="discuss-icon-button" type="button" aria-pressed="false" aria-label="Dock panel" title="Dock panel">
                   <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></svg>
