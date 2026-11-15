@@ -1,13 +1,14 @@
 ---
 title: 'short-ref-emoji-render: :thread:NNNN and :email:NNNN draw as emoji and number'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-15T17:22:00.000000000+00:00
-updated_at: 2026-11-15T17:22:00.000000000+00:00
+updated_at: 2026-11-15T18:55:00.000000000+00:00
+closed_at: 2026-11-15T18:55:00.000000000+00:00
 ---
 
 # Description
@@ -62,3 +63,12 @@ screenshots show placeholder boxes where the emoji go; the DOM text the
 walk asserts is the emoji itself, and real devices draw it. Speech still
 says a reference from the written text, as before; only the drawn body
 changed.
+
+## Resolution
+
+Landed ed2bc54e (gate pass on 27c50efc, owner priority). Thread and message
+short references draw as their emoji and number, linked when resolved and
+dotted when not; issue references keep their written form. Unit tests red
+before and green after; browser walk at 390 px and desktop with screenshots
+looked at. Not tested against a live bridge file (the resolution path is
+unchanged from #1565), and speech still reads the written form.
