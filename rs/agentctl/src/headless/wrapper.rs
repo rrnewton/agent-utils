@@ -53,6 +53,7 @@ use fs2::FileExt;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use super::adapter::HarnessAdapter;
 use super::approval::{self, Decision};
 use super::claude::{self, InputState, Signal};
 use super::control;
@@ -110,6 +111,9 @@ pub struct WrapperConfig {
     /// Launch environment entries (`KEY=VALUE`) the harness is spawned with, beyond
     /// `AGENTCTL_AGENT` (#1412 revive-profile-env); empty for most agents.
     pub environment: Vec<String>,
+    /// The harness adapter translating this harness's protocol
+    /// (`#1232 headless-harness-adapters`); Claude unless set otherwise.
+    pub adapter: &'static dyn HarnessAdapter,
 }
 
 impl WrapperConfig {
@@ -128,19 +132,21 @@ impl WrapperConfig {
             max_restarts: 5,
             restart_window: Duration::from_secs(600),
             stop_timeout: Duration::from_secs(60),
-            config_directory: claude::config_directory(),
-            tool_preview_lines: claude::PREVIEW_LINES,
+            config_directory: claude::CLAUDE_HARNESS.config_directory(),
+            tool_preview_lines: claude::CLAUDE_HARNESS.preview_lines(),
             approvals: true,
             approval_timeout: approval::DEFAULT_TIMEOUT,
             approval_cgroup_check: true,
             environment: Vec::new(),
+            adapter: &claude::CLAUDE_HARNESS,
         }
     }
 
     fn transcript(&self) -> Option<PathBuf> {
-        self.config_directory
-            .as_deref()
-            .map(|config| claude::transcript_path(&self.cwd, &self.session, config))
+        self.config_directory.as_deref().map(|config| {
+            self.adapter
+                .transcript_path(&self.cwd, &self.session, config)
+        })
     }
 }
 
@@ -477,13 +483,9 @@ impl Wrapper {
     fn spawn_harness(&mut self, hooks: &dyn Hooks) -> Result<()> {
         let resume = self.config.transcript().is_some_and(|path| path.is_file());
         let mut argv: Vec<String> = self.config.command[1..].to_vec();
-        argv.extend(claude::protocol_arguments());
-        if resume {
-            argv.extend(["--resume".to_owned(), self.config.session.clone()]);
-        } else {
-            argv.extend(["--session-id".to_owned(), self.config.session.clone()]);
-        }
-        argv.extend(claude::effective_arguments(
+        argv.extend(self.config.adapter.launch_arguments(
+            resume,
+            &self.config.session,
             &self.config.arguments,
             self.config.approvals,
         ));
@@ -658,7 +660,7 @@ impl Wrapper {
             let written = document.contains_key("paste_started_at");
             let proven = match (&uuid, &transcript) {
                 (Some(uuid), Some(transcript)) if written => {
-                    claude::transcript_received(transcript, uuid)
+                    self.config.adapter.transcript_received(transcript, uuid)
                 }
                 _ => false,
             };
@@ -824,7 +826,11 @@ impl Wrapper {
         };
         // A fresh ID per attempt: a returned or reused queue ID never matches an older input in
         // the transcript, which recovery reads as proof.
-        let uuid = claude::random_uuid().map_err(|error| io_fail("make an input ID", error))?;
+        let uuid = self
+            .config
+            .adapter
+            .new_input_id()
+            .map_err(|error| io_fail("make an input ID", error))?;
         let attempts = queue::delivery_attempts(&document, path).unwrap_or(0);
         document.insert("possibly_submitted".to_owned(), json!(true));
         document.insert("delivery_state".to_owned(), json!("inflight"));
@@ -845,7 +851,10 @@ impl Wrapper {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let line = claude::input_line(&uuid, &text, &self.config.session);
+        let line = self
+            .config
+            .adapter
+            .input_line(&uuid, &text, &self.config.session);
         let wrote = self
             .harness
             .as_ref()
@@ -880,7 +889,11 @@ impl Wrapper {
     /// the usual per-item rules, never retyping the combined text.
     fn deliver_batch(&mut self, group: Vec<(PathBuf, Map<String, Value>)>) -> Result<bool> {
         let lock = lock_delivery(&self.queue_root, self.queue_identity, &Blocking)?;
-        let uuid = claude::random_uuid().map_err(|error| io_fail("make an input ID", error))?;
+        let uuid = self
+            .config
+            .adapter
+            .new_input_id()
+            .map_err(|error| io_fail("make an input ID", error))?;
         let mut members: Vec<BatchMember> = Vec::new();
         let mut claims: Vec<agent_queue::fsio::HeldLock> = Vec::new();
         for (path, mut document) in group {
@@ -952,7 +965,10 @@ impl Wrapper {
                 .unwrap_or_default()
                 .to_owned();
             drop(lock);
-            let line = claude::input_line(&uuid, &text, &self.config.session);
+            let line = self
+                .config
+                .adapter
+                .input_line(&uuid, &text, &self.config.session);
             let _ = self
                 .harness
                 .as_ref()
@@ -978,7 +994,10 @@ impl Wrapper {
                 .collect::<Vec<_>>(),
         );
         drop(lock);
-        let line = claude::input_line(&uuid, &combined, &self.config.session);
+        let line = self
+            .config
+            .adapter
+            .input_line(&uuid, &combined, &self.config.session);
         let wrote = self
             .harness
             .as_ref()
@@ -1211,7 +1230,7 @@ impl Wrapper {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Ok(());
         };
-        for signal in claude::parse(&value) {
+        for signal in self.config.adapter.parse(&value) {
             let causation = self.turn_causation.clone();
             let causation = causation.as_deref();
             match signal {
@@ -1327,7 +1346,7 @@ impl Wrapper {
                                 .and_then(|file| reply::read_file(file, &self.config.cwd))
                                 .map(|text| {
                                     text.lines()
-                                        .map(claude::mask_secrets)
+                                        .map(|line| self.config.adapter.mask_secrets(line))
                                         .collect::<Vec<_>>()
                                         .join("\n")
                                 })
@@ -1418,7 +1437,7 @@ impl Wrapper {
                     subtype,
                 } => {
                     let error = format!("the headless wrapper does not serve {subtype:?} requests");
-                    self.write_harness(claude::control_error_line(&request_id, &error));
+                    self.write_harness(self.config.adapter.control_error_line(&request_id, &error));
                     self.emit(
                         "error",
                         causation,
@@ -1510,7 +1529,7 @@ impl Wrapper {
                     Some(input) => {
                         self.next_request += 1;
                         let request_id = format!("agentctl-interrupt-{}", self.next_request);
-                        let line = claude::interrupt_line(&request_id);
+                        let line = self.config.adapter.interrupt_line(&request_id);
                         match input.send(line.into_bytes()) {
                             Ok(()) => {
                                 // Only a running turn can end interrupted.
@@ -1587,10 +1606,14 @@ impl Wrapper {
     /// Hold a permission prompt for the owner's answer and log it.
     fn permission_request(&mut self, request: claude::PermissionRequest) -> Result<()> {
         let causation = self.turn_causation.clone();
-        if !claude::asks_wrapper(&self.config.arguments, self.config.approvals) {
+        if !self
+            .config
+            .adapter
+            .asks_wrapper(&self.config.arguments, self.config.approvals)
+        {
             // Not asked for; answer at once, as `--permission-prompts none` would.
             let message = "This headless session takes no approvals, so the call was denied.";
-            self.write_harness(claude::permission_answer_line(
+            self.write_harness(self.config.adapter.permission_answer_line(
                 &request.request_id,
                 false,
                 &Value::Null,
@@ -1670,7 +1693,7 @@ impl Wrapper {
         };
         if decision != "cancelled" {
             let allow = decision == "approved";
-            let line = claude::permission_answer_line(
+            let line = self.config.adapter.permission_answer_line(
                 &pending.request_id,
                 allow,
                 &pending.input,
@@ -1913,7 +1936,12 @@ impl Wrapper {
         }
         let reason = body["reason"]
             .as_str()
-            .map(|reason| events::excerpt(&claude::denial_text(reason), ANSWER_REASON_BYTES))
+            .map(|reason| {
+                events::excerpt(
+                    &self.config.adapter.denial_text(reason),
+                    ANSWER_REASON_BYTES,
+                )
+            })
             .filter(|reason| !reason.trim().is_empty());
         let decided = match decision {
             Decision::Approve => "approved",
@@ -2703,7 +2731,7 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
             "cwd": wrapper.config.cwd,
             "settings_sha256": settings_digest,
             "pruned_generations": wrapper.writer.pruned(),
-            "approvals": claude::asks_wrapper(&wrapper.config.arguments, wrapper.config.approvals),
+            "approvals": wrapper.config.adapter.asks_wrapper(&wrapper.config.arguments, wrapper.config.approvals),
             "approval_timeout_s": wrapper.config.approval_timeout.as_secs(),
         }),
     )?;

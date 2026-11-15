@@ -10,6 +10,7 @@
 //! - [`control`]: the wrapper's control socket (wake, status, interrupt, stop, approval).
 //! - [`approval`]: permission prompts held for the owner's answer (`#671
 //!   headless-approval-surface`).
+//! - [`adapter`]: the harness-adapter seam every headless harness implements (`#1232`).
 //! - [`claude`]: Claude Code's stream-json protocol, translated.
 //! - [`wrapper`]: the Claude Code wrapper, the queue's only drainer (M2).
 //!
@@ -24,6 +25,7 @@
 //! <registry>/agents/<agent>/headless.lock   held by the running wrapper
 //! ```
 
+pub mod adapter;
 pub mod approval;
 pub mod claude;
 pub mod control;
@@ -39,22 +41,28 @@ pub const ADAPTER: &str = "harness-wrapper";
 /// The `mode` value of a headless agent's record.
 pub const MODE: &str = "headless";
 /// Harnesses this build can run headless.
-pub const HARNESSES: &[&str] = &["claude"];
+#[must_use]
+pub fn harnesses() -> Vec<&'static str> {
+    adapter::harness_names()
+}
 
 /// What `agentctl capabilities` reports about headless support in this build.
 #[must_use]
 pub fn capabilities() -> serde_json::Value {
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "adapter": ADAPTER,
-        "harnesses": HARNESSES,
+        "harnesses": harnesses(),
         "event_log": format!("v{}", events::VERSION),
         "commands": ["start --mode headless", "run-headless", "tail", "interrupt", "compact",
                      "send", "drain", "status", "stop", "install-units --headless", "takeover", "handback", "turnover",
                      "approvals", "approve", "deny"],
         "approvals": {"default_timeout_s": approval::DEFAULT_TIMEOUT.as_secs(),
                       "answers": ["chat: approve|deny ID", "console: agentctl approve|deny NAME ID"]},
-        "claude": claude::capabilities(),
-    })
+    });
+    for harness in adapter::adapters() {
+        document[harness.name()] = harness.capabilities();
+    }
+    document
 }
 
 #[cfg(test)]

@@ -922,6 +922,107 @@ pub fn real_binary_of_launcher(given: &Path) -> Option<PathBuf> {
         .filter(|path| path.as_path() != given)
 }
 
+/// Claude Code as a [`super::adapter::HarnessAdapter`]: every method
+/// delegates to this module's existing translation, unchanged.
+#[derive(Debug)]
+pub struct ClaudeHarness;
+
+/// The one Claude adapter instance the registry hands out.
+pub static CLAUDE_HARNESS: ClaudeHarness = ClaudeHarness;
+
+impl super::adapter::HarnessAdapter for ClaudeHarness {
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+
+    fn capabilities(&self) -> Value {
+        capabilities()
+    }
+
+    fn launch_arguments(
+        &self,
+        resume: bool,
+        session: &str,
+        arguments: &[String],
+        approvals: bool,
+    ) -> Vec<String> {
+        let mut argv = protocol_arguments();
+        if resume {
+            argv.extend(["--resume".to_owned(), session.to_owned()]);
+        } else {
+            argv.extend(["--session-id".to_owned(), session.to_owned()]);
+        }
+        argv.extend(effective_arguments(arguments, approvals));
+        argv
+    }
+
+    fn new_input_id(&self) -> std::io::Result<String> {
+        random_uuid()
+    }
+
+    fn input_line(&self, uuid: &str, text: &str, session: &str) -> String {
+        input_line(uuid, text, session)
+    }
+
+    fn parse(&self, line: &Value) -> Vec<Signal> {
+        parse(line)
+    }
+
+    fn interrupt_line(&self, request_id: &str) -> String {
+        interrupt_line(request_id)
+    }
+
+    fn control_error_line(&self, request_id: &str, error: &str) -> String {
+        control_error_line(request_id, error)
+    }
+
+    fn permission_answer_line(
+        &self,
+        request_id: &str,
+        allow: bool,
+        input: &Value,
+        message: &str,
+    ) -> String {
+        permission_answer_line(request_id, allow, input, message)
+    }
+
+    fn asks_wrapper(&self, arguments: &[String], approvals: bool) -> bool {
+        asks_wrapper(arguments, approvals)
+    }
+
+    fn mask_secrets(&self, text: &str) -> String {
+        mask_secrets(text)
+    }
+
+    fn denial_text(&self, text: &str) -> String {
+        denial_text(text)
+    }
+
+    fn config_directory(&self) -> Option<PathBuf> {
+        config_directory()
+    }
+
+    fn transcript_path(&self, cwd: &Path, session: &str, config: &Path) -> PathBuf {
+        transcript_path(cwd, session, config)
+    }
+
+    fn transcript_received(&self, transcript: &Path, uuid: &str) -> bool {
+        transcript_received(transcript, uuid)
+    }
+
+    fn preview_lines(&self) -> usize {
+        PREVIEW_LINES
+    }
+
+    fn valid_session_id(&self, session: &str) -> bool {
+        is_uuid(session)
+    }
+
+    fn validate_arguments(&self, arguments: &[String]) -> Result<(), String> {
+        validate_arguments(arguments)
+    }
+}
+
 /// The wrapper's declared contract, printed by `agentctl capabilities`.
 #[must_use]
 pub fn capabilities() -> Value {

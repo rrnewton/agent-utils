@@ -71,9 +71,15 @@ impl AgentRecord {
         self.extra
             .get("headless")
             .filter(|spec| spec["schema"] == SPEC_SCHEMA)
-            .and_then(|spec| spec["session"].as_str())
-            .filter(|session| claude::is_uuid(session))
-            .map(str::to_owned)
+            .and_then(|spec| {
+                let session = spec["session"].as_str()?;
+                let harness = spec["harness"].as_str().unwrap_or("claude");
+                let valid = hl::adapter::adapter_for(harness).map_or_else(
+                    || claude::is_uuid(session),
+                    |adapter| adapter.valid_session_id(session),
+                );
+                valid.then(|| session.to_owned())
+            })
             .ok_or_else(|| {
                 fail(format!(
                     "headless agent {:?} has no valid session in its record",
@@ -278,17 +284,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if let Some(purpose) = options.purpose.as_deref() {
             super::control::validated_purpose(purpose)?;
         }
-        if !hl::HARNESSES.contains(&options.harness.as_str()) {
+        let Some(adapter) = hl::adapter::adapter_for(&options.harness) else {
             return Err(fail(format!(
                 "headless mode runs {} in this build, not {:?}",
-                hl::HARNESSES.join(", "),
+                hl::harnesses().join(", "),
                 options.harness
             )));
-        }
+        };
         if let Some(effort) = options.reasoning_effort.as_deref() {
             crate::profiles::validate_effort(&options.harness, effort)?;
         }
-        claude::validate_arguments(&options.arguments).map_err(fail)?;
+        adapter
+            .validate_arguments(&options.arguments)
+            .map_err(fail)?;
         let cwd = fs::canonicalize(cwd)
             .map_err(|error| fail(format!("working directory {}: {error}", cwd.display())))?;
         {
@@ -303,13 +311,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             )?;
         }
         let session = match options.session {
-            Some(session) if claude::is_uuid(&session) => session.to_ascii_lowercase(),
+            Some(session) if adapter.valid_session_id(&session) => session.to_ascii_lowercase(),
             Some(session) => {
                 return Err(fail(format!(
                     "--resume for a headless Claude agent takes a session UUID, not {session:?}"
                 )))
             }
-            None => claude::random_uuid()
+            None => adapter
+                .new_input_id()
                 .map_err(|error| fail(format!("make a session ID: {error}")))?,
         };
         let mut arguments = Vec::new();
@@ -519,8 +528,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         approvals: Option<HeadlessApprovals>,
         terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<i32> {
-        if effort.is_none() && self.load(agent_name)?.reasoning_effort.is_none() {
-            let levels = crate::profiles::effort_levels("claude")
+        let declared = self.load(agent_name)?;
+        if effort.is_none() && declared.reasoning_effort.is_none() {
+            let levels = crate::profiles::effort_levels(&declared.harness)
                 .map(|levels| levels.join(", "))
                 .unwrap_or_default();
             return Err(fail(format!(
@@ -596,6 +606,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let directory = self.directory(agent_name)?;
         let mut config =
             wrapper::WrapperConfig::new(agent_name, &directory, Path::new(&record.cwd), &session);
+        if let Some(adapter) = hl::adapter::adapter_for(&record.harness) {
+            config.adapter = adapter;
+            config.config_directory = adapter.config_directory();
+        }
         if let Some(bin) = claude_bin {
             // Spawn the launcher as given (#1221 follow-up): canonicalising
             // a symlink to the launcher script is fine, but never resolve
