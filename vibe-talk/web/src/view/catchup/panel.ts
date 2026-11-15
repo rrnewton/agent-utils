@@ -239,6 +239,15 @@ export interface DiscussPanel {
   mode(): DiscussLayoutMode;
   /** `#1354`. Stand the panel in `mode` and keep the choice on the device. */
   setMode(mode: DiscussLayoutMode): void;
+  /**
+   * `#1586 discuss-full-drops-to-half-on-link`. Leave full screen so a
+   * linked message can land in the list: a full phone sheet stands at
+   * half (its kept docked height untouched), a maximized desk panel
+   * returns to the mode it was maximized from. Kept on the device like
+   * the full-screen toggle keeps it, so the maximize button stands it
+   * full again. A no-op at partial or closed.
+   */
+  dropToPartialForLink(): void;
   /** `#1388` landing 1. Restate the strike from the read set now (a mark landed elsewhere). */
   refreshStrikes(): void;
   /**
@@ -970,6 +979,20 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     return layoutMode;
   }
 
+  /**
+   * `#1586`. The one exit from full screen for a message link, shared by
+   * every staying jump: the sheet half stands in the #1526 docked row at
+   * the height already on the pane (`--discuss-docked-height`, #1552),
+   * and a maximized panel exits as its full-screen button exits
+   * (`beforeFull`). Runs synchronously on the tap, before the jump, so
+   * the landing's scroll-into-view is measured at the partial height.
+   */
+  function dropToPartialForLink(): void {
+    if (!isOpen()) return;
+    if (sheetFull) applySheet(false, true);
+    if (layoutMode === "maximized") applyMode(beforeFull, true);
+  }
+
   /** Restate the kept layout on the panel: the stored choices, else the defaults. */
   function applyStoredLayout(): void {
     let storedWidth: number | undefined;
@@ -1143,7 +1166,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
               thread: ref.thread,
             };
             if (deps.onLinkTap) deps.onLinkTap(linkRef, params.get("scope") === "out");
-            else deps.onJump(linkRef);
+            else {
+              dropToPartialForLink();
+              deps.onJump(linkRef);
+            }
           }
         }
         return;
@@ -1348,6 +1374,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       button.className = "discuss-link";
       button.textContent = link.label.split(" · ")[0] ?? link.label;
       listening.listen(button, "click", () => {
+        dropToPartialForLink();
         deps.onJump({
           service: deps.serviceName(scope.channelId),
           channel: scope.channelId,
@@ -1849,6 +1876,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     setMode(mode: DiscussLayoutMode) {
       applyMode(mode, true);
     },
+    dropToPartialForLink,
     refreshStrikes() {
       restrike();
     },

@@ -1704,3 +1704,105 @@ test("catchup update: the banner's Update is one delta call; new parts green unt
     assert.equal(hasWord(li, STRUCK_BULLET_CLASS), true, "a read fresh bullet was not struck");
   } finally { fx.restore(); }
 });
+
+// ---- 11. full-screen drops to partial on a message link (`#1586`) ------------------------------
+
+test("discussdrop: a citation tap in the full sheet drops to half at the kept height", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    view.setDockedHeight(65);
+    view.setSheetFull(true);
+    assert.equal(view.sheetFull(), true);
+    tapCitation(fx, "/?c=chan-1&v=all&m=discord%3Achan-1%3Am1");
+    assert.equal(fx.calls.jumps.length, 1, "the citation did not jump");
+    assert.equal(view.isOpen(), true, "the drop closed the panel");
+    assert.equal(view.sheetFull(), false, "the full sheet did not drop to half");
+    assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "half");
+    assert.equal(view.dockedHeight(), 65, "the drop forgot the dragged height");
+    assert.equal(fx.kept.sheetKeeps.at(-1), false, "the partial choice was not kept");
+    // The maximize button's own act stands it full again.
+    view.setSheetFull(true);
+    assert.equal(view.sheetFull(), true, "maximize did not restore full screen");
+  } finally { fx.restore(); }
+});
+
+test("discussdrop: a footer time in the full sheet drops to half and jumps", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    view.setSheetFull(true);
+    const first = fx.els["discuss-links"].children[0].children[0];
+    click(first);
+    assert.deepEqual(fx.calls.jumps, [{ service: "discord", channel: "chan-1", message: "m1", thread: null }]);
+    assert.equal(view.sheetFull(), false, "the footer jump left the sheet full");
+    assert.equal(view.isOpen(), true, "the footer jump closed the panel");
+  } finally { fx.restore(); }
+});
+
+test("discussdrop: maximized drops to the mode it came from; full screen restores it", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    view.setMode("docked");
+    click(fx.els["discuss-full-toggle"]);
+    assert.equal(view.mode(), "maximized", "the full toggle did not maximize");
+    tapCitation(fx, "/?c=chan-1&v=all&m=discord%3Achan-1%3Am1");
+    assert.equal(fx.calls.jumps.length, 1, "the citation did not jump");
+    assert.equal(view.mode(), "docked", "maximized did not drop to its partial mode");
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "docked");
+    assert.equal(view.isOpen(), true, "the drop closed the panel");
+    click(fx.els["discuss-full-toggle"]);
+    assert.equal(view.mode(), "maximized", "the full-screen button did not maximize again");
+  } finally { fx.restore(); }
+});
+
+test("discussdrop: a return-to-bound tap drops; a tap at partial keeps nothing new", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    // At half/overlay a staying tap jumps without touching the kept layout.
+    const sheetKeeps = fx.kept.sheetKeeps.length;
+    const modeKeeps = fx.kept.modeKeeps.length;
+    tapCitation(fx, "/?c=chan-1&v=all&m=discord%3Achan-1%3Am1");
+    assert.equal(fx.kept.sheetKeeps.length, sheetKeeps, "a partial tap kept a sheet choice");
+    assert.equal(fx.kept.modeKeeps.length, modeKeeps, "a partial tap kept a mode choice");
+    // Narrowed under the global binding and full: returning to the bound drops.
+    fx.setSelection(THREAD_T1);
+    view.sync();
+    view.setSheetFull(true);
+    tapCitation(fx, "/?c=chan-1&v=all&m=discord%3Achan-1%3Am8");
+    assert.equal(fx.calls.bound.length, 1, "the tap did not return to the bound view");
+    assert.equal(view.sheetFull(), false, "the return-to-bound tap left the sheet full");
+    assert.equal(view.isOpen(), true, "the return-to-bound tap closed the panel");
+  } finally { fx.restore(); }
+});
+
+test("discussdrop: a fallback tap while full still closes and keeps no partial choice", async () => {
+  const fx = fixture({ selection: THREAD_T1 });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    view.setSheetFull(true);
+    const sheetKeeps = fx.kept.sheetKeeps.length;
+    tapCitation(fx, "/?c=chan-1&v=thread&t=t2&m=discord%3Achan-1%3Am9%3At2");
+    assert.equal(view.isOpen(), false, "the fallback tap left the panel open");
+    assert.equal(fx.calls.jumps.length, 1, "the fallback tap did not jump");
+    assert.equal(view.sheetFull(), true, "the closing tap dropped the sheet first");
+    assert.equal(fx.kept.sheetKeeps.length, sheetKeeps, "the closing tap kept a partial choice");
+  } finally { fx.restore(); }
+});

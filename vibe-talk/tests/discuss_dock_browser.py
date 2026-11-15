@@ -25,6 +25,11 @@ that no grip shows on the full-height sheet or the desk overlay.
 `#1584 discuss-grip-left`: the grip stands at the left end of the bar —
 its left edge on the bar's content padding, clear of and left of the
 title, vertically centred in the bar — at 390px and at 320px.
+
+`#1586 discuss-full-drops-to-half-on-link`: from the full-height sheet
+(phone) and from maximized (desk), a citation tap drops Discuss back to
+partial at the kept height/mode with the target row landed in the
+visible list, and the maximize button stands it full again.
 """
 
 import json
@@ -407,6 +412,47 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
         "() => document.getElementById('discuss-panel')"
         ".getBoundingClientRect().height <= innerHeight * 0.6",
         timeout=20_000)
+
+    # `#1586 discuss-full-drops-to-half-on-link`: from full screen, a
+    # citation tap drops Discuss back to half at the kept height (50 after
+    # the double-click above) so the row lands in the visible list, and
+    # the maximize button stands it full again.
+    page.click("#discuss-full-toggle")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-panel')"
+        ".dataset.sheet === 'full'",
+        timeout=20_000)
+    page.click("#discuss-answer a")
+    page.wait_for_function("""() => {
+      const panel = document.getElementById('discuss-panel');
+      if (panel.dataset.sheet !== 'half') return false;
+      const area = document.getElementById('scroll-area');
+      const row = area.querySelector('[data-linked]');
+      if (!row) return false;
+      const r = row.getBoundingClientRect();
+      const box = area.getBoundingClientRect();
+      return r.top >= box.top - 1.5 && r.bottom <= box.bottom + 1.5
+        && r.height > 0;
+    }""", timeout=20_000)
+    kept_after_drop = page.evaluate("""() => ({
+      now: document.getElementById('discuss-head').getAttribute('aria-valuenow'),
+      kept: localStorage.getItem('vibe-talk.voice.discuss-docked-height'),
+    })""")
+    check(kept_after_drop == {"now": "50", "kept": "50"},
+          f"the drop did not stand at the kept height: {kept_after_drop}")
+    import os
+    if os.environ.get("DISCUSS_SHOT_DIR"):
+        page.screenshot(path=f"{os.environ['DISCUSS_SHOT_DIR']}/discuss-drop-phone.png")
+    page.click("#discuss-full-toggle")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-panel')"
+        ".getBoundingClientRect().height >= innerHeight * 0.75",
+        timeout=20_000)
+    page.click("#discuss-full-toggle")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-panel')"
+        ".getBoundingClientRect().height <= innerHeight * 0.6",
+        timeout=20_000)
     page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
     page.wait_for_function(
@@ -459,6 +505,36 @@ def walk_desk(page: Page, base: str, width: int, height: int) -> None:
     import os
     if os.environ.get("DISCUSS_SHOT_DIR"):
         page.screenshot(path=f"{os.environ['DISCUSS_SHOT_DIR']}/discuss-drag-desktop.png")
+
+    # `#1586` on the desk: maximized covers the list, so a citation tap
+    # drops back to the mode it was maximized from (overlay here) with
+    # the panel open and the row landed; full screen maximizes again.
+    page.click("#discuss-full-toggle")
+    page.wait_for_function(
+        "() => document.getElementById('screen-main')"
+        ".getAttribute('data-discuss') === 'maximized'",
+        timeout=20_000)
+    page.click("#discuss-answer a")
+    page.wait_for_function(
+        "() => document.getElementById('screen-main')"
+        ".getAttribute('data-discuss') === null"
+        " && document.getElementById('discuss-panel')"
+        ".getAttribute('data-mode') === 'overlay'"
+        " && document.querySelector('#scroll-area [data-linked]') !== null",
+        timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    if os.environ.get("DISCUSS_SHOT_DIR"):
+        page.screenshot(path=f"{os.environ['DISCUSS_SHOT_DIR']}/discuss-drop-desktop.png")
+    page.click("#discuss-full-toggle")
+    page.wait_for_function(
+        "() => document.getElementById('screen-main')"
+        ".getAttribute('data-discuss') === 'maximized'",
+        timeout=20_000)
+    page.click("#discuss-full-toggle")
+    page.wait_for_function(
+        "() => document.getElementById('screen-main')"
+        ".getAttribute('data-discuss') === null",
+        timeout=20_000)
     page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
 

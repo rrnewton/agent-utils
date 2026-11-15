@@ -196,6 +196,8 @@ export interface DiscussView {
   mode(): "overlay" | "docked" | "maximized";
   /** `#1354`. Stand the panel in `mode` and keep the choice on the device. */
   setMode(mode: "overlay" | "docked" | "maximized"): void;
+  /** `#1586`. Leave full screen so a linked message can land in the list. */
+  dropToPartialForLink(): void;
   /** `#1388` landing 1. Restate the summary's strike from the read set now. */
   refreshStrikes(): void;
   /** `#1531 discuss-top-bar-slim-fixed`. Read the summary on screen aloud whole; false with none. */
@@ -321,6 +323,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     try {
       current = normalizeDiscussScope(scopeNow());
     } catch {
+      panel.dropToPartialForLink();
       deps.onJump(ref);
       return;
     }
@@ -332,8 +335,11 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       outOfScope,
     });
     if (decision.action === "jump-in-place") {
+      // `#1586`: out of full screen first, so the jump lands visibly.
+      panel.dropToPartialForLink();
       deps.onJump(ref);
     } else if (decision.action === "return-to-bound" && boundRaw !== null) {
+      panel.dropToPartialForLink();
       if (deps.navigateToBound) deps.navigateToBound(boundRaw, ref);
       else deps.onJump(ref);
     } else {
@@ -539,6 +545,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     setSheetFull: (full: boolean) => panel.setSheetFull(full),
     mode: () => panel.mode(),
     setMode: (mode: "overlay" | "docked" | "maximized") => panel.setMode(mode),
+    dropToPartialForLink: () => panel.dropToPartialForLink(),
     refreshStrikes: () => panel.refreshStrikes(),
     readSummary: () => panel.readSummary(),
   };
