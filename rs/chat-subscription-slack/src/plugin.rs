@@ -131,10 +131,15 @@
 //! full. Each rate-limited listing is logged with its method and channel, and the budget
 //! records the causing method with the hold. The poll also
 //! stops for the minute once half the per-minute budget is used, so a burst cannot starve
-//! the owner-channel general rescan. At the fastest
-//! setting (5 s) one relay channel costs at most 12 history listings a minute plus one
-//! listing per active relay thread — against the shared default of 20 calls a minute, so
-//! several bridges polling one channel want `rescan_calls_per_minute` raised or a slower poll.
+//! the owner-channel general rescan. The effective interval is floored at
+//! [`MIN_RELAY_POLL_SECONDS`] seconds whatever was configured (a faster setting is
+//! accepted and clamped, and the clamp is logged), and one poll lists at most
+//! [`MAX_RELAY_THREADS_PER_POLL`] threads, the rest staying due for the next poll
+//! (#1682 slack-rate-limit-budget: the 15 s poll was the bridge's largest listing
+//! spender, duplicating reads of channels another reader also lists). At the floor
+//! one relay channel costs at most 2 history listings a minute plus the capped
+//! thread listings — against the shared default of 20 calls a minute, so several
+//! bridges polling one channel still share one budget.
 //!
 //! A rescued batch's cursor is the cursor before it with `;rescued:<channel>/<ts>` appended, so a
 //! subscription resumed from it resumes the stream where the cursor before it did. Which messages
@@ -962,12 +967,20 @@ fn open_rescan(
             ledger.path().display()
         )),
     }
-    if let Some(interval) = config.relay_poll {
+    // `#1682 slack-rate-limit-budget`: the effective poll never runs faster
+    // than the floor; a faster setting is clamped, never refused.
+    let relay_interval = config
+        .relay_poll
+        .map(|interval| interval.max(Duration::from_secs(MIN_RELAY_POLL_SECONDS)));
+    if let Some(interval) = relay_interval {
         let channels: Vec<&String> = config.relay_peers.keys().collect();
+        let clamped = config
+            .relay_poll
+            .is_some_and(|configured| configured < interval);
         diagnostics.log(&format!(
             "relay poll: every {} s over {} relay channel(s) [{}], no settle wait, no grace; \
-             one history listing per relay channel per poll plus thread listings for threads \
-             with new replies (about {} history calls a minute per channel)",
+             one history listing per relay channel per poll plus at most {} thread listings \
+             (about {} history calls a minute per channel){}",
             interval.as_secs(),
             channels.len(),
             channels
@@ -975,7 +988,13 @@ fn open_rescan(
                 .map(|c| c.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
-            60 / interval.as_secs().max(1)
+            MAX_RELAY_THREADS_PER_POLL,
+            60 / interval.as_secs().max(1),
+            if clamped {
+                " (configured faster; floored)"
+            } else {
+                ""
+            }
         ));
     }
     Some(Rescan {
@@ -998,7 +1017,7 @@ fn open_rescan(
         replay,
         noted: BTreeSet::new(),
         truncation_noted: false,
-        relay_interval: config.relay_poll,
+        relay_interval,
         relay_next_due_millis: now_millis,
         relay_failures: 0,
     })
@@ -1052,6 +1071,13 @@ struct Rescan {
 /// Thread listings one relay poll may still make during a budget hold
 /// (#805 relay-poll-receipts-during-hold).
 const MAX_HOLD_THREAD_LISTINGS: usize = 3;
+/// The fastest effective relay poll, whatever `relay_poll_seconds` says
+/// (#1682 slack-rate-limit-budget). A faster setting is accepted and
+/// clamped to this, and the clamp is logged at startup.
+pub const MIN_RELAY_POLL_SECONDS: u64 = 30;
+/// Thread listings one relay poll makes (#1682 slack-rate-limit-budget);
+/// threads past the cap stay due for the next poll.
+const MAX_RELAY_THREADS_PER_POLL: usize = 3;
 const MAX_NOTED: usize = 1_024;
 const MAX_TRACKED_THREADS: usize = 1_024;
 /// Carried replies remembered per thread.
@@ -1746,7 +1772,9 @@ impl SlackDriver {
             }
             due_threads.sort_by(|a, b| b.cmp(a));
             due_threads.dedup_by(|a, b| a.1 == b.1);
-            due_threads.truncate(rescan::MAX_THREADS_PER_PASS);
+            // `#1682 slack-rate-limit-budget`: threads past the cap stay due
+            // (their watermark has not moved) for the next poll.
+            due_threads.truncate(MAX_RELAY_THREADS_PER_POLL);
             for (latest, root) in due_threads {
                 let key = message_key(channel, &root);
                 let through = rescan.threads.get(&key).copied().unwrap_or(0);

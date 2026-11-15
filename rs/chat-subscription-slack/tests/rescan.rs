@@ -1472,6 +1472,78 @@ fn relay_poll_stops_at_half_the_shared_budget() {
     fs::remove_dir_all(&directory).unwrap();
 }
 
+clock!(relay_floor_clock, RELAY_FLOOR_NOW);
+clock!(relay_cap_clock, RELAY_CAP_NOW);
+
+#[test]
+fn relay_poll_faster_than_the_floor_is_clamped_and_logged() {
+    // #1682 slack-rate-limit-budget: relay_extra asks for 5 s; the effective
+    // poll is floored at 30 s, and the startup log says so.
+    let directory = scratch("relay-floor");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 10]);
+    let mut backend = backend(&fake, relay_floor_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, relay_extra())).unwrap();
+    commit_next(&mut subscription);
+    let logged = log(&directory);
+    assert!(
+        logged.contains("relay poll: every 30 s") && logged.contains("floored"),
+        "{logged}"
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn relay_poll_lists_at_most_three_threads_and_keeps_the_rest_due() {
+    // #1682 slack-rate-limit-budget: one poll lists at most three due
+    // threads; the rest stay due and are listed by the next poll.
+    let directory = scratch("relay-cap");
+    let fake = FakeTransport::new();
+    fake.push_script(vec![FakeStep::Idle; 14]);
+    for i in 0..5_u64 {
+        let root = ts(T0 + 10_000 + i * 2_000);
+        let reply = ts(T0 + 11_000 + i * 2_000);
+        fake.push_history(bot_message(&root, None, RELAY_PEER, "relay envelope"));
+        fake.push_history(bot_message(&reply, Some(&root), RELAY_PEER, "first reply"));
+    }
+    let mut backend = backend(&fake, relay_cap_clock);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &relay_request(&directory, relay_extra())).unwrap();
+    commit_next(&mut subscription);
+    RELAY_CAP_NOW.store(T0 + 12_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let first_threads: std::collections::BTreeSet<String> = fake
+        .state()
+        .scans
+        .iter()
+        .filter_map(|scan| scan.1.clone())
+        .collect();
+    assert_eq!(
+        first_threads.len(),
+        3,
+        "first poll thread listings: {:?}",
+        fake.state().scans
+    );
+    RELAY_CAP_NOW.store(T0 + 60_000, Ordering::SeqCst);
+    drain_batches(&mut subscription);
+    let all_threads: std::collections::BTreeSet<String> = fake
+        .state()
+        .scans
+        .iter()
+        .filter_map(|scan| scan.1.clone())
+        .collect();
+    assert_eq!(
+        all_threads.len(),
+        5,
+        "every due thread listed across two polls: {:?}",
+        fake.state().scans
+    );
+    subscription.close().unwrap();
+    fs::remove_dir_all(&directory).unwrap();
+}
+
 // --- #805 relay-poll-receipts-during-hold ---
 
 clock!(relay_hold_clock, RELAY_HOLD_NOW);
@@ -1530,7 +1602,8 @@ fn relay_poll_during_budget_hold_reads_receipt_on_tracked_thread() {
         RELAY_PEER,
         "receipt: delivered",
     ));
-    RELAY_HOLD_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    // Past the floored 30 s poll interval (#1682), still inside the hold.
+    RELAY_HOLD_NOW.store(T0 + 48_000, Ordering::SeqCst);
     let batch = next_batch_long(&mut subscription).expect("receipt read during the hold");
     let message = single_message(&batch);
     assert!(message.is_thread_reply());
@@ -1590,7 +1663,7 @@ fn relay_poll_during_budget_hold_lists_at_most_three_threads() {
             "receipt: delivered",
         ));
     }
-    RELAY_HOLD_BOUND_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    RELAY_HOLD_BOUND_NOW.store(T0 + 48_000, Ordering::SeqCst);
     drain_batches(&mut subscription);
     let hold_scans = &fake.state().scans[tracked..];
     let thread_listings = hold_scans.iter().filter(|scan| scan.1.is_some()).count();
@@ -1636,7 +1709,7 @@ fn relay_poll_during_replies_caused_hold_lists_no_threads() {
         RELAY_PEER,
         "receipt: delivered",
     ));
-    RELAY_HOLD_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    RELAY_HOLD_NOW.store(T0 + 48_000, Ordering::SeqCst);
     assert!(
         next_batch_within(&mut subscription, 3).is_none(),
         "no receipt is read during a replies-caused hold"
@@ -1716,7 +1789,7 @@ fn relay_poll_during_hold_reads_receipt_on_fresh_post_with_no_earlier_reply() {
         RELAY_PEER,
         "receipt: delivered",
     ));
-    RELAY_HOLD_FRESH_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    RELAY_HOLD_FRESH_NOW.store(T0 + 48_000, Ordering::SeqCst);
     let batch = next_batch_long(&mut subscription).expect("receipt on a fresh post read in hold");
     assert_eq!(
         single_message(&batch).message_id().as_str(),
@@ -1750,7 +1823,7 @@ fn relay_poll_during_unknown_cause_hold_lists_no_threads() {
         RELAY_PEER,
         "receipt: delivered",
     ));
-    RELAY_HOLD_UNKNOWN_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    RELAY_HOLD_UNKNOWN_NOW.store(T0 + 48_000, Ordering::SeqCst);
     assert!(
         next_batch_within(&mut subscription, 3).is_none(),
         "no receipt is read during an unknown-cause hold"
@@ -1799,7 +1872,7 @@ fn relay_poll_stops_held_listings_when_one_is_rate_limited() {
              {\"retry_after_seconds\":60}",
             true,
         ));
-    RELAY_HOLD_LIMITED_NOW.store(T0 + 18_000, Ordering::SeqCst);
+    RELAY_HOLD_LIMITED_NOW.store(T0 + 48_000, Ordering::SeqCst);
     drain_batches(&mut subscription);
     let hold_scans = &fake.state().scans[tracked..];
     let thread_listings = hold_scans.iter().filter(|scan| scan.1.is_some()).count();
