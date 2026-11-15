@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-short-ref-links: :thread:/:email:/:issue: short references resolve into links in vibe-talk'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-15T13:00:00.000000000+00:00
-updated_at: 2026-11-15T13:00:00.000000000+00:00
+updated_at: 2026-11-15T14:30:00.000000000+00:00
+closed_at: 2026-11-15T14:30:00.000000000+00:00
 ---
 
 # Description
@@ -93,3 +94,7 @@ health-banner files. On the email fallback, the owner's "turn on main messages
 in thread view" is realised as the All landing wherever the message is not
 already shown: navigation has no dependency that flips that setting, and All
 shows and highlights the message in every such case.
+
+## Resolution
+
+Landed cc91f8d1 (gate pass on c2667620, owner priority; mu-shortrefs-vt). vibe-talk renders :thread:/:email:/:issue: from the bridge's short-refs file (thread link drills in at the top; message link highlights or jumps to All; unknown ids stay plain with a dotted underline) and document-link tooltips no longer embed the raw URL. Live on devbig014 2026-11-15 08:38 ET with [render] short_refs_files and issue_url_template set; resolves end to end once #658's writer lands. Not tested: two-column right-pane open in a browser walk; a live bridge file.

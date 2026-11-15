@@ -1,12 +1,13 @@
 ---
 title: 'summarizer-loud-failure-and-fallback-chain: loud summariser failures and per-kind fallback model chains'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-11-15T08:04:54-05:00
-updated_at: 2026-11-15T08:04:54-05:00
+updated_at: 2026-11-15T14:30:00.000000000+00:00
+closed_at: 2026-11-15T14:30:00.000000000+00:00
 ---
 
 # Description
@@ -72,3 +73,7 @@ Coordinated with the naming-starvation health work: one
 second surface. Live chain configuration is set by the coordinator in
 the host overlay after landing; this change never edits live config.
 No changes to `vibe-talk/web/voice.js` or `web/src/app/main.js`.
+
+## Resolution
+
+Landed 2348b270 (gate pass on c932ff11; mu-sumfallback). Per-kind fallback model chains (string or ordered list), cool-down 300 s, loud health past 3 consecutive whole-chain failures or 50% of the last 20 (>=5), ERROR target summarizer_health, WARN summarizer_fallback per switch, one page banner naming the model in use and the cause class; cache version hashes the configured chain. Live on devbig014 2026-11-15 08:45 ET with message and thread_name chained small-elk-internal -> muse-spark-1.4-internal; healthz summarizer overall ok; post-deploy watch reports it. Not tested: a real model outage.

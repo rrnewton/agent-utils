@@ -1,12 +1,13 @@
 ---
 title: 'settings-long-message-share-inputs: type the first-share numbers in one sentence'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-11-15T12:35:00.000000000+00:00
-updated_at: 2026-11-15T12:35:00.000000000+00:00
+updated_at: 2026-11-15T14:30:00.000000000+00:00
+closed_at: 2026-11-15T14:30:00.000000000+00:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Owner UI request 084 (2026-11-15): the Settings control "Not in the first share 
 # Notes
 
 Filed 2026-11-15 7:35 AM ET for lane mu-sharetext. Sibling lane mu-discordmerge (#1557) owns `web/src/present/rows/grouping.ts`; this change touches the Settings view and, only for its saved-line wording, `web/src/view/settings/preferences.ts`. No `present/rows` file changed, so no coordination was needed.
+
+## Resolution
+
+Landed aae08a14 (gate pass on 00acdae2, owner priority; mu-sharetext). The two long-message-share sliders became one sentence with two typeable number inputs (same bounds, defaults, persistence and sync; clamp with visible feedback; empty restores; greyed when the guard is off). Live on the devbig014 Slack instance 2026-11-15 08:41 ET; post-deploy watch clean. Not tested: a physical phone keyboard.
