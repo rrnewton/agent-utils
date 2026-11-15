@@ -48,7 +48,11 @@ pub fn to_markdown(text: &str) -> String {
 /// `#318 slack-mention-names`.
 #[must_use]
 pub fn to_markdown_with(text: &str, channels: &HashMap<String, String>) -> String {
-    let text = super::emoji::shortcodes(text);
+    // A history read of a block post may arrive flattened and double-converted
+    // (`#1606 message-rerender-loses-formatting`); undo that first, so it reads as
+    // the live event's mrkdwn does.
+    let text = split_glued_bullets(&repair_fallback_links(text)).into_owned();
+    let text = super::emoji::shortcodes(&text);
     let mut out = String::with_capacity(text.len());
     let mut rest: &str = &text;
     while let Some(open) = rest.find('<') {
@@ -342,6 +346,112 @@ fn angle_link_at(text: &str) -> Option<(usize, &str, &str)> {
     (!label.is_empty()).then_some((inner.len() + 2, href, label))
 }
 
+/// Undo a history reader's double conversion of a labelled link, `#1606
+/// message-rerender-loses-formatting`: `<https://x|GH #329>` came back as
+/// `<[https://x GH](https://x%7CGH) #329>` — the address and the label's first word
+/// as a Markdown link's text and (pipe escaped) address, the rest of the label after
+/// it. Only that exact shape is rewritten: its address, once the pipe is decoded,
+/// must be the link text with its first space for the pipe. Anything else — a link
+/// a writer really wrote this way, code or not — is left as written; the worst a
+/// miss costs is the rendering the text already had.
+#[must_use]
+pub(crate) fn repair_fallback_links(text: &str) -> Cow<'_, str> {
+    if !text.contains("%7C") && !text.contains("%7c") {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut repaired_any = false;
+    while let Some(open) = rest.find("<[") {
+        let Some(close) = rest[open..].find('>') else {
+            break;
+        };
+        let whole = &rest[open..open + close + 1];
+        let Some(repaired) = fallback_link(whole) else {
+            out.push_str(&rest[..open + 2]);
+            rest = &rest[open + 2..];
+            continue;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&repaired);
+        repaired_any = true;
+        rest = &rest[open + close + 1..];
+    }
+    if !repaired_any {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// One `<[text](href) rest>` token (see [`repair_fallback_links`]) as `[label](url)`.
+fn fallback_link(whole: &str) -> Option<String> {
+    let inner = whole.strip_prefix("<[")?.strip_suffix('>')?;
+    let (link_text, after) = inner.split_once("](")?;
+    let (href, label_rest) = after.split_once(')')?;
+    let (url, word) = href.split_once("%7C").or_else(|| href.split_once("%7c"))?;
+    if !(url.starts_with("http://") || url.starts_with("https://"))
+        || url.chars().any(char::is_whitespace)
+        || word.is_empty()
+        || word.chars().any(char::is_whitespace)
+        || link_text != format!("{url} {word}")
+    {
+        return None;
+    }
+    let label = format!("{word}{label_rest}");
+    let mut escaped = String::with_capacity(label.len());
+    for character in label.chars() {
+        if matches!(character, '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    Some(format!("[{escaped}]({url})"))
+}
+
+/// Put flattened `•` bullets back on their own lines, `#1606`: a history read of a
+/// block post joins the post's lines with spaces, so bullets that were lines arrive
+/// as ` • ` inside one line, and the soft single-newline rule joins them into the
+/// paragraph. A line holding at least two ` • ` whose following pieces read as
+/// items (at least one begins with a link, emphasis or code, as a flattened list's
+/// do) is split where the bullets are. Fenced code is left as written, and a lone
+/// ` • ` — an enumeration inside a sentence — keeps the line it is on.
+#[must_use]
+pub(crate) fn split_glued_bullets(text: &str) -> Cow<'_, str> {
+    if !text.contains(" • ") {
+        return Cow::Borrowed(text);
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut in_code = false;
+    let mut changed = false;
+    for line in text.split('\n') {
+        if line.matches("```").count() % 2 == 1 {
+            in_code = !in_code;
+        }
+        if in_code || line.matches(" • ").count() < 2 {
+            out.push(line.to_owned());
+            continue;
+        }
+        let pieces: Vec<&str> = line.split(" • ").collect();
+        let items = pieces[1..]
+            .iter()
+            .filter(|piece| piece.starts_with(['[', '<', '*', '_', '`']))
+            .count();
+        if items == 0 {
+            out.push(line.to_owned());
+            continue;
+        }
+        changed = true;
+        out.push(pieces[0].to_owned());
+        out.extend(pieces[1..].iter().map(|piece| format!("• {piece}")));
+    }
+    if changed {
+        Cow::Owned(out.join("\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -589,5 +699,77 @@ mod tests {
         assert_eq!(super::to_markdown("&gt; q\n\tindented"), "> q\n\tindented");
         // Up to three spaces before the marker is still a quote, and still ended.
         assert_eq!(super::to_markdown("  &gt; q\nanswer"), "  > q\n\nanswer");
+    }
+}
+
+#[cfg(test)]
+mod rerender_tests {
+    // `#1606 message-rerender-loses-formatting`: the exact shapes of one real message
+    // (Slack ts 1794762378.392739) on its two server paths. The live event carries clean
+    // mrkdwn; the history read behind the message cache returns the same message with its
+    // line breaks flattened and each `<url|label>` double-converted. Both must read alike.
+    pub(super) const LIVE: &str = "*What's open on GitHub from alice, bot-two and bot-three (example/widgets):* 43 issues and 5 PRs. These look new or active:\n• <https://example.com/widgets/issues/329|GH #329> (yours, 12:03 PM ET today): the Documents view is empty apart from one broken entry.\n• <https://example.com/widgets/pull/322|PR #322> container build (Rust path deps).\n\nI'm sending coordb all of this.";
+    pub(super) const HISTORY: &str = "*What's open on GitHub from alice, bot-two and bot-three (example/widgets):* 43 issues and 5 PRs. These look new or active: • <[https://example.com/widgets/issues/329 GH](https://example.com/widgets/issues/329%7CGH) #329> (yours, 12:03 PM ET today): the Documents view is empty apart from one broken entry. • <[https://example.com/widgets/pull/322 PR](https://example.com/widgets/pull/322%7CPR) #322> container build (Rust path deps).\n\nI'm sending coordb all of this.";
+
+    #[test]
+    fn a_history_read_of_a_block_post_reads_as_the_live_event_does() {
+        let live = super::to_markdown(super::rerender_tests::LIVE);
+        let history = super::to_markdown(super::rerender_tests::HISTORY);
+        assert_eq!(
+            history, live,
+            "history read must normalize to the live shape"
+        );
+        assert!(
+            history.contains("[GH #329](https://example.com/widgets/issues/329)"),
+            "{history}"
+        );
+        assert!(
+            history.contains("\n• [PR #322]"),
+            "bullets back on their own lines: {history}"
+        );
+        assert!(!history.contains("%7C"), "{history}");
+    }
+
+    #[test]
+    fn text_a_writer_really_wrote_is_not_repaired() {
+        // A genuine Markdown link, a lone in-sentence bullet and a plain enumeration
+        // hold no flattened-list shape and must pass through untouched.
+        for text in [
+            "see [the doc](https://example.com/a) and [x](https://e.test/%7C)",
+            "one • two, as a pair",
+            "red • green • blue are the options",
+        ] {
+            assert_eq!(super::to_markdown(text), text, "{text:?} was rewritten");
+        }
+    }
+
+    #[test]
+    fn every_render_path_draws_the_history_shape_as_the_live_shape() {
+        // Live event, cache-first read, refresh, edit update and the history page all
+        // end in the one renderer; a row already stored in the history shape (below)
+        // must draw there as the live shape draws.
+        let stored = super::to_markdown(super::rerender_tests::HISTORY);
+        let live_html = crate::render::to_html_as(
+            &super::to_markdown(super::rerender_tests::LIVE),
+            crate::render::Markup::Slack,
+            crate::render::SingleNewline::Soft,
+        );
+        for text in [stored.clone(), super::rerender_tests::HISTORY.to_owned()] {
+            let html = crate::render::to_html_as(
+                &text,
+                crate::render::Markup::Slack,
+                crate::render::SingleNewline::Soft,
+            );
+            assert_eq!(
+                html, live_html,
+                "a re-render diverged from the first render"
+            );
+            assert!(html.contains("<li>"), "bullets on separate lines: {html}");
+            assert!(
+                html.contains(">GH #329</a>"),
+                "GH #329 drawn as a link label: {html}"
+            );
+            assert!(!html.contains("%7C") && !html.contains("&lt;"), "{html}");
+        }
     }
 }

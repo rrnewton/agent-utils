@@ -195,6 +195,25 @@ impl Markup {
             Self::Discord => Cow::Borrowed(text),
             Self::GoogleChat | Self::Slack => {
                 use crate::slack::mrkdwn::angle_links_outside;
+                // `#1606 message-rerender-loses-formatting`: a row the cache stored
+                // from a flattened history read still holds that shape; repair it
+                // here too, so a cached row draws as the live event did.
+                if self == Self::Slack {
+                    let relinked = crate::slack::mrkdwn::repair_fallback_links(text);
+                    let repaired = match crate::slack::mrkdwn::split_glued_bullets(&relinked) {
+                        Cow::Owned(split) => Some(split),
+                        Cow::Borrowed(_) => match relinked {
+                            Cow::Owned(relinked) => Some(relinked),
+                            Cow::Borrowed(_) => None,
+                        },
+                    };
+                    if let Some(repaired) = repaired {
+                        return Cow::Owned(
+                            angle_links_outside(&repaired, &code_ranges(&repaired, options))
+                                .into_owned(),
+                        );
+                    }
+                }
                 match angle_links_outside(text, &[]) {
                     Cow::Borrowed(_) => Cow::Borrowed(text),
                     Cow::Owned(_) => Cow::Owned(
@@ -253,8 +272,9 @@ impl SearchText {
     /// the name a page label may also carry is never indexed, so no fetched text is in this
     /// version's key and rebuilding under it fetches nothing. `render-7`: a thread or
     /// message short reference drawn as its emoji and number (`#1607
-    /// short-ref-emoji-render`).
-    pub const VERSION: &'static str = "render-7";
+    /// short-ref-emoji-render`). `render-8`: a flattened history read's bullets and
+    /// double-converted links repaired (`#1606 message-rerender-loses-formatting`).
+    pub const VERSION: &'static str = "render-8";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -5742,6 +5762,10 @@ mod search_text_tests {
         ),
         (
             "render-7",
+            "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
+        ),
+        (
+            "render-8",
             "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
         ),
     ];

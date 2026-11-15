@@ -2281,6 +2281,24 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1606 message-rerender-loses-formatting` in the browser engine at 390px and on a
+  # desk: a block post re-read from history draws with its bullets on separate lines and
+  # GH #329 as a link label, as its first (live) render did.
+  - group: check
+    job: message-rerender-browser
+    desc: a re-rendered block post's bullets and link labels, in current Chromium at 390px and on a desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/message_rerender_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#621 send-double-check` in the browser engine at 393x852: the Sending card mid-send
   # shows tick one green (server accepted) and tick two gray (upstream held); the tap readout
   # shows durations from the Send tap.
