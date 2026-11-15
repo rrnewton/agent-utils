@@ -1,13 +1,14 @@
 ---
 title: 'linked-message-always-expanded: going to a linked message shows it in full'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-15T15:10:00.000000000+00:00
-updated_at: 2026-11-15T15:10:00.000000000+00:00
+updated_at: 2026-11-15T16:15:00.000000000+00:00
+closed_at: 2026-11-15T16:15:00.000000000+00:00
 ---
 
 # Description
@@ -94,3 +95,20 @@ This lane touches none of those; its browser coverage is a new file so the
 three lanes never serialise on one test file. The drop-to-partial runs on
 the tap before the jump, and the expand runs inside the landing before the
 scroll, so a Discuss citation lands expanded at the partial height.
+
+## Resolution
+
+Landed bf2be58f on main (gated 3800d2b8, owner priority, 174 steps pass).
+Whenever the page goes to a message — a tapped message link, a Discuss
+citation, an `:email:` short ref, a reply's arrow, a reply count, a sent
+message, a bookmark, or the address the page opens by — the target now
+opens in full before the page scrolls to it: a folded long message unfolds,
+a folded quote or "show more" inside it opens, and a combined row opens
+whole for any of its messages. The opening uses the row's own fold
+control, so the message stays open across redraws until the reader folds
+it again; nothing is ever folded by a landing. Tested: unit tests for the
+open-whole helper; a real-Chromium walk per entry point at 390x844 and
+1280x800, each landing expanded and on screen; screenshots at both sizes
+looked at (the linked message whole, its folded neighbours still folded).
+Not tested as separate fixtures: Discuss citations and search-result taps,
+which land through the same reveal the walk covers.
