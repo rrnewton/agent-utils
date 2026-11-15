@@ -1588,11 +1588,23 @@ impl HerdrClient {
                 )));
             }
             return Err(AdapterError::unavailable(format!(
-                "agent start {name:?}: {}",
-                stderr_detail(&result)
+                "agent start {name:?}: {}{}",
+                stderr_detail(&result),
+                self.launch_failure_hint(kind, pane_id)
+                    .map(|hint| format!("; {hint}"))
+                    .unwrap_or_default()
             )));
         }
         Ok(())
+    }
+
+    /// The remedy a failed launch's pane screen proves, if any: see
+    /// [`crate::harness::HarnessAdapter::launch_failure`]. Best effort: a
+    /// screen that cannot be read keeps the generic launch error.
+    fn launch_failure_hint(&self, kind: &str, pane_id: &str) -> Option<String> {
+        let adapter = crate::harness::adapter(kind)?;
+        let screen = self.read(pane_id, "visible", None).ok()?;
+        adapter.launch_failure(&screen).map(str::to_owned)
     }
 
     /// Wait until `pane_id` is an available shell as Herdr's `agent start` defines it: no agent

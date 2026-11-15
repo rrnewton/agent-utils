@@ -613,6 +613,67 @@ def test_codex_0_159_1_idle_composer_is_recognised(screen: str) -> None:
     assert "Ask Codex" not in view.transcript
 
 
+# Codex v0.169.0's unboxed layout (#1553 codex-footer-composer): composer
+# row, blank row, status row, hint row. Paths and titles are neutral.
+_V169_STATUS = "  GPT-6.1-Sol medium · /work/slot"
+_V169_STATUS_TITLED = "  GPT-6.1-Sol medium · /work/slot · Read coordinator brief"
+_V169_HINT = "  ← for agents · ? for shortcuts                       ⚠ 2 warnings · f2 to view"
+_V169_FRESH_IDLE = (
+    "• Done.\n\n› " + _dim("Ask Codex to do anything") + f"\n\n{_V169_STATUS}\n{_V169_HINT}\n"
+)
+_V169_SESSION_IDLE = (
+    "• Done.\n\n› " + _dim("Ask Codex to do anything") + f"\n\n{_V169_STATUS_TITLED}\n{_V169_HINT}\n"
+)
+_V169_STAGED = f"• Done.\n\n› {_V159_PROMPT}\n\n{_V169_STATUS_TITLED}\n{_V169_HINT}\n"
+_V169_SUBMITTED = (
+    f"› {_V159_PROMPT}\n\n• Working (0s • esc to interrupt)\n\n› "
+    + _dim("Ask Codex to do anything")
+    + f"\n\n{_V169_STATUS_TITLED}\n{_V169_HINT}\n"
+)
+_V169_DRAFTED = f"• Done.\n\n› unsent operator draft\n\n{_V169_STATUS_TITLED}\n{_V169_HINT}\n"
+
+
+@pytest.mark.parametrize(
+    "screen", [_V169_FRESH_IDLE, _V169_SESSION_IDLE], ids=["no-title", "with-title"],
+)
+def test_codex_0_169_idle_screens_put_the_two_row_footer_below_the_composer(screen: str) -> None:
+    view = composer_view("codex", screen)
+    assert view is not None, screen
+    assert view.composer_solid.strip() == "", view
+    assert "GPT-6.1-Sol" in view.footer and "for shortcuts" in view.footer, view
+    assert "GPT-6.1-Sol" not in view.composer, view
+    assert codex_idle_composer(screen)
+
+
+def test_codex_0_169_staged_text_is_the_composer_without_the_status_row() -> None:
+    view = composer_view("codex", _V169_STAGED)
+    assert view is not None
+    assert view.composer_solid.strip() == _V159_PROMPT, view
+    assert "Read coordinator brief" in view.footer, view
+
+
+def test_codex_0_169_idle_pane_accepts_a_send() -> None:
+    replay = Replay(_V169_FRESH_IDLE, _V169_STAGED, _V169_SUBMITTED)
+    receipt = _replay_submit(replay, _V159_PROMPT)
+    assert getattr(receipt, "key") == "Enter"
+    assert replay.keys == ["Enter"]
+
+
+def test_codex_0_169_real_draft_still_refuses_before_typing() -> None:
+    replay = Replay(_V169_DRAFTED, _V169_DRAFTED, _V169_DRAFTED)
+    with pytest.raises(PromptNotStaged, match="already holds unsubmitted text"):
+        _replay_submit(replay, "hello")
+    assert replay.pastes == [] and replay.keys == []
+
+
+def test_codex_unparseable_rows_under_the_composer_read_as_no_composer() -> None:
+    screen = (
+        "• Done.\n\n› " + _dim("Ask Codex to do anything")
+        + "\n\n  some future status row\n  some future hint row\n"
+    )
+    assert composer_view("codex", screen) is None, screen
+
+
 _BRAILLE_FIXTURES = Path(__file__).resolve().parents[2] / "rs" / "agentctl" / "tests" / "fixtures" / "composer"
 
 

@@ -3190,6 +3190,77 @@ mod tests {
         }
     }
 
+    /// Codex v0.169.0's unboxed layout (#1553 codex-footer-composer): the composer row, a
+    /// blank row, then TWO footer rows — the status row
+    /// (`<model> <effort> · /path [· <thread title>]`) and the hint row
+    /// (`← for agents · ? for shortcuts ...`). Paths and titles are neutral.
+    mod codex_v0_169 {
+        pub(super) const PROMPT: &str = "Reply with exactly READY and nothing else.";
+        const STATUS: &str = "  GPT-6.1-Sol medium · /work/slot";
+        const STATUS_TITLED: &str = "  GPT-6.1-Sol medium · /work/slot · Read coordinator brief";
+        const HINT: &str =
+            "  ← for agents · ? for shortcuts                       ⚠ 2 warnings · f2 to view";
+
+        fn screen(rows: &[&str]) -> String {
+            rows.join("\n") + "\n"
+        }
+
+        /// Idle before the first turn: no thread title in the status row.
+        pub(super) fn fresh_idle() -> String {
+            screen(&[
+                "• Done.",
+                "",
+                "› \u{1b}[2mAsk Codex to do anything\u{1b}[0m",
+                "",
+                STATUS,
+                HINT,
+            ])
+        }
+
+        /// Idle after a turn: the status row also carries the thread title.
+        pub(super) fn session_idle() -> String {
+            screen(&[
+                "• Done.",
+                "",
+                "› \u{1b}[2mAsk Codex to do anything\u{1b}[0m",
+                "",
+                STATUS_TITLED,
+                HINT,
+            ])
+        }
+
+        /// [`PROMPT`] pasted into the composer, before the submission key.
+        pub(super) fn staged() -> String {
+            screen(&["• Done.", "", &format!("› {PROMPT}"), "", STATUS_TITLED, HINT])
+        }
+
+        /// After Enter: the prompt is in the transcript and the composer is empty again.
+        pub(super) fn submitted() -> String {
+            screen(&[
+                &format!("› {PROMPT}"),
+                "",
+                "• Working (0s • esc to interrupt)",
+                "",
+                "› \u{1b}[2mAsk Codex to do anything\u{1b}[0m",
+                "",
+                STATUS_TITLED,
+                HINT,
+            ])
+        }
+
+        /// A real unsubmitted draft in the composer.
+        pub(super) fn drafted() -> String {
+            screen(&[
+                "• Done.",
+                "",
+                "› unsent operator draft",
+                "",
+                STATUS_TITLED,
+                HINT,
+            ])
+        }
+    }
+
     /// Rows Claude Code drew at the bottom of its pane while a turn was running, read with
     /// `herdr pane read --source visible --format ansi`: before a paste, with an 11-line paste
     /// collapsed into a placeholder, and after one Enter queued that paste. The composer, rule
@@ -3661,6 +3732,86 @@ mod tests {
             )]
         );
         assert_eq!(*replay.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn codex_0_169_idle_screens_put_the_two_row_footer_below_the_composer() {
+        // #1553: with and without the thread title, the status row and the
+        // hint row under the blank separator are footer, never composer text.
+        for screen in [codex_v0_169::fresh_idle(), codex_v0_169::session_idle()] {
+            let view = composer_view("codex", &screen)
+                .unwrap_or_else(|| panic!("no composer in {screen:?}"));
+            assert_eq!(view.composer_solid.trim(), "", "{view:?}");
+            assert!(view.footer.contains("GPT-6.1-Sol"), "{view:?}");
+            assert!(view.footer.contains("for shortcuts"), "{view:?}");
+            assert!(!view.composer.contains("GPT-6.1-Sol"), "{view:?}");
+            assert!(codex_idle_composer(&screen), "{screen:?}");
+        }
+        // The older single-row footers still parse exactly as before.
+        let view = composer_view(
+            "codex",
+            "Codex\n» \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n  ? for shortcuts\n",
+        )
+        .unwrap();
+        assert_eq!(view.composer_solid.trim(), "", "{view:?}");
+        assert_eq!(view.footer.trim(), "? for shortcuts", "{view:?}");
+    }
+
+    #[test]
+    fn codex_0_169_staged_text_is_the_composer_without_the_status_row() {
+        let view = composer_view("codex", &codex_v0_169::staged()).unwrap();
+        assert_eq!(view.composer_solid.trim(), codex_v0_169::PROMPT, "{view:?}");
+        assert!(view.footer.contains("Read coordinator brief"), "{view:?}");
+    }
+
+    #[test]
+    fn codex_0_169_idle_pane_accepts_a_send() {
+        let replay = Replay::new(
+            codex_v0_169::fresh_idle(),
+            codex_v0_169::staged(),
+            codex_v0_169::submitted(),
+        );
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "codex",
+            codex_v0_169::PROMPT,
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        let receipt = receipt(outcome);
+        assert_eq!(receipt.key, "Enter");
+        assert_eq!(receipt.key_presses, 1);
+        assert_eq!(*replay.keys.lock().unwrap(), ["Enter"]);
+    }
+
+    #[test]
+    fn codex_0_169_real_draft_still_refuses_before_typing() {
+        let screen = codex_v0_169::drafted();
+        let replay = Replay::new(screen.clone(), screen.clone(), screen);
+        let clock = Clock::default();
+        let outcome = submit_verified(
+            &replay,
+            "w1:p1",
+            "codex",
+            "hello",
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        let reason = refusal(outcome);
+        assert!(reason.contains("already holds unsubmitted text"), "{reason}");
+        assert!(reason.contains("unsent operator draft"), "{reason}");
+        assert!(replay.pastes.lock().unwrap().is_empty());
+        assert!(replay.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn codex_unparseable_rows_under_the_composer_read_as_no_composer() {
+        // A future footer shape this reader cannot parse must read as an
+        // unrecognisable composer, never as a draft that refuses the send.
+        let screen = "• Done.\n\n› \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  some future status row\n  some future hint row\n";
+        assert!(composer_view("codex", screen).is_none(), "{screen:?}");
     }
 
     #[test]

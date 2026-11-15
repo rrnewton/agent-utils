@@ -129,6 +129,12 @@ pub trait HarnessAdapter: Sync {
     fn assigns_session_id(&self) -> bool {
         false
     }
+    /// Why a launch failed, read from the pane screen it left behind, when the screen proves
+    /// a known cause with a remedy the caller can act on; `None` keeps the generic launch
+    /// error. The remedy is reported, never applied silently.
+    fn launch_failure(&self, _screen: &str) -> Option<&'static str> {
+        None
+    }
     /// The directory under the user's home where the harness looks for skills, when it reads
     /// them from a fixed place.
     fn skill_directory(&self) -> Option<&'static str> {

@@ -1,10 +1,10 @@
 ---
 title: 'codex-footer-composer: agentctl reads Codex 0.169''s status footer as unsubmitted composer text and refuses to send'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-15T12:08:06.535260796+00:00
-updated_at: 2026-11-15T12:08:06.535260796+00:00
+updated_at: 2026-11-15T12:36:31.000000000+00:00
 ---
 
 # Description
@@ -40,3 +40,47 @@ codex 0.169.0 here refuses to start without `--no-daemon`: "daemon executable no
 The footer line under the composer is not composer input. An idle Codex 0.169 pane accepts `agentctl send`, and the submit key reliably submits.
 
 Reported by a coordinator on the owner's external machine, 2026-11-15 ~7:10am ET.
+
+# Notes
+
+Redaction: as landed on main in d786df3c, the consuming project's name
+in the report above was replaced with neutral labels (`/<workspace-dir>`);
+the quoted footer text is otherwise as reported.
+
+## Resolution
+
+Cause: the Codex composer reader took the footer to be the screen's last
+populated row and the composer to be every row from the composer marker to
+that row. Codex 0.169 draws two footer rows (status, then hint), so the
+status row fell inside the composer and read as unsubmitted text. The same
+reader in the older build explains why it also reproduced there: it is a
+layout change breaking a long-standing single-footer assumption, not a
+recent agentctl regression.
+
+Fixed in both editions (Rust `harness/codex.rs`, Python
+`agentctl/submission.py`) with a structural rule, not a model-name list:
+a status row parses by shape (`<model> <effort> · /path [· title]`, the
+field after the first ` · ` naming an absolute or home-relative path),
+and when it sits directly above the hint row, blank-separated from the
+composer, the footer starts at the status row so the composer ends at
+its own boundary. Rows under the composer that no rule can classify now
+read as an unrecognisable composer, never as a draft, so an unparseable
+future footer cannot refuse a send as held text. Screen fixtures cover
+idle 0.169 panes with and without the thread title plus the hint line,
+the older single-row layouts, a staged prompt, and a real unsubmitted
+draft, which still refuses before typing.
+
+The `--no-daemon` side note is covered on the native Herdr start path:
+when a failed launch's pane screen shows `daemon executable not found`,
+the error now names the remedy (relaunch with `--no-daemon`, for example
+`--harness-arg=--no-daemon`). The flag is reported, never added silently.
+Other launch backends keep the generic launch error.
+
+The swallowed-first-Enter symptom is not fixed here: per the owner it is
+covered by the harness-agnostic unsubmitted-paste backstop, #1560
+(remember the sent text; while a fuzzy
+match stays in the pane's lower region over repeated polls, press Enter,
+capped and logged), which serves every TUI including unknown harnesses.
+
+Not yet done: the coordinator's services turnover to the landed build.
+Until then, live panes still run the old reader.

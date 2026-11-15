@@ -387,6 +387,20 @@ def _claude_view_framed(
     )
 
 
+def _codex_status_row(line: str) -> bool:
+    """Whether ``line`` is Codex's status row, parsed by shape: an indented
+    ``<model> <effort> · /path [· <thread title>]`` row. The field after the
+    first `` · `` must name an absolute or home-relative path; model names
+    and efforts are never enumerated, so new ones need no list here."""
+    if not line.startswith("  "):
+        return False
+    fields = line.lstrip().split(" · ")
+    if len(fields) < 2 or not fields[0]:
+        return False
+    path = fields[1].lstrip()
+    return path.startswith("/") or path.startswith("~/")
+
+
 def _codex_view(rows: list[tuple[str, str]]) -> ComposerView | None:
     populated = [index for index, (plain, _) in enumerate(rows) if plain.strip()]
     if len(populated) < 2:
@@ -394,6 +408,21 @@ def _codex_view(rows: list[tuple[str, str]]) -> ComposerView | None:
     footer = populated[-1]
     if not rows[footer][0].startswith("  "):
         return None
+    # Codex v0.169 draws two footer rows under the composer: the status row
+    # (see _codex_status_row) and a hint row under it (`← for agents · ? for
+    # shortcuts`, a queue hint, or a warning notice). The composer ends at
+    # its own boundary — the blank row above the status row — so when the
+    # row directly above the last row parses as the status row and a blank
+    # row separates it from the composer, the footer starts there instead.
+    if len(populated) >= 2:
+        above = populated[-2]
+        if (
+            above + 1 == footer
+            and above > 0
+            and not rows[above - 1][0].strip()
+            and _codex_status_row(rows[above][0])
+        ):
+            footer = above
     start = None
     for index in range(footer - 1, -1, -1):
         plain = rows[index][0]
@@ -404,6 +433,16 @@ def _codex_view(rows: list[tuple[str, str]]) -> ComposerView | None:
             return None
     if start is None:
         return None
+    # Populated rows below a blank row inside the candidate are footer rows
+    # this reader could not classify (a future layout). Reading them as
+    # composer text would refuse a send over words nobody typed, so the
+    # composer is unrecognisable instead: unknown never reads as a draft.
+    below_blank = False
+    for plain, _ in rows[start + 1:footer]:
+        if not plain.strip():
+            below_blank = True
+        elif below_blank:
+            return None
     body = rows[start:footer]
     plain_lines = [plain for plain, _ in body]
     solid_lines = [solid for _, solid in body]

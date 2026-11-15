@@ -86,6 +86,15 @@ impl HarnessAdapter for Codex {
         (arguments, Vec::new())
     }
 
+    fn launch_failure(&self, screen: &str) -> Option<&'static str> {
+        // Codex 0.169 exits at once when its app-server daemon executable is
+        // missing. Name the remedy; agentctl never adds the flag silently.
+        screen.contains("daemon executable not found").then_some(
+            "Codex could not start: its app-server daemon executable was not found; \
+             relaunch with --no-daemon (for example --harness-arg=--no-daemon)",
+        )
+    }
+
     fn reasoning_arguments(&self, effort: &str) -> Option<Vec<String>> {
         Some(vec![
             "--config".to_owned(),
@@ -264,6 +273,28 @@ pub(crate) fn only_placeholder_and_braille(composer: &str, composer_solid: &str)
     })
 }
 
+/// Whether `line` is Codex's status row, parsed by shape: an indented
+/// `<model> <effort> · /path [· <thread title>]` row. The field after the
+/// first ` · ` must name an absolute or home-relative path; model names and
+/// efforts are never enumerated, so new ones need no list here.
+fn status_row(line: &str) -> bool {
+    if !line.starts_with("  ") {
+        return false;
+    }
+    let mut fields = line.trim_start().split(" · ");
+    let Some(model) = fields.next() else {
+        return false;
+    };
+    if model.is_empty() {
+        return false;
+    }
+    let Some(path) = fields.next() else {
+        return false;
+    };
+    let path = path.trim_start();
+    path.starts_with('/') || path.starts_with("~/")
+}
+
 fn view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
     let populated: Vec<usize> = rows
         .iter()
@@ -274,9 +305,25 @@ fn view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
     if populated.len() < 2 {
         return None;
     }
-    let footer = populated[populated.len() - 1];
+    let mut footer = populated[populated.len() - 1];
     if !text_of(&rows[footer].0).starts_with("  ") {
         return None;
+    }
+    // Codex v0.169 draws two footer rows under the composer: the status row
+    // (see `status_row`) and a hint row under it (`← for agents · ? for
+    // shortcuts`, a queue hint, or a warning notice). The composer ends at
+    // its own boundary — the blank row above the status row — so when the
+    // row directly above the last row parses as the status row and a blank
+    // row separates it from the composer, the footer starts there instead.
+    if populated.len() >= 2 {
+        let above = populated[populated.len() - 2];
+        if above + 1 == footer
+            && above > 0
+            && rows[above - 1].0.iter().all(|c| c.is_whitespace())
+            && status_row(&text_of(&rows[above].0))
+        {
+            footer = above;
+        }
     }
     let mut start = None;
     for index in (0..footer).rev() {
@@ -290,6 +337,18 @@ fn view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
         }
     }
     let start = start?;
+    // Populated rows below a blank row inside the candidate are footer rows
+    // this reader could not classify (a future layout). Reading them as
+    // composer text would refuse a send over words nobody typed, so the
+    // composer is unrecognisable instead: unknown never reads as a draft.
+    let mut below_blank = false;
+    for (plain, _) in &rows[start + 1..footer] {
+        if plain.iter().all(|c| c.is_whitespace()) {
+            below_blank = true;
+        } else if below_blank {
+            return None;
+        }
+    }
     let (composer, mut composer_solid) = composer_from(&rows[start..footer], 1);
     if only_placeholder_and_braille(&composer, &composer_solid) {
         composer_solid = "\n".repeat(composer_solid.matches('\n').count());
@@ -947,6 +1006,23 @@ mod tests {
         }
         // Herdr's own verdict stands whenever it has one.
         assert_eq!(Codex.settle_herdr_state("working", idle), None);
+    }
+
+    #[test]
+    fn a_missing_daemon_executable_names_the_no_daemon_relaunch() {
+        // #1553 side note: Codex 0.169 exits with this line when its daemon
+        // executable is absent; the launch error must name --no-daemon.
+        let hint = Codex
+            .launch_failure("daemon executable not found at /x/codex\n")
+            .expect("daemon failure hint");
+        assert!(hint.contains("--no-daemon"), "{hint}");
+        assert_eq!(Codex.launch_failure("some other failure\n"), None);
+        assert_eq!(
+            crate::harness::adapter("claude")
+                .unwrap()
+                .launch_failure("daemon executable not found\n"),
+            None
+        );
     }
 
     #[test]
