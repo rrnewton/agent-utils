@@ -101,6 +101,17 @@ When you (the coordinator) are being replaced, or you replace another coordinato
 
 A send answered `undeliverable` is never lost and never delivered: it stays in the sender's outbox until the target is fixed. Treat any `undeliverable` you receive, or a watch-agents notice that this host refused messages as undeliverable, as a handover that was done out of order.
 
+## Harness support differs per harness
+
+What agentctl can do for a lane depends on its harness (Claude Code,
+Codex, Muse, an unrecognised TUI, headless): follow-up delivery, the
+stuck-paste backstop, form answering, approvals, and headless mode all
+diverge. The per-harness truth is
+`common/docs/agentctl/harness-support-matrix.md` in agent-utils (#1561
+harness-support-matrix) — check it before promising the owner a
+capability for a harness, and update it in the same commit as any change
+that adds or removes support for one harness.
+
 ## Supervise
 
 - `agentctl status NAME` and `agentctl read NAME` show progress; the agent's reply in

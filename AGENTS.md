@@ -321,6 +321,16 @@ Every top-level tool needs a `RELATED_WORK.md` comparing relevant public
 open-source systems. Keep private organizational sources and deployment details
 out of that comparison.
 
+### Harness support matrix
+
+`common/docs/agentctl/harness-support-matrix.md` records, per capability,
+what agentctl actually does for each harness (Claude Code, Codex, Muse,
+an unrecognised TUI, and headless). **Any change that adds or removes
+support for one harness updates the matrix in the same commit** — a new
+per-harness branch, adapter method, or list entry changes a cell, and a
+commit that changes the code without the cell is incomplete. The same
+rule is stated in the matrix itself and in the agentctl skill.
+
 Introduce tools by explaining the user's problem, the useful outcome, and the
 dependencies. The primary operator documentation belongs in CLI `quickstart` and
 `userguide` commands, plus top-level and per-subcommand help. CLI help must describe

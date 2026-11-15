@@ -156,6 +156,17 @@ doing anything. Never resubmit a possibly-submitted prompt automatically.
 `agentctl stop NAME` retires only the exact owned runtime after identity checks.
 Do not remove registry files or panes by hand to work around a refusal.
 
+## Per-harness support differs; check the matrix
+
+agentctl does not do the same things for every harness. Send follow-ups,
+the stuck-paste backstop, form answering, approvals, headless mode, and
+more each have a different truth for Claude Code, Codex, Muse, an
+unrecognised TUI, and headless. Before relying on a capability for a
+harness you have not used it with, read the harness support matrix in
+this repository's agentctl reference documentation
+(#1561 harness-support-matrix). If your change adds or removes support
+for one harness, update that matrix in the same commit.
+
 ## Restart a session in place
 
 `agentctl restart NAME --when-idle` restarts a live agent in its own pane
