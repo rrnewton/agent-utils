@@ -10243,6 +10243,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // it only by its agent name. Bind the harness agentctl just pinned, so ordinary owner
         // death detection covers the slot. A refusal does not undo a running launch; it is
         // reported in the returned status.
+        let has_slot_owner_target = slot_owner_target.is_some();
         let (slot_owner, slot_purpose) = match slot_owner_target {
             Some((wrkslots, project, slot)) => {
                 let (owner, purpose) =
@@ -10251,6 +10252,31 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             None => (None, None),
         };
+        // A harness that died during startup can still look ready to the
+        // terminal host (its label outlives it); if the process agentctl
+        // pinned is kernel-dead, the launch failed, whatever was reported
+        // (#1583: boxed Claude returned running with a dead harness).
+        if has_slot_owner_target {
+            let pinned = record
+                .harness_identity
+                .as_ref()
+                .or(record.custom_process_identity.as_ref());
+            if let Some(identity) = pinned {
+                if self.client.process_liveness(identity) == ProcessLiveness::Dead {
+                    record.lifecycle = "launch_failed".to_owned();
+                    record.error = Some(format!(
+                        "launched {} process {} died during startup",
+                        record.harness, identity.pid
+                    ));
+                    self.save(&record)?;
+                    return Err(fail(format!(
+                        "launch of {agent_name:?} failed: {}; record and any created tab retained at {}",
+                        record.error.as_deref().unwrap_or_default(),
+                        directory.display()
+                    )));
+                }
+            }
+        }
         // #1342: the slot's recorded purpose outranks the brief line the
         // record was created with, but never an explicit `--purpose`. The
         // owner bind already read the slot's status row, so this costs no
@@ -14385,6 +14411,27 @@ its drain would also type, so it was not queued",
                     .is_ok()
             {
                 return Ok(());
+            }
+        }
+        // A launch_failed record whose pinned process is kernel-dead and
+        // whose pane is back at its idle shell is provably this failed
+        // launch and nothing else (#1583): retire it without requiring
+        // the dead process to still be the foreground process.
+        if record.lifecycle == "launch_failed" {
+            if let Some(identity) = record.custom_process_identity.as_ref() {
+                let info = self.client.pane_info(pane)?;
+                let cwd_matches = info.cwd == record.cwd
+                    || fs::canonicalize(&info.cwd)
+                        .ok()
+                        .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+                if info.pane_id == pane
+                    && Some(&info.workspace_id) == record.workspace_id.as_ref()
+                    && cwd_matches
+                    && self.client.process_liveness(identity) == ProcessLiveness::Dead
+                    && self.client.pane_is_idle_shell(pane)?
+                {
+                    return Ok(());
+                }
             }
         }
         if record.lifecycle == "launch_failed"
@@ -22550,6 +22597,47 @@ fi
         let error = manager.stop("worker").unwrap_err();
         assert!(error.to_string().contains("foreground process"));
         assert!(fixture.client.closed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn launch_failed_muse_with_a_dead_pinned_process_is_stoppable() {
+        // #1583: the pinned process died during startup (its pane is back
+        // at the idle shell); stop must retire the record, not demand the
+        // dead process still be the pane's foreground process.
+        let fixture = Fixture::new();
+        fixture
+            .client
+            .custom_fails_after_identity
+            .store(true, Ordering::Relaxed);
+        let error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    harness: "muse".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("launch"), "{error}");
+        let failed = fixture.manager().load("worker").unwrap();
+        assert_eq!(failed.lifecycle, "launch_failed");
+        assert!(failed.custom_process_identity.is_some(), "{failed:?}");
+        let pane = failed.pane_id.clone().expect("failed pane");
+        fixture
+            .client
+            .custom_processes
+            .lock()
+            .unwrap()
+            .insert(pane.clone(), Fake::custom_identity());
+        fixture.client.dead_panes.lock().unwrap().insert(pane);
+        fixture.client.custom_alive.store(false, Ordering::Relaxed);
+        assert_eq!(
+            fixture.manager().stop("worker").unwrap()["pane_closed"],
+            true
+        );
     }
 
     #[test]

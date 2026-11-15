@@ -3655,6 +3655,23 @@ class ManagedAgents:
                 (None, None) if slot is None or launch_project is None
                 else _bind_launched_slot_owner(record, slot, launch_project, self.registry)
             )
+            # A harness that died during startup can still look ready to
+            # the terminal host; a kernel-dead pinned process fails the
+            # launch, whatever was reported (#1583).
+            if slot is not None and launch_project is not None:
+                pinned = record.harness_identity or record.custom_process_identity
+                liveness = getattr(self.client, "process_liveness", None)
+                if (pinned is not None and liveness is not None
+                        and liveness(pinned) == "dead"):
+                    record.lifecycle = "launch_failed"
+                    record.error = (
+                        f"launched {record.harness} process {pinned.pid} died during startup"
+                    )
+                    self._save(record)
+                    raise AgentDeliveryError(
+                        f"launch of {name!r} failed: {record.error}; record and any "
+                        f"created tab retained at {directory}"
+                    )
             # #1342: the slot's recorded purpose outranks the brief line, but
             # never an explicit purpose; the bind already read the status row.
             if purpose is None and slot_purpose is not None and record.purpose != slot_purpose:
@@ -4117,6 +4134,20 @@ class ManagedAgents:
                     return
                 except HerdrUnavailable:
                     pass
+        # A launch_failed record whose pinned process is kernel-dead and
+        # whose pane is back at its idle shell is provably this failed
+        # launch (#1583): retire without foreground proof of the dead pid.
+        if (record.lifecycle == "launch_failed"
+                and record.adapter == "herdr-pane"
+                and record.custom_process_identity is not None):
+            info = self.client.pane_info(pane_id)
+            liveness = getattr(self.client, "process_liveness", None)
+            if (info.pane_id == pane_id and info.workspace_id == record.workspace_id
+                    and os.path.realpath(info.cwd) == os.path.realpath(record.cwd)
+                    and liveness is not None
+                    and liveness(record.custom_process_identity) == "dead"
+                    and self.client.pane_is_idle_shell(pane_id)):
+                return
         # Preserve the original failed-launch fallback exactly. A stale report plus
         # return to the original shell is sufficient only after agentctl itself
         # reported that pane; an unreported pre-readiness pane remains unowned.
