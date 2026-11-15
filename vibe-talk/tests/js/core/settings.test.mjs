@@ -146,6 +146,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["discussWidth", "vibe-talk.voice.discuss-width", 560, [[700, "700"], [320, "320"]], 560],
     ["discussSheetFull", "vibe-talk.voice.discuss-sheet-full", false, [[true, "1"], [false, null]], false],
     ["discussMode", "vibe-talk.voice.discuss-mode", "overlay", [["docked", "docked"], ["maximized", "maximized"], ["overlay", "overlay"]], "overlay"],
+    ["discussDockedHeight", "vibe-talk.voice.discuss-docked-height", 50, [[65, "65"], [20, "20"]], 50],
     ["discussFolds", "vibe-talk.voice.discuss-folds", null, [[{ record: "chan-1||1700000000000", open: ["Beta"] }, "{\"record\":\"chan-1||1700000000000\",\"open\":[\"Beta\"]}"], [null, null]], null],
   ];
   const refused = () => { throw new Error("SecurityError"); };

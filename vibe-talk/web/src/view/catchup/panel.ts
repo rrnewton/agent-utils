@@ -135,6 +135,13 @@ export interface DiscussPanelDependencies {
   clampWidth?(value: unknown): number;
   /** The width a double-click (and no choice yet) restores. */
   defaultWidth?: number;
+  /** `#1552`. The docked pane's height (viewport %), as last left on this device. */
+  storedDockedHeight?(): number;
+  keepDockedHeight?(pct: number): void;
+  /** A docked height this page will apply: the device setting's clamp, handed in. */
+  clampDockedHeight?(value: unknown): number;
+  /** The docked height a double-click (and no choice yet) restores. */
+  defaultDockedHeight?: number;
   /** Whether the phone sheet stands at full height, as last left on this device. */
   storedSheetFull?(): boolean;
   keepSheetFull?(full: boolean): void;
@@ -220,6 +227,10 @@ export interface DiscussPanel {
   width(): number;
   /** `#1344`. Put a width on the panel and keep it on the device. */
   setWidth(px: unknown): void;
+  /** `#1552`. The docked pane's height in force, a viewport percentage. */
+  dockedHeight(): number;
+  /** `#1552`. Put a docked height on the pane and keep it on the device. */
+  setDockedHeight(pct: unknown): void;
   /** `#1344`. Whether the phone sheet stands at full height. */
   sheetFull(): boolean;
   /** `#1344`. Stand the phone sheet at full or half height and keep the choice. */
@@ -562,6 +573,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   const FALLBACK_MIN_WIDTH = 320;
   const FALLBACK_MAX_WIDTH = 960;
   let width = FALLBACK_DEFAULT_WIDTH;
+  // `#1552 discuss-docked-height-drag`. The docked pane's height, a viewport
+  // percentage; the stylesheet's grid row reads it as `--discuss-docked-height`.
+  const FALLBACK_DEFAULT_DOCKED_HEIGHT = 50;
+  const FALLBACK_MIN_DOCKED_HEIGHT = 20;
+  const FALLBACK_MAX_DOCKED_HEIGHT = 85;
+  let dockedHeight = FALLBACK_DEFAULT_DOCKED_HEIGHT;
+  let heightDrag: { startY: number; startPct: number; moved: boolean } | null = null;
   let sheetFull = false;
   let layoutMode: DiscussLayoutMode = "overlay";
   let drag: { startX: number; startWidth: number } | null = null;
@@ -763,6 +781,88 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     return deps.defaultWidth ?? FALLBACK_DEFAULT_WIDTH;
   }
 
+  function clampDockedHeight(value: unknown): number {
+    if (deps.clampDockedHeight) return deps.clampDockedHeight(value);
+    const pct = Math.round(Number(value));
+    return Number.isFinite(pct)
+      ? Math.min(FALLBACK_MAX_DOCKED_HEIGHT, Math.max(FALLBACK_MIN_DOCKED_HEIGHT, pct))
+      : FALLBACK_DEFAULT_DOCKED_HEIGHT;
+  }
+
+  function defaultDockedHeight(): number {
+    return deps.defaultDockedHeight ?? FALLBACK_DEFAULT_DOCKED_HEIGHT;
+  }
+
+  /** Snap near half and near the ends, on release only so a drag never jumps. */
+  function snapDockedHeight(pct: number): number {
+    const clamped = clampDockedHeight(pct);
+    if (Math.abs(clamped - FALLBACK_DEFAULT_DOCKED_HEIGHT) <= 3) return FALLBACK_DEFAULT_DOCKED_HEIGHT;
+    if (clamped - FALLBACK_MIN_DOCKED_HEIGHT <= 2) return FALLBACK_MIN_DOCKED_HEIGHT;
+    if (FALLBACK_MAX_DOCKED_HEIGHT - clamped <= 2) return FALLBACK_MAX_DOCKED_HEIGHT;
+    return clamped;
+  }
+
+  /** The viewport height a percentage is taken of; a phone's 844 where unknown. */
+  function viewportHeight(): number {
+    try {
+      const h = document.documentElement?.clientHeight ?? 0;
+      return h > 0 ? h : 844;
+    } catch {
+      return 844;
+    }
+  }
+
+  /**
+   * `#1552`. Keep/read the docked height where the page keeps nothing handed
+   * in: the same device key the device setting owns, read directly, so the
+   * choice still sticks across a reload. A refused store holds for the session.
+   */
+  const DOCKED_HEIGHT_KEY = "vibe-talk.voice.discuss-docked-height";
+  function fallbackStoredDockedHeight(): number | undefined {
+    if (deps.storedDockedHeight) return undefined;
+    try {
+      const raw = (globalThis as { localStorage?: { getItem(k: string): string | null } }).localStorage?.getItem(DOCKED_HEIGHT_KEY);
+      return raw === null || raw === undefined ? undefined : clampDockedHeight(raw);
+    } catch {
+      return undefined;
+    }
+  }
+  function fallbackKeepDockedHeight(): void {
+    if (deps.keepDockedHeight) {
+      deps.keepDockedHeight(dockedHeight);
+      return;
+    }
+    try {
+      (globalThis as { localStorage?: { setItem(k: string, v: string): void } }).localStorage?.setItem(DOCKED_HEIGHT_KEY, String(dockedHeight));
+    } catch {
+      // Storage refused: the height holds until a reload.
+    }
+  }
+
+  /** Put `pct` on the pane as `--discuss-docked-height`; kept only when `keep`. */
+  function applyDockedHeight(pct: unknown, keep: boolean): number {
+    dockedHeight = clampDockedHeight(pct);
+    const value = `${dockedHeight}dvh`;
+    const style = (panel() as HTMLElement).style as { setProperty?: (n: string, v: string) => void } | undefined;
+    if (style && typeof style.setProperty === "function") style.setProperty("--discuss-docked-height", value);
+    const screen = maybe("screen-main");
+    const screenStyle = screen ? (screen as HTMLElement).style as { setProperty?: (n: string, v: string) => void } | undefined : undefined;
+    if (screenStyle && typeof screenStyle.setProperty === "function") screenStyle.setProperty("--discuss-docked-height", value);
+    const head = maybe("discuss-head");
+    if (head) {
+      head.setAttribute("aria-valuenow", String(dockedHeight));
+      head.setAttribute("aria-valuetext", `Discuss pane ${dockedHeight} percent of the screen high`);
+    }
+    if (keep) {
+      try {
+        fallbackKeepDockedHeight();
+      } catch {
+        // Storage refused: the height holds until a reload.
+      }
+    }
+    return dockedHeight;
+  }
+
   /** Put `px` on the panel as `--discuss-width`; kept on the device only when `keep`. */
   function applyWidth(px: unknown, keep: boolean): number {
     width = clampWidth(px);
@@ -879,6 +979,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       storedWidth = undefined;
     }
     applyWidth(storedWidth === undefined ? defaultWidth() : storedWidth, false);
+    let storedDocked: number | undefined;
+    try {
+      storedDocked = deps.storedDockedHeight?.() ?? fallbackStoredDockedHeight();
+    } catch {
+      storedDocked = undefined;
+    }
+    applyDockedHeight(storedDocked === undefined ? defaultDockedHeight() : storedDocked, false);
     let storedFull = false;
     try {
       storedFull = deps.storedSheetFull?.() ?? false;
@@ -1592,6 +1699,73 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           });
           listening.listen(handle, "dblclick", () => applyWidth(defaultWidth(), true));
         }
+        // `#1552 discuss-docked-height-drag`: the "Discuss agent" title bar
+        // drags the docked (half-height) pane up and down. Pointer events
+        // cover mouse, touch and pen; a press on a bar button never starts
+        // a drag, and movement under 6px is a tap, not a drag. Capture is
+        // taken only once the drag is real, so a tap still clicks its button.
+        const head = maybe("discuss-head");
+        if (head) {
+          const isButton = (target: unknown): boolean => {
+            const el = target as { tagName?: string; closest?: (s: string) => unknown } | null;
+            if (!el) return false;
+            if (String(el.tagName || "").toUpperCase() === "BUTTON") return true;
+            try {
+              return typeof el.closest === "function" && el.closest("button") !== null;
+            } catch {
+              return false;
+            }
+          };
+          listening.listen(head, "pointerdown", (event: PointerEvent) => {
+            if (sheetFull || isButton(event.target)) return;
+            heightDrag = { startY: event.clientY, startPct: dockedHeight, moved: false };
+          });
+          listening.listen(head, "pointermove", (event: PointerEvent) => {
+            if (!heightDrag) return;
+            const dy = heightDrag.startY - event.clientY;
+            if (!heightDrag.moved && Math.abs(dy) < 6) return;
+            if (!heightDrag.moved) {
+              heightDrag.moved = true;
+              const holder = head as HTMLElement & { setPointerCapture?: (id: number) => void };
+              if (typeof holder.setPointerCapture === "function" && event.pointerId !== undefined) {
+                try {
+                  holder.setPointerCapture(event.pointerId);
+                } catch {
+                  // No pointer to hold: move/up on the bar still follow.
+                }
+              }
+            }
+            if (typeof event.preventDefault === "function") event.preventDefault();
+            const vh = viewportHeight();
+            applyDockedHeight(heightDrag.startPct + (dy / vh) * 100, false);
+          });
+          const endHeightDrag = (): void => {
+            if (!heightDrag) return;
+            const moved = heightDrag.moved;
+            heightDrag = null;
+            if (moved) applyDockedHeight(snapDockedHeight(dockedHeight), true);
+          };
+          listening.listen(head, "pointerup", endHeightDrag);
+          listening.listen(head, "pointercancel", endHeightDrag);
+          listening.listen(head, "keydown", (event: KeyboardEvent) => {
+            const step = event.key === "ArrowUp" ? 2 : event.key === "ArrowDown" ? -2
+              : event.key === "PageUp" ? 10 : event.key === "PageDown" ? -10 : null;
+            if (step !== null) {
+              if (typeof event.preventDefault === "function") event.preventDefault();
+              applyDockedHeight(dockedHeight + step, true);
+            } else if (event.key === "Home") {
+              if (typeof event.preventDefault === "function") event.preventDefault();
+              applyDockedHeight(FALLBACK_MIN_DOCKED_HEIGHT, true);
+            } else if (event.key === "End") {
+              if (typeof event.preventDefault === "function") event.preventDefault();
+              applyDockedHeight(FALLBACK_MAX_DOCKED_HEIGHT, true);
+            }
+          });
+          listening.listen(head, "dblclick", (event: Event) => {
+            if (isButton((event as PointerEvent).target)) return;
+            applyDockedHeight(defaultDockedHeight(), true);
+          });
+        }
       }
       return {
         unmount() {
@@ -1662,6 +1836,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     width: () => width,
     setWidth(px: unknown) {
       applyWidth(px, true);
+    },
+    dockedHeight: () => dockedHeight,
+    setDockedHeight(pct: unknown) {
+      applyDockedHeight(pct, true);
     },
     sheetFull: () => sheetFull,
     setSheetFull(full: boolean) {

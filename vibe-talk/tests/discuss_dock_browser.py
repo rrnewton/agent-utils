@@ -206,6 +206,53 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     check(geo["areaHeight"] < before,
           f"opening Discuss did not give the list its own upper area: {before} -> {geo}")
 
+    # `#1552`: drag the "Discuss agent" title bar up: the pane grows, the
+    # list shrinks, the choice is kept on the device, and a tap on a bar
+    # button is not a drag (the full toggle below still works).
+    title = page.locator(".discuss-title").bounding_box()
+    check(title is not None, "the Discuss title bar has no box to drag")
+    cx, cy = title["x"] + title["width"] / 2, title["y"] + title["height"] / 2
+    page.mouse.move(cx, cy)
+    page.mouse.down()
+    page.mouse.move(cx, cy - 120, steps=12)
+    page.mouse.up()
+    page.wait_for_function(
+        "() => document.getElementById('discuss-panel')"
+        ".getBoundingClientRect().height >= innerHeight * 0.6",
+        timeout=20_000)
+    dragged = page.evaluate("""() => ({
+      now: document.getElementById('discuss-head').getAttribute('aria-valuenow'),
+      kept: localStorage.getItem('vibe-talk.voice.discuss-docked-height'),
+      areaBottom: document.getElementById('scroll-area').getBoundingClientRect().bottom,
+      panelTop: document.getElementById('discuss-panel').getBoundingClientRect().top,
+    })""")
+    check(dragged["now"] is not None and int(dragged["now"]) >= 60,
+          f"the title-bar drag did not resize the docked pane: {dragged}")
+    check(dragged["kept"] == dragged["now"],
+          f"the dragged height was not kept per device: {dragged}")
+    check(abs(dragged["areaBottom"] - dragged["panelTop"]) <= 2,
+          f"the scroller no longer ends at the dragged pane's top: {dragged}")
+    # Keyboard: the focused bar resizes with the arrows.
+    page.locator("#discuss-head").focus()
+    page.keyboard.press("ArrowDown")
+    page.wait_for_function(
+        "() => Number(document.getElementById('discuss-head')"
+        ".getAttribute('aria-valuenow')) < 60 + 5",
+        timeout=20_000)
+    # Close/reopen keeps the dragged height.
+    kept_now = page.evaluate(
+        "() => document.getElementById('discuss-head').getAttribute('aria-valuenow')")
+    page.click("#discuss-close")
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    open_discuss(page)
+    page.wait_for_function(
+        f"() => document.getElementById('discuss-head')"
+        f".getAttribute('aria-valuenow') === '{kept_now}'",
+        timeout=20_000)
+    import os
+    if os.environ.get("DISCUSS_SHOT_DIR"):
+        page.screenshot(path=f"{os.environ['DISCUSS_SHOT_DIR']}/discuss-drag-phone.png")
+
     page.click("#discuss-summarize")
     page.wait_for_selector("#discuss-answer a", state="attached", timeout=20_000)
     page.locator("#discuss-answer .discuss-collapse-bar button").first.click()
@@ -252,6 +299,13 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
         && r.height > 0;
     }""", timeout=20_000)
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+
+    # A double-click on the bar restores half height.
+    page.dblclick(".discuss-title")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-head')"
+        ".getAttribute('aria-valuenow') === '50'",
+        timeout=20_000)
 
     # Full height still covers; back to half docks again; close frees the list.
     page.click("#discuss-full-toggle")

@@ -126,6 +126,7 @@ export interface ElementById {
   "discuss-dock-toggle": HTMLButtonElement;
   "discuss-followup": HTMLTextAreaElement;
   "discuss-footer": HTMLDivElement;
+  "discuss-head": HTMLDivElement;
   "discuss-full-toggle": HTMLButtonElement;
   "discuss-hours": HTMLInputElement;
   "discuss-links": HTMLUListElement;

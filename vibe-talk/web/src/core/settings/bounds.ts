@@ -176,6 +176,29 @@ const MIN_DISCUSS_WIDTH = 320;
 const MAX_DISCUSS_WIDTH = 960;
 const DEFAULT_DISCUSS_WIDTH = 560;
 
+/**
+ * `#1552 discuss-docked-height-drag`. The docked (half-height) Discuss pane's height on a
+ * phone, as a PERCENTAGE of the viewport height (`dvh`). Fifty until the reader drags the
+ * title bar; the floor still shows the title bar plus a few lines and the bottom Summarize
+ * bar, the ceiling still leaves a few message rows above. Kept per device with the width.
+ */
+const MIN_DISCUSS_DOCKED_HEIGHT = 20;
+const MAX_DISCUSS_DOCKED_HEIGHT = 85;
+const DEFAULT_DISCUSS_DOCKED_HEIGHT = 50;
+
+/** A docked height this page will actually apply, read as `clampDiscussWidth` reads its width. */
+function clampDiscussDockedHeight(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) {
+    return DEFAULT_DISCUSS_DOCKED_HEIGHT;
+  }
+  const pct = Number(text);
+  if (!Number.isFinite(pct)) {
+    return DEFAULT_DISCUSS_DOCKED_HEIGHT;
+  }
+  return Math.min(MAX_DISCUSS_DOCKED_HEIGHT, Math.max(MIN_DISCUSS_DOCKED_HEIGHT, Math.round(pct)));
+}
+
 /** A Discuss width this page will actually apply, read as `clampTwoColumnSplit` reads its split. */
 function clampDiscussWidth(value: unknown): number {
   const text = typeof value === "string" ? value.trim() : value;
@@ -207,6 +230,7 @@ const clampReadSpeed = (value: unknown): number | null => {
 export {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_COLLAPSED_LINES,
+  DEFAULT_DISCUSS_DOCKED_HEIGHT,
   DEFAULT_DISCUSS_WIDTH,
   DEFAULT_MSG_SCALE,
   DEFAULT_MARK_READ_FIRST_PERCENT,
@@ -216,6 +240,7 @@ export {
   DEFAULT_TWO_COLUMN_SPLIT,
   MAX_CARD_MAX_LINES,
   MAX_COLLAPSED_LINES,
+  MAX_DISCUSS_DOCKED_HEIGHT,
   MAX_DISCUSS_WIDTH,
   MAX_MSG_SCALE,
   MAX_MARK_READ_FIRST_PERCENT,
@@ -226,6 +251,7 @@ export {
   MAX_TWO_COLUMN_SPLIT,
   MIN_CARD_MAX_LINES,
   MIN_COLLAPSED_LINES,
+  MIN_DISCUSS_DOCKED_HEIGHT,
   MIN_DISCUSS_WIDTH,
   MIN_MSG_SCALE,
   MIN_MARK_READ_FIRST_PERCENT,
@@ -236,6 +262,7 @@ export {
   MIN_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
   clampCollapsedLines,
+  clampDiscussDockedHeight,
   clampDiscussWidth,
   clampMsgScale,
   clampMarkReadFirstPercent,

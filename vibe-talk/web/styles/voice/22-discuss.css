@@ -21,7 +21,7 @@
   /* `#1527`: the pane measures `#1524`'s bound fit now that the ask stands
    * beside the head; the query below reads this box either way. */
   container-type: inline-size;
-  height: 50dvh;
+  height: var(--discuss-docked-height, 50dvh);
   overflow-y: auto;
   /* `#1531 discuss-top-bar-slim-fixed`: no top padding — the sticky head
    * carries its own, so the fixed bar sits flush with the panel's top. */
@@ -772,9 +772,25 @@ stay its owner's (#1524). The pane itself already ends above the
  * and the desk regimes above are untouched (a desk docks sideways,
  * `#1354`). The floating chips (#scroll-tools), anchored to the bottom of
  * #screen-main, ride above the docked sheet. */
+/* `#1552 discuss-docked-height-drag`: on a phone the half-height pane's title
+ * bar is its height handle — ns-resize cursor, no touch scrolling from the bar
+ * (the drag must not scroll the page or the list underneath), and a focus ring
+ * for its separator keys. Buttons in the bar keep their own pointer cursor. */
+@media not ((min-width: 900px) and (pointer: fine)) {
+  #discuss-panel[data-sheet="half"] .discuss-head {
+    cursor: ns-resize;
+    touch-action: none;
+  }
+
+  .discuss-head:focus-visible {
+    outline: 2px solid #7ab3e3;
+    outline-offset: -2px;
+  }
+}
+
 @media not ((min-width: 900px) and (pointer: fine)) {
   #screen-main:has(> #discuss-panel:not([hidden])[data-sheet="half"]) {
-    grid-template-rows: auto auto minmax(0, 1fr) minmax(0, 50dvh);
+    grid-template-rows: auto auto minmax(0, 1fr) minmax(0, var(--discuss-docked-height, 50dvh));
   }
 
   #screen-main > #discuss-panel:not([hidden])[data-sheet="half"] {
@@ -787,6 +803,6 @@ stay its owner's (#1524). The pane itself already ends above the
   }
 
   #screen-main:has(> #discuss-panel:not([hidden])[data-sheet="half"]) > #scroll-tools {
-    bottom: calc(50dvh + var(--chips-foot, 0.5rem));
+    bottom: calc(var(--discuss-docked-height, 50dvh) + var(--chips-foot, 0.5rem));
   }
 }

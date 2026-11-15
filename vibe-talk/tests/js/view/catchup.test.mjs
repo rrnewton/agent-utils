@@ -103,7 +103,7 @@ const IDS = [
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
   "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline",
   "discuss-followup", "discuss-send",
-  "discuss-actions", "discuss-resize",
+  "discuss-actions", "discuss-resize", "discuss-head",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
   "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours",
   // `#1531 discuss-top-bar-slim-fixed`: no #discuss-read in the top bar; the
@@ -161,7 +161,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["read-steer"].hidden = true;
   const calls = { posts: [], previews: [], records: [], followups: [], updates: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [], bound: [], history: [] };
   // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
-  const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [] };
+  const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [], dockedHeight: null, dockedKeeps: [] };
   const clampW = (value) => {
     const px = Math.round(Number(value));
     return Number.isFinite(px) ? Math.min(960, Math.max(320, px)) : 560;
@@ -213,6 +213,8 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     keepSheetFull: (full) => { kept.sheetFull = full; kept.sheetKeeps.push(full); },
     storedMode: () => kept.mode,
     keepMode: (mode) => { kept.mode = mode; kept.modeKeeps.push(mode); },
+    storedDockedHeight: () => (kept.dockedHeight === null ? 50 : kept.dockedHeight),
+    keepDockedHeight: (pct) => { kept.dockedHeight = pct; kept.dockedKeeps.push(pct); },
   };
   const savedDocument = globalThis.document;
   globalThis.document = {
@@ -902,6 +904,62 @@ test("catchup layout: the sheet starts at half, full height sticks across close/
     assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "full");
     view.setSheetFull(false);
     assert.equal(view.sheetFull(), false, "half height did not return the sheet to half");
+  } finally { fx.restore(); }
+});
+
+test("catchup docked height: title-bar drag resizes, clamps, snaps, keeps once; keys and buttons are not drags", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(view.dockedHeight(), 50, "the docked pane did not start at half");
+    assert.equal(fx.els["discuss-panel"].style.props["--discuss-docked-height"], "50dvh");
+    const head = fx.els["discuss-head"];
+    // A tap (below the 6px threshold) on the bar is never a drag.
+    fire(head, "pointerdown", { clientY: 400, pointerId: 7 });
+    fire(head, "pointermove", { clientY: 397, pointerId: 7 });
+    fire(head, "pointerup", { pointerId: 7 });
+    assert.equal(view.dockedHeight(), 50, "a sub-threshold tap dragged the pane");
+    assert.deepEqual(fx.kept.dockedKeeps, [], "a tap kept a height");
+    // Drag up (clientY falls) grows the pane; document height is 0 in the fake, so 844 is assumed.
+    fire(head, "pointerdown", { clientY: 400, pointerId: 7 });
+    fire(head, "pointermove", { clientY: 316, pointerId: 7 });
+    assert.equal(view.dockedHeight(), 60, "dragging up did not grow the pane");
+    assert.deepEqual(fx.kept.dockedKeeps, [], "the height was kept mid-drag");
+    fire(head, "pointerup", { pointerId: 7 });
+    assert.deepEqual(fx.kept.dockedKeeps, [60], "the dragged height was not kept at the end");
+    assert.equal(head.getAttribute("aria-valuenow"), "60");
+    // Clamp at both ends, snap near half on release.
+    view.setDockedHeight(1);
+    assert.equal(view.dockedHeight(), 20, "a height under the floor was not clamped");
+    view.setDockedHeight(999);
+    assert.equal(view.dockedHeight(), 85, "a height over the ceiling was not clamped");
+    view.setDockedHeight(50);
+    fire(head, "pointerdown", { clientY: 400, pointerId: 7 });
+    fire(head, "pointermove", { clientY: 383, pointerId: 7 });
+    fire(head, "pointerup", { pointerId: 7 });
+    assert.equal(view.dockedHeight(), 50, "a release near half did not snap to half");
+    // Keyboard: ArrowUp grows, ArrowDown shrinks, kept at once.
+    fire(head, "keydown", { key: "ArrowUp" });
+    assert.equal(view.dockedHeight(), 52, "ArrowUp did not grow the pane");
+    fire(head, "keydown", { key: "ArrowDown" });
+    assert.equal(view.dockedHeight(), 50, "ArrowDown did not shrink the pane");
+    assert.equal(fx.kept.dockedKeeps.at(-1), 50, "the keyed height was not kept");
+    fire(head, "dblclick", {});
+    assert.equal(view.dockedHeight(), 50, "a double-click did not restore half");
+    // The kept height survives close/reopen; full sheet ignores the drag.
+    view.setDockedHeight(65);
+    view.close();
+    view.open();
+    await flush();
+    assert.equal(view.dockedHeight(), 65, "the kept height did not survive close/reopen");
+    view.setSheetFull(true);
+    fire(head, "pointerdown", { clientY: 400, pointerId: 7 });
+    fire(head, "pointermove", { clientY: 300, pointerId: 7 });
+    fire(head, "pointerup", { pointerId: 7 });
+    assert.equal(view.dockedHeight(), 65, "dragging the full sheet's bar resized the docked height");
   } finally { fx.restore(); }
 });
 

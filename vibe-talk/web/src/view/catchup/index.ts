@@ -127,6 +127,10 @@ export interface DiscussViewDependencies {
   keepWidth?(px: number): void;
   clampWidth?(value: unknown): number;
   defaultWidth?: number;
+  storedDockedHeight?(): number;
+  keepDockedHeight?(pct: number): void;
+  clampDockedHeight?(value: unknown): number;
+  defaultDockedHeight?: number;
   storedSheetFull?(): boolean;
   keepSheetFull?(full: boolean): void;
   /** `#1354 discuss-layout-modes`. The panel's layout mode, forwarded to the panel. */
@@ -180,6 +184,10 @@ export interface DiscussView {
   width(): number;
   /** `#1344`. Put a width on the panel and keep it on the device. */
   setWidth(px: unknown): void;
+  /** `#1552`. The docked pane's height in force, a viewport percentage. */
+  dockedHeight(): number;
+  /** `#1552`. Put a docked height on the pane and keep it on the device. */
+  setDockedHeight(pct: unknown): void;
   /** `#1344`. Whether the phone sheet stands at full height. */
   sheetFull(): boolean;
   /** `#1344`. Stand the phone sheet at full or half height and keep the choice. */
@@ -373,6 +381,10 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     keepWidth: deps.keepWidth,
     clampWidth: deps.clampWidth,
     defaultWidth: deps.defaultWidth,
+    storedDockedHeight: deps.storedDockedHeight,
+    keepDockedHeight: deps.keepDockedHeight,
+    clampDockedHeight: deps.clampDockedHeight,
+    defaultDockedHeight: deps.defaultDockedHeight,
     storedSheetFull: deps.storedSheetFull,
     keepSheetFull: deps.keepSheetFull,
     storedMode: deps.storedMode,
@@ -521,6 +533,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     },
     width: () => panel.width(),
     setWidth: (px: unknown) => panel.setWidth(px),
+    dockedHeight: () => panel.dockedHeight(),
+    setDockedHeight: (pct: unknown) => panel.setDockedHeight(pct),
     sheetFull: () => panel.sheetFull(),
     setSheetFull: (full: boolean) => panel.setSheetFull(full),
     mode: () => panel.mode(),

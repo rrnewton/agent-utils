@@ -10,6 +10,7 @@ import {
   DEFAULT_MARK_READ_LONG_WORDS,
   DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_COLLAPSED_LINES,
+  DEFAULT_DISCUSS_DOCKED_HEIGHT,
   DEFAULT_DISCUSS_WIDTH,
   DEFAULT_MSG_SCALE,
   DEFAULT_READING_CH,
@@ -19,6 +20,7 @@ import {
   clampMarkReadLongWords,
   clampQuoteReadPercent,
   clampCollapsedLines,
+  clampDiscussDockedHeight,
   clampDiscussWidth,
   clampMsgScale,
   clampReadSpeed,
@@ -195,6 +197,14 @@ export const DEVICE_SETTINGS = Object.freeze({
     read: (raw: string | null) => clampDiscussWidth(raw === null ? DEFAULT_DISCUSS_WIDTH : raw),
     write: (px: number) => String(px),
     refused: { value: DEFAULT_DISCUSS_WIDTH },
+  } satisfies DeviceSetting<number>,
+  /** `#1552 discuss-docked-height-drag`. The docked pane's height, a viewport percentage,
+   * clamped (`clampDiscussDockedHeight`). Per device, as the width is; a refused read is half. */
+  discussDockedHeight: {
+    key: "vibe-talk.voice.discuss-docked-height",
+    read: (raw: string | null) => clampDiscussDockedHeight(raw === null ? DEFAULT_DISCUSS_DOCKED_HEIGHT : raw),
+    write: (pct: number) => String(pct),
+    refused: { value: DEFAULT_DISCUSS_DOCKED_HEIGHT },
   } satisfies DeviceSetting<number>,
   /** `#1344 discuss-panel-resize` (owner reply 417). Whether the phone's Discuss sheet stands at
    * full height: half until the reader maximizes it, and the choice sticks across close/reopen.
