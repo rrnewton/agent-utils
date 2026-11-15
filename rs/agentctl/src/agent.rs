@@ -1995,19 +1995,25 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
     // concurrent send never waits out a delivery it is not part of. Claimed
     // items sit in `inflight/` under their per-item claim lock, which
     // start-of-drain recovery leaves to their owner (see agent-queue).
-    let take_queue_lock = |lock_runtime: &dyn AgentRuntime| -> AgentResult<File> {
-        let lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
-        lock_exclusive_with_runtime(&lock, &queue_lock_path, "queue delivery", lock_runtime)
-            .map_err(lock_limit)?;
-        verify_queue_lock(
-            root,
-            directory_identity,
-            &queue_lock_path,
-            &lock,
-            "queue delivery lock",
-        )?;
-        Ok(lock)
-    };
+    // Held locks unlock explicitly on drop: releasing by closing the
+    // descriptor alone would keep the flock held while any child
+    // forked under it (every Herdr call spawns one) sits between fork
+    // and exec, and the next take would find it spuriously busy.
+    let take_queue_lock =
+        |lock_runtime: &dyn AgentRuntime| -> AgentResult<agent_queue::fsio::HeldLock> {
+            let lock = open_private_lock(&queue_lock_path, "queue delivery lock")?;
+            lock_exclusive_with_runtime(&lock, &queue_lock_path, "queue delivery", lock_runtime)
+                .map_err(lock_limit)?;
+            let lock = agent_queue::fsio::HeldLock::new(lock);
+            verify_queue_lock(
+                root,
+                directory_identity,
+                &queue_lock_path,
+                &lock,
+                "queue delivery lock",
+            )?;
+            Ok(lock)
+        };
     let mut queue_lock = take_queue_lock(lock_runtime)?;
     let mut delivered = Vec::new();
     // An item a previous process may have typed goes back to pending as
@@ -4205,6 +4211,7 @@ fn bind_queue_with_runtime(
     let binding_path = root.join("target.json");
     let lock = open_private_lock(&lock_path, "queue binding lock")?;
     lock_exclusive_with_runtime(&lock, &lock_path, "queue binding", runtime)?;
+    let lock = agent_queue::fsio::HeldLock::new(lock);
     verify_queue_lock(
         root,
         directory_identity,
