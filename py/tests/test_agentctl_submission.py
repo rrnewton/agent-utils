@@ -652,6 +652,18 @@ def test_codex_0_169_staged_text_is_the_composer_without_the_status_row() -> Non
     assert "Read coordinator brief" in view.footer, view
 
 
+def test_codex_0_169_multi_paragraph_draft_keeps_its_paragraphs() -> None:
+    screen = (
+        "• Working (1s • esc to interrupt)\n\n› 3 queued messages:\n\n"
+        "  [from a] note a\n\n  [from b] note b\n\n"
+        f"{_V169_STATUS_TITLED}\n  ← for agents · ? for shortcuts\n"
+    )
+    view = composer_view("codex", screen)
+    assert view is not None, screen
+    assert "note a" in view.composer_solid and "note b" in view.composer_solid, view
+    assert "GPT-6.1-Sol" in view.footer, view
+
+
 def test_codex_0_169_idle_pane_accepts_a_send() -> None:
     replay = Replay(_V169_FRESH_IDLE, _V169_STAGED, _V169_SUBMITTED)
     receipt = _replay_submit(replay, _V159_PROMPT)

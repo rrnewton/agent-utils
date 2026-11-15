@@ -433,15 +433,24 @@ def _codex_view(rows: list[tuple[str, str]]) -> ComposerView | None:
             return None
     if start is None:
         return None
-    # Populated rows below a blank row inside the candidate are footer rows
-    # this reader could not classify (a future layout). Reading them as
-    # composer text would refuse a send over words nobody typed, so the
-    # composer is unrecognisable instead: unknown never reads as a draft.
-    below_blank = False
-    for plain, _ in rows[start + 1:footer]:
-        if not plain.strip():
-            below_blank = True
-        elif below_blank:
+    # Populated rows below a blank row inside the candidate, under a
+    # composer holding only its placeholder, are footer rows this reader
+    # could not classify (a future layout). Reading them as composer text
+    # would refuse a send over words nobody typed, so the composer is
+    # unrecognisable instead: unknown never reads as a draft. Under a
+    # composer holding real text they are its own later paragraphs, which
+    # a multi-paragraph draft relies on, so they stay composer text.
+    blank = next(
+        (i for i in range(start + 1, footer) if not rows[i][0].strip()), None
+    )
+    if blank is not None and any(rows[i][0].strip() for i in range(blank + 1, footer)):
+        head_plain = [plain for plain, _ in rows[start:blank]]
+        head_solid = [solid for _, solid in rows[start:blank]]
+        head_plain[0] = head_plain[0][1:]
+        head_solid[0] = head_solid[0][1:]
+        if _codex_only_placeholder_and_braille(
+            "\n".join(head_plain), "\n".join(head_solid)
+        ):
             return None
     body = rows[start:footer]
     plain_lines = [plain for plain, _ in body]

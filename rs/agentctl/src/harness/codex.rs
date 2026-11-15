@@ -337,16 +337,21 @@ fn view(rows: &[(Vec<char>, Vec<char>)]) -> Option<ComposerView> {
         }
     }
     let start = start?;
-    // Populated rows below a blank row inside the candidate are footer rows
-    // this reader could not classify (a future layout). Reading them as
-    // composer text would refuse a send over words nobody typed, so the
-    // composer is unrecognisable instead: unknown never reads as a draft.
-    let mut below_blank = false;
-    for (plain, _) in &rows[start + 1..footer] {
-        if plain.iter().all(|c| c.is_whitespace()) {
-            below_blank = true;
-        } else if below_blank {
-            return None;
+    // Populated rows below a blank row inside the candidate, under a
+    // composer holding only its placeholder, are footer rows this reader
+    // could not classify (a future layout). Reading them as composer text
+    // would refuse a send over words nobody typed, so the composer is
+    // unrecognisable instead: unknown never reads as a draft. Under a
+    // composer holding real text they are its own later paragraphs, which
+    // a multi-paragraph draft relies on, so they stay composer text.
+    if let Some(blank) =
+        (start + 1..footer).find(|index| rows[*index].0.iter().all(|c| c.is_whitespace()))
+    {
+        if (blank + 1..footer).any(|index| rows[index].0.iter().any(|c| !c.is_whitespace())) {
+            let (head, head_solid) = composer_from(&rows[start..blank], 1);
+            if only_placeholder_and_braille(&head, &head_solid) {
+                return None;
+            }
         }
     }
     let (composer, mut composer_solid) = composer_from(&rows[start..footer], 1);

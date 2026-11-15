@@ -3231,7 +3231,14 @@ mod tests {
 
         /// [`PROMPT`] pasted into the composer, before the submission key.
         pub(super) fn staged() -> String {
-            screen(&["• Done.", "", &format!("› {PROMPT}"), "", STATUS_TITLED, HINT])
+            screen(&[
+                "• Done.",
+                "",
+                &format!("› {PROMPT}"),
+                "",
+                STATUS_TITLED,
+                HINT,
+            ])
         }
 
         /// After Enter: the prompt is in the transcript and the composer is empty again.
@@ -3765,6 +3772,18 @@ mod tests {
     }
 
     #[test]
+    fn codex_0_169_multi_paragraph_draft_keeps_its_paragraphs() {
+        // Rows below a blank row under a composer holding real text are the
+        // draft's own later paragraphs, not footer: a batched prompt relies
+        // on them staying composer text.
+        let screen = "• Working (1s • esc to interrupt)\n\n› 3 queued messages:\n\n  [from a] note a\n\n  [from b] note b\n\n  GPT-6.1-Sol medium · /work/slot · Read coordinator brief\n  ← for agents · ? for shortcuts\n";
+        let view = composer_view("codex", screen).unwrap();
+        assert!(view.composer_solid.contains("note a"), "{view:?}");
+        assert!(view.composer_solid.contains("note b"), "{view:?}");
+        assert!(view.footer.contains("GPT-6.1-Sol"), "{view:?}");
+    }
+
+    #[test]
     fn codex_0_169_idle_pane_accepts_a_send() {
         let replay = Replay::new(
             codex_v0_169::fresh_idle(),
@@ -3800,7 +3819,10 @@ mod tests {
             &clock,
         );
         let reason = refusal(outcome);
-        assert!(reason.contains("already holds unsubmitted text"), "{reason}");
+        assert!(
+            reason.contains("already holds unsubmitted text"),
+            "{reason}"
+        );
         assert!(reason.contains("unsent operator draft"), "{reason}");
         assert!(replay.pastes.lock().unwrap().is_empty());
         assert!(replay.keys.lock().unwrap().is_empty());
