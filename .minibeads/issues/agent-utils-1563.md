@@ -1,6 +1,6 @@
 ---
 title: 'thread-picker-names-and-width: slug plus readable title in the picker and header, names from the cache'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -36,3 +36,7 @@ Two commits, each gated and landed on its own, picker first.
 # Notes
 
 No live configuration change: no interval value fixes a starved shared bucket. Sibling lanes: the Settings view and the Discord row grouping touch other files; the shared health surface is agreed with the summariser-fallback lane, which folds these counters into its one headline rather than adding a second warning.
+
+## Resolution
+
+[watermelon-full-preview] Landed in two gated commits on github/main: the picker and header as 18caf792 (gate a70183a5), cache-first naming as 8db6490b (gate 33b870e2). Screenshots looked at: /tmp/shots-pickername/threadpin-desk-1-popup-bang-pinned.png, threadpin-phone-1-popup-bang-pinned.png, threadpin-desk-4-thread-header-slug.png. Browser tests at 390x852 and 1280x800 plus the naming suites pass; the full validate DAG is green twice. The thread_naming counters join the one summarizer_health diagnostics surface; the page banner is the fallback lane's fold-in of the same counters.
