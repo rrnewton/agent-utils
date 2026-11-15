@@ -120,4 +120,33 @@ function foldedTextLine(body: Element, text: unknown, collapsedLines: number): H
     : [{ runs: drawn(""), rh: null }], collapsedLines);
 }
 
-export { FOLD_FLOW_BLOCKS, FOLD_INLINE, RESTATED_CLASS, elisionLine, foldRuns, foldedTextLine, textNodesOf };
+/**
+ * Open `row` whole for a landing (`#1585 linked-message-always-expanded`): a jump to a
+ * message — a link, a reply arrow, a bookmark, any "jump to" — shows its target in full,
+ * never folded. A folded row is opened by its own fold control, so the opening is the
+ * reader's own act in every way that matters: the fold's record (`expandedIds`) keeps
+ * the message open across redraws until the reader folds it again. Any fold drawn
+ * inside the row (a folded quote, a "show more") is opened with it. True where anything
+ * was opened. A row with no fold, or already open, is left exactly as it stands.
+ */
+function expandLandedRow(row: HTMLElement): boolean {
+  let opened = false;
+  if (row.getAttribute("data-collapsed") === "true" && typeof row.querySelector === "function") {
+    const fold = row.querySelector(".fold") as HTMLElement | null;
+    if (fold && typeof fold.click === "function") {
+      fold.click();
+      opened = true;
+    }
+  }
+  if (typeof row.querySelectorAll === "function") {
+    for (const fold of [...row.querySelectorAll("details")] as Array<HTMLElement & { open?: boolean }>) {
+      if (fold.open !== true) {
+        fold.open = true;
+        opened = true;
+      }
+    }
+  }
+  return opened;
+}
+
+export { FOLD_FLOW_BLOCKS, FOLD_INLINE, RESTATED_CLASS, elisionLine, expandLandedRow, foldRuns, foldedTextLine, textNodesOf };

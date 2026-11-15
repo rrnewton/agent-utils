@@ -108,6 +108,7 @@ import {
 } from "../../core/annotations/index.ts";
 import { bookmarkSpot } from "../../present/rows/index.ts";
 import { idsOf, rowMessages, rowNewestMs, rowSentMs, rowShown } from "./rows.ts";
+import { expandLandedRow } from "./fold.ts";
 
 /** A bookmark anchor, as the server holds it. */
 export interface BookmarkAnchorLike {
@@ -387,6 +388,8 @@ export function createReadingBookmark(deps: ReadingBookmarkDependencies): Readin
     if (deps.side()) return deps.inColumn(deps.mainColumn(), landOnBookmark);
     const target = bookmarkDrawn.main;
     if (!target || !target.row.bookmarkLine || target.row.parentNode !== el("discord-log")) return false;
+    // `#1585 linked-message-always-expanded`. A jump shows its message in full.
+    expandLandedRow(target.row);
     const area = el("scroll-area");
     const line = target.row.bookmarkLine;
     deps.nudge(area, line.getBoundingClientRect().top - deps.paneHead() - deps.replyLandingGapPx());

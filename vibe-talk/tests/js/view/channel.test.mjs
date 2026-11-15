@@ -26,6 +26,31 @@ test("`#624 voice-page-modularity`: a drawn body read into the fold model's runs
   assert.equal(textNodesOf(node("pre", ["a", node("b", ["c"])]), "|"), "a|c");
 });
 
+test("`#1585 linked-message-always-expanded`: a landing opens its folded row whole, from the module alone", () => {
+  const { expandLandedRow } = CHANNEL_VIEW;
+  const landedRow = (collapsed, detailsOpen = []) => {
+    let clicks = 0;
+    const fold = { click: () => { clicks += 1; } };
+    const details = detailsOpen.map((open) => ({ open }));
+    const row = {
+      getAttribute: (name) => (name === "data-collapsed" ? collapsed : null),
+      querySelector: (selector) => (selector === ".fold" ? fold : null),
+      querySelectorAll: (selector) => (selector === "details" ? details : []),
+    };
+    return { row, clicks: () => clicks, details };
+  };
+  const folded = landedRow("true", [false, true]);
+  assert.equal(expandLandedRow(folded.row), true, "a folded landing was not opened");
+  assert.equal(folded.clicks(), 1, "the row's own fold control was not used, so its kept-open record would not hold");
+  assert.deepStrictEqual(folded.details.map((one) => one.open), [true, true], "a fold inside the row was left shut");
+  const open = landedRow("false", [true]);
+  assert.equal(expandLandedRow(open.row), false, "an open landing was touched");
+  assert.equal(open.clicks(), 0, "an open row's fold was clicked");
+  const plain = landedRow(null, []);
+  assert.equal(expandLandedRow(plain.row), false, "a row with no fold was touched");
+  assert.equal(plain.clicks(), 0, "a row with no fold was clicked");
+});
+
 test("`#624 voice-page-modularity`: a time's title is worded again as the pointer reaches it, from the module alone", () => {
   const { freshenDayTitle, rowTime, EDITED_MARK } = CHANNEL_VIEW;
   const timeEl = (className, at, text) => {

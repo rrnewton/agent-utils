@@ -9,6 +9,7 @@ import { childByClass } from "../dom/index.ts";
 import { idsOf, rowShown } from "./rows.ts";
 import { setArrowReach, setMarkerLift } from "./replies.ts";
 import { PULL_WAIT_MS } from "./pull.ts";
+import { expandLandedRow } from "./fold.ts";
 
 /** How far below the floating line a row lands, so its top edge is not flush against the pill. */
 export const REPLY_LANDING_GAP_PX = 8;
@@ -356,6 +357,10 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
    * come back from. A row nearer the end of the list than a screenful stops where the list does.
    */
   function revealRow(row: ReplyArrowRow, center = false): void {
+    // `#1585 linked-message-always-expanded`. Every landing comes through here — a link,
+    // a reply arrow, a reply count, a sent message — so the target is opened whole first,
+    // before its height is measured: the reader asked for this message, in full.
+    expandLandedRow(row);
     const area = deps.el("scroll-area");
     // The reader asked for this message: a filter change's hold, and its walk back, give way. `#243`.
     deps.filterState().hold = null;

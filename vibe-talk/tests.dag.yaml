@@ -1591,6 +1591,25 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1585 linked-message-always-expanded`, in the browser engine: every way of going to a
+  # message — an in-app link, a reply's arrow, a combined row's second constituent, an
+  # `:email:` short ref, and the address the page opens by — lands on a folded long message
+  # opened whole and on screen, at 390x844 with touch and at 1280x800.
+  - group: check
+    job: linked-expand-browser
+    desc: a jump to a folded message by link, reply arrow, combined constituent, short ref or deep link opens it whole and on screen, in current Chromium at 390x844 with touch and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/linked_expand_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 10
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#1224 mention-jump-in-view`, in the browser engine: a Documents mention tapped in a channel of
   # 120 long messages read ten at a time, its message mid-history. At 393x852 with touch and at
   # 1280x800, in the owner's configuration (collapsed summaries off) late reads that replace rows
