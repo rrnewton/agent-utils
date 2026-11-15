@@ -1,12 +1,13 @@
 ---
 title: 'discuss-drag-grip-mark: a visible grip on the draggable Discuss title bar'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-11-15T12:00:00.000000000+00:00
-updated_at: 2026-11-15T12:00:00.000000000+00:00
+updated_at: 2026-11-15T12:45:00.000000000+00:00
+closed_at: 2026-11-15T12:45:00.000000000+00:00
 ---
 
 # Description
@@ -67,3 +68,7 @@ Owner UI request 078; prior work reused: #1552 (the drag this makes
 discoverable), #1531 discuss-top-bar-slim-fixed (the bar the grip sits
 in), #1526 discuss-docked-pane-mobile (the dock), #1527 (bottom bar,
 untouched).
+
+## Resolution
+
+Landed e58a51b8 (gate pass on f3046f86, owner priority; mu-grip). A three-line grip sits centred on the docked half-height Discuss title bar on phones, only where the bar drags; hidden on the full-height sheet and the desktop overlay; title and buttons keep their space at 390 and 320 px. Deployed to the live Slack instance 2026-11-15 07:24 ET; the 15-minute post-deploy watch passed. Not tested: a physical finger drag (same pointer-event path as the tested mouse drag).
