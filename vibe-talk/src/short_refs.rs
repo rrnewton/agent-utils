@@ -91,8 +91,16 @@ impl ShortRefs {
             return None;
         }
         Some(Self {
-            threads: file.threads.into_iter().map(|entry| (entry.n, entry)).collect(),
-            messages: file.messages.into_iter().map(|entry| (entry.n, entry)).collect(),
+            threads: file
+                .threads
+                .into_iter()
+                .map(|entry| (entry.n, entry))
+                .collect(),
+            messages: file
+                .messages
+                .into_iter()
+                .map(|entry| (entry.n, entry))
+                .collect(),
         })
     }
 
@@ -155,7 +163,9 @@ static READER: LazyLock<RwLock<Reader>> = LazyLock::new(|| {
 /// Configure the reader once at startup: the `short-refs.json` paths and the
 /// `issue_url_template` (`{n}` where the number goes), as `[render]` names them.
 pub fn set_short_refs(files: Vec<PathBuf>, issue_url_template: Option<String>) {
-    let mut reader = READER.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut reader = READER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     reader.files = files;
     reader.issue_url_template = issue_url_template;
     reader.stamps = Vec::new();
@@ -166,7 +176,9 @@ pub fn set_short_refs(files: Vec<PathBuf>, issue_url_template: Option<String>) {
 /// configured. The template was checked at load: exactly one `{n}`, https.
 #[must_use]
 pub fn issue_url(n: u64) -> Option<String> {
-    let reader = READER.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reader = READER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     reader
         .issue_url_template
         .as_ref()
@@ -184,7 +196,10 @@ pub fn issue_template_problem(template: &str) -> Option<String> {
         || template.matches('{').count() != 1
         || template.matches('}').count() != 1
     {
-        return Some("issue_url_template must hold exactly one {n} placeholder and no other brace".to_owned());
+        return Some(
+            "issue_url_template must hold exactly one {n} placeholder and no other brace"
+                .to_owned(),
+        );
     }
     None
 }
@@ -198,7 +213,9 @@ pub fn short_refs() -> Arc<ShortRefs> {
     if let Some(refs) = TEST_REFS.with(|cell| cell.borrow().clone()) {
         return refs;
     }
-    let mut reader = READER.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut reader = READER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let stamps: Vec<Option<(SystemTime, u64)>> = reader
         .files
         .iter()
@@ -232,7 +249,9 @@ pub fn fingerprint() -> Option<String> {
     if TEST_REFS.with(|cell| cell.borrow().is_some()) {
         return Some("test".to_owned());
     }
-    let reader = READER.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reader = READER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if reader.files.is_empty() && reader.issue_url_template.is_none() {
         return None;
     }
@@ -335,7 +354,9 @@ mod tests {
         // A root message names no thread over itself; a reply names its root.
         let root = refs.message(1846).expect("message 1846");
         assert_eq!(root.thread, None);
-        assert!(root.message.is_some_and(|id| !id.is_empty() && id != "1700000000.000100"));
+        assert!(root
+            .message
+            .is_some_and(|id| !id.is_empty() && id != "1700000000.000100"));
         let reply = refs.message(1847).expect("message 1847");
         assert_eq!(reply.thread.as_deref(), Some("1700000000.000100"));
         assert_eq!(refs.thread(999), None);
@@ -350,7 +371,10 @@ mod tests {
 
     #[test]
     fn issue_templates_are_checked() {
-        assert_eq!(issue_template_problem("https://tracker.example.invalid/issues/{n}"), None);
+        assert_eq!(
+            issue_template_problem("https://tracker.example.invalid/issues/{n}"),
+            None
+        );
         assert!(issue_template_problem("http://tracker.example.invalid/{n}").is_some());
         assert!(issue_template_problem("https://tracker.example.invalid/issues/").is_some());
         assert!(issue_template_problem("https://tracker.example.invalid/{n}/{n}").is_some());

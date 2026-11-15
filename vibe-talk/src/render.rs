@@ -1208,14 +1208,13 @@ fn mark_message_links(html: &str) -> String {
 fn short_ref_link(href: &str) -> Option<(String, crate::message_links::Target, &'static str)> {
     let path = href.strip_prefix(SHORTREF_HOST)?;
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    let target = |channel: &str, message: Option<&str>, thread: Option<&str>| {
-        crate::message_links::Target {
+    let target =
+        |channel: &str, message: Option<&str>, thread: Option<&str>| crate::message_links::Target {
             service: crate::message_links::Service::Slack,
             channel: channel.to_owned(),
             message: message.map(str::to_owned),
             thread: thread.map(str::to_owned),
-        }
-    };
+        };
     match parts.as_slice() {
         ["thread", channel, root] if !root.is_empty() => Some((
             format!(
@@ -2565,7 +2564,13 @@ fn sanitizer_builder<'a>() -> ammonia::Builder<'a> {
         .tag_attributes(HashMap::from([
             (
                 "a",
-                HashSet::from(["href", "title", crate::message_links::ATTRIBUTE, "data-doc", "data-shortref"]),
+                HashSet::from([
+                    "href",
+                    "title",
+                    crate::message_links::ATTRIBUTE,
+                    "data-doc",
+                    "data-shortref",
+                ]),
             ),
             ("ol", HashSet::from(["start"])),
             ("input", HashSet::from(["checked"])),
@@ -2766,7 +2771,9 @@ fn link_short_refs<'a>(
         for token in tokens {
             if token.start > written {
                 node.insert_before(
-                    arena.alloc(NodeValue::Text(text[written..token.start].to_owned().into()).into()),
+                    arena.alloc(
+                        NodeValue::Text(text[written..token.start].to_owned().into()).into(),
+                    ),
                 );
             }
             let shown = &text[token.start..token.end];
@@ -2832,8 +2839,8 @@ fn short_ref_tokens(text: &str) -> Vec<ShortRefToken> {
     let mut at = 0;
     while at < bytes.len() {
         if bytes[at] == b':' {
-            let before_ok = at == 0
-                || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let before_ok =
+                at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
             if before_ok {
                 if let Some((prefix, kind)) = KINDS
                     .iter()
@@ -2846,7 +2853,12 @@ fn short_ref_tokens(text: &str) -> Vec<ShortRefToken> {
                     }
                     if end > digits_start {
                         if let Ok(number) = text[digits_start..end].parse::<u64>() {
-                            tokens.push(ShortRefToken { kind: *kind, number, start: at, end });
+                            tokens.push(ShortRefToken {
+                                kind: *kind,
+                                number,
+                                start: at,
+                                end,
+                            });
                         }
                         at = end;
                         continue;
@@ -6527,8 +6539,14 @@ mod short_ref_tests {
         let html = drawn("see :thread:060 and :email:1847 and :issue:1565");
         assert!(html.contains("data-shortref=\"thread\""), "{html}");
         assert!(html.contains("data-shortref=\"email\""), "{html}");
-        assert!(html.contains("data-msg=\"slack:C0123ABCD::1700000000.000100\""), "{html}");
-        assert!(html.contains("href=\"?c=C0123ABCD&v=thread&t=1700000000.000100\""), "{html}");
+        assert!(
+            html.contains("data-msg=\"slack:C0123ABCD::1700000000.000100\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"?c=C0123ABCD&v=thread&t=1700000000.000100\""),
+            "{html}"
+        );
         assert!(
             html.contains("href=\"https://tracker.example.invalid/issues/1565\""),
             "{html}"

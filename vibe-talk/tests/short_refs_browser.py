@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 WEB_ROOT = fixture.WEB_ROOT
 SIZES = (("desk", 1280, 800, False), ("phone", 390, 852, True))
 THREAD = "spaces/A/threads/one"
-CHAN = CHANNEL["id"]
+CHAN = str(CHANNEL["id"])
 
 
 def mark(channel: str, msg: str, thread: str = "") -> str:
