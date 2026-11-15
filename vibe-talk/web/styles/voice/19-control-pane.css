@@ -505,7 +505,7 @@
     white-space: nowrap;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose .reply-actions > button {
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-compose :is(#reply-cancel, #reply-send) {
     white-space: nowrap;
   }
 }
