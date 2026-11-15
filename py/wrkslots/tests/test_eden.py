@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -556,3 +557,86 @@ def test_forget_absent_validate_binds_drops_only_named_slots(
     wrkslots_cli._forget_absent_validate_binds(config, ["edenstuck"])
 
     assert set(worktreesimage.load_bind_records(config.control)) == {"other"}
+
+
+# ------------------------------ archived Eden rows (#1554 archive path)
+
+
+def test_archive_round_trip_validates_an_eden_record(tmp_path: Path) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+    item = wrkslots_cli.AbsentValidateRow(
+        machine="node-a",
+        slot=record.slot,
+        generation=record.generation,
+        record_sha256=wrkslots_cli._record_sha256(record),
+    )
+    entry = wrkslots_cli._absent_validate_archive_entry(
+        record, item, "2026-11-15T00:00:00Z"
+    )
+    archive_path = wrkslots_cli._archive_path(config)
+    archive_path.write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 1, "records": [entry]})
+    )
+
+    archive = wrkslots_cli._load_archive(config)
+
+    assert [row["slot"] for row in archive.records] == ["edenstuck"]
+    assert wrkslots_cli._archive_to_obj(archive)["records"] == [entry]
+
+
+def _absent_args(root: Path, input_path: Path, **overrides: object) -> argparse.Namespace:
+    values: dict[str, object] = dict(
+        project_root=str(root), machine="node-a", input=str(input_path),
+        apply=False, coordinator_pid=os.getpid(), coordinator_authorized=True,
+        format="human", wait_lock=0.0,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_recover_absent_validate_rows_disposes_an_eden_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root, _upstream = _absent_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    backing = str(tmp_path / "eden-backing-repos" / "backing")
+    record = _eden_validate_record(config, backing)
+    _write_row(config, record)
+    input_path = root / "absent-validate-rows.json"
+    input_path.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "rows": [
+                    {
+                        "machine": "node-a",
+                        "slot": record.slot,
+                        "generation": record.generation,
+                        "record_sha256": wrkslots_cli._record_sha256(record),
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(wrkslots_cli, "_short_hostname", lambda: "node-a")
+    monkeypatch.setattr(wrkslots_cli, "_absent_validate_process_snapshot", lambda: ())
+    monkeypatch.setattr(
+        wrkslots_cli, "_absent_validate_privileged_path_match", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(wrkslots_cli, "_user_systemd_snapshot", lambda: ())
+
+    assert wrkslots_cli._cmd_recover_absent_validate_rows(
+        _absent_args(root, input_path)
+    ) == 0
+    assert "outcome=planned" in capsys.readouterr().out
+    assert wrkslots_cli._cmd_recover_absent_validate_rows(
+        _absent_args(root, input_path, apply=True)
+    ) == 0
+    assert "outcome=recovered" in capsys.readouterr().out
+
+    assert wrkslots_cli._load_active(config).slots == ()
+    archive = wrkslots_cli._load_archive(config)
+    assert [row["slot"] for row in archive.records] == ["edenstuck"]

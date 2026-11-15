@@ -8741,9 +8741,11 @@ def _archive_record_from_obj(
     for checkout in checkouts:
         # Archived rows keep the path they were created with (#1183):
         # accept every historical validate root, keep identity checks.
+        # An Eden checkout keeps its Eden layout (<slot>/checkout under
+        # flat), never the Git one (#1554).
         candidates = _historical_slot_candidates(config, slot, slot_type)
         expecteds = {
-            (candidate if record_layout == "flat" else candidate / checkout.name)
+            _checkout_destination(candidate, record_layout, checkout.name, vcs=checkout.vcs)
             .relative_to(config.root)
             .as_posix()
             for candidate in candidates

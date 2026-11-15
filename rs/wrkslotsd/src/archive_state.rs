@@ -226,7 +226,9 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
             let alt_slot_path = cfg.worktrees.join("validate").join(&slot);
             let mut expecteds = Vec::new();
             for candidate in [slot_path, alt_slot_path] {
-                let destination = if record_layout == "flat" {
+                let destination = if checkout.vcs == "eden" && record_layout == "flat" {
+                    candidate.join("checkout")
+                } else if record_layout == "flat" {
                     candidate
                 } else {
                     candidate.join(&checkout.name)

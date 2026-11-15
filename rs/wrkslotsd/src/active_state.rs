@@ -63,6 +63,7 @@ pub(crate) struct CheckoutRec {
     pub(crate) repository: String,
     pub(crate) remote: String,
     pub(crate) landed_ref: String,
+    pub(crate) vcs: String,
 }
 
 pub(crate) struct ImportRec {
@@ -356,6 +357,7 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
             repository,
             remote,
             landed_ref,
+            vcs,
         });
     }
     validate_remote(&remote)?;
@@ -378,6 +380,7 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
         repository,
         remote,
         landed_ref,
+        vcs,
     })
 }
 

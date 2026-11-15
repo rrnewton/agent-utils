@@ -155,3 +155,41 @@ def test_parse_archive_missing_shard(tmp_path: Path) -> None:
     result = _rust(root)
     assert result.returncode == 1
     assert "missing archive state" in result.stderr
+
+
+def _eden_record() -> dict[str, object]:
+    record = _record("eden-a", "agent-eden")
+    record["slot_type"] = "validate"
+    record["checkouts"] = [
+        {
+            "name": "main",
+            "path": "worktrees/validate/eden-a/checkout",
+            "repository": "/backing/eden-backing",
+            "branch": "eden",
+            "start_point": SHA,
+            "remote": "eden",
+            "remote_url_sha256": DIGEST,
+            "landed_ref": "refs/remotes/eden/main",
+            "head": SHA,
+            "containing_remote_refs": [],
+            "vcs": "eden",
+        }
+    ]
+    return record
+
+
+def test_parse_archive_matches_python_with_an_eden_record(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    config_path = root / ".wrkslots.yml"
+    config_path.write_text(
+        config_path.read_text().replace(
+            "heartbeat_ttl_seconds: 60\n", "layout: flat\nheartbeat_ttl_seconds: 60\n"
+        )
+    )
+    archive = _archive(_eden_record())
+    _write_archive(root, archive)
+    # Flat layout keeps its control files beside worktrees/, not inside.
+    (root / "ARCHIVED.node-a.json").write_text(json.dumps(archive))
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
