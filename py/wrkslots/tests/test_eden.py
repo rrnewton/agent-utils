@@ -657,12 +657,18 @@ class _StubEdenDaemon:
         self.escape_after_fixup = False
         self.wedged = False
 
+    discovery_root: str | None = None
+    cloned_mount: str | None = None
+
     def __call__(self, argv: Sequence[str]) -> tuple[int, str, str]:
         self.calls.append(tuple(argv))
+        if argv[0] == "sl":
+            return (0, f"{self.discovery_root or self.cloned_mount or ''}\n", "")
         config_dir = argv[2] if len(argv) > 2 and argv[1] == "--config-dir" else None
         rest = list(argv[3:] if config_dir is not None else argv[1:])
         if rest[:1] == ["clone"]:
             mount = rest[2]
+            self.cloned_mount = mount
             assert config_dir is not None
             Path(config_dir).mkdir(parents=True, exist_ok=True)
             Path(mount).mkdir(parents=True, exist_ok=True)
@@ -1133,3 +1139,48 @@ def test_remove_of_an_eden_validate_slot_uses_no_git(
     config_dir = str(slot_path / ".eden-state")
     assert ("eden", "--config-dir", config_dir, "remove", "-y", str(mount)) in daemon.calls
     assert ("eden", "--config-dir", config_dir, "stop") in daemon.calls
+
+
+# ------------------------------------------- discovery guard (#1555)
+
+
+def test_discovery_mismatch_refuses_create_and_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _eden_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    slot_path = wrkslots_cli._slot_directory(config, "eden-a", "agent")
+    derived = tmp_path / "scratch" / "buck-out"
+    daemon = _StubEdenDaemon(
+        [{"repo_path": "buck-out", "type": "bind", "target": str(derived)}]
+    )
+    daemon.discovery_root = str(slot_path.parent)
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", daemon)
+
+    with pytest.raises(wrkslots_cli.Refusal, match="discovery guard"):
+        wrkslots_cli._cmd_create(_eden_create_args(root))
+
+    assert daemon.daemon_writes()
+    assert not slot_path.exists()
+    assert sorted(config.control.glob("CREATE.*.journal")) == []
+
+
+def test_doctor_flags_a_mismatched_eden_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _eden_project(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    derived = tmp_path / "scratch" / "buck-out"
+    daemon = _StubEdenDaemon(
+        [{"repo_path": "buck-out", "type": "bind", "target": str(derived)}]
+    )
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", daemon)
+    assert wrkslots_cli._cmd_create(_eden_create_args(root)) == 0
+    states = [wrkslots_cli._load_active(config)]
+
+    assert wrkslots_cli._eden_discovery_doctor_findings(config, states) == []
+
+    daemon.discovery_root = str(root)
+    findings = wrkslots_cli._eden_discovery_doctor_findings(config, states)
+    assert len(findings) == 1
+    assert findings[0]["kind"] == "eden-discovery-mismatch"

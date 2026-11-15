@@ -37741,6 +37741,36 @@ def _harness_checkout_doctor_findings(
     return findings
 
 
+def _eden_discovery_doctor_findings(
+    config: Config, states: Sequence[ActiveState]
+) -> list[dict[str, object]]:
+    """Doctor re-check: live Eden mounts must discover as themselves (#1555)."""
+
+    findings: list[dict[str, object]] = []
+    for state in states:
+        if state.machine != config.machine:
+            continue
+        for record in state.slots:
+            for checkout in record.checkouts:
+                if checkout.vcs != "eden":
+                    continue
+                mount = _stored_path(config, checkout.path, "checkout path")
+                if not mount.is_dir():
+                    continue
+                problem = _eden_discovery_problem(str(mount))
+                if problem is not None:
+                    finding = _operational_finding(
+                        "eden-discovery-mismatch",
+                        record.slot,
+                        record.machine,
+                        f"{problem}; use 'sl -R {mount}' until the mount "
+                        "discovers as itself again",
+                    )
+                    finding["checkout"] = checkout.name
+                    findings.append(finding)
+    return findings
+
+
 def _shared_submodule_doctor_findings(
     config: Config, states: Sequence[ActiveState]
 ) -> list[dict[str, object]]:
@@ -38190,6 +38220,59 @@ def _eden_runner(argv: Sequence[str]) -> tuple[int, str, str]:
         list(argv), capture_output=True, text=True, check=False
     )
     return done.returncode, done.stdout, done.stderr
+
+
+def _eden_discovery_problem(
+    mount: str, runner: eden.Runner | None = None
+) -> str | None:
+    """Why ``mount`` does not discover as itself, or None when it does (#1555).
+
+    The Eden mount's ``.hg`` is a symlink into the slot's Eden state,
+    and ``--cwd`` discovery can walk past it to an outer working tree;
+    ``sl -R`` resolves correctly, so only the discovery answers are
+    judged here.
+    """
+
+    run = _eden_runner if runner is None else runner
+    rc, stdout, stderr = run(["sl", "--cwd", mount, "root"])
+    if rc != 0:
+        return (
+            f"sl root does not answer at Eden mount {mount}: "
+            f"{stderr.strip() or stdout.strip() or 'sl root failed'}"
+        )
+    reported = stdout.strip()
+    if reported != mount:
+        return (
+            f"sl root at Eden mount {mount} reports {reported!r}; "
+            "mutating through it would move the outer checkout"
+        )
+    git_marker = Path(mount) / ".git"
+    if git_marker.exists() or git_marker.is_symlink():
+        rc, stdout, stderr = run(
+            ["git", "-C", mount, "rev-parse", "--show-toplevel"]
+        )
+        if rc != 0:
+            return (
+                f"git toplevel does not answer at Eden mount {mount}: "
+                f"{stderr.strip() or stdout.strip() or 'git rev-parse failed'}"
+            )
+        reported = stdout.strip()
+        if reported != mount:
+            return (
+                f"git toplevel at Eden mount {mount} reports {reported!r}; "
+                "mutating through it would move the outer checkout"
+            )
+    return None
+
+
+def _assert_eden_discovery(mount: str, runner: eden.Runner | None = None) -> None:
+    problem = _eden_discovery_problem(mount, runner)
+    if problem is not None:
+        raise Refusal(
+            f"Eden discovery guard: {problem}. remedy: use 'sl -R {mount}' "
+            "and place Eden mounts outside any other working tree where "
+            "the layout allows it"
+        )
 
 
 def _eden_known_config_dirs(config: Config) -> tuple[str, ...]:
@@ -38642,6 +38725,7 @@ def _provision_eden_slot(
                 raise Refusal(
                     f"redirection {item.repo_path} is not backed by the slot image"
                 )
+        _assert_eden_discovery(str(mount))
     except Exception as exc:
         if isinstance(exc, Refusal):
             message = str(exc)
@@ -38972,6 +39056,55 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 for line in _eden_leftover_lines(fields):
                     print(line, file=sys.stderr)
                 raise
+            try:
+                _assert_eden_discovery(str(slot_path / "checkout"))
+            except Refusal as discovery_refusal:
+                problems = _eden_stop_slot_daemon(
+                    _eden_runner,
+                    str(slot_path / ".eden-state"),
+                    str(slot_path / "checkout"),
+                )
+                if not problems:
+                    problems = _eden_remove_slot_storage(
+                        config, slot_path, made_in_slot, made_derived
+                    )
+                if not problems:
+                    _clear_journal(
+                        config,
+                        journal_payload,
+                        event_writer=event_writer,
+                        journal_path=journal_path,
+                    )
+                    raise
+                fields = _parse_eden_create_journal(config, journal_payload)
+                _write_journal(
+                    config,
+                    _eden_create_journal_payload(
+                        config,
+                        args,
+                        owner,
+                        task_scope,
+                        coordinator_lease,
+                        slot_path,
+                        checkout_name,
+                        backing,
+                        requested_rev,
+                        created_at=created_at,
+                        operation_id=operation_id,
+                        phase="cleanup-failed",
+                        detail=str(discovery_refusal),
+                        in_slot_targets=made_in_slot,
+                        derived_targets=made_derived,
+                    ),
+                    event_writer=event_writer,
+                    journal_path=journal_path,
+                )
+                for line in _eden_leftover_lines(fields):
+                    print(line, file=sys.stderr)
+                raise Refusal(
+                    f"{discovery_refusal}; Eden cleanup incomplete: "
+                    f"{'; '.join(problems)}"
+                ) from discovery_refusal
             record = ActiveRecord(
                 slot=args.slot,
                 agent=args.agent,
@@ -50896,6 +51029,20 @@ def _status_record(
     value["storage_inconsistencies"] = [
         item.to_obj() for item in storage_inconsistencies
     ]
+    eden_mounts = [
+        str(_stored_path(config, checkout.path, "checkout path"))
+        for checkout in record.checkouts
+        if checkout.vcs == "eden"
+    ]
+    if eden_mounts:
+        problems = [
+            problem
+            for mount in eden_mounts
+            if (problem := _eden_discovery_problem(mount)) is not None
+        ]
+        value["eden_discovery"] = (
+            {"ok": False, "detail": problems[0]} if problems else {"ok": True, "detail": None}
+        )
     value["harness_checkout"] = _is_harness_checkout(config, record)
     value["harness_checkout_reason"] = record.harness_checkout_reason
     return value
@@ -51716,6 +51863,7 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         # would need to prepare, and slot submodules still privately cloned.
         findings.extend(_shared_submodule_doctor_findings(config, states))
         findings.extend(_harness_checkout_doctor_findings(config, states))
+        findings.extend(_eden_discovery_doctor_findings(config, states))
         doctor_records = [record for state in states for record in state.slots]
         doctor_liveness = cache.owner_liveness(config, doctor_records)
         rows = [
