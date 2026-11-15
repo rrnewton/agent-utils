@@ -1964,6 +1964,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   /** `#1587 autoplay-follow-scroll`: whether the reader's own scroll has paused following, and the port watched for it. */
   const followPause = createFollowPause();
   let followPort: HTMLElement | null = null;
+  /** Where the follow's last scroll was headed, so its own scroll events are told from the reader's. */
+  let followTargetTop: number | null = null;
 
   /**
    * `#1587 autoplay-follow-scroll`. Keep what is being read in the middle third of the
@@ -1984,7 +1986,12 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (followPort !== area) {
       followPort = area;
       if (typeof area.addEventListener === "function") {
-        area.addEventListener("scroll", () => { if (nowPlaying) followPause.noteScroll(nowPlaying.id); }, { passive: true });
+        area.addEventListener("scroll", () => {
+          if (!nowPlaying) return;
+          // The follow's own scroll lands where it was headed; any other landing is the reader's.
+          if (followTargetTop !== null && Math.abs(area.scrollTop - followTargetTop) <= 2) { followTargetTop = null; return; }
+          followPause.noteScroll(nowPlaying.id);
+        }, { passive: true });
       }
     }
     const port = area.getBoundingClientRect();
@@ -2006,6 +2013,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       glide = style ? String(style.getPropertyValue("--column-glide")).trim() : "";
     } catch (_error) { glide = ""; }
     const behavior = followBehavior(glide === "auto");
+    followTargetTop = area.scrollTop + delta;
     if (typeof area.scrollBy === "function") area.scrollBy({ top: delta, behavior });
     else area.scrollTop += delta;
   }
