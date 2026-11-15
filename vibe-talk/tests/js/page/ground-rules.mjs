@@ -76,6 +76,21 @@ test("every number this page is tuned by stays inside a band that says what woul
     "the panel's fallback widths have drifted from the device setting's"
   );
   assert.ok(
+    sourceConstant("MIN_DISCUSS_DOCKED_HEIGHT") < sourceConstant("MAX_DISCUSS_DOCKED_HEIGHT"),
+    "the lowest docked height the reader may drag to is not less than the highest"
+  );
+  assert.ok(
+    sourceConstant("DEFAULT_DISCUSS_DOCKED_HEIGHT") >= sourceConstant("MIN_DISCUSS_DOCKED_HEIGHT") &&
+      sourceConstant("DEFAULT_DISCUSS_DOCKED_HEIGHT") <= sourceConstant("MAX_DISCUSS_DOCKED_HEIGHT"),
+    "the default docked height is not one the reader is allowed to drag to"
+  );
+  assert.ok(
+    sourceConstant("FALLBACK_MIN_DOCKED_HEIGHT") === sourceConstant("MIN_DISCUSS_DOCKED_HEIGHT") &&
+      sourceConstant("FALLBACK_MAX_DOCKED_HEIGHT") === sourceConstant("MAX_DISCUSS_DOCKED_HEIGHT") &&
+      sourceConstant("FALLBACK_DEFAULT_DOCKED_HEIGHT") === sourceConstant("DEFAULT_DISCUSS_DOCKED_HEIGHT"),
+    "the panel's fallback docked heights have drifted from the device setting's"
+  );
+  assert.ok(
     sourceConstant("MIN_TWO_COLUMN_SPLIT") < sourceConstant("MAX_TWO_COLUMN_SPLIT"),
     "the least split the reader may drag to is not less than the most"
   );

@@ -210,15 +210,16 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     # list shrinks, the choice is kept on the device, and a tap on a bar
     # button is not a drag (the full toggle below still works).
     title = page.locator(".discuss-title").bounding_box()
-    check(title is not None, "the Discuss title bar has no box to drag")
+    if title is None:
+        raise AssertionError("the Discuss title bar has no box to drag")
     cx, cy = title["x"] + title["width"] / 2, title["y"] + title["height"] / 2
     page.mouse.move(cx, cy)
     page.mouse.down()
-    page.mouse.move(cx, cy - 120, steps=12)
+    page.mouse.move(cx, cy - 70, steps=12)
     page.mouse.up()
     page.wait_for_function(
         "() => document.getElementById('discuss-panel')"
-        ".getBoundingClientRect().height >= innerHeight * 0.6",
+        ".getBoundingClientRect().height >= innerHeight * 0.55",
         timeout=20_000)
     dragged = page.evaluate("""() => ({
       now: document.getElementById('discuss-head').getAttribute('aria-valuenow'),
@@ -226,7 +227,7 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
       areaBottom: document.getElementById('scroll-area').getBoundingClientRect().bottom,
       panelTop: document.getElementById('discuss-panel').getBoundingClientRect().top,
     })""")
-    check(dragged["now"] is not None and int(dragged["now"]) >= 60,
+    check(dragged["now"] is not None and int(dragged["now"]) >= 56,
           f"the title-bar drag did not resize the docked pane: {dragged}")
     check(dragged["kept"] == dragged["now"],
           f"the dragged height was not kept per device: {dragged}")
@@ -237,7 +238,7 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
     page.keyboard.press("ArrowDown")
     page.wait_for_function(
         "() => Number(document.getElementById('discuss-head')"
-        ".getAttribute('aria-valuenow')) < 60 + 5",
+        ".getAttribute('aria-valuenow')) < 56 + 3",
         timeout=20_000)
     # Close/reopen keeps the dragged height.
     kept_now = page.evaluate(
@@ -261,6 +262,27 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
         ".every((d) => d.open)",
         timeout=20_000)
     page.wait_for_selector("#discuss-answer a", state="visible", timeout=20_000)
+
+    # (b, at the dragged height) A citation tap far up lands its row fully
+    # in the visible list area above the taller pane.
+    page.click("#discuss-answer a")
+    page.wait_for_function("""() => {
+      const area = document.getElementById('scroll-area');
+      const row = area.querySelector('[data-linked]');
+      if (!row) return false;
+      const r = row.getBoundingClientRect();
+      const box = area.getBoundingClientRect();
+      return r.top >= box.top - 1.5 && r.bottom <= box.bottom + 1.5
+        && r.height > 0;
+    }""", timeout=20_000)
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+
+    # A double-click on the bar restores half height for the checks below.
+    page.dblclick(".discuss-title")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-head')"
+        ".getAttribute('aria-valuenow') === '50'",
+        timeout=20_000)
 
     # (a) The list scrolls to its true bottom inside the visible upper area:
     # at the end the list's foot (the channel composer) stands fully in the
@@ -286,26 +308,6 @@ def walk_phone(page: Page, base: str, width: int, height: int) -> None:
       const box = area.getBoundingClientRect();
       return r.top >= box.top - 1.5 && r.bottom <= box.bottom + 1.5 && r.height > 0;
     }""", timeout=20_000)
-
-    # (b) A citation tap far up lands its row fully in the visible list area.
-    page.click("#discuss-answer a")
-    page.wait_for_function("""() => {
-      const area = document.getElementById('scroll-area');
-      const row = area.querySelector('[data-linked]');
-      if (!row) return false;
-      const r = row.getBoundingClientRect();
-      const box = area.getBoundingClientRect();
-      return r.top >= box.top - 1.5 && r.bottom <= box.bottom + 1.5
-        && r.height > 0;
-    }""", timeout=20_000)
-    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
-
-    # A double-click on the bar restores half height.
-    page.dblclick(".discuss-title")
-    page.wait_for_function(
-        "() => document.getElementById('discuss-head')"
-        ".getAttribute('aria-valuenow') === '50'",
-        timeout=20_000)
 
     # Full height still covers; back to half docks again; close frees the list.
     page.click("#discuss-full-toggle")
@@ -363,6 +365,9 @@ def walk_desk(page: Page, base: str, width: int, height: int) -> None:
               panel: {top: panel.top, bottom: panel.bottom}, overlapPx: x * y};
     }""")
     print(f"discuss dock desk note: jumped row vs overlay panel: {overlap}")
+    import os
+    if os.environ.get("DISCUSS_SHOT_DIR"):
+        page.screenshot(path=f"{os.environ['DISCUSS_SHOT_DIR']}/discuss-drag-desktop.png")
     page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
 

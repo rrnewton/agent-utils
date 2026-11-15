@@ -5581,6 +5581,21 @@ const TUNING_BANDS = {
   DEFAULT_TWO_COLUMN_SPLIT: [40, 60,
     "half and half until the reader drags the separator (#1186 two-column-splitter), and it has " +
     "to be a split the drag is allowed to reach"],
+  MIN_DISCUSS_DOCKED_HEIGHT: [10, 40,
+    "the lowest the docked Discuss pane may be dragged to (#1552 discuss-docked-height-drag), " +
+    "in viewport percent: under it the title bar and Summarize bar crowd out the answer"],
+  MAX_DISCUSS_DOCKED_HEIGHT: [60, 95,
+    "the highest the docked Discuss pane may be dragged to (#1552): past it no list rows " +
+    "remain above to read, which is the maximize button's job instead"],
+  DEFAULT_DISCUSS_DOCKED_HEIGHT: [40, 60,
+    "half the screen until the reader drags the title bar (#1552), and it has to be a " +
+    "height the drag is allowed to reach"],
+  FALLBACK_MIN_DOCKED_HEIGHT: [10, 40,
+    "the panel's own floor where a host hands it no clamp (#1552): mirrors the device setting's"],
+  FALLBACK_MAX_DOCKED_HEIGHT: [60, 95,
+    "the panel's own ceiling where a host hands it no clamp (#1552): mirrors the device setting's"],
+  FALLBACK_DEFAULT_DOCKED_HEIGHT: [40, 60,
+    "the panel's own default where a host hands it no clamp (#1552): mirrors the device setting's"],
   MIN_DISCUSS_WIDTH: [240, 400,
     "the narrowest the Discuss overlay may be dragged to (#1344 discuss-panel-resize): under a " +
     "reading column the answer wraps to nothing, past it the floor leaves no desk to drag on"],
