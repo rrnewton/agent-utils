@@ -3877,19 +3877,20 @@ mod tests {
         }
         let (root, options) = gate_double("sweep");
         let leftover_file = root.join("leftover-pid");
+        let survived_file = root.join("leftover-survived");
         let argv: Vec<String> = [
             "bash",
             "-c",
-            "sleep 10 & echo $! > \"$1\"; echo hello; exit 7",
+            "(sleep 10; touch \"$2\") & echo $! > \"$1\"; echo hello; exit 7",
             "bash",
             leftover_file.to_string_lossy().as_ref(),
+            survived_file.to_string_lossy().as_ref(),
         ]
         .iter()
         .map(|item| item.to_string())
         .collect();
         let runner = identity_of(i64::from(std::process::id()));
         let recorded = std::cell::RefCell::new(Vec::new());
-        let started = Instant::now();
         let mut proc = spawn_owned_harness_at(
             Path::new("/proc"),
             &options,
@@ -3913,15 +3914,24 @@ mod tests {
         assert_eq!(status.code(), Some(7));
         assert_eq!(status.signal(), None);
         assert_eq!(stdout, "hello\n");
+        // The leftover was swept, not waited out: it is gone and it
+        // never reached the end of its own sleep (no survived file).
+        // How long getting there took is scheduling, which a loaded
+        // host decides, so no elapsed time is the verdict.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "leftover kept the turn open"
+            !survived_file.exists(),
+            "leftover lived out its sleep instead of being swept"
         );
         let leftover: i64 = std::fs::read_to_string(&leftover_file)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
+        // Gone is the condition; the guard only reports a hang.
+        let gone_deadline = Instant::now() + Duration::from_secs(120);
+        while !wait_gone(leftover) && Instant::now() < gone_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(wait_gone(leftover), "leftover pid {leftover} was not swept");
         assert!(proc.finish());
         let _ = std::fs::remove_dir_all(&root);

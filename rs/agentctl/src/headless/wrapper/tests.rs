@@ -878,6 +878,28 @@ impl Fixture {
     }
 }
 
+/// The identity pinned at `path` for `pid`, once it is readable: a
+/// pin file can be momentarily absent or replaced between a wait
+/// that saw it and a following read, so post-wait reads poll on the
+/// condition too instead of unwrapping one look. The bound only
+/// reports a hang.
+fn pinned_identity_for(path: &Path, pid: u32) -> agent_queue::identity::ProcessIdentity {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(identity) = pinned_identity(path) {
+            if identity.pid == u64::from(pid) {
+                return identity;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no pin for pid {pid} readable at {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn pinned_identity(path: &Path) -> Option<agent_queue::identity::ProcessIdentity> {
     let document: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     serde_json::from_value(document.get("identity")?.clone()).ok()
@@ -934,7 +956,7 @@ fn an_execing_launcher_pins_the_post_exec_harness_on_start_and_wrapper_restart()
             && pinned_identity(&fixture.agent_directory.join(HARNESS_FILE))
                 .is_some_and(|identity| identity.pid == u64::from(first_pid))
     });
-    let pinned = pinned_identity(&hooks.record).unwrap();
+    let pinned = pinned_identity_for(&hooks.record, first_pid);
     assert_ne!(pinned, stale);
     // The launcher stayed in the spawn path: its export reached the harness.
     let environ = fs::read(format!("/proc/{first_pid}/environ")).unwrap();
@@ -950,7 +972,7 @@ fn an_execing_launcher_pins_the_post_exec_harness_on_start_and_wrapper_restart()
         agent_queue::identity::liveness(&pinned),
         agent_queue::identity::ProcessLiveness::Alive
     );
-    let harness_file = pinned_identity(&fixture.agent_directory.join(HARNESS_FILE)).unwrap();
+    let harness_file = pinned_identity_for(&fixture.agent_directory.join(HARNESS_FILE), first_pid);
     assert_eq!(harness_file.pid, u64::from(first_pid));
     fixture.stop(handle);
 
@@ -967,15 +989,13 @@ fn an_execing_launcher_pins_the_post_exec_harness_on_start_and_wrapper_restart()
             && pinned_identity(&fixture.agent_directory.join(HARNESS_FILE))
                 .is_some_and(|identity| identity.pid == u64::from(second_pid))
     });
-    let pinned = pinned_identity(&hooks.record).unwrap();
+    let pinned = pinned_identity_for(&hooks.record, second_pid);
     assert_eq!(
         agent_queue::identity::liveness(&pinned),
         agent_queue::identity::ProcessLiveness::Alive
     );
     assert_eq!(
-        pinned_identity(&fixture.agent_directory.join(HARNESS_FILE))
-            .unwrap()
-            .pid,
+        pinned_identity_for(&fixture.agent_directory.join(HARNESS_FILE), second_pid).pid,
         u64::from(second_pid)
     );
     fixture.stop(handle);
@@ -1008,7 +1028,7 @@ fn an_execing_launcher_repins_after_an_unexpected_harness_exit() {
                 .is_some_and(|identity| identity.pid == u64::from(second_pid))
     });
     assert_eq!(
-        agent_queue::identity::liveness(&pinned_identity(&hooks.record).unwrap()),
+        agent_queue::identity::liveness(&pinned_identity_for(&hooks.record, second_pid)),
         agent_queue::identity::ProcessLiveness::Alive
     );
     fixture.stop(handle);

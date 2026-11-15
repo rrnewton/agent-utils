@@ -7263,7 +7263,24 @@ mod tests {
                 {"key": "b", "phase": "delivery_uncertain"},
             ]},
         });
-        with_agent_lock(&mut status, &registry);
+        // The holder is found in /proc/locks, whose generation on a
+        // loaded host is not atomic: an entry can be missed while
+        // thousands of locks churn around it. Poll until this
+        // process's own lock is listed; the bound only reports a hang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            with_agent_lock(&mut status, &registry);
+            if status["delivery_alarm"]["agent_lock"]["holder"]["pid"] == json!(std::process::id())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "own lock holder never listed: {}",
+                status["delivery_alarm"]["agent_lock"]
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let alarm = &status["delivery_alarm"];
         assert_eq!(
             alarm["agent_lock"]["holder"]["pid"],
