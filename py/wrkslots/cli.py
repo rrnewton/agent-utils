@@ -15645,6 +15645,15 @@ _REMOTE_CONTAINMENT_MEMO: contextvars.ContextVar[
     dict[tuple[str, str, str, bool], _RemoteContainmentEvidence] | None
 ] = contextvars.ContextVar("wrkslots_remote_containment_memo", default=None)
 
+# The advertised-tips answer of remote_advertised_tips (#1681), kept under
+# the same scope and age bound as _REMOTE_CONTAINMENT_MEMO: one removal asks
+# for a repository's advertised refs once, however many salvage attempts
+# re-derive their thin-bundle prerequisites from that answer. Without this,
+# every _thin_bundle_prerequisites call paid a fresh ls-remote round trip.
+_REMOTE_ADVERTISED_TIPS_MEMO: contextvars.ContextVar[
+    dict[tuple[str, str], _RemoteContainmentEvidence] | None
+] = contextvars.ContextVar("wrkslots_remote_advertised_tips_memo", default=None)
+
 
 # Set only while one agent-slot removal runs: the (archive ref and commit,
 # sha256, size) of each local salvage bundle it has already restored into a fresh
@@ -15740,6 +15749,7 @@ def _remote_containment_scope() -> Iterator[None]:
     """Keep remote containment answers, salvage facts and bundle verifications for one removal."""
 
     token = _REMOTE_CONTAINMENT_MEMO.set({})
+    tips_token = _REMOTE_ADVERTISED_TIPS_MEMO.set({})
     bundles = _VERIFIED_SALVAGE_BUNDLES.set(set())
     created = _CREATED_SHARED_SALVAGE_BUNDLES.set(set())
     facts = _SALVAGE_FACTS_MEMO.set({})
@@ -15753,6 +15763,7 @@ def _remote_containment_scope() -> Iterator[None]:
         _SALVAGE_FACTS_MEMO.reset(facts)
         _CREATED_SHARED_SALVAGE_BUNDLES.reset(created)
         _VERIFIED_SALVAGE_BUNDLES.reset(bundles)
+        _REMOTE_ADVERTISED_TIPS_MEMO.reset(tips_token)
         _REMOTE_CONTAINMENT_MEMO.reset(token)
 
 
@@ -21088,18 +21099,43 @@ class _GitVcs:
         prefixes = ("refs/heads/", "refs/tags/", "refs/salvage/", "refs/rescue/")
         common = self.common_directory(checkout)
         objects = common / "objects"
-        with self._isolated_repository(objects) as (isolated, object_env):
-            return {
-                ref: tip
-                for ref, tip in self._ls_remote_inventory(
-                    isolated,
-                    target.url,
-                    refs=tuple(f"{prefix}*" for prefix in prefixes),
-                    env_overrides=object_env,
-                    timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
-                ).items()
-                if ref.startswith(prefixes)
-            }
+        memo = _REMOTE_ADVERTISED_TIPS_MEMO.get()
+        key = (str(objects.resolve()), target.url)
+        if memo is not None:
+            cached = memo.get(key)
+            if (
+                cached is not None
+                and time.monotonic() - cached.observed_at
+                <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+            ):
+                if cached.refusal is not None:
+                    raise cached.refusal
+                return dict(
+                    entry.split("\0", 1) for entry in cached.refs
+                )
+        try:
+            with self._isolated_repository(objects) as (isolated, object_env):
+                tips = {
+                    ref: tip
+                    for ref, tip in self._ls_remote_inventory(
+                        isolated,
+                        target.url,
+                        refs=tuple(f"{prefix}*" for prefix in prefixes),
+                        env_overrides=object_env,
+                        timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+                    ).items()
+                    if ref.startswith(prefixes)
+                }
+        except Refusal as exc:
+            if memo is not None:
+                memo[key] = _RemoteContainmentEvidence((), time.monotonic(), exc)
+            raise
+        if memo is not None:
+            memo[key] = _RemoteContainmentEvidence(
+                tuple(sorted(f"{ref}\0{tip}" for ref, tip in tips.items())),
+                time.monotonic(),
+            )
+        return tips
 
     def _remote_advertised_covering_uncached(
         self,
@@ -88823,6 +88859,43 @@ def _refusal_remedy(args: argparse.Namespace, error: Refusal) -> str:
     return "run 'wrkslots --help', correct the named condition, then rerun wrkslots"
 
 
+_INITIAL_PARENT_PID = os.getppid()
+
+
+def _install_parent_death_signal() -> None:
+    """Ask the kernel to SIGTERM this process when its parent dies (#1681).
+
+    A remove launched under a wrapper (``timeout``, a shell, a
+    ``systemd-run --scope`` client) otherwise outlives that wrapper: the
+    wrapper's death is not delivered into the scope, and the remove kept
+    running for tens of minutes after its parent was killed. With the
+    parent-death signal the kernel delivers SIGTERM to this process
+    itself, whose default action stops it; its bounded Git children
+    (item-budget and per-fetch timeouts) then end on their own bounds.
+    A parent that died before the signal was installed shows as PID 1
+    afterwards; then this process terminates itself, because that is
+    the death the signal would have delivered. No-op where prctl is
+    unavailable.
+    """
+
+    if sys.platform != "linux":
+        return
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0)
+    except (AttributeError, OSError):
+        return
+    # A process parented to PID 1 from the start (a daemon child) is not
+    # orphaned; only a parent lost since import is.
+    if _INITIAL_PARENT_PID > 1 and os.getppid() <= 1:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
+#: Commands whose client must not outlive the wrapper that launched it (#1681).
+_PARENT_DEATH_COMMANDS = frozenset(
+    {"remove", "remove-agent-batch", "remove-validate-batch", "retire-pending", "finisher"}
+)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface and return its process exit status."""
 
@@ -88833,6 +88906,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
     args = parser.parse_args(values)
+    if getattr(args, "command", None) in _PARENT_DEATH_COMMANDS:
+        _install_parent_death_signal()
     _bind_held_config_lock(held_config_lock, args)
     # The raw words, for handlers that must know which side of `--` a word was on.
     args.raw_arguments = values
