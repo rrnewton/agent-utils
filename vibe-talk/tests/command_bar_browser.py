@@ -184,7 +184,7 @@ def desk(browser: Browser, url: str, width: int, height: int, shots: Path | None
     shot(page, shots, f"{size}-long-thread")
     one_row(state, f"{size} on a thread named in 120 characters")
     label = str(state["label"])
-    check(label.endswith("…"), f"{size}: fixture: the long thread's option is not cut: {label!r}")
+    check(LONG_NAME in label, f"{size}: the long thread's option does not name it whole (#1563): {label!r}")
     check(LONG_NAME in str(state["title"]), f"{size}: the view picker's tooltip does not name the whole thread: "
           f"{state['title']!r}")
     cut = page.evaluate("() => getComputedStyle(document.getElementById('thread-select')).textOverflow")

@@ -532,7 +532,7 @@ def columns_walk(desk: Desk) -> None:
     desk.check(said == "runner-wedged: The overnight runner hung twice and was restarted by hand.",
                f"the card at the top of the thread says {said!r}")
     named = page.evaluate("() => document.getElementById('side-scroll').getAttribute('aria-label')")
-    desk.check(named == "Thread: runner-wedged", f"the right column's region is called {named!r}")
+    desk.check(str(named).startswith("Thread: runner-wedged · "), f"the right column's region is called {named!r}")
     desk.check(not page.is_visible("#side-freshness"), "a thread read a moment ago is said to be stale")
     desk.check(len(desk.rows("discord-log")) == 11, "selecting a thread changed the left column")
 

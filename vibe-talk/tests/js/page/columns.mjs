@@ -2704,7 +2704,7 @@ test("`#298 thread-card-header`: every way into a thread on the right puts its c
     assert.equal(header.highlighted, false, "the card at the top carries the highlight that unclamps a card");
     assert.equal(page.el("side-title").hidden, true, `${way}: "Thread list" is still over the thread`);
     assert.equal(page.el("side-close").hidden, false);
-    assert.equal(page.el("side-scroll").getAttribute("aria-label"), "Thread: runner-wedged", `${way}: the region lost the thread's name`);
+    assert.ok((page.el("side-scroll").getAttribute("aria-label") || "").startsWith("Thread: runner-wedged · "), `${way}: the region lost the thread's name`);
   }
   // From one thread to another: the card says the other's.
   await threadBadge(rowWithId(page, "203")).click();

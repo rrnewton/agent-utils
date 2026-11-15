@@ -2064,7 +2064,7 @@ test("`#406 command-bar-one-row`: the view picker's tooltip names the open threa
   assert.doesNotMatch(general, /Release train/, "the tooltip names a thread nobody has opened");
   await pickThread(page, `thread:${data.threads[0].id}`);
   const option = picker.children.find((one) => one.value === picker.value);
-  assert.ok(option && option.textContent.endsWith("…"), `the premise is an option cut short: ${option && option.textContent}`);
+  assert.ok(option && option.textContent.includes(long), `the option does not name the thread whole (#1563): ${option && option.textContent}`);
   assert.equal(picker.title, `${long}\n${general}`, "the tooltip does not name the open thread whole");
   // Back to Main: the tooltip names no thread.
   await pickThread(page, "main");

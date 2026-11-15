@@ -66,14 +66,18 @@ class PinApi(fixture.FakeApi):
             thread = row["thread"]
             assert isinstance(thread, dict)
             thread["root_message_id"] = row["id"]
+        long_title = ("Release checklist for the November rollout with every "
+                      "gate and owner named in full")
         self.threads = [
             {"id": BANG, "root": self.messages[0], "title": "deploy",
              "reply_count": 1, "reply_count_exact": True,
              "updated_at": self.messages[1]["timestamp"]},
-            {"id": INCIDENT, "root": self.messages[2], "title": "incident notes",
+            {"id": INCIDENT, "root": self.messages[2],
+             "title": "Incident notes from the overnight database failover review",
              "reply_count": 1, "reply_count_exact": True,
              "updated_at": self.messages[3]["timestamp"]},
-            {"id": RELEASE, "root": self.messages[4], "title": "release checklist",
+            {"id": RELEASE, "root": self.messages[4], "title": long_title,
+             "display_name": "release-day",
              "reply_count": 1, "reply_count_exact": True,
              "updated_at": self.messages[5]["timestamp"]},
         ]
@@ -200,8 +204,12 @@ POPUP_JS = """() => {
         const open = row.querySelector('.thread-picker-open');
         const pinRect = pin ? pin.getBoundingClientRect() : null;
         const openRect = open ? open.getBoundingClientRect() : null;
+        const slug = row.querySelector('.thread-picker-slug');
+        const title = row.querySelector('.thread-picker-title');
         return {
             text: (open ? open.textContent : row.textContent).trim(),
+            slug: slug ? slug.textContent.trim() : null,
+            title: title ? title.textContent.trim() : null,
             pinned: pin ? pin.getAttribute('aria-pressed') : null,
             pinLeft: pinRect ? pinRect.left : null,
             openLeft: openRect ? openRect.left : null,
@@ -209,7 +217,8 @@ POPUP_JS = """() => {
             goldBg: pin ? getComputedStyle(pin).backgroundColor : null,
         };
     });
-    return {rows, overflow: document.documentElement.scrollWidth - window.innerWidth};
+    return {rows, overflow: document.documentElement.scrollWidth - window.innerWidth,
+            popupWidth: popup.getBoundingClientRect().width, innerWidth: window.innerWidth};
 }"""
 
 
@@ -322,6 +331,17 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     gold = str(thread_rows[0]["gold"])
     desk.check(gold not in ("", "rgb(231, 233, 238)"),
                f"a pinned pin is not gold-dressed: {thread_rows[0]}")
+    # `#1563`: slug plus readable title; an unnamed thread shows its full title.
+    named = next(r for r in thread_rows if r["slug"] == "release-day")
+    desk.check("Release checklist for the November rollout" in str(named["title"]),
+               f"the named row does not show slug plus full title: {named}")
+    unnamed = next(r for r in thread_rows if r["slug"] in (None, ""))
+    desk.check(str(unnamed["title"]).startswith("Incident notes from the overnight"),
+               f"the unnamed row does not show its full title: {unnamed}")
+    found = page.evaluate(POPUP_JS)
+    want = min(560, int(found["innerWidth"]) - 16)
+    desk.check(abs(float(found["popupWidth"]) - want) <= 2,
+               f"pop-up width {found['popupWidth']} is not min(560, viewport-16)={want}")
     desk.shot("1-popup-bang-pinned")
     desk.notes.append(f"pop-up order {names}; @liteinst pinned by default, gold, pin left")
 
@@ -367,10 +387,28 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
                   "the channel did not reopen after the second reload")
     desk.settled()
     rows = open_popup(desk)
+    page.wait_for_function(
+        "() => { const rows = [...document.querySelectorAll('.thread-picker-thread')];"
+        " const last = rows[rows.length - 1];"
+        " return last && last.querySelector('.thread-pin')?.getAttribute('aria-pressed') === 'false'"
+        " && last.textContent.includes('@liteinst'); }", timeout=10_000)
+    rows = open_popup_rows(page)
     thread_rows = [r for r in rows if r["pinned"] is not None]
     desk.check(thread_rows[-1]["pinned"] == "false" and "@liteinst" in str(thread_rows[-1]["text"]),
                f"the bang thread's unpin did not stick across a reload: {texts(rows)}")
     desk.notes.append("a bang-bound thread's unpin sticks across a reload")
+
+    # `#1563`: inside the thread, the header leads with the slug.
+    page.evaluate("""() => {
+        const open = [...document.querySelectorAll('.thread-picker-open')]
+            .find((el) => el.querySelector('.thread-picker-slug')?.textContent === 'release-day');
+        open.click();
+    }""")
+    page.wait_for_function(
+        "() => (document.querySelector('#thread-card-text')?.textContent || '')"
+        ".includes('release-day')", timeout=10_000)
+    desk.shot("4-thread-header-slug")
+    desk.notes.append("thread header leads with the slug")
     with api.lock:
         check(api.pins == {}, "message pins were touched by thread pins")
 

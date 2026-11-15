@@ -22,6 +22,8 @@ export interface ThreadCardView {
   readonly text: string;
   readonly mode: string;
   readonly cut: unknown;
+  /** The filed slug the header leads with, when the body shows the root instead (`#1563`). */
+  readonly slug?: string;
 }
 
 /** What the thread card head asks of the page. */
@@ -138,6 +140,13 @@ export function createThreadCardHead(deps: ThreadCardHeadDependencies): ThreadCa
     // `#528 thread-card-markdown-and-cap`: its root's formatted words, as a list card's.
     deps.markCardLayout(card, view.mode, view.cut);
     deps.fillCardText(words, view, text);
+    // `#1563`: with the root's body on show, lead it with the slug so the header names the thread.
+    if (view.slug && !(words.textContent || "").startsWith(view.slug)) {
+      const lead = document.createElement("strong");
+      lead.className = "side-card-slug";
+      lead.textContent = `${view.slug} · `;
+      words.prepend(lead);
+    }
     if (button.getAttribute("title") !== text) button.setAttribute("title", text);
     deps.setTextIfChanged(deps.leftById(`${card.id}-age`), age);
     // `#479 message-time-full-date`. Hovering the open thread's age says the day it last moved, whole.

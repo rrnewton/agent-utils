@@ -370,9 +370,21 @@
   text-align: left;
   cursor: pointer;
   font: inherit;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: break-word;
+  line-height: 1.35;
+}
+.thread-picker-facts {
+  display: block;
+  font-size: 0.8em;
+  opacity: 0.75;
+}
+.thread-picker-slug {
+  font-weight: 700;
+}
+.thread-picker-slug + .thread-picker-title::before {
+  content: " · ";
+  font-weight: 400;
 }
 .thread-pin {
   flex: none;

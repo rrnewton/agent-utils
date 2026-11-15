@@ -93,7 +93,7 @@ export interface CardLines {
   cardHead(root: Message, cut: CardCut | null): HTMLElement;
   continuationOf(root: Message, cut: CardCut): Message;
   cardPending(choice: CardChoice | null): boolean;
-  cardView(choice: CardChoice): { mode: string; text: string; cut: CardCut | null; body: () => HTMLElement | null };
+  cardView(choice: CardChoice): { mode: string; text: string; slug?: string; cut: CardCut | null; body: () => HTMLElement | null };
   cutForCard(lines: number[], marks?: number[], wholes?: boolean[], headings?: boolean[]): CardCut | null;
   rootInward(choice: CardChoice): boolean;
   cardSplit(choice: CardChoice | null): CardCut | null;
@@ -231,7 +231,7 @@ export function createCardLines(deps: CardLinesDependencies): CardLines {
     }).length;
   }
 
-  function cardView(choice: CardChoice): { mode: string; text: string; cut: CardCut | null; body: () => HTMLElement | null } {
+  function cardView(choice: CardChoice): { mode: string; text: string; slug?: string; cut: CardCut | null; body: () => HTMLElement | null } {
     const words = deps.threadWords(choice);
     if (words.named && words.said) return { mode: "summary", text: `${words.named}: ${words.said}`, cut: null, body: () => null };
     const root = choice.root;
@@ -239,7 +239,8 @@ export function createCardLines(deps: CardLinesDependencies): CardLines {
     if (!entry || !entry.text) return { mode: "name", text: deps.threadName(choice, Infinity), cut: null, body: () => null };
     const { cut, text } = entry;
     const mode = cut === null ? "root" : cardPending(choice) ? "pending" : cut.whole ? "clamped" : "split";
-    return { mode, text, cut, body: () => cardHead(root as Message, cut) };
+    // `#1563`: the header leads with the slug (the head prepends it over the root's body).
+    return { mode, text, slug: words.named || "", cut, body: () => cardHead(root as Message, cut) };
   }
 
   const rootInward = (choice: CardChoice): boolean => ["summary", "pending", "clamped"].includes(cardView(choice).mode);

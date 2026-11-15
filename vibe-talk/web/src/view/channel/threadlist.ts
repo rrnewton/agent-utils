@@ -166,21 +166,48 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     return replies + 1 >= (deps.rootOverflowsCard(choice.root) ? 2 : 3);
   }
 
-  function threadName(choice: ThreadChoice | null, chars: number = THREAD_TITLE_CHARS): string {
-    const summary = choice ? choice.summary as { title?: unknown } | null : null;
-    const named = choice ? threadWords(choice).named : "";
-    const title = summary && typeof summary.title === "string" && summary.title.trim() !== "Thread"
+  /** The slug a picker row leads with: `@agent` for a bang-bound thread, else its filed name. */
+  function threadSlug(choice: ThreadChoice | null): string {
+    if (!choice) return "";
+    const agent = bangAgent(choice);
+    if (agent) return `@${agent}`;
+    return threadWords(choice).named;
+  }
+
+  /** The readable title beside the slug: the server's title, else the root's first line (80 at most). */
+  function threadTitle(choice: ThreadChoice | null): string {
+    if (!choice) return "";
+    const summary = choice.summary as { title?: unknown } | null;
+    const titled = summary && typeof summary.title === "string" && summary.title.trim() !== "Thread"
       ? summary.title : "";
-    for (const source of [named, title, choice && choice.root ? deps.messageText(choice.root) : ""]) {
-      const name = firstLineOf(source as string, chars);
+    const slug = threadSlug(choice);
+    if (titled) {
+      const title = firstLineOf(titled, Infinity);
+      if (title && title !== slug) return title;
+    }
+    const title = firstLineOf(choice.root ? deps.messageText(choice.root) : "", Infinity);
+    return title && title !== slug ? title : "";
+  }
+
+  function threadName(choice: ThreadChoice | null, chars: number = THREAD_TITLE_CHARS): string {
+    if (!choice) return "Thread";
+    const slug = threadSlug(choice);
+    const title = threadTitle(choice);
+    // Full form (`Infinity`, the picker pop-up and headings): slug plus title, the
+    // title alone while unnamed — never a 28-character prefix (`#1563`).
+    if (!Number.isFinite(chars) || chars >= 80) {
+      if (slug && title) return `${slug} · ${title}`;
+      return slug || title || "Thread";
+    }
+    for (const source of [slug, title]) {
+      const name = firstLineOf(source, chars);
       if (name) return name;
     }
     return "Thread";
   }
 
   function threadLabel(choice: ThreadChoice, chars: number = THREAD_TITLE_CHARS): string {
-    const agent = bangAgent(choice);
-    const name = agent ? `@${agent}` : threadName(choice, chars);
+    const name = threadName(choice, chars);
     return [threadFacts(choice as never) as string, name].filter((part) => part !== "").join(" · ");
   }
 
@@ -347,10 +374,10 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       }
       const choices = orderedThreadChoices();
       const shown = choices.slice(0, THREAD_SELECT_LIMIT);
-      for (const choice of shown) options.push([`thread:${choice.id}`, threadLabel(choice)]);
+      for (const choice of shown) options.push([`thread:${choice.id}`, threadLabel(choice, Infinity)]);
       const open = openThreadChoice();
       if (open && !shown.some((choice) => choice.id === open.id)) {
-        options.push([`thread:${open.id}`, threadLabel(open)]);
+        options.push([`thread:${open.id}`, threadLabel(open, Infinity)]);
       }
     }
     const current = viewChoiceOnScreen();
@@ -447,7 +474,26 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         const openButton = document.createElement("button");
         openButton.setAttribute("type", "button");
         openButton.className = "thread-picker-open";
-        openButton.textContent = threadLabel(choice, Infinity);
+        const facts = threadFacts(choice as never) as string;
+        const slug = threadSlug(choice);
+        const title = threadTitle(choice);
+        if (facts) {
+          const factsEl = document.createElement("span");
+          factsEl.className = "thread-picker-facts";
+          factsEl.textContent = facts;
+          openButton.append(factsEl, document.createTextNode(" "));
+        }
+        if (slug) {
+          const slugEl = document.createElement("strong");
+          slugEl.className = "thread-picker-slug";
+          slugEl.textContent = slug;
+          openButton.append(slugEl, document.createTextNode(" "));
+        }
+        const titleEl = document.createElement("span");
+        titleEl.className = "thread-picker-title";
+        titleEl.textContent = title || (slug ? "" : "Thread");
+        openButton.append(titleEl);
+        openButton.setAttribute("aria-label", threadLabel(choice, Infinity));
         openButton.addEventListener("click", () => choosePickerValue(select, `thread:${choice.id}`));
         row.append(pinButton(choice), openButton);
         rows.push(row);
@@ -484,7 +530,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       drawThreadPickerPopup(select);
       const rect = select.getBoundingClientRect();
       popup.hidden = false;
-      popup.style.width = "min(320px, calc(100vw - 16px))";
+      popup.style.width = "min(560px, calc(100vw - 16px))";
       const height = popup.offsetHeight;
       const viewWidth = document.documentElement.clientWidth;
       const viewHeight = document.documentElement.clientHeight;
@@ -681,7 +727,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     button.className = "thread-open";
     button.setAttribute("type", "button");
     const title = document.createElement("strong");
-    title.textContent = threadName(choice, Infinity);
+    title.textContent = threadSlug(choice) || threadTitle(choice) || "Thread";
     const said = threadWords(choice).said;
     const view = deps.cardView(choice);
     const first = view.mode === "name" ? "" : view.text;

@@ -107,8 +107,8 @@ test("`#298 thread-card-header` x `#194 thread-picker-polish`: the heading over 
   assert.equal(card.age, age, `the card says "${card.age}" and the option "${option}"`);
   assert.equal(count, "1");
   const short = option.slice(`${age} · ${count} · `.length);
-  assert.ok(short.endsWith("…") && long.startsWith(short.slice(0, -1)),
-    `the option's name ${JSON.stringify(short)} is not the thread's name, shortened`);
+  assert.equal(short, long,
+    `the option's name ${JSON.stringify(short)} is not the thread's full title (#1563)`);
 });
 
 test("`#298 thread-card-header`: a summary that arrives after the thread opened is drawn on its card across the window, and the option takes the name with it", async () => {
@@ -125,7 +125,8 @@ test("`#298 thread-card-header`: a summary that arrives after the thread opened 
   assert.equal(wideCard(page).text, "storage-rollout: Whether the storage tier moves on Tuesday.",
     "the card kept the words it was opened with");
   assert.equal(wideCard(page).title, "storage-rollout: Whether the storage tier moves on Tuesday.");
-  assert.match(optionLabel(page, `thread:${id}`), / · storage-rollout$/);
+  assert.match(optionLabel(page, `thread:${id}`), / · storage-rollout · /,
+    "the option does not lead with the slug and follow with the title (#1563)");
 });
 
 test("a thread opened from a tag is named at once, by its card as the picker names it, not 'Thread'", async () => {

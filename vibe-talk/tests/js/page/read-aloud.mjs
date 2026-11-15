@@ -4245,7 +4245,7 @@ test("a thread's summarised display name is what the picker calls it, when the s
   await page.el("thread-select").dispatch("pointerdown");
   await page.settle();
   const labels = threadOptions(page).map(([, label]) => label);
-  assert.ok(labels.some((label) => / · 1 · deploy-rollback$/.test(label)),
+  assert.ok(labels.some((label) => / · 1 · deploy-rollback · /.test(label)),
     `the display name did not win over the title and the prefix: ${JSON.stringify(labels)}`);
 });
 
