@@ -2511,6 +2511,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1557 discord-split-merge-regression` in the browser engine, at 390x844 by touch and 1280x800
+  # with a mouse, in Main: a Discord post the plugin split at the 2,000-char cap (three chunks a
+  # second apart, only the first answering the prompt, each an unanswered potential root) is one
+  # row standing for all three ids, while another author's message and the bot's later post keep
+  # rows of their own, no row wider than the screen, and no page error.
+  - group: check
+    job: discord-split-merge-browser
+    desc: a Discord post split at the cap is one combined row in current Chromium at 390x844 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discord_split_merge_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#377 compact-collapsed-rows` in the browser engine, at 393x852 by touch and 1280x800 with a mouse, in
   # All: every collapsed row's header is one line inside its row (the name cut by an ellipsis, never under
   # a few letters; the time; the Thread tag; ⋯) with no Reply, Done, Unarchive or Not noise drawn or in the

@@ -824,6 +824,10 @@ thread-button-browser:
 # line, in one column and in two at 1280x800, and two columns at 1024x768 follow the phone's rule.
 # Pass WEB_ROOT=dir to run it against another copy of the page, SCREENSHOTS=dir to keep a PNG of each
 # state, and REPORT=1 to print every header measured and go on past a failed check.
+.PHONY: discord-split-merge-browser
+discord-split-merge-browser:
+	python3 tests/discord_split_merge_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(REPORT),--report)
+
 .PHONY: compact-rows-browser
 compact-rows-browser:
 	python3 tests/compact_rows_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS)) $(if $(REPORT),--report)

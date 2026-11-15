@@ -65,6 +65,20 @@ test("`#624 voice-page-modularity`: which messages are drawn as one row, from th
   assert.equal(joinsGroup(first, { ...second, timestamp: "" }, true), false, "joined on no evidence of when");
   assert.equal(joinsGroup({ ...first, noise: true }, second, true), false, "a placeholder joined its answer");
   assert.equal(joinsGroup(null, second, true), false);
+  // `#1557 discord-split-merge-regression`: a Discord split chunk arrives as its own potential
+  // root (is_root, no replies yet, thread id its own id); two of those are one post, while a
+  // chunk that has since gained a reply heads a real thread and joins nothing.
+  const chunk = (id, ms, replies = 0) => ({ id, author_id: "a", timestamp: at(ms), content: "half",
+    thread: { id, root_message_id: id, is_root: true, reply_count: replies, reply_count_exact: false } });
+  assert.equal(joinsGroup(chunk("10", 0), chunk("11", 1000), true), true, "two Discord split chunks stayed apart");
+  assert.equal(joinsGroup(chunk("10", 0), chunk("11", 1000, 1), true), false, "a chunk with a reply joined the row above");
+  assert.equal(joinsGroup(chunk("10", 0, 1), chunk("11", 1000), true), false, "a plain chunk joined under a thread head");
+  // ...and a root with replies still heads a row its own thread's replies join (`#463`).
+  const headed = { id: "20", author_id: "a", timestamp: at(0),
+    thread: { id: "T", root_message_id: "20", is_root: true, reply_count: 2, reply_count_exact: true } };
+  const inThread = { id: "21", author_id: "a", timestamp: at(1000),
+    thread: { id: "T", root_message_id: "20", is_root: false, reply_count: null, reply_count_exact: false } };
+  assert.equal(joinsGroup(headed, inThread, true), true, "a thread's reply no longer joins its root's row");
   assert.deepStrictEqual([isNoise({ noise: true }), isNoise({}), isNoise(null)], [true, false, false]);
 });
 

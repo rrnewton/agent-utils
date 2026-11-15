@@ -26,6 +26,29 @@ function isNoise(message: Pick<Message, "noise"> | null | undefined): boolean {
 }
 
 /**
+ * The thread a message counts as in for combining: none for a POTENTIAL root — a root no reply
+ * has reached yet (`is_root` with a reply count of 0), which is how the server names every
+ * ordinary channel message so the reader can start its thread (`#287 discord-start-thread`).
+ * Such a message is on the channel, not in a thread of its own: the split halves of one long
+ * post each arrive as one (`#1557 discord-split-merge-regression`), and the cache's own store
+ * already reads an unanswered root the same way (`thread_id` in `src/cache/rows.rs`). A root
+ * WITH replies keeps its thread, so it still heads — and only heads — a combined row, as a
+ * Slack long post's first part does with the parts that continue in its thread (`#463`).
+ */
+function groupThreadOf(message: Message): string | null {
+  const thread = message.thread;
+  if (thread && thread.is_root && (thread.reply_count ?? 0) === 0) {
+    return null;
+  }
+  return threadOf(message);
+}
+
+/** Whether `message` heads a real thread, so it may head a row but never join one. */
+function headsThread(message: Message): boolean {
+  return Boolean(message.thread && message.thread.is_root && (message.thread.reply_count ?? 0) !== 0);
+}
+
+/**
  * Does `message` belong with the one before it? Never while the reader has turned combining off
  * (the Combine messages switch, `DEVICE_SETTINGS.combineMessages`, passed in).
  *
@@ -36,7 +59,7 @@ function joinsGroup(previous: Message | null | undefined, message: Message, comb
   if (!combineMessages || !previous) {
     return false;
   }
-  if (threadOf(previous) !== threadOf(message) || (message.thread && message.thread.is_root)) {
+  if (groupThreadOf(previous) !== groupThreadOf(message) || headsThread(message)) {
     return false;
   }
   if (String(previous.author_id || "") !== String(message.author_id || "")) {

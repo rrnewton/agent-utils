@@ -7763,20 +7763,59 @@ const optionText = (page, id) => [...page.el(id).children].map((option) => optio
  * has nothing to do with what the test is about.
  */
 function splitPost(first, second) {
+  // `#1557 discord-split-merge-regression`: each half carries the thread record the server
+  // really sends for an ordinary Discord channel message — its own potential root, no replies
+  // yet (`src/discord/threads.rs`). A fixture without it cannot see the class again.
+  const potentialRoot = (id) => ({ id, root_message_id: id, is_root: true,
+    reply_count: 0, reply_count_exact: false });
   return [
     message({
       id: "1000000000000000001",
       content: "the overnight run finished and the runner is",
       timestamp: "2026-08-19T04:31:00.000Z",
+      thread: potentialRoot("1000000000000000001"),
       ...first,
     }),
     message({
       id: "1000000000000000002",
       content: "back up again.",
       timestamp: "2026-08-19T04:31:01.500Z",
+      thread: potentialRoot("1000000000000000002"),
       ...second,
     }),
   ];
+}
+
+/**
+ * One long agent post as the official Discord plugin leaves it (`#1557`): cut at Discord's
+ * 2,000-character cap on a newline boundary into three channel messages by the same bot,
+ * consecutive ids a second apart, only the FIRST carrying the reply reference, each one an
+ * unanswered potential root in the server's record. The text is built, not typed out: lines
+ * of a known length, cut where the plugin's length mode would cut.
+ */
+function discordSplitPost() {
+  const line = "the overnight run finished and the runner is back up again, all lanes green.\n";
+  const whole = line.repeat(70); // about 5,500 characters: three chunks at the cap.
+  const chunks = [];
+  let rest = whole;
+  while (rest.length > 2000) {
+    let cut = rest.lastIndexOf("\n", 2000);
+    if (cut < 1000) cut = 2000;
+    chunks.push(rest.slice(0, cut + 1));
+    rest = rest.slice(cut + 1);
+  }
+  chunks.push(rest);
+  const base = Date.parse("2026-08-19T04:31:00.000Z");
+  return chunks.map((content, index) => {
+    const id = `100000000000000001${index}`;
+    return message({
+      id,
+      content,
+      timestamp: new Date(base + index * 1000).toISOString(),
+      ...(index === 0 ? { reply_to: "1000000000000000009" } : {}),
+      thread: { id, root_message_id: id, is_root: true, reply_count: 0, reply_count_exact: false },
+    });
+  });
 }
 
 /** A streamed WAV header as the server writes one: 16-bit PCM, length unknown up front. */
@@ -10422,7 +10461,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   settingsGroup, settingsHeading, settingsHeadings, settingsOptions, settingsSection,
   settleRedraftWait, settleSend, settleSpokenYes, showDiscord, showLinks, showPinned, shownIds,
   sideAtFoot, sideIds, sideRow, signIn, sourceCalls, sourceConstant, sourceString, sourceStringTable, speakRelay,
-  speech, splitPost, spokenDraft, sseDelete, sseMessage, sseUpdate, stackPlaces, startChatting,
+  discordSplitPost, speech, splitPost, spokenDraft, sseDelete, sseMessage, sseUpdate, stackPlaces, startChatting,
   startNeutralCall, startOf, startTalking, startTalkingNamed, startV1Call, state, statusText,
   storedPin, storedTexts, summaryText, tagOf, tagged, takesASide, tallChannel, tallColumns,
   tapArrow, tapBookmarkClear, tapKind, tapPin, tapRow, test, testsDefined, textOfRow, threadBadge,

@@ -21,7 +21,7 @@ import { ACKNOWLEDGED, BASE_CSS, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS, CSS_C
   refreshDiscord, reloadPage, reloadWith, reopenedChannel, replyButton, replyInStream, row,
   rowMoreButton, rowOf, rowState, rowWithId, savedScopes, scaleOf, scatteredThread, scopeKey,
   seamDetail, seamLabel, search, selectedId, settingsGroup, showDiscord, showLinks, showPinned,
-  shownIds, signIn, sourceConstant, splitPost, sseMessage, startTalking, statusText, storedPin,
+  discordSplitPost, shownIds, signIn, sourceConstant, splitPost, sseMessage, startTalking, statusText, storedPin,
   summaryText, tagged, tallChannel, tapArrow, tapKind, test, textOfRow, threadBadge, threadData,
   tokenValues, turnSummariesOn, twoColumnServer, twoColumns, typeAndPause, typingPaused, unreadSaid,
   wavHeader, withLiveChannel } from "./fixture.mjs";
@@ -3218,6 +3218,62 @@ test("...and two messages seconds apart from DIFFERENT AUTHORS stay two rows", a
   );
 
   assert.equal(rows.length, 2, "two authors were drawn as one speaker");
+});
+
+test("`#1557 discord-split-merge-regression`: A POST THE PLUGIN SPLIT AT THE DISCORD CAP IS ONE ROW", async () => {
+  // The owner's report, in the shape Discord really leaves it: three chunks at the 2,000-char
+  // cap, the first answering the prompt, each its own unanswered potential root on the server.
+  const page = newPage();
+  await signIn(page);
+  const chunks = discordSplitPost();
+  assert.equal(chunks.length, 3, "the fixture did not split into three chunks");
+  assert.ok(chunks.every((chunk) => chunk.content.length <= 2000), "a chunk is over Discord's cap");
+  const rows = await showDiscord(page, chunks);
+
+  assert.equal(rows.length, 1, "the chunks of one split post are still separate rows");
+  assert.equal(rows[0].getAttribute("data-ids"), chunks.map((chunk) => chunk.id).join(" "));
+  assert.equal(rows[0].getAttribute("data-id"), chunks[0].id);
+});
+
+test("`#1557 discord-split-merge-regression`: A CHUNK THAT GAINS A REPLY SPLITS BACK OUT", async () => {
+  // The middle chunk later heads a real thread: on the next read it must stand as its own row
+  // again, not stay welded into the combined one.
+  const page = newPage();
+  await signIn(page);
+  const chunks = discordSplitPost();
+  const rows = await showDiscord(page, chunks);
+  assert.equal(rows.length, 1, "the premise row is not combined");
+
+  page.messages = page.messages.map((held) => held.id === chunks[1].id
+    ? { ...held, thread: { ...held.thread, reply_count: 1 } }
+    : held);
+  await pollOnce(page);
+
+  const after = page.el("discord-log").children;
+  assert.equal(after.length, 3, "the answered chunk did not split back out");
+  assert.equal(after[0].getAttribute("data-ids"), chunks[0].id);
+  assert.equal(after[1].getAttribute("data-id"), chunks[1].id);
+});
+
+test("`#1557 discord-split-merge-regression`: A COMBINED DISCORD ROW'S THREAD STARTS FROM ITS HEAD CHUNK", async () => {
+  // Starting a thread on the combined row (the affordance the potential-root record exists
+  // for) must start it on the first chunk, as every act on a combined row addresses its head.
+  const page = newPage();
+  page.threadingSupported = true;
+  await signIn(page);
+  const chunks = discordSplitPost();
+  const rows = await showDiscord(page, chunks);
+  assert.equal(rows.length, 1, "the premise row is not combined");
+
+  const badge = threadBadge(rows[0]);
+  assert.ok(badge, "the combined row offers no Thread start");
+  await badge.click();
+  await page.settle();
+  await page.el("channel-compose-text").setValue("first reply in the new thread");
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(page.repliesPosted.at(-1).body.thread_id, chunks[0].id,
+    "the thread was not started on the head chunk");
 });
 
 test("MARKING A COMBINED ROW AS DEALT WITH ARCHIVES EVERY MESSAGE IN IT", async () => {
