@@ -15,6 +15,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from wrkslots import cli as wrkslots_cli
 
 from wrkslots.tests.test_create_text_rust import _fixture, _git
@@ -141,6 +143,149 @@ def test_reap_stray_reports_past_archived_records(tmp_path: Path) -> None:
     payload = json.loads(out)
     assert payload["stray"][0]["outcome"] == "reaped"
     assert payload["malformed_archives"][0]["slot"] == "slot-bad"
+    assert not stray.exists()
+
+
+def _gone_archived_record(slot: str) -> dict[str, object]:
+    record = _archived_record(slot)
+    checkouts = record["checkouts"]
+    assert isinstance(checkouts, list)
+    checkout = checkouts[0]
+    assert isinstance(checkout, dict)
+    checkout["repository"] = "../gone-source"
+    return record
+
+
+def _active_record(slot: str, repository: str) -> dict[str, object]:
+    identity: dict[str, object] = {
+        "pid": 123,
+        "start_ticks": 1123,
+        "boot_id": "boot-1",
+        "host_id": "host-1",
+        "cgroup_path": "/user.slice/session.scope",
+    }
+    return {
+        "slot": slot,
+        "agent": f"agent-{slot}",
+        "task": "do work",
+        "purpose": "testing",
+        "slot_type": "agent",
+        "machine": "node-a",
+        "generation": 1,
+        "created_at": "2026-10-26T00:00:00Z",
+        "heartbeat_at": "2026-10-26T01:00:00Z",
+        "heartbeat_ttl_seconds": 60,
+        "owner": identity,
+        "coordinator_lease": dict(identity, pid=456, start_ticks=1456),
+        "coordinator_recovery_note": None,
+        "handoff": None,
+        "checkouts": [
+            {
+                "name": "repo",
+                "path": f"worktrees/{slot}/repo",
+                "repository": repository,
+                "branch": "suite/work",
+                "start_point": "a" * 40,
+                "remote": "origin",
+                "remote_url_sha256": "b" * 64,
+                "landed_ref": "refs/remotes/origin/main",
+                "head": "a" * 40,
+                "containing_remote_refs": ["refs/remotes/origin/main"],
+                "vcs": "git",
+            }
+        ],
+    }
+
+
+def _write_registry(
+    root: Path,
+    *,
+    active: list[dict[str, object]],
+    archived: list[dict[str, object]],
+) -> None:
+    control = root / "worktrees"
+    control.mkdir(parents=True, exist_ok=True)
+    (control / "ARCHIVED.node-a.json").write_text(
+        json.dumps(
+            {"schema": 2, "machine": "node-a", "revision": 4, "records": archived}
+        )
+    )
+    (control / "EVENTS.node-a").mkdir(exist_ok=True)
+    (control / "ACTIVE.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 1, "slots": active})
+    )
+
+
+def test_reap_stray_report_skips_archived_record_with_deleted_repository(
+    tmp_path: Path,
+) -> None:
+    # #1433 (1): the report census names and skips an archived row
+    # whose source repository is gone, and still completes.
+    root = _fixture(tmp_path / "case")
+    stray = _stray(tmp_path / "case")
+    _write_registry(
+        root,
+        active=[],
+        archived=[_archived_record("slot-old"), _gone_archived_record("slot-gone")],
+    )
+
+    rc, out = _run(root, apply=False, fmt="json")
+    assert rc == 0
+    payload = json.loads(out)
+    skipped = payload["unresolvable_archives"]
+    assert len(skipped) == 1
+    assert skipped[0]["machine"] == "node-a"
+    assert skipped[0]["slot"] == "slot-gone"
+    assert skipped[0]["repository"] == "../gone-source"
+    assert "does not exist or cannot be resolved" in skipped[0]["reason"]
+    assert [row["path"] for row in payload["stray"]] == [str(stray)]
+    assert stray.exists()
+
+    rc, out = _run(root, apply=False)
+    assert rc == 0
+    assert "UNRESOLVABLE-ARCHIVE: machine=node-a slot=slot-gone" in out
+    assert "repository=../gone-source" in out
+
+
+def test_reap_stray_report_still_refuses_active_record_with_deleted_repository(
+    tmp_path: Path,
+) -> None:
+    # #1433 (3): an active row with a missing repository refuses in
+    # both modes.
+    root = _fixture(tmp_path / "case")
+    _stray(tmp_path / "case")
+    _write_registry(
+        root,
+        active=[_active_record("slot-live", "../gone-source")],
+        archived=[_gone_archived_record("slot-gone")],
+    )
+
+    with pytest.raises(wrkslots_cli.Refusal, match="does not exist"):
+        _run(root, apply=False)
+    with pytest.raises(wrkslots_cli.Refusal, match="does not exist"):
+        _run(root, apply=True)
+
+
+def test_reap_stray_apply_skips_archived_record_with_deleted_repository(
+    tmp_path: Path,
+) -> None:
+    # #1433 (2): with --apply the archived row is skipped and named,
+    # and the real strays are still reaped: a gone source repository
+    # cannot own any live registration, so refusing would block the
+    # reap forever for no safety gain.
+    root = _fixture(tmp_path / "case")
+    stray = _stray(tmp_path / "case")
+    _write_registry(
+        root,
+        active=[],
+        archived=[_archived_record("slot-old"), _gone_archived_record("slot-gone")],
+    )
+
+    rc, out = _run(root, apply=True, fmt="json")
+    assert rc == 0
+    payload = json.loads(out)
+    assert [row["slot"] for row in payload["unresolvable_archives"]] == ["slot-gone"]
+    assert payload["stray"][0]["outcome"] == "reaped"
     assert not stray.exists()
 
 

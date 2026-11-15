@@ -60,6 +60,10 @@ pub(crate) fn reap_stray_worktrees(
     let (cfg, _selected) = load_cfg(root, machine_override)?;
     let mut owned: BTreeSet<PathBuf> = BTreeSet::new();
     let mut repositories: BTreeSet<PathBuf> = BTreeSet::new();
+    // #1433: archived rows whose source repository is gone cannot own
+    // any live registration: both modes skip and name them. Active
+    // rows with an unresolvable repository refuse (see the walk).
+    let mut unresolvable_archives: Vec<Value> = Vec::new();
     for machine in discover_machines(&cfg.control)? {
         for (doc_name, key) in [
             (format!("ACTIVE.{machine}.json"), "slots"),
@@ -98,10 +102,28 @@ pub(crate) fn reap_stray_worktrees(
                             }
                         }
                         if let Some(raw) = checkout.get("repository").and_then(Value::as_str) {
-                            if let Ok((_, repo)) =
-                                crate::finish_write::stored_repository_path(&cfg, raw)
-                            {
-                                repositories.insert(repo);
+                            match crate::finish_write::stored_repository_path(&cfg, raw) {
+                                Ok((_, repo)) => {
+                                    repositories.insert(repo);
+                                }
+                                Err(reason) if key == "records" => {
+                                    let row = json!({
+                                        "machine": machine,
+                                        "slot": record
+                                            .get("slot")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_owned),
+                                        "repository": raw,
+                                        "reason": reason,
+                                    });
+                                    if !unresolvable_archives.contains(&row) {
+                                        unresolvable_archives.push(row);
+                                    }
+                                }
+                                // #1433: an active row's repository must
+                                // resolve in both modes.
+                                Err(reason) if key == "slots" => return Err(reason),
+                                Err(_) => {}
                             }
                         }
                     }
@@ -275,6 +297,7 @@ pub(crate) fn reap_stray_worktrees(
             // #877: this reader is already lenient per record, so the
             // named-malformed list is empty here.
             "malformed_archives": Vec::<Value>::new(),
+            "unresolvable_archives": unresolvable_archives,
         });
         return Ok((
             format!(
@@ -302,6 +325,21 @@ pub(crate) fn reap_stray_worktrees(
             "RETAINED: {} outcome={} reason={}\n",
             item.get("path").and_then(Value::as_str).unwrap_or_default(),
             item.get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            item.get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ));
+    }
+    for item in &unresolvable_archives {
+        out.push_str(&format!(
+            "UNRESOLVABLE-ARCHIVE: machine={} slot={} repository={} reason={}\n",
+            item.get("machine")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            item.get("slot").and_then(Value::as_str).unwrap_or_default(),
+            item.get("repository")
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
             item.get("reason")
