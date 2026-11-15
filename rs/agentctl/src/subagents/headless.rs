@@ -314,7 +314,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             Some(session) if adapter.valid_session_id(&session) => session.to_ascii_lowercase(),
             Some(session) => {
                 return Err(fail(format!(
-                    "--resume for a headless Claude agent takes a session UUID, not {session:?}"
+                    "--resume for a headless agent takes a session UUID, not {session:?}"
                 )))
             }
             None => adapter
@@ -607,8 +607,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let mut config =
             wrapper::WrapperConfig::new(agent_name, &directory, Path::new(&record.cwd), &session);
         if let Some(adapter) = hl::adapter::adapter_for(&record.harness) {
-            config.adapter = adapter;
+            if claude_bin.is_none() {
+                config.command = vec![adapter.default_binary().to_owned()];
+            }
+            config.tool_preview_lines = adapter.preview_lines();
             config.config_directory = adapter.config_directory();
+            config.adapter = adapter;
         }
         if let Some(bin) = claude_bin {
             // Spawn the launcher as given (#1221 follow-up): canonicalising

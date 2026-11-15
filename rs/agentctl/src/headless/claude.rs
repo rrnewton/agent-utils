@@ -111,7 +111,7 @@ pub enum Signal {
         denial: Option<Denial>,
     },
     /// The harness asks whether a tool call may run, and waits for the answer.
-    PermissionRequest(PermissionRequest),
+    PermissionRequest(Box<PermissionRequest>),
     /// The harness withdrew a permission prompt it asked, unanswered.
     PermissionCancelled {
         /// The withdrawn request's identifier.
@@ -155,6 +155,20 @@ pub enum Signal {
         /// The response body.
         body: Value,
     },
+    /// Opening the recorded session failed; the wrapper logs it and
+    /// restarts the harness, whose next handshake corrects course.
+    SessionOpenFailed {
+        /// Why the open failed, for the event log.
+        message: String,
+    },
+    /// The harness on the wire is not the build the adapter was pinned
+    /// against; the wrapper logs it and carries on (warn, never refuse).
+    VersionMismatch {
+        /// The harness build the adapter was tested with.
+        expected: String,
+        /// The harness build that answered.
+        actual: String,
+    },
 }
 
 /// Why a tool call never ran.
@@ -190,6 +204,17 @@ pub struct PermissionRequest {
     pub blocked_path: Option<String>,
     /// The tool call identifier.
     pub tool_use_id: String,
+    /// The approval stage a decision must target, for harnesses whose
+    /// answer names one (Muse's `currentRequirementId`); echoed unchanged
+    /// in the answer. Claude's protocol has no such stage.
+    pub requirement: Option<Value>,
+    /// The choices the harness offered, `(id, decision, scope)`, for
+    /// harnesses whose answer picks one (Muse's `availableChoices`).
+    pub choices: Vec<(String, String, String)>,
+    /// The transport's per-connection request handle, when it differs
+    /// from `request_id` (Muse's JSON-RPC request id, answered with a
+    /// presentation receipt while the decision travels separately).
+    pub wire_id: Option<String>,
 }
 
 /// Stream-json framing, factored into a shared crate (`#1331 claude-session-summarizer`);
@@ -678,7 +703,7 @@ pub fn parse(line: &Value) -> Vec<Signal> {
                         kind => kind,
                     };
                     let (detail, complete) = approval_detail(&tool, &input);
-                    vec![Signal::PermissionRequest(PermissionRequest {
+                    vec![Signal::PermissionRequest(Box::new(PermissionRequest {
                         request_id,
                         summary: tool_summary(&tool, &input),
                         detail,
@@ -692,7 +717,10 @@ pub fn parse(line: &Value) -> Vec<Signal> {
                             .and_then(Value::as_str)
                             .map(str::to_owned),
                         tool_use_id: field("tool_use_id"),
-                    })]
+                        requirement: None,
+                        choices: Vec::new(),
+                        wire_id: None,
+                    }))]
                 }
                 subtype => vec![Signal::UnknownControlRequest {
                     request_id,
@@ -939,6 +967,10 @@ impl super::adapter::HarnessAdapter for ClaudeHarness {
         capabilities()
     }
 
+    fn default_binary(&self) -> &'static str {
+        "claude"
+    }
+
     fn launch_arguments(
         &self,
         resume: bool,
@@ -960,7 +992,7 @@ impl super::adapter::HarnessAdapter for ClaudeHarness {
         random_uuid()
     }
 
-    fn input_line(&self, uuid: &str, text: &str, session: &str) -> String {
+    fn input_line(&self, uuid: &str, text: &str, session: &str, _effort: Option<&str>) -> String {
         input_line(uuid, text, session)
     }
 
@@ -968,7 +1000,7 @@ impl super::adapter::HarnessAdapter for ClaudeHarness {
         parse(line)
     }
 
-    fn interrupt_line(&self, request_id: &str) -> String {
+    fn interrupt_line(&self, request_id: &str, _session: &str, _turn: Option<&str>) -> String {
         interrupt_line(request_id)
     }
 
@@ -982,6 +1014,9 @@ impl super::adapter::HarnessAdapter for ClaudeHarness {
         allow: bool,
         input: &Value,
         message: &str,
+        _requirement: Option<&Value>,
+        _choices: &[(String, String, String)],
+        _session: &str,
     ) -> String {
         permission_answer_line(request_id, allow, input, message)
     }

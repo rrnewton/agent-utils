@@ -113,13 +113,15 @@ pub struct WrapperConfig {
     pub environment: Vec<String>,
     /// The harness adapter translating this harness's protocol
     /// (`#1232 headless-harness-adapters`); Claude unless set otherwise.
-    pub adapter: &'static dyn HarnessAdapter,
+    pub adapter: std::sync::Arc<dyn HarnessAdapter>,
 }
 
 impl WrapperConfig {
     /// Defaults for `agent` in `agent_directory`, running `claude` in `cwd`.
     #[must_use]
     pub fn new(agent: &str, agent_directory: &Path, cwd: &Path, session: &str) -> Self {
+        let adapter: std::sync::Arc<dyn HarnessAdapter> =
+            std::sync::Arc::new(claude::ClaudeHarness);
         Self {
             agent: agent.to_owned(),
             agent_directory: agent_directory.to_path_buf(),
@@ -132,13 +134,13 @@ impl WrapperConfig {
             max_restarts: 5,
             restart_window: Duration::from_secs(600),
             stop_timeout: Duration::from_secs(60),
-            config_directory: claude::CLAUDE_HARNESS.config_directory(),
-            tool_preview_lines: claude::CLAUDE_HARNESS.preview_lines(),
+            config_directory: adapter.config_directory(),
+            tool_preview_lines: adapter.preview_lines(),
             approvals: true,
             approval_timeout: approval::DEFAULT_TIMEOUT,
             approval_cgroup_check: true,
             environment: Vec::new(),
-            adapter: &claude::CLAUDE_HARNESS,
+            adapter,
         }
     }
 
@@ -357,6 +359,10 @@ struct PendingApproval {
     blocked_path: Option<String>,
     input: Value,
     tool_use_id: String,
+    /// The prompt's decision stage, for adapters whose answer names it.
+    requirement: Option<Value>,
+    /// The prompt's offered choices, for adapters whose answer picks one.
+    choices: Vec<(String, String, String)>,
     asked_at: Instant,
     deadline: Instant,
     causation: Option<String>,
@@ -557,6 +563,18 @@ impl Wrapper {
                 }
             })
             .map_err(|error| io_fail("start harness writer", error))?;
+        // The adapter's opening lines (a handshake, a session open) go
+        // before any queued input; delivery waits for `Init` when the
+        // adapter says the handshake has to land first.
+        for hello in self.config.adapter.hello_lines(
+            resume,
+            &self.config.session,
+            &self.config.cwd,
+            super::adapter::declared_effort(&self.config.arguments),
+            self.config.approvals,
+        ) {
+            self.write_harness(hello);
+        }
         // A new spawn must never keep a previous run's identity: both files
         // are cleared inside the pin attempt, then re-observed post-exec.
         self.pin_pid = Some(pid);
@@ -739,6 +757,11 @@ impl Wrapper {
                 .harness
                 .as_ref()
                 .is_none_or(|harness| harness.input.is_none())
+            || (self.config.adapter.needs_init_before_input()
+                && self
+                    .harness
+                    .as_ref()
+                    .is_some_and(|harness| !harness.initialized))
         {
             return Ok(());
         }
@@ -851,10 +874,12 @@ impl Wrapper {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let line = self
-            .config
-            .adapter
-            .input_line(&uuid, &text, &self.config.session);
+        let line = self.config.adapter.input_line(
+            &uuid,
+            &text,
+            &self.config.session,
+            super::adapter::declared_effort(&self.config.arguments),
+        );
         let wrote = self
             .harness
             .as_ref()
@@ -965,10 +990,12 @@ impl Wrapper {
                 .unwrap_or_default()
                 .to_owned();
             drop(lock);
-            let line = self
-                .config
-                .adapter
-                .input_line(&uuid, &text, &self.config.session);
+            let line = self.config.adapter.input_line(
+                &uuid,
+                &text,
+                &self.config.session,
+                super::adapter::declared_effort(&self.config.arguments),
+            );
             let _ = self
                 .harness
                 .as_ref()
@@ -994,10 +1021,12 @@ impl Wrapper {
                 .collect::<Vec<_>>(),
         );
         drop(lock);
-        let line = self
-            .config
-            .adapter
-            .input_line(&uuid, &combined, &self.config.session);
+        let line = self.config.adapter.input_line(
+            &uuid,
+            &combined,
+            &self.config.session,
+            super::adapter::declared_effort(&self.config.arguments),
+        );
         let wrote = self
             .harness
             .as_ref()
@@ -1250,7 +1279,7 @@ impl Wrapper {
                         self.emit(
                             "lifecycle.harness",
                             None,
-                            json!({"harness": "claude", "version": version, "model": model,
+                            json!({"harness": self.config.adapter.name(), "version": version, "model": model,
                                    "permission_mode": permission_mode, "session": session, "tools": tools}),
                         )?;
                         // By init the launcher exec is done: re-pin post-exec (#1221).
@@ -1282,7 +1311,7 @@ impl Wrapper {
                             }
                         }
                     }
-                    if !self.busy {
+                    if !self.busy && self.config.adapter.init_begins_turn() {
                         self.begin_turn("self", None)?;
                     }
                 }
@@ -1422,7 +1451,7 @@ impl Wrapper {
                         json!({"trigger": trigger, "pre_tokens": pre_tokens, "post_tokens": post_tokens}),
                     )?;
                 }
-                Signal::PermissionRequest(request) => self.permission_request(request)?,
+                Signal::PermissionRequest(request) => self.permission_request(*request)?,
                 Signal::PermissionCancelled { request_id } => {
                     if let Some(index) = self
                         .approvals
@@ -1450,6 +1479,29 @@ impl Wrapper {
                             json!({"ok": true, "request_id": request_id, "response": body}),
                         );
                     }
+                }
+                Signal::SessionOpenFailed { message } => {
+                    self.emit(
+                        "error",
+                        causation,
+                        json!({"class": "session_open", "message": message}),
+                    )?;
+                    // End this harness; the relaunch handshake corrects
+                    // course (resume a retained session, start a missing one).
+                    if let Some(harness) = self.harness.as_mut() {
+                        drop(harness.input.take());
+                        terminate_group(&mut harness.child);
+                    }
+                }
+                Signal::VersionMismatch { expected, actual } => {
+                    // Warn, never refuse: the adapter's translation is
+                    // pinned to one harness build and the wire may have moved.
+                    self.emit(
+                        "error",
+                        causation,
+                        json!({"class": "harness_version", "expected": expected, "actual": actual,
+                               "message": "the harness build differs from the one this adapter was tested against; carrying on"}),
+                    )?;
                 }
             }
         }
@@ -1529,7 +1581,11 @@ impl Wrapper {
                     Some(input) => {
                         self.next_request += 1;
                         let request_id = format!("agentctl-interrupt-{}", self.next_request);
-                        let line = self.config.adapter.interrupt_line(&request_id);
+                        let line = self.config.adapter.interrupt_line(
+                            &request_id,
+                            &self.config.session,
+                            self.current.as_ref().map(|current| current.uuid.as_str()),
+                        );
                         match input.send(line.into_bytes()) {
                             Ok(()) => {
                                 // Only a running turn can end interrupted.
@@ -1618,8 +1674,14 @@ impl Wrapper {
                 false,
                 &Value::Null,
                 message,
+                request.requirement.as_ref(),
+                &request.choices,
+                &self.config.session,
             ));
             return Ok(());
+        }
+        if let Some(receipt) = self.config.adapter.permission_receipt_line(&request) {
+            self.write_harness(receipt);
         }
         let id = approval::approval_id(self.writer.next_seq());
         let timeout = self.config.approval_timeout;
@@ -1652,6 +1714,8 @@ impl Wrapper {
             blocked_path: request.blocked_path,
             input: request.input,
             tool_use_id: request.tool_use_id,
+            requirement: request.requirement,
+            choices: request.choices,
             asked_at: now,
             deadline: now + timeout,
             causation,
@@ -1698,6 +1762,9 @@ impl Wrapper {
                 allow,
                 &pending.input,
                 &message,
+                pending.requirement.as_ref(),
+                &pending.choices,
+                &self.config.session,
             );
             if !self.write_harness(line) {
                 self.emit(
@@ -2724,7 +2791,7 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
         "lifecycle.started",
         None,
         json!({
-            "harness": "claude",
+            "harness": wrapper.config.adapter.name(),
             "harness_version": null,
             "wrapper": crate::build_info::document(),
             "wrapper_pid": std::process::id(),

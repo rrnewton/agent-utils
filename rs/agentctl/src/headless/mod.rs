@@ -12,6 +12,7 @@
 //!   headless-approval-surface`).
 //! - [`adapter`]: the harness-adapter seam every headless harness implements (`#1232`).
 //! - [`claude`]: Claude Code's stream-json protocol, translated.
+//! - [`muse`]: Muse's MSP protocol (`muse serve`), translated (`#1234`).
 //! - [`wrapper`]: the Claude Code wrapper, the queue's only drainer (M2).
 //!
 //! A headless agent's record has `adapter: harness-wrapper` and `mode: headless`. Its files sit
@@ -30,6 +31,7 @@ pub mod approval;
 pub mod claude;
 pub mod control;
 pub mod events;
+pub mod muse;
 pub mod render;
 pub mod reply;
 pub mod tail;

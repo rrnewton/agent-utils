@@ -4978,7 +4978,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     "no reasoning effort declared for harness {harness:?} (mode {mode}): declare reasoning_effort in the launch profile or pass --effort LEVEL (accepted levels: {levels})"
                 )));
             }
-            if mode == "headless" && harness == "claude" && value.profile.is_none() {
+            if mode == "headless"
+                && crate::headless::adapter::adapter_for(&harness).is_some()
+                && value.profile.is_none()
+            {
                 let brief = match value.file {
                     Some(path) => Some(
                         fs::read_to_string(path)
@@ -4988,7 +4991,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 };
                 if !environment.is_empty() || value.slot.is_some() {
                     return Err(Failure::Usage(
-                        "--env and --slot do not apply to a headless Claude agent; pass harness options with --harness-arg".to_owned(),
+                        "--env and --slot do not apply to a headless agent; pass harness options with --harness-arg".to_owned(),
                     ));
                 }
                 if let Some(effort) = reasoning_effort.as_deref() {
@@ -5010,7 +5013,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     },
                 )?
             } else if mode != "interactive" {
-                return Err(Failure::Usage("Rust agentctl runs headless Claude agents (start --mode headless --harness claude) and interactive sessions; use agentctl with the worker extension for other headless workers (the Python edition; for example DAGRUN_ENGINE=python)".to_owned()));
+                return Err(Failure::Usage(format!("Rust agentctl runs headless agents for {} (start --mode headless --harness NAME) and interactive sessions; use agentctl with the worker extension for other headless workers (the Python edition; for example DAGRUN_ENGINE=python)", crate::headless::harnesses().join(", "))));
             } else {
                 if value.no_launch {
                     return Err(Failure::Usage(

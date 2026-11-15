@@ -43,6 +43,7 @@ Environment metadata contains names only; values remain in private profiles.
 | Interactive | A native Codex, Claude, or Muse TUI that remains directly accessible | Herdr, or tmux in the Rust edition |
 | Headless worker extension | Resumable Codex, AGY, or Muse structured turns; a terminal shows the transcript | Herdr or tmux and the chosen harness |
 | Headless Claude agent (Rust edition) | One persistent Claude Code stream-json process per agent, fed only from its durable queue; `agentctl tail` shows its typed event log | Claude Code; systemd to supervise it |
+| Headless Muse agent (Rust edition) | One persistent `muse serve` MSP host per agent, fed only from its durable queue with approvals relayed to the owner; `agentctl tail` shows the same typed event log | Muse; systemd to supervise it |
 | Chat service | Provider messages connected to an interactive coordinator | Herdr and either the Python Google Chat transport or a Rust subscription plugin |
 | MCP extension | The same session operations over local MCP stdio | An MCP client |
 
