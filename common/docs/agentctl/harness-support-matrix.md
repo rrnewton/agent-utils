@@ -102,9 +102,12 @@ adapter (`HarnessAdapter::verified_submission`, `composer_view`,
   (`rs/agentctl/src/harness/claude.rs`); submits with Enter.
 - **Codex**: supported. Composer reader in
   `rs/agentctl/src/harness/codex.rs`; submits with Enter, or Tab while
-  busy (Tab queues for the end of the turn). Broken today on Codex
-  0.169, whose status footer the reader mistakes for composer text —
-  in progress, #1553 codex-footer-composer.
+  busy (Tab queues for the end of the turn). Codex 0.164's boxed layout
+  (one status row under the shaded composer box) and 0.169's two-row
+  footer (status row, then hint row) both parse: the status row is
+  recognised by shape (`<model> <effort> · /path [· title]`), so an
+  idle 0.169 pane accepts sends (#1553 codex-footer-composer, landed
+  8a0d30a5).
 - **Muse**: supported, by a separate path. The Muse adapter has no
   composer view; delivery goes through the verified-process editor
   reader in `rs/agentctl/src/client.rs` and the Muse submission paths in
@@ -173,9 +176,9 @@ in `rs/agentctl/src/stale_draft.rs`.
 
 - **Claude Code**: supported (composer reader; the tall-draft unframed
   fallback landed with #1546).
-- **Codex**: partial today — supported in shape, but the Codex 0.169
-  footer misread (#1553) makes the reader see a draft that is not
-  there, so sends refuse instead. In progress, #1553.
+- **Codex**: supported — the 0.169 footer misread that made the reader
+  see a draft that is not there is fixed (#1553, landed 8a0d30a5), so
+  Codex drafts attribute and flush like Claude Code's.
 - **Muse**: supported (the Muse editor reader; #1546).
 - **Unknown TUI**: partial — report only. The sweep cannot read an
   unknown editor, so a stranded prompt there becomes a `draft:
@@ -201,8 +204,14 @@ draft, and to feed the backstop above.
 - **Claude Code**: supported (`composer_view` in
   `rs/agentctl/src/harness/claude.rs`, including the unframed tall-draft
   fallback).
-- **Codex**: supported (`rs/agentctl/src/harness/codex.rs`), with the
-  0.169 footer defect of #1553.
+- **Codex**: supported (`rs/agentctl/src/harness/codex.rs`). The
+  composer ends at its own blank boundary: 0.164's boxed single status
+  row and 0.169's two-row footer (status row parsed by shape, then the
+  hint row) are footer, never draft text. Rows under the composer that
+  no rule classifies read as composer-unknown beneath a
+  placeholder-only composer (never a draft that refuses a send), and
+  as the draft's own paragraphs beneath a composer holding real text
+  (#1553, landed 8a0d30a5).
 - **Muse**: supported, outside the adapter — the editor reader in
   `rs/agentctl/src/client.rs` (`muse_verified_process_editor_rows` and
   friends), used by delivery, status, and the sweep.
@@ -445,6 +454,20 @@ mid-turn agent is never interrupted for it without `--urgent`.
   structured model, and validation refuses it.
 - **Headless**: supported for Claude Code, applied at the next wrapper
   launch or turn boundary.
+
+### Launch failure hints
+
+When a launch fails, the pane screen it left behind can name the cause
+and remedy (`HarnessAdapter::launch_failure` in
+`rs/agentctl/src/harness/mod.rs`).
+
+- **Codex**: supported on the native Herdr start path — a screen
+  showing `daemon executable not found` makes the launch error name
+  the `--no-daemon` relaunch (for example `--harness-arg=--no-daemon`);
+  the flag is reported, never added silently (#1553, landed 8a0d30a5).
+  Other launch backends keep the generic launch error.
+- **Claude Code, Muse, Unknown TUI, Headless**: none — the generic
+  launch error stands.
 
 ### Launch-env replay
 
