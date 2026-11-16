@@ -33,7 +33,10 @@
 //! A harness draws a long paste as one placeholder, which shows only the paste's size: Muse and
 //! Codex draw `[Pasted Content N chars]`, Claude Code (and Codex for a paste of many lines)
 //! `[Pasted text #K +M lines]`. A character-count draft matches only the very last prompt
-//! typed, of exactly that size, within [`PLACEHOLDER_LOOKBACK`], a shorter window than
+//! typed, of exactly that size — or, when exactly one delivery in the lookback has that
+//! size, that delivery, however many prompts followed it (#1732: on a busy lane the stuck
+//! paste is routinely no longer the latest, and a size two deliveries share names neither).
+//! That match lives within [`PLACEHOLDER_LOOKBACK`], a shorter window than
 //! [`TEXT_LOOKBACK`] for a draft whose text shows. A numbered draft matches, among every
 //! record in its lookback, the one holding its exact recorded `paste_label` (#808),
 //! or, when a record holds no label (its paste never showed in the composer, as on a busy
@@ -464,54 +467,31 @@ pub(crate) fn find(
         .collect();
     records.extend(recent_cancelled_digests(queue, now, lookback));
     records.sort_by(|left, right| right.0.total_cmp(&left.0));
+    // A character-count placeholder may name an older delivery by a unique
+    // size (#1732); keep every record for that second look.
+    let all_records = if matches!(draft, Draft::Placeholder(_)) {
+        records.clone()
+    } else {
+        Vec::new()
+    };
     let mut times: Vec<f64> = records.iter().map(|record| record.0).collect();
     times.dedup();
     let Some(&oldest) = times.get(deliveries - 1).or(times.last()) else {
         return digest_without_record(queue, draft);
     };
     records.retain(|record| record.0 >= oldest);
-    for (_, path, document) in &records {
-        let digest = digest_record(path, document);
-        let quarantined = digest
-            || path
-                .parent()
-                .and_then(Path::file_name)
-                .is_some_and(|phase| phase == "failed");
-        let matched = typed_texts(document).into_iter().any(|text| {
-            if !framed(text) && !digest {
-                return false;
-            }
-            match draft {
-                // A whole prompt, or a fragment of one (the tail a split
-                // paste leaves, #731 agentctl-paste-tail-flush). A whole
-                // prompt under `Unproven` vouches only when quarantined:
-                // a person may have recalled it with the history keys. A
-                // fragment is not what recall produces (that is the whole
-                // prompt), so a fragment vouches either way.
-                Draft::Text(rows) => {
-                    fragment_matches(rows, text)
-                        || (text_matches(rows, text)
-                            && (vouching == Vouching::Recent || quarantined))
-                }
-                // A numbered paste placeholder matches a record holding
-                // that exact label (#808), or a recent record holding no
-                // label whose size the shared line-count matcher accepts
-                // for its count (#884 follow-up busy-evidence). A
-                // character-count placeholder carries no such proof and
-                // keeps the rule above.
-                Draft::PastedLines(_) => placeholder_matches_q(draft, text, document, quarantined),
-                _ => {
-                    placeholder_matches(draft, text, document)
-                        && (vouching == Vouching::Recent || quarantined)
-                }
-            }
-        });
-        if matched {
-            return Some(typed_prompt(path, document, Vec::new()));
+    for record in &records {
+        if record_matches(record, draft, vouching) {
+            return Some(typed_prompt(&record.1, &record.2, Vec::new()));
         }
     }
     if let Some(found) = digest_without_record(queue, draft) {
         return Some(found);
+    }
+    if matches!(draft, Draft::Placeholder(_)) {
+        if let Some(found) = unique_placeholder_match(&all_records, draft, vouching) {
+            return Some(found);
+        }
     }
     let Draft::Text(rows) = draft else {
         return None;
@@ -565,6 +545,69 @@ pub(crate) fn find(
         }
     }
     None
+}
+
+/// Whether one typed record's prompt is `draft`, under `vouching`.
+fn record_matches(record: &Record, draft: &Draft, vouching: Vouching) -> bool {
+    let (_, path, document) = record;
+    let digest = digest_record(path, document);
+    let quarantined = digest
+        || path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|phase| phase == "failed");
+    typed_texts(document).into_iter().any(|text| {
+        if !framed(text) && !digest {
+            return false;
+        }
+        match draft {
+            // A whole prompt, or a fragment of one (the tail a split
+            // paste leaves, #731 agentctl-paste-tail-flush). A whole
+            // prompt under `Unproven` vouches only when quarantined:
+            // a person may have recalled it with the history keys. A
+            // fragment is not what recall produces (that is the whole
+            // prompt), so a fragment vouches either way.
+            Draft::Text(rows) => {
+                fragment_matches(rows, text)
+                    || (text_matches(rows, text) && (vouching == Vouching::Recent || quarantined))
+            }
+            // A numbered paste placeholder matches a record holding
+            // that exact label (#808), or a recent record holding no
+            // label whose size the shared line-count matcher accepts
+            // for its count (#884 follow-up busy-evidence). A
+            // character-count placeholder carries no such proof and
+            // keeps the rule above.
+            Draft::PastedLines(_) => placeholder_matches_q(draft, text, document, quarantined),
+            _ => {
+                placeholder_matches(draft, text, document)
+                    && (vouching == Vouching::Recent || quarantined)
+            }
+        }
+    })
+}
+
+/// A character-count placeholder whose size exactly one delivery in the
+/// lookback has (#1732): that delivery, named however many prompts followed
+/// it. A size two deliveries share names neither, so a person's paste of
+/// the same length as an old prompt is never submitted on this evidence.
+fn unique_placeholder_match(
+    records: &[Record],
+    draft: &Draft,
+    vouching: Vouching,
+) -> Option<TypedPrompt> {
+    let mut found: Option<&Record> = None;
+    for record in records {
+        if !record_matches(record, draft, vouching) {
+            continue;
+        }
+        match found {
+            None => found = Some(record),
+            // One delivery typed as a batch shares its typed time.
+            Some(previous) if previous.0 == record.0 => {}
+            Some(_) => return None,
+        }
+    }
+    found.map(|record| typed_prompt(&record.1, &record.2, Vec::new()))
 }
 
 /// One piece of a composer draft, for [`composite_match`].
@@ -926,6 +969,47 @@ message number {index:02}"
             &json!({"text": text(10), "inflight_at": 300.0}),
         );
         assert!(find(queue, &Draft::Text(text(10)), Vouching::Recent, now).is_none());
+    }
+
+    #[test]
+    fn a_placeholder_unique_to_an_older_delivery_still_vouches_for_it() {
+        // #1732 agentctl-muse-midturn-typed-not-submitted: a busy lane's stuck
+        // paste is routinely no longer its latest delivery, so a size that
+        // exactly one typed record in the lookback has must still name it;
+        // a size several records share stays latest-only, as above.
+        let directory = Scratch::new("unique-placeholder");
+        let queue = directory.0.as_path();
+        let older =
+            format!("{HEADER}\na longer older message that Muse collapsed to a placeholder");
+        let newer = format!("{HEADER}\nshort");
+        record(
+            queue,
+            "processed",
+            "older",
+            &json!({"text": older, "inflight_at": 100.0}),
+        );
+        record(
+            queue,
+            "processed",
+            "newer",
+            &json!({"text": newer, "inflight_at": 200.0}),
+        );
+        let now = SystemTime::now();
+        let shown = crate::client::muse_paste_length(&format!(
+            "{HEADER}\na longer older message that Muse collapsed to a placeholder"
+        ));
+        assert_eq!(
+            find(queue, &Draft::Placeholder(shown), Vouching::Recent, now).map(|found| found.id),
+            Some("older".to_owned())
+        );
+        // Once a second record shares that size, it no longer vouches.
+        record(
+            queue,
+            "processed",
+            "twin",
+            &json!({"text": format!("{HEADER}\na longer older message that Muse collapsed to a placeholder"), "inflight_at": 150.0}),
+        );
+        assert!(find(queue, &Draft::Placeholder(shown), Vouching::Recent, now).is_none());
     }
 
     #[test]

@@ -116,6 +116,72 @@ fn a_watchers_drain_types_a_queued_prompt_into_a_busy_muse() {
 }
 
 #[test]
+fn a_busy_muse_that_drops_enters_under_its_placeholder_still_takes_the_prompt() {
+    // #1732: Muse drops a submit key that lands while it takes in a paste or
+    // redraws mid-turn; the paste shows only as its placeholder. The delivery
+    // presses again on that evidence and ends with the editor empty.
+    let fixture = Fixture::new();
+    let manager = start_busy_muse(&fixture, false);
+    {
+        let mut editor = fixture.client.muse_editor.lock().unwrap();
+        let editor = editor.as_mut().unwrap();
+        *editor = MuseEditor::new("Launch overrides", false, Some(120));
+        editor.busy = true;
+        editor.missed_enters = 2;
+    }
+    let prompt = format!(
+        "[from lane-a via agentctl · reply: agentctl send lane-a]\n{}",
+        "a longer busy message that Muse collapsed to a placeholder ".repeat(3)
+    );
+    let result = manager
+        .send_identified_with_runtime("worker", &prompt, held(), "busyph", &Clock::default())
+        .unwrap();
+    assert_eq!(result.delivered, ["busyph"]);
+    assert_eq!(fixture.client.literal_pastes.lock().unwrap().len(), 1);
+    assert!(fixture
+        .client
+        .muse_editor
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .staged()
+        .is_none());
+}
+
+#[test]
+fn a_prompt_muse_returns_after_the_settle_is_pressed_again_by_the_recheck() {
+    // #1732: a steer Muse refuses only after the delivery's settle (a long
+    // compaction) puts the prompt back in the editor after the delivery has
+    // counted it delivered. The delayed re-check presses Enter on it, so it
+    // never sits there for the watcher to call foreign.
+    let fixture = Fixture::new();
+    let manager = start_busy_muse(&fixture, false);
+    {
+        let mut editor = fixture.client.muse_editor.lock().unwrap();
+        let editor = editor.as_mut().unwrap();
+        editor.failing_steers = 1;
+        // Long past the settle, inside the re-check's watch.
+        editor.steer_fails_after_reads = 50;
+    }
+    let prompt = "[from lane-a via agentctl · reply: agentctl send lane-a]\nrecheck me";
+    let result = manager
+        .send_identified_with_runtime("worker", prompt, held(), "recheck", &Clock::default())
+        .unwrap();
+    assert_eq!(result.delivered, ["recheck"]);
+    assert_eq!(keys(&fixture), ["Enter", "Enter"], "{:?}", keys(&fixture));
+    assert!(fixture
+        .client
+        .muse_editor
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .staged()
+        .is_none());
+}
+
+#[test]
 fn a_follow_up_muse_never_accepts_is_taken_back_out_and_stays_pending() {
     let fixture = Fixture::new();
     let manager = start_busy_muse(&fixture, false);

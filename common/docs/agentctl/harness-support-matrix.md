@@ -57,7 +57,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Capability | Claude Code | Codex | Muse | Unknown TUI | Headless |
 | --- | --- | --- | --- | --- | --- |
 | Send: typing + submit | supported | supported | supported | partial | supported (Claude only) |
-| Second Enter after delivery (#1691) | supported | supported | supported (Rust editor path) | none | n/a (no composer) |
+| Second Enter after delivery (#1691) | supported | supported | supported (delayed re-check, #1732) | none | n/a (no composer) |
 | Send: delivery receipts | supported | supported | supported | partial | supported (Claude only) |
 | Follow-up while working | partial | supported | supported | none | n/a (queued turns) |
 | Stuck-paste / Enter backstop | supported | partial | supported | partial | n/a (no composer) |
@@ -181,7 +181,10 @@ in `rs/agentctl/src/stale_draft.rs`.
 - **Codex**: supported — the 0.169 footer misread that made the reader
   see a draft that is not there is fixed (#1553, landed 8a0d30a5), so
   Codex drafts attribute and flush like Claude Code's.
-- **Muse**: supported (the Muse editor reader; #1546).
+- **Muse**: supported (the Muse editor reader; #1546). A placeholder draft
+  whose size exactly one typed delivery in its lookback has is attributed
+  to that delivery even when later prompts followed it (#1732); a size
+  two deliveries share still names neither.
 - **Unknown TUI**: partial — report only from the per-harness sweep,
   which cannot read an unknown editor, so a stranded prompt there
   becomes a `draft: unreadable` blocked finding from that layer. The
@@ -220,7 +223,12 @@ and foreign drafts (`second_enter_skipped` on the queue record), and a
 flush is receipted as `submitted by second_enter` with `second_enter_at`
 stamped. Bare Enter on an empty composer was verified harmless live for
 Claude Code, Codex and Muse. Opt out: `AGENTCTL_SECOND_ENTER=0`. Unknown
-TUI gets none (no composer model); headless has no composer.
+TUI gets none (no composer model); headless has no composer. Muse, which
+never runs `submit_verified`, gets the matching delayed re-check instead
+(#1732): after a verified steer, if its editor again holds exactly the
+prompt just sent, one Enter (`recheck_muse_submitted` in
+`rs/agentctl/src/subagents.rs`); foreign text and approval dialogs are
+left alone, and the verified outcome stands.
 
 ### Composer / draft detection
 

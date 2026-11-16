@@ -415,6 +415,48 @@ fn a_prompt_muse_returns_after_a_long_compaction_is_submitted_by_the_next_delive
     }
 }
 
+/// #1732 agentctl-muse-midturn-typed-not-submitted: a long prompt Muse put
+/// back in its editor as a placeholder, no longer the lane's latest delivery,
+/// is still recognised as agentctl's by its unique size and submitted by the
+/// next delivery — never reported as a draft agentctl did not type.
+#[test]
+fn a_returned_placeholder_no_longer_latest_is_submitted_by_the_next_delivery() {
+    let fixture = Fixture::new();
+    let manager = start_muse(&fixture, true);
+    editor(&fixture, |editor| {
+        *editor = MuseEditor::new("YOLO", false, Some(120));
+        editor.busy = true;
+    });
+    let older = format!(
+        "{LANE}\na longer older message that Muse collapsed to a placeholder for the editor, with enough text to pass the limit"
+    );
+    manager
+        .send_identified_with_runtime("coord", &older, quick(), "older", &Clock::default())
+        .unwrap();
+    manager
+        .send_identified_with_runtime(
+            "coord",
+            &format!("{LANE}\nshort"),
+            quick(),
+            "newer",
+            &Clock::default(),
+        )
+        .unwrap();
+    // Muse puts the older prompt back, drawn only as its placeholder.
+    editor(&fixture, |editor| editor.draft(&older));
+    fixture.client.keys_sent.lock().unwrap().clear();
+
+    let owner = format!("{OWNER}\nare you there?");
+    let result = manager
+        .send_identified_with_runtime("coord", &owner, quick(), "chat-7", &Clock::default())
+        .unwrap();
+    assert_eq!(result.delivered, ["chat-7"]);
+    assert!(editor(&fixture, |editor| editor.staged().is_none()));
+    let recovered = processed(&manager, "older");
+    assert!(recovered["draft_recovered_at"].is_number(), "{recovered}");
+    assert_eq!(processed(&manager, "chat-7")["delivery_state"], "processed");
+}
+
 /// An extra Enter on an empty Muse editor, idle or running a turn, starts no turn and draws
 /// nothing: the steady state agentctl relies on when it presses Enter again for a draft that has
 /// just left the editor. (Modelled: unlike Claude Code and Codex, this was not observed on a

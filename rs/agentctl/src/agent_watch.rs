@@ -8734,6 +8734,53 @@ mod tests {
     }
 
     #[test]
+    fn a_muse_placeholder_unique_to_an_older_delivery_is_flushed_by_the_sweep() {
+        // #1732: the stuck paste is no longer the lane's latest delivery, but
+        // its placeholder size is unique among the typed records, so the
+        // sweep attributes and flushes it instead of calling it foreign.
+        use std::os::unix::fs::DirBuilderExt;
+        let queue =
+            std::env::temp_dir().join(format!("agentctl-sweep-muse-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(queue.join("processed"))
+            .unwrap();
+        let older = "[from lane-a via agentctl · reply: agentctl send lane-a]\na longer older message that Muse collapsed to a placeholder for the editor";
+        let newer = "[from lane-a via agentctl · reply: agentctl send lane-a]\nshort";
+        for (id, text, at) in [("older", older, 1_000.0), ("newer", newer, 1_050.0)] {
+            crate::agent::atomic_json(
+                &queue.join(format!("processed/{id}.json")),
+                &json!({"id": id, "text": text, "delivery_state": "processed",
+                        "inflight_at": at}),
+            )
+            .unwrap();
+        }
+        let shown = crate::client::muse_paste_length(older);
+        let screen = sweep_muse_screen(&format!("[Pasted Content {shown} chars]"));
+        let mut probe = SweepProbe {
+            queue: queue.clone(),
+            screens: vec![("worker".into(), screen, "muse".into())],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let screens = probe.screens.clone();
+        let rows = sweep_editor_drafts(
+            &mut probe,
+            &mut notifier,
+            &mut state,
+            screens,
+            1_120.0,
+            &options(),
+        );
+        assert_eq!(rows[0]["action"], "flushed", "{rows:?}");
+        assert_eq!(rows[0]["id"], "older", "{rows:?}");
+        assert_eq!(notifier.flushes, ["worker"]);
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
     fn a_claude_tall_draft_with_no_top_rule_is_flushed_by_the_sweep() {
         // A long pasted draft grows the composer upward until its top rule
         // leaves the visible frame; only the bottom rule, under a footer

@@ -2859,7 +2859,62 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             last = Some(screen);
             runtime.sleep(POLL);
         };
-        self.muse_followup_submit(&guarded, pane_id, text, &staged, started, runtime)
+        let outcome = self.muse_followup_submit(&guarded, pane_id, text, &staged, started, runtime);
+        if matches!(outcome, Ok(Submission::Verified(_))) {
+            self.recheck_muse_submitted(&guarded, pane_id, text, runtime);
+        }
+        outcome
+    }
+
+    /// One delayed re-check after a verified Muse steer (#1732
+    /// agentctl-muse-midturn-typed-not-submitted): Muse can refuse a steer
+    /// only after the delivery's settle — a compaction finishing late — and
+    /// put the prompt back in its editor, where it would sit until the next
+    /// delivery or the watcher's sweep. After [`RECHECK_DELAY`], while the
+    /// editor again holds exactly the prompt just sent (as text or as its
+    /// paste placeholder), press Enter once and watch it leave for up to
+    /// [`RECHECK_VERIFY`]. An empty editor, foreign text, or an approval or
+    /// peer dialog is left exactly as it is, and the verified outcome stands
+    /// whatever the re-check finds, as on the Claude/Codex path
+    /// (`recheck_submitted` in `submission.rs`).
+    fn recheck_muse_submitted(
+        &self,
+        guarded: &dyn GuardedInput,
+        pane_id: &str,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) {
+        use crate::submission::{POLL, RECHECK_DELAY, RECHECK_VERIFY};
+        if runtime.cancelled() {
+            return;
+        }
+        runtime.sleep(RECHECK_DELAY);
+        let deadline = runtime.monotonic().saturating_add(RECHECK_VERIFY);
+        let mut pressed = false;
+        loop {
+            if runtime.cancelled() || runtime.monotonic() >= deadline {
+                return;
+            }
+            let Ok(screen) = self.verified_muse_screen(pane_id, runtime) else {
+                return;
+            };
+            if crate::harness_tui::muse::MuseTui::approval_form(&screen)
+                || crate::harness_tui::muse::MuseTui::peer_approval_form(&screen)
+            {
+                return;
+            }
+            if muse_verified_process_paste_is_exact_composer(&screen, text) {
+                if !pressed {
+                    if guarded.send_keys(pane_id, "Enter").is_err() {
+                        return;
+                    }
+                    pressed = true;
+                }
+            } else if pressed && !muse_verified_process_paste_in_composer(&screen, text) {
+                return;
+            }
+            runtime.sleep(POLL);
+        }
     }
 
     /// Press Enter on `text`, which `staged` shows as the whole Muse editor, and prove from the
