@@ -511,6 +511,7 @@
         "py/wrkslots/tests/test_slot_images.py",
         "py/wrkslots/tests/test_small_commands_rust.py",
         "py/wrkslots/tests/test_status_cli_rust.py",
+        "py/wrkslots/tests/test_status_interrupted.py",
         "py/wrkslots/tests/test_status_state_rust.py",
         "py/wrkslots/tests/test_storage_state_rust.py",
         "py/wrkslots/tests/test_tool_authority.py",

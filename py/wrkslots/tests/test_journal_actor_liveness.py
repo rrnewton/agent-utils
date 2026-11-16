@@ -99,8 +99,11 @@ def test_dead_actor_journal_reports_interrupted(tmp_path: Path) -> None:
         cli._assert_no_journal(config)
     assert not isinstance(caught.value, cli._JournalBusy)
     message = str(caught.value)
-    assert "interrupted mutation recorded in" in message
-    assert "run 'wrkslots recover' first" in message
+    assert "interrupted mutation for slot 'slot01' recorded in" in message
+    assert (
+        "run 'wrkslots recover --coordinator-pid PID --slot slot01' first"
+        in message
+    )
     assert "kind 'finish'" in message
 
 

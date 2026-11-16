@@ -128,3 +128,48 @@ def test_status_publishes_the_registry_after_a_change_mid_read_like_python(
     assert python_result.returncode == 0, python_result.stderr
     python_document = cast(dict[str, object], json.loads(python_result.stdout))
     assert _normalized(rust_document) == _normalized(python_document)
+
+
+def test_status_interrupted_journal_matches_python(tmp_path: Path) -> None:
+    """#1700: a dead actor's finish reads INTERRUPTED in both editions."""
+    from wrkslots.tests.test_lifecycle import (
+        create,
+        make_project,
+        prepare_removal_journal,
+    )
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    journal = prepare_removal_journal(project)
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+
+    python_result = _python(project, "--format", "json")
+    rust_result = _rust(project, "--format", "json")
+    assert python_result.returncode == 0, python_result.stderr
+    assert rust_result.returncode == 0, rust_result.stderr
+    python_document = cast(dict[str, object], json.loads(python_result.stdout))
+    rust_document = cast(dict[str, object], json.loads(rust_result.stdout))
+    fields = ("slot", "kind", "schema", "actor_pid", "alive", "state", "recover_command")
+    python_reports = cast(list[dict[str, object]], python_document["interrupted_journals"])
+    rust_reports = cast(list[dict[str, object]], rust_document["interrupted_journals"])
+    assert [
+        {key: report[key] for key in fields} for report in python_reports
+    ] == [{key: report[key] for key in fields} for report in rust_reports]
+    (report,) = python_reports
+    assert report["slot"] == "slot01"
+    assert report["kind"] == "finish"
+    assert report["alive"] is False
+    assert report["actor_pid"] == raw["owner"]["pid"]
+
+    python_human = _python(project)
+    rust_human = _rust(project)
+    assert python_human.returncode == 0, python_human.stderr
+    assert rust_human.returncode == 0, rust_human.stderr
+    for line in python_human.stdout.splitlines():
+        if line.startswith("INTERRUPTED"):
+            assert "alive=false" in line
+            assert any(
+                candidate.startswith("INTERRUPTED slot=slot01 kind=finish")
+                and "alive=false" in candidate
+                for candidate in rust_human.stdout.splitlines()
+            )

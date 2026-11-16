@@ -343,3 +343,171 @@ pub(crate) fn journal_blocker_message(control: &Path, name: &str) -> String {
     }
     interrupted
 }
+
+/// The exact command that resumes one interrupted mutation (#1700).
+pub(crate) fn recover_command(slot: Option<&str>, kind: Option<&str>) -> String {
+    match (slot, kind) {
+        (Some(slot), Some("create" | "create-eden" | "finish")) => {
+            format!("wrkslots recover --coordinator-pid PID --slot {slot}")
+        }
+        _ => "wrkslots recover --coordinator-pid PID".to_string(),
+    }
+}
+
+/// One outstanding journal as status and doctor report it (#1700).
+///
+/// Mirrors the Python `_journal_report`: the journal is parsed and its
+/// recorded actor generation is checked with the start-time identity
+/// proof, never by PID existence alone. A journal that cannot be read
+/// still reports, with `alive` unknown.
+pub(crate) fn journal_reports(control: &Path, names: &[String]) -> Vec<Value> {
+    names
+        .iter()
+        .map(|name| {
+            let path = control.join(name);
+            let _file_age = crate::classify_journals::journal_age_seconds(&path);
+            let contents = std::fs::read_to_string(&path).ok();
+            let raw = contents
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .and_then(|value| value.as_object().cloned());
+            let Some(raw) = raw else {
+                return json!({
+                    "journal": name,
+                    "slot": null,
+                    "kind": null,
+                    "schema": null,
+                    "actor_pid": null,
+                    "alive": null,
+                    "state": "interrupted",
+                    "age_seconds": null,
+                    "recover_command": recover_command(None, None),
+                    "reason": "journal cannot be read",
+                });
+            };
+            let slot = raw.get("slot").and_then(Value::as_str);
+            let kind = raw.get("kind").and_then(Value::as_str);
+            // Age from the record's own start stamp only, as the
+            // Python report does: a file mtime would make two readers
+            // of the same journal disagree by the time between runs.
+            let mut stamped_age: Option<u64> = None;
+            for field in ["finished_at", "created_at", "recorded_at"] {
+                if let Some(stamp) = raw.get(field).and_then(Value::as_str) {
+                    if let Some(started) = parse_journal_timestamp(stamp) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|elapsed| elapsed.as_secs() as i64)
+                            .unwrap_or(started);
+                        stamped_age = Some(u64::try_from((now - started).max(0)).unwrap_or(0));
+                        break;
+                    }
+                }
+            }
+            let age = stamped_age;
+            let identities = journal_actor_identities(&raw);
+            let actor_pid = identities.first().map(|identity| identity.pid);
+            let writer_kind = !matches!(
+                kind,
+                Some("create") | Some("create-eden") | Some("import-existing")
+            );
+            let mut alive: Option<bool> = None;
+            let mut state = "interrupted";
+            let mut reason = "the journal records no actor process generation".to_string();
+            if !identities.is_empty() {
+                let states: Vec<String> = identities
+                    .iter()
+                    .map(|identity| crate::status_state::process_state(Some(identity)).0)
+                    .collect();
+                if writer_kind {
+                    if let Some(index) = states.iter().position(|value| value == "live") {
+                        state = "in-progress";
+                        alive = Some(true);
+                        reason = format!("actor PID {} is live", identities[index].pid);
+                    }
+                }
+                if state != "in-progress" {
+                    if states.iter().all(|value| value == "dead") {
+                        alive = Some(false);
+                        reason = format!("actor PID {} is dead", identities[0].pid);
+                    } else {
+                        reason = "actor liveness is indeterminate".to_string();
+                    }
+                }
+            }
+            let live_pid = if state == "in-progress" {
+                identities
+                    .iter()
+                    .find(|identity| crate::status_state::process_state(Some(identity)).0 == "live")
+                    .map(|identity| identity.pid)
+            } else {
+                None
+            };
+            json!({
+                "journal": name,
+                "slot": slot,
+                "kind": kind,
+                "schema": raw.get("schema").cloned().unwrap_or(Value::Null),
+                "actor_pid": live_pid.or(actor_pid),
+                "alive": alive,
+                "state": state,
+                "age_seconds": age,
+                "recover_command": recover_command(slot, kind),
+                "reason": reason,
+            })
+        })
+        .collect()
+}
+
+/// Human form of one journal report (#1700).
+pub(crate) fn format_journal_report(report: &Value) -> String {
+    let text = |key: &str| match report.get(key) {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        _ => "None".to_string(),
+    };
+    let alive = match report.get("alive") {
+        Some(Value::Bool(true)) => "true",
+        Some(Value::Bool(false)) => "false",
+        _ => "unknown",
+    };
+    let age = match report.get("age_seconds") {
+        Some(Value::Number(value)) => format!("{value}s"),
+        _ => "unknown".to_string(),
+    };
+    let label = if report.get("state").and_then(Value::as_str) == Some("in-progress") {
+        "IN-PROGRESS"
+    } else {
+        "INTERRUPTED"
+    };
+    format!(
+        "{label} slot={} kind={} schema={} actor_pid={} alive={alive} age={age} recover=\"{}\" journal={}",
+        text("slot"),
+        text("kind"),
+        text("schema"),
+        text("actor_pid"),
+        text("recover_command"),
+        text("journal"),
+    )
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted = if month <= 2 { year - 1 } else { year };
+    let era = adjusted.div_euclid(400);
+    let year_of_era = adjusted.rem_euclid(400);
+    let month_prime = if month > 2 { month - 3 } else { month + 9 } as i64;
+    let day_of_year = (153 * month_prime + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Epoch seconds for a `YYYY-MM-DDTHH:MM:SSZ` journal timestamp.
+fn parse_journal_timestamp(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes[10] != b'T' {
+        return None;
+    }
+    let number =
+        |start: usize, len: usize| -> Option<i64> { value.get(start..start + len)?.parse().ok() };
+    let days = days_from_civil(number(0, 4)?, number(5, 2)? as u32, number(8, 2)? as u32);
+    Some(days * 86_400 + number(11, 2)? * 3600 + number(14, 2)? * 60 + number(17, 2)?)
+}

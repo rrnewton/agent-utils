@@ -214,15 +214,13 @@ pub(crate) fn parse_doctor(
     }
     let journals = parse_journals(root)?;
     if let Some(names) = journals.get("journals").and_then(Value::as_array) {
-        for name in names {
-            if let Some(name) = name.as_str() {
-                findings.push(note(
-                    "unfinished-journal",
-                    None,
-                    None,
-                    format!("recovery required: {name}"),
-                ));
-            }
+        for name in names.iter().filter_map(|name| name.as_str()) {
+            findings.push(note(
+                "unfinished-journal",
+                None,
+                None,
+                format!("recovery required: {name}"),
+            ));
         }
     }
     for row in crate::quarantine_write::quarantined_rows(&cfg) {
@@ -437,18 +435,24 @@ fn doctor_cli_once(
     }
     findings.extend(identity_drift_findings(root, &cfg, &config, &selected)?);
     findings.extend(crate::storage_state::image_findings(&cfg, &selected));
+    let mut journal_report_names: Vec<String> = Vec::new();
     let journals = parse_journals(root)?;
     if let Some(names) = journals.get("journals").and_then(Value::as_array) {
-        for name in names {
-            if let Some(name) = name.as_str() {
-                findings.push(note(
-                    "unfinished-journal",
-                    None,
-                    None,
-                    format!("recovery required: {name}"),
-                ));
-            }
+        let name_strings: Vec<String> = names
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect();
+        for name in &name_strings {
+            findings.push(note(
+                "unfinished-journal",
+                None,
+                None,
+                format!("recovery required: {name}"),
+            ));
         }
+        // Reports are built here; the findings are appended after
+        // every other finding, in the Python doctor's order (#1700).
+        journal_report_names = name_strings.clone();
     }
     for row in crate::quarantine_write::quarantined_rows(&cfg) {
         let age = match row.get("age_seconds").and_then(Value::as_u64) {
@@ -493,6 +497,35 @@ fn doctor_cli_once(
         }
     }
     findings.extend(harness_findings(&cfg, &records_all));
+    // Interrupted mutations last, as status reports them (#1700).
+    for report in crate::journals_state::journal_reports(&cfg.control, &journal_report_names) {
+        let kind = if report.get("state").and_then(Value::as_str) == Some("in-progress") {
+            "journal-in-progress"
+        } else {
+            "interrupted-mutation"
+        };
+        let mut finding = note(
+            kind,
+            report.get("slot").and_then(Value::as_str),
+            Some(selected.as_str()),
+            format!(
+                "{} ({})",
+                crate::journals_state::format_journal_report(&report),
+                report
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ),
+        );
+        finding["remedy"] = json!(format!(
+            "run '{}' to resume the recorded operation; diagnosis alone authorizes no mutation",
+            report
+                .get("recover_command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ));
+        findings.push(finding);
+    }
     if !all_machines {
         findings.retain(|item| {
             item.get("machine").is_none_or(|machine| {

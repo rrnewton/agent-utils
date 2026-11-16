@@ -2326,9 +2326,9 @@ pub fn run() -> u8 {
                 slot.as_deref(),
                 format == "human",
             ) {
-                Ok(text) => {
+                Ok((text, exit)) => {
                     print!("{text}");
-                    return 0;
+                    return u8::try_from(exit).unwrap_or(1);
                 }
                 Err(error) => {
                     eprintln!("wrkslotsd: {error}");

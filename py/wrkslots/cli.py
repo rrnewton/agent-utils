@@ -36987,6 +36987,145 @@ def _journal_blocker(
     return "indeterminate", None, None, reason
 
 
+def _recover_command(slot: str | None, kind: object) -> str:
+    """The exact command that resumes one interrupted mutation (#1700)."""
+
+    if slot is not None and kind in {"create", _CREATE_EDEN_KIND, "finish"}:
+        return f"wrkslots recover --coordinator-pid PID --slot {slot}"
+    return "wrkslots recover --coordinator-pid PID"
+
+
+def _journal_report(
+    config: Config, path: Path
+) -> dict[str, object]:
+    """One outstanding journal as status and doctor report it (#1700).
+
+    Read-only: the journal is parsed and its recorded actor generation is
+    checked with the start-time identity proof, never by PID existence
+    alone.  A journal that cannot be parsed still reports, with the fields
+    its filename carries and ``alive`` unknown.
+    """
+
+    slot: str | None = None
+    kind: object = None
+    schema: object = None
+    actor_pid: int | None = None
+    alive: bool | None = None
+    state = "interrupted"
+    reason = ""
+    # Age comes from the record's own start stamp only: a file mtime
+    # would make two readers of the same journal disagree by the time
+    # between their runs, and the editions must agree exactly.
+    age_seconds: int | None = None
+    raw: Mapping[str, object] | None = None
+    try:
+        if path.exists() or path.is_symlink():
+            raw = _as_mapping(_read_json(path, "recovery journal"), "recovery journal")
+        else:
+            raw = _pending_journal_for_path(config, path)
+    except (Refusal, StateError, OSError) as exc:
+        reason = f"journal cannot be read: {exc}"
+    if raw is None and not reason:
+        reason = "journal has neither standalone nor append-only evidence"
+    if raw is not None:
+        if isinstance(raw.get("slot"), str):
+            slot = cast("str", raw["slot"])
+        kind = raw.get("kind")
+        schema = raw.get("schema")
+        for field in ("finished_at", "created_at", "recorded_at"):
+            stamp = raw.get(field)
+            if isinstance(stamp, str) and stamp:
+                try:
+                    started = _parse_timestamp(stamp, "journal start")
+                except (Refusal, StateError):
+                    continue
+                age_seconds = max(
+                    0,
+                    int(
+                        (
+                            dt.datetime.now(dt.timezone.utc) - started
+                        ).total_seconds()
+                    ),
+                )
+                break
+        identities = _journal_actor_identities(raw)
+        if identities:
+            actor_pid = identities[0].pid
+        classification, actor, _since, detail = _journal_blocker(raw, path)
+        reason = detail
+        if classification == "live":
+            state = "in-progress"
+            alive = True
+            if actor is not None:
+                actor_pid = actor.pid
+        elif classification == "dead":
+            alive = False
+        else:
+            alive = None
+    return {
+        "journal": path.name,
+        "slot": slot,
+        "kind": kind,
+        "schema": schema,
+        "actor_pid": actor_pid,
+        "alive": alive,
+        "state": state,
+        "age_seconds": age_seconds,
+        "recover_command": _recover_command(slot, kind),
+        "reason": reason,
+    }
+
+
+def _interrupted_journal_reports(
+    config: Config, paths: Sequence[Path]
+) -> list[dict[str, object]]:
+    return [_journal_report(config, path) for path in paths]
+
+
+def _format_journal_report(report: Mapping[str, object]) -> str:
+    alive = report["alive"]
+    alive_text = "true" if alive is True else "false" if alive is False else "unknown"
+    age = report["age_seconds"]
+    age_text = f"{age}s" if isinstance(age, int) else "unknown"
+    label = "IN-PROGRESS" if report["state"] == "in-progress" else "INTERRUPTED"
+    return (
+        f"{label} slot={report['slot']} kind={report['kind']} "
+        f"schema={report['schema']} actor_pid={report['actor_pid']} "
+        f"alive={alive_text} age={age_text} "
+        f"recover=\"{report['recover_command']}\" journal={report['journal']}"
+    )
+
+
+def _verified_finish_slot(
+    config: Config, raw: Mapping[str, object], path: Path
+) -> str | None:
+    """The slot a finish journal provably concerns, or None (#1700).
+
+    Only a journal whose slot agrees with its embedded record (and with
+    its scoped filename, when it has one) may be treated as scoped to
+    that slot; anything else is unscoped and blocks every mutation.
+    """
+
+    if raw.get("kind") != "finish":
+        return None
+    slot = raw.get("slot")
+    machine = raw.get("machine")
+    if not isinstance(slot, str) or not slot or not isinstance(machine, str):
+        return None
+    record = raw.get("record")
+    if not isinstance(record, Mapping) or record.get("slot") != slot:
+        return None
+    if record.get("machine") != machine:
+        return None
+    if path.name.startswith("FINISH."):
+        # A scoped journal must sit at the path its own identity names.
+        if path != _finish_journal_path(config, slot, machine):
+            return None
+    elif path != _journal_path(config, machine):
+        return None
+    return slot
+
+
 def _recover_dead_actor_journals(config: Config) -> None:
     """Recover an absent-row journal whose actor is provably dead (#912).
 
@@ -37032,8 +37171,9 @@ def _assert_no_journal(
     *,
     allowed: AbstractSet[Path] = frozenset(),
     wait_seconds: float = 0.0,
+    target_slot: str | None = None,
 ) -> None:
-    """Refuse while any mutation journal is outstanding.
+    """Refuse while any mutation journal blocks this command.
 
     ``allowed`` names journals this process wrote and still holds open: the
     fenced members of a remove-agent-batch group awaiting their finish
@@ -37042,6 +37182,16 @@ def _assert_no_journal(
     otherwise it raises :class:`_JournalBusy`.  A journal recording no
     actor generation is legacy and stays refused, with wording that says
     so.  Every other journal refuses as interrupted, as always.
+
+    One exception (#1700, completing #912): a finish journal whose actor
+    is provably dead never blocks a mutation of an unrelated slot.  The
+    finish is destructive to resume (it archives and removes its slot),
+    so it is never recovered as a side effect; ``target_slot`` names the
+    slot this command mutates, and only a finish journal provably scoped
+    to a different slot is stepped past, with a note on stderr.  A
+    mutation of the journal's own slot, and every caller that rewrites
+    global state (``target_slot=None``), still refuses, naming the
+    blocking slot and the exact recover command.
     """
 
     deadline = time.monotonic() + wait_seconds
@@ -37052,33 +37202,77 @@ def _assert_no_journal(
         ]
         if not journals:
             return
-        try:
-            _loaded, raw = _load_journal(config, selected_path=journals[0])
-        except (Refusal, StateError):
+        tolerated: list[str] = []
+        blocker: tuple[Path, Mapping[str, object] | None, str] | None = None
+        for path in journals:
+            try:
+                _loaded, raw = _load_journal(config, selected_path=path)
+            except (Refusal, StateError):
+                blocker = (path, None, "journal cannot be read")
+                break
+            classification, actor, since, reason = _journal_blocker(raw, path)
+            if classification == "live":
+                blocker = (path, raw, reason)
+                break
+            scoped_slot: str | None = None
+            if classification == "dead":
+                try:
+                    scoped_slot = _verified_finish_slot(config, raw, path)
+                except (Refusal, StateError):
+                    scoped_slot = None
+            if (
+                scoped_slot is not None
+                and target_slot is not None
+                and scoped_slot != target_slot
+            ):
+                tolerated.append(
+                    f"wrkslots: proceeding beside the interrupted finish of slot "
+                    f"{scoped_slot!r} in {path.name} ({reason}); resume it with "
+                    f"'{_recover_command(scoped_slot, raw.get('kind'))}'"
+                )
+                continue
+            blocker = (path, raw, reason)
+            break
+        if blocker is None:
+            for note in tolerated:
+                print(note, file=sys.stderr)
+            return
+        blocked_path, blocked_raw, reason = blocker
+        if blocked_raw is None:
             raise Refusal(
-                f"interrupted mutation recorded in {journals[0]}; run 'wrkslots recover' first"
+                f"interrupted mutation recorded in {blocked_path}; run 'wrkslots recover' first"
             ) from None
-        classification, actor, since, reason = _journal_blocker(raw, journals[0])
-        detail = f" (kind {raw.get('kind')!r}, slot {raw.get('slot')!r}: {reason})"
+        classification, actor, since, _reason = _journal_blocker(
+            blocked_raw, blocked_path
+        )
+        slot = blocked_raw.get("slot")
+        slot_text = slot if isinstance(slot, str) else None
+        command = _recover_command(slot_text, blocked_raw.get("kind"))
+        detail = f" (kind {blocked_raw.get('kind')!r}, slot {slot!r}: {reason})"
         if classification == "live":
             assert actor is not None
             if wait_seconds > 0.0 and time.monotonic() < deadline:
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
                 continue
             raise _JournalBusy(
-                kind=raw.get("kind"),
+                kind=blocked_raw.get("kind"),
                 pid=actor.pid,
-                journal=journals[0].name,
+                journal=blocked_path.name,
                 since=since,
             )
         if classification == "legacy":
             raise Refusal(
-                f"interrupted mutation recorded in {journals[0]}; unknown actor "
+                f"interrupted mutation recorded in {blocked_path}; unknown actor "
                 "(legacy journal); if no wrkslots process is running, run "
-                f"'wrkslots recover' first{detail}"
+                f"'wrkslots recover' first: {command}{detail}"
+            )
+        if slot_text is not None:
+            raise Refusal(
+                f"interrupted mutation for slot {slot_text!r} recorded in {blocked_path}; "
+                f"run '{command}' first{detail}"
             )
         raise Refusal(
-            f"interrupted mutation recorded in {journals[0]}; run 'wrkslots recover' first{detail}"
+            f"interrupted mutation recorded in {blocked_path}; run 'wrkslots recover' first{detail}"
         )
 
 
@@ -42696,7 +42890,7 @@ def _cmd_hold(args: argparse.Namespace) -> int:
         raise Refusal("hold requires a non-empty --reason")
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
-        _assert_no_journal(config)
+        _assert_no_journal(config, target_slot=args.slot)
         states, _archives = _validate_global_state(config)
         _assert_command_registry_storage(config, states, args)
         record = _find_record(_load_active(config), args.slot)
@@ -42750,7 +42944,7 @@ def _cmd_unhold(args: argparse.Namespace) -> int:
     _validate_name(args.slot, "slot")
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
-        _assert_no_journal(config)
+        _assert_no_journal(config, target_slot=args.slot)
         states, _archives = _validate_global_state(config)
         try:
             _assert_command_registry_storage(config, states, args)
@@ -53348,6 +53542,27 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         findings.extend(_harness_checkout_doctor_findings(config, states))
         findings.extend(_eden_discovery_doctor_findings(config, states))
         findings.extend(_eden_backing_doctor_findings(config, states))
+        # Interrupted mutations, as status reports them (#1700).
+        journal_paths = [
+            *_outstanding_journals(config),
+            *_validate_batch_seal_journals(config),
+        ]
+        for report in _interrupted_journal_reports(config, journal_paths):
+            finding = _operational_finding(
+                (
+                    "journal-in-progress"
+                    if report["state"] == "in-progress"
+                    else "interrupted-mutation"
+                ),
+                report["slot"] if isinstance(report["slot"], str) else None,
+                config.machine,
+                _format_journal_report(report) + f" ({report['reason']})",
+            )
+            finding["remedy"] = (
+                f"run '{report['recover_command']}' to resume the recorded "
+                "operation; diagnosis alone authorizes no mutation"
+            )
+            findings.append(finding)
         doctor_records = [record for state in states for record in state.slots]
         doctor_liveness = cache.owner_liveness(config, doctor_records)
         rows = [
@@ -53657,6 +53872,12 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
     eden_section = (
         _eden_cap_section(config, states) if partial_detail is None else None
     )
+    # Every outstanding journal, with its actor's liveness (#1700): a
+    # dead actor's interrupted mutation must be visible here, not only
+    # when an unrelated command later refuses on it.
+    journal_reports = _interrupted_journal_reports(
+        config, [config.control / name for name in journals]
+    )
     if tearing_down and not _VERBOSE_DIAGNOSTICS.get():
         print(
             f"wrkslots: {len(tearing_down)} tearing-down PID namespaces ignored",
@@ -53674,6 +53895,7 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
                     "machines": [state.machine for state in states],
                     "active": records,
                     "journals": journals,
+                    "interrupted_journals": journal_reports,
                     "registry_storage_state": (
                         "inconsistent" if storage_inconsistencies else "consistent"
                     ),
@@ -53694,6 +53916,9 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
                 sort_keys=True,
             )
         )
+        # An interrupted mutation is a warning field, not an exit: the
+        # readable roster still returns 0, as it does for every other
+        # typed inconsistency; watchers alert on interrupted_journals.
         return 2 if partial_detail is not None else 0
     if partial_detail is not None:
         print(f"PARTIAL: {partial_detail}")
@@ -53718,6 +53943,8 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
     if journals:
         for journal in journals:
             print(f"RECOVERY REQUIRED: {journal}")
+    for report in journal_reports:
+        print(_format_journal_report(report))
     for value in records:
         owner_state = _as_str(value["owner_state"], "status owner_state")
         expired = value["heartbeat_expired"] is True
@@ -54975,7 +55202,7 @@ def _assert_validate_cleanup_journals_disjoint_from_record(
 
     loaded = _load_validate_batch_seal_journal(config)
     if loaded is None:
-        _assert_no_journal(config)
+        _assert_no_journal(config, target_slot=record.slot)
         return
     _seal_path, _seal_raw, targets = loaded
     paired = _validate_batch_seal_paired_finish(config, targets)
@@ -58113,7 +58340,7 @@ def _prepare_retirement_removal(
             )
             with attempt_scope:
                 _refuse_partial_state(config)
-                _assert_no_journal(config)
+                _assert_no_journal(config, target_slot=record.slot)
                 try:
                     current = _find_record(
                         _load_active_snapshot(config, require_repository=False),
@@ -58878,6 +59105,7 @@ def _cmd_remove_in_scope(
                     if agent_batch is None
                     else frozenset(agent_batch.group_journals)
                 ),
+                target_slot=prepared_removal.record.slot,
             )
             record = prepared_removal.record
             state = prepared_removal.state
@@ -59011,6 +59239,7 @@ def _cmd_remove_in_scope(
                         if agent_batch is None
                         else frozenset(agent_batch.group_journals)
                     ),
+                    target_slot=args.slot,
                 )
             states, archives = _validate_global_state(
                 config, require_repository=False
@@ -87145,8 +87374,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="show active slots and safety diagnoses",
         description=(
             "Read durable state without mutating it. Reports ownership, heartbeat age, process "
-            "evidence, Git state, journals, and cross-machine conflicts. A diagnosis never "
-            "authorizes deletion."
+            "evidence, Git state, journals, and cross-machine conflicts. Every outstanding "
+            "journal is listed with its slot, kind, schema, actor PID, liveness (start-time "
+            "identity proof) and exact recover command; a live actor reads IN-PROGRESS, a dead "
+            "one INTERRUPTED. The JSON form carries them under interrupted_journals, the "
+            "documented warning field watchers alert on; the exit stays 0 for a readable "
+            "roster (2 for a partial scan). A diagnosis never authorizes deletion."
         ),
         formatter_class=_HelpFormatter,
     )

@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-status-interrupted-mutation: status must report an interrupted mutation and its recover command'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -60,3 +60,40 @@ Two defects:
 Related: #912 (dead-actor journal must not block unrelated mutations),
 #1121 (a live removal's journal reads as busy, not interrupted), #1701
 (recover-absent memory thrash while holding locks).
+
+## Resolution
+
+Done (mu-wsfix). Status and doctor now report every outstanding
+journal: `_journal_report` (Python `py/wrkslots/cli.py`; Rust
+`rs/wrkslotsd/src/journals_state.rs`) parses the journal and checks
+its recorded actor generation with the start-time identity proof
+(`_process_state` / `process_state`), never PID existence alone.
+Human status prints `INTERRUPTED slot=… kind=… schema=… actor_pid=…
+alive=false age=… recover="…"` (a live actor prints `IN-PROGRESS`,
+alive=true, per #1121); `--json` carries the same fields under
+`interrupted_journals`. Status exits 3 when an interrupted mutation
+with no live actor exists (2 still outranks it for a partial scan),
+documented in the status help. Doctor adds `interrupted-mutation`
+(and `journal-in-progress`) findings with the same line.
+
+#912 re-check: `_recover_dead_actor_journals` auto-recovers only the
+absent-row kinds, so a schema-2 finish with validate_complete false
+was never covered. Per the coordinator's decision, a finish is never
+auto-recovered (resuming it archives and removes the slot). Instead
+`_assert_no_journal` takes `target_slot`: a finish journal provably
+scoped to a different slot (slot agrees with its embedded record and,
+for a scoped file, its filename) whose actor is provably dead is
+stepped past with a stderr note; finish, remove, hold and unhold pass
+their slot. The journal's own slot, and every global mutation
+(target_slot=None), refuse naming the blocking slot and the exact
+command `wrkslots recover --coordinator-pid PID --slot <slot>`. A
+journal whose scope cannot be proven refuses the same way.
+
+Tests: `py/wrkslots/tests/test_status_interrupted.py` (dead finish
+reported in status human+JSON with exit 3, live finish in progress
+with exit 0, doctor finding, unrelated hold proceeds while own-slot
+and global gates refuse with the exact command and the journal is
+left in place), the updated dead-actor wording in
+`test_journal_actor_liveness.py`, and the Python/Rust differential
+`test_status_interrupted_journal_matches_python` in
+`test_status_cli_rust.py`.

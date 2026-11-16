@@ -549,7 +549,7 @@ pub(crate) fn status_cli(
     all_machines: bool,
     slot_filter: Option<&str>,
     human: bool,
-) -> Result<String> {
+) -> Result<(String, i32)> {
     // Published only from a read the registry did not change under
     // (#1200 rust-status-consistency).
     let (cfg, _selected) = load_cfg(root, machine_override)?;
@@ -564,7 +564,7 @@ fn status_cli_once(
     all_machines: bool,
     slot_filter: Option<&str>,
     human: bool,
-) -> Result<String> {
+) -> Result<(String, i32)> {
     let (cfg, selected) = load_cfg(root, machine_override)?;
     // Refuse a partial atomic update, like the Python status.
     {
@@ -682,6 +682,10 @@ fn status_cli_once(
         }
         records.push(record);
     }
+    let journal_reports = crate::journals_state::journal_reports(&cfg.control, &journals);
+    // A warning field, not an exit: the readable roster still returns
+    // 0, as for every other typed inconsistency (#1700).
+    let exit_code = 0;
     if !human {
         let envelope = json!({
             "schema": 2,
@@ -692,14 +696,18 @@ fn status_cli_once(
             "machines": machines,
             "active": records,
             "journals": journals,
+            "interrupted_journals": journal_reports,
             "registry_storage_state": if inconsistencies.is_empty() { "consistent" } else { "inconsistent" },
             "registry_storage_inconsistencies": inconsistencies,
             "harness_checkouts": records.iter().filter(|r| r.get("harness_checkout").and_then(Value::as_bool) == Some(true)).filter_map(|r| r.get("slot").cloned()).collect::<Vec<_>>(),
         });
-        return Ok(format!(
-            "{}\n",
-            serde_json::to_string_pretty(&envelope)
-                .map_err(|error| format!("cannot encode status: {error}"))?
+        return Ok((
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&envelope)
+                    .map_err(|error| format!("cannot encode status: {error}"))?
+            ),
+            exit_code,
         ));
     }
     let mut event_count = 0usize;
@@ -725,6 +733,12 @@ fn status_cli_once(
     );
     for journal in &journals {
         out.push_str(&format!("RECOVERY REQUIRED: {journal}\n"));
+    }
+    for report in &journal_reports {
+        out.push_str(&format!(
+            "{}\n",
+            crate::journals_state::format_journal_report(report)
+        ));
     }
     for record in &records {
         let text = |key: &str| {
@@ -813,5 +827,5 @@ fn status_cli_once(
             text("remedy").unwrap_or_default(),
         ));
     }
-    Ok(out)
+    Ok((out, exit_code))
 }

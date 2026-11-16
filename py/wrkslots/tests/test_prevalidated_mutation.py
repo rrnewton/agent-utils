@@ -380,7 +380,7 @@ def test_an_outstanding_journal_keeps_the_locked_path(
     # adopt refuses on the interrupted create exactly as before, from under the lock.
     assert cli.main(_adopt_argv(project)) == 3
     captured = capsys.readouterr()
-    assert "interrupted mutation recorded in" in captured.err
+    assert "interrupted mutation for slot 'slot02' recorded in" in captured.err
     assert "CREATE." in captured.err
     assert ledger.count("journals", held=True) >= 1
     row = _row(project, "slot01")
