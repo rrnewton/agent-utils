@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-sandbox-pins-validate-binds: slot binds are shared and propagate into foreign mount namespaces, pinning removals'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-bindprivate
@@ -36,3 +36,9 @@ Tests use the existing stubbed mount runner only: never real mounts of live slot
 - A busy unmount that never clears names the holding process IDs and units; a busy unmount that clears on retry succeeds without that diagnostic.
 - Config load does not re-bind a slot with an outstanding removal journal or a fenced sibling.
 - The gate passes and the fix lands on `main` for deployment by the coordinator.
+
+# Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on `main` as f4644343. Binds are created private on every peer view in both editions, removal privatises after the fence and retries a busy unmount a bounded number of times before naming the holding PIDs and units, config-load healing skips journaled or fenced removals, and shared binds left by older versions become private at the next mount or removal. Regression tests use the stubbed mount runner only (Python `test_worktrees_image.py`, Rust `worktrees_image` unit tests); the full gate passed at owner priority. Not verified live: no live slot was mounted, unmounted, or removed; the reporting host deploys through its coordinator.
