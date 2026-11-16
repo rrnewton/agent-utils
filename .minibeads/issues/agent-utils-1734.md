@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-view-scroll-default: entering search keeps the reader in place or goes to the newest hits'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -29,3 +29,9 @@ Today, opening the search bar holds the reader's place (the bar's room at the he
 - With no hit on screen, entering the search scrolls to the bottom and the most recent hits are visible first.
 - Page tests at phone (412x915) and desktop (1280x800) sizes cover both branches, in light and dark theme, with the keyboard open (visualViewport shrink) where layout is involved, and the Discuss half-pane open in at least the phone shots.
 - Screenshot matrix per the standing acceptance (light/dark x keyboard open/closed x phone/desktop, before and after the targeted state), reviewed image by image.
+
+# Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 11133490 (gated tree from 454fc6f0, replayed over 57ca8c63; combined tree verified). Entering a typed search notes the rows on screen before typing (visualViewport-shrunken with the keyboard up); a hit among them keeps the reader, otherwise the reader goes to the newest line so the most recent hits show first; no hits keeps the emptied list's sentence-at-head placement. Fake-DOM test (both branches) plus tests/search_scroll_browser.py at 412x915 (Discuss open) and 1280x800, light/dark, keyboard open/closed; mu-searchred's wheel-back press keeps search_unmatched_browser green. Trade-off left for the owner: the All-channels row rides at the list head, one scroll-up away after the jump. Screenshot matrix in /tmp/mu-searchview-shots (32 images, inspected).
