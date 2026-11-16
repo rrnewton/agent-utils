@@ -5769,6 +5769,31 @@ fn audit_record(
                     reasons.push(error);
                 }
             }
+            // Private history in any recursive submodule blocks exactly
+            // as remove refuses it (#1741); validate slots judge their
+            // contents disposable and skip this scan.
+            if slot_type == "agent" {
+                for checkout in &checkouts {
+                    let name = checkout
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let raw_path = checkout
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let Ok(path) = stored_path(cfg, raw_path, "checkout path") else {
+                        continue;
+                    };
+                    if let Some(reason) =
+                        crate::remove_write::audit_private_history_reason(cfg, &slot, &name, &path)
+                    {
+                        reasons.push(reason);
+                        break;
+                    }
+                }
+            }
         }
     }
     if slot_absent {

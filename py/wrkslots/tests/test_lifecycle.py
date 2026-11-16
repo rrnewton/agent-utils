@@ -63024,6 +63024,38 @@ def test_remove_refuses_private_history_in_a_declared_submodule(tmp_path: Path) 
     assert len(active_slots(project)) == 1
 
 
+def test_audit_blocks_nested_submodule_private_history_as_remove_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#1741: private history only in a nested submodule blocks audit as remove."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    leaf = component / "leaf"
+    _leaf_private_branch_and_tag(leaf)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths: wrkslots._ProcessPathCensus((), ()),
+    )
+
+    assert wrkslots.main(["--project-root", str(project), "audit", "--format", "json"]) == 0
+    (row,) = json.loads(capsys.readouterr().out)["slots"]
+
+    assert row["verdict"] == "BLOCKED", row["reasons"]
+    assert any(
+        "unpushed private history in submodule product/component/leaf" in reason
+        and "--archive-private-history" in reason
+        for reason in row["reasons"]
+    ), row["reasons"]
+
+    refused = remove(project)
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "unpushed private history in submodule product/component/leaf" in refused.stderr
+    assert tree.is_dir()
+
+
 def test_archive_private_history_names_bundled_commit_and_not_kept_tip(
     tmp_path: Path,
 ) -> None:

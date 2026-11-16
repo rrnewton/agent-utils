@@ -50,7 +50,8 @@ def _git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
         [
             "git", "-c", "user.email=test@example.invalid", "-c", "user.name=Test",
-            "-c", "commit.gpgsign=false", "-C", str(cwd), *args,
+            "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always",
+            "-C", str(cwd), *args,
         ],
         capture_output=True, text=True, check=True, env=env, timeout=120,
     )
@@ -268,6 +269,120 @@ def test_audit_nested_cargo_target_matches_python(tmp_path: Path) -> None:
 # Unpinned: the real census path stays exercised in both editions.
 @pytest.mark.real_process_evidence
 @pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
+def _nested_submodule_fixture(base: Path) -> Path:
+    """Slot whose only private history sits in a nested submodule (#1741)."""
+    leaf = base / "leaf-repo"
+    leaf.mkdir(parents=True)
+    _git(leaf, "init", "-q", "-b", "main")
+    _git(leaf, "config", "protocol.file.allow", "always")
+    (leaf / "leaf.txt").write_text("leaf\n")
+    _git(leaf, "add", "leaf.txt")
+    _git(leaf, "commit", "-q", "-m", "leaf")
+
+    comp = base / "comp-repo"
+    comp.mkdir(parents=True)
+    _git(comp, "init", "-q", "-b", "main")
+    _git(comp, "config", "protocol.file.allow", "always")
+    (comp / "comp.txt").write_text("comp\n")
+    _git(comp, "add", "comp.txt")
+    _git(comp, "commit", "-q", "-m", "comp")
+    _git(comp, "submodule", "add", "-q", "../leaf-repo", "leaf")
+    _git(comp, "commit", "-q", "-m", "add leaf")
+
+    root = base
+    upstream = root / "upstream-repo"
+    upstream.mkdir(parents=True)
+    _git(upstream, "init", "-q", "-b", "main")
+    _git(upstream, "config", "protocol.file.allow", "always")
+    (upstream / "file.txt").write_text("one\n")
+    _git(upstream, "add", "file.txt")
+    _git(upstream, "commit", "-q", "-m", "one")
+    _git(upstream, "submodule", "add", "-q", "../comp-repo", "component")
+    _git(upstream, "commit", "-q", "-m", "add component")
+    head = _git(upstream, "rev-parse", "HEAD")
+    _git(upstream, "remote", "add", "origin", str(upstream))
+    _git(upstream, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    _git(upstream, "submodule", "update", "-q", "--init", "--recursive")
+
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+    )
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    _git(upstream, "worktree", "add", "-q", "-b", "suite/work", str(checkout), "HEAD")
+    _git(checkout, "config", "protocol.file.allow", "always")
+    _git(checkout, "submodule", "update", "-q", "--init", "--recursive")
+    sub = checkout / "component" / "leaf"
+    _git(sub, "checkout", "-q", "-b", "side")
+    (sub / "side1.txt").write_text("side1\n")
+    _git(sub, "add", "side1.txt")
+    _git(sub, "commit", "-q", "-m", "side1")
+    (sub / "side2.txt").write_text("side2\n")
+    _git(sub, "add", "side2.txt")
+    _git(sub, "commit", "-q", "-m", "side2")
+    side_head = _git(sub, "rev-parse", "HEAD")
+    _git(sub, "tag", "-a", "kept", "-m", "kept", side_head)
+    _git(sub, "checkout", "-q", "main")
+    dead = _dead_identity()
+    record: dict[str, object] = {
+        "slot": "slot-a",
+        "agent": "agent-slot-a",
+        "task": "do work",
+        "purpose": "testing",
+        "machine": "node-a",
+        "generation": 1,
+        "created_at": "2026-10-26T00:00:00Z",
+        "heartbeat_at": "2026-10-26T01:00:00Z",
+        "heartbeat_ttl_seconds": 60,
+        "owner": dead,
+        "coordinator_lease": dead,
+        "coordinator_recovery_note": None,
+        "handoff": None,
+        "checkouts": [
+            {
+                "name": "repo",
+                "path": "worktrees/slot-a/repo",
+                "repository": "upstream-repo",
+                "branch": "suite/work",
+                "start_point": head,
+                "remote": "origin",
+                "remote_url_sha256": hashlib.sha256(str(upstream).encode()).hexdigest(),
+                "landed_ref": "refs/remotes/origin/main",
+                "head": head,
+                "containing_remote_refs": ["refs/remotes/origin/main"],
+                "vcs": "git",
+            }
+        ],
+    }
+    (root / "worktrees" / "ACTIVE.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 7, "slots": [record]})
+    )
+    (root / "worktrees" / "ARCHIVED.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 3, "records": []})
+    )
+    return root
+
+
+def test_audit_nested_submodule_private_history_matches_python(tmp_path: Path) -> None:
+    """#1741: audit blocks on private history only in a nested submodule."""
+    root = _nested_submodule_fixture(tmp_path / "nested")
+    actual = _check(root, tmp_path)
+    row = _rows(actual)[0]
+    assert row["verdict"] == "BLOCKED", row["reasons"]
+    assert any(
+        "unpushed private history in submodule repo/component/leaf" in str(reason)
+        and "--archive-private-history" in str(reason)
+        for reason in cast(list[object], row["reasons"])
+    ), row["reasons"]
+
+
 def test_audit_deletable_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     actual = _check(root, tmp_path)

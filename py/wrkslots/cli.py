@@ -51198,6 +51198,41 @@ def _absent_slot_recovery_reason(
     )
 
 
+def _audit_submodule_private_history(
+    config: Config,
+    record: ActiveRecord,
+    submodule: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+) -> _PrivateHistory | None:
+    """Private history of one submodule, on remove's evidence (#1741).
+
+    Same scan removal runs (_submodule_private_history over the durable
+    repositories, with the recorded remote asked about tips no durable
+    repository reaches), kept read-only: no salvage commit is built, so
+    the kept tip is the submodule's HEAD itself.
+    """
+
+    authority = vcs.remote_authority(path, submodule.remote)
+
+    def cover(tips: tuple[str, ...]) -> _RemoteCoverage:
+        try:
+            covering, branches = vcs.remote_advertised_covering(
+                path, submodule.remote, tips, authority
+            )
+        except Refusal as exc:
+            return _RemoteCoverage(submodule.remote, frozenset(), None, str(exc))
+        return _RemoteCoverage(submodule.remote, covering, branches)
+
+    return _submodule_private_history(
+        vcs,
+        path,
+        vcs.head(path),
+        _durable_submodule_repositories(vcs, config, record, submodule, path, authority),
+        remote_cover=cover,
+    )
+
+
 def _audit_record(
     config: Config,
     record: ActiveRecord,
@@ -51356,7 +51391,25 @@ def _audit_record(
                 # agent slot.  Audit must therefore establish the same local
                 # remote authority first; otherwise it can advertise
                 # DELETABLE only for remove to refuse before salvage.
-                _submodule_salvage_checkouts(config, checkout, selected_vcs)
+                # The same agreement covers private history (#1741): audit
+                # runs remove's scan over every initialized submodule,
+                # nested clones included, and a kept tip blocks with
+                # remove's own refusal, which names the remedy flag.
+                for submodule, submodule_path in _submodule_salvage_checkouts(
+                    config, checkout, selected_vcs
+                ):
+                    history = _audit_submodule_private_history(
+                        config, record, submodule, submodule_path, selected_vcs
+                    )
+                    if history is not None and history.tips:
+                        raise _private_history_refusal(
+                            record.slot,
+                            submodule,
+                            history,
+                            declared=not _checkout_is_self_sourced(
+                                config, submodule, submodule_path, selected_vcs
+                            ),
+                        )
             if not _checkout_remote_unchanged(selected_vcs, path, checkout, config):
                 raise Refusal(f"checkout {checkout.name} remote URL changed")
     except Refusal as exc:

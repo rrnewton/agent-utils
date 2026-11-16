@@ -2763,6 +2763,53 @@ fn declared_submodules(checkout_path: &Path) -> Vec<(String, PathBuf)> {
     found
 }
 
+/// Declared submodules below one checkout, recursively (#1741):
+/// (path relative to the checkout, absolute path), nested clones
+/// included, in relative-path order.
+fn declared_submodules_recursive(checkout_path: &Path) -> Vec<(String, PathBuf)> {
+    fn visit(top: &Path, current: &Path, out: &mut Vec<(String, PathBuf)>) {
+        for (_name, sub_path) in declared_submodules(current) {
+            let Ok(relative) = sub_path.strip_prefix(top) else {
+                continue;
+            };
+            out.push((relative.to_string_lossy().into_owned(), sub_path.clone()));
+            visit(top, &sub_path, out);
+        }
+    }
+    let mut found = Vec::new();
+    visit(checkout_path, checkout_path, &mut found);
+    found.sort();
+    found
+}
+
+/// Audit's private-history block for one checkout (#1741): the first
+/// recursive submodule whose own repository holds kept private
+/// history, worded exactly as remove's refusal, or None.
+pub(crate) fn audit_private_history_reason(
+    cfg: &Cfg,
+    slot: &str,
+    checkout_name: &str,
+    checkout_path: &Path,
+) -> Option<String> {
+    for (relative, sub_path) in declared_submodules_recursive(checkout_path) {
+        let kept = git(&sub_path, &["rev-parse", "--verify", "HEAD"])
+            .map(|out| out.trim().to_string())
+            .unwrap_or_default();
+        if kept.is_empty() {
+            continue;
+        }
+        match submodule_private_history(cfg, checkout_path, &sub_path, &kept) {
+            Ok(Some(history)) => {
+                let label = format!("{checkout_name}/{relative}");
+                return Some(private_history_refusal(slot, &label, &history));
+            }
+            Ok(None) => continue,
+            Err(error) => return Some(error),
+        }
+    }
+    None
+}
+
 /// Both object names of every reflog entry under `logs`.
 fn reflog_endpoints(logs: &Path) -> std::collections::BTreeSet<String> {
     let mut endpoints = std::collections::BTreeSet::new();
