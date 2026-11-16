@@ -479,6 +479,7 @@ def test_summarize_multi_agent(tmp_path: Path, rust_wrkviz: Path) -> None:
 
 STATEFUL_CODEX = """#!/usr/bin/env python3
 import json, os, sys
+SINGLE_FAILURES = 1
 args = sys.argv[1:]
 out_path = args[args.index("--output-last-message") + 1]
 prompt = sys.stdin.read()
@@ -509,7 +510,7 @@ else:
     elif jobs:
         key = jobs[0]["key"]
         state["singles"][key] = state["singles"].get(key, 0) + 1
-        if state["singles"][key] < 2:
+        if state["singles"][key] <= SINGLE_FAILURES:
             jobs = []
     summaries = []
     for job in jobs:
@@ -537,14 +538,23 @@ print(json.dumps({"type": "turn.completed", "usage": {
 """
 
 
-def test_summarize_retryable_split_is_fatal(
-    tmp_path: Path, rust_wrkviz: Path
+@pytest.mark.parametrize("failures,expected", [(1, 0), (2, 2)])
+def test_summarize_single_job_retries_once_then_succeeds_or_fails(
+    tmp_path: Path, rust_wrkviz: Path, failures: int, expected: int,
 ) -> None:
-    fake = _write_executable(tmp_path / "stateful-codex", STATEFUL_CODEX)
+    # This corpus has one phase, so it exercises the single-job retry, not a
+    # split. A recoverable first answer succeeds; two bad answers must fail.
+    source = STATEFUL_CODEX.replace("SINGLE_FAILURES = 1", f"SINGLE_FAILURES = {failures}")
+    fake = _write_executable(tmp_path / "stateful-codex", source)
     _compare(tmp_path, rust_wrkviz, [
         "--backend", "codex", "--model", "fake-model",
         "--codex-command", str(fake), "--summary-batch-size", "2",
-    ], expect=2)
+    ], expect=expected)
+    states = list(tmp_path.glob("state-*.json"))
+    assert len(states) == 2  # One backend history per edition.
+    for state in states:
+        counts = json.loads(state.read_text())["singles"]
+        assert counts and set(counts.values()) == {2}
 
 
 

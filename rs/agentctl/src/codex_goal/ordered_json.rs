@@ -11,7 +11,7 @@
 
 use std::fmt::{self, Write as _};
 
-use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Deserialize, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
 /// One decoded JSON value whose objects keep their members in document order.
@@ -420,11 +420,51 @@ pub(crate) fn is_space(character: char) -> bool {
 
 impl<'de> Deserialize<'de> for Json {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(JsonVisitor)
+        JsonSeed(0).deserialize(deserializer)
     }
 }
 
-struct JsonVisitor;
+// Read numeric lexemes ourselves: arbitrary_precision represents numbers to a generic
+// visitor as a private map. Treating that map as a number would also reinterpret a real
+// user object with the same key. RawValue retains that distinction and the document order.
+struct JsonSeed(usize);
+
+impl<'de> DeserializeSeed<'de> for JsonSeed {
+    type Value = Json;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Json, D::Error> {
+        let raw = <&serde_json::value::RawValue>::deserialize(deserializer)?;
+        let text = raw.get();
+        let first = text.as_bytes()[0];
+        if matches!(first, b'[' | b'{') && self.0 >= 127 {
+            return Err(de::Error::custom("recursion limit exceeded"));
+        }
+        if first == b'-' || first.is_ascii_digit() {
+            if !text.contains(['.', 'e', 'E']) && text != "-0" {
+                if first == b'-' {
+                    if let Ok(value) = text.parse::<i64>() {
+                        return Ok(Json::Int(value));
+                    }
+                } else if let Ok(value) = text.parse::<u64>() {
+                    return Ok(Json::UInt(value));
+                }
+            }
+            let value = text.parse::<f64>().map_err(de::Error::custom)?;
+            if !value.is_finite() {
+                return Err(de::Error::custom("number out of range"));
+            }
+            return Ok(Json::Float(value));
+        }
+        let mut parser = serde_json::Deserializer::from_str(text);
+        parser
+            .deserialize_any(JsonVisitor { depth: self.0 })
+            .map_err(de::Error::custom)
+    }
+}
+
+struct JsonVisitor {
+    depth: usize,
+}
 
 impl<'de> Visitor<'de> for JsonVisitor {
     type Value = Json;
@@ -467,7 +507,7 @@ impl<'de> Visitor<'de> for JsonVisitor {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Json, A::Error> {
         let mut values = Vec::new();
-        while let Some(value) = sequence.next_element()? {
+        while let Some(value) = sequence.next_element_seed(JsonSeed(self.depth + 1))? {
             values.push(value);
         }
         Ok(Json::Array(values))
@@ -475,7 +515,8 @@ impl<'de> Visitor<'de> for JsonVisitor {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
         let mut members: Vec<(String, Json)> = Vec::new();
-        while let Some((key, value)) = map.next_entry::<String, Json>()? {
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(JsonSeed(self.depth + 1))?;
             // As a dict is built: a repeated key keeps its first position and its last value.
             if let Some(existing) = members.iter_mut().find(|(name, _)| *name == key) {
                 existing.1 = value;
@@ -490,6 +531,28 @@ impl<'de> Visitor<'de> for JsonVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_lexemes_and_literal_serde_tags_keep_their_meaning() {
+        let value = Json::parse(
+            br#"[1.5, -0, 1e2, 18446744073709551615, {"$serde_json::private::Number":"1.5"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            value.dumps(),
+            "[1.5, -0.0, 100.0, 18446744073709551615, {\"$serde_json::private::Number\": \"1.5\"}]"
+        );
+        assert!(Json::parse(b"1e400").is_err());
+        assert!(Json::parse(b"[01]").is_err());
+        assert!(Json::parse(br#""\ud800""#).is_err());
+    }
+
+    #[test]
+    fn raw_values_do_not_bypass_the_original_nesting_limit() {
+        let nested = |depth: usize| format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(Json::parse(nested(127).as_bytes()).is_ok());
+        assert!(Json::parse(nested(128).as_bytes()).is_err());
+    }
 
     #[test]
     fn dumps_matches_python_separators_order_and_escapes() {

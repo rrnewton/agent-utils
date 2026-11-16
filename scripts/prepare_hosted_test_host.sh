@@ -30,6 +30,11 @@ print(_root_owned_executable(Path('/usr/bin/sudo'), 'sudo'))
 PY
 sudo -n true
 
+# Replay/commit-tree fixtures create fresh bare repositories, so repository-local
+# identity from the checkout cannot supply their committer. This VM is disposable.
+git config --global user.name 'agent-utils CI'
+git config --global user.email 'agent-utils-ci@example.invalid'
+
 # Only this disposable VM is changed. The tests must really create nested user
 # and mount namespaces; a capability skip must not count as passing coverage.
 if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -44,21 +49,22 @@ test_host_root="$RUNNER_TEMP/agent-utils-test-host"
 mkdir -m 700 "$test_host_root"
 truncate -s 16G "$test_host_root/filesystem.img"
 mkfs.btrfs -q -f "$test_host_root/filesystem.img"
-mkdir -m 700 "$test_host_root/mount"
-sudo -n mount -o loop,noatime "$test_host_root/filesystem.img" "$test_host_root/mount"
-sudo -n chown "$(id -u):$(id -g)" "$test_host_root/mount"
-chmod 700 "$test_host_root/mount"
-mkdir -m 700 "$test_host_root/mount/tmp"
-test "$(findmnt -n -o FSTYPE --target "$test_host_root/mount/tmp")" = btrfs
-touch "$test_host_root/mount/tmp/nocow-probe"
-chattr +C "$test_host_root/mount/tmp/nocow-probe"
-lsattr "$test_host_root/mount/tmp/nocow-probe"
-rm "$test_host_root/mount/tmp/nocow-probe"
-
-# Each later Bash step inherits the private umask, including Rust tests which
-# create their own temporary directories. Python inherits the chosen TMPDIR.
-printf 'umask 077\n' > "$test_host_root/bash-env"
-printf 'TMPDIR=%s\nBASH_ENV=%s\n' \
-    "$test_host_root/mount/tmp" "$test_host_root/bash-env" >> "$GITHUB_ENV"
-printf 'Test host ready: Ubuntu %s, canonical sudo, user namespaces, btrfs TMPDIR=%s\n' \
-    "$VERSION_ID" "$test_host_root/mount/tmp"
+# Tests explicitly prove exclusions against /tmp, and Unix sockets have a
+# 108-byte pathname bound. Preserve the disposable VM's existing /tmp entries
+# before exposing the btrfs mount there. No developer host can reach this code.
+test_tmp="$test_host_root/mount"
+mkdir -m 700 "$test_tmp"
+sudo -n mount -o loop,noatime "$test_host_root/filesystem.img" "$test_tmp"
+sudo -n cp -a /tmp/. "$test_tmp/"
+sudo -n chown root:root "$test_tmp"
+sudo -n chmod 1777 "$test_tmp"
+sudo -n mount --bind "$test_tmp" /tmp
+test "$(findmnt -n -o FSTYPE --target /tmp)" = btrfs
+probe=$(mktemp /tmp/nocow.XXXXXX)
+chattr +C "$probe"
+lsattr "$probe"
+rm "$probe"
+# Do not override the test process umask: permission tests exercise its default.
+printf 'TMPDIR=/tmp\n' >> "$GITHUB_ENV"
+printf 'Test host ready: Ubuntu %s, canonical sudo, user namespaces, btrfs /tmp\n' \
+    "$VERSION_ID"
