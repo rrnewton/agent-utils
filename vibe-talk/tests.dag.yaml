@@ -1149,6 +1149,24 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1710 vibe-talk-readerbar-sound-overlap` in the browser engine: Sound and the cloud/device
+  # selector stacked in the phone reader bar's left column, at 412x915 (device scale 2.6) and
+  # again at a 130% root font, with the desktop reading pane unchanged.
+  - group: check
+    job: readerbar-overlap-browser
+    desc: Sound and the cloud/device selector do not overlap and each is tappable in the phone reader bar, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/readerbar_overlap_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 27
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#344 search-shortcut` in the browser engine, the keys pressed through CDP Input.dispatchKeyEvent at
   # 1280x800: Ctrl+/ opens the search with its field focused and its default refused from the channel's
   # message box holding a draft (the draft untouched, no slash typed, a bare "/" there still a slash),

@@ -3527,10 +3527,16 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 else:
                     check(abs(tall - PHONE_DOCK_PX) <= 1,
                           f"{where}: the phone's dock is {tall:.1f}px tall; it was {PHONE_DOCK_PX:.1f}px")
-                    for big in ("hang-up", "talk", "read-aloud", "read-speed", "audio-source"):
+                    for big in ("hang-up", "talk", "read-aloud", "read-speed"):
                         if big in boxes:
                             check(abs(boxes[big]["height"] - PHONE_SPAN_PX) <= 1,
                                   f"{where}: #{big} is {boxes[big]['height']:.1f}px tall, not the tile's two rows")
+                    # `#1710 vibe-talk-readerbar-sound-overlap`: the selector no longer spans
+                    # the tile; it stacks under Sound at one row, Sound's own height.
+                    if "audio-source" in boxes and "speaker" in boxes:
+                        check(abs(boxes["audio-source"]["height"] - boxes["speaker"]["height"]) <= 1,
+                              f"{where}: #audio-source is {boxes['audio-source']['height']:.1f}px tall, "
+                              f"not the one row it stacks in under #speaker")
                     for narrow in ("audio-source", "speaker", "clear-view"):
                         if narrow in boxes:
                             check(abs(boxes[narrow]["width"] - PHONE_NARROW_PX) <= 1,

@@ -201,10 +201,17 @@
 }
 
 /* `#1355 phone-bar-discuss-slot`: the audio toggle in the narrow column
-   Show/Fold vacated for the hamburger menu, spanning the reader row. */
+   Show/Fold vacated for the hamburger menu.
+   `#1710 vibe-talk-readerbar-sound-overlap`: row 2, under Sound — never
+   spanning both rows. Spanning put it in Sound's cell (row 1) as well, and
+   Sound, being positioned, painted over its top half: only the top of the
+   cloud icon showed beneath SOUND. Stacked, each keeps the column's full
+   width and the grid gap is the spacing between them; Clear, which holds
+   row 2 in a call, is hidden while reading, so the row is free exactly
+   when the toggle is shown. */
 #control-pane #audio-source {
   grid-column: 1;
-  grid-row: 1 / span 2;
+  grid-row: 2;
 }
 
 /* Only while the reader row is the pane's content: with a call up, Sound and
