@@ -100,15 +100,21 @@ def number(found: Json, *path: str) -> float:
     return float(value)
 
 
-def box(found: Json, name: str) -> dict:
+def box(found: Json, name: str) -> dict[str, object]:
     value = found[name]
     assert isinstance(value, dict), f"{name} is {value!r}, not a box"
     return value
 
 
-def meets(a: dict, b: dict) -> bool:
-    return (float(a["left"]) < float(b["right"]) - 0.5 and float(b["left"]) < float(a["right"]) - 0.5
-            and float(a["top"]) < float(b["bottom"]) - 0.5 and float(b["top"]) < float(a["bottom"]) - 0.5)
+def side(rect: dict[str, object], key: str) -> float:
+    value = rect[key]
+    assert isinstance(value, (int, float)), f"{key} is {value!r}, not a number"
+    return float(value)
+
+
+def meets(a: dict[str, object], b: dict[str, object]) -> bool:
+    return (side(a, "left") < side(b, "right") - 0.5 and side(b, "left") < side(a, "right") - 0.5
+            and side(a, "top") < side(b, "bottom") - 0.5 and side(b, "top") < side(a, "bottom") - 0.5)
 
 
 def state(desk: Desk) -> Json:
@@ -165,9 +171,9 @@ def raise_undo(desk: Desk, skip: str | None = None) -> None:
 
 def check_chip(desk: Desk, found: Json, where: str, *, hittable: bool = True) -> None:
     undo, tools = box(found, "undo"), box(found, "tools")
-    desk.check(24.0 <= float(undo["height"]) <= CHIP_MAX,
+    desk.check(24.0 <= side(undo, "height") <= CHIP_MAX,
                f"{where}: the Undo chip stands {undo['height']}px tall, not a chip's height: {found}")
-    desk.check(float(tools["height"]) <= STRIP_MAX,
+    desk.check(side(tools, "height") <= STRIP_MAX,
                f"{where}: the chips strip stands {tools['height']}px tall: {found}")
     if hittable:
         desk.check(found["undoHit"] is True, f"{where}: the Undo chip is not hittable at its centre: {found}")
@@ -203,7 +209,7 @@ def phone_walk(desk: Desk) -> None:
     desk.check(found["said"] == "closed", f"replying, keyboard down: {found}")
     desk.shot("2-keyboard-down-discuss")
     check_chip(desk, found, "replying, keyboard down, Discuss docked")
-    desk.check(float(box(found, "tools")["bottom"]) <= float(box(found, "panel")["top"]) + 1,
+    desk.check(side(box(found, "tools"), "bottom") <= side(box(found, "panel"), "top") + 1,
                f"replying, keyboard down: the chips row stands over the Discuss pane: {found}")
     desk.notes.append("keyboard down: the chip stands at the list's foot above the pane, a chip still")
 
