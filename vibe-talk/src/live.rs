@@ -1912,7 +1912,14 @@ pub fn events(
                 }
             }
             if let Some(noise) = &state.replay_noise {
-                judge(noise, &state.app, &state.channel, state.markup, state.profiles.as_deref(), &mut held);
+                judge(
+                    noise,
+                    &state.app,
+                    &state.channel,
+                    state.markup,
+                    state.profiles.as_deref(),
+                    &mut held,
+                );
             }
             return Some((Ok(message_event(&held, true)), state));
         }
@@ -1949,7 +1956,14 @@ pub fn events(
                     .await;
                 }
                 let noise = crate::noise::filter_for(&state.app, &state.channel).await;
-                judge(&noise, &state.app, &state.channel, state.markup, state.profiles.as_deref(), &mut live);
+                judge(
+                    &noise,
+                    &state.app,
+                    &state.channel,
+                    state.markup,
+                    state.profiles.as_deref(),
+                    &mut live,
+                );
                 Some((Ok(message_event(&live, false)), state))
             }
             Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -2064,7 +2078,14 @@ pub fn all_events(
         let noise = crate::noise::filter_for(&state.app, &channel.id).await;
         let markup = crate::render::markup_for(&state.app.config, &channel);
         let profiles = crate::render::profile_base_for(&state.app.config, &channel);
-        judge(&noise, &state.app, &channel.id, markup, profiles.as_deref(), &mut live);
+        judge(
+            &noise,
+            &state.app,
+            &channel.id,
+            markup,
+            profiles.as_deref(),
+            &mut live,
+        );
         Some((Ok(message_event_as(&live, from_tail, &cursor)), state))
     })
 }

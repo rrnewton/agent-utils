@@ -712,7 +712,15 @@ pub fn headed_body(
     mentions: &[MentionName],
     profiles: Option<&str>,
 ) -> (String, Option<crate::model::Heading>) {
-    headed_body_by(to_html_named, text, markup, bot, confirmed, mentions, profiles)
+    headed_body_by(
+        to_html_named,
+        text,
+        markup,
+        bot,
+        confirmed,
+        mentions,
+        profiles,
+    )
 }
 
 /// How a body is rendered: [`to_html_named`], through the cache, or [`render_named`], past it.
@@ -737,7 +745,14 @@ fn headed_body_by(
     if plain {
         return (String::new(), Some(heading));
     }
-    match mark_restated(render, &html, &text[..found.cut], markup, mentions, profiles) {
+    match mark_restated(
+        render,
+        &html,
+        &text[..found.cut],
+        markup,
+        mentions,
+        profiles,
+    ) {
         Some(marked) => (marked, Some(heading)),
         None => (html, None),
     }
@@ -1140,6 +1155,7 @@ fn render_visiting_trusted<T>(
 }
 
 /// [`render_visiting`] under the single-newline rule `rule`.
+#[allow(clippy::too_many_arguments)]
 fn render_visiting_as<T>(
     text: &str,
     markup: Markup,
@@ -1428,13 +1444,19 @@ pub struct SourceBlock {
 pub fn source_blocks(text: &str, markup: Markup, mentions: &[MentionName]) -> Vec<SourceBlock> {
     // Read-aloud blocks are cut from the source, and a prefetch of them is no page read:
     // drawn without thread names ([`Names::TextOnly`]), which the block kinds never depended on.
-    let (html, walked) =
-        render_visiting(text, markup, mentions, None, Names::TextOnly, |root, source| {
+    let (html, walked) = render_visiting(
+        text,
+        markup,
+        mentions,
+        None,
+        Names::TextOnly,
+        |root, source| {
             let lines = line_starts(source);
             let mut found = Vec::new();
             tree_blocks(root, source, &lines, Walk::Blocks, &mut found);
             found
-        });
+        },
+    );
     let Some(blocks) = walked.filter(|_| html != plain_html(text)) else {
         // Drawn as plain paragraphs, by the page from the text itself.
         return plain_blocks(text);
@@ -2832,7 +2854,10 @@ fn adjust<'a>(
             NodeValue::Text(text) => {
                 let pieces = mention_pieces(text, mentions, profiles);
                 drop(ast);
-                if pieces.iter().any(|piece| matches!(piece, Piece::Chip { .. })) {
+                if pieces
+                    .iter()
+                    .any(|piece| matches!(piece, Piece::Chip { .. }))
+                {
                     replace_with(arena, node, pieces);
                 }
             }
