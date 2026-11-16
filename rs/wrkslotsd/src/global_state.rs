@@ -608,7 +608,11 @@ pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {
                 &cfg, machine,
             )?);
         } else {
-            archives.push(parse_archive(root, Some(machine))?);
+            let mut document = parse_archive(root, Some(machine))?;
+            if let Some(map) = document.as_object_mut() {
+                map.remove("quarantined_records");
+            }
+            archives.push(document);
         }
     }
     let mut archived_owner: Vec<(&str, &str)> = Vec::new();
