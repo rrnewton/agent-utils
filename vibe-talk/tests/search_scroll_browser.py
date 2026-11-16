@@ -126,7 +126,7 @@ class Walk:
             self.page.wait_for_timeout(25)
         self.check(bool(self.page.evaluate(script)), why)
 
-    def state(self) -> dict:
+    def state(self) -> Json:
         found = self.page.evaluate(STATE_JS)
         return found if isinstance(found, dict) else {}
 
