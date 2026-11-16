@@ -2188,6 +2188,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1734 vibe-talk-search-view-scroll-default` in the browser engine: entering a search from
+  # the top of a forty-message channel whose newest fifteen hold the word lands at the foot
+  # with the newest hit on screen, and entering it parked mid-list on a hit leaves the row
+  # under the eye unmoved, in light and dark at 412x915 (Discuss half-pane open) and 1280x800,
+  # with the keyboard closed and open (a shrunken visualViewport).
+  - group: check
+    job: search-scroll-browser
+    desc: entering a search stays on a visible hit or goes to the newest hits, in current Chromium at 412x915 and 1280x800 in both schemes, keyboard open and closed
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/search_scroll_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#620 link-url-chip` in the browser engine, at 393x852 and 412x915 with a finger and 1280x800 with
   # a mouse: URL first among the chips under Links, links written as their labels and then as their whole
   # addresses wrapped at their slashes, the choice kept over a reload, a search by a word only an address

@@ -2839,3 +2839,29 @@ test("`#404 threads-unpack-all`: Unpack is a chip in the cards' heading, Pack al
   assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/sum"), [], "Pack all left rows behind");
   assert.equal(page.storage.get(UNPACK_STORAGE), "packed");
 });
+
+test("`#1734 vibe-talk-search-view-scroll-default`: entering a search stays on a visible hit, else goes to the newest hits", async () => {
+  const page = newPage();
+  await signIn(page);
+  // Forty messages; "needle" only in the last fifteen, "haystack" in every one.
+  await showDiscord(page, Array.from({ length: 40 }, (_u, i) =>
+    message({ id: String(i + 1), content: `haystack note ${i}${i >= 25 ? " needle" : ""}` })));
+  const area = page.el("scroll-area");
+  assert.ok(area.scrollHeight > area.clientHeight * 2, "the fixture list does not overflow, so this proves nothing");
+  // Read from the top: no needle on screen.
+  area.scrollTop = 0;
+  await search(page, "needle");
+  const foot = area.scrollHeight - area.clientHeight;
+  assert.ok(Math.abs(area.scrollTop - foot) <= 2, `no hit on screen: reader left at ${area.scrollTop}, foot is ${foot}`);
+  // Clear, park mid-list on a haystack row, and search haystack: a hit is on screen, so stay.
+  await page.el("search-toggle").click();
+  await page.settle();
+  area.scrollTop = Math.round(foot / 2);
+  await page.settle();
+  const anchor = page.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > area.getBoundingClientRect().top);
+  const anchorTop = anchor.getBoundingClientRect().top;
+  const parked = area.scrollTop;
+  await search(page, "haystack");
+  assert.ok(Math.abs(area.scrollTop - parked) <= 2, `a hit was on screen but the reader moved from ${parked} to ${area.scrollTop}`);
+  assert.ok(Math.abs(anchor.getBoundingClientRect().top - anchorTop) <= 2, "the row under the reader's eye moved");
+});

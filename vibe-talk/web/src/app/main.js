@@ -2745,6 +2745,48 @@ const {
   sayCardCount, openedGaps, placeSeam, seamDrawn,
 } = searchRows;
 
+// `#1734 vibe-talk-search-view-scroll-default`. The search identity the reader
+// last landed on: a typed query lands once, when it is first entered (a new
+// identity), and refining keystrokes that keep a hit on screen never move the
+// reader again. Stay where they are when any hit stands at least partly in
+// the visible message area; otherwise go to the newest line, where the most
+// recent hits stand.
+let enteredSearchIdentity = "";
+let searchScreenRows = [];
+let searchScreenIdentity = null;
+function noteSearchScreen() {
+  const text = el("search-field").value;
+  if (!searchTyped(text)) {
+    searchScreenIdentity = null;
+    searchScreenRows = [];
+    return;
+  }
+  const identity = searchIdentity(text);
+  searchScreenIdentity = identity;
+  // A redraw of the search already landed reads no row's layout again.
+  if (identity === enteredSearchIdentity) return;
+  const list = visibleList();
+  const rows = [...list.children].filter((row) => row.getAttribute("data-search") !== null);
+  searchScreenRows = scrollKeeping.rowsOnScreen(rows);
+}
+function landSearchEntry() {
+  if (!searchField.open() || !searchTyped(searchField.query())) {
+    enteredSearchIdentity = "";
+    return;
+  }
+  const identity = searchIdentity(searchField.query());
+  if (identity !== searchScreenIdentity) return;
+  if (identity === enteredSearchIdentity) return;
+  enteredSearchIdentity = identity;
+  const hits = new Set([...visibleList().children].filter((row) =>
+    row.getAttribute("data-search") !== null &&
+    !String(row.className).split(/\s+/).includes("search-hidden")));
+  // Nothing matched: the emptied list's own placement takes the reader to
+  // the sentence at its head that says why; there are no recent hits to show.
+  if (hits.size === 0) return;
+  if (!searchScreenRows.some((row) => hits.has(row))) scrollToNewest();
+}
+
 // --- a filter changed: the reader's message stays where it is on the screen ----------------------
 //
 // `#243 filter-keeps-selection`. The owner, 2026-10-12: "In long transcripts we must be very careful
@@ -8993,6 +9035,8 @@ application.track(mountFilterChips({
   markSearchSoon: () => markSearchSoon(),
   markSearchNow: () => markSearchNow(),
   searchOlderFromField: () => searchOlderFromField(),
+  noteSearchScreen: () => noteSearchScreen(),
+  landSearchEntry: () => landSearchEntry(),
   settleFocus: () => settleFocus(),
   swallow: (event) => swallow(event),
 }));

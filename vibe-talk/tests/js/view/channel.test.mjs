@@ -1168,6 +1168,8 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
     markSearchSoon: () => log.push("mark soon"),
     markSearchNow: () => log.push("mark now"),
     searchOlderFromField: () => { log.push("older"); return state.older; },
+    noteSearchScreen: () => log.push("note screen"),
+    landSearchEntry: () => log.push("land"),
     settleFocus: () => log.push("settle"),
     swallow: (event) => log.push(`swallow ${event.key}`),
   });
@@ -1181,11 +1183,11 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
   fire("link-kinds", "focusin", { target: null });
   assert.deepStrictEqual(into, { block: "nearest", inline: "nearest" });
   el("search-field").value = "foo";
-  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["keep place (", "lift (", "query foo", "typed? \"<foo>\"", "chips", ")", ")", "mark soon"]);
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["note screen", "keep place (", "lift (", "query foo", "typed? \"<foo>\"", "chips", ")", ")", "land", "mark soon"]);
   state.typed = false;
   state.side = true;
   el("search-field").value = " ";
-  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["keep place (", "lift (", "query  ", "typed? \"< >\"", "marked \"< >\"", "chips", "side cards", ")", ")", "mark soon"],
+  assert.deepStrictEqual(run(() => fire("search-field", "input")), ["note screen", "keep place (", "lift (", "query  ", "typed? \"< >\"", "marked \"< >\"", "chips", "side cards", ")", ")", "land", "mark soon"],
     "a cleared search kept its marks, or the right column's cards were not filtered again");
   assert.deepStrictEqual([run(() => fire("search-field", "keydown", { key: "Enter" })), run(() => { state.older = true; fire("search-field", "keydown", { key: "Enter" }); }),
     run(() => fire("search-field", "keydown", { key: "Escape" })), run(() => fire("search-field", "keydown", { key: "Escape", isComposing: true })),

@@ -56,6 +56,10 @@ export interface FilterChipsDependencies {
   markSearchNow(): void;
   /** Search further back from the field, where the step back offers it; whether it did. */
   searchOlderFromField(): boolean;
+  /** Note which rows stand on screen before a typed search filters (`#1734`). */
+  noteSearchScreen(): void;
+  /** Land a newly typed search (`#1734`): stay on a visible hit, else go to the newest hits. */
+  landSearchEntry(): void;
   /** Give the list on screen the focus, unless the reader is typing in a field still on screen. */
   settleFocus(): void;
   /** Keep a key from the browser's own default for it. */
@@ -99,6 +103,10 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
   // `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence saying
   // so, and text that matches again puts back the message they were on before it.
   listen(el("search-field"), "input", () => {
+    // `#1734 vibe-talk-search-view-scroll-default`. Which rows stand on screen
+    // is read before the filter moves them: "on screen" names the screen the
+    // reader was looking at when they typed, not the compacted list after.
+    deps.noteSearchScreen();
     // `#262 search-load-older`. The first term typed, or the last taken away, may make Hide read step
     // aside or come back (`liftingHideRead`).
     deps.keepingFilterPlace(() => deps.liftingHideRead(() => {
@@ -109,6 +117,11 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
       deps.renderEveryColumnsTools();
       if (deps.sideColumnUp()) deps.refilterSideCards();
     }));
+    // `#1734 vibe-talk-search-view-scroll-default`. After the place-keeper has
+    // put the reader back, a newly entered search lands: on a hit already on
+    // screen nothing moves; with none on screen the reader goes to the foot,
+    // where the most recent hits stand.
+    deps.landSearchEntry();
     deps.markSearchSoon();
   });
   // Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a

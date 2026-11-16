@@ -138,6 +138,13 @@ export interface ScrollKeeping {
   restoreScroll(mark: ScrollMark): void;
   /** A turn arrived: follow it only if the reader had not scrolled away. */
   followIfPinned(pinned: boolean, turns?: number, view?: string): void;
+  /**
+   * Which of `rows` stand at least partly in the visible message area
+   * (`#1734 vibe-talk-search-view-scroll-default`): the shared scroller's box,
+   * cut down to the `visualViewport` where one stands, so an on-screen
+   * keyboard shrinks the area exactly as it shrinks what the reader sees.
+   */
+  rowsOnScreen(rows: readonly Element[]): Element[];
 }
 
 /** Keeping the reader in the page's lists. */
@@ -431,5 +438,30 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     deps.setJumpNewest(true, view, turns);
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned };
+  function rowsOnScreen(rows: readonly Element[]): Element[] {
+    if (rows.length === 0) return [];
+    const area = el("scroll-area");
+    const box = area.getBoundingClientRect();
+    let head = box.top;
+    let foot = box.bottom;
+    const visual = typeof window !== "undefined" ? window.visualViewport : null;
+    if (visual) {
+      // Rects are read in the visual viewport's own coordinates, whose
+      // visible band is [0, height]; the keyboard's shrink shows up here.
+      head = Math.max(head, 0);
+      foot = Math.min(foot, visual.height);
+    }
+    if (foot <= head) return [];
+    const onScreen: Element[] = [];
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect();
+      // Rows stand in list order, so their tops do not decrease: past the
+      // foot, nothing further down can come back onto the screen.
+      if (rect.top >= foot && rect.bottom > rect.top) break;
+      if (rect.bottom > rect.top && rect.bottom > head && rect.top < foot) onScreen.push(row);
+    }
+    return onScreen;
+  }
+
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen };
 }
