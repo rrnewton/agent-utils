@@ -1150,6 +1150,102 @@ mod tests {
     }
 
     #[test]
+    fn an_approval_request_names_its_stage_and_choices() {
+        let h = harness();
+        let request: Value = serde_json::from_str(
+            r#"{"id": 7, "method": "approval/request", "params": {
+                "approvalId": "ap-1", "toolName": "shell",
+                "rawArgs": "{\"command\": \"git push\"}", "itemId": "t1",
+                "currentRequirementId": {"id": "r1"},
+                "availableChoices": [
+                    {"choiceId": "allow-once", "decision": "approved", "scope": "once", "label": "Allow"},
+                    {"choiceId": "deny-once", "decision": "denied", "scope": "once", "label": "Deny"}
+                ]}}"#,
+        )
+        .unwrap();
+        let [Signal::PermissionRequest(pending)] = &h.parse(&request)[..] else {
+            panic!("expected one permission request");
+        };
+        assert_eq!(pending.request_id, "ap-1");
+        assert_eq!(pending.tool, "shell");
+        assert_eq!(pending.requirement, Some(json!({"id": "r1"})));
+        assert_eq!(pending.choices.len(), 2);
+        // The answer names the stage and picks the once-scoped choice.
+        let line = h.permission_answer_line(
+            "ap-1",
+            true,
+            &json!({}),
+            "",
+            pending.requirement.as_ref(),
+            &pending.choices,
+            "sess-1",
+        );
+        let decide: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(decide["method"], "approval/decide");
+        assert_eq!(decide["params"]["approvalId"], "ap-1");
+        assert_eq!(decide["params"]["choiceId"], "allow-once");
+        assert_eq!(decide["params"]["requirementId"], json!({"id": "r1"}));
+        assert_eq!(decide["params"]["sessionId"], "sess-1");
+        let denied = h.permission_answer_line(
+            "ap-1",
+            false,
+            &json!({}),
+            "not now",
+            pending.requirement.as_ref(),
+            &pending.choices,
+            "sess-1",
+        );
+        let decide: Value = serde_json::from_str(&denied).unwrap();
+        assert_eq!(decide["params"]["choiceId"], "deny-once");
+        assert_eq!(decide["params"]["feedback"], "not now");
+        // Presenting is receipted at once; the decision travels separately.
+        let receipt = h.permission_receipt_line(pending).unwrap();
+        let receipt: Value = serde_json::from_str(&receipt).unwrap();
+        assert_eq!(receipt["result"], json!({}));
+    }
+
+    #[test]
+    fn approvals_decided_elsewhere_and_stage_changes_parse() {
+        let h = harness();
+        let resolved: Value = serde_json::from_str(
+            r#"{"method":"approval/resolved","params":{"approvalId":"ap-1","decision":"approvedForSession"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            h.parse(&resolved),
+            vec![Signal::PermissionResolved {
+                request_id: "ap-1".into(),
+                decision: "approvedForSession".into(),
+            }]
+        );
+        let updated: Value = serde_json::from_str(
+            r#"{"method":"approval/updated","params":{"approvalId":"ap-1","currentRequirementId":{"id":"r2"},"availableChoices":[{"choiceId":"allow-2","decision":"approved","scope":"once","label":"Allow"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            h.parse(&updated),
+            vec![Signal::PermissionUpdated {
+                request_id: "ap-1".into(),
+                requirement: Some(json!({"id": "r2"})),
+                choices: vec![("allow-2".into(), "approved".into(), "once".into())],
+            }]
+        );
+    }
+
+    #[test]
+    fn exec_lines_drive_the_relay() {
+        let h = MuseHarness::exec();
+        let turn: Value =
+            serde_json::from_str(&h.input_line("u1", "hello", "s1", Some("max"))).unwrap();
+        assert_eq!(turn["relay"], "turn");
+        assert_eq!(turn["effort"], "max");
+        let interrupt: Value =
+            serde_json::from_str(&h.interrupt_line("agentctl-interrupt-1", "s1", Some("u1")))
+                .unwrap();
+        assert_eq!(interrupt["relay"], "interrupt");
+    }
+
+    #[test]
     fn an_unpinned_harness_warns_instead_of_refusing() {
         let h = harness();
         let init: Value = serde_json::from_str(

@@ -1475,3 +1475,157 @@ fn the_harness_is_spawned_with_the_configured_launch_environment() {
     });
     fixture.stop(handle);
 }
+
+/// A scripted `muse serve` (MSP over stdio JSON-RPC), pinned to the
+/// Muse 1.4.23 shapes `headless/muse.rs` translates: the `initialize`
+/// handshake, `session/start`, one `turn/start` per prompt, an
+/// `approval/request` for a prompt containing `ASK` that waits for the
+/// wrapper's `approval/decide`, and `turn/completed` to close. It records
+/// every decision it receives in `FAKE_MUSE_LOG`.
+const FAKE_MUSE: &str = r#"
+import json, os, queue, sys, threading
+inputs = queue.Queue()
+def reader():
+    for line in sys.stdin:
+        inputs.put(json.loads(line))
+    inputs.put(None)
+threading.Thread(target=reader, daemon=True).start()
+def out(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+def log(value):
+    with open(os.environ["FAKE_MUSE_LOG"], "a") as handle:
+        handle.write(json.dumps(value) + "\n")
+while True:
+    message = inputs.get()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        out({"id": message["id"], "result": {"serverInfo": {"name": "muse", "version": "1.4.23"}}})
+        continue
+    if method in ("session/start", "session/resume"):
+        session = message["params"]["sessionId"]
+        out({"id": message["id"], "result": {"session": {"sessionId": session, "modelId": "fake",
+             "approvalMode": {"mode": "onRequest"}}}})
+        continue
+    if method == "turn/interrupt":
+        out({"id": message["id"], "result": {}})
+        continue
+    if method == "approval/decide":
+        out({"id": message["id"], "result": {}})
+        continue
+    if method != "turn/start":
+        continue
+    params = message["params"]
+    turn = params["commandId"]
+    text = params["input"][0]["text"]
+    out({"id": message["id"], "result": {"commandId": turn, "disposition": "started",
+         "startedNewTurn": True, "status": "accepted", "turnId": turn}})
+    out({"method": "turn/started", "params": {"turnId": turn, "sessionId": session}})
+    if "ASK" in text:
+        out({"method": "item/started", "params": {"item": {"itemId": "t1", "kind": "toolCall",
+             "tool": "shell", "args": "{\"command\": \"git push\"}", "status": "inProgress",
+             "turnId": turn}, "sessionId": session}})
+        out({"id": "srv-1", "method": "approval/request", "params": {
+            "approvalId": "ap-1", "toolName": "shell", "rawArgs": "{\"command\": \"git push\"}",
+            "itemId": "t1", "currentRequirementId": {"id": "r1"},
+            "availableChoices": [
+                {"choiceId": "allow-once", "decision": "approved", "scope": "once", "label": "Allow"},
+                {"choiceId": "deny-once", "decision": "denied", "scope": "once", "label": "Deny"}]}})
+        decide = None
+        held = []
+        while decide is None:
+            incoming = inputs.get()
+            if incoming is None:
+                break
+            if incoming.get("method") == "approval/decide":
+                decide = incoming
+            else:
+                held.append(incoming)
+        for incoming in held:
+            inputs.put(incoming)
+        if decide is not None:
+            log({"decide": decide["params"]})
+            out({"method": "item/completed", "params": {"item": {"itemId": "t1", "kind": "toolCall",
+                 "tool": "shell", "status": "completed", "visibleOutput": "pushed",
+                 "turnId": turn}, "sessionId": session}})
+    out({"method": "item/completed", "params": {"item": {"itemId": turn + "-msg",
+         "kind": "agentMessage", "messagePhase": "finalAnswer", "status": "completed",
+         "text": "fake: " + text, "turnId": turn}, "sessionId": session}})
+    out({"method": "turn/completed", "params": {"turnId": turn, "terminal": "completed",
+         "durationMs": 5, "usage": {"inputTokens": 1, "outputTokens": 2}}})
+"#;
+
+impl Fixture {
+    /// A wrapper driving the fake Muse (serve transport) instead of Claude.
+    fn muse(label: &str) -> Self {
+        let mut fixture = Self::new(label, "normal");
+        let script = fixture.root.join("fake_muse.py");
+        fs::write(&script, FAKE_MUSE).unwrap();
+        fixture.config.command = vec![
+            "env".to_owned(),
+            format!("FAKE_MUSE_LOG={}", fixture.root.join("muse.log").display()),
+            "python3".to_owned(),
+            script.display().to_string(),
+        ];
+        fixture.config.adapter = std::sync::Arc::new(crate::headless::muse::MuseHarness::serve());
+        fixture.config.config_directory = Some(fixture.root.join("muse-home"));
+        fixture
+    }
+
+    fn muse_log(&self) -> Vec<Value> {
+        fs::read_to_string(self.root.join("muse.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|row| serde_json::from_str(row).ok())
+            .collect()
+    }
+}
+
+#[test]
+fn a_muse_serve_turn_flows_through_the_wrapper() {
+    let fixture = Fixture::muse("muse-echo");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "hello muse", json!({}));
+    fixture.wait("input started", || {
+        fixture.has_event("input.started", |data| data["queue_id"] == "m1")
+    });
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |data| data["outcome"] == "completed")
+    });
+    fixture.wait("assistant text", || {
+        fixture.has_event("assistant.text", |data| {
+            data["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("hello muse"))
+        })
+    });
+    assert_eq!(fixture.state("m1"), Some(queue::MessageState::Processed));
+    fixture.stop(handle);
+}
+
+#[test]
+fn a_muse_approval_is_held_and_answered_with_approval_decide() {
+    let fixture = Fixture::muse("muse-ask");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "ASK to push", json!({"from": "owner"}));
+    let id = fixture.approval_id();
+    let asked = fixture.event_data("approval.requested");
+    assert_eq!(asked["tool"], "shell");
+    assert_eq!(fixture.request("status")["approvals_pending"], 1);
+    let answer = fixture.answer(json!({"op": "approval", "id": id, "decision": "approve",
+                                       "by": "chat:U1"}));
+    assert_eq!(answer["ok"], true, "{answer}");
+    fixture.wait("the decide reached the fake", || {
+        !fixture.muse_log().is_empty()
+    });
+    let decide = &fixture.muse_log()[0]["decide"];
+    assert_eq!(decide["approvalId"], "ap-1");
+    assert_eq!(decide["choiceId"], "allow-once");
+    assert_eq!(decide["requirementId"], json!({"id": "r1"}));
+    fixture.wait("turn completed", || {
+        fixture.has_event("turn.completed", |data| data["outcome"] == "completed")
+    });
+    fixture.stop(handle);
+}
