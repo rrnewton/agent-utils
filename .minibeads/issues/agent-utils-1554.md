@@ -1,12 +1,13 @@
 ---
 title: 'eden-remove-and-absent-rows: Eden validate rows must not block git creates or absent-row recovery'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-15T11:35:00.000000000+00:00
-updated_at: 2026-11-15T11:35:00.000000000+00:00
+updated_at: 2026-11-16T00:52:59.000000000+00:00
+closed_at: 2026-11-16T00:52:59.000000000+00:00
 ---
 
 # Description
@@ -74,6 +75,6 @@ Part A (this change):
 
 # Notes
 
-Resolution (part A): (fill in at landing)
+## Resolution
 
-Remove-flow part: later commit, not in this change.
+Landed in four parts (mu-edenfail, each gated before land-main). 528631d2 part A: existing-row scans skip only Git repository resolution for vcs=eden checkouts, while path and slot overlap checks still cover Eden rows; absent-row recovery accepts Eden backings as canonical absolute paths; stale bind records are dropped on disposal. 0a574796 part A2: archived Eden checkouts validate at their Eden layout path in both the Python and Rust archive validators. b12aeb5c part A3: a refused recover-absent --apply that wrote nothing releases its own journal; refused replays keep theirs. 4b1d54f8 part B: plain remove of an Eden validate slot goes through the Eden remove sequence with its safety proof and never takes the Git path fence, handoff scan or registration checks. Each fix has a test that fails on the parent code.

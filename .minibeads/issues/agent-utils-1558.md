@@ -1,12 +1,13 @@
 ---
 title: 'eden-create-failure-cleanup: a failed create --eden must not orphan its daemon'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-15T11:20:00.000000000+00:00
-updated_at: 2026-11-15T11:20:00.000000000+00:00
+updated_at: 2026-11-16T00:52:59.000000000+00:00
+closed_at: 2026-11-16T00:52:59.000000000+00:00
 ---
 
 # Description
@@ -98,4 +99,6 @@ Related: #1423 eden-daemon-containment (the daemon runs as
 
 # Notes
 
-Resolution: (fill in at landing)
+## Resolution
+
+Landed d02350d4 (mu-edenfail, gated; renumbered from #1553), with follow-ups 06acf2d6 and 67be9216. create --eden writes a create-eden journal (slot path, config dir, mount) before the daemon starts and creates the derived parent on a fresh clone; any failure after provisioning stops only the slot's own daemon through its own --config-dir; an unfinished rollback stays journaled with the exact leftover (config dir, mount, unit); recover --abort-create --slot handles Eden journals; a retry over a journal points at recover. The Rust edition has no Eden create path and refuses create-eden journals as an unsupported kind. The eden runner is stubbed in every test.

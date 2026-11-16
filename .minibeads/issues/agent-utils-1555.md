@@ -1,12 +1,13 @@
 ---
 title: 'eden-discovery-guard: an Eden mount must discover as itself, never as the outer repo'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-15T16:45:00.000000000+00:00
-updated_at: 2026-11-15T16:45:00.000000000+00:00
+updated_at: 2026-11-16T00:52:59.000000000+00:00
+closed_at: 2026-11-16T00:52:59.000000000+00:00
 ---
 
 # Description
@@ -54,5 +55,6 @@ reuses), #1432 (Eden-slot recipe on another host).
 
 # Notes
 
-Resolution: (fill in at landing, including why discovery fell
-through to the outer repo)
+## Resolution
+
+Landed e19d3ac4 (mu-edenfail, gated). Create now proves that the sl root at the mount equals the mount, both after provisioning and again before the ACTIVE row is written (and the git toplevel too where the mount carries its own .git), and rolls back on a mismatch; doctor flags live Eden rows that no longer discover as themselves; status records eden_discovery. Why discovery fell through: the mount's .hg is a symlink into .eden-state, and --cwd discovery walked past it to the outer repository, while sl -R resolved correctly every time. Callers should keep mounts outside any other working tree where the layout allows.
