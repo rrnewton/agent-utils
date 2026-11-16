@@ -1,6 +1,6 @@
 ---
 title: 'slack-rate-limit-budget: account for every Slack consumer and cut what empties the shared bucket'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 external_ref: gh-1682
@@ -70,3 +70,17 @@ this issue changes code only.
 coordinator before coding and approved as cuts (1), (5) and (2) above.
 The bridge change is harness-neutral (Slack transport only), so no cell of
 the harness support matrix changes.
+
+## Resolution
+
+[watermelon-full-preview] Landed in two commits: e4f50735 (page server: a
+poll/side Flat read reads at most three costly threads instead of ten, and
+`poll`/`side` became a Page budget priority held to half of each method's
+ceiling) and 87aa9bab (chat bridge: relay poll floored at thirty seconds,
+at most three thread listings a poll). An in-flight share was rejected
+because the existing overlapping-read tests prove an older copy must never
+take back an edit. The coordinator applied the live cadence changes
+(120 s live poll, 1800 s relist, 90 s naming interval); the hour after
+that restart sent 10.20 calls/min against 15.37 in the symptom window,
+with history rate-limit answers down from 56.7/h to 4.3/h. Full accounting
+and before/after are in the measurement report for this issue.
