@@ -1316,7 +1316,7 @@ test("Fold read peels a long run five at a time from either edge, and every mess
   let head = row(ids[0]);
   assert.equal(head.getAttribute("data-read-run"), "head");
   assert.equal(countSaid(head), 24);
-  assert.deepStrictEqual([peel(head, "first").textContent, peel(head, "last").textContent], ["(first 5)", "(last 5)"]);
+  assert.deepStrictEqual([peel(head, "first").textContent, peel(head, "last").textContent], ["First 5", "Last 5"]);
   assert.equal(peel(head, "first").getAttribute("type"), "button", "a peel is not a real button");
   assert.ok(peel(head, "first").getAttribute("aria-label").includes("first 5"), "a peel says nothing to a screen reader");
   // Peel the oldest five: they stand revealed, collapsed, and the line stays for the other 19.

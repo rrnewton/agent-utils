@@ -118,7 +118,7 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
     button.className = "read-run-peel";
     button.setAttribute("type", "button");
     button.setAttribute("data-peel", edge);
-    button.textContent = `(${edge} ${READ_RUN_PEEL_SIZE})`;
+    button.textContent = edge === "first" ? `First ${READ_RUN_PEEL_SIZE}` : `Last ${READ_RUN_PEEL_SIZE}`;
     button.setAttribute("aria-label", edge === "first"
       ? `Show first ${READ_RUN_PEEL_SIZE} messages of this folded run`
       : `Show last ${READ_RUN_PEEL_SIZE} messages of this folded run`);

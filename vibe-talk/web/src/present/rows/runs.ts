@@ -13,7 +13,7 @@ const READ_RUN_MIN_ROWS = 2;
 /** How many messages one peel of a folded run reveals from either edge. */
 const READ_RUN_PEEL_SIZE = 5;
 
-/** At or above this many still-folded messages a run offers its `(first 5)` / `(last 5)` peels. */
+/** At or above this many still-folded messages a run offers its `First 5` / `Last 5` peels. */
 const READ_RUN_PEEL_MIN = 10;
 
 /** Where a row goes under Fold read: the "head" its run's line is drawn on, or a "member", and how many messages the run stands for. */

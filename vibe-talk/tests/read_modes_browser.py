@@ -371,6 +371,29 @@ MEASURE_JS = """({root, answer}) => {
 }"""
 
 
+# `#1718 vibe-talk-fold-run-buttons-margins`: where the peels and the summary stand on the line.
+PEEL_JS = """() => {
+  const box = (node) => {
+    if (!node) return null;
+    const r = node.getBoundingClientRect();
+    return {top: r.top, bottom: r.bottom, height: r.height, left: r.left, right: r.right, width: r.width};
+  };
+  const head = document.querySelector('#discord-log > li[data-read-run="head"]');
+  if (!head) return null;
+  const line = head.querySelector('.read-run');
+  const first = head.querySelector('.read-run-peel[data-peel="first"]');
+  const last = head.querySelector('.read-run-peel[data-peel="last"]');
+  let words = null;
+  if (line) {
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    words = box(range);
+  }
+  return {head: box(head), line: box(line), words, first: box(first), last: box(last),
+    firstText: first ? first.textContent : null, lastText: last ? last.textContent : null};
+}"""
+
+
 # `#222 unread-replies`: Main's rows, and the root's unread count beside its N replies.
 MAIN_JS = """(root) => {
   const rows = [...document.querySelectorAll('#discord-log > li')];
@@ -636,10 +659,34 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     # Peel five from the oldest edge, then five from the newest: the line stays, its count drops,
     # and what came out of the fold is not standing open.
     head_line = '#discord-log > li[data-read-run="head"]'
+    # `#1718 vibe-talk-fold-run-buttons-margins`: First 5 at the line's left margin, Last 5 at its
+    # right margin, the summary between them, neither button over the summary's words.
+    page.wait_for_function(
+        "() => { const b = document.querySelector('#discord-log > li[data-read-run=\"head\"]"
+        " .read-run-peel[data-peel=\"first\"]'); return b && b.getClientRects().length > 0; }",
+        timeout=5_000)
+    geo = page.evaluate(PEEL_JS)
+    check(isinstance(geo, dict) and geo.get("first") and geo.get("last"),
+          f"{size}: the peels are not on the line: {geo!r}")
+    assert isinstance(geo, dict)
+    check(geo["firstText"] == "First 5" and geo["lastText"] == "Last 5",
+          f"{size}: the peels say {geo['firstText']!r} and {geo['lastText']!r}, not First 5 / Last 5")
+    check(abs(geo["first"]["left"] - geo["head"]["left"]) <= 3,
+          f"{size}: First 5 starts {geo['first']['left'] - geo['head']['left']:.1f}px from the line's left edge")
+    check(abs(geo["last"]["right"] - geo["head"]["right"]) <= 3,
+          f"{size}: Last 5 ends {geo['head']['right'] - geo['last']['right']:.1f}px from the line's right edge")
+    check(geo["first"]["right"] <= geo["words"]["left"] + 1 and geo["last"]["left"] >= geo["words"]["right"] - 1,
+          f"{size}: a peel overlaps the summary: {geo!r}")
+    check(geo["first"]["height"] >= TARGET_PX and geo["last"]["height"] >= TARGET_PX
+          and geo["first"]["width"] >= TARGET_PX and geo["last"]["width"] >= TARGET_PX,
+          f"{size}: a peel is under a {TARGET_PX}px touch target: {geo!r}")
+    notes.append("margins: First 5 at the left edge, Last 5 at the right, summary clear between")
+    shot("2a-fold-line-margins")
     for edge, want in (("first", READ_REPLIES - 5), ("last", READ_REPLIES - 10)):
         peel = f"{head_line} .read-run-peel[data-peel=\"{edge}\"]"
-        check(page.locator(peel).is_visible(), f"{size}: the ({edge} 5) peel is not on the line")
-        check(page.locator(peel).inner_text() == f"({edge} 5)", f"{size}: the peel says {page.locator(peel).inner_text()!r}")
+        check(page.locator(peel).is_visible(), f"{size}: the {edge} peel is not on the line")
+        want_words = "First 5" if edge == "first" else "Last 5"
+        check(page.locator(peel).inner_text() == want_words, f"{size}: the peel says {page.locator(peel).inner_text()!r}")
         tap(page, peel, touch)
         page.wait_for_function(
             f"() => document.querySelector('{head_line} .read-run')?.textContent.includes('{want} read messages')",

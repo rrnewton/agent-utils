@@ -1304,34 +1304,61 @@ body .side-card-row[data-linked="true"] {
   outline-offset: -2px;
 }
 
-/* The peels at the far end of a long run's line: small grey real buttons over the line's end, each
-   revealing five messages from its edge while the line stays for the rest. They sit on the head
-   row itself, clear of the line button, so a tap on one never opens the whole run. */
+/* The peels at the two margins of a long run's line (`#1718 vibe-talk-fold-run-buttons-margins`):
+   "First 5" at the left margin and "Last 5" at the right, each revealing five messages from its
+   edge while the line stays for the rest, with the run's summary between them. The head row is a
+   flex row of the two peels and the line (the peels' box takes no box of its own, so the buttons
+   stand at the row's own edges), and the line takes what room is left with a floor of none, so
+   its words can never run under either button and clip instead on a narrow phone. Each peel is a
+   real button beside the line button, so a tap on one never opens the whole run. */
 #side-log li.discord-message[data-read-run="head"],
 #side-cards li.discord-message[data-read-run="head"],
 #discord-log li.discord-message[data-read-run="head"],
 #side-cards li.side-card-row[data-read-run="head"] {
   position: relative;
+  display: flex;
+  align-items: stretch;
 }
 
 #side-log li.discord-message[data-read-run="head"] > .read-run-peels.read-run-peels,
 #side-cards li.discord-message[data-read-run="head"] > .read-run-peels.read-run-peels,
 #side-cards li.side-card-row[data-read-run="head"] > .read-run-peels.read-run-peels,
 #discord-log li.discord-message[data-read-run="head"] > .read-run-peels.read-run-peels {
-  display: flex !important;
-  position: absolute;
-  right: 0.25rem;
-  top: 50%;
-  transform: translateY(-50%);
-  gap: 0.25rem;
-  background: var(--bg);
-  padding-left: 0.5rem;
+  display: contents !important;
 }
 
 #side-log .read-run-peels[hidden],
 #side-cards .read-run-peels[hidden],
 #discord-log .read-run-peels[hidden] {
   display: none !important;
+}
+
+#side-log .read-run-peels[hidden] > .read-run-peel,
+#side-cards .read-run-peels[hidden] > .read-run-peel,
+#discord-log .read-run-peels[hidden] > .read-run-peel {
+  display: none !important;
+}
+
+#side-log li.discord-message[data-read-run="head"] > .read-run,
+#side-cards li.discord-message[data-read-run="head"] > .read-run,
+#side-cards li.side-card-row[data-read-run="head"] > .read-run,
+#discord-log li.discord-message[data-read-run="head"] > .read-run {
+  order: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#side-log .read-run-peel[data-peel="first"],
+#side-cards .read-run-peel[data-peel="first"],
+#discord-log .read-run-peel[data-peel="first"] {
+  order: 0;
+}
+
+#side-log .read-run-peel[data-peel="last"],
+#side-cards .read-run-peel[data-peel="last"],
+#discord-log .read-run-peel[data-peel="last"] {
+  order: 2;
 }
 
 #side-log .read-run-peel,
