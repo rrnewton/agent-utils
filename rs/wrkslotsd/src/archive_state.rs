@@ -27,10 +27,15 @@ pub(crate) fn normalize_archive_value(
     selected: &str,
     label_prefix: &str,
 ) -> Result<Value> {
-    archive_from_obj(cfg, value, selected, label_prefix)
+    Ok(archive_from_obj(cfg, value, selected, label_prefix)?.0)
 }
 
-fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str) -> Result<Value> {
+fn archive_from_obj(
+    cfg: &Cfg,
+    value: &Value,
+    selected: &str,
+    label_prefix: &str,
+) -> Result<(Value, Vec<Value>)> {
     let raw = as_mapping(value, label_prefix)?;
     exact_keys(
         raw,
@@ -257,10 +262,13 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
                 expecteds.push(posix_relative(&cfg.root, &destination)?);
             }
             if !expecteds.iter().any(|expected| &checkout.path == expected) {
-                let contained = [slot_path.clone(), alt_slot_path.clone()].iter().any(|candidate| {
-                    let rel = posix_relative(&cfg.root, candidate).unwrap_or_default();
-                    checkout.path == rel || checkout.path.starts_with(&format!("{rel}/"))
-                });
+                let contained =
+                    [slot_path.clone(), alt_slot_path.clone()]
+                        .iter()
+                        .any(|candidate| {
+                            let rel = posix_relative(&cfg.root, candidate).unwrap_or_default();
+                            checkout.path == rel || checkout.path.starts_with(&format!("{rel}/"))
+                        });
                 if checkout.vcs != "git" && contained {
                     quarantined.push(json!({
                         "slot": slot,
@@ -290,13 +298,15 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
     let revision = as_int(&raw["revision"], "archive state.revision", 0)?;
     let mut all_records = records;
     all_records.extend(quarantined_raw);
-    Ok(json!({
-        "schema": SCHEMA,
-        "machine": actual_machine,
-        "revision": revision,
-        "records": all_records,
-        "quarantined_records": quarantined,
-    }))
+    Ok((
+        json!({
+            "schema": SCHEMA,
+            "machine": actual_machine,
+            "revision": revision,
+            "records": all_records,
+        }),
+        quarantined,
+    ))
 }
 
 /// Read and validate `ARCHIVED.<machine>.json` under a project's control
@@ -315,5 +325,8 @@ pub(crate) fn parse_archive(root: Option<&Path>, machine_override: Option<&str>)
     })?;
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| format!("archive state is malformed JSON: {error}"))?;
-    archive_from_obj(&cfg, &value, &selected, &path.to_string_lossy())
+    let (mut document, quarantined) =
+        archive_from_obj(&cfg, &value, &selected, &path.to_string_lossy())?;
+    document["quarantined_records"] = json!(quarantined);
+    Ok(document)
 }

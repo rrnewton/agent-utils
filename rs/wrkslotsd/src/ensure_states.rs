@@ -481,7 +481,10 @@ pub(crate) fn ensure_event_log(root: Option<&Path>, cfg: &Cfg, machine: &str) ->
         return Ok(());
     }
     let (active, order) = parse_state_ordered(root, Some(machine))?;
-    let archive = parse_archive(root, Some(machine))?;
+    let mut archive = parse_archive(root, Some(machine))?;
+    if let Some(document) = archive.as_object_mut() {
+        document.remove("quarantined_records");
+    }
     let slots = active
         .get("slots")
         .and_then(Value::as_array)
