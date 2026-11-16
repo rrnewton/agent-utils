@@ -1103,6 +1103,10 @@ pub(crate) struct SlotView {
     pub(crate) coordinator: bool,
     pub(crate) writable: Vec<PathBuf>,
     pub(crate) propagate: Vec<PathBuf>,
+    pub(crate) eden_checkout: Option<PathBuf>,
+    pub(crate) eden_backing: Option<PathBuf>,
+    pub(crate) eden_hidden: Vec<PathBuf>,
+    pub(crate) checkout_alias: Option<PathBuf>,
 }
 
 /// Host facts `build_spec` needs, injected so tests never read
@@ -1337,6 +1341,85 @@ fn ensure_spec_directory(directory: &Path, uid: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate `view.checkout_alias`, mirroring Python
+/// `_checkout_alias_bind`: the (Eden checkout, alias target) bind, or
+/// None when no alias is set. A missing host mount point is refused
+/// naming the `sudo mkdir` that creates it.
+fn checkout_alias_bind(
+    view: &SlotView,
+    settings: &SandboxSettings,
+    slot_writable: bool,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let Some(target) = &view.checkout_alias else {
+        return Ok(None);
+    };
+    let Some(checkout) = &view.eden_checkout else {
+        return Err("--checkout-alias binds an Eden checkout; this slot has none".to_string());
+    };
+    if settings.isolation == "cgroup" {
+        return Err(
+            "--checkout-alias needs a file-system view; isolation cgroup has none".to_string(),
+        );
+    }
+    let target_text = target.to_string_lossy();
+    let mut components = 0usize;
+    let mut clean = target.is_absolute() && target_text != "/";
+    for part in target_text.split('/') {
+        match part {
+            "" => {}
+            "." | ".." => clean = false,
+            _ => components += 1,
+        }
+    }
+    if !clean || components == 0 {
+        return Err(format!(
+            "--checkout-alias must be an absolute path below /, not {target_text}"
+        ));
+    }
+    let is_inside = |path: &Path, root: &Path| path == root || path.starts_with(root);
+    if is_inside(target, checkout) || is_inside(checkout, target) {
+        return Err(format!(
+            "--checkout-alias {target_text} must not overlap the Eden checkout {}",
+            checkout.display()
+        ));
+    }
+    if target == &view.slot_path || is_inside(target, &view.slot_path) {
+        return Err(format!(
+            "--checkout-alias {target_text} must not overlap the slot {}",
+            view.slot_path.display()
+        ));
+    }
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "--checkout-alias {target_text} is not a real directory; remove it and retry"
+                ));
+            }
+            let mut entries = std::fs::read_dir(target)
+                .map_err(|error| format!("--checkout-alias {target_text}: {error}"))?;
+            if entries.next().is_some() {
+                return Err(format!(
+                    "--checkout-alias {target_text} is not empty; the alias bind needs an empty mount point"
+                ));
+            }
+        }
+        Err(_) => {
+            if target.parent() != Some(Path::new("/tmp")) {
+                return Err(format!(
+                    "--checkout-alias {target_text} does not exist: create the mount point once on the host with `sudo mkdir {target_text}` (an empty root-owned directory), then retry"
+                ));
+            }
+        }
+    }
+    if !slot_writable {
+        return Err(
+            "--checkout-alias binds the checkout writable and refuses a closed set".to_string(),
+        );
+    }
+    Ok(Some((checkout.clone(), target.clone())))
+}
+
 /// Describe the view the helper must build, as plain JSON,
 /// mirroring Python `build_spec`. Filesystem existence checks
 /// read the given tree; the only side effect is Python's own:
@@ -1393,6 +1476,9 @@ pub(crate) fn build_spec(
             add(directory, directory);
         }
     }
+    if let Some((checkout, target)) = checkout_alias_bind(view, settings, slot_writable)? {
+        add(&checkout, &target);
+    }
     if let Some(root) = &view.project_root {
         for relative in &settings.outputs {
             let path = root.join(relative);
@@ -1447,6 +1533,19 @@ pub(crate) fn build_spec(
             );
         }
     }
+    if view.eden_checkout.is_some() {
+        for relative in ["local/.eden", ".eden"] {
+            for base in &aliases {
+                masks.push(base.join(relative).to_string_lossy().into_owned());
+            }
+        }
+        for path in &view.eden_hidden {
+            masks.push(path.to_string_lossy().into_owned());
+        }
+        if let Some(backing) = &view.eden_backing {
+            masks.push(backing.to_string_lossy().into_owned());
+        }
+    }
     let mut git_masks: Vec<String> = Vec::new();
     if git_config_policy == "isolated" {
         git_masks = git_config_mask_paths(&aliases);
@@ -1484,6 +1583,9 @@ pub(crate) fn build_spec(
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
         "cwd": cwd.to_string_lossy(),
+        "eden_root_cover": view.eden_checkout.is_some(),
+        "eden_checkout": view.eden_checkout.as_ref().map(|path| path.to_string_lossy().into_owned()),
+        "eden_backing": view.eden_backing.as_ref().map(|path| path.to_string_lossy().into_owned()),
     });
     if git_config_policy == "isolated" {
         if let Some(map) = spec.as_object_mut() {
@@ -2332,6 +2434,10 @@ sys.stdout.write(json.dumps(list(result.items())) + "\n")
                 coordinator,
                 writable: Vec::new(),
                 propagate: Vec::new(),
+                eden_checkout: None,
+                eden_backing: None,
+                eden_hidden: Vec::new(),
+                checkout_alias: None,
             };
             let settings = settings_from_obj(&json!({
                 "isolation": isolation,
@@ -2475,6 +2581,10 @@ sys.stdout.write("OK\n" + json.dumps(spec, sort_keys=True) + "\n")
             } else {
                 Vec::new()
             },
+            eden_checkout: None,
+            eden_backing: None,
+            eden_hidden: Vec::new(),
+            checkout_alias: None,
         }
     }
 

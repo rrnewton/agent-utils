@@ -275,6 +275,63 @@ def test_build_spec_layers_home_and_binds_blessed_paths(tmp_path: Path) -> None:
     assert hidden["home_binds"] == ["bin", ".local/bin"]
 
 
+def test_build_spec_eden_masks_shared_state_and_binds_alias(tmp_path: Path) -> None:
+    home = _fake_home(tmp_path)
+    (home / "local" / ".eden" / "clients").mkdir(parents=True)
+    (tmp_path / "slot" / "checkout").mkdir(parents=True)
+    (tmp_path / "slot" / ".eden-state").mkdir()
+    (tmp_path / "backing" / ".hg").mkdir(parents=True)
+    (tmp_path / "other" / ".eden-state").mkdir(parents=True)
+    for directory in ("repo.git", "control", "project/ai_docs"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+    view = dataclasses.replace(
+        _view(tmp_path),
+        eden_checkout=tmp_path / "slot" / "checkout",
+        eden_backing=tmp_path / "backing",
+        eden_hidden=(tmp_path / "other" / ".eden-state",),
+        checkout_alias=Path("/tmp/alias-checkout"),
+    )
+    spec = sandbox.build_spec(view, sandbox.SandboxSettings(), home, tmp_path / "slot" / "checkout")
+    masks = spec["masks"]
+    assert isinstance(masks, list)
+    # The shared host Eden config dir, other slots' state and the host
+    # backing store are masked; this slot's own state is not.
+    assert str(home / "local" / ".eden") in masks
+    assert str(tmp_path / "other" / ".eden-state") in masks
+    assert str(tmp_path / "backing") in masks
+    assert str(tmp_path / "slot" / ".eden-state") not in masks
+    assert spec["eden_root_cover"] is True
+    binds = spec["binds"]
+    assert isinstance(binds, list)
+    assert [str(tmp_path / "slot" / "checkout"), "/tmp/alias-checkout"] in binds
+
+
+def test_build_spec_plain_view_has_no_eden_cover_or_masks(tmp_path: Path) -> None:
+    home = _fake_home(tmp_path)
+    for directory in ("slot", "repo.git", "control", "project/ai_docs"):
+        (tmp_path / directory).mkdir(parents=True)
+    spec = sandbox.build_spec(_view(tmp_path), sandbox.SandboxSettings(), home, tmp_path / "slot")
+    assert spec["eden_root_cover"] is False
+    plain_masks = spec["masks"]
+    assert isinstance(plain_masks, list)
+    assert not any(str(path).endswith("local/.eden") for path in plain_masks)
+
+
+def test_build_spec_alias_missing_host_mount_point_refuses(tmp_path: Path) -> None:
+    home = _fake_home(tmp_path)
+    (tmp_path / "slot" / "checkout").mkdir(parents=True)
+    view = dataclasses.replace(
+        _view(tmp_path),
+        eden_checkout=tmp_path / "slot" / "checkout",
+        checkout_alias=Path("/wrkslots-alias-missing"),
+    )
+    with pytest.raises(sandbox.SandboxError, match=r"sudo mkdir /wrkslots-alias-missing"):
+        sandbox.build_spec(view, sandbox.SandboxSettings(), home, tmp_path / "slot" / "checkout")
+    relative = dataclasses.replace(view, checkout_alias=Path("relative-alias"))
+    with pytest.raises(sandbox.SandboxError, match="absolute"):
+        sandbox.build_spec(relative, sandbox.SandboxSettings(), home, tmp_path / "slot" / "checkout")
+
+
 def test_prepare_state_builds_the_layer_without_touching_home(tmp_path: Path) -> None:
     home = _fake_home(tmp_path)
     before = sorted(str(path.relative_to(home)) for path in home.rglob("*"))

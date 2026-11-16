@@ -1341,6 +1341,10 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
                     Vec::new()
                 },
                 propagate: Vec::new(),
+                eden_checkout: None,
+                eden_backing: None,
+                eden_hidden: Vec::new(),
+                checkout_alias: None,
             };
             let settings = settings_from_obj(&json!({
                 "isolation": isolation,
@@ -1523,6 +1527,10 @@ sys.stdout.write(render(rc))
                 coordinator: false,
                 writable: Vec::new(),
                 propagate: Vec::new(),
+                eden_checkout: None,
+                eden_backing: None,
+                eden_hidden: Vec::new(),
+                checkout_alias: None,
             };
             let settings = settings_from_obj(&json!({
                 "isolation": if case == "wrong-isolation" { "cgroup" } else { "root" },

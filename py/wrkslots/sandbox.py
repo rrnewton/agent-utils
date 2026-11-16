@@ -36,6 +36,13 @@ slot's private state differs (the state image, or ``<control>/slot-state/``).
      tmpfs, files by ``/dev/null``.
   6. With ``protect_system`` every remaining mount becomes read-only, except
      ``/proc``, ``/sys``, ``/dev``, and ``/run/user``.
+  7. An Eden slot (``SlotView.eden_checkout``) masks the shared host daemon
+     configuration directories, other slots' ``.eden-state`` and the host
+     backing store (the last with a bare shared-directory skeleton so the
+     lane's own ``sl root`` still works), re-roots the namespace on a
+     user-owned tmpfs so Sapling's shared-directory ownership walk passes,
+     and, with ``SlotView.checkout_alias``, binds its own checkout again at
+     a caller-chosen absolute path.
 
 The network is not touched: agent harnesses and site policy own that.
 """
@@ -549,6 +556,22 @@ class SlotView:
     #: Roots whose mounts made on the host after the box starts (image slots)
     #: appear inside it; everything else is cut off from host mount events.
     propagate: tuple[Path, ...] = ()
+    #: An Eden slot's checkout mount, or None for a non-Eden slot. Its
+    #: presence turns on the Eden view: the shared daemon config directories,
+    #: other slots' Eden state and the host backing store are masked, and
+    #: the root-owned ancestors of the checkout and backing are covered so
+    #: Sapling's shared-directory ownership check sees a user-owned root.
+    eden_checkout: Path | None = None
+    #: The Eden checkout's host backing store, masked in the view.
+    eden_backing: Path | None = None
+    #: Other slots' ``.eden-state`` directories, masked in the view.
+    eden_hidden: tuple[Path, ...] = ()
+    #: Absolute path at which the Eden checkout is also bound inside the
+    #: box (a slot-view setting chosen by the caller, never a configured
+    #: default). The mount point must already exist on the host as an empty
+    #: directory, except under the box's fresh ``/tmp`` where the view
+    #: creates it in its own tmpfs.
+    checkout_alias: Path | None = None
 
 
 # ------------------------------------------------------------------ slices
@@ -1020,6 +1043,50 @@ def prepare_state(view: SlotView, settings: SandboxSettings, home: Path) -> None
         shutil.rmtree(legacy_tmp, ignore_errors=True)
 
 
+#: $HOME-relative shared Eden daemon config directories: every host
+#: checkout is listed through them, so an Eden slot's box masks them and a
+#: lane sees only its own per-slot state directory.
+EDEN_SHARED_CONFIG_DIRS = ("local/.eden", ".eden")
+
+
+def _checkout_alias_bind(view: SlotView, settings: SandboxSettings) -> tuple[Path, Path] | None:
+    """Validate ``view.checkout_alias``; return its (checkout, target) bind.
+
+    The alias target is a caller-chosen absolute path. It must already be an
+    empty directory on the host -- a one-time host-side creation that only
+    the host owner can make at a root-owned location -- except below the
+    box's fresh ``/tmp``, where the view creates the mount point in its own
+    tmpfs. A missing host mount point is refused naming the command that
+    creates it; the box never creates a directory on the host root.
+    """
+
+    target = view.checkout_alias
+    if target is None:
+        return None
+    if view.eden_checkout is None:
+        raise SandboxError("--checkout-alias binds an Eden checkout; this slot has none")
+    if settings.isolation == "cgroup":
+        raise SandboxError("--checkout-alias needs a file-system view; isolation cgroup has none")
+    if not target.is_absolute() or os.path.normpath(target) != str(target) or str(target) == "/":
+        raise SandboxError(f"--checkout-alias must be an absolute path below /, not {target}")
+    checkout = view.eden_checkout
+    if target == checkout or checkout in target.parents or target in checkout.parents:
+        raise SandboxError(f"--checkout-alias {target} must not overlap the Eden checkout {checkout}")
+    if target == view.slot_path or view.slot_path in target.parents:
+        raise SandboxError(f"--checkout-alias {target} must not overlap the slot {view.slot_path}")
+    if target.exists() or target.is_symlink():
+        if target.is_symlink() or not target.is_dir():
+            raise SandboxError(f"--checkout-alias {target} is not a real directory; remove it and retry")
+        if any(target.iterdir()):
+            raise SandboxError(f"--checkout-alias {target} is not empty; the alias bind needs an empty mount point")
+    elif target.parent != Path("/tmp"):
+        raise SandboxError(
+            f"--checkout-alias {target} does not exist: create the mount point once on the host "
+            f"with `sudo mkdir {target}` (an empty root-owned directory), then retry"
+        )
+    return checkout, target
+
+
 def build_spec(
     view: SlotView,
     settings: SandboxSettings,
@@ -1064,6 +1131,11 @@ def build_spec(
         add(view.slot_path, view.slot_path)
         for directory in (*view.git_directories, *view.writable):
             add(directory, directory)
+    alias = _checkout_alias_bind(view, settings)
+    if alias is not None:
+        if not slot_writable:
+            raise SandboxError("--checkout-alias binds the checkout writable and refuses a closed set")
+        add(alias[0], alias[1])
     # A slot's box never writes the wrkslots control directory (registry,
     # journals, other slots, slot images, private HOME layers): registry commands
     # such as heartbeat, finish, and write-handoff run outside it. A coordinator
@@ -1099,6 +1171,17 @@ def build_spec(
     # slot-images visible: it creates and removes image slots.
     private_state = ("slot-state", "box-state") if view.coordinator else ("slot-images", "slot-state", "box-state")
     masks += [str(view.control_directory / name) for name in private_state]
+    if view.eden_checkout is not None:
+        # A boxed Eden lane sees only its own checkout and state: the shared
+        # host daemon config directories name every other host checkout, and
+        # the host backing store's Sapling store is readable through the
+        # read-only $HOME bind, so all of them are masked. This slot's own
+        # per-slot state stays visible below its slot bind.
+        for relative in EDEN_SHARED_CONFIG_DIRS:
+            masks += [str(base / relative) for base in aliases]
+        masks += [str(path) for path in view.eden_hidden]
+        if view.eden_backing is not None:
+            masks.append(str(view.eden_backing))
     policy: dict[str, object] = {}
     if git_config_policy == "isolated":
         git_masks = git_config_mask_paths(aliases)
@@ -1121,6 +1204,9 @@ def build_spec(
         "protect_system": settings.protect_system,
         "propagate": [str(path) for path in view.propagate],
         "cwd": str(cwd),
+        "eden_root_cover": view.eden_checkout is not None,
+        "eden_checkout": str(view.eden_checkout) if view.eden_checkout is not None else None,
+        "eden_backing": str(view.eden_backing) if view.eden_backing is not None else None,
         **policy,
     }
 
@@ -1406,6 +1492,41 @@ def _mask(path: str) -> None:
         _remount_read_only(path)
 
 
+def _mask_eden_backing(path: str) -> None:
+    """Mask a host Eden backing store, leaving a bare shared-dir skeleton.
+
+    The store's contents are hidden exactly as :func:`_mask` hides a
+    directory, but Sapling still has to find its shared repository: it
+    refuses a checkout whose sharedpath names a directory with no
+    ``.hg/store`` at all, which would break ``sl root`` in the lane's own
+    checkout. An empty ``.hg`` skeleton (a ``store`` directory and an empty
+    ``requires`` file) keeps that discovery working while every real store
+    file reads as absent. The skeleton lives on a writable tmpfs because
+    Sapling also wants write access to its shared directory; anything a
+    boxed command writes there lands in this launch's tmpfs, never on the
+    host, and is discarded with the box. Store-reading commands already
+    fail against the read-only host backing (its lock files cannot be
+    opened), so no working behaviour is lost.
+    """
+
+    if not os.path.lexists(path):
+        return
+    path = os.path.realpath(path)
+    if not os.path.isdir(path):
+        _mask(path)
+        return
+    _mount(
+        "tmpfs",
+        path,
+        "tmpfs",
+        _MS_NOSUID | _MS_NODEV | _MS_NOEXEC,
+        f"mode=0755,uid={os.getuid()},gid={os.getgid()},size=16m",
+    )
+    os.makedirs(os.path.join(path, ".hg", "store"))
+    with open(os.path.join(path, ".hg", "requires"), "a", encoding="utf-8"):
+        pass
+
+
 def _mask_git_config(path: str) -> str:
     """Mask one isolated-policy Git configuration path; return its outcome.
 
@@ -1513,6 +1634,171 @@ def _same_kind(real: str, placeholder: str) -> bool:
     return os.path.isdir(real) == os.path.isdir(placeholder)
 
 
+_SYS_OPEN_TREE = 428
+_SYS_MOVE_MOUNT = 429
+_SYS_PIVOT_ROOT = 155
+_OPEN_TREE_CLONE = 1
+_OPEN_TREE_CLOEXEC = 0o2000000
+_AT_RECURSIVE = 0x8000
+_AT_FDCWD = -100
+_MOVE_MOUNT_F_EMPTY_PATH = 0x00000004
+_MNT_DETACH = 2
+
+
+def _syscall(number: int, *args: object) -> int:
+    libc = _libc()
+    libc.syscall.restype = ctypes.c_long
+    result = libc.syscall(number, *args)
+    if result < 0:
+        error = ctypes.get_errno()
+        raise MountError(f"syscall {number}: {os.strerror(error)}", error)
+    return int(result)
+
+
+def _open_tree_clone(root_fd: int, name: str, *, recursive: bool) -> int:
+    flags = _OPEN_TREE_CLONE | _OPEN_TREE_CLOEXEC | (_AT_RECURSIVE if recursive else 0)
+    return _syscall(_SYS_OPEN_TREE, root_fd, name.encode(), flags)
+
+
+def _move_mount_clone(descriptor: int, target: str) -> None:
+    _syscall(_SYS_MOVE_MOUNT, descriptor, b"", _AT_FDCWD, target.encode(), _MOVE_MOUNT_F_EMPTY_PATH)
+
+
+def _pivot_user_root() -> None:
+    """Re-root this namespace on a user-owned tmpfs under the fresh ``/tmp``.
+
+    Sapling's shared-repository check walks the ancestors of a checkout's
+    shared store to ``/`` and refuses any that are owned by neither the user
+    nor root. Inside a user namespace a host root-owned directory shows as
+    the overflow uid, so the check always fails at ``/`` (``eden info``
+    exit 77). Mounting over ``/`` does not help: the process root stays
+    pinned to the covered mount. Pivot instead: clone every top-level entry
+    of the old root (fd-based, via open_tree), pivot into a bind of a
+    staging directory on the fresh user-owned ``/tmp`` tmpfs, re-attach the
+    clones, and detach the old root. Afterwards ``/`` is a directory the
+    box user owns and every top-level path resolves as before.
+    """
+
+    stage_mount = Path("/tmp/.wrkslots-stage")
+    staging = stage_mount / "root"
+    if os.path.lexists(stage_mount):
+        raise SandboxError(f"cannot build the Eden view: {stage_mount} already exists in the fresh /tmp")
+    root_fd = os.open("/", _O_PATH)
+    try:
+        names = os.listdir(f"/proc/self/fd/{root_fd}")
+        entries: dict[str, int] = {}
+        links: dict[str, str] = {}
+        proc_clone: int | None = None
+        for name in names:
+            info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                links[name] = os.readlink(name, dir_fd=root_fd)
+            elif name == "proc":
+                # /proc must come back without a /proc to look through, so
+                # it is the one entry cloned with open_tree; every other
+                # entry is bound back through its pinned descriptor below,
+                # the same fd-based bind the slot tree uses.
+                proc_clone = _open_tree_clone(root_fd, name, recursive=True)
+            else:
+                entries[name] = os.open(name, _O_PATH, dir_fd=root_fd)
+        try:
+            stage_mount.mkdir(mode=0o755)
+            _mount("tmpfs", str(stage_mount), "tmpfs", _MS_NOSUID | _MS_NODEV, "mode=0755,size=256m")
+            staging.mkdir(mode=0o755)
+            (staging / ".old-root").mkdir(mode=0o755)
+            _mount(str(staging), str(staging), None, _MS_BIND)
+            _syscall(_SYS_PIVOT_ROOT, str(staging).encode(), str(staging / ".old-root").encode())
+            os.chdir("/")
+            _mount(None, "/", None, _MS_REC | _MS_PRIVATE)
+            if proc_clone is not None:
+                os.mkdir("/proc", mode=0o755)
+                _move_mount_clone(proc_clone, "/proc")
+                proc_clone = None
+            for name in sorted(names):
+                if name == "proc" or name not in entries:
+                    continue
+                _bind_fd(entries[name], "/" + name)
+            for name, target_text in links.items():
+                os.symlink(target_text, "/" + name)
+        finally:
+            if proc_clone is not None:
+                os.close(proc_clone)
+            for descriptor in entries.values():
+                os.close(descriptor)
+    finally:
+        os.close(root_fd)
+
+
+def _detach_pivoted_root() -> None:
+    """Detach the old root left at ``/.old-root`` by :func:`_pivot_user_root`.
+
+    Called only once every pinned bind has been made: a directory on a
+    detached mount cannot be bind-mounted through its descriptor (EINVAL),
+    so the old tree must stay attached while the view is built from those
+    descriptors. Its staging mount under ``/tmp`` goes with it.
+    """
+
+    libc = _libc()
+    libc.umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    if libc.umount2(b"/.old-root", _MNT_DETACH) != 0:
+        error = ctypes.get_errno()
+        raise MountError(f"cannot detach the old root: {os.strerror(error)}", error)
+    os.rmdir("/.old-root")
+    with contextlib.suppress(OSError):
+        libc.umount2(b"/tmp/.wrkslots-stage", _MNT_DETACH)
+        os.rmdir("/tmp/.wrkslots-stage")
+
+
+def _cover_unowned_ancestors(targets: Sequence[str]) -> None:
+    """Cover root-owned ancestors of ``targets`` with a user tmpfs, binding the child back.
+
+    The pivot makes ``/`` itself user-owned; an ancestor such as ``/home``
+    can still be a host root-owned directory (the overflow uid inside a
+    user namespace) on the walk Sapling makes from a shared store. Cover
+    each such ancestor with an empty tmpfs owned by the box user and bind
+    back the one child that leads to the target, recursively, so nothing
+    below it changes. Ancestors owned by the user, or by real root in root
+    mode, are left alone.
+    """
+
+    for target in targets:
+        for ancestor in [str(parent) for parent in Path(target).parents][::-1]:
+            if ancestor == "/":
+                continue
+            try:
+                info = os.stat(ancestor)
+            except OSError:
+                continue
+            if info.st_uid in (os.geteuid(), 0):
+                continue
+            relative = Path(target).relative_to(ancestor)
+            child = str(Path(ancestor) / relative.parts[0])
+            descriptor = os.open(child, _O_PATH)
+            try:
+                _mount(
+                    "tmpfs",
+                    ancestor,
+                    "tmpfs",
+                    _MS_NOSUID | _MS_NODEV,
+                    "mode=0755,size=16m",
+                )
+                _bind_fd(descriptor, child)
+            finally:
+                os.close(descriptor)
+
+
+def _cover_shared_ancestors(spec: Mapping[str, object]) -> None:
+    """Make the ancestors Sapling walks from an Eden checkout user-owned."""
+
+    targets = [
+        str(spec[key])
+        for key in ("eden_checkout", "eden_backing")
+        if isinstance(spec.get(key), str) and spec.get(key)
+    ]
+    _pivot_user_root()
+    _cover_unowned_ancestors(targets)
+
+
 def build_view(spec: Mapping[str, object]) -> None:
     """Build the view described by ``spec`` in the CURRENT (new) mount namespace.
 
@@ -1566,6 +1852,10 @@ def build_view(spec: Mapping[str, object]) -> None:
 
     # 1. A fresh /tmp for this launch.
     _mount("tmpfs", "/tmp", "tmpfs", _MS_NOSUID | _MS_NODEV, f"mode=1777,size={spec.get('tmp_size', DEFAULT_TMP_SIZE)}")
+    if spec.get("eden_root_cover"):
+        # 1a. An Eden view is re-rooted on a user-owned tmpfs so Sapling's
+        # shared-directory ownership walk reaches a root it accepts.
+        _cover_shared_ancestors(spec)
 
     # 2. $HOME: the slot's private layer, with the real entries bound read-only
     #    on their placeholders. The layer itself stays writable, so a harness
@@ -1610,6 +1900,8 @@ def build_view(spec: Mapping[str, object]) -> None:
     for path in strings("masks"):
         if path in git_config_masks:
             git_config_outcomes.append((path, _mask_git_config(path)))
+        elif path == spec.get("eden_backing"):
+            _mask_eden_backing(path)
         else:
             _mask(path)
     if sorted(path for path, _outcome in git_config_outcomes) != sorted(git_config_masks):
@@ -1618,10 +1910,19 @@ def build_view(spec: Mapping[str, object]) -> None:
         for alias in aliases:
             _remount_read_only(alias)
 
+    if spec.get("eden_root_cover"):
+        # The old root stayed attached only so the pinned binds above could
+        # be made from it; detach it before the read-only sweep so none of
+        # its mounts are swept (or visible) in the finished view.
+        _detach_pivoted_root()
     # 6. Everything else read-only. The layer mount is skipped by its EXACT
     # path only: the read-only binds below it must not be skipped with it.
     if spec.get("protect_system", True):
         keep = [*(target for _source, target in binds), "/tmp", *_ALWAYS_WRITABLE_PREFIXES]
+        if isinstance(spec.get("eden_backing"), str):
+            # The backing skeleton stays writable for Sapling's shared-dir
+            # write check; it is a per-launch tmpfs, never the host store.
+            keep.append(str(spec["eden_backing"]))
         failures = _remount_tree_read_only("/", keep, keep_exact=[home])
         if failures:
             raise SandboxError(

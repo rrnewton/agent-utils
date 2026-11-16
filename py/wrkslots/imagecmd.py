@@ -397,6 +397,19 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     run.add_argument("--slot-type", choices=("agent", "validate"), default="agent", help="slot type (default: agent)")
     _view_arguments(run)
     run.add_argument("--cwd", metavar="PATH", help="working directory (default: the slot directory)")
+    run.add_argument(
+        "--checkout-alias",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Eden slots only: also bind the slot's own Eden checkout at this absolute path inside "
+            "the box, writable, for tools that expect the checkout at a fixed location (for "
+            "example /checkout). The path must be an existing empty directory on the host, "
+            "created once by the host owner, or a path below /tmp, which the view creates in its "
+            "own fresh tmpfs; a missing host directory is refused naming the mkdir that creates "
+            "it. No alias is bound without this option"
+        ),
+    )
     run.add_argument("--print", action="store_true", dest="print_only", help="print the scope, slice limits, environment additions, and helper command or view; run nothing")
     run.add_argument(
         "--place-only",
@@ -676,6 +689,12 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         help="passed to run (default: configuration.sandbox.isolation, else userns)",
     )
     shell_command.add_argument("--shell", default=None, metavar="PATH", help="interactive shell (default: $SHELL, else /bin/bash)")
+    shell_command.add_argument(
+        "--checkout-alias",
+        metavar="PATH",
+        default=None,
+        help="passed to run: also bind an Eden slot's checkout at this absolute path inside the box (see `wrkslots run --help`)",
+    )
     shell_command.add_argument(
         "--format",
         choices=("text", "json"),
@@ -2171,6 +2190,8 @@ def slot_view(
     vcs = cli._GitVcs()
     common_directory = _isolated_common_directory if isolated_git else vcs.common_directory
     git_directories: list[Path] = []
+    eden_checkout: Path | None = None
+    eden_backing: Path | None = None
     for checkout, (repository, path, _head) in zip(
         record.checkouts, _checkout_paths(config, record), strict=True
     ):
@@ -2179,6 +2200,8 @@ def slot_view(
             # (<slot>/checkout and <slot>/.eden-state, whose socket reaches
             # the per-slot daemon outside the box). The backing repo is
             # deliberately not bound (#1569).
+            eden_checkout = path
+            eden_backing = repository
             continue
         common = common_directory(path if path.exists() else repository)
         if common not in git_directories:
@@ -2192,7 +2215,28 @@ def slot_view(
         control_directory=config.control,
         representation="image" if image is not None else "worktree",
         project_root=config.root,
+        eden_checkout=eden_checkout,
+        eden_backing=eden_backing,
+        eden_hidden=_other_eden_state_dirs(config, slot_path) if eden_checkout is not None else (),
     )
+
+
+def _other_eden_state_dirs(config: "cli.Config", own_slot_path: Path) -> tuple[Path, ...]:
+    """Every other slot's ``.eden-state`` directory under the slot roots."""
+
+    from wrkslots import cli
+
+    found: list[Path] = []
+    for root in cli._slot_roots(config).values():
+        try:
+            siblings = sorted(root.iterdir())
+        except OSError:
+            continue
+        for sibling in siblings:
+            state = sibling / ".eden-state"
+            if sibling != own_slot_path and state.is_dir() and state not in found:
+                found.append(state)
+    return tuple(found)
 
 
 def _project_git_directories(config: "cli.Config", state: "cli.ActiveState") -> list[Path]:
@@ -2324,6 +2368,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     config = _config(args)
     git_config_policy: str | None = getattr(args, "git_config_policy", None)
     view = slot_view(config, args.slot, args.slot_type, isolated_git=git_config_policy == "isolated")
+    if getattr(args, "checkout_alias", None) is not None:
+        view = dataclasses.replace(view, checkout_alias=Path(args.checkout_alias))
     deadline_ns: int | None = getattr(args, "deadline_monotonic_ns", None)
     output_format: str | None = getattr(args, "format", None)
     try:
@@ -2545,6 +2591,8 @@ def _cmd_shell_command(args: argparse.Namespace) -> int:
 
     config = _config(args)
     command = list(args.command)
+    if args.box and getattr(args, "checkout_alias", None) is not None:
+        raise _refuse("shell-command --checkout-alias applies to a slot's box, not --box")
     if args.box:
         if args.slot is not None:
             # With --box there is no SLOT: argparse hands the first word after -- to it.
@@ -2589,6 +2637,8 @@ def _cmd_shell_command(args: argparse.Namespace) -> int:
             argv += ["--writable", args.writable]
     else:
         argv += ["run", args.slot, "--slot-type", args.slot_type]
+    if getattr(args, "checkout_alias", None) is not None:
+        argv += ["--checkout-alias", args.checkout_alias]
     if args.isolation is not None:
         argv += ["--isolation", args.isolation]
     if command:

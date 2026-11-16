@@ -3165,6 +3165,22 @@ With `userns` or `root` isolation, COMMAND sees:
    multiplexers need). Each mount keeps its own `nosuid`/`nodev`/`noexec`/atime flags. A mount that
    cannot be made read-only while you could write to it refuses the run.
 
+An **Eden slot** gets three extra rules. The shared host daemon configuration directories under
+`$HOME` (the directories through which every host checkout is listed), every other slot's
+`.eden-state`, and the checkout's host backing store are masked, so the lane sees only its own
+checkout and its own `.eden-state`; the backing store's mask leaves a bare shared-directory
+skeleton (an empty `.hg/store` and an empty `requires` on a per-launch tmpfs) so the lane's own
+`sl root` still works, while no host store file can be read. The namespace is also re-rooted on a
+tmpfs owned by the boxed user (the old root is cloned entry by entry and detached before COMMAND
+starts) and any still root-owned ancestors of the checkout and its backing are covered the same
+way: Sapling walks those ancestors checking that each is owned by the user or by root, a check a
+host root-owned directory always fails inside a user namespace, which is what made `eden info`
+exit 77 before this view existed. With `--checkout-alias PATH` (`run` and `shell-command`), the
+slot's own Eden checkout is bound a second time at `PATH`, writable, for tools that expect the
+checkout at a fixed location; `PATH` must be an existing empty directory on the host (created
+once by the host owner) or a path below the box's fresh `/tmp`, and a missing host directory is
+refused naming the `sudo mkdir` that creates it.
+
 `env` adds variables to COMMAND's environment (a leading `~` in a value is your `$HOME`). The
 network is not changed. Commands that need a path this view hides should list it in `read_write`
 (writable) or rely on the read-only view. A project located under `/tmp` loses everything except
