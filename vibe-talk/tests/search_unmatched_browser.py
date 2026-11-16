@@ -444,6 +444,29 @@ BOX_JS = """(selector) => {
 }"""
 
 
+ALL_CHANNELS_UNCOVERED_JS = """() => {
+  const box = document.getElementById('search-all-channels');
+  if (!box || !box.getClientRects().length) return false;
+  const r = box.getBoundingClientRect();
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  return Boolean(hit && (hit === box || box.contains(hit) ||
+    (hit.closest && hit.closest('.search-all-channels'))));
+}"""
+
+
+def press_all_channels(walk: Walk) -> None:
+    """Press All channels with the scope row uncovered (`#1734`).
+
+    Entering a search with no hit on screen now lands at the foot, so the
+    scope row at the head of the scroller stands under the sticky search
+    field; a press there lands on the field and never toggles. Scroll back
+    to the head and wait until the checkbox is uncovered, then press.
+    """
+    walk.page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
+    walk.until(ALL_CHANNELS_UNCOVERED_JS, "the All channels checkbox stayed under the search field")
+    walk.press("#search-all-channels")
+
+
 def walk_server_search(walk: Walk, api: GapApi) -> None:
     """`#605`-`#608 server-side-search`: the server's copy searched, at this size."""
     page = walk.page
@@ -469,7 +492,7 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     walk.notes.append(f"server: {scope}")
 
     # All channels: every channel searched, the hit elsewhere named by its channel.
-    walk.press("#search-all-channels")
+    press_all_channels(walk)
     walk.until("() => document.querySelectorAll('#server-hits > li').length === 2",
                "All channels did not bring the other channel's hit")
     walk.check(any("GET /api/v1/search?" in one for one in api.requests), "All channels did not ask every channel")
@@ -477,7 +500,7 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
                f"the line says {page.evaluate(SCOPE_JS)!r}")
     walk.no_overflow()
     walk.shot("7-all-channels")
-    walk.press("#search-all-channels")
+    press_all_channels(walk)
     walk.until("() => document.querySelectorAll('#server-hits > li').length === 1", "one channel did not come back")
 
     # Main: a thread stands for its children, so the reply's word keeps the lantern root.
