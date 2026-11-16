@@ -222,7 +222,10 @@ jobs:
     # Historical 3.10 defects in minibeads #367 python-minimum-failures were closed October 20.
     # Red shards are failures, not an expected exemption. #336 validation-host-contract makes
     # their host prerequisites explicit; no skips or continue-on-error conceal missing coverage.
-    timeout-minutes: 30
+    # On Nov 16 shard 3 reached 82% after 22 minutes with no failure events.
+    # Keep the whole minimum-interpreter suite and a bounded 35-minute step;
+    # the additional job margin preserves summary/artifact uploads on timeout.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -240,7 +243,7 @@ jobs:
         run: python -m pip install --upgrade 'setuptools>=77' pytest pyyaml
       - name: tests on declared minimum Python, shard ${{ matrix.shard }} of 6
         working-directory: py
-        timeout-minutes: 22
+        timeout-minutes: 35
         # bash, so pipefail holds: the step fails when pytest does, while tee keeps the log for
         # the summary step even if this step is stopped at its limit before pytest's report.
         shell: bash
