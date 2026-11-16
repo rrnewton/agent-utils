@@ -78,6 +78,44 @@ def _mirror_scope(root: Path) -> contextlib.AbstractContextManager[None]:
     return wrkslots._remote_containment_scope(root)
 
 
+def test_retire_proof_mirrors_idle_orphaned_and_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl as _fcntl
+    import json as _json
+    import os as _os
+
+    config = object.__new__(wrkslots.Config)
+    object.__setattr__(config, "control", tmp_path)
+    root = tmp_path / "proof-mirrors"
+    now = 2_000_000_000.0
+
+    def make(name: str, fetched_at: float) -> Path:
+        entry = root / name
+        entry.mkdir(parents=True)
+        (entry / "record.json").write_text(
+            _json.dumps({"fetched_at": fetched_at})
+        )
+        return entry
+
+    idle = make("idle", now - 8 * 24 * 3600)
+    orphan = make("orphan", now)
+    kept = make("kept", now)
+    locked = make("locked", now - 8 * 24 * 3600)
+    descriptor = _os.open(locked / ".lock", _os.O_RDWR | _os.O_CREAT, 0o600)
+    _fcntl.flock(descriptor, _fcntl.LOCK_EX)
+    try:
+        monkeypatch.setattr(
+            wrkslots, "_live_remote_digests", lambda cfg: {"kept", "locked"}
+        )
+        dropped = wrkslots._retire_proof_mirrors(config, now=now)
+    finally:
+        _os.close(descriptor)
+    assert dropped == ["idle", "orphan"]
+    assert not idle.exists() and not orphan.exists()
+    assert kept.exists() and locked.exists()
+
+
 def test_mirror_serves_second_proof_without_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

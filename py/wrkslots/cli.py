@@ -15682,16 +15682,34 @@ def _proof_mirror_directory(root: Path, url: str) -> Path:
 _PROOF_MIRROR_IDLE_SECONDS = 7 * 24 * 3600.0
 
 
-def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[str]:
-    """Drop proof mirrors idle past the retirement age; return their digests (#1692).
+def _live_remote_digests(config: Config) -> set[str] | None:
+    """Remote URL digests of live slots' checkouts; None when unreadable."""
 
-    A mirror whose refresh lock is held (a removal is using it) is kept.
+    try:
+        state = _load_active_snapshot(config, require_repository=False)
+    except Exception:
+        return None
+    return {
+        checkout.remote_url_sha256
+        for record in state.slots
+        for checkout in record.checkouts
+    }
+
+
+def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[str]:
+    """Drop idle or orphaned proof mirrors; return their digests (#1692).
+
+    A mirror is dropped when it has been idle past the retirement age
+    (7 days since its last fetch) or when no live slot names its remote.
+    A mirror whose refresh lock is held (a removal is using it) is kept,
+    and when the live set cannot be read every mirror is kept.
     """
 
     root = config.control / "proof-mirrors"
     if not root.is_dir():
         return []
     moment = time.time() if now is None else now
+    live = _live_remote_digests(config)
     dropped: list[str] = []
     for entry in sorted(root.iterdir()):
         record_path = entry / "record.json"
@@ -15701,7 +15719,9 @@ def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[s
             fetched_at = float(record.get("fetched_at", 0.0))  # type: ignore[arg-type]
         except (Refusal, OSError, TypeError, ValueError):
             fetched_at = 0.0
-        if moment - fetched_at <= _PROOF_MIRROR_IDLE_SECONDS:
+        idle = moment - fetched_at > _PROOF_MIRROR_IDLE_SECONDS
+        orphaned = live is not None and entry.name not in live
+        if not idle and not orphaned:
             continue
         descriptor = os.open(
             entry / ".lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
