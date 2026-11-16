@@ -102,4 +102,4 @@ Verified end to end on the scratch copy: a 1 GiB bound now prints
 the partial JSON with the conversion named and exits 2 (was exit 1
 with a traceback). The Rust reader installs no such bound and
 needed no change. Whole-log retention (the 4.63 GiB validate peak)
-is filed as #1750 wrkslots-read-scan-event-retention.
+is filed as #1756 wrkslots-read-scan-event-retention.
