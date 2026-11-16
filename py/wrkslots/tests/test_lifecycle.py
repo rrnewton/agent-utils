@@ -20242,7 +20242,9 @@ def test_raised_census_seconds_reaches_the_batch_budget(
 
     captured = capsys.readouterr()
     assert rc == 3, captured.err
-    assert observed == [(600.0, pytest.approx(700.0))]
+    assert len(observed) == 1
+    assert observed[0][0] == 600.0
+    assert observed[0][1] == pytest.approx(700.0)
     assert "(bound 600.0 s, elapsed 601.0 s)" in captured.err
     assert (
         "rerun with --census-seconds 1200 to allow a slower census"
