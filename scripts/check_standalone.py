@@ -249,8 +249,12 @@ def wrkslots_scenario(box: Sandbox) -> None:
     pid = str(os.getpid())
     handoff = box.run(["wrkslots", "read-handoff", "s1", "--coordinator-pid", pid], cwd=project)
     _require("Work committed on worker-a/t1." in handoff, f"handoff not returned:\n{handoff}")
+    # The scenario proves the standalone lifecycle, not lock-budget
+    # enforcement: its removal must not race the product's 60-second
+    # remove budget under host load (#1748). The default stays.
     box.run(
-        ["wrkslots", "remove", "s1", "--coordinator-pid", pid, "--expected-generation", "1"],
+        ["wrkslots", "remove", "s1", "--coordinator-pid", pid, "--expected-generation", "1",
+         "--no-lock-budget"],
         cwd=project,
         timeout=600,
     )
