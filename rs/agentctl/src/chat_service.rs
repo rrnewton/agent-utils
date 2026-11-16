@@ -2950,6 +2950,18 @@ struct AckWorkers {
 /// crash would leave it, for the next start to recover, instead of for systemd's 90 s timeout.
 pub const CHAT_STOP_GRACE: Duration = Duration::from_secs(4);
 
+/// The stop grace in force: [`CHAT_STOP_GRACE`], unless the test-only
+/// `AGENTCTL_CHAT_STOP_GRACE_S` (whole seconds) overrides it so a test can
+/// separate the clean-stop route from the abandonment route without its
+/// verdict being the host's speed (#1750 agentctl-tests-load-sensitive).
+/// Production sets nothing and keeps the 4 s budget.
+pub fn chat_stop_grace() -> Duration {
+    std::env::var("AGENTCTL_CHAT_STOP_GRACE_S")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(CHAT_STOP_GRACE, Duration::from_secs)
+}
+
 /// How long one owner-loop step may take before the service log names it (#858
 /// chat-reply-wake-latency): a pass that holds the loop this long holds every other kind of work
 /// with it.

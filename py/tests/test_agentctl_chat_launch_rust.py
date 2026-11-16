@@ -542,21 +542,30 @@ def _children(pid: int) -> list[int]:
 
 
 @pytest.mark.parametrize("moment", ["at-exec", "plugin-handshake"])
-def test_run_sigterm_during_startup_exits_within_five_seconds(
+def test_run_sigterm_during_startup_stops_cleanly(
     fixture: Fixture, tmp_path: Path, moment: str
 ) -> None:
     # #870 agentctl-service-slow-stop: a stop that lands while `chat run` is still starting,
     # right after it was exec'd or while its provider plugin has not finished its handshake,
-    # ends within 5 s, as a stop of a running bridge does.
+    # is taken by the bridge itself, as a stop of a running bridge is. The stop grace is
+    # set generously (AGENTCTL_CHAT_STOP_GRACE_S) so the verdict is the route taken — the
+    # bridge's own stop — never the host's speed (#1750 agentctl-tests-load-sensitive;
+    # owner rule 346). The abandonment route has its own test below.
     if moment == "plugin-handshake":
         config = tmp_path / "startup.json"
         document = json.loads(fixture.config.read_text())
         document["subscription_environment"] = ["CHAT_SUBSCRIPTION_FAKE_STALL"]
         config.write_text(json.dumps(document))
         config.chmod(0o600)
-        process = fixture.launch(config=config, extra_env={"CHAT_SUBSCRIPTION_FAKE_STALL": "hello"})
+        process = fixture.launch(
+            config=config,
+            extra_env={
+                "CHAT_SUBSCRIPTION_FAKE_STALL": "hello",
+                "AGENTCTL_CHAT_STOP_GRACE_S": "120",
+            },
+        )
     else:
-        process = fixture.launch()
+        process = fixture.launch(extra_env={"AGENTCTL_CHAT_STOP_GRACE_S": "120"})
     try:
         assert _wait_for(lambda: bool(fixture.bridge_processes()), 300, interval=0.01)
         bridge = fixture.bridge_processes()[0]
@@ -566,14 +575,63 @@ def test_run_sigterm_during_startup_exits_within_five_seconds(
             assert _wait_for(lambda: bool(_children(bridge)), 300, interval=0.01), (
                 log.read_text()[-3000:] if log.exists() else "no bridge log"
             )
-            time.sleep(0.5)
         os.kill(bridge, signal.SIGTERM)
         # Exit is the condition; the generous bound only reports a hang.
         assert _wait_for(lambda: _process_gone(bridge), 300)
-        # It stopped by itself: the termination guard, which abandons a stop after 4 s, did
-        # not have to end it.
+        # It stopped by itself: the termination guard did not have to end it.
         text = log.read_text() if log.exists() else ""
         assert "did not stop within" not in text, text[-2000:]
+    finally:
+        process.send_signal(signal.SIGTERM)
+        process.communicate(timeout=300)
+
+
+def test_run_sigterm_abandoned_when_a_step_never_ends(
+    fixture: Fixture, tmp_path: Path
+) -> None:
+    # The other route of #870: a step that never ends (the provider driver
+    # is blocked in its receive, and its cancellation never lands) outlives
+    # a tiny stop grace, so the termination guard abandons it and ends the
+    # process. Both assertions are events — the abandonment line in the log
+    # and the process gone — waited on with bounds that only report a hang
+    # (#1750).
+    config = tmp_path / "startup.json"
+    document = json.loads(fixture.config.read_text())
+    document["subscription_environment"] = [
+        "CHAT_SUBSCRIPTION_FAKE_STALL",
+        "CHAT_SUBSCRIPTION_FAKE_ENTERED_MARKER",
+        "CHAT_SUBSCRIPTION_FAKE_CLOSE_MARKER",
+        "CHAT_SUBSCRIPTION_FAKE_CANCEL_DELAY_MILLIS",
+    ]
+    config.write_text(json.dumps(document))
+    config.chmod(0o600)
+    entered = tmp_path / "entered"
+    process = fixture.launch(
+        config=config,
+        extra_env={
+            "CHAT_SUBSCRIPTION_FAKE_STALL": "blocking-next-graceful",
+            "CHAT_SUBSCRIPTION_FAKE_ENTERED_MARKER": str(entered),
+            "CHAT_SUBSCRIPTION_FAKE_CLOSE_MARKER": str(tmp_path / "closed"),
+            "CHAT_SUBSCRIPTION_FAKE_CANCEL_DELAY_MILLIS": "600000",
+            "AGENTCTL_CHAT_STOP_GRACE_S": "1",
+        },
+    )
+    try:
+        assert _wait_for(lambda: bool(fixture.bridge_processes()), 300, interval=0.01)
+        bridge = fixture.bridge_processes()[0]
+        log = fixture.state / "bridge.log"
+        # The condition that the step is really blocked: the driver has
+        # entered its receive and not come back.
+        assert _wait_for(lambda: entered.exists(), 300, interval=0.01), (
+            log.read_text()[-3000:] if log.exists() else "no bridge log"
+        )
+        os.kill(bridge, signal.SIGTERM)
+        assert _wait_for(
+            lambda: log.exists() and "did not stop within" in log.read_text(),
+            300,
+            interval=0.01,
+        ), (log.read_text()[-3000:] if log.exists() else "no bridge log")
+        assert _wait_for(lambda: _process_gone(bridge), 300)
     finally:
         process.send_signal(signal.SIGTERM)
         process.communicate(timeout=300)

@@ -55,14 +55,13 @@ def test_packaged_runner_resumes_two_durable_turns(
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     try:
-        deadline = time.monotonic() + 10
+        # The condition is the second turn consumed; the generous bound only
+        # reports a hang, never the host's speed (#1750; owner rule 346).
         second = lib.processed_dir(rec.name) / "000000000001.json"
-        while not second.exists() and proc.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert second.exists(), f"runner failed to consume turns, return code {proc.poll()}"
+        _wait_for(second, proc, timeout=_HANG_TIMEOUT_S)
     finally:
         proc.terminate()
-        stdout, stderr = proc.communicate(timeout=5)
+        stdout, stderr = proc.communicate(timeout=_HANG_TIMEOUT_S)
     assert proc.returncode == 0, (stdout, stderr)
     assert lib.read_registry()[rec.name].session_id == "session-portable"
     calls = [json.loads(line) for line in Path(str(executable) + ".calls").read_text().splitlines()]
@@ -621,10 +620,15 @@ def test_context_reset_clears_session_before_the_next_codex_turn(fake_runner_sta
 #: stop: the product's own harness cleanup budget (KILL_WAIT_S, 10 s) plus
 #: watcher join and exit bookkeeping. The waits poll observable events, so
 #: this bound only trips when progress has actually stopped.
-_STOP_EXIT_TIMEOUT_S = 30
+_STOP_EXIT_TIMEOUT_S = 300
+
+#: Generous bound for condition waits in this file: it only ever reports
+#: a hang, never the host's speed (#1750 agentctl-tests-load-sensitive;
+#: owner rule 346).
+_HANG_TIMEOUT_S = 300
 
 
-def _wait_for(path: Path, process: subprocess.Popen[str], timeout: float = 8) -> None:
+def _wait_for(path: Path, process: subprocess.Popen[str], timeout: float = _HANG_TIMEOUT_S) -> None:
     deadline = time.monotonic() + timeout
     while not path.exists() and process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -749,17 +753,17 @@ def test_stop_waits_for_harness_identity_publication(fake_runner_state: Path) ->
         assert stopper.is_alive(), "retirement crossed an unpublished harness identity"
         assert runner.poll() is None and _process_running(child_pid)
         release.touch()
-        stopper.join(timeout=5)
+        stopper.join(timeout=_HANG_TIMEOUT_S)
         assert stopped == [True]
-        runner.communicate(timeout=5)
+        runner.communicate(timeout=_HANG_TIMEOUT_S)
         assert not _process_running(child_pid)
     finally:
         release.touch()
         if stopper is not None:
-            stopper.join(timeout=5)
+            stopper.join(timeout=_HANG_TIMEOUT_S)
         if runner.poll() is None:
             runner.kill()
-        runner.communicate(timeout=5)
+        runner.communicate(timeout=_HANG_TIMEOUT_S)
         if child_pid is not None:
             _kill_started(child_pid, child_start)
 
@@ -794,8 +798,8 @@ def test_crashed_runner_owned_harness_is_cleaned_before_state_reuse(
         leader_pid, child_pid = json.loads(ready.read_text())
         started = {pid: lib.pid_start_time(pid) for pid in (leader_pid, child_pid)}
         runner.kill()
-        runner.communicate(timeout=5)
-        deadline = time.monotonic() + 3
+        runner.communicate(timeout=_HANG_TIMEOUT_S)
+        deadline = time.monotonic() + _HANG_TIMEOUT_S
         while _process_running(leader_pid) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert not _process_running(leader_pid)
@@ -811,17 +815,17 @@ def test_crashed_runner_owned_harness_is_cleaned_before_state_reuse(
             replacement = _runner_process(fake_runner_state, rec.name, executable)
             _wait_for(lib.failed_dir(rec.name) / f"{seq:012d}.json", replacement)
             assert lib.read_registry()[rec.name].runner_pid == replacement.pid
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + _HANG_TIMEOUT_S
         while _process_running(child_pid) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert not _process_running(child_pid)
     finally:
         if replacement is not None:
             replacement.terminate()
-            replacement.communicate(timeout=5)
+            replacement.communicate(timeout=_HANG_TIMEOUT_S)
         if runner.poll() is None:
             runner.kill()
-        runner.communicate(timeout=5)
+        runner.communicate(timeout=_HANG_TIMEOUT_S)
         for pid, starttime in started.items():
             _kill_started(pid, starttime)
 

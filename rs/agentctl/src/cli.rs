@@ -6769,7 +6769,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             crate::agent::install_termination_handler();
             crate::agent::spawn_termination_guard(
                 "chat run",
-                crate::chat_service::CHAT_STOP_GRACE,
+                crate::chat_service::chat_stop_grace(),
                 std::sync::Arc::clone(&stopped),
                 crate::chat_service::owner_loop_step,
             );
