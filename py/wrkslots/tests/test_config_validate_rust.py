@@ -184,6 +184,23 @@ def test_validate_config_machine_overrides_match_python(
     assert json.loads(result.stdout)["machine_source"] == "--machine"
 
 
+def test_validate_config_eden_mount_root_matches_python(tmp_path: Path) -> None:
+    mount_root = tmp_path / "eden-mounts"
+    root = _root(tmp_path, f"eden_mount_root: {mount_root}\n")
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["eden_mount_root"] == str(mount_root)
+    config = wrkslots_cli._load_config(str(root), None)
+    assert config.eden_mount_root == mount_root
+
+    inside = _root(tmp_path / "inner", f"eden_mount_root: {tmp_path}/inner/project/mounts\n")
+    refused = _rust(inside)
+    assert refused.returncode != 0
+    assert "eden_mount_root" in refused.stderr
+    with pytest.raises(wrkslots_cli.StateError, match="eden_mount_root"):
+        wrkslots_cli._load_config(str(inside), None)
+
+
 def test_validate_config_with_sections_matches_python(tmp_path: Path) -> None:
     root = _root(
         tmp_path,

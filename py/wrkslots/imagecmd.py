@@ -2196,10 +2196,11 @@ def slot_view(
         record.checkouts, _checkout_paths(config, record), strict=True
     ):
         if checkout.vcs == "eden":
-            # No Git directory to bind: the box binds only the slot itself
-            # (<slot>/checkout and <slot>/.eden-state, whose socket reaches
-            # the per-slot daemon outside the box). The backing repo is
-            # deliberately not bound (#1569).
+            # No Git directory to bind: the box binds the slot itself
+            # (<slot>/.eden-state, whose socket reaches the per-slot
+            # daemon outside the box) and the checkout at its recorded
+            # mount path (outside the slot since #1730). The backing
+            # repo is deliberately not bound (#1569).
             eden_checkout = path
             eden_backing = repository
             continue

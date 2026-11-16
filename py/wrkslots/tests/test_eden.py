@@ -863,6 +863,7 @@ def _direct_config(tmp_path: Path) -> wrkslots_cli.Config:
         default_landed_ref="refs/remotes/origin/main",
         heartbeat_ttl_seconds=60,
         liveness_command=tmp_path / "live.py",
+        eden_mount_root=tmp_path / "eden-mounts",
     )
 
 
@@ -909,8 +910,9 @@ def test_fixup_failure_stops_only_the_slots_daemon(
         wrkslots_cli._provision_eden_slot(_direct_config(tmp_path), args, slot)
 
     config_dir = str(slot / ".eden-state")
+    mount = tmp_path / "eden-mounts" / "agent" / "slot-a"
     assert daemon.daemon_writes() == [
-        ("eden", "--config-dir", config_dir, "remove", "-y", str(slot / "checkout")),
+        ("eden", "--config-dir", config_dir, "remove", "-y", str(mount)),
         ("eden", "--config-dir", config_dir, "stop"),
     ]
     assert not slot.exists()
@@ -976,6 +978,7 @@ def _eden_project(tmp_path: Path) -> Path:
         "default_landed_ref: refs/remotes/origin/main\n"
         "heartbeat_ttl_seconds: 60\n"
         "liveness_command: live.py\n"
+        f"eden_mount_root: {tmp_path}/eden-mounts\n"
     )
     return root
 
@@ -1043,7 +1046,7 @@ def test_oserror_mid_loop_is_journaled_then_recover_aborts_it(
     )
     assert fields.phase == "cleanup-failed"
     assert fields.config_dir == str(slot_path / ".eden-state")
-    assert fields.mount == str(slot_path / "checkout")
+    assert fields.mount == str(tmp_path / "eden-mounts" / "agent" / "eden-a")
     assert fields.unit.startswith("edenfs@") and fields.unit.endswith(".service")
     printed = capsys.readouterr().err
     assert fields.config_dir in printed and fields.mount in printed
@@ -1552,3 +1555,132 @@ def test_create_eden_refuses_backing_mismatch_before_writing(
     args = argparse.Namespace(eden=["main=source-repo"], eden_rev=[])
     with pytest.raises(wrkslots_cli.Refusal, match="not seeded"):
         wrkslots_cli._eden_create_plan(config, args)
+
+
+# ------------------------- Eden mount outside the project (#1730)
+
+def _eden_project_with_mount(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "project"
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    mount_root = tmp_path / "eden-mounts"
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees\n"
+        "layout: flat\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+        f"eden_mount_root: {mount_root}\n"
+    )
+    return root, mount_root
+
+
+def test_create_eden_mounts_outside_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, mount_root = _eden_project_with_mount(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    slot_path = wrkslots_cli._slot_directory(config, "eden-a", "agent")
+    derived = tmp_path / "scratch" / "buck-out"
+    daemon = _StubEdenDaemon(
+        [{"repo_path": "buck-out", "type": "bind", "target": str(derived)}]
+    )
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", daemon)
+
+    assert wrkslots_cli._cmd_create(_eden_create_args(root)) == 0
+
+    mount = mount_root / "agent" / "eden-a"
+    state = wrkslots_cli._load_active(config)
+    assert [record.slot for record in state.slots] == ["eden-a"]
+    checkout = state.slots[0].checkouts[0]
+    assert checkout.path == str(mount)
+    assert not str(mount).startswith(str(root) + "/")
+    assert slot_path.is_dir() and (slot_path / ".eden-state").is_dir()
+    wrkslots_cli._assert_record_paths(config, state.slots[0])
+    assert daemon.cloned_mount == str(mount)
+    assert sorted(config.control.glob("CREATE.*.journal")) == []
+
+
+def test_eden_mount_root_inside_the_project_refuses(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees\n"
+        "layout: flat\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+        f"eden_mount_root: {root}/eden-mounts\n"
+    )
+    with pytest.raises((wrkslots_cli.StateError, wrkslots_cli.Refusal)):
+        wrkslots_cli._load_config(str(root), "node-a")
+
+
+def test_record_paths_refuse_an_eden_path_outside_the_mount_root(
+    tmp_path: Path,
+) -> None:
+    root, _mount_root = _eden_project_with_mount(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    record = _eden_validate_record(config, "/backing/repo")
+    outside = dataclasses.replace(
+        record,
+        checkouts=(
+            dataclasses.replace(
+                record.checkouts[0], path="/elsewhere/checkout"
+            ),
+        ),
+    )
+    with pytest.raises(wrkslots_cli.StateError):
+        wrkslots_cli._assert_record_paths(
+            config, outside, require_repository=False
+        )
+
+
+def test_remove_of_an_outside_mount_eden_validate_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, mount_root = _eden_project_with_mount(tmp_path)
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    record = _eden_validate_record(config, "/backing/repo")
+    mount = mount_root / "validate" / record.slot
+    record = dataclasses.replace(
+        record,
+        checkouts=(
+            dataclasses.replace(record.checkouts[0], path=str(mount)),
+        ),
+    )
+    dead_owner = dataclasses.replace(
+        wrkslots_cli._read_process_identity(os.getpid()), pid=2_147_483_647
+    )
+    record = dataclasses.replace(record, owner=dead_owner)
+    _write_row(config, record)
+    slot_path = wrkslots_cli._slot_directory(config, record.slot, "validate")
+    (slot_path / ".eden-state").mkdir(parents=True)
+    mount.mkdir(parents=True)
+    daemon = _StubEdenRemoval(mount)
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", daemon)
+
+    assert (
+        wrkslots_cli.main(
+            [
+                "--project-root", str(root),
+                "remove", record.slot,
+                "--coordinator-pid", str(os.getpid()),
+                "--expected-generation", "1",
+            ]
+        )
+        == 0
+    )
+
+    assert wrkslots_cli._load_active(config).slots == ()
+    assert not slot_path.exists()
+    assert not mount.exists()
+    config_dir = str(slot_path / ".eden-state")
+    assert ("eden", "--config-dir", config_dir, "remove", "-y", str(mount)) in daemon.calls

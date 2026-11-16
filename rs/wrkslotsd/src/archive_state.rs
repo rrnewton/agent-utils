@@ -261,6 +261,14 @@ fn archive_from_obj(
                 };
                 expecteds.push(posix_relative(&cfg.root, &destination)?);
             }
+            // Outside Eden mounts (#1730) keep their absolute path.
+            if checkout.vcs == "eden" {
+                expecteds.push(
+                    crate::active_state::eden_mount_path(cfg, &slot, &slot_type)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             if !expecteds.iter().any(|expected| &checkout.path == expected) {
                 let contained =
                     [slot_path.clone(), alt_slot_path.clone()]

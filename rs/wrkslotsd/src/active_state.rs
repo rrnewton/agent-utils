@@ -44,6 +44,8 @@ pub(crate) struct Cfg {
     /// The selected local machine; event appends may only target it (#876).
     pub(crate) machine: String,
     pub(crate) harness_repo: Option<String>,
+    /// Configured Eden mount root (#1730); None derives the default.
+    pub(crate) eden_mount_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -876,7 +878,49 @@ pub(crate) fn posix_relative(root: &Path, path: &Path) -> Result<String> {
         .join("/"))
 }
 
+/// Where Eden checkouts mount on this host (#1730), mirroring the
+/// Python edition: the configured root, or a per-host default under
+/// the user's local directory keyed by machine and project.
+pub(crate) fn eden_mount_root(cfg: &Cfg) -> PathBuf {
+    if let Some(root) = &cfg.eden_mount_root {
+        return root.clone();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(cfg.root.to_string_lossy().as_bytes())
+    );
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    home.join("local")
+        .join("wrkslots-eden-mounts")
+        .join(format!("{}-{}", cfg.machine, &digest[..12]))
+}
+
+pub(crate) fn eden_mount_path(cfg: &Cfg, slot: &str, slot_type: &str) -> PathBuf {
+    eden_mount_root(cfg).join(slot_type).join(slot)
+}
+
 fn stored_path_reference(cfg: &Cfg, raw: &str, label: &str) -> Result<PathBuf> {
+    if raw.starts_with('/') {
+        // An Eden mount outside the project (#1730): the only stored
+        // checkout path allowed to be absolute, under the mount root.
+        let candidate = PathBuf::from(raw);
+        if raw != normpath_absolute(raw) || raw.split('/').any(|part| part == "..") {
+            return Err(format!(
+                "{label} must be a canonical absolute path: {raw:?}"
+            ));
+        }
+        let mount_root = eden_mount_root(cfg);
+        if !candidate.starts_with(&mount_root) {
+            return Err(format!(
+                "{label} is outside the Eden mount root {}: {raw:?}",
+                mount_root.display()
+            ));
+        }
+        return Ok(candidate);
+    }
     let parts: Vec<&str> = raw.split('/').collect();
     if raw.starts_with('/') || raw.is_empty() || parts.contains(&"..") {
         return Err(format!(
@@ -1008,8 +1052,24 @@ fn assert_record_paths(cfg: &Cfg, record: &RecordRec) -> Result<()> {
                 record.slot, checkout.name
             ));
         }
-        // Eden mounts always live at <slot>/checkout; pre-fix nested
-        // rows recorded <slot>/<name>, and both forms stay readable.
+        // Eden mounts live outside the project since #1730, at
+        // <eden_mount_root>/<slot-type>/<slot>; in-slot rows created
+        // before it (<slot>/checkout, or the legacy <slot>/<name>
+        // form) stay readable below.
+        if checkout.vcs == "eden" {
+            let mount = eden_mount_path(cfg, &record.slot, &record.slot_type);
+            if checkout.path == mount.to_string_lossy() {
+                let actual = stored_path_reference(cfg, &checkout.path, "checkout path")?;
+                if actual != mount {
+                    return Err(format!(
+                        "slot {} checkout path identity changed",
+                        record.slot
+                    ));
+                }
+                stored_repository_reference(cfg, &checkout.repository)?;
+                continue;
+            }
+        }
         let expected_absolute = if checkout.vcs == "eden" {
             expected_slot.join("checkout")
         } else if layout == "flat" {
@@ -1271,6 +1331,10 @@ pub(crate) fn load_cfg(
             .get("harness_repo")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        eden_mount_root: config
+            .get("eden_mount_root")
+            .and_then(Value::as_str)
+            .map(PathBuf::from),
     };
     Ok((cfg, selected))
 }
@@ -1301,4 +1365,69 @@ pub(crate) fn parse_state_ordered(
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| format!("active state is malformed JSON: {error}"))?;
     active_from_obj(&cfg, &value, &selected, &path.to_string_lossy())
+}
+
+#[cfg(test)]
+mod eden_mount_tests {
+    use super::*;
+
+    fn cfg(root: PathBuf, mount_root: Option<PathBuf>) -> Cfg {
+        Cfg {
+            worktrees: root.join("worktrees"),
+            control: root.join("worktrees"),
+            layout: "nested".to_owned(),
+            default_remote: "origin".to_owned(),
+            default_landed_ref: "refs/remotes/origin/main".to_owned(),
+            machine: "node-a".to_owned(),
+            harness_repo: None,
+            eden_mount_root: mount_root,
+            root,
+        }
+    }
+
+    fn eden_record(path: String) -> RecordRec {
+        RecordRec {
+            slot: "eden-a".to_owned(),
+            agent: "agent-eden".to_owned(),
+            task: "task-1".to_owned(),
+            purpose: "testing".to_owned(),
+            slot_type: "agent".to_owned(),
+            machine: "node-a".to_owned(),
+            generation: 1,
+            created_at: "2026-11-16T00:00:00Z".to_owned(),
+            layout: None,
+            owner: None,
+            checkouts: vec![CheckoutRec {
+                name: "main".to_owned(),
+                path,
+                repository: "../backing-repo".to_owned(),
+                remote: "eden".to_owned(),
+                landed_ref: "refs/remotes/eden/main".to_owned(),
+                vcs: "eden".to_owned(),
+            }],
+            import_source: None,
+            normalized: Value::Null,
+        }
+    }
+
+    #[test]
+    fn outside_eden_mount_record_is_accepted() {
+        let root = PathBuf::from("/tmp/wrkslots-test/project");
+        let mount_root = PathBuf::from("/tmp/wrkslots-test/eden-mounts");
+        let config = cfg(root, Some(mount_root.clone()));
+        let mount = mount_root.join("agent").join("eden-a");
+        assert_eq!(eden_mount_path(&config, "eden-a", "agent"), mount);
+        assert_record_paths(&config, &eden_record(mount.to_string_lossy().into_owned()))
+            .expect("outside mount record");
+    }
+
+    #[test]
+    fn eden_path_outside_the_mount_root_is_refused() {
+        let root = PathBuf::from("/tmp/wrkslots-test/project");
+        let config = cfg(root, Some(PathBuf::from("/tmp/wrkslots-test/eden-mounts")));
+        assert!(
+            assert_record_paths(&config, &eden_record("/elsewhere/checkout".to_owned())).is_err()
+        );
+        assert!(stored_path_reference(&config, "/elsewhere/checkout", "checkout path").is_err());
+    }
 }

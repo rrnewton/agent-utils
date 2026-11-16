@@ -597,6 +597,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "liveness_batch_command",
         "max_active_slots",
         "eden_host_cap",
+        "eden_mount_root",
         "layout",
         "cache_globs",
         "repo_cache_globs",
@@ -697,6 +698,15 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     ),
     "max_active_slots": "Cap on active slots. Absent means uncapped.",
     "eden_host_cap": "Host-wide Eden checkout cap, counted across every daemon config dir.",
+    "eden_mount_root": (
+        "Absolute host-local directory under which Eden checkouts mount, at "
+        "<eden_mount_root>/<slot-type>/<slot> (#1730). It must live outside the project "
+        "checkout, so Sapling discovery at a mount resolves to the mount itself instead of "
+        "walking to an outer working tree. Slot records, locks, journals and .eden-state "
+        "stay in the slot directory; only the mount moves. Absent derives a per-host "
+        "default under the user's local directory. List the key in ignorable_keys so an "
+        "older wrkslots ignores it instead of refusing."
+    ),
     "cache_globs": "Slot-relative globs of regenerable caches that `clean-caches` may delete.",
     "repo_cache_globs": "Per-repository cache globs: repository name to a list of globs.",
     "post_provision_hooks": (
@@ -1357,6 +1367,12 @@ class Config:
     #: Host-wide Eden checkout cap for Eden slots (#1204); counted across
     #: every daemon config dir, never just wrkslots rows.
     eden_host_cap: int = 3
+    #: Host-local root for Eden mounts (#1730): checkouts mount at
+    #: ``<root>/<slot-type>/<slot>``, outside the project checkout, so
+    #: Sapling discovery at the mount resolves to the mount itself.
+    #: None (key absent) derives a per-host default under the user's
+    #: local directory; slot records and storage stay in place.
+    eden_mount_root: Path | None = None
     layout: str = "nested"
     cache_globs: tuple[str, ...] = ()
     repo_cache_globs: tuple[tuple[str, tuple[str, ...]], ...] = ()
@@ -4696,6 +4712,71 @@ def _harness_unpushed_state(
     }
 
 
+def _validate_eden_mount_root(raw: object, root: Path) -> Path:
+    """The configured Eden mount root: absolute, canonical, outside the project."""
+
+    value = _as_str(raw, "configuration.eden_mount_root")
+    candidate = Path(value)
+    if (
+        not candidate.is_absolute()
+        or value != os.path.normpath(value)
+        or ".." in candidate.parts
+        or not candidate.name
+    ):
+        raise StateError(
+            "configuration.eden_mount_root must be a canonical absolute path: "
+            f"{value!r}"
+        )
+    if candidate == root or eden.is_inside(str(candidate), str(root)):
+        raise StateError(
+            "configuration.eden_mount_root must live outside the project "
+            f"checkout ({root}), so an Eden mount discovers as itself: {value!r}"
+        )
+    return candidate
+
+
+def _eden_mount_root(config: Config) -> Path:
+    """Where Eden checkouts mount on this host (#1730).
+
+    The configured root stands. Absent, a per-host default under the
+    user's local directory, keyed by machine and project so two
+    projects on one host never share a mount namespace.
+    """
+
+    if config.eden_mount_root is not None:
+        return config.eden_mount_root
+    digest = hashlib.sha256(str(config.root).encode("utf-8")).hexdigest()[:12]
+    return (
+        Path.home() / "local" / "wrkslots-eden-mounts" / f"{config.machine}-{digest}"
+    )
+
+
+def _eden_mount_path(config: Config, slot: str, slot_type: str) -> Path:
+    """The mount for one Eden slot: ``<mount root>/<slot-type>/<slot>``."""
+
+    _validate_name(slot, "slot")
+    if slot_type not in SLOT_TYPES:
+        raise Refusal(f"slot type must be one of {', '.join(SLOT_TYPES)}")
+    return _eden_mount_root(config) / slot_type / slot
+
+
+def _eden_slot_path(config: Config, mount: Path, checkout: Checkout) -> Path:
+    """The slot directory owning an Eden checkout's daemon state.
+
+    Outside mounts name their slot and type in their last two
+    components; in-slot mounts (current ``checkout`` and the legacy
+    ``<name>`` form) sit directly inside the slot.
+    """
+
+    del checkout
+    root = _eden_mount_root(config)
+    if mount.is_relative_to(root):
+        slot_type = mount.parent.name
+        if slot_type in SLOT_TYPES:
+            return _slot_directory(config, mount.name, slot_type)
+    return mount.parent
+
+
 def _load_config(explicit_root: str | None, machine_override: str | None) -> Config:
     root = _discover_root(explicit_root)
     path = root / CONFIG_NAME
@@ -4902,6 +4983,11 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             3
             if "eden_host_cap" not in raw
             else _as_int(raw["eden_host_cap"], "configuration.eden_host_cap", minimum=1)
+        ),
+        eden_mount_root=(
+            None
+            if "eden_mount_root" not in raw
+            else _validate_eden_mount_root(raw["eden_mount_root"], root)
         ),
         layout=layout,
         cache_globs=cache_globs,
@@ -8976,6 +9062,9 @@ def _archive_record_from_obj(
             .as_posix()
             for candidate in candidates
         }
+        if checkout.vcs == "eden":
+            # Outside mounts (#1730) keep their absolute mount path.
+            expecteds.add(str(_eden_mount_path(config, slot, slot_type)))
         if checkout.path not in expecteds:
             candidate_paths = {
                 candidate.relative_to(config.root).as_posix()
@@ -23279,6 +23368,11 @@ def _checkout_path_for_layout(
     _validate_name(name, "checkout name")
     _validate_layout(layout)
     slot_path = _slot_directory(config, slot, slot_type)
+    if vcs == "eden":
+        # Eden mounts live outside the project (#1730); the stored
+        # path is the absolute mount, never a project-relative path.
+        destination = _eden_mount_path(config, slot, slot_type)
+        return str(destination), destination
     destination = _checkout_destination(slot_path, layout, name, vcs)
     _ensure_no_symlink_components(config.root, destination, "checkout")
     relative = destination.relative_to(config.root).as_posix()
@@ -23290,12 +23384,30 @@ def _record_layout(config: Config, record: ActiveRecord) -> str:
 
 
 def _stored_path(config: Config, raw: str, label: str) -> Path:
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        # An Eden mount outside the project (#1730): the only stored
+        # checkout path allowed to be absolute, and only under the
+        # configured mount root.
+        absolute = _stored_path_reference(config, raw, label)
+        _ensure_no_symlink_components(_eden_mount_root(config), absolute, label)
+        return absolute
     relative, absolute = _relative_inside(config.root, raw, label)
     del relative
     return absolute
 
 
 def _stored_path_reference(config: Config, raw: str, label: str) -> Path:
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        if raw != os.path.normpath(raw) or ".." in candidate.parts:
+            raise Refusal(f"{label} must be a canonical absolute path: {raw!r}")
+        mount_root = _eden_mount_root(config)
+        if not candidate.is_relative_to(mount_root):
+            raise Refusal(
+                f"{label} is outside the Eden mount root {mount_root}: {raw!r}"
+            )
+        return candidate
     _relative, absolute = _relative_inside_reference(config.root, raw, label)
     return absolute
 
@@ -28024,6 +28136,10 @@ def _assert_record_paths(
         if historical:
             candidates = _historical_slot_candidates(config, record.slot, record.slot_type)
             matched: Path | None = None
+            if checkout.vcs == "eden":
+                mount = _eden_mount_path(config, record.slot, record.slot_type)
+                if checkout.path == str(mount):
+                    matched = mount
             for candidate in candidates:
                 absolute = _checkout_destination(
                     candidate, layout, checkout.name, checkout.vcs
@@ -28047,24 +28163,39 @@ def _assert_record_paths(
                     f"{checkout.path!r} != {expected_absolute.relative_to(config.root).as_posix()!r}"
                 )
             expected_absolute = matched
-            expected_relative = expected_absolute.relative_to(config.root).as_posix()
+            expected_relative = (
+                checkout.path
+                if checkout.vcs == "eden" and Path(checkout.path).is_absolute()
+                else expected_absolute.relative_to(config.root).as_posix()
+            )
         elif require_repository:
             expected_relative, expected_absolute = _checkout_path_for_layout(
                 config, record.slot, checkout.name, record.slot_type, layout,
                 vcs=checkout.vcs,
             )
+        elif checkout.vcs == "eden":
+            expected_absolute = _eden_mount_path(
+                config, record.slot, record.slot_type
+            )
+            expected_relative = str(expected_absolute)
         else:
             expected_absolute = _checkout_destination(
                 expected_slot, layout, checkout.name, checkout.vcs
             )
             expected_relative = expected_absolute.relative_to(config.root).as_posix()
         if checkout.vcs == "eden" and checkout.path != expected_relative:
-            legacy = _eden_legacy_destination(
-                expected_slot, layout, checkout.name
-            )
-            if checkout.path == legacy.relative_to(config.root).as_posix():
-                expected_absolute = legacy
-                expected_relative = checkout.path
+            for fallback in (
+                _checkout_destination(
+                    expected_slot, layout, checkout.name, checkout.vcs
+                ),
+                _eden_legacy_destination(
+                    expected_slot, layout, checkout.name
+                ),
+            ):
+                if checkout.path == fallback.relative_to(config.root).as_posix():
+                    expected_absolute = fallback
+                    expected_relative = checkout.path
+                    break
         if checkout.path != expected_relative:
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} path does not match its slot: "
@@ -28535,7 +28666,7 @@ def _assert_eden_checkout_safe(
         runner = _eden_runner
 
     path = _stored_path(config, checkout.path, "checkout path")
-    slot_path = path.parent
+    slot_path = _eden_slot_path(config, path, checkout)
     config_dir = str(slot_path / ".eden-state")
     rc, stdout, stderr = runner(["eden", "--config-dir", config_dir, "info", str(path)])
     if rc != 0:
@@ -32887,14 +33018,17 @@ def _recorded_remote_names_same_repository(
 
 
 def _checkout_remote_unchanged(
-    vcs: _GitVcs, path: Path, checkout: Checkout
+    vcs: _GitVcs, path: Path, checkout: Checkout, config: Config | None = None
 ) -> bool:
     if checkout.vcs == "eden":
         # Eden rows carry a fixed remote marker; the daemon is the
         # authority for the backing repo, never Git. Fail closed:
         # only a daemon answer naming the recorded backing counts
         # as unchanged; anything unsure refuses salvage (#1432).
-        config_dir = str(path.parent / ".eden-state")
+        slot_path = (
+            _eden_slot_path(config, path, checkout) if config is not None else path.parent
+        )
+        config_dir = str(slot_path / ".eden-state")
         rc, out, _err = _eden_runner(
             ["eden", "--config-dir", config_dir, "info", str(path)]
         )
@@ -34114,7 +34248,7 @@ def _salvage_agent_slot(
         drift = _observe_checkout_drift(vcs, checkout, path) if archive_drifted else None
         if drift is not None and drift_refusal is not None:
             raise _drifted_checkout_refusal(checkout, drift, drift_refusal)
-        if drift is None and not _checkout_remote_unchanged(vcs, path, checkout):
+        if drift is None and not _checkout_remote_unchanged(vcs, path, checkout, config):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed; restore the "
                 "recorded remote before reclaim so salvage cannot be sent elsewhere"
@@ -34617,7 +34751,7 @@ def _salvage_ownerless_worktree(
     path_override: Path | None = None,
 ) -> tuple[dict[str, object], ...]:
     path = path_override or _stored_path(config, checkout.path, "ownerless checkout path")
-    if not _checkout_remote_unchanged(vcs, path, checkout):
+    if not _checkout_remote_unchanged(vcs, path, checkout, config):
         raise Refusal(
             f"checkout {checkout.name} remote {checkout.remote} changed during salvage"
         )
@@ -34703,7 +34837,7 @@ def _assert_salvage_still_matches(
         drift = _checkout_drift_from_receipt(by_name.get(checkout.name))
         if drift is not None:
             _assert_checkout_drift_unchanged(vcs, checkout, path, drift)
-        elif not _checkout_remote_unchanged(vcs, path, checkout):
+        elif not _checkout_remote_unchanged(vcs, path, checkout, config):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed after "
                 "salvage; preserve it and rerun remove"
@@ -35053,13 +35187,31 @@ def _assert_slot_contents_values(
             config, slot, checkout.name, slot_type, layout, vcs=checkout.vcs
         )
         if checkout.path != expected_path:
-            raise StateError(
-                f"slot {slot} checkout path does not equal the flat slot root"
+            eden_forms = (
+                {
+                    _checkout_destination(
+                        slot_path, layout, checkout.name, checkout.vcs
+                    )
+                    .relative_to(config.root)
+                    .as_posix(),
+                    _eden_legacy_destination(slot_path, layout, checkout.name)
+                    .relative_to(config.root)
+                    .as_posix(),
+                }
+                if checkout.vcs == "eden"
+                else set()
             )
+            if checkout.path not in eden_forms:
+                raise StateError(
+                    f"slot {slot} checkout path does not equal the flat slot root"
+                )
         return slot_path
     expected_names = {
         _checkout_destination(slot_path, layout, checkout.name, checkout.vcs).name
         for checkout in checkouts
+        # An outside Eden mount (#1730) leaves no checkout entry in
+        # the slot; only its .eden-state and redirection targets stay.
+        if not (checkout.vcs == "eden" and Path(checkout.path).is_absolute())
     }
     allowed_names = set(expected_names)
     if any(checkout.vcs == "eden" for checkout in checkouts):
@@ -36853,7 +37005,7 @@ def _reclaim_preconditions(
                 )
             vcs.assert_ordinary_history(path)
             vcs.assert_ordinary_index(path)
-        if drift is None and not _checkout_remote_unchanged(vcs, path, checkout):
+        if drift is None and not _checkout_remote_unchanged(vcs, path, checkout, config):
             raise Refusal(
                 f"checkout {checkout.name} remote {checkout.remote} URL changed; "
                 "restore the recorded remote before reclaim"
@@ -39914,6 +40066,10 @@ def _eden_known_config_dirs(config: Config) -> tuple[str, ...]:
     known = [str(Path.home() / "local" / ".eden")]
     for state_dir in sorted(config.worktrees.glob("*/.eden-state")):
         known.append(str(state_dir))
+    validate_dir = _validate_slots_directory(config)
+    if validate_dir.is_dir():
+        for state_dir in sorted(validate_dir.glob("*/.eden-state")):
+            known.append(str(state_dir))
     return tuple(known)
 
 
@@ -40170,7 +40326,7 @@ def _eden_create_journal_payload(
             "requested_rev": requested_rev,
             "slot_path": str(slot_path),
             "config_dir": config_dir,
-            "mount": str(slot_path / "checkout"),
+            "mount": str(_eden_mount_path(config, args.slot, args.slot_type)),
             "unit": _edenfs_unit_name(config_dir),
             "phase": phase,
             "detail": detail,
@@ -40257,9 +40413,11 @@ def _parse_eden_create_journal(
     config_dir = str(slot_path / ".eden-state")
     if _as_str(eden_raw["config_dir"], "eden create journal.eden.config_dir") != config_dir:
         raise StateError("eden create journal.eden.config_dir does not match its slot")
-    mount = str(slot_path / "checkout")
-    if _as_str(eden_raw["mount"], "eden create journal.eden.mount") != mount:
+    mount = str(_eden_mount_path(config, slot, slot_type))
+    stored_mount = _as_str(eden_raw["mount"], "eden create journal.eden.mount")
+    if stored_mount not in {mount, str(slot_path / "checkout")}:
         raise StateError("eden create journal.eden.mount does not match its slot")
+    mount = stored_mount
     unit = _edenfs_unit_name(config_dir)
     if _as_str(eden_raw["unit"], "eden create journal.eden.unit") != unit:
         raise StateError("eden create journal.eden.unit does not match its config dir")
@@ -40350,10 +40508,13 @@ def _eden_remove_slot_storage(
     slot_path: Path,
     in_slot_targets: Sequence[str],
     derived_targets: Sequence[str],
+    mount: Path | None = None,
 ) -> tuple[str, ...]:
     """Remove only the storage one Eden create made; refuse anything else."""
 
-    expected = {".eden-state", "checkout", *in_slot_targets}
+    expected = {".eden-state", *in_slot_targets}
+    if mount is None or mount == slot_path / "checkout":
+        expected.add("checkout")
     if slot_path.is_symlink() or (slot_path.exists() and not slot_path.is_dir()):
         return (f"slot path is unsafe: {slot_path}",)
     if slot_path.exists():
@@ -40393,6 +40554,16 @@ def _eden_remove_slot_storage(
                 _remove_slot_directory(config, slot_path)
             except OSError as exc:
                 problems.append(f"cannot remove slot directory {slot_path}: {exc}")
+    if mount is not None and mount != slot_path / "checkout" and not problems:
+        # The outside mount (#1730): eden remove already unmounted it;
+        # only an empty leftover directory may remain.
+        try:
+            if mount.is_symlink() or (mount.exists() and not mount.is_dir()):
+                problems.append(f"eden mount is unsafe: {mount}")
+            elif mount.exists():
+                shutil.rmtree(mount)
+        except OSError as exc:
+            problems.append(f"cannot remove eden mount {mount}: {exc}")
     return tuple(problems)
 
 
@@ -40414,12 +40585,13 @@ def _provision_eden_slot(
 
     name, backing, requested_rev = _eden_create_plan(config, args)
     config_dir = slot_path / ".eden-state"
-    mount = slot_path / "checkout"
+    mount = _eden_mount_path(config, args.slot, args.slot_type)
     in_slot_targets: list[str] = []
     derived_targets: list[str] = []
     daemon_started = False
     try:
         slot_path.parent.mkdir(parents=True, exist_ok=True)
+        mount.parent.mkdir(parents=True, exist_ok=True)
         if config.worktrees_image is not None:
             # Mirror born-in-image git provisioning: bind layout creates the
             # subvolume inside the image and binds it at the slot path.
@@ -40501,7 +40673,7 @@ def _provision_eden_slot(
             )
         if not problems:
             problems = _eden_remove_slot_storage(
-                config, slot_path, in_slot_targets, derived_targets
+                config, slot_path, in_slot_targets, derived_targets, mount=mount
             )
         if problems:
             raise _EdenProvisionFailure(
@@ -40818,16 +40990,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     print(line, file=sys.stderr)
                 raise
             try:
-                _assert_eden_discovery(str(slot_path / "checkout"))
+                _assert_eden_discovery(
+                    str(_eden_mount_path(config, args.slot, args.slot_type))
+                )
             except Refusal as discovery_refusal:
                 problems = _eden_stop_slot_daemon(
                     _eden_runner,
                     str(slot_path / ".eden-state"),
-                    str(slot_path / "checkout"),
+                    str(_eden_mount_path(config, args.slot, args.slot_type)),
                 )
                 if not problems:
                     problems = _eden_remove_slot_storage(
-                        config, slot_path, made_in_slot, made_derived
+                        config,
+                        slot_path,
+                        made_in_slot,
+                        made_derived,
+                        mount=_eden_mount_path(config, args.slot, args.slot_type),
                     )
                 if not problems:
                     _clear_journal(
@@ -51173,7 +51351,7 @@ def _audit_record(
                 # remote authority first; otherwise it can advertise
                 # DELETABLE only for remove to refuse before salvage.
                 _submodule_salvage_checkouts(config, checkout, selected_vcs)
-            if not _checkout_remote_unchanged(selected_vcs, path, checkout):
+            if not _checkout_remote_unchanged(selected_vcs, path, checkout, config):
                 raise Refusal(f"checkout {checkout.name} remote URL changed")
     except Refusal as exc:
         reasons.append(str(exc))
@@ -56557,10 +56735,11 @@ def _finish_remove_paths(
         for checkout in record.checkouts:
             if checkout.name in removed:
                 continue
-            # The mount always lives at <slot>/checkout, even for
-            # rows recorded with the legacy <slot>/<name> path.
-            mount = slot_path / "checkout"
-            config_dir = str(mount.parent / ".eden-state")
+            # The recorded path names the mount: outside the project
+            # since #1730, at <slot>/checkout (or the legacy
+            # <slot>/<name> form) for rows created before it.
+            mount = _stored_path(config, checkout.path, "checkout path")
+            config_dir = str(slot_path / ".eden-state")
             if record.slot_type == "agent":
                 rc, status, stderr = _eden_runner(["sl", "-R", str(mount), "status"])
                 if rc != 0:
@@ -56618,6 +56797,10 @@ def _finish_remove_paths(
                         f"Eden slot {record.slot} holds unexpected entry "
                         f"{entry}; preserve it for inspection"
                     )
+        for checkout in record.checkouts:
+            mount = _stored_path(config, checkout.path, "checkout path")
+            if mount != slot_path / "checkout" and mount.is_dir() and not mount.is_symlink():
+                shutil.rmtree(mount)
         _remove_slot_directory(config, slot_path)
         return journal
     # A remove-agent-batch item whose budget is spent stops before its fence.
@@ -65102,7 +65285,11 @@ def _abort_eden_create(
     problems = _eden_stop_slot_daemon(_eden_runner, fields.config_dir, fields.mount)
     if not problems:
         problems = _eden_remove_slot_storage(
-            config, fields.slot_path, fields.in_slot_targets, fields.derived_targets
+            config,
+            fields.slot_path,
+            fields.in_slot_targets,
+            fields.derived_targets,
+            mount=Path(fields.mount),
         )
     if problems:
         leftover = "; ".join(_eden_leftover_lines(fields))
@@ -71415,7 +71602,7 @@ def _assert_ownerless_salvage_still_matches(
     vcs: _GitVcs,
     path: Path,
 ) -> None:
-    if not _checkout_remote_unchanged(vcs, path, checkout):
+    if not _checkout_remote_unchanged(vcs, path, checkout, config):
         raise Refusal("ownerless worktree remote changed after salvage; preserve it")
     candidates = [(checkout, path, False)]
     candidates.extend(
@@ -71646,7 +71833,7 @@ def _assert_ownerless_salvage_reachable(
     written.  Salvage repeats every check before it publishes.
     """
 
-    if not _checkout_remote_unchanged(vcs, path, checkout):
+    if not _checkout_remote_unchanged(vcs, path, checkout, config):
         raise Refusal(
             f"checkout {checkout.name} remote {checkout.remote} changed before salvage"
         )

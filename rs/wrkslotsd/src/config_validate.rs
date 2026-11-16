@@ -31,11 +31,12 @@ const REQUIRED: [&str; 6] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 26] = [
+const OPTIONAL: [&str; 27] = [
     "machine",
     "liveness_batch_command",
     "max_active_slots",
     "eden_host_cap",
+    "eden_mount_root",
     "layout",
     "cache_globs",
     "repo_cache_globs",
@@ -1413,6 +1414,43 @@ pub(crate) fn parse_harness_declaration(
     Ok((json!(harness), products))
 }
 
+/// The configured Eden mount root (#1730): canonical absolute, outside the project.
+pub(crate) fn validate_eden_mount_root(value: &Value, root: &Path) -> Result<String> {
+    let raw = as_str(value, "configuration.eden_mount_root")?;
+    let candidate = PathBuf::from(raw);
+    let parts: Vec<&str> = raw.split('/').collect();
+    if !candidate.is_absolute()
+        || raw != normpath_absolute(raw)
+        || parts.contains(&"..")
+        || candidate.file_name().is_none()
+    {
+        return Err(format!(
+            "configuration.eden_mount_root must be a canonical absolute path: {raw:?}"
+        ));
+    }
+    if candidate == root || candidate.starts_with(root) {
+        return Err(format!(
+            "configuration.eden_mount_root must live outside the project checkout ({}), so an Eden mount discovers as itself: {raw:?}",
+            root.display()
+        ));
+    }
+    Ok(raw.to_owned())
+}
+
+fn normpath_absolute(raw: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
 pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
     let root = discover_root(root)?;
     let path = root.join(".wrkslots.yml");
@@ -1526,6 +1564,10 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
     let eden_cap = match raw.get("eden_host_cap") {
         None | Some(Value::Null) => None,
         Some(value) => Some(json!(as_int(value, "configuration.eden_host_cap", 1)?)),
+    };
+    let eden_mount_root = match raw.get("eden_mount_root") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(json!(validate_eden_mount_root(value, &root)?)),
     };
     let cache_globs = match raw.get("cache_globs") {
         None => Vec::new(),
@@ -1730,12 +1772,32 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
             .expect("config payload object")
             .insert("eden_host_cap".to_owned(), value);
     }
+    if let Some(value) = eden_mount_root {
+        payload
+            .as_object_mut()
+            .expect("config payload object")
+            .insert("eden_mount_root".to_owned(), value);
+    }
     Ok(payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eden_mount_root_must_be_absolute_and_outside_the_project() {
+        let root = PathBuf::from("/tmp/wrkslots-test/project");
+        assert_eq!(
+            validate_eden_mount_root(&json!("/tmp/wrkslots-test/eden-mounts"), &root)
+                .expect("outside mount root"),
+            "/tmp/wrkslots-test/eden-mounts"
+        );
+        assert!(validate_eden_mount_root(&json!("eden-mounts"), &root).is_err());
+        assert!(
+            validate_eden_mount_root(&json!("/tmp/wrkslots-test/project/mounts"), &root).is_err()
+        );
+    }
 
     #[test]
     fn cache_globs_stay_literal_first() {

@@ -2788,12 +2788,16 @@ top-level content, live use, or an occupied destination, and journals the same-i
 ## Eden slots
 
 A slot can hold one EdenFS checkout instead of Git worktrees
-(`create --eden NAME=BACKING`). The mount always lands at
-`<slot>/checkout`, with the daemon state at `<slot>/.eden-state` — a
-private `--config-dir`, so every Eden slot gets its own `edenfs`
-daemon and never registers with the user's default daemon. Keep Eden
-mounts outside any other working tree: discovery from inside a mount
-can walk past its `.hg` symlink to an outer repository.
+(`create --eden NAME=BACKING`). The mount lands outside the project
+checkout, at `<eden_mount_root>/<slot-type>/<slot>`, with the daemon
+state at `<slot>/.eden-state` — a private `--config-dir`, so every
+Eden slot gets its own `edenfs` daemon and never registers with the
+user's default daemon. The slot's record names the mount (an absolute
+path); its records, locks, journals and `.eden-state` stay in the
+slot directory. Eden mounts must stay outside any other working
+tree: discovery from inside a mount can walk past its `.hg` symlink
+to an outer repository, which is why the mount no longer lives under
+the project's worktrees or validate directories.
 
 Register one with an isolated project (its own `.wrkslots.yml`, its
 own worktrees root, never another team's registry):
@@ -2803,6 +2807,7 @@ wrkslots init <project> --worktrees-dir worktrees/slots \
     --liveness-command <probe>
 # in <project>/.wrkslots.yml, under configuration:
 #   eden_host_cap: 10        # see the cap note below
+#   eden_mount_root: /home/<you>/local/eden-mounts   # host-local, outside the project
 wrkslots --project-root <project> create <slot> --slot-type agent \
     --coordinator-authorized --coordinator-pid <coordinator-pid> \
     --owner-pid <owner-pid> --agent <agent> --task <task> \
@@ -2810,8 +2815,14 @@ wrkslots --project-root <project> create <slot> --slot-type agent \
     --eden main=<backing-repo>
 wrkslots --project-root <project> status   # eden: outer=N cap=C
 eden --config-dir <slot>/.eden-state list
-eden --config-dir <slot>/.eden-state info <slot>/checkout
+eden --config-dir <slot>/.eden-state info <eden_mount_root>/agent/<slot>
 ```
+
+`configuration.eden_mount_root` is an absolute, host-local directory;
+a value inside the project checkout refuses at load. When the key is
+absent, a per-host default under the user's local directory is
+derived (keyed by machine and project), so two projects on one host
+never share a mount namespace.
 
 The coordinator PID must be live for the whole create-to-remove
 sequence; a PID read from a short-lived shell is dead by the next
@@ -2828,7 +2839,7 @@ cap in your own project's configuration only, never by editing
 another project's. The cap counts checkouts across every daemon
 config dir and refuses closed when a daemon cannot be queried.
 
-Clones live at `<slot>/checkout` on the project's worktrees root;
+Clones live at the mount under `eden_mount_root`;
 measure the disk with `df` on that filesystem, never with `du` or
 `find` over the mount (walking a mount fetches the whole repository
 and the daemon escapes caller scopes). A large backing repo needs
@@ -2848,7 +2859,7 @@ a checkout by hand to make a registry look consistent.
 
 Authentication is Sapling's and the submit tool's, tested inside
 the checkout once it exists: `sl id` and `sl status` must answer in
-`<slot>/checkout`, and the submit tool must accept its session
+the mount, and the submit tool must accept its session
 before any work is entrusted to the slot. Test outside any existing
 checkout that belongs to someone else.
 

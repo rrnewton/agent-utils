@@ -16,6 +16,7 @@ pub(crate) const TOP_DOCS: &[(&str, &str)] = &[
     ("liveness_batch_command", "Project-relative batch liveness program (one wrkslots-liveness-batch-request/v1 JSON request for many agents), used by audit on large registries."),
     ("max_active_slots", "Cap on active slots. Absent means uncapped."),
     ("eden_host_cap", "Host cap on OUTER Eden checkouts (outside the worktrees image), counted across every daemon config dir; in-image checkouts are bounded by the image."),
+    ("eden_mount_root", "Absolute host-local directory under which Eden checkouts mount, at <eden_mount_root>/<slot-type>/<slot> (#1730). It must live outside the project checkout, so Sapling discovery at a mount resolves to the mount itself instead of walking to an outer working tree. Slot records, locks, journals and .eden-state stay in the slot directory; only the mount moves. Absent derives a per-host default under the user's local directory. List the key in ignorable_keys so an older wrkslots ignores it instead of refusing."),
     ("cache_globs", "Slot-relative globs of regenerable caches that `clean-caches` may delete."),
     ("repo_cache_globs", "Per-repository cache globs: repository name to a list of globs."),
     (
@@ -97,6 +98,7 @@ pub(crate) const OPTIONAL_KEYS: &[&str] = &[
     "liveness_batch_command",
     "max_active_slots",
     "eden_host_cap",
+    "eden_mount_root",
     "cache_globs",
     "repo_cache_globs",
     "post_provision_hooks",

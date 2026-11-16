@@ -1129,6 +1129,12 @@ def build_spec(
             add(private_home_directory(view, relative), home / relative)
     if slot_writable:
         add(view.slot_path, view.slot_path)
+        if view.eden_checkout is not None and not view.eden_checkout.is_relative_to(
+            view.slot_path
+        ):
+            # An Eden mount outside the slot (#1730) is not under the
+            # slot bind; bind it at its own recorded path.
+            add(view.eden_checkout, view.eden_checkout)
         for directory in (*view.git_directories, *view.writable):
             add(directory, directory)
     alias = _checkout_alias_bind(view, settings)
