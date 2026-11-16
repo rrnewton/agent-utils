@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-remove-proof-mirror: one host-wide mirror per remote as the removal proof source'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:

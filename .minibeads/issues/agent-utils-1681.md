@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-remove-proof-fetch-cost: one advertised-refs proof per repository per removal'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
