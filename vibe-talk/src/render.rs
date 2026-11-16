@@ -274,7 +274,11 @@ impl SearchText {
     /// message short reference drawn as its emoji and number (`#1607
     /// short-ref-emoji-render`). `render-8`: a flattened history read's bullets and
     /// double-converted links repaired (`#1606 message-rerender-loses-formatting`).
-    pub const VERSION: &'static str = "render-8";
+    /// `render-9`: the same double conversion repaired without its angle brackets,
+    /// so a bridge-expanded short reference draws as one short-labelled link,
+    /// its thread or message label the emoji and number (`#1713
+    /// vibe-talk-short-ref-link-double-render`).
+    pub const VERSION: &'static str = "render-9";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -3102,6 +3106,29 @@ fn label_link<'a>(node: &'a AstNode<'a>, names: Names) {
     if shown.is_empty() {
         return;
     }
+    // A bridge-expanded thread or message reference (`#1713
+    // vibe-talk-short-ref-link-double-render`): the link's whole label is the
+    // written `:thread:NNN` / `:email:NNN`, so it is drawn as the emoji and
+    // number a plain reference is (`#1607 short-ref-emoji-render`), never the
+    // colons. An issue's label stays as the bridge wrote it (`#N`).
+    let tokens = short_ref_tokens(&shown);
+    if let [token] = tokens.as_slice() {
+        if token.start == 0
+            && token.end == shown.len()
+            && !matches!(token.kind, ShortRefKind::Issue)
+        {
+            let label = short_ref_label(token.kind, &shown);
+            drop(ast);
+            let kids: Vec<_> = node.children().collect();
+            if let Some((first, rest)) = kids.split_first() {
+                first.data.borrow_mut().value = NodeValue::Text(label.into());
+                for kid in rest {
+                    kid.detach();
+                }
+            }
+            return;
+        }
+    }
     let address = crate::link_labels::strip_scheme(&link.url).unwrap_or(&link.url);
     let thread = crate::link_labels::thread_ref(&link.url);
     let is_address = crate::link_labels::strip_scheme(&shown).unwrap_or(&shown) == address;
@@ -5768,6 +5795,10 @@ mod search_text_tests {
             "render-8",
             "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
         ),
+        (
+            "render-9",
+            "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
+        ),
     ];
 
     fn corpus_digest() -> String {
@@ -6605,6 +6636,46 @@ mod short_ref_tests {
             "{html}"
         );
         assert!(!html.contains("shortrefs.invalid"), "{html}");
+    }
+
+    #[test]
+    fn a_bridge_expanded_reference_draws_one_clean_link() {
+        // `#1713 vibe-talk-short-ref-link-double-render`: a bridge reply's
+        // reference reaches the page already expanded by the bridge and then
+        // flattened by the history read to `[url label](url%7Clabel)`. The
+        // page must draw ONE anchor per reference, with the short label, no
+        // raw URL as text and no `%7C` in its address; the thread anchor
+        // carries the message-link marking the in-app drill uses.
+        let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        let _guard = ShortRefsGuard::set(
+            refs,
+            Some("https://tracker.example.invalid/issues/{n}".to_owned()),
+        );
+        let read = crate::slack::mrkdwn::to_markdown(
+            "poll ([https://acme.slack.com/archives/C0123ABCD/p1700000000000100 :thread:060]\
+             (https://acme.slack.com/archives/C0123ABCD/p1700000000000100%7C:thread:060)) \
+             and ([https://tracker.example.invalid/issues/658 :issue:658]\
+             (https://tracker.example.invalid/issues/658%7C:issue:658))",
+        );
+        let html = to_html(&read, Markup::Slack);
+        assert_eq!(html.matches("<a ").count(), 2, "{html}");
+        // The thread label is drawn as the emoji and number a plain
+        // reference is (`#1607`); the issue label stays as written.
+        assert!(html.contains(">🧵060</a>"), "{html}");
+        assert!(!html.contains(">:thread:060</a>"), "{html}");
+        assert!(html.contains(">:issue:658</a>"), "{html}");
+        assert!(
+            html.contains("href=\"https://acme.slack.com/archives/C0123ABCD/p1700000000000100\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"https://tracker.example.invalid/issues/658\""),
+            "{html}"
+        );
+        assert!(html.contains("data-msg=\"slack:C0123ABCD"), "{html}");
+        assert!(!html.contains("%7C"), "{html}");
+        assert!(!html.contains("p1700000000000100 :thread"), "{html}");
+        assert!(!html.contains("issues/658 :issue"), "{html}");
     }
 
     #[test]

@@ -350,7 +350,11 @@ fn angle_link_at(text: &str) -> Option<(usize, &str, &str)> {
 /// message-rerender-loses-formatting`: `<https://x|GH #329>` came back as
 /// `<[https://x GH](https://x%7CGH) #329>` — the address and the label's first word
 /// as a Markdown link's text and (pipe escaped) address, the rest of the label after
-/// it. Only that exact shape is rewritten: its address, once the pipe is decoded,
+/// it. The same conversion without its angle brackets also arrives
+/// (`#1713 vibe-talk-short-ref-link-double-render`): a bridge reference
+/// `<https://x|:thread:060>` stored as `[https://x :thread:060](https://x%7C:thread:060)`,
+/// which comrak would draw as one link whose text is the raw address plus label.
+/// Only these exact shapes are rewritten: an address, once the pipe is decoded,
 /// must be the link text with its first space for the pipe. Anything else — a link
 /// a writer really wrote this way, code or not — is left as written; the worst a
 /// miss costs is the rendering the text already had.
@@ -362,20 +366,39 @@ pub(crate) fn repair_fallback_links(text: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let mut repaired_any = false;
-    while let Some(open) = rest.find("<[") {
-        let Some(close) = rest[open..].find('>') else {
-            break;
-        };
-        let whole = &rest[open..open + close + 1];
-        let Some(repaired) = fallback_link(whole) else {
-            out.push_str(&rest[..open + 2]);
-            rest = &rest[open + 2..];
+    while let Some(open) = rest.find('[') {
+        // The bracketed form holds its label rest before the closing `>`.
+        if open > 0 && rest.as_bytes()[open - 1] == b'<' {
+            let start = open - 1;
+            let Some(close) = rest[start..].find('>').map(|close| start + close) else {
+                break;
+            };
+            let Some(repaired) = fallback_link(&rest[start..=close]) else {
+                out.push_str(&rest[..open + 1]);
+                rest = &rest[open + 1..];
+                continue;
+            };
+            out.push_str(&rest[..start]);
+            out.push_str(&repaired);
+            repaired_any = true;
+            rest = &rest[close + 1..];
+            continue;
+        }
+        // The bare form is the whole flattened link; an image's `[` is not one.
+        if open > 0 && rest.as_bytes()[open - 1] == b'!' {
+            out.push_str(&rest[..open + 1]);
+            rest = &rest[open + 1..];
+            continue;
+        }
+        let Some((repaired, consumed)) = bare_fallback_link(&rest[open..]) else {
+            out.push_str(&rest[..open + 1]);
+            rest = &rest[open + 1..];
             continue;
         };
         out.push_str(&rest[..open]);
         out.push_str(&repaired);
         repaired_any = true;
-        rest = &rest[open + close + 1..];
+        rest = &rest[open + consumed..];
     }
     if !repaired_any {
         return Cow::Borrowed(text);
@@ -389,6 +412,22 @@ fn fallback_link(whole: &str) -> Option<String> {
     let inner = whole.strip_prefix("<[")?.strip_suffix('>')?;
     let (link_text, after) = inner.split_once("](")?;
     let (href, label_rest) = after.split_once(')')?;
+    repaired_link(link_text, href, label_rest)
+}
+
+/// One bare `[text](href)` flattened link at the start of `text` (see
+/// [`repair_fallback_links`]), as its `[label](url)` and its byte length.
+fn bare_fallback_link(text: &str) -> Option<(String, usize)> {
+    let (link_text, after) = text.strip_prefix('[')?.split_once("](")?;
+    let (href, _) = after.split_once(')')?;
+    let repaired = repaired_link(link_text, href, "")?;
+    Some((repaired, text.len() - after.len() + href.len() + 1))
+}
+
+/// A flattened link's text and address as the link it was flattened from:
+/// `[label](url)`, where the label is the address's pipe word plus any label
+/// rest the flattened shape held after the link.
+fn repaired_link(link_text: &str, href: &str, label_rest: &str) -> Option<String> {
     let (url, word) = href.split_once("%7C").or_else(|| href.split_once("%7c"))?;
     if !(url.starts_with("http://") || url.starts_with("https://"))
         || url.chars().any(char::is_whitespace)
@@ -731,11 +770,58 @@ mod rerender_tests {
     }
 
     #[test]
+    fn a_history_read_of_a_bridge_reference_reads_as_the_live_event_does() {
+        // `#1713 vibe-talk-short-ref-link-double-render`: the bridge's
+        // `<url|:thread:060>` comes back from a history read flattened WITHOUT
+        // the angle brackets #1606's shape holds, as
+        // `[url :thread:060](url%7C:thread:060)` (the exact stored shape of a
+        // real bridge reply). Both labels the bridge has used for an issue —
+        // `:issue:658` and, after #1709, `#658` — flatten the same way. Each
+        // must read as the live event's one clean link.
+        let live = super::to_markdown(
+            "(<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:060>) \
+             and (<https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD|:email:1846>) \
+             and (<https://tracker.example.invalid/issues/658|:issue:658>) \
+             and (<https://tracker.example.invalid/issues/659|#659>)",
+        );
+        let history = super::to_markdown(
+            "([https://acme.slack.com/archives/C0123ABCD/p1700000000000100 :thread:060]\
+             (https://acme.slack.com/archives/C0123ABCD/p1700000000000100%7C:thread:060)) \
+             and ([https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD :email:1846]\
+             (https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD%7C:email:1846)) \
+             and ([https://tracker.example.invalid/issues/658 :issue:658]\
+             (https://tracker.example.invalid/issues/658%7C:issue:658)) \
+             and ([https://tracker.example.invalid/issues/659 #659]\
+             (https://tracker.example.invalid/issues/659%7C#659))",
+        );
+        assert_eq!(
+            history, live,
+            "history read must normalize to the live shape"
+        );
+        assert!(
+            history.contains(
+                "[:thread:060](https://acme.slack.com/archives/C0123ABCD/p1700000000000100)"
+            ),
+            "{history}"
+        );
+        assert!(
+            history.contains("[:issue:658](https://tracker.example.invalid/issues/658)"),
+            "{history}"
+        );
+        assert!(
+            history.contains("[#659](https://tracker.example.invalid/issues/659)"),
+            "{history}"
+        );
+        assert!(!history.contains("%7C"), "{history}");
+    }
+
+    #[test]
     fn text_a_writer_really_wrote_is_not_repaired() {
         // A genuine Markdown link, a lone in-sentence bullet and a plain enumeration
         // hold no flattened-list shape and must pass through untouched.
         for text in [
             "see [the doc](https://example.com/a) and [x](https://e.test/%7C)",
+            "see [https://e.test/a word](https://e.test/b%7Cword) linked",
             "one • two, as a pair",
             "red • green • blue are the options",
         ] {
