@@ -60,10 +60,11 @@ def _expected(root: Path) -> dict[str, object]:
     config = wrkslots_cli._load_config(str(oracle), None)
     wrkslots_cli._ensure_state_shard(config)
     control = oracle / "worktrees"
+    archive = json.loads((control / "ARCHIVED.node-a.json").read_text())
     return {
         "machine": "node-a",
         "active": json.loads((control / "ACTIVE.node-a.json").read_text()),
-        "archive": json.loads((control / "ARCHIVED.node-a.json").read_text()),
+        "archive": archive,
     }
 
 

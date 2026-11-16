@@ -8646,12 +8646,7 @@ class _ArchiveQuarantine(StateError):
 
 
 def _archive_from_obj(
-    config: Config,
-    value: object,
-    selected: str,
-    label_prefix: str,
-    *,
-    quarantine_unknown: bool = True,
+    config: Config, value: object, selected: str, label_prefix: str
 ) -> ArchiveState:
     raw = _as_mapping(value, label_prefix)
     _exact_keys(raw, {"schema", "machine", "revision", "records"}, set(), "archive state")
@@ -8680,8 +8675,6 @@ def _archive_from_obj(
                 archived_slots,
             )
         except _ArchiveQuarantine as exc:
-            if not quarantine_unknown:
-                raise StateError(str(exc)) from exc
             quarantined.append(
                 {
                     "slot": mapping.get("slot")
@@ -84473,8 +84466,11 @@ def _append_absent_validate_archives(
         },
         state.machine,
         "absent-validation-row derived archive",
-        quarantine_unknown=False,
     )
+    if updated.quarantined_records:
+        raise StateError(
+            str(updated.quarantined_records[-1].get("reason"))
+        )
     recovery_identities = set(state.absent_validate_recoveries)
     recovery_identities.update(
         (item.slot, item.generation, item.record_sha256)

@@ -90,6 +90,10 @@ pub(crate) fn parse_states(root: Option<&Path>, machine_override: Option<&str>) 
     if let Some(message) = partial_write_refusal(&events) {
         return Err(message);
     }
+    let mut archive = archive;
+    if let Some(document) = archive.as_object_mut() {
+        document.remove("quarantined_records");
+    }
     Ok(json!({
         "machine": selected,
         "active": active,
