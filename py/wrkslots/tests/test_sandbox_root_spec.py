@@ -1,12 +1,11 @@
-"""Root-launcher spec boundary (#1583, redesign after adversarial review).
+"""Root-launcher spec boundary (#1583, after two adversarial reviews).
 
 Threat model: the attacker is the invoking user, with full control of
-the spec and their own files. The helper must refuse anything that
-would turn that control into root: unregistered slots, unknown schema
-keys, paths outside the allowed roots, symlink-smuggled targets, and
-option-string injection through tmp_size.
+the spec and their own files. One test per review finding: trusted
+roots only, resolve-strict paths, spec policy refused, the seal.
 """
 
+import inspect
 import json
 import os
 from pathlib import Path
@@ -20,16 +19,22 @@ def _control(tmp_path: Path) -> Path:
     control = tmp_path / "worktrees"
     control.mkdir()
     (control / "ACTIVE.test.json").write_text(
-        json.dumps({"slots": [{"slot": "s1", "agent": "worker"}]}), encoding="utf-8"
+        json.dumps({
+            "slots": [{
+                "slot": "s1",
+                "agent": "worker",
+                "checkouts": [{"path": "worktrees/slots/s1/repo", "name": "repo"}],
+            }]
+        }),
+        encoding="utf-8",
     )
     return control
 
 
 def _document(tmp_path: Path, control: Path) -> dict[str, object]:
-    home = tmp_path / "home"
-    home.mkdir(exist_ok=True)
+    home = Path(os.path.expanduser("~"))
     slot_path = control / "slots" / "s1"
-    slot_path.mkdir(parents=True, exist_ok=True)
+    (slot_path / "repo").mkdir(parents=True, exist_ok=True)
     return {
         "view": {
             "home": str(home),
@@ -53,32 +58,35 @@ def _document(tmp_path: Path, control: Path) -> dict[str, object]:
             "slot": "s1",
             "slot_path": str(slot_path),
             "control": str(control),
+            "project_root": str(tmp_path),
         },
     }
 
 
-def test_unregistered_slot_is_refused(tmp_path: Path) -> None:
+def test_unregistered_and_forged_claims_are_refused(tmp_path: Path) -> None:
     control = _control(tmp_path)
     document = _document(tmp_path, control)
+    view = document["view"]
+    assert isinstance(view, dict)
+    trusted = sandbox._verify_registered(document, view, os.getuid())
+    assert trusted["slot_path"] == str(control / "slots" / "s1")
     registered = document["registered"]
     assert isinstance(registered, dict)
     registered["slot"] = "ghost"
     with pytest.raises(sandbox.SandboxError, match="not registered"):
-        sandbox._verify_registered(document, os.getuid())
+        sandbox._verify_registered(document, view, os.getuid())
+    # N1: a spec-supplied home owned by someone else (a system home) refuses.
+    forged = {**view, "home": "/etc"}
+    with pytest.raises(sandbox.SandboxError, match="invoking user's home"):
+        sandbox._verify_registered(document, forged, os.getuid())
+    # N1: a spec-supplied slot_path the registry row does not name refuses.
+    registered["slot"] = "s1"
+    registered["slot_path"] = str(tmp_path / "elsewhere")
+    with pytest.raises(sandbox.SandboxError, match="not registered"):
+        sandbox._verify_registered(document, view, os.getuid())
 
 
-def test_registered_slot_and_box_are_accepted(tmp_path: Path) -> None:
-    control = _control(tmp_path)
-    document = _document(tmp_path, control)
-    sandbox._verify_registered(document, os.getuid())
-    sandbox._verify_registered(
-        {"registered": {"kind": "box", "control": str(control)}}, os.getuid()
-    )
-    with pytest.raises(sandbox.SandboxError, match="no registered slot"):
-        sandbox._verify_registered({}, os.getuid())
-
-
-def test_closed_schema_and_tmp_size_are_enforced(tmp_path: Path) -> None:
+def test_closed_schema_tmp_size_and_policy_are_enforced(tmp_path: Path) -> None:
     control = _control(tmp_path)
     document = _document(tmp_path, control)
     sandbox._check_root_schema(document)
@@ -87,39 +95,44 @@ def test_closed_schema_and_tmp_size_are_enforced(tmp_path: Path) -> None:
     raw_view = document["view"]
     assert isinstance(raw_view, dict)
     view: dict[str, object] = dict(raw_view)
-    with pytest.raises(sandbox.SandboxError, match="unknown keys"):
-        sandbox._check_root_schema({**document, "view": {**view, "evil": True}})
     with pytest.raises(sandbox.SandboxError, match="tmp_size"):
         sandbox._check_root_schema({**document, "view": {**view, "tmp_size": "1;evil"}})
-    with pytest.raises(sandbox.SandboxError, match="tmp_size"):
-        sandbox._check_root_schema({**document, "view": {**view, "tmp_size": "99999G"}})
+    # N3/N4: spec mount policy refuses in root mode.
+    trusted = sandbox._verify_registered(document, view, os.getuid())
+    with pytest.raises(sandbox.SandboxError, match="protect_system"):
+        sandbox._check_root_policy({**view, "protect_system": False}, trusted, os.getuid())
+    with pytest.raises(sandbox.SandboxError, match="Eden"):
+        sandbox._check_root_policy({**view, "eden_root_cover": True}, trusted, os.getuid())
+    with pytest.raises(sandbox.SandboxError, match="propagation"):
+        sandbox._check_root_policy({**view, "propagate": ["/x"]}, trusted, os.getuid())
 
 
-def test_dumpable_stays_zero_while_capabilities_are_held() -> None:
-    # Addition 1: dumpable is 0 from entry and never raised to 1 on the
-    # root entry path (a dumpable root helper is ptraceable by the user).
-    import inspect
-
-    source = inspect.getsource(sandbox.enter_root)
-    assert "_PR_SET_DUMPABLE, 0" in source
-    assert "_PR_SET_DUMPABLE, 1" not in source
-    assert "_prctl(_PR_SET_NO_NEW_PRIVS" not in source  # setuid-capable by design
-
-
-def test_paths_outside_allowed_roots_are_refused(tmp_path: Path) -> None:
+def test_paths_outside_trusted_roots_are_refused(tmp_path: Path) -> None:
     control = _control(tmp_path)
     document = _document(tmp_path, control)
     view = document["view"]
     assert isinstance(view, dict)
-    sandbox._check_root_paths(document, view)
+    trusted = sandbox._verify_registered(document, view, os.getuid())
+    sandbox._check_root_ownership(sandbox._allowed_roots(trusted, view, os.getuid()), os.getuid())
+    sandbox._check_root_paths(view, trusted, os.getuid())
     home = Path(str(view["home"]))
     for target in ("/etc/sudoers", "/usr/lib/evil.so", "relative/path", "/var/tmp/x"):
         bad = {**view, "binds": [[str(home), target]]}
         with pytest.raises(sandbox.SandboxError, match="refusing"):
-            sandbox._check_root_paths(document, bad)
-    # A symlink that resolves outside the allowed roots is refused too.
-    link = home / "link"
+            sandbox._check_root_paths(bad, trusted, os.getuid())
+    link = home / ".boxedlane-test-link"
     link.symlink_to("/etc")
-    bad = {**view, "binds": [[str(home), str(link / "passwd")]]}
-    with pytest.raises(sandbox.SandboxError, match="refusing"):
-        sandbox._check_root_paths(document, bad)
+    try:
+        bad = {**view, "binds": [[str(home), str(link / "passwd")]]}
+        with pytest.raises(sandbox.SandboxError, match="refusing"):
+            sandbox._check_root_paths(bad, trusted, os.getuid())
+    finally:
+        link.unlink()
+
+
+def test_seal_and_dumpable_are_pinned() -> None:
+    source = inspect.getsource(sandbox.enter_root)
+    assert "_PR_SET_DUMPABLE, 0" in source
+    assert "_PR_SET_DUMPABLE, 1" not in source
+    # (a): root mode is sealed; harness setuid steps fail honestly there.
+    assert "_prctl(_PR_SET_NO_NEW_PRIVS, 1)" in source

@@ -683,7 +683,8 @@ def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
     if isolation == "root":
         # A root launch must name a registered slot (#1583); model one.
         (box_base / "control" / "ACTIVE.test.json").write_text(
-            json.dumps({"slots": [{"slot": slot, "agent": "worker"}]}), encoding="utf-8"
+            json.dumps({"slots": [{"slot": slot, "agent": "worker", "checkouts": [{"path": "slot"}]}]}),
+            encoding="utf-8",
         )
     script = (
         "import sys\n"
@@ -835,7 +836,9 @@ def test_other_slots_and_the_registry_are_read_only_from_a_box(
     (control / "ACTIVE.testhost.json").write_text(
         '{"registry": true, "slots": [{"slot": "'
         + f"pytest-ctl-{isolation}-{layout}-{int(protect_system)}-{os.getpid()}"
-        + '", "agent": "worker"}]}\n',
+        + '", "agent": "worker", "checkouts": [{"path": "'
+        + ("wt/mine" if layout == "nested" else "wt/slots/mine")
+        + '"}]}]}\n',
         encoding="utf-8",
     )
     other_layer = control / "slot-state" / "agent" / "other" / "home"
@@ -874,6 +877,10 @@ def test_other_slots_and_the_registry_are_read_only_from_a_box(
         )
     finally:
         subprocess.run(["systemctl", "--user", "stop", sandbox.slice_name("agent", slot)], capture_output=True, check=False)
+    if isolation == "root" and not protect_system:
+        # Root mode takes no mount policy from the spec (#1583).
+        assert result.returncode != 0 and "protect_system=false" in result.stderr
+        return
     assert result.returncode == 0, result.stderr
     assert _probe_results(result.stdout) == {
         "own_slot_write": True,

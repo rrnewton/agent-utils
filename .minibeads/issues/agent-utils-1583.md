@@ -80,11 +80,14 @@ boxed-lanes report. Resolution: (fill in at landing)
 Attacker: the invoking user, with full control of the spec and
 their own files, trying to turn the root helper into root. The
 helper (`py/wrkslots/sandbox.py`) is the only root code path; the
-spec arrives on stdin, so no sudoers wildcard exists. Root mode is
-setuid-capable BY DESIGN (its purpose is harness sandboxes working
-inside, verified live by the root Muse relay lane), so there is
-deliberately no NO_NEW_PRIVS seal and the allowlist below is the
-boundary. One line per independent-review finding (2026-11-16):
+spec arrives on stdin, so no sudoers wildcard exists. DECISION
+(2026-11-16, after the second review): root mode IS sealed with
+PR_SET_NO_NEW_PRIVS. Harness launchers need a setuid step, so they
+fail honestly in a sealed root box (probed: the launcher dies
+`Error setting effective UID to root: EPERM`, exactly as in a user
+namespace); userns remains their mount-sandboxed route, and root
+mode serves non-setuid boxed tools until an unsealed redesign
+passes review. One line per review finding (both rounds):
 
 - F1 root unlink/lookup of a user path: CLOSED — the spec travels
   on stdin (`root_helper` fixed argv, `_exec_root_helper` dup2);
@@ -94,19 +97,22 @@ boundary. One line per independent-review finding (2026-11-16):
   registry reads are post-drop, O_NOFOLLOW, regular-file only;
   dumpable is 0 from entry to exec and never raised (unit-tested).
   Registration is documented as an accident guard, not a boundary.
-- F3 bypassable denylist: CLOSED by ALLOWLIST — every source and
-  target (binds, aliases, home binds, layer, read-only, cwd) must
-  resolve, symlink-free via openat2 (fail closed when openat2 is
-  unavailable), at or beneath an allowed root: the slot path, the
-  user's home, the control directory, the box `/tmp`, each checkout
-  alias, the user's runtime spec directory, and the user's own
-  credential directory (each justified: per-user, no other tenant).
-  Masks (content-free covers) keep only the system-prefix refusal.
-  Checks run post-drop and again against the built view. The old
-  system-prefix denylist remains as belt and braces.
-- F4 NO_NEW_PRIVS contradiction: DECIDED — no seal; root mode is
-  documented setuid-capable, and F3's allowlist is therefore
-  load-bearing (see above).
+- F3 bypassable denylist: CLOSED by TRUSTED ALLOWLIST — allowed
+  roots come only from trusted data (passwd home or a user-owned
+  home, the registry row's checkout paths compared exactly for
+  slot/project, the control directory, the per-slot state
+  directory, the box `/tmp`, the user's runtime spec and credential
+  directories), with ownership checked along every ancestor.
+  Spec-claimed aliases and cwd are not roots; an alias qualifies
+  only as the same directory (device+inode) or an ancestor of the
+  home. Every source and target resolves symlink-free via openat2
+  (fail closed when unavailable), checks run post-drop and again
+  against the built view, and the finished mount points are
+  verified before exec. The system-prefix denylist remains as belt
+  and braces, and masks keep only that refusal.
+- F4 NO_NEW_PRIVS contradiction: DECIDED the other way — the seal
+  is restored (see the decision above); the allowlist is defense
+  in depth, not the only boundary.
 - F5 stale installed copy / `-B` mismatch: CLOSED — always `-I -B`;
   the launcher reads the installed copy's `_HELPER_VERSION` and
   refuses on mismatch with this file's version.
@@ -132,12 +138,18 @@ remain theoretically open; the attacker is the invoking user, who
 already owns every file involved, and mounts are fd-pinned for
 sources. (3) Installed-copy version skew fails closed.
 
+Operational note: a box's private mount namespace pins host binds
+that existed when it started; a long-lived boxed process therefore
+blocks host cleanup of those binds until it exits. Boxed test
+processes must be retired promptly, never left idle.
+
 Tests: `py/wrkslots/tests/test_sandbox_root_spec.py` (unregistered
-refused; registered slot/box accepted; closed schema; tmp_size;
-paths outside allowed roots and symlink-smuggled targets refused;
-dumpable/no-seal pinned). Live: `wrkslots run <slot> --isolation
-root -- /bin/true` passes with all checks, and a root Muse relay
-lane completes start/send-state/stop. The narrow sudoers line
+and forged claims refused; closed schema; tmp_size; spec mount
+policy refused; paths outside trusted roots and symlink-smuggled
+targets refused; seal and dumpable pinned). Live: `wrkslots run
+<slot> --isolation root -- /bin/true` and `/usr/bin/id` pass with
+all checks; a sealed root Muse relay lane fails honestly at
+startup (the launcher's EPERM), as decided. The narrow sudoers line
 ships only after this design passes an independent adversarial
 review; install (owner, per host; nothing installed by the agent):
 `sudo install -d -o root -g root -m 0755 /usr/local/lib/wrkslots`
