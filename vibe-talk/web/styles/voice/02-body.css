@@ -986,6 +986,20 @@
   padding-bottom: max(1rem, env(safe-area-inset-bottom));
 }
 
+/* `#1711 vibe-talk-floating-chip-overlap`. The status pill stands over the chips and the strip
+   at the foot of the channel's list, and without room of its own it lay over the last card's
+   reaction chips (owner screenshot, 2026-11-16). So outside the open search bar the pill
+   stands raised by its own allowance — its least height and the gap over what it stands on,
+   the 2.4rem the call's box already keeps for it (`CHIPS_PILL_REM`) — which puts it over the
+   room the chips at the foot already keep and clear of the last card's reaction chips there.
+   No room is reserved in the list for this: a landing's centre, the list's height and its
+   foot are all as they always were, and no Send measured against them moves. The raise is
+   not kept while a draft's card stands in the pane or the search bar is open, where the
+   pill's ordinary standing is measured against controls of its own. */
+#frame-body:has(#pane-discord:not([hidden])):not(:has(#pane-discord > #post-confirm:not([hidden]))):not(:has(#screen-main[data-searching])):not(:has(#column-reply:not([hidden]))):not(:has(#side-reply:not([hidden]))) #status-line {
+  translate: 0 -2.4rem;
+}
+
 #compose-text,
 #side-compose-text,
 #channel-compose-text {

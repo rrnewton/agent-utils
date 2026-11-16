@@ -589,6 +589,32 @@
   pointer-events: auto;
 }
 
+/* `#1711 vibe-talk-floating-chip-overlap`. On a phone the pill, this chip and the search glass
+   together are wider than the room beside the first card's Thread(N) control: laid out in one
+   line the reload chip ran to the right-hand edge and covered that control (owner screenshot,
+   2026-11-16). So on a phone, while the pill is also up, the reload chip stacks on its own
+   centred line directly under the pill instead of sharing its line. The two chips then cannot
+   cover each other, and neither reaches the card controls at the right-hand end of the pill's
+   line. A desk keeps the one line, where the column has room for both. */
+@media (max-width: 899px) {
+  /* Both chips at the left-hand end, the pill's line first: a centred stack would still reach
+     the Thread(N) control at the right of a card whose header stands on the pill's line. */
+  #channel-freshness-anchor:has(> #channel-freshness:not([hidden])):has(> #page-update:not([hidden])) {
+    justify-content: flex-start;
+  }
+
+  #channel-freshness-anchor:has(> #channel-freshness:not([hidden])):has(> #page-update:not([hidden]))::before {
+    flex-basis: 0;
+  }
+
+  #channel-freshness-anchor:has(> #channel-freshness:not([hidden])) > #page-update:not([hidden]) {
+    position: absolute;
+    left: calc(var(--float-edge) + env(safe-area-inset-left));
+    top: calc(var(--freshness-box) / 2 + var(--float-gap));
+    margin-left: 0;
+  }
+}
+
 /* Never shrunk by the line; capped at its width instead, which is where the ellipsis starts. */
 #channel-freshness {
   flex: 0 0 auto;

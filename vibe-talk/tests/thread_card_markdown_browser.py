@@ -522,15 +522,19 @@ def build_walk(desk: Desk, api: MarkdownApi) -> None:
     desk.check(bool(found["shown"]) and "New version" in str(found["words"]), f"the chip is not drawn: {found}")
     desk.check(0 <= float(chip["left"]) and float(chip["right"]) <= float(str(found["width"])) and float(str(found["overflow"])) <= 0,
                f"the chip is outside the window: {found}")
+    # `#1711 vibe-talk-floating-chip-overlap`: no intersection in either axis counts — on a phone
+    # the chip stacks under the pill (x overlap, y clear) rather than beside it.
     desk.check(not isinstance(pill, dict) or float(pill["right"]) <= float(chip["left"]) + 0.5
-               or float(chip["right"]) <= float(pill["left"]) + 0.5, f"the chip covers the freshness pill: {found}")
+               or float(chip["right"]) <= float(pill["left"]) + 0.5
+               or float(pill["bottom"]) <= float(chip["top"]) + 0.5
+               or float(chip["bottom"]) <= float(pill["top"]) + 0.5, f"the chip covers the freshness pill: {found}")
     desk.shot("1-new-version")
     page.evaluate("() => { window.__beforeReload = true; }")
     with page.expect_navigation():
         page.click("#page-update")
     desk.check(not page.evaluate("() => Boolean(window.__beforeReload)"), "the chip did not reload the page")
     desk.notes.append(f"a newer build showed the chip at x {float(chip['left']):.0f}-{float(chip['right']):.0f}px "
-                      "beside the pill, and a press reloaded the page")
+                      "clear of the pill, and a press reloaded the page")
 
 
 def old_shell_walk(desk: Desk, api: MarkdownApi) -> None:
