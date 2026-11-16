@@ -110,11 +110,30 @@ def test_concurrent_remove_leaves_the_running_invocations_seal(
 
     def second_invocation() -> None:
         # The first invocation holds no lock during this census, and its
-        # finish journal does not exist yet.
+        # finish journal does not exist yet. It runs in this process, so
+        # a real operator process stands in for it: the seal scan only
+        # counts wrkslots processes acting on the sealed targets.
         sealed = seal.read_bytes()
-        second = raw_command_with_census_authority_stub(
-            project, *_remove_command()
+        operator = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(120)",
+                "-m",
+                "wrkslots",
+                "--project-root",
+                str(project),
+                "remove",
+                "target",
+            ]
         )
+        try:
+            second = raw_command_with_census_authority_stub(
+                project, *_remove_command()
+            )
+        finally:
+            operator.kill()
+            operator.wait()
         observed.append(
             (
                 second.returncode,
@@ -198,9 +217,10 @@ def test_crashed_invocations_seal_waits_for_explicit_recovery(
     mode = target.stat().st_mode & 0o777
 
     assert remove_completed_validation(project) == 3
-    # The crashed invocation's coordinator (this test process) is still
-    # alive, so the seal reads as in progress, not interrupted (#1736).
-    assert "in progress (pid " in capsys.readouterr().err
+    # The crashed invocation is gone even though its coordinator (this
+    # test process) lives on: the seal is interrupted, with recovery
+    # named, because no wrkslots process acts on its targets (#1736).
+    assert "interrupted validation-batch seal recorded" in capsys.readouterr().err
     assert seal.read_bytes() == sealed
     assert target.stat().st_mode & 0o777 == mode
 
@@ -588,11 +608,12 @@ def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
 
     classified = _classify(project, "next")
     assert classified.returncode != 0
-    if actor == "live":
-        assert "in progress (pid " in classified.stderr
-        assert "recover" not in classified.stderr
+    if actor in ("live", "other-boot"):
+        # No wrkslots process acts on the target (and an ended boot is
+        # dead everywhere in wrkslots): interrupted, recovery named.
+        assert "interrupted validation-batch seal recorded" in classified.stderr
     else:
-        # Another boot or machine proves nothing: no recovery suggestion.
+        # Another machine proves nothing: no recovery suggestion.
         assert "cannot be proven dead" in classified.stderr
         assert "recover" not in classified.stderr
 
@@ -613,8 +634,9 @@ def test_classify_reports_live_validate_batch_seal_as_structured_blocking_reason
     classified = _classify(project, "next")
 
     assert classified.returncode == 3, classified.stderr
-    assert "in progress (pid " in classified.stderr
-    assert "recover" not in classified.stderr
+    # No wrkslots process acts on the target, so the refusal wording
+    # is interrupted even though the structured state stays live.
+    assert "interrupted validation-batch seal recorded" in classified.stderr
     payload = json.loads(classified.stdout)
     assert payload["blocking"] is True
     assert payload["schema"] == 2
@@ -952,7 +974,51 @@ def test_adopt_names_a_live_seal_as_in_progress_without_suggesting_recover(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """#1736: adopt meets a seal whose batch is still alive."""
+    """#1736: adopt meets a seal whose batch is still alive.
+
+    The seal's actor is the authorizing coordinator (this test
+    process); the batch itself is the operator process below. Only
+    the two together read as in progress.
+    """
+
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(
+        seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
+    )
+    sealed = seal.read_bytes()
+    operator = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            "-m",
+            "wrkslots",
+            "--project-root",
+            str(project),
+            "remove",
+            "target",
+        ]
+    )
+    try:
+        result = _adopt_target(project)
+    finally:
+        operator.kill()
+        operator.wait()
+
+    assert result == 3
+    err = capsys.readouterr().err
+    assert "in progress (pid " in err
+    assert f"pid {operator.pid}" in err
+    assert "recover" not in err
+    assert seal.read_bytes() == sealed
+
+
+def test_adopt_calls_a_seal_whose_batch_is_gone_interrupted_even_if_coordinator_lives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#1736: a live coordinator alone does not keep a seal in progress."""
 
     project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
     _rewrite_actor(
@@ -962,9 +1028,8 @@ def test_adopt_names_a_live_seal_as_in_progress_without_suggesting_recover(
 
     assert _adopt_target(project) == 3
     err = capsys.readouterr().err
-    assert "in progress (pid " in err
-    assert f"pid {os.getpid()}" in err
-    assert "recover" not in err
+    assert "interrupted validation-batch seal recorded" in err
+    assert "wrkslots recover" in err
     assert seal.read_bytes() == sealed
 
 

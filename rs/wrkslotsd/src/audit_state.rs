@@ -4066,7 +4066,8 @@ fn heartbeat_diagnosis(record: &Value) -> Result<(i64, bool)> {
 /// (#1736), mirroring `_audit_validate_batch_seal_reason`.
 fn audit_seal_reason(control: &Path, machine: &str) -> String {
     let path = control.join(format!("VALIDATE-BATCH-SEAL.{machine}.journal"));
-    let (state, pid, since, detail) = crate::ensure_states::seal_owner_liveness(&path);
+    let root = control.parent().map(|parent| parent.to_path_buf()).unwrap_or_default();
+    let (state, pid, since, detail) = crate::ensure_states::seal_owner_liveness(&path, &root);
     match state.as_str() {
         "live" => format!(
             "validation-batch seal in progress (pid {}, since {}); the remove-validate-batch that owns it is still running",

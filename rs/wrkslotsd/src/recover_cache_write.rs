@@ -392,7 +392,7 @@ pub(crate) fn classify_ownerless_validate_batch(
             if name.starts_with("VALIDATE-BATCH-SEAL.") && name.ends_with(".journal") {
                 let path = entry.path();
                 let (state, pid, since, detail) =
-                    crate::ensure_states::seal_owner_liveness(&path);
+                    crate::ensure_states::seal_owner_liveness(&path, &cfg.root);
                 return Err(match state.as_str() {
                     "live" => format!(
                         "validation-batch seal in progress (pid {}, since {}) recorded in {}; the remove-validate-batch that owns it is still running; wait for it to finish and retry; list blocking journals with 'wrkslots classify-create-journals --all-kinds'",

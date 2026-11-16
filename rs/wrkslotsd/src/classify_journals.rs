@@ -1929,7 +1929,7 @@ fn classify_create_journals_inner(
             .filter_map(|reason| reason.get("path").and_then(Value::as_str))
             .map(PathBuf::from)
             .collect();
-        let message = crate::ensure_states::seal_blocking_message(&seal_paths);
+        let message = crate::ensure_states::seal_blocking_message(&seal_paths, &cfg.root);
         return Err(ClassifyError::Blocked { payload, message });
     }
     crate::hold_write::validate_global(root, &cfg)?;

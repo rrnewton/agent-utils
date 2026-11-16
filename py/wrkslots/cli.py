@@ -37751,20 +37751,24 @@ def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str
 def _validate_batch_seal_owner_liveness(
     config: Config, path: Path
 ) -> tuple[str, int | None, str | None, str]:
-    """Liveness of one seal's recorded owner (#1736).
+    """Whether the batch that owns one seal is still running (#1736).
 
-    Returns ``(state, pid, created_at, detail)`` where ``state`` is
-    ``"live"`` only when the seal's actor ran on this machine identity
-    and this boot and its exact process generation is still alive --
-    the same proof ``_validate_batch_seal_orphaned`` and the journal
-    classifiers use (``_process_state``). ``"dead"`` only when that
-    generation is proven gone; every other outcome (another machine
-    or boot, an unreadable journal, an indeterminate probe) is
-    ``"unknown"`` and proves nothing either way.
+    Returns ``(state, pid, created_at, detail)``. The seal's recorded
+    actor is the coordinator that authorized the batch, not the
+    wrkslots process running it, so a live actor alone proves nothing:
+    ``"live"`` requires a live wrkslots process acting on the sealed
+    targets (``_other_live_wrkslots_processes``, the same test
+    recovery uses), and ``pid`` is then that process. ``"dead"`` --
+    the batch is gone, however long its coordinator lives -- when the
+    actor's generation is proven gone, when its boot has ended (as
+    the rest of wrkslots and the Rust edition treat it), or when no
+    wrkslots process acts on the targets. Another machine identity,
+    an unreadable journal, or an indeterminate probe is ``"unknown"``
+    and proves nothing either way.
     """
 
     try:
-        raw, _targets = _validate_batch_seal_journal(
+        raw, targets = _validate_batch_seal_journal(
             config, path, _read_json(path, "validation-batch seal journal")
         )
     except (Refusal, StateError) as exc:
@@ -37789,18 +37793,34 @@ def _validate_batch_seal_owner_liveness(
             "the seal's actor belongs to another machine identity",
         )
     if identity.boot_id != boot_id:
+        return "dead", identity.pid, since, "the recorded machine boot ended"
+    state, reason = _process_state(identity)
+    if state == "dead":
+        return "dead", identity.pid, since, reason
+    if state != "live":
         return (
             "unknown",
             identity.pid,
             since,
-            "the seal's actor ran in an earlier boot",
+            f"the seal's actor is {state}: {reason}",
         )
-    state, reason = _process_state(identity)
-    if state == "live":
-        return "live", identity.pid, since, reason
-    if state == "dead":
-        return "dead", identity.pid, since, reason
-    return "unknown", identity.pid, since, f"the seal's actor is {state}: {reason}"
+    operators = _other_live_wrkslots_processes(
+        config.root,
+        targets=tuple(
+            dict.fromkeys(
+                [slot for slot, _generation, _target in targets]
+                + [str(target.path) for _slot, _generation, target in targets]
+            )
+        ),
+    )
+    if operators:
+        return "live", operators[0], since, reason
+    return (
+        "dead",
+        identity.pid,
+        since,
+        "no wrkslots process is acting on the sealed targets",
+    )
 
 
 def _classify_blocking_seal_reasons(config: Config) -> list[dict[str, object]]:
@@ -88349,27 +88369,14 @@ def _cmd_recover(
                 loaded_seal = _load_validate_batch_seal_journal(config)
                 assert loaded_seal is not None
                 _seal_path, _seal_raw, sealed_targets = loaded_seal
-                # Recover never retires a live batch's seal (#1736): the
-                # seal's recorded owner is alive and a wrkslots process is
-                # still acting on the sealed targets. A live coordinator
-                # alone does not hold the seal open -- only a wrkslots
-                # process can be part way through a sealed removal (the
-                # absent-target deadlock this distinction already fixes).
+                # Recover never retires a live batch's seal (#1736):
+                # "live" here already means a wrkslots process is still
+                # acting on the sealed targets; a live coordinator alone
+                # does not hold the seal open.
                 _seal_state, _seal_pid, _seal_since, _seal_detail = (
                     _validate_batch_seal_owner_liveness(config, _seal_path)
                 )
-                if _seal_state == "live" and _other_live_wrkslots_processes(
-                    config.root,
-                    targets=tuple(
-                        dict.fromkeys(
-                            [slot for slot, _g, _t in sealed_targets]
-                            + [
-                                str(target.path)
-                                for _s, _g, target in sealed_targets
-                            ]
-                        )
-                    ),
-                ):
+                if _seal_state == "live":
                     raise Refusal(
                         f"validation-batch seal in progress (pid {_seal_pid}, "
                         f"since {_seal_since}) recorded in {_seal_path}; "

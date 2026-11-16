@@ -528,11 +528,105 @@ pub(crate) fn require_fixture() -> Result<()> {
     Ok(())
 }
 
-/// Liveness of one seal's recorded owner (#1736), mirroring
-/// `_validate_batch_seal_owner_liveness`: `(state, pid, created_at,
-/// detail)` with state "live"/"dead" only on proof, else "unknown".
+/// Whether an argv runs a wrkslots removal command, mirroring
+/// `_is_wrkslots_command`.
+fn is_wrkslots_command(argv: &[String]) -> bool {
+    const OPERATORS: [&str; 4] = ["remove", "remove-validate-batch", "remove-agent-batch", "retire-pending"];
+    let mut runs = false;
+    for (index, argument) in argv.iter().enumerate() {
+        if argument == "wrkslots" && index > 0 && argv[index - 1] == "-m" {
+            runs = true;
+        } else if argument.ends_with("/wrkslots/__main__.py") {
+            runs = true;
+        } else if index <= 1
+            && std::path::Path::new(argument).file_name().and_then(|name| name.to_str()) == Some("wrkslots")
+        {
+            runs = true;
+        }
+    }
+    runs && argv.iter().any(|argument| OPERATORS.contains(&argument.as_str()))
+}
+
+fn path_within(candidate: &Path, root: &Path) -> bool {
+    candidate.starts_with(root) || root.starts_with(candidate)
+}
+
+/// PIDs of live wrkslots removal processes for this project acting on
+/// `targets`, mirroring `_other_live_wrkslots_processes`.
+pub(crate) fn other_live_wrkslots_processes(root: &Path, targets: &[String]) -> Vec<i64> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let own = i64::from(std::process::id());
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return vec![-1];
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(pid) = name.parse::<i64>() else { continue };
+        if pid == own {
+            continue;
+        }
+        let raw = match std::fs::read(entry.path().join("cmdline")) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                found.push(pid);
+                continue;
+            }
+        };
+        let argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        if !is_wrkslots_command(&argv) {
+            continue;
+        }
+        if !targets.is_empty()
+            && !targets.iter().any(|target| {
+                argv.iter().any(|part| {
+                    part == target
+                        || part.contains(&format!("/{target}/"))
+                        || part.ends_with(&format!("/{target}"))
+                })
+            })
+        {
+            continue;
+        }
+        let mut project: Option<PathBuf> = None;
+        for (index, argument) in argv.iter().enumerate() {
+            if argument == "--project-root" {
+                project = argv.get(index + 1).map(PathBuf::from);
+            } else if let Some(value) = argument.strip_prefix("--project-root=") {
+                project = Some(PathBuf::from(value));
+            }
+        }
+        let project = match project {
+            Some(project) => Some(project),
+            None => std::fs::read_link(entry.path().join("cwd")).ok(),
+        };
+        let same_project = match &project {
+            None => true,
+            Some(candidate) => {
+                let resolved = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone());
+                path_within(&resolved, &root)
+            }
+        };
+        if same_project {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// Whether the batch that owns one seal is still running (#1736),
+/// mirroring `_validate_batch_seal_owner_liveness`: `(state, pid,
+/// created_at, detail)`. The recorded actor is the authorizing
+/// coordinator, so "live" also requires a wrkslots process acting on
+/// the sealed targets; its pid is reported then.
 pub(crate) fn seal_owner_liveness(
     path: &Path,
+    root: &Path,
 ) -> (String, Option<i64>, Option<String>, String) {
     let unknown = |detail: String| ("unknown".to_string(), None, None, detail);
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -553,8 +647,35 @@ pub(crate) fn seal_owner_liveness(
         .map(str::to_owned);
     let (state, detail) = crate::status_state::process_state(Some(&identity));
     match state.as_str() {
-        "live" => ("live".to_string(), Some(identity.pid), since, detail),
         "dead" => ("dead".to_string(), Some(identity.pid), since, detail),
+        "live" => {
+            let mut targets: Vec<String> = Vec::new();
+            if let Some(items) = value.get("targets").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(slot) = item.get("slot").and_then(Value::as_str) {
+                        if !targets.iter().any(|existing| existing == slot) {
+                            targets.push(slot.to_string());
+                        }
+                    }
+                    if let Some(stored) = item.get("path").and_then(Value::as_str) {
+                        if !targets.iter().any(|existing| existing == stored) {
+                            targets.push(stored.to_string());
+                        }
+                    }
+                }
+            }
+            let operators = other_live_wrkslots_processes(root, &targets);
+            if let Some(pid) = operators.first() {
+                ("live".to_string(), Some(*pid), since, detail)
+            } else {
+                (
+                    "dead".to_string(),
+                    Some(identity.pid),
+                    since,
+                    "no wrkslots process is acting on the sealed targets".to_string(),
+                )
+            }
+        }
         _ => (
             "unknown".to_string(),
             Some(identity.pid),
@@ -567,10 +688,10 @@ pub(crate) fn seal_owner_liveness(
 /// Refusal text for blocking seals (#1736), mirroring the seal branch
 /// of `_refuse_partial_state`: live owners are in progress and never
 /// pointed at recovery; only proven-dead owners are "interrupted".
-pub(crate) fn seal_blocking_message(paths: &[PathBuf]) -> String {
+pub(crate) fn seal_blocking_message(paths: &[PathBuf], root: &Path) -> String {
     let first = paths.first().map(|path| path.display().to_string()).unwrap_or_default();
     let statuses: Vec<(String, Option<i64>, Option<String>, String)> =
-        paths.iter().map(|path| seal_owner_liveness(path)).collect();
+        paths.iter().map(|path| seal_owner_liveness(path, root)).collect();
     for (state, pid, since, _detail) in &statuses {
         if state == "live" {
             if let (Some(pid), Some(since)) = (pid, since) {
@@ -688,7 +809,8 @@ fn refuse_partial_state_inner(control: &Path, allow_validate_batch_seals: bool) 
         .collect();
     seals.sort();
     if !seals.is_empty() {
-        return Err(seal_blocking_message(&seals));
+        let root = control.parent().map(|parent| parent.to_path_buf()).unwrap_or_default();
+        return Err(seal_blocking_message(&seals, &root));
     }
     Ok(())
 }
