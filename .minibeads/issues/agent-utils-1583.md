@@ -74,3 +74,75 @@ EINVAL pane line for all three harnesses; cgroup (limits-only) muse
 lane completes the full cycle; the working mount-sandboxed set is
 the runtime-beside-launcher launch above. Full matrix in the #1569
 boxed-lanes report. Resolution: (fill in at landing)
+
+## Security review: the root-launcher spec parser (threat model)
+
+Attacker: the invoking user, with full control of the spec and
+their own files, trying to turn the root helper into root. The
+helper (`py/wrkslots/sandbox.py`) is the only root code path; the
+spec arrives on stdin, so no sudoers wildcard exists. Root mode is
+setuid-capable BY DESIGN (its purpose is harness sandboxes working
+inside, verified live by the root Muse relay lane), so there is
+deliberately no NO_NEW_PRIVS seal and the allowlist below is the
+boundary. One line per independent-review finding (2026-11-16):
+
+- F1 root unlink/lookup of a user path: CLOSED — the spec travels
+  on stdin (`root_helper` fixed argv, `_exec_root_helper` dup2);
+  the helper takes no path argument and unlinks nothing as root.
+- F2 root reads of user symlinks + ptrace window: CLOSED — the
+  drop (keeping only CAP_SYS_ADMIN) happens before stdin is read;
+  registry reads are post-drop, O_NOFOLLOW, regular-file only;
+  dumpable is 0 from entry to exec and never raised (unit-tested).
+  Registration is documented as an accident guard, not a boundary.
+- F3 bypassable denylist: CLOSED by ALLOWLIST — every source and
+  target (binds, aliases, home binds, layer, read-only, cwd) must
+  resolve, symlink-free via openat2 (fail closed when openat2 is
+  unavailable), at or beneath an allowed root: the slot path, the
+  user's home, the control directory, the box `/tmp`, each checkout
+  alias, the user's runtime spec directory, and the user's own
+  credential directory (each justified: per-user, no other tenant).
+  Masks (content-free covers) keep only the system-prefix refusal.
+  Checks run post-drop and again against the built view. The old
+  system-prefix denylist remains as belt and braces.
+- F4 NO_NEW_PRIVS contradiction: DECIDED — no seal; root mode is
+  documented setuid-capable, and F3's allowlist is therefore
+  load-bearing (see above).
+- F5 stale installed copy / `-B` mismatch: CLOSED — always `-I -B`;
+  the launcher reads the installed copy's `_HELPER_VERSION` and
+  refuses on mismatch with this file's version.
+- F6 flag-clearing remount: CLOSED — the nosuid/nodev remount
+  preserves existing ro/noexec flags and touches only binds made.
+- F7 groups/tmp_size/interpreter: CLOSED — groups are the spec's
+  claimed set intersected with the caller's own (via sudo's parent
+  /proc status, falling back to the group database, equality
+  refused otherwise); `tmp_size` is strictly validated before it
+  reaches a tmpfs option string; the install step requires a
+  root-owned interpreter with a root-owned sys.path under `-I`.
+
+Held from the review: identity only from SUDO_UID/SUDO_GID; root
+invoker refused; private propagation (nothing reaches the host
+mount table); all capabilities dropped before exec; fixed fs types
+(tmpfs or bind); no ptrace surface while CAP_SYS_ADMIN is held.
+
+Residual risks: (1) a large Python module still parses user JSON —
+now as the user, post-drop, under a closed schema (unknown keys
+refuse); root surface before the drop is env reading plus the
+uid/gid drop itself. (2) Same-uid races between check and mount
+remain theoretically open; the attacker is the invoking user, who
+already owns every file involved, and mounts are fd-pinned for
+sources. (3) Installed-copy version skew fails closed.
+
+Tests: `py/wrkslots/tests/test_sandbox_root_spec.py` (unregistered
+refused; registered slot/box accepted; closed schema; tmp_size;
+paths outside allowed roots and symlink-smuggled targets refused;
+dumpable/no-seal pinned). Live: `wrkslots run <slot> --isolation
+root -- /bin/true` passes with all checks, and a root Muse relay
+lane completes start/send-state/stop. The narrow sudoers line
+ships only after this design passes an independent adversarial
+review; install (owner, per host; nothing installed by the agent):
+`sudo install -d -o root -g root -m 0755 /usr/local/lib/wrkslots`
+and `sudo install -o root -g root -m 0755 py/wrkslots/sandbox.py
+/usr/local/lib/wrkslots/sandbox.py`, plus one wildcard-free
+sudoers line naming the invoking user, the host's resolved
+python realpath, `-I -B`, the installed helper, and the literal
+`enter-root` (spec on stdin; one line serves every project).

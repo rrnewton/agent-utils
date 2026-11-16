@@ -362,28 +362,29 @@ def test_provision_slot_image_uses_the_settings_it_is_given(
 # ------------------------------------------- root launcher bytecode suppression
 
 
-def test_root_helper_adds_dont_write_bytecode_only_when_this_interpreter_has_it(
+def test_root_helper_is_a_fixed_stdin_argv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The spec travels on stdin: no path argument, no wildcard, always -I -B.
     helper = str(Path(sandbox.__file__).resolve())
     interpreter = os.path.realpath(sys.executable)
 
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
-    assert sandbox.root_helper("SPEC") == [
-        "sudo", "-n", "--", interpreter, "-I", helper, "enter-root", "SPEC"
+    assert sandbox.root_helper() == [
+        "sudo", "-n", "--", interpreter, "-I", "-B", helper, "enter-root"
     ]
 
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
-    assert sandbox.root_helper("SPEC") == [
-        "sudo", "-n", "--", interpreter, "-I", "-B", helper, "enter-root", "SPEC"
+    assert sandbox.root_helper() == [
+        "sudo", "-n", "--", interpreter, "-I", "-B", helper, "enter-root"
     ]
 
 
-@pytest.mark.parametrize(("flags", "expected"), [((), ["-I"]), (("-B",), ["-I", "-B"])])
+@pytest.mark.parametrize("flags", [(), ("-B",)])
 def test_root_helper_carries_the_callers_dash_b_across_sudo_by_argv(
-    tmp_path: Path, flags: tuple[str, ...], expected: list[str]
+    tmp_path: Path, flags: tuple[str, ...]
 ) -> None:
-    """A `python3 -B` caller yields a root helper argv with `-I -B`; sudo scrubs the environment."""
+    """The root helper argv is always `-I -B`; sudo scrubs the environment."""
 
     environment = {
         key: value
@@ -394,15 +395,16 @@ def test_root_helper_carries_the_callers_dash_b_across_sudo_by_argv(
     completed = subprocess.run(
         [
             sys.executable, *flags, "-c",
-            "import json; from wrkslots import sandbox; print(json.dumps(sandbox.root_helper('SPEC')))",
+            "import json; from wrkslots import sandbox; print(json.dumps(sandbox.root_helper()))",
         ],
         cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=60,
     )
 
     assert completed.returncode == 0, completed.stderr
     argv = json.loads(completed.stdout)
-    assert argv[4 : 4 + len(expected)] == expected
-    assert argv[4 + len(expected)].endswith("sandbox.py")
+    assert argv[4:6] == ["-I", "-B"]
+    assert argv[6].endswith("sandbox.py")
+    assert argv[7] == "enter-root"
 
 
 # ----------------------------------------------- run --place-only (slices once)
@@ -789,8 +791,13 @@ def _in_scope_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
     cgroup.write_text(_MANAGER + "/app.slice/app-wrkslots.slice/app-wrkslots-s1.slice/run-1.scope\n")
 
     def execvpe(file: str, argv: list[str], env: dict[str, str]) -> None:
-        spec = json.loads(Path(argv[-1]).read_text())
-        assert stat.S_IMODE(os.stat(argv[-1]).st_mode) == 0o600
+        # The spec arrives on stdin (fd 0), never as a path argument.
+        assert argv[-1] == "enter-root"
+        assert stat.S_IMODE(os.fstat(0).st_mode) == 0o600
+        chunks = []
+        while chunk := os.read(0, 1 << 20):
+            chunks.append(chunk)
+        spec = json.loads(b"".join(chunks))
         raise _Execed(list(argv), spec)
 
     monkeypatch.setattr(os, "execvpe", execvpe)
@@ -850,7 +857,7 @@ def test_enter_in_place_runs_the_root_steps_in_the_callers_scope(
     argv, spec = caught.value.argv, caught.value.spec
     assert argv[:6] == ["sudo", "-n", "--", os.path.realpath(sys.executable), "-I", "-B"]
     assert argv[6:8] == [str(Path(sandbox.__file__).resolve()), "enter-root"]
-    assert not Path(argv[-1]).exists()  # the spec is removed when the exec does not happen
+    assert list((tmp_path / "runtime" / "wrkslots").glob("sandbox-*.json")) == []  # spec removed when the exec does not happen
     # The slice check (one escape), then the sudo probe; no scope was created or
     # joined (no busctl, no systemd-run) and no limit was applied (no systemctl).
     assert _calls(log) == ["systemd-escape -- s1", "sudo -n true"]
@@ -1053,7 +1060,7 @@ def test_a_dash_b_placement_and_root_helper_write_no_bytecode(
     )
     helper = subprocess.run(
         [sys.executable, "-B", "-c",
-         "import json; from wrkslots import sandbox; print(json.dumps(sandbox.root_helper('SPEC')))"],
+         "import json; from wrkslots import sandbox; print(json.dumps(sandbox.root_helper()))"],
         cwd=tmp_path, env=environment, text=True, capture_output=True, check=False, timeout=300,
     )
 

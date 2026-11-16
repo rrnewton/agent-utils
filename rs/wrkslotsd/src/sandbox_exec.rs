@@ -283,12 +283,7 @@ pub(crate) fn run_print(
             }
         }
         "root" => {
-            let argv = root_helper_argv(
-                &facts.helper_interpreter,
-                &facts.helper_module,
-                "SPEC-FILE",
-                facts.dont_write_bytecode,
-            );
+            let argv = root_helper_argv(&facts.helper_interpreter, &facts.helper_module);
             let quoted: Vec<String> = argv.iter().map(|part| shlex_quote(part)).collect();
             out.push_str(&quoted.join(" "));
             out.push('\n');
@@ -451,27 +446,18 @@ pub(crate) fn userns_helper_argv(
 }
 
 /// Argv that builds the view as root through `sudo -n`, mirroring
-/// Python `root_helper` (`-B` only when bytecode writing is off).
-pub(crate) fn root_helper_argv(
-    interpreter: &str,
-    module: &str,
-    spec_file: &str,
-    dont_write_bytecode: bool,
-) -> Vec<String> {
-    let mut argv = vec![
+/// Python `root_helper`: fixed argv, always `-I -B`, spec on stdin.
+pub(crate) fn root_helper_argv(interpreter: &str, module: &str) -> Vec<String> {
+    vec![
         "sudo".to_string(),
         "-n".to_string(),
         "--".to_string(),
         interpreter.to_string(),
         "-I".to_string(),
-    ];
-    if dont_write_bytecode {
-        argv.push("-B".to_string());
-    }
-    argv.push(module.to_string());
-    argv.push("enter-root".to_string());
-    argv.push(spec_file.to_string());
-    argv
+        "-B".to_string(),
+        module.to_string(),
+        "enter-root".to_string(),
+    ]
 }
 
 /// Python `!r` for the short name strings the in-scope
@@ -761,12 +747,7 @@ pub(crate) fn run_in_scope_print(
         "slices": expected.to_obj(),
         "writable": writable,
         "masks": masks,
-        "helper": root_helper_argv(
-            &facts.helper_interpreter,
-            &facts.helper_module,
-            "SPEC-FILE",
-            facts.dont_write_bytecode,
-        ),
+        "helper": root_helper_argv(&facts.helper_interpreter, &facts.helper_module),
         "command": command,
         "view": spec,
     });
@@ -973,7 +954,7 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
         assert!(bus.contains(&"StartTransientUnit".to_string()));
         let fallback = scope_fallback_argv("u.scope", "wrkslots.slice", &["/bin/true".to_string()]);
         assert_eq!(fallback[6], "--slice=wrkslots.slice");
-        let root = root_helper_argv("/usr/bin/python3", "sandbox.py", "/tmp/spec.json", true);
+        let root = root_helper_argv("/usr/bin/python3", "sandbox.py");
         assert_eq!(root[5], "-B");
     }
 

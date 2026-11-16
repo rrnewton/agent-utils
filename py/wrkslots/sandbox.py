@@ -1996,6 +1996,10 @@ def enter_userns(spec: Mapping[str, object], command: Sequence[str]) -> None:
 # --------------------------------------------------------------- root helper
 
 _PR_SET_KEEPCAPS = 8
+
+#: The root-owned copy of this file the sudoers entry names (#1583). A
+#: checkout copy is user-writable, so sudo may never run it as root.
+_INSTALLED_HELPER = Path("/usr/local/lib/wrkslots/sandbox.py")
 _PR_SET_DUMPABLE = 4
 _CAP_SYS_ADMIN = 21
 _LINUX_CAPABILITY_VERSION_3 = 0x20080522
@@ -2046,87 +2050,314 @@ def _sudo_identity() -> tuple[int, int, list[int], str]:
     return uid, gid, groups, name
 
 
-def _read_root_spec(spec_file: str, uid: int) -> dict[str, object]:
-    """Read and delete the launcher's spec, trusting it only if the user alone could write it."""
+def _registered_claim(view: SlotView) -> dict[str, object]:
+    """What `write_root_spec` records for the root helper to verify (#1583)."""
 
+    if view.coordinator:
+        return {"kind": "box", "control": str(view.control_directory)}
+    return {
+        "kind": "slot",
+        "slot": view.slot,
+        "slot_path": str(view.slot_path),
+        "control": str(view.control_directory),
+        "project_root": str(view.project_root) if view.project_root is not None else None,
+    }
+
+
+#: Mount targets a root-built view may never cover: a user-authored spec
+#: binding over one of these (then running a setuid program inside) is the
+#: classic namespace escalation the root helper exists to refuse (#1583).
+_SYSTEM_TARGET_PREFIXES = (
+    "/etc", "/usr", "/lib", "/lib64", "/bin", "/sbin", "/proc", "/sys", "/dev", "/boot", "/root",
+)
+
+
+#: Closed schemas for the root spec: any other key refuses (#1583).
+_ROOT_DOCUMENT_KEYS = frozenset(
+    {"view", "command", "environment", "uid", "gid", "groups", "umask", "registered"}
+)
+_ROOT_VIEW_KEYS = frozenset(
+    {
+        "home", "home_aliases", "home_mode", "home_layer", "home_binds", "read_only",
+        "binds", "masks", "tmp_size", "protect_system", "propagate", "cwd",
+        "git_config_policy", "git_config_masks",
+        "eden_root_cover", "eden_checkout", "eden_backing",
+    }
+)
+
+_TMP_SIZE = re.compile(r"([0-9]+)([KMGT]?)\Z")
+
+
+def _check_root_schema(document: Mapping[str, object]) -> dict[str, object]:
+    """Validate the stdin spec against the closed schema; return its view."""
+
+    unknown = set(document) - _ROOT_DOCUMENT_KEYS
+    if unknown:
+        raise SandboxError(f"root launcher spec has unknown keys {sorted(unknown)}; refusing")
+    view = document.get("view")
+    if not isinstance(view, dict):
+        raise SandboxError("root launcher spec has no view object; refusing")
+    unknown_view = set(view) - _ROOT_VIEW_KEYS
+    if unknown_view:
+        raise SandboxError(f"root view has unknown keys {sorted(unknown_view)}; refusing")
+    tmp_size = view.get("tmp_size", DEFAULT_TMP_SIZE)
+    match = _TMP_SIZE.fullmatch(str(tmp_size)) if isinstance(tmp_size, (str, int)) else None
+    multiplier = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    if match is None or int(match.group(1)) * multiplier[match.group(2)] > 64 * (1 << 30):
+        raise SandboxError(f"root view tmp_size {tmp_size!r} is invalid; refusing")
+    return view
+
+
+def _verify_registered(document: Mapping[str, object], uid: int) -> None:
+    """Accident guard: refuse a spec naming no live registered slot.
+
+    This runs AFTER the privilege drop, as the invoking user, and reads
+    registry files with nofollow + regular-file checks. It is forgeable
+    (a box claim needs only a user-owned control directory), so it is an
+    accident guard, not a security boundary; the boundary is the fixed
+    sudo argv, the root-owned helper, and the checks in this module.
+    """
+
+    registered = document.get("registered")
+    if not isinstance(registered, dict):
+        raise SandboxError("the root launcher spec names no registered slot; refusing")
+    control = registered.get("control")
+    if not isinstance(control, str) or not os.path.isabs(control):
+        raise SandboxError("the root launcher spec names no control directory; refusing")
     try:
-        directory = os.stat(os.path.dirname(spec_file) or ".", follow_symlinks=False)
-        descriptor = os.open(spec_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        info = os.stat(control)
     except OSError as exc:
-        with contextlib.suppress(OSError):
-            os.unlink(spec_file)
-        raise SandboxError(f"cannot open the root launcher spec: {exc}") from exc
+        raise SandboxError(f"the root launcher control directory cannot be inspected: {exc}") from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid:
+        raise SandboxError("the root launcher control directory is not the invoking user's; refusing")
+    if registered.get("kind") == "box":
+        return
+    if registered.get("kind") != "slot":
+        raise SandboxError("the root launcher spec names an unknown registration kind; refusing")
+    slot = registered.get("slot")
+    slot_path = registered.get("slot_path")
+    if not isinstance(slot, str) or not slot or not isinstance(slot_path, str):
+        raise SandboxError("the root launcher spec names no slot; refusing")
+    for active in Path(control).glob("ACTIVE.*.json"):
+        try:
+            descriptor = os.open(active, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                continue
+            document_active = json.loads(os.read(descriptor, 16 << 20).decode("utf-8"))
+        except (OSError, ValueError):
+            continue
+        finally:
+            os.close(descriptor)
+        rows = document_active.get("slots") if isinstance(document_active, dict) else None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if isinstance(row, dict) and row.get("slot") == slot:
+                return
+    raise SandboxError(f"slot {slot!r} is not registered in {control}; refusing the root launch")
+
+
+def _allowed_roots(document: Mapping[str, object], view: Mapping[str, object]) -> list[str]:
+    """Roots every root-view source and target must resolve beneath (#1583).
+
+    The slot path (or the box control directory), the invoking user's
+    home, the wrkslots control directory, the box's own `/tmp`, and each
+    configured checkout alias (an alias is a first-class root because a
+    checkout may be addressed only through it). Fixed additions each
+    need a written justification in the issue file; there are none yet.
+    """
+
+    registered = document.get("registered")
+    assert isinstance(registered, dict)
+    # The per-slot state directory (the home layer's parent) holds the
+    # slot's private state binds; it is per-slot by construction.
+    roots = [str(view["home"]), "/tmp", str(Path(str(view["home_layer"])).parent)]
+    control = registered.get("control")
+    if isinstance(control, str):
+        roots.append(control)
+    slot_path = registered.get("slot_path")
+    if isinstance(slot_path, str):
+        roots.append(slot_path)
+    project_root = registered.get("project_root")
+    if isinstance(project_root, str):
+        # The slot's project root: its blessed outputs bind lives there.
+        roots.append(project_root)
+    if registered.get("kind") == "box":
+        # A coordinator box works in its cwd (its writable scope root).
+        roots.append(str(view.get("cwd", "/")))
+    aliases = view.get("home_aliases", [])
+    if isinstance(aliases, list):
+        roots.extend(str(alias) for alias in aliases)
+    # The invoking user's own runtime spec directory (the read-only bind
+    # that keeps live specs out of boxed reach) and credential directory:
+    # harness credential binds live there, per-user, nowhere else added.
+    uid = document.get("uid")
+    if isinstance(uid, int):
+        roots.append(f"/run/user/{uid}/wrkslots")
+    if isinstance(uid, int):
+        try:
+            import pwd
+
+            roots.append(f"/var/facebook/credentials/{pwd.getpwuid(uid).pw_name}")
+        except (KeyError, ImportError):
+            pass
+    return [os.path.realpath(root) for root in roots]
+
+
+def _beneath(path: str, roots: Sequence[str]) -> bool:
+    return any(path == root or path.startswith(root + "/") for root in roots)
+
+
+def _openat2_strict(path: str) -> int:
+    """Open `path` with symlink-free resolution; fail closed without openat2."""
+
+    import struct
+
+    libc = _libc()
+    if not hasattr(libc, "syscall"):
+        raise SandboxError("root launch needs openat2 (unavailable); refusing")
+    # struct open_how { u64 flags; u64 mode; u64 resolve; }
+    how = ctypes.create_string_buffer(struct.pack("QQQ", os.O_PATH | os.O_CLOEXEC, 0, 0x04 | 0x02), 24)
+    result = libc.syscall(437, -100, path.encode(), ctypes.byref(how), 24)
+    if result < 0:
+        error = ctypes.get_errno()
+        if error == 38:  # ENOSYS
+            raise SandboxError("root launch needs openat2 (unavailable); refusing")
+        raise SandboxError(f"root view path {path!r} does not resolve without symlinks ({os.strerror(error)}); refusing")
+    return int(result)
+
+
+def _check_root_paths(document: Mapping[str, object], view: Mapping[str, object]) -> None:
+    """Every source and target beneath an allowed root, resolved strictly.
+
+    Runs as the invoking user (after the drop) and again-able against the
+    built view. The system-prefix denylist stays as belt and braces.
+    """
+
+    roots = _allowed_roots(document, view)
+    paths: list[str] = [str(view["home"]), str(view["home_layer"]), str(view.get("cwd", "/"))]
+    raw_binds = view.get("binds", [])
+    if isinstance(raw_binds, list):
+        for pair in raw_binds:
+            if isinstance(pair, list) and len(pair) == 2:
+                paths.extend([str(pair[0]), str(pair[1])])
+    for key in ("read_only", "home_aliases"):
+        value = view.get(key, [])
+        if isinstance(value, list):
+            paths.extend(str(item) for item in value)
+    home_binds = view.get("home_binds", [])
+    if isinstance(home_binds, list):
+        paths.extend(os.path.join(str(view["home"]), str(item)) for item in home_binds)
+    for path in paths:
+        if not os.path.isabs(path):
+            raise SandboxError(f"root view path {path!r} is not absolute; refusing")
+        descriptor = _openat2_strict(path) if os.path.exists(path) else None
+        if descriptor is not None:
+            os.close(descriptor)
+        resolved = os.path.realpath(path)
+        if not _beneath(resolved, roots):
+            raise SandboxError(f"root view path {path!r} resolves outside the allowed roots; refusing")
+        for prefix in _SYSTEM_TARGET_PREFIXES:
+            if resolved == prefix or resolved.startswith(prefix + "/"):
+                raise SandboxError(
+                    f"root view path {path!r} resolves over system path {prefix}; refusing"
+                )
+    # Masks bring no content (they cover with tmpfs or /dev/null), so they
+    # may name outside paths (an Eden backing to hide); only a cover over
+    # a system path itself is refused.
+    masks = view.get("masks", [])
+    if isinstance(masks, list):
+        for item in masks:
+            path = str(item)
+            if not os.path.isabs(path):
+                raise SandboxError(f"root view mask {path!r} is not absolute; refusing")
+            resolved = os.path.realpath(path)
+            for prefix in _SYSTEM_TARGET_PREFIXES:
+                if resolved == prefix or resolved.startswith(prefix + "/"):
+                    raise SandboxError(
+                        f"root view mask {path!r} resolves over system path {prefix}; refusing"
+                    )
+
+
+def _caller_groups() -> list[int] | None:
+    """The invoking caller's groups, from sudo's parent's /proc status."""
+
     try:
-        info = os.fstat(descriptor)
-        problems = []
-        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != uid or directory.st_mode & 0o077:
-            problems.append("its directory is not private to the invoking user")
-        if not stat.S_ISREG(info.st_mode):
-            problems.append("it is not a regular file")
-        if info.st_uid != uid:
-            problems.append("it is not owned by the invoking user")
-        if stat.S_IMODE(info.st_mode) != 0o600:
-            problems.append("its mode is not 0600")
-        if info.st_nlink != 1:
-            problems.append("it has other links")
-        if info.st_size > _SPEC_BYTES_LIMIT:
-            problems.append("it is too large")
-        if problems:
-            raise SandboxError("refusing the root launcher spec: " + "; ".join(problems))
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1 << 20)
-            if not chunk:
+        sudo_pid = os.getppid()
+        parent = Path(f"/proc/{sudo_pid}/status").read_text(encoding="utf-8")
+        caller_pid = int(next(l.split()[1] for l in parent.splitlines() if l.startswith("PPid:")))
+        status = Path(f"/proc/{caller_pid}/status").read_text(encoding="utf-8")
+        groups = next(l for l in status.splitlines() if l.startswith("Groups:"))
+        return sorted({int(item) for item in groups.split()[1:]})
+    except (OSError, ValueError, StopIteration):
+        return None
+
+
+def _remount_nosuid_nodev(target: str) -> None:
+    """Remount one made bind NOSUID|NODEV, preserving its ro/rw and noexec flags."""
+
+    flags = _MS_BIND | _MS_REMOUNT | _MS_NOSUID | _MS_NODEV
+    try:
+        for line in Path("/proc/self/mounts").read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if len(fields) >= 4 and fields[1].encode().decode("unicode_escape") == target:
+                options = set(fields[3].split(","))
+                if "ro" in options:
+                    flags |= _MS_RDONLY
+                if "noexec" in options:
+                    flags |= _MS_NOEXEC
                 break
-            chunks.append(chunk)
-            if sum(len(part) for part in chunks) > _SPEC_BYTES_LIMIT:
-                raise SandboxError("refusing the root launcher spec: it is too large")
-    finally:
-        os.close(descriptor)
-        with contextlib.suppress(OSError):
-            os.unlink(spec_file)
-    try:
-        document = json.loads(b"".join(chunks))
-    except ValueError as exc:
-        raise SandboxError(f"the root launcher spec is not JSON: {exc}") from exc
-    if not isinstance(document, dict):
-        raise SandboxError("root sandbox spec must be a JSON object")
-    return document
+    except OSError:
+        pass
+    _mount(None, target, None, flags)
 
 
-def enter_root(spec_file: str) -> None:
+def enter_root() -> None:
     """``sudo -n`` side of ``isolation: root``: build the view, drop to the user, run the command.
 
-    The identity comes from sudo (SUDO_UID, SUDO_GID, and the user's groups from
-    the group database); the spec must agree with it. The spec, which carries
-    the complete child environment because sudo scrubbed ours, is accepted only
-    from a 0600 file owned by the user in a directory only the user can write,
-    and is deleted as soon as it is read. Privilege is shed in two steps: uid,
-    gid, and groups become the user's immediately, keeping only CAP_SYS_ADMIN,
-    so the view is built with the user's own path access (a FUSE mount the user
-    owns stays reachable); then that capability is dropped too, and the command
-    replaces this process.
+    The spec arrives on stdin (no path argument, so no root-side lookup or
+    unlink of a user path ever happens). Privilege is shed FIRST, keeping
+    only CAP_SYS_ADMIN, and every check on the spec then runs as the
+    invoking user: identity from sudo, groups intersected with the
+    caller's own, registration as an accident guard, and every view
+    source/target beneath an allowed root with symlink-free resolution.
+    Dumpable stays 0 from entry to exec. Setuid programs inside work by
+    design (that is root mode's purpose; there is deliberately no
+    NO_NEW_PRIVS seal), so the allowlist above is the boundary.
 
-    No user namespace is created, so setuid programs inside the box work. No
-    PID namespace either: harness launchers that talk to the user's systemd
-    manager fail inside one (the bus cannot identify a peer in another PID
-    namespace), so host processes stay visible (see the user guide's "Limits of
+    No user namespace is created. No PID namespace either: harness
+    launchers that talk to the user's systemd manager fail inside one,
+    so host processes stay visible (see the user guide's "Limits of
     the box").
     """
 
     if os.geteuid() != 0:
-        with contextlib.suppress(OSError):
-            os.unlink(spec_file)
         raise SandboxError("enter-root must run as root (through sudo -n)")
+    _prctl(_PR_SET_DUMPABLE, 0)
+    uid, gid, db_groups, name = _sudo_identity()
+    caller = _caller_groups()
+    groups = sorted(set(caller) & set(db_groups)) if caller is not None else db_groups
+    os.setgroups(groups)
+    os.setresgid(gid, gid, gid)
+    _prctl(_PR_SET_KEEPCAPS, 1)
+    os.setresuid(uid, uid, uid)
+    _set_capabilities([_CAP_SYS_ADMIN])
+    _prctl(_PR_SET_KEEPCAPS, 0)
+    raw = sys.stdin.buffer.read(_SPEC_BYTES_LIMIT + 1)
+    if len(raw) > _SPEC_BYTES_LIMIT:
+        raise SandboxError("the root launcher spec is too large; refusing")
     try:
-        uid, gid, groups, name = _sudo_identity()
-    except SandboxError:
-        with contextlib.suppress(OSError):
-            os.unlink(spec_file)
-        raise
-    document = _read_root_spec(spec_file, uid)
-    view = document["view"]
-    assert isinstance(view, dict)
+        document = json.loads(raw)
+    except ValueError as exc:
+        raise SandboxError(f"the root launcher spec is not JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise SandboxError("root sandbox spec must be a JSON object")
+    view = _check_root_schema(document)
+    _verify_registered(document, uid)
+    _check_root_paths(document, view)
     raw_command = document["command"]
     raw_environment = document["environment"]
     raw_groups = document.get("groups", [])
@@ -2136,22 +2367,22 @@ def enter_root(spec_file: str) -> None:
         raise SandboxError("the root launcher spec has invalid groups")
     command = [str(item) for item in raw_command]
     environment = {str(key): str(value) for key, value in raw_environment.items()}
-    claimed = (document.get("uid"), document.get("gid"), sorted(set(raw_groups)))
-    if claimed != (uid, gid, groups):
+    if document.get("uid") != uid or document.get("gid") != gid:
         raise SandboxError(
-            f"the root launcher spec names uid/gid/groups {claimed[0]}/{claimed[1]}/{claimed[2]}, "
-            f"but sudo was invoked by {name} ({uid}/{gid}/{groups}); refusing"
+            f"the root launcher spec names uid/gid {document.get('uid')}/{document.get('gid')}, "
+            f"but sudo was invoked by {name} ({uid}/{gid}); refusing"
         )
-    os.setgroups(groups)
-    os.setresgid(gid, gid, gid)
-    _prctl(_PR_SET_KEEPCAPS, 1)
-    os.setresuid(uid, uid, uid)
-    _set_capabilities([_CAP_SYS_ADMIN])
-    _prctl(_PR_SET_KEEPCAPS, 0)
-    _prctl(_PR_SET_DUMPABLE, 1)
+    if sorted(set(raw_groups)) != groups:
+        raise SandboxError("the root launcher spec groups are not the caller's own; refusing")
     os.umask(int(str(document.get("umask", 0o022))))
     _check(_libc().unshare(_CLONE_NEWNS), "unshare mount namespace")
     build_view(view)
+    _check_root_paths(document, view)
+    raw_binds = view.get("binds", [])
+    if isinstance(raw_binds, list):
+        for pair in raw_binds:
+            if isinstance(pair, list) and len(pair) == 2:
+                _remount_nosuid_nodev(str(pair[1]))
     command = _traced(view, command, environment)
     _set_capabilities([])
     if os.getuid() != uid or os.geteuid() != uid or os.getgid() != gid:
@@ -2163,13 +2394,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
     """Internal entry points.
 
     ``sandbox.py enter SPEC-JSON -- COMMAND...``   (userns, as the user)
-    ``sandbox.py enter-root SPEC-FILE``            (root, through sudo -n)
+    ``sandbox.py enter-root``                      (root, through sudo -n; spec on stdin)
     """
 
     values = list(sys.argv[1:] if argv is None else argv)
     try:
-        if len(values) == 2 and values[0] == "enter-root":
-            enter_root(values[1])
+        if len(values) == 1 and values[0] == "enter-root":
+            enter_root()
         elif len(values) >= 4 and values[0] == "enter" and values[2] == "--":
             loaded: object = json.loads(values[1])
             if not isinstance(loaded, dict):
@@ -2177,7 +2408,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             enter_userns({str(key): value for key, value in loaded.items()}, values[3:])
         else:
             print(
-                "usage: sandbox.py enter SPEC-JSON -- COMMAND... | sandbox.py enter-root SPEC-FILE",
+                "usage: sandbox.py enter SPEC-JSON -- COMMAND... | sandbox.py enter-root (spec on stdin)",
                 file=sys.stderr,
             )
             return 2
@@ -2211,16 +2442,50 @@ def userns_helper(spec: Mapping[str, object], command: Sequence[str]) -> list[st
     ]
 
 
-def root_helper(spec_file: str) -> list[str]:
+#: Version of the root-helper protocol in this file. The launcher refuses
+#: an installed copy whose version differs (#1583, review finding 5).
+_HELPER_VERSION = "2"
+
+
+def _installed_helper_version(path: Path) -> str | None:
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("_HELPER_VERSION"):
+                return line.partition("=")[2].strip().strip('"').strip("'")
+    except OSError:
+        return None
+    return None
+
+
+def root_helper() -> list[str]:
     """Argv that builds the view as root through ``sudo -n``, then drops privilege.
 
-    When this interpreter writes no bytecode (``python3 -B``), the root helper
-    gets ``-B`` too. It has to travel in argv: ``-I`` ignores
-    ``PYTHONDONTWRITEBYTECODE`` and sudo scrubs the environment anyway.
+    The spec travels on stdin, so the argv is fixed (no path, no wildcard).
+    Always ``-I -B``: ``-I`` ignores ``PYTHONDONTWRITEBYTECODE`` and sudo
+    scrubs the environment anyway. The root-owned installed copy is the
+    only path a sudoers entry may safely name; a version mismatch with
+    this file refuses instead of silently running a stale helper.
     """
 
-    flags = ["-I", "-B"] if sys.dont_write_bytecode else ["-I"]
-    return ["sudo", "-n", "--", _interpreter(), *flags, str(Path(__file__).resolve()), "enter-root", spec_file]
+    script = Path(__file__).resolve()
+    if _INSTALLED_HELPER.is_file():
+        if _installed_helper_version(_INSTALLED_HELPER) != _HELPER_VERSION:
+            raise SandboxError(
+                f"installed root helper {_INSTALLED_HELPER} is not version {_HELPER_VERSION}; refusing"
+            )
+        script = _INSTALLED_HELPER
+    return ["sudo", "-n", "--", _interpreter(), "-I", "-B", str(script), "enter-root"]
+
+
+def _exec_root_helper(argv: Sequence[str], spec_file: str, environment: Mapping[str, str]) -> None:
+    """Exec the root helper with the spec file as its stdin (never its argv)."""
+
+    descriptor = os.open(spec_file, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.dup2(descriptor, 0)
+    finally:
+        os.close(descriptor)
+    os.execvpe(argv[0], list(argv), dict(environment))
 
 
 def check_sudo(*, deadline_ns: int | None = None) -> None:
@@ -2279,7 +2544,8 @@ _STALE_SPEC_SECONDS = 300
 
 
 def write_root_spec(
-    spec: Mapping[str, object], command: Sequence[str], environment: Mapping[str, str]
+    spec: Mapping[str, object], command: Sequence[str], environment: Mapping[str, str],
+    *, registered: Mapping[str, object] | None = None,
 ) -> str:
     """Write the root helper's input to a 0600 file in the user's runtime tmpfs.
 
@@ -2312,6 +2578,10 @@ def write_root_spec(
         "gid": os.getgid(),
         "groups": sorted(set(os.getgroups())),
         "umask": umask,
+        # What the root helper must find registered before it builds
+        # anything (#1583): {"kind": "slot", "slot", "slot_path", "control"}
+        # or {"kind": "box", "control"} for a coordinator box.
+        "registered": dict(registered) if registered is not None else None,
     }
     descriptor, path = tempfile.mkstemp(prefix="sandbox-", suffix=".json", dir=directory)
     try:
@@ -2426,7 +2696,7 @@ def run(
         if isolation == "userns":
             print(" \\\n  ".join(_quote(part) for part in userns_helper(spec, command)))
         elif isolation == "root":
-            print(" ".join(_quote(part) for part in root_helper("SPEC-FILE")))
+            print(" ".join(_quote(part) for part in root_helper()))
             print(json.dumps({"view": spec, "command": list(command)}, indent=2, sort_keys=True))
         else:
             print(" ".join(_quote(part) for part in command))
@@ -2451,11 +2721,15 @@ def run(
     for line in apply_slice_limits(view, settings.limits):
         print(f"wrkslots run: limits {line}", file=sys.stderr)
     environment = child_environment(view, settings, os.environ)
+    root_spec: str | None = None
     if isolation == "userns":
         argv = userns_helper(build_spec(view, settings, home, workdir), command)
     elif isolation == "root":
-        spec_file = write_root_spec(build_spec(view, settings, home, workdir), command, environment)
-        argv = root_helper(spec_file)
+        root_spec = write_root_spec(
+            build_spec(view, settings, home, workdir), command, environment,
+            registered=_registered_claim(view),
+        )
+        argv = root_helper()
     else:
         os.chdir(workdir)
         argv = list(command)
@@ -2463,11 +2737,13 @@ def run(
     # the command inherit the slot's cgroup.
     try:
         if place_in_scope(unit_name, slot_slice):
+            if root_spec is not None:
+                _exec_root_helper(argv, root_spec, environment)
             os.execvpe(argv[0], argv, environment)
     except OSError:
-        if isolation == "root":
+        if root_spec is not None:
             with contextlib.suppress(OSError):
-                os.unlink(argv[-1])
+                os.unlink(root_spec)
         raise
     print(
         "wrkslots run: the user manager's D-Bus API is unavailable, so the command runs under "
@@ -2485,6 +2761,8 @@ def run(
         "--",
         *argv,
     ]
+    if root_spec is not None:
+        _exec_root_helper(fallback, root_spec, environment)
     os.execvpe(fallback[0], fallback, environment)
 
 
@@ -2583,7 +2861,7 @@ def in_scope_plan(
         "slices": expected.to_obj(),
         "writable": writable,
         "masks": masks,
-        "helper": root_helper("SPEC-FILE"),
+        "helper": root_helper(),
         "command": list(command),
         "view": spec,
     }
@@ -2702,11 +2980,11 @@ def enter_in_place(
     # And from the spec the helper will actually build.
     _check_expected_writable(writable_set(spec, created_sources=planned), expected_writable)
     _check_expected_masks(mask_report(spec), expected_masks)
-    spec_file = write_root_spec(spec, command, environment)
-    argv = root_helper(spec_file)
+    spec_file = write_root_spec(spec, command, environment, registered=_registered_claim(view))
+    argv = root_helper()
     try:
         _timeout(deadline_ns, "entering the box")
-        os.execvpe(argv[0], argv, environment)
+        _exec_root_helper(argv, spec_file, environment)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(spec_file)

@@ -680,6 +680,11 @@ def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
     for directory in ("slot", "state", "control", "outside", "project/ai_docs", "project/src"):
         (box_base / directory).mkdir(parents=True)
     slot = f"pytest-{isolation}-{os.getpid()}"
+    if isolation == "root":
+        # A root launch must name a registered slot (#1583); model one.
+        (box_base / "control" / "ACTIVE.test.json").write_text(
+            json.dumps({"slots": [{"slot": slot, "agent": "worker"}]}), encoding="utf-8"
+        )
     script = (
         "import sys\n"
         "from pathlib import Path\n"
@@ -827,7 +832,12 @@ def test_other_slots_and_the_registry_are_read_only_from_a_box(
     for directory in (mine, other, box_base / "project"):
         directory.mkdir(parents=True)
     (other / "secret.txt").write_text("other slot's work\n", encoding="utf-8")
-    (control / "ACTIVE.testhost.json").write_text('{"registry": true}\n', encoding="utf-8")
+    (control / "ACTIVE.testhost.json").write_text(
+        '{"registry": true, "slots": [{"slot": "'
+        + f"pytest-ctl-{isolation}-{layout}-{int(protect_system)}-{os.getpid()}"
+        + '", "agent": "worker"}]}\n',
+        encoding="utf-8",
+    )
     other_layer = control / "slot-state" / "agent" / "other" / "home"
     other_layer.mkdir(parents=True)
     (other_layer / ".claude.json").write_text("{}", encoding="utf-8")
