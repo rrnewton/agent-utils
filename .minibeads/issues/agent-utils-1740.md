@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-validate-batch-census-bound-flag: let an operator raise the validate-batch census bound on a saturated host'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-16T16:24:09-05:00
-updated_at: 2026-11-16T16:24:09-05:00
+updated_at: 2026-11-16T18:13:43-05:00
+closed_at: 2026-11-16T18:13:43-05:00
 ---
 
 # Description
@@ -61,3 +62,24 @@ today the only remedy is to wait for the host to quieten.
   Python edition; no Rust change is needed (see Design).
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as
+`528cf2ad6e4edcd0c435fbdd94b36c6b4a17ea38` (gated tree `0763b42e`;
+owner-priority gate pass, local validate OK on the exact tree).
+`--census-seconds SECONDS` now raises the shared census bound on
+`remove-validate-batch` (computed default 120 s plus 60 s per further
+slot), `remove --validate-complete` / `--validation-proof-manifest`,
+`recover-ownerless-validate-batch`, and
+`classify-ownerless-validate-batch` (flat 120 s default). Raise-only:
+below the computed default refuses, above 3600 s refuses, defaults
+unchanged without the flag. A census-timeout refusal names the rerun
+("rerun with --census-seconds N to allow a slower census"). Documented
+in `--help` and the user guide; `check_documented_defaults.py` passes.
+Rust parity: none needed — the Rust edition does not implement
+`remove-validate-batch`, the ownerless-batch recovery census stays
+with the Python edition, and `remove` refuses validate slots to
+Python, so no Rust census budget exists to raise. Tests use a stubbed
+clock and budget only; the new defect tests fail on the parent code
+and pass landed.
