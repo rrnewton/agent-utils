@@ -20584,7 +20584,8 @@ class _GitVcs:
         """Yield a temporary bare repository whose only configuration is _NETWORK_CONFIG.
 
         Its objects are ``objects``, or, with ``own_objects``, a store of its
-        own that starts empty and has no alternates. Each of ``alternates``
+        own that starts empty (the proof mirror, #1692, adds its remotely
+        fetched objects as the one alternate). Each of ``alternates``
         is added as an alternate object directory, read-only. The temporary
         repository is made in ``parent`` when given, otherwise in the
         system temporary directory.
@@ -20592,8 +20593,6 @@ class _GitVcs:
 
         if objects.is_symlink() or not objects.is_dir():
             raise Refusal(f"Git object directory is absent or unsafe: {objects}")
-        if own_objects and alternates:
-            raise StateError("an isolated repository with its own objects has no alternates")
         for alternate in alternates:
             if alternate.is_symlink() or not alternate.is_dir():
                 raise Refusal(f"Git object directory is absent or unsafe: {alternate}")
@@ -21344,10 +21343,52 @@ class _GitVcs:
         # With own_objects the first argument names no store that is used;
         # it only has to be a real object directory, and a linked worktree's
         # own Git directory has none, so the shared one is named.
+        # With a proof mirror (#1692) there is no fetch at all: the mirror's
+        # objects, fetched from the remote and self-checked at refresh time,
+        # are read as an alternate, and the proof refs name the advertised
+        # tips directly. The store still starts empty and lazy fetching is
+        # still off, so every commit walked is one the remote sent.
+        mirror_alternates: tuple[Path, ...] = ()
+        if source_url is not None:
+            mirror_alternates = (Path(source_url) / "objects",)
         with self._isolated_repository(
-            common / "objects", own_objects=True, parent=git_directory
+            common / "objects",
+            own_objects=True,
+            alternates=mirror_alternates,
+            parent=git_directory,
         ) as (isolated, object_env):
             (isolated / "config").write_bytes(proof_config)
+            if source_url is not None:
+                self._run(
+                    isolated,
+                    ["update-ref", "--stdin"],
+                    input_text="".join(
+                        f"update {proof_root}{index} {missing[name]}\n"
+                        for index, name in enumerate(names)
+                    ),
+                    env_overrides={
+                        **object_env,
+                        _NETWORK_CONFIG_SHA256_ENV: hashlib.sha256(
+                            proof_config
+                        ).hexdigest(),
+                    },
+                )
+                (isolated / "config").write_bytes(_NETWORK_CONFIG)
+                expected_mirror = {
+                    f"{proof_root}{index}": missing[name]
+                    for index, name in enumerate(names)
+                }
+                if (
+                    self._direct_ref_inventory(
+                        isolated, proof_root, env_overrides=object_env
+                    )
+                    != expected_mirror
+                ):
+                    raise Refusal(
+                        "proof mirror does not hold the commits it advertised"
+                    )
+                yield isolated, {**object_env, "GIT_NO_LAZY_FETCH": "1"}, proof_root
+                return
             fetched = self._run_bytes(
                 isolated,
                 [

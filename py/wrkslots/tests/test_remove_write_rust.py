@@ -1422,6 +1422,7 @@ def _scrub_finish_journal(journal: dict[str, object]) -> str:
             identity["pid"] = identity["start_ticks"] = "SLOT-OWNER"
     for item in cast(list[dict[str, object]], copy.get("salvage", [])):
         item["source_head"] = item["salvage_commit"] = "HEAD"
+        item.pop("proof_mirror", None)
     return json.dumps(copy, indent=2, sort_keys=True)
 
 
