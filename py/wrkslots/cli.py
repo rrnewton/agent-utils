@@ -7103,19 +7103,32 @@ def _run_prevalidated_mutation(
                 raise
             continue
         except _SealInProgress as seal_busy:
-            # A live validation-batch seal (#1736): wait without the locks
-            # for its batch to retire it, bounded by the same --wait-lock
-            # deadline, then re-validate.
+            # A live validation-batch seal (#1736): wait without the locks,
+            # bounded by the same --wait-lock deadline. Each wake re-judges
+            # the seal: if its batch died meanwhile, stop waiting and let
+            # the next round refuse it as interrupted (or proceed if the
+            # seal is gone); never wait out the deadline on a stale live.
             if wait_seconds <= 0.0 or time.monotonic() >= lock_deadline:
                 raise
             while time.monotonic() < lock_deadline:
+                _wait_for_control_change(
+                    config, max(0.0, lock_deadline - time.monotonic())
+                )
                 if not seal_busy.journal.exists():
                     break
-                time.sleep(
-                    min(0.05, max(0.0, lock_deadline - time.monotonic()))
+                state, _pid, _since, _detail = (
+                    _validate_batch_seal_owner_liveness(config, seal_busy.journal)
                 )
+                if state != "live":
+                    break
+            else:
+                raise seal_busy
             if seal_busy.journal.exists():
-                raise
+                state, _pid, _since, _detail = (
+                    _validate_batch_seal_owner_liveness(config, seal_busy.journal)
+                )
+                if state == "live":
+                    raise seal_busy
             continue
     raise _RegistryBusy(
         f"registry is busy: another wrkslots mutation changed it during each of the "
@@ -25812,6 +25825,7 @@ def _other_live_wrkslots_processes(
             continue
         if targets and not any(
             part == target
+            or part.partition("=")[0] == target
             or f"/{target}/" in part
             or part.endswith(f"/{target}")
             for target in targets
@@ -37785,6 +37799,36 @@ def _validate_batch_seal_owner_liveness(
         boot_id = _boot_id(Path("/proc"))
     except Refusal as exc:
         return "unknown", identity.pid, since, str(exc)
+    operator = (
+        _identity_from_obj(
+            raw["operator"], "validation-batch seal journal.operator"
+        )
+        if raw.get("operator") is not None
+        else None
+    )
+    if operator is not None:
+        # The recorded batch process is the proven identity (#1736):
+        # judge it alone, with no pid-reuse risk from a cmdline scan.
+        if operator.host_id != host_id:
+            return (
+                "unknown",
+                operator.pid,
+                since,
+                "the seal's operator belongs to another machine identity",
+            )
+        if operator.boot_id != boot_id:
+            return "dead", operator.pid, since, "the recorded machine boot ended"
+        ostate, oreason = _process_state(operator)
+        if ostate == "live":
+            return "live", operator.pid, since, oreason
+        if ostate == "dead":
+            return "dead", operator.pid, since, oreason
+        return (
+            "unknown",
+            operator.pid,
+            since,
+            f"the seal's operator is {ostate}: {oreason}",
+        )
     if identity.host_id != host_id:
         return (
             "unknown",
@@ -37813,6 +37857,13 @@ def _validate_batch_seal_owner_liveness(
             )
         ),
     )
+    if operators == [-1]:
+        return (
+            "unknown",
+            None,
+            since,
+            "the process list cannot be read, so no batch process can be proven",
+        )
     if operators:
         return "live", operators[0], since, reason
     return (
@@ -38367,6 +38418,43 @@ def _recover_dead_actor_journals(config: Config) -> None:
             f"wrkslots: recovered the dead actor's journal {path.name}; {reason}",
             file=sys.stderr,
         )
+
+
+def _wait_for_control_change(config: Config, timeout_seconds: float) -> None:
+    """Block until the control directory changes or the timeout passes (#1755).
+
+    Event-driven (inotify on the control directory), never a sleep
+    poll: a waiter for a live finish journal wakes when that journal
+    is rewritten or removed. Where inotify is unavailable the wait
+    degrades to a single bounded sleep of the remaining budget.
+    """
+
+    if timeout_seconds <= 0.0:
+        return
+    fd: int | None = None
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # IN_NONBLOCK | IN_CLOEXEC; watch create/delete/move of journals.
+        fd = int(libc.inotify_init1(0o4000 | 0o2000000))
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+        watch = int(
+            libc.inotify_add_watch(
+                fd,
+                os.fsencode(config.control),
+                0x00000FFF,  # IN_ALL_EVENTS
+            )
+        )
+        if watch < 0:
+            raise OSError(ctypes.get_errno(), "inotify_add_watch failed")
+        with selectors.DefaultSelector() as selector:
+            selector.register(fd, selectors.EVENT_READ)
+            selector.select(timeout_seconds)
+    except (OSError, AttributeError, ValueError):
+        time.sleep(timeout_seconds)
+    finally:
+        if fd is not None and fd >= 0:
+            os.close(fd)
 
 
 def _assert_no_journal(
@@ -56671,7 +56759,7 @@ def _validate_batch_seal_journal(
     _exact_keys(
         raw,
         {"schema", "kind", "machine", "created_at", "actor", "targets"},
-        _JOURNAL_EXTENSION_KEYS,
+        _JOURNAL_EXTENSION_KEYS | {"operator"},
         "validation-batch seal journal",
     )
     if _as_int(raw["schema"], "validation-batch seal journal.schema") != (
@@ -56692,6 +56780,14 @@ def _validate_batch_seal_journal(
     )
     if _identity_from_obj(raw["actor"], "validation-batch seal journal.actor") is None:
         raise StateError("validation-batch seal journal has no actor")
+    if (
+        raw.get("operator") is not None
+        and _identity_from_obj(
+            raw["operator"], "validation-batch seal journal.operator"
+        )
+        is None
+    ):
+        raise StateError("validation-batch seal journal has no operator")
     targets = tuple(
         _private_cleanup_target_from_obj(
             config, item, f"validation-batch seal journal.targets[{index}]"
@@ -61859,6 +61955,10 @@ def _seal_validate_batch_targets(
             "machine": config.machine,
             "created_at": _utc_now(),
             "actor": _identity_to_obj(coordinator),
+            # The batch process itself (#1736): the actor above is the
+            # authorizing coordinator, which routinely outlives the
+            # batch, so liveness judges this proven identity instead.
+            "operator": _identity_to_obj(_read_process_identity(os.getpid())),
             "targets": [],
         }
         _write_owned_validate_batch_seal_journal(config, seal_journal, owned_seal)

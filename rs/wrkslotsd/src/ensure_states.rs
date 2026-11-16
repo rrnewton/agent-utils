@@ -596,6 +596,7 @@ pub(crate) fn other_live_wrkslots_processes(root: &Path, targets: &[String]) -> 
             && !targets.iter().any(|target| {
                 argv.iter().any(|part| {
                     part == target
+                        || part.split('=').next() == Some(target.as_str())
                         || part.contains(&format!("/{target}/"))
                         || part.ends_with(&format!("/{target}"))
                 })
@@ -656,6 +657,26 @@ pub(crate) fn seal_owner_liveness(
         .get("created_at")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    // The recorded batch process is the proven identity (#1736):
+    // judge it alone when the seal carries one.
+    if let Some(operator_value) = value.get("operator") {
+        if !operator_value.is_null() {
+            let Some(operator) = crate::status_state::identity_from_value(operator_value) else {
+                return unknown("the seal records no operator".to_string());
+            };
+            let (ostate, odetail) = crate::status_state::process_state(Some(&operator));
+            return match ostate.as_str() {
+                "live" => ("live".to_string(), Some(operator.pid), since, odetail),
+                "dead" => ("dead".to_string(), Some(operator.pid), since, odetail),
+                _ => (
+                    "unknown".to_string(),
+                    Some(operator.pid),
+                    since,
+                    format!("the seal's operator is {ostate}: {odetail}"),
+                ),
+            };
+        }
+    }
     let (state, detail) = crate::status_state::process_state(Some(&identity));
     match state.as_str() {
         "dead" => ("dead".to_string(), Some(identity.pid), since, detail),
@@ -676,6 +697,15 @@ pub(crate) fn seal_owner_liveness(
                 }
             }
             let operators = other_live_wrkslots_processes(root, &targets);
+            if operators == [-1] {
+                return (
+                    "unknown".to_string(),
+                    None,
+                    since,
+                    "the process list cannot be read, so no batch process can be proven"
+                        .to_string(),
+                );
+            }
             if let Some(pid) = operators.first() {
                 ("live".to_string(), Some(*pid), since, detail)
             } else {

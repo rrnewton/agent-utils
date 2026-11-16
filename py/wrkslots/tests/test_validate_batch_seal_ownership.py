@@ -367,6 +367,11 @@ def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
                 "target" if sealer == "live-with-wrkslots-operator" else "other-slot",
             ]
         )
+        if sealer == "live-with-wrkslots-operator":
+            # The seal's recorded batch process is this operator (#1736):
+            # recover must refuse while it lives.
+            _rewrite_operator(seal, operator.pid)
+            sealed = seal.read_bytes()
     try:
         recovered = raw_command_with_census_authority_stub(
             project,
@@ -530,6 +535,14 @@ def _crashed_seal(
 def _rewrite_actor(seal: Path, **fields: object) -> None:
     raw = json.loads(seal.read_text())
     raw["actor"].update(fields)
+    if isinstance(raw.get("operator"), dict):
+        raw["operator"].update(fields)
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+
+def _rewrite_operator(seal: Path, pid: int) -> None:
+    raw = json.loads(seal.read_text())
+    raw["operator"] = wrkslots._identity_to_obj(wrkslots._read_process_identity(pid))
     seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
 
 
@@ -608,9 +621,12 @@ def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
 
     classified = _classify(project, "next")
     assert classified.returncode != 0
-    if actor in ("live", "other-boot"):
-        # No wrkslots process acts on the target (and an ended boot is
-        # dead everywhere in wrkslots): interrupted, recovery named.
+    if actor == "live":
+        # The rewrite names this live process as actor and operator.
+        assert "in progress (pid " in classified.stderr
+        assert "recover" not in classified.stderr
+    elif actor == "other-boot":
+        # An ended boot is dead everywhere in wrkslots.
         assert "interrupted validation-batch seal recorded" in classified.stderr
     else:
         # Another machine proves nothing: no recovery suggestion.
@@ -634,9 +650,9 @@ def test_classify_reports_live_validate_batch_seal_as_structured_blocking_reason
     classified = _classify(project, "next")
 
     assert classified.returncode == 3, classified.stderr
-    # No wrkslots process acts on the target, so the refusal wording
-    # is interrupted even though the structured state stays live.
-    assert "interrupted validation-batch seal recorded" in classified.stderr
+    # The rewrite names this live process as the seal's operator.
+    assert "in progress (pid " in classified.stderr
+    assert "recover" not in classified.stderr
     payload = json.loads(classified.stdout)
     assert payload["blocking"] is True
     assert payload["schema"] == 2
@@ -985,7 +1001,6 @@ def test_adopt_names_a_live_seal_as_in_progress_without_suggesting_recover(
     _rewrite_actor(
         seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
     )
-    sealed = seal.read_bytes()
     operator = subprocess.Popen(
         [
             sys.executable,
@@ -999,6 +1014,8 @@ def test_adopt_names_a_live_seal_as_in_progress_without_suggesting_recover(
             "target",
         ]
     )
+    _rewrite_operator(seal, operator.pid)
+    sealed = seal.read_bytes()
     try:
         result = _adopt_target(project)
     finally:
@@ -1024,6 +1041,10 @@ def test_adopt_calls_a_seal_whose_batch_is_gone_interrupted_even_if_coordinator_
     _rewrite_actor(
         seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
     )
+    # The batch process itself stays the crashed (dead) one.
+    raw = json.loads(seal.read_text())
+    raw["operator"]["pid"] = 2_147_483_647
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
     sealed = seal.read_bytes()
 
     assert _adopt_target(project) == 3
@@ -1051,6 +1072,111 @@ def test_adopt_calls_a_dead_actors_seal_interrupted_and_suggests_recover(
     assert seal.read_bytes() == sealed
 
 
+def test_a_real_running_batch_is_in_progress_to_adopt_and_recover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#1736: an actual remove-validate-batch child owns its seal.
+
+    The batch process is blocked inside its shared census on a FIFO,
+    so the seal it published (recording the batch process itself as
+    operator) is live for real: adopt and recover both name it in
+    progress with the batch pid, and neither suggests or performs a
+    recovery against it.
+    """
+
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    entered = tmp_path / "batch-entered"
+    fifo = tmp_path / "batch-fifo"
+    os.mkfifo(fifo)
+    launcher = tmp_path / "batch_launcher.py"
+    launcher.write_text(
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from wrkslots import cli\n"
+        "cli._assert_slot_unused = lambda *a, **k: None\n"
+        "def census(paths, **kw):\n"
+        "    Path(os.environ['BATCH_ENTERED']).touch()\n"
+        "    with open(os.environ['BATCH_FIFO'], 'rb') as fh:\n"
+        "        fh.read(1)\n"
+        "    return cli._ProcessPathCensus((), ())\n"
+        "cli._capture_process_path_census = census\n"
+        "cli._capture_same_uid_process_path_census = (\n"
+        "    lambda paths, **kw: cli._ProcessPathCensus((), ())\n"
+        ")\n"
+        "cli._production_frozen_validation_authority_commit = (\n"
+        "    cli._frozen_validation_authority_commit\n"
+        ")\n"
+        "cli._validation_run_host_evidence = lambda: ((), ())\n"
+        "cli._retained_unit_cgroup_members = lambda units, root=None: dict.fromkeys(units, 0)\n"
+        "cli._assert_host_process_view = lambda: None\n"
+        "raise SystemExit(cli.main(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    from wrkslots.tests.test_lifecycle import source_environment
+
+    env = source_environment()
+    env["BATCH_ENTERED"] = str(entered)
+    env["BATCH_FIFO"] = str(fifo)
+    batch = subprocess.Popen(
+        [
+            sys.executable,
+            str(launcher),
+            "--project-root",
+            str(project),
+            "remove-validate-batch",
+            "--slot",
+            "target=1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # Condition wait (hang guard only): the batch is inside its
+        # census, holding its seal, when these assertions run.
+        for _ in range(1200):
+            if entered.exists():
+                break
+            assert batch.poll() is None, "batch exited before its census"
+            import time as _time
+
+            _time.sleep(0.05)
+        assert entered.exists(), "batch never reached its census"
+        assert seal.is_file()
+
+        assert _adopt_target(project) == 3
+        adopt_err = capsys.readouterr().err
+        assert f"pid {batch.pid}" in adopt_err
+        assert "recover" not in adopt_err
+        recovered = raw_command_with_census_authority_stub(
+            project,
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+        assert recovered.returncode == 3, recovered.stderr
+        assert f"pid {batch.pid}" in recovered.stderr
+        assert seal.is_file()
+        assert target.is_dir()
+    finally:
+        with open(fifo, "wb") as handle:
+            handle.write(b"x")
+        out, err = batch.communicate(timeout=120)
+
+    assert batch.returncode == 0, err
+    assert not seal.exists()
+    assert not target.exists()
+    assert active_slots(project) == []
+
+
 def test_recover_refuses_a_seal_whose_batch_is_still_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1060,7 +1186,6 @@ def test_recover_refuses_a_seal_whose_batch_is_still_running(
     _rewrite_actor(
         seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
     )
-    sealed = seal.read_bytes()
     operator = subprocess.Popen(
         [
             sys.executable,
@@ -1074,6 +1199,8 @@ def test_recover_refuses_a_seal_whose_batch_is_still_running(
             "target",
         ]
     )
+    _rewrite_operator(seal, operator.pid)
+    sealed = seal.read_bytes()
     try:
         recovered = raw_command_with_census_authority_stub(
             project,
