@@ -1295,6 +1295,28 @@ class _JournalBusy(Refusal):
         self.since = since
 
 
+class _SealInProgress(Refusal):
+    """A validation-batch seal whose recorded owner is proven alive (#1736).
+
+    Retryable busy, not interrupted: the batch that owns the seal is
+    still running, so no recovery may be suggested against it. Carries
+    the seal path so a waiting caller can poll for its retirement
+    without holding the registry locks.
+    """
+
+    def __init__(self, *, pid: int, since: str, journal: Path) -> None:
+        super().__init__(
+            f"validation-batch seal in progress (pid {pid}, since {since}) "
+            f"recorded in {journal}; the remove-validate-batch that owns it "
+            "is still running; wait for it to finish and retry; list "
+            "blocking journals with "
+            "'wrkslots classify-create-journals --all-kinds'"
+        )
+        self.pid = pid
+        self.since = since
+        self.journal = journal
+
+
 class _LockBusy(Refusal):
     """A bounded lock wait elapsed without acquiring the requested lock."""
 
@@ -7078,6 +7100,21 @@ def _run_prevalidated_mutation(
                     min(0.05, max(0.0, lock_deadline - time.monotonic()))
                 )
             if _outstanding_journals(config):
+                raise
+            continue
+        except _SealInProgress as seal_busy:
+            # A live validation-batch seal (#1736): wait without the locks
+            # for its batch to retire it, bounded by the same --wait-lock
+            # deadline, then re-validate.
+            if wait_seconds <= 0.0 or time.monotonic() >= lock_deadline:
+                raise
+            while time.monotonic() < lock_deadline:
+                if not seal_busy.journal.exists():
+                    break
+                time.sleep(
+                    min(0.05, max(0.0, lock_deadline - time.monotonic()))
+                )
+            if seal_busy.journal.exists():
                 raise
             continue
     raise _RegistryBusy(
@@ -37711,6 +37748,61 @@ def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str
     return True, f"its actor PID {identity.pid} is dead: {reason}"
 
 
+def _validate_batch_seal_owner_liveness(
+    config: Config, path: Path
+) -> tuple[str, int | None, str | None, str]:
+    """Liveness of one seal's recorded owner (#1736).
+
+    Returns ``(state, pid, created_at, detail)`` where ``state`` is
+    ``"live"`` only when the seal's actor ran on this machine identity
+    and this boot and its exact process generation is still alive --
+    the same proof ``_validate_batch_seal_orphaned`` and the journal
+    classifiers use (``_process_state``). ``"dead"`` only when that
+    generation is proven gone; every other outcome (another machine
+    or boot, an unreadable journal, an indeterminate probe) is
+    ``"unknown"`` and proves nothing either way.
+    """
+
+    try:
+        raw, _targets = _validate_batch_seal_journal(
+            config, path, _read_json(path, "validation-batch seal journal")
+        )
+    except (Refusal, StateError) as exc:
+        return "unknown", None, None, f"the seal cannot be judged: {exc}"
+    identity = _identity_from_obj(
+        raw["actor"], "validation-batch seal journal.actor"
+    )
+    if identity is None:
+        return "unknown", None, None, "the seal records no actor"
+    created_at = raw.get("created_at")
+    since = created_at if isinstance(created_at, str) else None
+    try:
+        host_id = _host_id()
+        boot_id = _boot_id(Path("/proc"))
+    except Refusal as exc:
+        return "unknown", identity.pid, since, str(exc)
+    if identity.host_id != host_id:
+        return (
+            "unknown",
+            identity.pid,
+            since,
+            "the seal's actor belongs to another machine identity",
+        )
+    if identity.boot_id != boot_id:
+        return (
+            "unknown",
+            identity.pid,
+            since,
+            "the seal's actor ran in an earlier boot",
+        )
+    state, reason = _process_state(identity)
+    if state == "live":
+        return "live", identity.pid, since, reason
+    if state == "dead":
+        return "dead", identity.pid, since, reason
+    return "unknown", identity.pid, since, f"the seal's actor is {state}: {reason}"
+
+
 def _classify_blocking_seal_reasons(config: Config) -> list[dict[str, object]]:
     """Structured reasons each non-orphaned seal blocks classification.
 
@@ -37829,9 +37921,27 @@ def _refuse_partial_state(
                 if not _validate_batch_seal_orphaned(config, path)[0]
             ]
         if seal_journals:
+            # A seal is "interrupted" only when its owner is proven dead
+            # (#1736). A live owner means the batch is still running:
+            # say so, name it, and never point at recover.
+            statuses = [
+                (path, *_validate_batch_seal_owner_liveness(config, path))
+                for path in seal_journals
+            ]
+            for path, state, pid, since, _detail in statuses:
+                if state == "live" and pid is not None and since is not None:
+                    raise _SealInProgress(pid=pid, since=since, journal=path)
+            if all(state == "dead" for _p, state, _pid, _s, _d in statuses):
+                raise Refusal(
+                    f"interrupted validation-batch seal recorded in {seal_journals[0]}; "
+                    "run 'wrkslots recover' first; list blocking journals with "
+                    "'wrkslots classify-create-journals --all-kinds'"
+                )
+            first_path, _state, _pid, _since, detail = statuses[0]
             raise Refusal(
-                f"interrupted validation-batch seal recorded in {seal_journals[0]}; "
-                "run 'wrkslots recover' first; list blocking journals with "
+                f"validation-batch seal recorded in {first_path}; its owner "
+                f"cannot be proven dead here ({detail}), so it still binds; "
+                "list blocking journals with "
                 "'wrkslots classify-create-journals --all-kinds'"
             )
 
@@ -52132,6 +52242,28 @@ def _audit_record(
     )
 
 
+def _audit_validate_batch_seal_reason(config: Config, machine: str) -> str:
+    """Doctor/status wording for one machine's validation-batch seal (#1736).
+
+    Only a proven-dead owner makes the seal "interrupted" with a
+    recovery suggestion; a live owner is a batch still in progress.
+    """
+
+    path = _validate_batch_seal_journal_path(config, machine)
+    state, pid, since, detail = _validate_batch_seal_owner_liveness(config, path)
+    if state == "live":
+        return (
+            f"validation-batch seal in progress (pid {pid}, since {since}); "
+            "the remove-validate-batch that owns it is still running"
+        )
+    if state == "dead":
+        return "interrupted validation-batch seal requires wrkslots recover"
+    return (
+        "validation-batch seal recorded; its owner cannot be proven dead "
+        f"here ({detail})"
+    )
+
+
 def _audit_validate_batch_seal_evidence(
     config: Config,
 ) -> tuple[
@@ -53029,7 +53161,7 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
             if sealed_generation == record.generation:
                 reasons.insert(
                     0,
-                    "interrupted validation-batch seal requires wrkslots recover",
+                    _audit_validate_batch_seal_reason(config, record.machine),
                 )
                 row["verdict"] = "BLOCKED"
             else:
@@ -53087,7 +53219,7 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
                         "wrkslots recover"
                         if journal_slot is not None
                         else (
-                            "interrupted validation-batch seal requires wrkslots recover"
+                            _audit_validate_batch_seal_reason(config, config.machine)
                             if sealed is not None
                             else (
                                 "validation directory has no active registry row; preserve "
@@ -53157,8 +53289,8 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
                 "record_sha256": None,
                 "verdict": "BLOCKED",
                 "reasons": [
-                    "interrupted validation-batch seal requires wrkslots recover; "
-                    f"recorded path={sealed_path}"
+                    _audit_validate_batch_seal_reason(config, machine)
+                    + f"; recorded path={sealed_path}"
                 ],
                 "owner_state": "validation-batch-seal",
                 "liveness_state": "unverifiable",
@@ -53393,7 +53525,7 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
             late_machine: object = journal_identity[0]
             late_generation: object = None
         elif late_sealed is not None:
-            reason = "interrupted validation-batch seal requires wrkslots recover"
+            reason = _audit_validate_batch_seal_reason(config, config.machine)
             owner_state = "validation-batch-seal"
             late_machine = config.machine
             late_generation = late_sealed[0]
@@ -53470,8 +53602,8 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
                 "record_sha256": None,
                 "verdict": "BLOCKED",
                 "reasons": [
-                    "interrupted validation-batch seal requires wrkslots recover; "
-                    f"recorded path={sealed_path}"
+                    _audit_validate_batch_seal_reason(config, row_machine)
+                    + f"; recorded path={sealed_path}"
                 ],
                 "owner_state": "validation-batch-seal",
                 "liveness_state": "unverifiable",
@@ -87821,9 +87953,22 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
     else:
         aligned_proofs = (None,) * len(checkouts)
     _refuse_partial_state(config, allow_validate_batch_seals=True)
-    if _validate_batch_seal_journals(config):
+    _seal_paths = _validate_batch_seal_journals(config)
+    if _seal_paths:
+        _state, _pid, _since, _detail = _validate_batch_seal_owner_liveness(
+            config, _seal_paths[0]
+        )
+        if _state == "live":
+            raise _SealInProgress(
+                pid=_pid or 0, since=_since or "", journal=_seal_paths[0]
+            )
+        if _state == "dead":
+            raise Refusal(
+                "an interrupted validation-batch seal is recorded; recover it before admission"
+            )
         raise Refusal(
-            "an interrupted validation-batch seal is recorded; recover it before admission"
+            "a validation-batch seal is recorded; its owner cannot be proven "
+            f"dead here ({_detail}), so admission still refuses"
         )
     before_states, before_archives = _validate_global_state(config)
     before_rows = _global_rows(before_states, before_archives)
@@ -88204,6 +88349,33 @@ def _cmd_recover(
                 loaded_seal = _load_validate_batch_seal_journal(config)
                 assert loaded_seal is not None
                 _seal_path, _seal_raw, sealed_targets = loaded_seal
+                # Recover never retires a live batch's seal (#1736): the
+                # seal's recorded owner is alive and a wrkslots process is
+                # still acting on the sealed targets. A live coordinator
+                # alone does not hold the seal open -- only a wrkslots
+                # process can be part way through a sealed removal (the
+                # absent-target deadlock this distinction already fixes).
+                _seal_state, _seal_pid, _seal_since, _seal_detail = (
+                    _validate_batch_seal_owner_liveness(config, _seal_path)
+                )
+                if _seal_state == "live" and _other_live_wrkslots_processes(
+                    config.root,
+                    targets=tuple(
+                        dict.fromkeys(
+                            [slot for slot, _g, _t in sealed_targets]
+                            + [
+                                str(target.path)
+                                for _s, _g, target in sealed_targets
+                            ]
+                        )
+                    ),
+                ):
+                    raise Refusal(
+                        f"validation-batch seal in progress (pid {_seal_pid}, "
+                        f"since {_seal_since}) recorded in {_seal_path}; "
+                        "recover refuses a seal whose owner is still "
+                        "running; wait for the batch to finish"
+                    )
                 # #885: an exact-slot create journal that overlaps no seal
                 # target is recovered before the seal, whose pairing would
                 # otherwise classify (and possibly refuse on) that journal

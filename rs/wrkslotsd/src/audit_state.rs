@@ -4062,6 +4062,24 @@ fn heartbeat_diagnosis(record: &Value) -> Result<(i64, bool)> {
     Ok((age, age > ttl))
 }
 
+/// Doctor/status wording for one machine's validation-batch seal
+/// (#1736), mirroring `_audit_validate_batch_seal_reason`.
+fn audit_seal_reason(control: &Path, machine: &str) -> String {
+    let path = control.join(format!("VALIDATE-BATCH-SEAL.{machine}.journal"));
+    let (state, pid, since, detail) = crate::ensure_states::seal_owner_liveness(&path);
+    match state.as_str() {
+        "live" => format!(
+            "validation-batch seal in progress (pid {}, since {}); the remove-validate-batch that owns it is still running",
+            pid.unwrap_or_default(),
+            since.unwrap_or_default()
+        ),
+        "dead" => "interrupted validation-batch seal requires wrkslots recover".to_string(),
+        _ => format!(
+            "validation-batch seal recorded; its owner cannot be proven dead here ({detail})"
+        ),
+    }
+}
+
 /// Journal and stray-registration overrides for one registered row,
 /// in the oracle's order: an interrupted journal blocks the row,
 /// then (for DELETABLE/BLOCKED rows with the directory present) stray
@@ -4074,6 +4092,8 @@ fn apply_overrides(
     slot_type: &str,
     slot_absent: bool,
     sealed_generation: Option<i64>,
+    control: &Path,
+    machine: &str,
 ) {
     if let Some(journal) = journals.get(slot) {
         let state_text = journal.state.replace('-', " ");
@@ -4094,10 +4114,7 @@ fn apply_overrides(
     if let Some(sealed_generation) = sealed_generation {
         let active = row.get("generation").and_then(Value::as_i64).unwrap_or(0);
         let (reason, verdict) = if sealed_generation == active {
-            (
-                "interrupted validation-batch seal requires wrkslots recover".to_string(),
-                "BLOCKED",
-            )
+            (audit_seal_reason(control, machine), "BLOCKED")
         } else {
             (
                 format!(
@@ -5664,6 +5681,8 @@ fn audit_record(
             &slot_type,
             slot_absent,
             sealed_generation,
+            &cfg.control,
+            &machine,
         );
         return Ok((row, agent_running));
     }
@@ -5877,6 +5896,8 @@ fn audit_record(
         &slot_type,
         slot_absent,
         sealed_generation,
+        &cfg.control,
+        &machine,
     );
     Ok((row, agent_running))
 }
@@ -6772,7 +6793,7 @@ pub(crate) fn parse_audit(
             )
         } else if sealed.is_some() {
             (
-                "interrupted validation-batch seal requires wrkslots recover".to_string(),
+                audit_seal_reason(&cfg.control, &selected),
                 "validation-batch-seal".to_string(),
             )
         } else if slot_type == "validate" {
@@ -6890,7 +6911,8 @@ pub(crate) fn parse_audit(
             "record_sha256": Value::Null,
             "verdict": "BLOCKED",
             "reasons": [format!(
-                "interrupted validation-batch seal requires wrkslots recover; recorded path={}",
+                "{}; recorded path={}",
+                audit_seal_reason(&cfg.control, &target.machine),
                 target.path.display()
             )],
             "owner_state": "validation-batch-seal",
@@ -7238,7 +7260,7 @@ pub(crate) fn parse_audit(
             )
         } else if let Some((generation, _path)) = sealed {
             (
-                "interrupted validation-batch seal requires wrkslots recover".to_string(),
+                audit_seal_reason(&cfg.control, &selected),
                 "validation-batch-seal".to_string(),
                 json!(selected),
                 json!(generation),
@@ -7320,7 +7342,8 @@ pub(crate) fn parse_audit(
             "record_sha256": Value::Null,
             "verdict": "BLOCKED",
             "reasons": [format!(
-                "interrupted validation-batch seal requires wrkslots recover; recorded path={}",
+                "{}; recorded path={}",
+                audit_seal_reason(&cfg.control, &target.machine),
                 target.path.display()
             )],
             "owner_state": "validation-batch-seal",

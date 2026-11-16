@@ -273,10 +273,10 @@ def test_hold_seal_journal_refuses_without_writing(tmp_path: Path) -> None:
         (root / "worktrees" / "VALIDATE-BATCH-SEAL.node-a.journal").write_text("{}")
     with pytest.raises(Exception) as caught:
         _python(oracle_root, "slot-a", "keep it")
-    assert "interrupted validation-batch seal" in str(caught.value)
+    assert "validation-batch seal recorded" in str(caught.value)
     result = _rust(rust_root, "slot-a", "keep it")
     assert result.returncode == 1
-    assert "interrupted validation-batch seal" in result.stderr
+    assert "validation-batch seal recorded" in result.stderr
     assert _hold_record(rust_root) is None
 
 

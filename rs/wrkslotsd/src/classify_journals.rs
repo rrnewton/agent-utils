@@ -640,10 +640,11 @@ pub(crate) enum ClassifyError {
     },
     /// A non-orphaned validation-batch seal blocks classification
     /// (c4c4c64a): `payload` is the structured JSON for stdout in
-    /// JSON mode, `first` names the first blocking seal path.
+    /// JSON mode and `message` is the liveness-aware refusal text
+    /// (#1736), which names the first blocking seal path.
     Blocked {
-        first: String,
         payload: Option<String>,
+        message: String,
     },
     Other(String),
 }
@@ -663,11 +664,8 @@ impl std::fmt::Display for ClassifyError {
                     "busy: live '{kind}' mutation {journal} by pid {pid}; retry"
                 )
             }
-            ClassifyError::Blocked { first, .. } => {
-                write!(
-                    formatter,
-                    "interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first; list blocking journals with 'wrkslots classify-create-journals --all-kinds'"
-                )
+            ClassifyError::Blocked { message, .. } => {
+                write!(formatter, "{message}")
             }
             ClassifyError::Other(message) => write!(formatter, "{message}"),
         }
@@ -1912,11 +1910,6 @@ fn classify_create_journals_inner(
     // structured reasons on stdout in JSON mode.
     let reasons = seal_blocking_reasons(&cfg);
     if !reasons.is_empty() {
-        let first = reasons[0]
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
         let payload = if format_json {
             let body = json!({
                 "blocking": true,
@@ -1931,7 +1924,13 @@ fn classify_create_journals_inner(
         } else {
             None
         };
-        return Err(ClassifyError::Blocked { first, payload });
+        let seal_paths: Vec<PathBuf> = reasons
+            .iter()
+            .filter_map(|reason| reason.get("path").and_then(Value::as_str))
+            .map(PathBuf::from)
+            .collect();
+        let message = crate::ensure_states::seal_blocking_message(&seal_paths);
+        return Err(ClassifyError::Blocked { payload, message });
     }
     crate::hold_write::validate_global(root, &cfg)?;
     // Load every machine's ACTIVE/ARCHIVED documents.

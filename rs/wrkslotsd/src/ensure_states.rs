@@ -528,6 +528,72 @@ pub(crate) fn require_fixture() -> Result<()> {
     Ok(())
 }
 
+/// Liveness of one seal's recorded owner (#1736), mirroring
+/// `_validate_batch_seal_owner_liveness`: `(state, pid, created_at,
+/// detail)` with state "live"/"dead" only on proof, else "unknown".
+pub(crate) fn seal_owner_liveness(
+    path: &Path,
+) -> (String, Option<i64>, Option<String>, String) {
+    let unknown = |detail: String| ("unknown".to_string(), None, None, detail);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return unknown("the seal cannot be read".to_string());
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return unknown("the seal cannot be judged: invalid JSON".to_string());
+    };
+    let Some(actor) = value.get("actor") else {
+        return unknown("the seal records no actor".to_string());
+    };
+    let Some(identity) = crate::status_state::identity_from_value(actor) else {
+        return unknown("the seal records no actor".to_string());
+    };
+    let since = value
+        .get("created_at")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let (state, detail) = crate::status_state::process_state(Some(&identity));
+    match state.as_str() {
+        "live" => ("live".to_string(), Some(identity.pid), since, detail),
+        "dead" => ("dead".to_string(), Some(identity.pid), since, detail),
+        _ => (
+            "unknown".to_string(),
+            Some(identity.pid),
+            since,
+            format!("the seal's actor is {state}: {detail}"),
+        ),
+    }
+}
+
+/// Refusal text for blocking seals (#1736), mirroring the seal branch
+/// of `_refuse_partial_state`: live owners are in progress and never
+/// pointed at recovery; only proven-dead owners are "interrupted".
+pub(crate) fn seal_blocking_message(paths: &[PathBuf]) -> String {
+    let first = paths.first().map(|path| path.display().to_string()).unwrap_or_default();
+    let statuses: Vec<(String, Option<i64>, Option<String>, String)> =
+        paths.iter().map(|path| seal_owner_liveness(path)).collect();
+    for (state, pid, since, _detail) in &statuses {
+        if state == "live" {
+            if let (Some(pid), Some(since)) = (pid, since) {
+                return format!(
+                    "validation-batch seal in progress (pid {pid}, since {since}) recorded in {first}; the remove-validate-batch that owns it is still running; wait for it to finish and retry; list blocking journals with 'wrkslots classify-create-journals --all-kinds'"
+                );
+            }
+        }
+    }
+    if !statuses.is_empty() && statuses.iter().all(|(state, ..)| state == "dead") {
+        return format!(
+            "interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first; list blocking journals with 'wrkslots classify-create-journals --all-kinds'"
+        );
+    }
+    let detail = statuses
+        .first()
+        .map(|(_, _, _, detail)| detail.clone())
+        .unwrap_or_default();
+    format!(
+        "validation-batch seal recorded in {first}; its owner cannot be proven dead here ({detail}), so it still binds; list blocking journals with 'wrkslots classify-create-journals --all-kinds'"
+    )
+}
+
 /// Refuse when a partial atomic update is present in the control
 /// directory, matching the existing `_refuse_partial_state` scan.
 pub(crate) fn refuse_partial_state(control: &Path) -> Result<()> {
@@ -621,11 +687,8 @@ fn refuse_partial_state_inner(control: &Path, allow_validate_batch_seals: bool) 
         .map(|name| control.join(name))
         .collect();
     seals.sort();
-    if let Some(first) = seals.first() {
-        return Err(format!(
-            "interrupted validation-batch seal recorded in {}; run 'wrkslots recover' first; list blocking journals with 'wrkslots classify-create-journals --all-kinds'",
-            first.display()
-        ));
+    if !seals.is_empty() {
+        return Err(seal_blocking_message(&seals));
     }
     Ok(())
 }

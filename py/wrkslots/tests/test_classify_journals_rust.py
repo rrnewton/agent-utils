@@ -446,10 +446,14 @@ def test_classify_live_seal_structured_blocking_reason_matches_python(
     _write_seal(oracle_root, _live_identity(os.getpid()))
     rc, out, err = _python_main_classify(oracle_root)
     assert rc == 3, err
-    assert "interrupted validation-batch seal recorded" in err
+    # A live seal is in progress in both editions, never interrupted,
+    # and neither suggests recovery against it (#1736).
+    assert "in progress (pid " in err
+    assert "recover" not in err
     result = _rust_classify(rust_root, fmt="json")
     assert result.returncode == 3, result.stderr
-    assert "interrupted validation-batch seal recorded" in result.stderr
+    assert "in progress (pid " in result.stderr
+    assert "recover" not in result.stderr
     assert _norm(result.stdout, rust_root) == _norm(out, oracle_root)
     reasons = json.loads(result.stdout)["blocking_reasons"]
     assert reasons[0]["kind"] == "validate-batch-seal"
@@ -864,13 +868,13 @@ def test_adopt_refusal_names_live_seal_and_the_all_kinds_report(
     # in both editions.
     rc_c, _out_c, err_c = _python_main_classify(oracle_root)
     assert rc_c == 3, err_c
-    assert "interrupted validation-batch seal recorded" in err_c
+    assert "in progress (pid " in err_c
     assert "classify-create-journals --all-kinds" in err_c
     rust_root = _fixture(tmp_path / "rust")
     _write_seal(rust_root, _live_identity(os.getpid()))
     result = _rust_classify(rust_root, fmt="json")
     assert result.returncode == 3, result.stderr
-    assert "interrupted validation-batch seal recorded" in result.stderr
+    assert "in progress (pid " in result.stderr
     assert "classify-create-journals --all-kinds" in result.stderr
 
 

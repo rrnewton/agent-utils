@@ -36719,7 +36719,7 @@ def test_clean_caches_only_refuses_invalid_unselected_scoped_finish_journal(
     assert seal.is_file()
     assert wrkslots.main(only) == 3
     sealed = capsys.readouterr()
-    assert "interrupted validation-batch seal recorded" in sealed.err
+    assert "in progress (pid " in sealed.err
     assert artifact.is_file()
 
     # Without the seal the damaged finish journal must refuse on its own.
@@ -39994,7 +39994,7 @@ def test_remove_refuses_unrelated_finish_journal_before_target_mutation(
     # The private removal now publishes its seal before the paired finish
     # journal. A second removal must stop at that outer durable boundary; it
     # still cannot mutate either slot until recovery resolves the pair.
-    assert "interrupted validation-batch seal" in capsys.readouterr().err
+    assert "in progress (pid " in capsys.readouterr().err
     assert active.read_bytes() == active_before
     assert checkout(project, slot="target", slot_type="validate").is_dir()
     assert other_journal.is_file()
@@ -40003,7 +40003,7 @@ def test_remove_refuses_unrelated_finish_journal_before_target_mutation(
 @pytest.mark.parametrize(
     ("obstruction", "expected"),
     (("partial", "partial atomic update found"),
-     ("batch-seal", "interrupted validation-batch seal recorded in")),
+     ("batch-seal", "validation-batch seal recorded in")),
 )
 def test_scoped_validation_remove_keeps_global_recovery_obstructions(
     tmp_path: Path,

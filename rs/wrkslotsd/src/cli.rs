@@ -3894,15 +3894,14 @@ pub fn run() -> u8 {
                     print!("{text}");
                     return 0;
                 }
-                Err(crate::classify_journals::ClassifyError::Blocked { first, payload }) => {
+                Err(crate::classify_journals::ClassifyError::Blocked { payload, message, .. }) => {
                     // Seal refusal (c4c4c64a): structured reasons on stdout
                     // in JSON mode; refusal exit 3 like the Python main.
+                    // The text is liveness-aware (#1736).
                     if let Some(payload) = payload {
                         print!("{payload}");
                     }
-                    eprintln!(
-                        "wrkslotsd: interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first; list blocking journals with 'wrkslots classify-create-journals --all-kinds'"
-                    );
+                    eprintln!("wrkslotsd: {message}");
                     return 3;
                 }
                 Err(crate::classify_journals::ClassifyError::Busy { kind, pid, journal }) => {

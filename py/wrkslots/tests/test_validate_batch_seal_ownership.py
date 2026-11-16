@@ -132,7 +132,10 @@ def test_concurrent_remove_leaves_the_running_invocations_seal(
     assert len(observed) == 1
     returncode, stderr, sealed, after, mode = observed[0]
     assert returncode == 3
-    assert "interrupted validation-batch seal recorded" in stderr
+    # The first invocation is still running, so its seal is in progress,
+    # never "interrupted", and recovery is not suggested (#1736).
+    assert "in progress (pid " in stderr
+    assert "recover" not in stderr
     assert after == sealed
     assert mode == 0o700
     assert not target.exists()
@@ -195,7 +198,9 @@ def test_crashed_invocations_seal_waits_for_explicit_recovery(
     mode = target.stat().st_mode & 0o777
 
     assert remove_completed_validation(project) == 3
-    assert "interrupted validation-batch seal recorded" in capsys.readouterr().err
+    # The crashed invocation's coordinator (this test process) is still
+    # alive, so the seal reads as in progress, not interrupted (#1736).
+    assert "in progress (pid " in capsys.readouterr().err
     assert seal.read_bytes() == sealed
     assert target.stat().st_mode & 0o777 == mode
 
@@ -356,11 +361,9 @@ def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
             operator.wait()
 
     if sealer == "live-with-wrkslots-operator":
+        # Recover refuses a seal whose batch is still running (#1736).
         assert recovered.returncode == 3, recovered.stderr
-        assert "is absent while its ACTIVE row remains" in recovered.stderr
-        assert "the seal's coordinator is live" in recovered.stderr
-        # #885 item 8: the refusal names the scoped recovery to run.
-        assert "recover --slot target" in recovered.stderr
+        assert "in progress (pid " in recovered.stderr
         assert seal.read_bytes() == sealed
         assert [row.slot for row in wrkslots._load_active(config).slots] == ["target"]
         return
@@ -585,7 +588,13 @@ def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
 
     classified = _classify(project, "next")
     assert classified.returncode != 0
-    assert "interrupted validation-batch seal recorded" in classified.stderr
+    if actor == "live":
+        assert "in progress (pid " in classified.stderr
+        assert "recover" not in classified.stderr
+    else:
+        # Another boot or machine proves nothing: no recovery suggestion.
+        assert "cannot be proven dead" in classified.stderr
+        assert "recover" not in classified.stderr
 
     made = create(project, slot="next", slot_type="validate", branch=None)
     assert "recovered the validation-batch seal" not in made.stderr
@@ -604,7 +613,8 @@ def test_classify_reports_live_validate_batch_seal_as_structured_blocking_reason
     classified = _classify(project, "next")
 
     assert classified.returncode == 3, classified.stderr
-    assert "interrupted validation-batch seal recorded" in classified.stderr
+    assert "in progress (pid " in classified.stderr
+    assert "recover" not in classified.stderr
     payload = json.loads(classified.stdout)
     assert payload["blocking"] is True
     assert payload["schema"] == 2
@@ -640,7 +650,7 @@ def test_classify_unknown_actor_seal_reports_unknown_blocking_reason(
     classified = _classify(project, "next")
 
     assert classified.returncode == 3, classified.stderr
-    assert "interrupted validation-batch seal recorded" in classified.stderr
+    assert "cannot be proven dead" in classified.stderr
     payload = json.loads(classified.stdout)
     reasons = payload["blocking_reasons"]
     assert len(reasons) == 1
@@ -659,7 +669,7 @@ def test_classify_other_kind_seal_reports_other_blocking_reason(
     classified = _classify(project, "next")
 
     assert classified.returncode == 3, classified.stderr
-    assert "interrupted validation-batch seal recorded" in classified.stderr
+    assert "cannot be proven dead" in classified.stderr
     payload = json.loads(classified.stdout)
     reasons = payload["blocking_reasons"]
     assert len(reasons) == 1
@@ -917,3 +927,100 @@ def test_private_cleanup_identity_matches_cross_boot_rules(tmp_path: Path) -> No
         target, live, recorded,
         cross_boot=True, recorded_fs_id=None, fs_anchor=tmp_path,
     )
+
+def _adopt_target(project: Path) -> int:
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "target")
+    return wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "adopt",
+            "target",
+            "--agent",
+            record.agent,
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        ]
+    )
+
+
+def test_adopt_names_a_live_seal_as_in_progress_without_suggesting_recover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#1736: adopt meets a seal whose batch is still alive."""
+
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(
+        seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
+    )
+    sealed = seal.read_bytes()
+
+    assert _adopt_target(project) == 3
+    err = capsys.readouterr().err
+    assert "in progress (pid " in err
+    assert f"pid {os.getpid()}" in err
+    assert "recover" not in err
+    assert seal.read_bytes() == sealed
+
+
+def test_adopt_calls_a_dead_actors_seal_interrupted_and_suggests_recover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#1736: only a proven-dead owner earns the interrupted wording."""
+
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(seal, pid=2_147_483_647)
+    sealed = seal.read_bytes()
+
+    assert _adopt_target(project) == 3
+    err = capsys.readouterr().err
+    assert "interrupted validation-batch seal recorded" in err
+    assert "wrkslots recover" in err
+    assert seal.read_bytes() == sealed
+
+
+def test_recover_refuses_a_seal_whose_batch_is_still_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1736: recover never retires a live batch's seal."""
+
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(
+        seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
+    )
+    sealed = seal.read_bytes()
+    operator = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            "-m",
+            "wrkslots",
+            "--project-root",
+            str(project),
+            "remove",
+            "target",
+        ]
+    )
+    try:
+        recovered = raw_command_with_census_authority_stub(
+            project,
+            "recover",
+            "--coordinator-authorized",
+            "--coordinator-pid",
+            str(os.getpid()),
+        )
+    finally:
+        operator.kill()
+        operator.wait()
+
+    assert recovered.returncode == 3, recovered.stderr
+    assert "in progress (pid " in recovered.stderr
+    assert seal.read_bytes() == sealed

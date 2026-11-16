@@ -192,7 +192,7 @@ def test_retry_interrupted_after_fence_is_recoverable(
     streams = capsys.readouterr()
     assert "reused after completion" not in streams.out + streams.err
     assert planned != 0
-    assert "interrupted validation-batch seal" in streams.err
+    assert "in progress (pid " in streams.err
     assert _event_bytes(config) == history
 
     recovered = raw_command_with_census_authority_stub(

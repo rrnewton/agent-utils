@@ -384,15 +384,30 @@ pub(crate) fn classify_ownerless_validate_batch(
     let config = crate::config_validate::load_config(root, machine_override)?;
     crate::ensure_states::refuse_partial_state_allow_seals(&cfg.control)?;
     // Python `_validate_batch_seal_journals`: any seal journal
-    // blocks admission before classification.
+    // blocks admission before classification, worded by its owner's
+    // liveness (#1736).
     if let Ok(entries) = std::fs::read_dir(&cfg.control) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("VALIDATE-BATCH-SEAL.") && name.ends_with(".journal") {
-                return Err(
-                    "an interrupted validation-batch seal is recorded; recover it before admission"
-                        .to_string(),
-                );
+                let path = entry.path();
+                let (state, pid, since, detail) =
+                    crate::ensure_states::seal_owner_liveness(&path);
+                return Err(match state.as_str() {
+                    "live" => format!(
+                        "validation-batch seal in progress (pid {}, since {}) recorded in {}; the remove-validate-batch that owns it is still running; wait for it to finish and retry; list blocking journals with 'wrkslots classify-create-journals --all-kinds'",
+                        pid.unwrap_or_default(),
+                        since.unwrap_or_default(),
+                        path.display()
+                    ),
+                    "dead" => {
+                        "an interrupted validation-batch seal is recorded; recover it before admission"
+                            .to_string()
+                    }
+                    _ => format!(
+                        "a validation-batch seal is recorded; its owner cannot be proven dead here ({detail}), so admission still refuses"
+                    ),
+                });
             }
         }
     }
