@@ -55,13 +55,8 @@ created from.
    its next natural restart, never by forcing one.
 3. Give a complete brief: the goal and why, the slot and branch, how to validate, where to record
    findings, how to report back, and when to stop.
-4. Use a fresh agent for a fresh task. A new major task gets a new agent started from a handoff
-   brief. Never repurpose an idle agent by sending it an unrelated task. If an earlier agent's
-   context matters, have it write a handoff brief, stop it, and start the new agent from that
-   brief. A stopped session stays resumable by ID. Reviewers are allocated per pull request: one
-   fresh reviewer agent per pull request. It stays for that pull request's later heads and is
-   stopped when the pull request lands or closes. Context from one review is mostly noise for
-   the next.
+4. Choose which agent gets the task by the rules in "Agent lifetime" below. In short: a fresh
+   agent for a fresh task, and a long-term workstream's lane works only on that workstream.
 
 Start, message, read, and stop agents only through `agentctl`, never with raw terminal-multiplexer
 commands. `agentctl send` opens every prompt with a sender header
@@ -69,6 +64,39 @@ commands. `agentctl send` opens every prompt with a sender header
 `herdr pane send-text` carries none, so its reader cannot tell who wrote it. Say so in every
 brief: agents message each other with `agentctl send`, never by raw pane typing. If a suite tool fails or lacks a capability, report it (and fix it in agent-utils if
 that is your job) rather than routing around it.
+
+## Agent lifetime
+
+Decide who does a task by asking what an agent's existing context is worth to that task. The
+owner's rule (2026-11-16): long-term work keeps moving even when only one agent is on it;
+transient new work goes to short-lived, disposable agents; never reuse a context that does not
+match the task, because that only raises token cost and buys nothing; reuse a context when
+being warm helps.
+
+- **A long-term workstream keeps its own dedicated lane, and nothing diverts that lane.** One
+  agent is enough for a workstream only while nothing else is routed to it. In one case a
+  workstream with a single agent stalled for days because that agent kept being pulled onto
+  unrelated CI fixes. If the lane is blocked, unblock it. When the workstream ends, stop the
+  lane; do not keep it busy with other work.
+- **Transient and interrupt work goes to a new, short-lived agent**: a red check on main, a
+  one-off fix, a cleanup, someone else's failing change. Start a fresh agent with a complete
+  brief and stop it when the work is done. Do this even when a long-term lane knows the area.
+  If its knowledge is needed, ask it a question or have it write a brief, and leave it on its
+  workstream.
+- **Reuse a warm context only for the same task, or when its warmth clearly helps.** The same
+  task continues through compaction or a session resumed by ID. Warmth clearly helps when a
+  pull request's reviewer reviews that pull request's later heads (a delta review), or when a
+  change's author takes a follow-up on that same change: review findings, a rebase, a CI
+  failure on that change. An agent being idle, or already running, is never a reason to reuse
+  it.
+- **Never reuse a context that does not match the task.** Sending an unrelated task to an
+  existing agent makes every later turn carry context that does not help, and it pulls that
+  agent off its own work. If an earlier agent's context matters to a new task, have it write a
+  handoff brief and start the new agent from that brief. Then stop the earlier agent, or let it
+  get back to its own work. A stopped session stays resumable by ID.
+- **Reviewers are allocated per pull request**: one fresh reviewer agent per pull request. It
+  stays for that pull request's later heads and is stopped when the pull request lands or
+  closes. Context from one review is mostly noise for the next.
 
 ## Let the owner talk to a sub-agent directly
 
@@ -121,6 +149,7 @@ that adds or removes support for one harness.
   possibly-submitted prompt automatically.
 - Pause automation (`agentctl pause`) before a human types into the same terminal.
 - Keep a sensible number of agents busy on real tasks; idle agents and idle slots are cost.
+  Stop an agent whose task is done instead of handing it unrelated work ("Agent lifetime").
   Where `agentctl watch-agents` runs, a child that ends its turn with a `DONE:` or `BLOCKED:`
   verdict reaches you at once as a `child-done` notice; act on it rather than waiting for a sweep.
 
