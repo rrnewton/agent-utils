@@ -306,7 +306,13 @@ def test_doctor_machine_auto_note_matches_python(
     expected = json.loads(capsys.readouterr().out)
     result = _rust_doctor(root, "json")
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == expected
+    actual = json.loads(result.stdout)
+    # #1706: timings and subprocess counts describe the run, not the
+    # registry; the editions never agree on them exactly.
+    for document in (actual, expected):
+        document.pop("timings", None)
+        document.pop("subprocesses", None)
+    assert actual == expected
 
     args.format = "human"
     assert wrkslots_cli._cmd_doctor(args) == 0

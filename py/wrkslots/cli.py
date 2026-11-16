@@ -55279,7 +55279,12 @@ def _doctor_quick(args: argparse.Namespace, config: Config) -> int:
         for item in findings:
             kind = str(item["kind"])
             counts[kind] = counts.get(kind, 0) + 1
-        slowest = max(timings, key=lambda name: timings[name])
+        # The slowest *check*: total is the whole run, not a check,
+        # and including it made the label depend on rounding ties.
+        slowest = max(
+            (name for name in timings if name != "total"),
+            key=lambda name: timings[name],
+        )
         if args.format == "json":
             print(
                 json.dumps(

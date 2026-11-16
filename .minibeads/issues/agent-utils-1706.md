@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-doctor-speed: doctor slowed about 9x; give periodic gates a fast bounded mode'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
