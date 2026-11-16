@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-floating-chip-overlap: floating chips and toasts must not cover card controls on the mobile page'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - ui
 created_at: 2026-11-16T12:39:59.452163968+00:00
-updated_at: 2026-11-16T12:39:59.452163968+00:00
+updated_at: 2026-11-16T20:56:16.025431640+00:00
+closed_at: 2026-11-16T20:56:16.025431530+00:00
 ---
 
 # Description
