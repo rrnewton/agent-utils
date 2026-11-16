@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-eden-mount-outside-git-worktree: mount Eden checkouts outside any git worktree'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-16T14:10:00-05:00
-updated_at: 2026-11-16T14:10:00-05:00
+updated_at: 2026-11-16T15:57:21-05:00
+closed_at: 2026-11-16T15:57:21-05:00
 ---
 
 # Description
@@ -63,3 +64,16 @@ as `<worktrees root>/validate`.
   and archive.
 - Deterministic regression tests in both editions where the tool has
   both; condition-based waits only.
+
+# Notes
+
+## Resolution
+
+Landed 28bbac8d63e29e71a0fabfa7f7155c8ce42650e5 on github/main
+(mu-edenmount; gated as 414c0e15, gate ledger exit 0). `create --eden`
+mounts at `<eden_mount_root>/<slot-type>/<slot>` with the record's
+checkout path naming the mount; in-slot rows stay readable and every
+lifecycle path resolves Eden checkouts from the recorded path. Local
+validate was 63/64 (the one red, a loop-device identity probe on a
+git image slot under load, passed 5/5 solo plus 1/1); the gate ran
+green with --no-local-preflight. No real Eden clone or mount was run.
