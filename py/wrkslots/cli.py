@@ -1191,7 +1191,12 @@ def _agent_remove_batch_item_seconds(
 # gone, removal asks before it takes the registry lock and the answer is
 # reused under the lock for at most this many seconds, so the lock is not held
 # across that network I/O (see _prefetch_remote_containment).  The local facts
-# (HEAD, status, remote URL) are always re-read under the lock.
+# (HEAD, status, remote URL) are always re-read under the lock.  Past that age
+# within the same removal, the answer is reused only after one ls-remote
+# shows the same advertised inventory it was derived from (its fingerprint;
+# #1681 part 2): the remote is re-asked what it advertises now, but no objects
+# are re-fetched.  Across removals nothing is kept, so this bound is also the
+# oldest evidence any removal starts from.
 _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS = 300.0
 # When the GitHub credential helper's pacing bucket is full it tells Git to
 # quit; a network Git command then waits, bounded, for a credential slot
@@ -15631,6 +15636,10 @@ class _RemoteContainmentEvidence:
     refusal: Refusal | None = None
     # remote_advertised_covering only: the branches the remote advertised.
     extra: tuple[str, ...] = ()
+    # Hash of the advertised inventory this answer was derived from (#1681
+    # part 2): past the age bound, one ls-remote showing the same inventory
+    # revalidates the answer without re-fetching any objects.
+    fingerprint: str = ""
 
 
 # Set only while one agent-slot removal runs (see
@@ -15742,6 +15751,14 @@ _SUBMODULE_INVENTORY_MEMO: contextvars.ContextVar[
 _PREGATHERED_SALVAGE_RECEIPTS: contextvars.ContextVar[
     dict[str, tuple[tuple[object, ...], dict[str, object]]] | None
 ] = contextvars.ContextVar("wrkslots_pregathered_salvage_receipts", default=None)
+
+
+def _advertised_fingerprint(inventory: Mapping[str, str]) -> str:
+    """Hash one advertised inventory (ref -> tip), order-independent."""
+
+    return hashlib.sha256(
+        "".join(f"{ref}\0{tip}\n" for ref, tip in sorted(inventory.items())).encode()
+    ).hexdigest()
 
 
 @contextlib.contextmanager
@@ -20573,6 +20590,33 @@ class _GitVcs:
         refs = tuple(line for line in result.stdout.splitlines() if line)
         return refs
 
+    def _advertised_inventory(
+        self,
+        checkout: Path,
+        target: _RemoteAuthority,
+        *,
+        heads_only: bool = False,
+        prefixes: tuple[str, ...] = (),
+    ) -> dict[str, str]:
+        """List the remote's advertised refs once (one ls-remote, no fetch)."""
+
+        common = self.common_directory(checkout)
+        objects = common / "objects"
+        with self._isolated_repository(objects) as (isolated, object_env):
+            inventory = self._ls_remote_inventory(
+                isolated,
+                target.url,
+                heads_only=heads_only,
+                refs=tuple(f"{prefix}*" for prefix in prefixes),
+                env_overrides=object_env,
+                timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+            )
+        if prefixes:
+            return {
+                ref: tip for ref, tip in inventory.items() if ref.startswith(prefixes)
+            }
+        return inventory
+
     def remote_heads_containing(
         self,
         checkout: Path,
@@ -20630,16 +20674,34 @@ class _GitVcs:
         key = (str(objects.resolve()), target.url, head, shallow)
         if memo is not None:
             cached = memo.get(key)
-            if (
-                cached is not None
-                and time.monotonic() - cached.observed_at
-                <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
-            ):
-                if cached.refusal is not None:
-                    raise cached.refusal
-                return cached.refs
+            if cached is not None:
+                fresh = (
+                    time.monotonic() - cached.observed_at
+                    <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+                )
+                if not fresh and cached.fingerprint:
+                    # Past the age bound within one removal: revalidate by
+                    # fingerprint (one ls-remote, no fetch) instead of
+                    # re-deriving (#1681 part 2).
+                    current = _advertised_fingerprint(
+                        self._advertised_inventory(checkout, target, heads_only=True)
+                    )
+                    fresh = current == cached.fingerprint
+                    if fresh:
+                        cached = _RemoteContainmentEvidence(
+                            cached.refs,
+                            time.monotonic(),
+                            cached.refusal,
+                            cached.extra,
+                            cached.fingerprint,
+                        )
+                        memo[key] = cached
+                if fresh:
+                    if cached.refusal is not None:
+                        raise cached.refusal
+                    return cached.refs
         try:
-            refs = self._remote_heads_containing_uncached(
+            refs, advertised = self._remote_heads_containing_uncached(
                 checkout, remote, head, target, common, shallow=shallow
             )
         except Refusal as exc:
@@ -20647,7 +20709,9 @@ class _GitVcs:
                 memo[key] = _RemoteContainmentEvidence((), time.monotonic(), exc)
             raise
         if memo is not None:
-            memo[key] = _RemoteContainmentEvidence(refs, time.monotonic())
+            memo[key] = _RemoteContainmentEvidence(
+                refs, time.monotonic(), fingerprint=_advertised_fingerprint(advertised)
+            )
         return refs
 
     def remote_tags_containing(
@@ -20750,7 +20814,7 @@ class _GitVcs:
         common: Path,
         *,
         shallow: bool = False,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
         """Ask the remote at ``target``; see remote_heads_containing."""
 
         objects = common / "objects"
@@ -20795,7 +20859,7 @@ class _GitVcs:
         )
         for ref in refs:
             _validate_full_ref(ref, "remote-tracking ref")
-        return refs
+        return refs, advertised
 
     def _private_git_directory(self, checkout: Path) -> Path:
         """Return ``checkout``'s own Git directory (a linked worktree's, not the shared one)."""
@@ -21049,16 +21113,40 @@ class _GitVcs:
         )
         if memo is not None:
             cached = memo.get(key)
-            if (
-                cached is not None
-                and time.monotonic() - cached.observed_at
-                <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
-            ):
-                if cached.refusal is not None:
-                    raise cached.refusal
-                return frozenset(cached.refs), frozenset(cached.extra)
+            if cached is not None:
+                fresh = (
+                    time.monotonic() - cached.observed_at
+                    <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+                )
+                if not fresh and cached.fingerprint:
+                    current = _advertised_fingerprint(
+                        self._advertised_inventory(
+                            checkout,
+                            target,
+                            prefixes=(
+                                "refs/heads/",
+                                "refs/tags/",
+                                "refs/salvage/",
+                                "refs/rescue/",
+                            ),
+                        )
+                    )
+                    fresh = current == cached.fingerprint
+                    if fresh:
+                        cached = _RemoteContainmentEvidence(
+                            cached.refs,
+                            time.monotonic(),
+                            cached.refusal,
+                            cached.extra,
+                            cached.fingerprint,
+                        )
+                        memo[key] = cached
+                if fresh:
+                    if cached.refusal is not None:
+                        raise cached.refusal
+                    return frozenset(cached.refs), frozenset(cached.extra)
         try:
-            covering, branches = self._remote_advertised_covering_uncached(
+            covering, branches, advertised = self._remote_advertised_covering_uncached(
                 checkout, target, common, tips
             )
         except Refusal as exc:
@@ -21067,7 +21155,10 @@ class _GitVcs:
             raise
         if memo is not None:
             memo[key] = _RemoteContainmentEvidence(
-                tuple(sorted(covering)), time.monotonic(), extra=tuple(sorted(branches))
+                tuple(sorted(covering)),
+                time.monotonic(),
+                extra=tuple(sorted(branches)),
+                fingerprint=_advertised_fingerprint(advertised),
             )
         return covering, branches
 
@@ -21143,7 +21234,7 @@ class _GitVcs:
         target: _RemoteAuthority,
         common: Path,
         tips: Sequence[str],
-    ) -> tuple[frozenset[str], frozenset[str]]:
+    ) -> tuple[frozenset[str], frozenset[str], dict[str, str]]:
         """Ask the remote at ``target``; see remote_advertised_covering."""
 
         prefixes = ("refs/heads/", "refs/tags/", "refs/salvage/", "refs/rescue/")
@@ -21186,8 +21277,10 @@ class _GitVcs:
                 common, self._private_git_directory(checkout), target, missing
             ) as (fetched, lazy_off, _proof_root):
                 covering |= self._present_commits(fetched, remaining, lazy_off)
-        return frozenset(covering), frozenset(
-            ref for ref in advertised if ref.startswith("refs/heads/")
+        return (
+            frozenset(covering),
+            frozenset(ref for ref in advertised if ref.startswith("refs/heads/")),
+            advertised,
         )
 
     def _present_peeled_commits(
@@ -29594,10 +29687,9 @@ def _salvage_candidate(
         tuple(_cache_globs_for(config, checkout.name)),
     )
     cached = memo.get(key)
-    if cached is not None and (
-        time.monotonic() - cached.observed_at
-        <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
-    ):
+    if cached is not None:
+        # Within one removal the fingerprint below, not wall-clock age,
+        # guards reuse (#1681 part 2): it is recomputed on every reuse.
         mirror = (
             _absolute_local_remote_directory(path, cached.facts.remote_authority)
             if cached.facts.aliased
@@ -31342,12 +31434,7 @@ def _submodule_salvage_checkouts(
     )
     inventory = vcs.initialized_submodules(checkout_path)
     cached = memo.get(key)
-    if (
-        cached is not None
-        and cached.inventory == inventory
-        and time.monotonic() - cached.observed_at
-        <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
-    ):
+    if cached is not None and cached.inventory == inventory:
         try:
             sources = _submodule_source_identities(
                 config, vcs, checkout_path, source_repository, inventory

@@ -73,6 +73,40 @@ def test_advertised_tips_not_memoized_outside_scope(
     assert calls == ["ls-remote", "ls-remote"]
 
 
+def test_expired_heads_evidence_revalidated_without_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repo, "origin")
+    head = _git(repo, "rev-parse", "HEAD")
+    calls: list[str] = []
+    original = wrkslots._GitVcs._ls_remote_inventory
+
+    def counting(self: wrkslots._GitVcs, *args: object, **kwargs: object) -> dict[str, str]:
+        calls.append("ls-remote")
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    def no_fetch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("proof fetch ran during fingerprint revalidation")
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_ls_remote_inventory", counting)
+    monkeypatch.setattr(wrkslots._GitVcs, "_fetched_proof_store", no_fetch)
+    with wrkslots._remote_containment_scope():
+        first = vcs.remote_heads_containing(repo, "origin", head, authority)
+        assert first
+        memo = wrkslots._REMOTE_CONTAINMENT_MEMO.get()
+        assert memo is not None
+        for key, evidence in list(memo.items()):
+            memo[key] = wrkslots._RemoteContainmentEvidence(
+                evidence.refs, 0.0, evidence.refusal, evidence.extra, evidence.fingerprint
+            )
+        before = len(calls)
+        second = vcs.remote_heads_containing(repo, "origin", head, authority)
+    assert second == first
+    assert len(calls) - before == 1
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="prctl parent-death signal is Linux-only")
 def test_parent_death_signal_stops_child(tmp_path: Path) -> None:
     py_dir = Path(wrkslots.__file__).resolve().parent.parent
