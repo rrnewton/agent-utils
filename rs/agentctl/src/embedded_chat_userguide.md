@@ -2856,6 +2856,17 @@ The dry-run comparison harness is
 it posts nothing, and its live mode refuses without an explicit test channel
 and coordinator approval.
 
+One more converted-path key: `long_markdown_route` (a bridge configuration
+boolean, default off). The vendor's `--slack-mrkdwn` flag refuses a body
+over 4,000 bytes, so a converted body longer than that splits into several
+posts. With `"long_markdown_route": true`, such a body instead posts once
+as its original Markdown via `--markdown` (the vendor's 12,000-byte cap;
+it splits only above that), while a body at or under 4,000 bytes keeps the
+local conversion and its Block Kit headings. Leave it off unless the
+vendor's own Markdown rendering has been checked for the deployment: the
+local conversion exists because that rendering lost formatting in the
+past.
+
 Thread and issue links. Two configuration keys name where links point, and both are
 optional: `slack_workspace_url` is the Slack workspace origin (for example
 `"slack_workspace_url": "https://acme.slack.com"`), and `issue_url_template` is an

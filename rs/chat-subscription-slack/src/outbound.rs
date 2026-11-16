@@ -548,6 +548,8 @@ enum Request {
         thread_ts: Option<String>,
         text: String,
         slack_format: Option<TextFormat>,
+        /// The bridge's `long_markdown_route` switch (#1712).
+        long_markdown_route: bool,
         /// Message metadata, compact JSON (#832 chat-trace-format-tagging).
         metadata: Option<String>,
     },
@@ -582,7 +584,7 @@ enum Request {
 }
 
 /// The keys a send request may carry beyond the required ones.
-const SEND_OPTIONAL: [&str; 2] = ["slack_format", "metadata"];
+const SEND_OPTIONAL: [&str; 3] = ["slack_format", "metadata", "long_markdown_route"];
 
 /// The most bytes of compact metadata JSON a send accepts.
 pub const MAX_METADATA_BYTES: usize = 4_096;
@@ -661,6 +663,11 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
                 }
                 _ => return Err(invalid("thread_id must be a string or null")),
             };
+            let long_markdown_route = match object.get("long_markdown_route") {
+                None => false,
+                Some(Value::Bool(route)) => *route,
+                Some(_) => return Err(invalid("long_markdown_route must be a boolean")),
+            };
             let body = text("text").ok_or_else(|| invalid("text must be a string"))?;
             if body.trim().is_empty() {
                 return Err(invalid("text is empty"));
@@ -670,6 +677,7 @@ fn parse_request(object: &Map<String, Value>, action: &str) -> Result<Request, R
                 thread_ts,
                 text: body,
                 slack_format,
+                long_markdown_route,
                 metadata,
             })
         }
@@ -969,6 +977,7 @@ pub fn handle_request(
             thread_ts,
             text,
             slack_format,
+            long_markdown_route,
             metadata,
         } => send(
             config,
@@ -979,6 +988,7 @@ pub fn handle_request(
             thread_ts.as_deref(),
             &text,
             slack_format,
+            long_markdown_route,
             metadata.as_deref(),
             now_millis,
             &diagnostics,
@@ -1115,6 +1125,41 @@ fn trim_newline(input: &[u8]) -> &[u8] {
         end -= 1;
     }
     &input[..end]
+}
+
+/// The converted path's chunks, each with its Block Kit blocks where it has
+/// them, and the wire format they post under. At or under the vendor's
+/// 4,000-byte `--slack-mrkdwn` cap the body posts as locally converted
+/// mrkdwn as today. Over it, with `long_markdown_route` on, the ORIGINAL
+/// Markdown posts via `--markdown` instead (the vendor refuses a longer
+/// `--slack-mrkdwn` body and names that flag; its cap is 12,000 bytes), so
+/// a long body is one post up to that cap and splits only above it (#1712).
+fn converted_chunks(
+    text: &str,
+    max_chunk_bytes: usize,
+    long_markdown_route: bool,
+) -> (Vec<(String, Option<String>)>, TextFormat) {
+    if long_markdown_route
+        && crate::mrkdwn::convert_markdown(text).len() > crate::mrkdwn::MAX_MRKDWN_BYTES
+    {
+        return (
+            split_body(text, max_chunk_bytes.min(SLACK_MAX_BODY_BYTES))
+                .into_iter()
+                .map(|chunk| (chunk, None))
+                .collect(),
+            TextFormat::Markdown,
+        );
+    }
+    (
+        crate::mrkdwn::convert_and_split_parts(
+            text,
+            max_chunk_bytes.min(crate::mrkdwn::MAX_MRKDWN_BYTES),
+        )
+        .into_iter()
+        .map(|part| (part.text, part.blocks))
+        .collect(),
+        TextFormat::SlackMrkdwn,
+    )
 }
 
 /// Split a body into chunks of at most `limit` bytes, preferring line breaks.
@@ -1330,6 +1375,7 @@ fn send(
     thread_ts: Option<&str>,
     text: &str,
     slack_format: Option<TextFormat>,
+    long_markdown_route: bool,
     metadata: Option<&str>,
     now_millis: &dyn Fn() -> u64,
     diagnostics: &Diagnostics,
@@ -1346,16 +1392,14 @@ fn send(
     let mut chunk_blocks: Vec<Option<String>> = Vec::new();
     let (chunks, post_format) = match format {
         TextFormat::Converted => {
-            let parts = crate::mrkdwn::convert_and_split_parts(
-                text,
-                config.max_chunk_bytes.min(crate::mrkdwn::MAX_MRKDWN_BYTES),
-            );
-            let mut chunks = Vec::with_capacity(parts.len());
-            for part in parts {
-                chunks.push(part.text);
-                chunk_blocks.push(part.blocks);
+            let (planned, planned_format) =
+                converted_chunks(text, config.max_chunk_bytes, long_markdown_route);
+            let mut chunks = Vec::with_capacity(planned.len());
+            for (chunk, blocks) in planned {
+                chunks.push(chunk);
+                chunk_blocks.push(blocks);
             }
-            (chunks, TextFormat::SlackMrkdwn)
+            (chunks, planned_format)
         }
         TextFormat::SlackMrkdwn => (
             split_body(
@@ -1536,6 +1580,33 @@ fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converted_chunks_route_long_bodies_to_markdown_only_when_switched_on() {
+        // #1712: ~6.5 KB of Markdown whose converted form exceeds 4,000.
+        let body = format!("# Status\n\n{}", "detail line with some text\n".repeat(250));
+        let (chunks, format) = converted_chunks(&body, 11_000, true);
+        assert_eq!(format, TextFormat::Markdown);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, body);
+        assert!(chunks[0].1.is_none());
+        // Off (the default): today's locally converted parts at 4,000.
+        let (chunks, format) = converted_chunks(&body, 11_000, false);
+        assert_eq!(format, TextFormat::SlackMrkdwn);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|(chunk, _)| chunk.len() <= 4_000));
+        // Over the 12,000 vendor Markdown cap the routed body still splits.
+        let big = "word ".repeat(5_000);
+        let (chunks, format) = converted_chunks(&big, 11_000, true);
+        assert_eq!(format, TextFormat::Markdown);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|(chunk, _)| chunk.len() <= 11_000));
+        // A short body is unchanged with the route on.
+        let (chunks, format) = converted_chunks("hello **there**", 11_000, true);
+        assert_eq!(format, TextFormat::SlackMrkdwn);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].0, "hello *there*");
+    }
 
     #[test]
     fn splits_long_bodies_at_line_breaks() {

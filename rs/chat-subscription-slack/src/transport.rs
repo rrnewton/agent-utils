@@ -137,7 +137,10 @@ pub enum TextFormat {
     /// Slack mrkdwn, shown as typed (`--slack-mrkdwn`, at most 4,000 bytes).
     SlackMrkdwn,
     /// Standard Markdown that the helper converts to Slack mrkdwn itself
-    /// (see [`crate::mrkdwn`]) and then posts as [`Self::SlackMrkdwn`].
+    /// (see [`crate::mrkdwn`]) and then posts as [`Self::SlackMrkdwn`]. With
+    /// the bridge's `long_markdown_route` switch on, a body whose converted
+    /// form exceeds the 4,000-byte cap posts as its original Markdown
+    /// instead ([`Self::Markdown`], the vendor's 12,000-byte cap; #1712).
     Converted,
 }
 

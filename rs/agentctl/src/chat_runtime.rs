@@ -775,6 +775,13 @@ pub struct BridgeConfiguration {
     /// Per-channel Slack outbound format, overriding `slack_format`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slack_format_by_channel: BTreeMap<String, SlackFormat>,
+    /// On the converted path, post a body whose converted mrkdwn exceeds
+    /// the vendor's 4,000-byte `--slack-mrkdwn` cap as its original
+    /// Markdown via `--markdown` instead (one post up to 12,000 bytes;
+    /// #1712 slack-post-cap-raise). Absent or false, long bodies split at
+    /// 4,000 bytes as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub long_markdown_route: bool,
     /// Slack workspace origin (`https://acme.slack.com`) thread permalinks are
     /// built on, locally and without a provider call (#658
     /// chat-bridge-permalinks). Absent, no thread link is ever formed.
@@ -1244,6 +1251,7 @@ impl BridgeConfiguration {
             .transpose()?;
         if let Some(transport) = transport.as_mut() {
             transport.set_slack_formats(self.slack_format, self.slack_format_by_channel.clone());
+            transport.set_long_markdown_route(self.long_markdown_route);
         }
         Ok(transport)
     }
@@ -4279,6 +4287,7 @@ pub struct CommandOutboundTransport {
     slack_format: Option<SlackFormat>,
     slack_format_by_channel: BTreeMap<String, SlackFormat>,
     slack_format_override: Option<SlackFormat>,
+    long_markdown_route: bool,
     // `#708 vt-live-push`: the sinks told of every post and reaction this transport makes.
     event_sink: Option<Arc<crate::chat_event_sink::EventSink>>,
     // #832 chat-trace-format-tagging: metadata for the next sends and root posts.
@@ -4363,6 +4372,7 @@ impl CommandOutboundTransport {
             slack_format: self.slack_format,
             slack_format_by_channel: self.slack_format_by_channel.clone(),
             slack_format_override: self.slack_format_override,
+            long_markdown_route: self.long_markdown_route,
             event_sink: self.event_sink.clone(),
             post_metadata: self.post_metadata.clone(),
         })
@@ -4475,6 +4485,7 @@ impl CommandOutboundTransport {
             slack_format: None,
             slack_format_by_channel: BTreeMap::new(),
             slack_format_override: None,
+            long_markdown_route: false,
             event_sink: None,
             post_metadata: None,
         })
@@ -4490,6 +4501,12 @@ impl CommandOutboundTransport {
     ) {
         self.slack_format = default;
         self.slack_format_by_channel = by_channel;
+    }
+
+    /// Name the bridge's `long_markdown_route` switch on send requests
+    /// (#1712): off, requests encode exactly as before.
+    pub fn set_long_markdown_route(&mut self, route: bool) {
+        self.long_markdown_route = route;
     }
 
     /// Force one Slack outbound format for the next operations, as
@@ -4661,8 +4678,12 @@ impl ReplyTransport for CommandOutboundTransport {
         submission: ReplySubmission<'_>,
     ) -> std::result::Result<String, OutboundFailure> {
         let format = self.slack_format_for(submission.channel_id);
-        let request =
-            encode_send_request_with_metadata(&submission, format, self.post_metadata.as_ref())?;
+        let request = encode_send_request_with_metadata(
+            &submission,
+            format,
+            self.post_metadata.as_ref(),
+            self.long_markdown_route,
+        )?;
         let response = self.exchange(&request)?;
         let message_id = decode_send_response(&response, &submission)?;
         self.note_posted(
@@ -4685,8 +4706,12 @@ impl ReplyTransport for CommandOutboundTransport {
             body: submission.body,
             request_id: submission.request_id,
         };
-        let request =
-            encode_root_message_request_with_metadata(&root, format, self.post_metadata.as_ref())?;
+        let request = encode_root_message_request_with_metadata(
+            &root,
+            format,
+            self.post_metadata.as_ref(),
+            self.long_markdown_route,
+        )?;
         let response = self.exchange(&request)?;
         let message_id = decode_send_response(&response, &submission)?;
         self.note_posted(
@@ -4710,6 +4735,7 @@ impl RootMessageTransport for CommandOutboundTransport {
             &submission,
             format,
             self.post_metadata.as_ref(),
+            self.long_markdown_route,
         )?;
         let response = self.exchange(&request)?;
         let message_id = decode_root_message_response(&response, &submission)?;
@@ -4876,6 +4902,10 @@ struct SendWireRequest<'a> {
     text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     slack_format: Option<&'a str>,
+    /// The bridge's `long_markdown_route` switch (#1712), only when on: a
+    /// request without it encodes exactly as before.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    long_markdown_route: bool,
     /// Message metadata (#832 chat-trace-format-tagging), only when set: a request without it
     /// encodes exactly as before, so an older helper still accepts it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4975,7 +5005,7 @@ pub fn encode_send_request_with_format(
     submission: &ReplySubmission<'_>,
     format: Option<SlackFormat>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
-    encode_send_request_with_metadata(submission, format, None)
+    encode_send_request_with_metadata(submission, format, None, false)
 }
 
 /// Encode one v1 send request that may also carry message metadata (#832).
@@ -4983,6 +5013,7 @@ pub fn encode_send_request_with_metadata(
     submission: &ReplySubmission<'_>,
     format: Option<SlackFormat>,
     metadata: Option<&serde_json::Value>,
+    long_markdown_route: bool,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
     validate_outbound_send(submission)?;
     encode_wire_request(&SendWireRequest {
@@ -4993,6 +5024,7 @@ pub fn encode_send_request_with_metadata(
         thread_id: Some(submission.thread_id),
         text: submission.body,
         slack_format: format.map(SlackFormat::name),
+        long_markdown_route,
         metadata,
     })
 }
@@ -5009,7 +5041,7 @@ pub fn encode_root_message_request_with_format(
     submission: &RootMessageSubmission<'_>,
     format: Option<SlackFormat>,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
-    encode_root_message_request_with_metadata(submission, format, None)
+    encode_root_message_request_with_metadata(submission, format, None, false)
 }
 
 /// Encode one v1 root-message request that may also carry message metadata (#832).
@@ -5017,6 +5049,7 @@ pub fn encode_root_message_request_with_metadata(
     submission: &RootMessageSubmission<'_>,
     format: Option<SlackFormat>,
     metadata: Option<&serde_json::Value>,
+    long_markdown_route: bool,
 ) -> std::result::Result<Vec<u8>, OutboundFailure> {
     validate_root_message_submission(submission)?;
     encode_wire_request(&SendWireRequest {
@@ -5027,6 +5060,7 @@ pub fn encode_root_message_request_with_metadata(
         thread_id: None,
         text: submission.body,
         slack_format: format.map(SlackFormat::name),
+        long_markdown_route,
         metadata,
     })
 }
@@ -22822,6 +22856,7 @@ pub(crate) mod tests {
             reply_alias_range: None,
             slack_format: Some(SlackFormat::Markdown),
             slack_format_by_channel: std::collections::BTreeMap::new(),
+            long_markdown_route: false,
             relay_channels: Vec::new(),
             labels: None,
         }
@@ -40414,7 +40449,8 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             serde_json::from_slice(&encode_send_request(&send).expect("encode")).expect("json");
         assert!(plain.get("metadata").is_none(), "{plain}");
         let reply: Value = serde_json::from_slice(
-            &encode_send_request_with_metadata(&send, None, Some(&metadata)).expect("encode"),
+            &encode_send_request_with_metadata(&send, None, Some(&metadata), false)
+                .expect("encode"),
         )
         .expect("json");
         assert_eq!(reply["metadata"], metadata);
@@ -40429,7 +40465,7 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             None,
         );
         let root: Value = serde_json::from_slice(
-            &encode_root_message_request_with_metadata(&root, None, Some(&root_metadata))
+            &encode_root_message_request_with_metadata(&root, None, Some(&root_metadata), false)
                 .expect("encode"),
         )
         .expect("json");

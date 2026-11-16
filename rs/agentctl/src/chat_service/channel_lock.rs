@@ -230,6 +230,7 @@ mod tests {
             reply_alias_range: None,
             slack_format: None,
             slack_format_by_channel: Default::default(),
+            long_markdown_route: false,
             relay_channels: Vec::new(),
             labels: None,
         }
