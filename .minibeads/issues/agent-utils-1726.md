@@ -54,7 +54,9 @@ Wanted:
   and dark theme, with the Discuss half-pane open in at least the phone
   shots, per the standing screenshot matrix.
 
-# Resolution
+# Notes
+
+## Resolution
 
 Landed on main as 3d1baf69 (gated tree 41e8b4ee rebased on the #1729 fix
 daaf2f7f). `notices.ts`: an error with no words reads "Something went
