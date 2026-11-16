@@ -1749,22 +1749,22 @@ pub(crate) enum IgnoredMode {
 
 /// One gitignored regular file or symlink removal would otherwise lose.
 #[derive(Clone)]
-struct IgnoredFile {
-    path: String,
-    size: u64,
-    sha256: String,
-    link_target: Option<String>,
-    executable: bool,
+pub(crate) struct IgnoredFile {
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
+    pub(crate) link_target: Option<String>,
+    pub(crate) executable: bool,
 }
 
-struct IgnoredContext<'a> {
-    machine: &'a str,
-    slot: &'a str,
-    generation: i64,
-    archive_root: &'a Path,
+pub(crate) struct IgnoredContext<'a> {
+    pub(crate) machine: &'a str,
+    pub(crate) slot: &'a str,
+    pub(crate) generation: i64,
+    pub(crate) archive_root: &'a Path,
 }
 
-const IGNORED_ARCHIVE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const IGNORED_ARCHIVE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 
 fn is_cargo_target_dir(path: &Path) -> bool {
     // The Python edition's `_is_cargo_target_dir` (#1042).
@@ -2063,7 +2063,48 @@ fn collect_ignored_files(
     Ok(())
 }
 
-fn ignored_files_outside_caches(
+/// Drop collected ignored files a finish decision already tolerates
+/// (#1686): unchanged provisioned paths and allowlisted paths, mirroring
+/// the Python edition's `_finish_ignored_subset` (nested-worktree
+/// prefixes are a finish-status concern and never reach this set).
+pub(crate) fn finish_ignored_subset(
+    files: Vec<IgnoredFile>,
+    tolerated: &[String],
+    allowlist: &[String],
+) -> Vec<IgnoredFile> {
+    files
+        .into_iter()
+        .filter(|item| {
+            let clean = item.path.trim_end_matches('/');
+            if tolerated.iter().any(|entry| {
+                clean == entry || clean.starts_with(&format!("{}/", entry.trim_end_matches('/')))
+            }) {
+                return false;
+            }
+            let parts: Vec<String> = clean
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+            !allowlist.iter().any(|pattern| {
+                let pattern_parts = crate::finish_write::glob_parts(pattern);
+                (1..=parts.len()).any(|end| {
+                    crate::finish_write::glob_parts_match(&pattern_parts, &parts[..end])
+                })
+            })
+        })
+        .collect()
+}
+
+/// The (path, bytes, sha256) identity a finish decision records (#1686).
+pub(crate) fn ignored_triples(files: &[IgnoredFile]) -> Vec<(String, u64, String)> {
+    files
+        .iter()
+        .map(|item| (item.path.clone(), item.size, item.sha256.clone()))
+        .collect()
+}
+
+pub(crate) fn ignored_files_outside_caches(
     config: &Value,
     checkout_name: &str,
     checkout_path: &Path,
@@ -2443,7 +2484,7 @@ fn verify_ignored_archive(
     Ok(())
 }
 
-fn archive_ignored_files(
+pub(crate) fn archive_ignored_files(
     context: &IgnoredContext<'_>,
     checkout_name: &str,
     checkout_path: &Path,
@@ -3110,6 +3151,8 @@ fn salvage_gate(
     repository: &Path,
     ignored_mode: IgnoredMode,
     ignored_context: &IgnoredContext<'_>,
+    handoff: &Value,
+    slot: &str,
 ) -> Result<Value> {
     let name = checkout
         .get("name")
@@ -3124,9 +3167,87 @@ fn salvage_gate(
     // Gitignored files outside the regenerable caches are judged before
     // anything else (#1302): refuse, archive, or explicitly discard.
     let ignored_files = ignored_files_outside_caches(config, &name, &path)?;
+    // A finish-recorded ignored decision (#1686) is enforced here: the
+    // files must still match it exactly, and a remove flag that
+    // disagrees with it refuses.
+    let mut effective_mode = ignored_mode;
+    let recorded_entries: Vec<&Value> = handoff
+        .get("ignored_files")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item.get("checkout").and_then(Value::as_str) == Some(name.as_str())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !recorded_entries.is_empty() {
+        let disposition = recorded_entries[0]
+            .get("disposition")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let recorded_mode = if disposition == "archived" {
+            IgnoredMode::Archive
+        } else {
+            IgnoredMode::Discard
+        };
+        if ignored_mode != IgnoredMode::Refuse && ignored_mode != recorded_mode {
+            return Err(format!(
+                "slot {slot} finish recorded ignored files as {disposition}, but remove was given the opposite disposition; rerun remove without an ignored flag so the recorded decision stands. state: REFUSED -- no checkout was salvaged or removed"
+            ));
+        }
+        let tolerated: Vec<String> = checkout
+            .get("provisioned")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.get("path").and_then(Value::as_str).map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let allowlist: Vec<String> = config
+            .get("provisioned_allowlist")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let current = finish_ignored_subset(ignored_files.clone(), &tolerated, &allowlist);
+        let mut recorded_triples: Vec<(String, u64, String)> = recorded_entries
+            .iter()
+            .map(|item| {
+                (
+                    item.get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    item.get("bytes").and_then(Value::as_u64).unwrap_or_default(),
+                    item.get("sha256")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+        recorded_triples.sort();
+        if ignored_triples(&current) != recorded_triples {
+            return Err(format!(
+                "slot {slot} gitignored files changed after finish recorded them; restore the recorded files exactly (path, size and sha256 in the handoff) and rerun remove. state: REFUSED -- no checkout was salvaged or removed"
+            ));
+        }
+        effective_mode = recorded_mode;
+    }
     let mut ignored_archive = Value::Null;
     if !ignored_files.is_empty() {
-        match ignored_mode {
+        match effective_mode {
             IgnoredMode::Refuse => {
                 return Err(ignored_refusal(&name, &ignored_files));
             }
@@ -3233,7 +3354,7 @@ fn salvage_gate(
         "ref_inventory": ref_inventory(&path, &name)?,
     });
     if !ignored_files.is_empty() {
-        let disposition = match ignored_mode {
+        let disposition = match effective_mode {
             IgnoredMode::Archive => "archived",
             IgnoredMode::Discard => "discarded",
             IgnoredMode::Refuse => unreachable!(),
@@ -3251,7 +3372,7 @@ fn salvage_gate(
                     }))
                     .collect::<Vec<_>>()),
             );
-            if ignored_mode == IgnoredMode::Archive {
+            if effective_mode == IgnoredMode::Archive {
                 object.insert("ignored_archive".to_string(), ignored_archive);
             }
         }
@@ -3922,6 +4043,7 @@ fn prepare_remove(
         (None, None) => {}
     }
     let mut salvage: Vec<Value> = Vec::new();
+    let handoff_value = record.get("handoff").cloned().unwrap_or(Value::Null);
     for checkout in record
         .get("checkouts")
         .and_then(Value::as_array)
@@ -3946,6 +4068,8 @@ fn prepare_remove(
             &repository,
             ignored_mode,
             &ignored_context,
+            &handoff_value,
+            slot,
         )?);
     }
     assert_slot_unused(&slot_path, coordinator_pid)?;

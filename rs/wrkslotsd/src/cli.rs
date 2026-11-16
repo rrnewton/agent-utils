@@ -1484,6 +1484,12 @@ pub(crate) enum Lifecycle {
         /// Finish despite unaccounted commits: bundle and record them (#1364)
         #[arg(long)]
         discard_unaccounted: bool,
+        /// Archive gitignored files outside the caches and record them (#1686)
+        #[arg(long, conflicts_with = "discard_ignored")]
+        archive_ignored: bool,
+        /// Record gitignored files outside the caches as discarded (#1686)
+        #[arg(long)]
+        discard_ignored: bool,
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -4130,6 +4136,8 @@ pub fn run() -> u8 {
                 validation,
                 limitation,
                 discard_unaccounted,
+                archive_ignored,
+                discard_ignored,
                 root,
                 machine,
             } => {
@@ -4143,6 +4151,8 @@ pub fn run() -> u8 {
                     &validation,
                     &limitation,
                     discard_unaccounted,
+                    archive_ignored,
+                    discard_ignored,
                 ) {
                     Ok(value) => {
                         println!(

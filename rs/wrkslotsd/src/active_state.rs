@@ -280,6 +280,79 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
             }
         }
     }
+    let mut ignored_dispositions: Vec<&str> = Vec::new();
+    if let Some(files) = raw.get("ignored_files") {
+        for (index, item) in as_list(files, &format!("{label}.ignored_files"))?
+            .iter()
+            .enumerate()
+        {
+            let entry_label = format!("{label}.ignored_files[{index}]");
+            let entry = as_mapping(item, &entry_label)?;
+            exact_keys(
+                entry,
+                &["checkout", "path", "bytes", "sha256", "disposition"],
+                &[],
+                &entry_label,
+            )?;
+            as_str(&entry["checkout"], &format!("{entry_label}.checkout"))?;
+            as_str(&entry["path"], &format!("{entry_label}.path"))?;
+            as_int(&entry["bytes"], &format!("{entry_label}.bytes"), 0)?;
+            let digest = as_str(&entry["sha256"], &format!("{entry_label}.sha256"))?;
+            if !is_digest(digest) {
+                return Err(format!("{entry_label} holds an invalid sha256: {digest:?}"));
+            }
+            let disposition = as_str(
+                &entry["disposition"],
+                &format!("{entry_label}.disposition"),
+            )?;
+            if disposition != "archived" && disposition != "discarded" {
+                return Err(format!(
+                    "{entry_label} holds an unknown disposition: {disposition:?}"
+                ));
+            }
+            ignored_dispositions.push(disposition);
+        }
+    }
+    if !ignored_dispositions.is_empty()
+        && ignored_dispositions
+            .iter()
+            .any(|item| *item != ignored_dispositions[0])
+    {
+        return Err(format!(
+            "{label}.ignored_files mixes archived and discarded dispositions"
+        ));
+    }
+    let mut archive_count = 0usize;
+    if let Some(archives) = raw.get("ignored_archives") {
+        for (index, item) in as_list(archives, &format!("{label}.ignored_archives"))?
+            .iter()
+            .enumerate()
+        {
+            let entry_label = format!("{label}.ignored_archives[{index}]");
+            let entry = as_mapping(item, &entry_label)?;
+            exact_keys(
+                entry,
+                &["checkout", "archive_root", "path", "bytes", "sha256"],
+                &[],
+                &entry_label,
+            )?;
+            as_str(&entry["checkout"], &format!("{entry_label}.checkout"))?;
+            as_str(&entry["archive_root"], &format!("{entry_label}.archive_root"))?;
+            as_str(&entry["path"], &format!("{entry_label}.path"))?;
+            as_int(&entry["bytes"], &format!("{entry_label}.bytes"), 0)?;
+            let digest = as_str(&entry["sha256"], &format!("{entry_label}.sha256"))?;
+            if !is_digest(digest) {
+                return Err(format!("{entry_label} holds an invalid sha256: {digest:?}"));
+            }
+            archive_count += 1;
+        }
+    }
+    let archived = ignored_dispositions.first() == Some(&"archived");
+    if archived != (archive_count > 0) {
+        return Err(format!(
+            "{label} ignored archives do not match its ignored files"
+        ));
+    }
     let recorded_at = as_str(&raw["recorded_at"], &format!("{label}.recorded_at"))?;
     parse_timestamp(recorded_at, &format!("{label}.recorded_at"))?;
     let validation = as_list(&raw["validation"], &format!("{label}.validation"))?;

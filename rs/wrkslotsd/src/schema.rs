@@ -62,7 +62,8 @@ pub(crate) const IDENTITY_REQUIRED: &[&str] =
 pub(crate) const IDENTITY_OPTIONAL: &[&str] = &["namespace_pid", "pidns_inode"];
 pub(crate) const HANDOFF_REQUIRED: &[&str] =
     &["recorded_at", "validation", "limitations", "continuation"];
-pub(crate) const HANDOFF_OPTIONAL: &[&str] = &["discarded_unaccounted"];
+pub(crate) const HANDOFF_OPTIONAL: &[&str] =
+    &["discarded_unaccounted", "ignored_files", "ignored_archives"];
 pub(crate) const CHECKOUT_REQUIRED: &[&str] = &[
     "name",
     "path",
@@ -423,6 +424,72 @@ fn validate_handoff(value: &Value, label: &str) -> Result<(), ObserverError> {
         {
             digest(item, 40, &format!("{label}.discarded_unaccounted[{index}]"))?;
         }
+    }
+    let mut ignored_dispositions: Vec<&str> = Vec::new();
+    if let Some(files) = handoff.get("ignored_files") {
+        for (index, item) in array(files, &format!("{label}.ignored_files"))?
+            .iter()
+            .enumerate()
+        {
+            let entry_label = format!("{label}.ignored_files[{index}]");
+            let entry = object(item, &entry_label)?;
+            exact_keys(
+                entry,
+                &["checkout", "path", "bytes", "sha256", "disposition"],
+                &entry_label,
+            )?;
+            string(&entry["checkout"], &format!("{entry_label}.checkout"))?;
+            string(&entry["path"], &format!("{entry_label}.path"))?;
+            if entry["bytes"].as_u64().is_none() {
+                return Err(invalid(format!("{entry_label}.bytes must be an integer >= 0")));
+            }
+            digest(&entry["sha256"], 64, &format!("{entry_label}.sha256"))?;
+            let disposition = string(&entry["disposition"], &format!("{entry_label}.disposition"))?;
+            if disposition != "archived" && disposition != "discarded" {
+                return Err(invalid(format!(
+                    "{entry_label} holds an unknown disposition: {disposition:?}"
+                )));
+            }
+            ignored_dispositions.push(disposition);
+        }
+    }
+    if !ignored_dispositions.is_empty()
+        && ignored_dispositions
+            .iter()
+            .any(|item| *item != ignored_dispositions[0])
+    {
+        return Err(invalid(format!(
+            "{label}.ignored_files mixes archived and discarded dispositions"
+        )));
+    }
+    let mut archive_count = 0usize;
+    if let Some(archives) = handoff.get("ignored_archives") {
+        for (index, item) in array(archives, &format!("{label}.ignored_archives"))?
+            .iter()
+            .enumerate()
+        {
+            let entry_label = format!("{label}.ignored_archives[{index}]");
+            let entry = object(item, &entry_label)?;
+            exact_keys(
+                entry,
+                &["checkout", "archive_root", "path", "bytes", "sha256"],
+                &entry_label,
+            )?;
+            string(&entry["checkout"], &format!("{entry_label}.checkout"))?;
+            string(&entry["archive_root"], &format!("{entry_label}.archive_root"))?;
+            string(&entry["path"], &format!("{entry_label}.path"))?;
+            if entry["bytes"].as_u64().is_none() {
+                return Err(invalid(format!("{entry_label}.bytes must be an integer >= 0")));
+            }
+            digest(&entry["sha256"], 64, &format!("{entry_label}.sha256"))?;
+            archive_count += 1;
+        }
+    }
+    let archived = ignored_dispositions.first() == Some(&"archived");
+    if archived != (archive_count > 0) {
+        return Err(invalid(format!(
+            "{label} ignored archives do not match its ignored files"
+        )));
     }
     parse_timestamp(
         string(&handoff["recorded_at"], &format!("{label}.recorded_at"))?,

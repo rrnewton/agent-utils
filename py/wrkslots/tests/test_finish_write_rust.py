@@ -149,6 +149,8 @@ def _rust_finish(
     generation: int = 1,
     fixture: bool = True,
     discard: bool = False,
+    archive_ignored: bool = False,
+    discard_ignored: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fixture:
@@ -164,6 +166,10 @@ def _rust_finish(
         args.extend(["--validation", entry])
     if discard:
         args.append("--discard-unaccounted")
+    if archive_ignored:
+        args.append("--archive-ignored")
+    if discard_ignored:
+        args.append("--discard-ignored")
     return subprocess.run(
         args, cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env
     )
@@ -175,15 +181,41 @@ def _python_finish(
     validation: list[str] | None = None,
     generation: int = 1,
     discard: bool = False,
+    archive_ignored: bool = False,
+    discard_ignored: bool = False,
 ) -> int:
     args = argparse.Namespace(
         project_root=str(root), machine=None, slot="slot-a", agent="agent-slot-a",
         owner_pid=os.getpid(), expected_generation=generation,
         validation=VALIDATION if validation is None else validation,
         discard_unaccounted=discard,
+        archive_ignored=archive_ignored,
+        discard_ignored=discard_ignored,
         limitation=[], wait_lock=0.0,
     )
     return wrkslots_cli._cmd_finish(args)
+
+
+def _ignore_build_output(root: Path) -> Path:
+    """Make build.log gitignored in the fixture checkout via info/exclude."""
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    common = Path(_git(checkout, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = (checkout / common).resolve()
+    (common / "info").mkdir(exist_ok=True)
+    exclude = common / "info" / "exclude"
+    exclude.write_text(exclude.read_text() + "build.log\n" if exclude.exists() else "build.log\n")
+    target = checkout / "build.log"
+    target.write_text("build output\n")
+    return target
+
+
+def _normalize_handoff(handoff: dict[str, object]) -> None:
+    handoff.pop("recorded_at", None)
+    archives = handoff.get("ignored_archives")
+    if isinstance(archives, list):
+        for archive in cast(list[dict[str, object]], archives):
+            archive["archive_root"] = "ARCHIVEROOT"
 
 
 def _active_doc(root: Path) -> dict[str, object]:
@@ -191,7 +223,7 @@ def _active_doc(root: Path) -> dict[str, object]:
     for record in cast(list[dict[str, object]], doc["slots"]):
         handoff = record.get("handoff")
         if isinstance(handoff, dict):
-            handoff.pop("recorded_at")
+            _normalize_handoff(handoff)
         for checkout in cast(list[dict[str, object]], record["checkouts"]):
             checkout["head"] = "HEAD"
             checkout["start_point"] = "HEAD"
@@ -218,7 +250,15 @@ def _events(root: Path) -> list[dict[str, object]]:
         if isinstance(record, dict):
             handoff = record.get("handoff")
             if isinstance(handoff, dict):
-                handoff.pop("recorded_at")
+                _normalize_handoff(handoff)
+        evidence = payload.get("evidence")
+        if isinstance(evidence, dict):
+            accounting = evidence.get("accounting")
+            if isinstance(accounting, dict):
+                archives = accounting.get("ignored_archives")
+                if isinstance(archives, list):
+                    for archive in cast(list[dict[str, object]], archives):
+                        archive["archive_root"] = "ARCHIVEROOT"
             for checkout in cast(list[dict[str, object]], record["checkouts"]):
                 checkout["head"] = "HEAD"
                 checkout["start_point"] = "HEAD"
@@ -566,3 +606,45 @@ def test_finish_accounting_discard_both_editions(tmp_path: Path) -> None:
         )
         assert handoff["discarded_unaccounted"] == [commits[label]]
         assert list((root / "worktrees" / "wrkslots-salvage").glob("*.bundle"))
+
+
+def test_finish_ignored_discard_matches_python(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    for root in (rust_root, oracle_root):
+        _ignore_build_output(root)
+    assert _python_finish(oracle_root, discard_ignored=True) == 0
+    result = _rust_finish(rust_root, discard_ignored=True)
+    assert result.returncode == 0, result.stderr
+    assert _active_doc(rust_root) == _active_doc(oracle_root)
+    assert _events(rust_root)[-1]["payload"] == _events(oracle_root)[-1]["payload"]
+    doc = _active_doc(rust_root)
+    record = cast(list[dict[str, object]], doc["slots"])[0]
+    handoff = cast(dict[str, object], record["handoff"])
+    recorded = cast(list[dict[str, object]], handoff["ignored_files"])
+    assert [(item["path"], item["disposition"]) for item in recorded] == [
+        ("build.log", "discarded")
+    ]
+
+
+def test_finish_ignored_archive_matches_python(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    for root in (rust_root, oracle_root):
+        _ignore_build_output(root)
+    assert _python_finish(oracle_root, archive_ignored=True) == 0
+    result = _rust_finish(rust_root, archive_ignored=True)
+    assert result.returncode == 0, result.stderr
+    assert _active_doc(rust_root) == _active_doc(oracle_root)
+    assert _events(rust_root)[-1]["payload"] == _events(oracle_root)[-1]["payload"]
+
+
+def test_finish_ignored_with_untracked_refuses(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    for root in (rust_root, oracle_root):
+        _ignore_build_output(root)
+        (root / "worktrees" / "slot-a" / "repo" / "notes.txt").write_text("wip\n")
+    with pytest.raises(Exception) as caught:
+        _python_finish(oracle_root, discard_ignored=True)
+    assert "cover gitignored files only" in str(caught.value)
+    result = _rust_finish(rust_root, discard_ignored=True)
+    assert result.returncode == 1
+    assert "cover gitignored files only" in result.stderr

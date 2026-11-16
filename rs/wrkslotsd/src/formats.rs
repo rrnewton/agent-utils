@@ -100,6 +100,42 @@ pub struct Checkout {
     pub provisioned: Vec<ProvisionedPath>,
 }
 
+/// One gitignored file finish judged under --archive/--discard-ignored (#1686).
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffIgnoredFile {
+    /// Checkout holding the file (a submodule is `parent/relative`).
+    pub checkout: String,
+    /// Path relative to that checkout.
+    pub path: String,
+    /// File size in bytes (a symlink's target length).
+    #[schemars(range(min = 0))]
+    pub bytes: u64,
+    /// SHA-256 of the file bytes (of the target text for a symlink).
+    #[schemars(length(equal = 64))]
+    pub sha256: String,
+    /// archived or discarded.
+    pub disposition: String,
+}
+
+/// The verified tar one checkout's archived ignored files were kept in (#1686).
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffIgnoredArchive {
+    /// Checkout the tar belongs to.
+    pub checkout: String,
+    /// Salvage archive root holding the tar.
+    pub archive_root: String,
+    /// Tar path relative to the archive root.
+    pub path: String,
+    /// Tar size in bytes.
+    #[schemars(range(min = 0))]
+    pub bytes: u64,
+    /// SHA-256 of the tar bytes.
+    #[schemars(length(equal = 64))]
+    pub sha256: String,
+}
+
 /// The handoff summary embedded in an active record.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -115,6 +151,12 @@ pub struct HandoffSummary {
     /// Commits finish discarded under --discard-unaccounted (#1364).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discarded_unaccounted: Vec<String>,
+    /// Gitignored files finish archived or discarded (#1686), by checkout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_files: Vec<HandoffIgnoredFile>,
+    /// Verified tars for the archived ignored files (#1686).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_archives: Vec<HandoffIgnoredArchive>,
 }
 
 /// Where an imported record came from.

@@ -1495,6 +1495,29 @@ class Checkout:
 
 
 @dataclasses.dataclass(frozen=True)
+class HandoffIgnoredFile:
+    """One gitignored file finish judged under --archive/--discard-ignored (#1686)."""
+
+    checkout: str
+    path: str
+    size: int
+    sha256: str
+    #: archived or discarded; one disposition for the whole handoff.
+    disposition: str
+
+
+@dataclasses.dataclass(frozen=True)
+class HandoffIgnoredArchive:
+    """The verified tar one checkout's archived ignored files were kept in (#1686)."""
+
+    checkout: str
+    archive_root: str
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
 class Handoff:
     """Owner-recorded evidence that a slot is ready for later removal."""
 
@@ -1504,6 +1527,9 @@ class Handoff:
     continuation: str
     #: Commits finish discarded under --discard-unaccounted (#1364), full SHAs.
     discarded_unaccounted: tuple[str, ...] = ()
+    #: Gitignored files finish archived or discarded (#1686), by checkout.
+    ignored_files: tuple[HandoffIgnoredFile, ...] = ()
+    ignored_archives: tuple[HandoffIgnoredArchive, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7471,6 +7497,28 @@ def _handoff_to_obj(handoff: Handoff | None) -> object:
     }
     if handoff.discarded_unaccounted:
         value["discarded_unaccounted"] = list(handoff.discarded_unaccounted)
+    if handoff.ignored_files:
+        value["ignored_files"] = [
+            {
+                "checkout": item.checkout,
+                "path": item.path,
+                "bytes": item.size,
+                "sha256": item.sha256,
+                "disposition": item.disposition,
+            }
+            for item in handoff.ignored_files
+        ]
+    if handoff.ignored_archives:
+        value["ignored_archives"] = [
+            {
+                "checkout": item.checkout,
+                "archive_root": item.archive_root,
+                "path": item.path,
+                "bytes": item.size,
+                "sha256": item.sha256,
+            }
+            for item in handoff.ignored_archives
+        ]
     return value
 
 
@@ -7481,7 +7529,7 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
     _exact_keys(
         raw,
         {"recorded_at", "validation", "limitations", "continuation"},
-        {"discarded_unaccounted"},
+        {"discarded_unaccounted", "ignored_files", "ignored_archives"},
         label,
     )
     recorded_at = _as_str(raw["recorded_at"], f"{label}.recorded_at")
@@ -7506,7 +7554,85 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
     for sha in discarded:
         if not SHA_RE.fullmatch(sha):
             raise StateError(f"{label}.discarded_unaccounted holds an invalid commit: {sha!r}")
-    return Handoff(recorded_at, validation, limitations, continuation, discarded)
+    ignored_files: list[HandoffIgnoredFile] = []
+    for index, item in enumerate(
+        _as_list(raw.get("ignored_files", []), f"{label}.ignored_files")
+    ):
+        entry = _as_mapping(item, f"{label}.ignored_files[{index}]")
+        _exact_keys(
+            entry,
+            {"checkout", "path", "bytes", "sha256", "disposition"},
+            set(),
+            f"{label}.ignored_files[{index}]",
+        )
+        disposition = _as_str(
+            entry["disposition"], f"{label}.ignored_files[{index}].disposition"
+        )
+        if disposition not in ("archived", "discarded"):
+            raise StateError(
+                f"{label}.ignored_files[{index}] holds an unknown disposition: {disposition!r}"
+            )
+        digest = _as_str(entry["sha256"], f"{label}.ignored_files[{index}].sha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise StateError(f"{label}.ignored_files[{index}] holds an invalid sha256: {digest!r}")
+        size = _as_int(entry["bytes"], f"{label}.ignored_files[{index}].bytes")
+        if size < 0:
+            raise StateError(f"{label}.ignored_files[{index}] holds a negative byte count")
+        ignored_files.append(
+            HandoffIgnoredFile(
+                checkout=_as_str(entry["checkout"], f"{label}.ignored_files[{index}].checkout"),
+                path=_as_str(entry["path"], f"{label}.ignored_files[{index}].path"),
+                size=size,
+                sha256=digest,
+                disposition=disposition,
+            )
+        )
+    if len({item.disposition for item in ignored_files}) > 1:
+        raise StateError(f"{label}.ignored_files mixes archived and discarded dispositions")
+    ignored_archives: list[HandoffIgnoredArchive] = []
+    for index, item in enumerate(
+        _as_list(raw.get("ignored_archives", []), f"{label}.ignored_archives")
+    ):
+        entry = _as_mapping(item, f"{label}.ignored_archives[{index}]")
+        _exact_keys(
+            entry,
+            {"checkout", "archive_root", "path", "bytes", "sha256"},
+            set(),
+            f"{label}.ignored_archives[{index}]",
+        )
+        digest = _as_str(entry["sha256"], f"{label}.ignored_archives[{index}].sha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise StateError(
+                f"{label}.ignored_archives[{index}] holds an invalid sha256: {digest!r}"
+            )
+        size = _as_int(entry["bytes"], f"{label}.ignored_archives[{index}].bytes")
+        if size < 0:
+            raise StateError(f"{label}.ignored_archives[{index}] holds a negative byte count")
+        ignored_archives.append(
+            HandoffIgnoredArchive(
+                checkout=_as_str(
+                    entry["checkout"], f"{label}.ignored_archives[{index}].checkout"
+                ),
+                archive_root=_as_str(
+                    entry["archive_root"], f"{label}.ignored_archives[{index}].archive_root"
+                ),
+                path=_as_str(entry["path"], f"{label}.ignored_archives[{index}].path"),
+                size=size,
+                sha256=digest,
+            )
+        )
+    archived = bool(ignored_files) and ignored_files[0].disposition == "archived"
+    if archived != bool(ignored_archives):
+        raise StateError(f"{label} ignored archives do not match its ignored files")
+    return Handoff(
+        recorded_at,
+        validation,
+        limitations,
+        continuation,
+        discarded,
+        tuple(ignored_files),
+        tuple(ignored_archives),
+    )
 
 
 def _handoff_artifact_to_obj(artifact: _HandoffArtifact) -> dict[str, object]:
@@ -28251,6 +28377,28 @@ def _provisioned_unchanged(path: Path, entry: ProvisionedPath) -> bool:
     return current == entry
 
 
+def _provisioned_changed_refusal(checkout_name: str, entry: ProvisionedPath) -> Refusal:
+    """Name a changed provisioned path and how to restore it (#1686)."""
+    if entry.kind == "symlink":
+        recorded = f"recorded symlink -> {entry.target}"
+        restore = f"recreate it exactly with: ln -s {entry.target} {entry.path}"
+    elif entry.kind == "directory":
+        recorded = "recorded directory"
+        restore = (
+            "restore the directory exactly as provisioning left it "
+            "(same files, contents and links)"
+        )
+    else:
+        recorded = f"recorded file sha256 {entry.sha256}"
+        restore = "restore the file exactly as provisioning left it (same bytes)"
+    return Refusal(
+        f"checkout {checkout_name} provisioned path changed: {entry.path} ({recorded}); "
+        f"{restore}, or re-run the slot's post-provision hooks and rerun finish. "
+        "A changed or deleted provisioned path is not covered by --archive-ignored "
+        "or --discard-ignored, because provisioning recorded its exact state"
+    )
+
+
 def _status_outside_provisioned(
     status: str, tolerated: Sequence[str], allowlist: Sequence[str]
 ) -> str:
@@ -28420,6 +28568,9 @@ def _assert_checkout_safe(
     refresh_remote: bool = True,
     accounting: bool = False,
     accounting_sink: list[dict[str, object]] | None = None,
+    ignored_mode: _IgnoredMode = "refuse",
+    ignored_sink: dict[str, tuple[_IgnoredFile, ...]] | None = None,
+    expected_ignored: tuple[_IgnoredFile, ...] | None = None,
 ) -> Checkout:
     if checkout.vcs == "eden":
         return _assert_eden_checkout_safe(config, checkout)
@@ -28446,6 +28597,7 @@ def _assert_checkout_safe(
         _cache_globs_for(config, checkout.name),
     )
     status = vcs.status(path, _cache_globs_for(config, checkout.name))
+    nested_prefixes: list[str] = []
     if status and accounting:
         # A nested linked worktree is a checkout boundary, not dirt: its
         # own commits are accounted separately (#1364).
@@ -28457,23 +28609,59 @@ def _assert_checkout_safe(
         ]
         if nested_prefixes:
             status = _status_outside_paths(status, nested_prefixes)
+    tolerated_provisioned: list[str] = [
+        entry.path
+        for entry in checkout.provisioned
+        if _provisioned_unchanged(path, entry)
+    ]
     if status and (checkout.provisioned or config.provisioned_allowlist):
         # Provisioning output is removable build output, not dirty work,
         # while it is exactly as create recorded it (#1369).
-        tolerated = [
-            entry.path
-            for entry in checkout.provisioned
-            if _provisioned_unchanged(path, entry)
-        ]
         status = _status_outside_provisioned(
-            status, tolerated, config.provisioned_allowlist
+            status, tolerated_provisioned, config.provisioned_allowlist
         )
     for entry in checkout.provisioned:
         if not _provisioned_unchanged(path, entry):
+            raise _provisioned_changed_refusal(checkout.name, entry)
+    if expected_ignored is not None:
+        # A remove recheck of a finish-recorded decision (#1686): the
+        # ignored files must still be exactly what finish recorded.
+        current_ignored = _ignored_files_outside_caches(config, checkout, path, vcs)
+        current_ignored = _finish_ignored_subset(
+            current_ignored,
+            tolerated_provisioned,
+            nested_prefixes,
+            config.provisioned_allowlist,
+        )
+        if _ignored_triples(current_ignored) != _ignored_triples(expected_ignored):
             raise Refusal(
-                f"checkout {checkout.name} provisioned path changed: {entry.path}; "
-                "restore the provisioning output or remove it before finishing"
+                f"checkout {checkout.name} gitignored files changed after finish "
+                "recorded them; restore the recorded files exactly (path, size "
+                "and sha256 in the handoff) and rerun remove"
             )
+        status_lines = [
+            line for line in status.splitlines() if not line.startswith("! ")
+        ]
+        status = "\n".join(status_lines) + ("\n" if status_lines else "")
+    elif status and ignored_mode != "refuse":
+        # Finish with --archive-ignored/--discard-ignored (#1686): only
+        # ignored lines may remain; tracked or untracked work still refuses.
+        lines = status.splitlines()
+        blocking = [line for line in lines if not line.startswith("! ")]
+        if blocking:
+            raise Refusal(
+                f"checkout {checkout.name} is dirty or has untracked/ignored files "
+                f"({blocking[0]}); --archive-ignored and --discard-ignored cover "
+                "gitignored files only: commit intended work and publish it before "
+                "finishing; keep a handoff out of commits (use write-handoff)"
+            )
+        collected = _ignored_files_outside_caches(config, checkout, path, vcs)
+        collected = _finish_ignored_subset(
+            collected, tolerated_provisioned, nested_prefixes, config.provisioned_allowlist
+        )
+        if collected and ignored_sink is not None:
+            ignored_sink[checkout.name] = collected
+        status = ""
     if status:
         first = status.splitlines()[0]
         raise Refusal(
@@ -33524,6 +33712,63 @@ def _ignored_files_outside_caches(
     return tuple(found[path] for path in sorted(found))
 
 
+def _finish_ignored_subset(
+    files: tuple[_IgnoredFile, ...],
+    tolerated: Sequence[str],
+    nested_prefixes: Sequence[str],
+    allowlist: Sequence[str] = (),
+) -> tuple[_IgnoredFile, ...]:
+    """Drop collected ignored files finish already tolerates (#1686).
+
+    Provisioned paths (unchanged, by definition), nested-worktree
+    contents (their own checkout's business), and allowlisted paths
+    are not part of a finish ignored decision.
+    """
+    kept: list[_IgnoredFile] = []
+    for item in files:
+        clean = item.path.rstrip("/")
+        if any(
+            clean == entry or clean.startswith(entry.rstrip("/") + "/")
+            for entry in (*tolerated, *nested_prefixes)
+        ):
+            continue
+        parts = tuple(part for part in clean.split("/") if part)
+        covered = False
+        for pattern in allowlist:
+            pattern_parts = _glob_pattern_parts(pattern)
+            if any(
+                _glob_parts_match(pattern_parts, parts[:end])
+                for end in range(1, len(parts) + 1)
+            ):
+                covered = True
+                break
+        if not covered:
+            kept.append(item)
+    return tuple(kept)
+
+
+def _ignored_triples(
+    files: Sequence[_IgnoredFile],
+) -> tuple[tuple[str, int, str], ...]:
+    """The (path, bytes, sha256) identity a finish decision records (#1686)."""
+    return tuple((item.path, item.size, item.sha256) for item in files)
+
+
+def _handoff_ignored_by_checkout(
+    handoff: Handoff,
+) -> dict[str, tuple[_IgnoredFile, ...]]:
+    """A handoff's recorded ignored files as collected-file triples (#1686)."""
+    grouped: dict[str, list[_IgnoredFile]] = {}
+    for item in handoff.ignored_files:
+        grouped.setdefault(item.checkout, []).append(
+            _IgnoredFile(item.path, item.size, item.sha256)
+        )
+    return {
+        name: tuple(sorted(files, key=lambda entry: entry.path))
+        for name, files in grouped.items()
+    }
+
+
 def _ignored_refusal(
     ignored_by_checkout: Mapping[str, tuple[_IgnoredFile, ...]],
 ) -> Refusal:
@@ -33922,6 +34167,60 @@ def _salvage_agent_slot(
         files = _ignored_files_outside_caches(config, checkout, path, vcs)
         if files:
             ignored_by_checkout[checkout.name] = files
+    if record.handoff is not None and record.handoff.ignored_files:
+        # A finish-recorded ignored decision (#1686) is enforced here:
+        # the files must still match it exactly, and a remove flag that
+        # disagrees with it refuses.
+        recorded_ignored = _handoff_ignored_by_checkout(record.handoff)
+        recorded_mode: _IgnoredMode = (
+            "archive"
+            if record.handoff.ignored_files[0].disposition == "archived"
+            else "discard"
+        )
+        if ignored_mode not in ("refuse", recorded_mode):
+            raise Refusal(
+                f"slot {record.slot} finish recorded ignored files as "
+                f"{record.handoff.ignored_files[0].disposition}, but remove was "
+                f"given the opposite disposition; rerun remove without an "
+                "ignored flag so the recorded decision stands. "
+                "state: REFUSED -- no checkout was salvaged or removed"
+            )
+        current_decision: dict[str, tuple[_IgnoredFile, ...]] = {}
+        for name, files in ignored_by_checkout.items():
+            tolerated: list[str] = []
+            candidate = next(
+                (item for item, *_rest in candidates if item.name == name), None
+            )
+            if candidate is not None and candidate.provisioned:
+                tolerated = [entry.path for entry in candidate.provisioned]
+            else:
+                for parent in record.checkouts:
+                    if name.startswith(parent.name + "/"):
+                        relative = name[len(parent.name) + 1 :]
+                        tolerated = [
+                            entry.path[len(relative) + 1 :]
+                            for entry in parent.provisioned
+                            if entry.path.startswith(relative + "/")
+                        ]
+            filtered = _finish_ignored_subset(
+                files, tolerated, (), config.provisioned_allowlist
+            )
+            if filtered:
+                current_decision[name] = filtered
+        if {
+            name: _ignored_triples(files)
+            for name, files in current_decision.items()
+        } != {
+            name: _ignored_triples(files)
+            for name, files in recorded_ignored.items()
+        }:
+            raise Refusal(
+                f"slot {record.slot} gitignored files changed after finish "
+                "recorded them; restore the recorded files exactly (path, size "
+                "and sha256 in the handoff) and rerun remove. "
+                "state: REFUSED -- no checkout was salvaged or removed"
+            )
+        ignored_mode = recorded_mode
     ignored_archives: dict[str, dict[str, object]] = {}
     if ignored_by_checkout:
         if ignored_mode == "refuse":
@@ -36296,6 +36595,9 @@ def _handoff_preconditions(
     refresh_remote: bool = True,
     accounting: bool = False,
     accounting_sink: list[dict[str, object]] | None = None,
+    ignored_mode: _IgnoredMode = "refuse",
+    ignored_sink: dict[str, tuple[_IgnoredFile, ...]] | None = None,
+    expected_ignored: Mapping[str, tuple[_IgnoredFile, ...]] | None = None,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
@@ -36307,6 +36609,11 @@ def _handoff_preconditions(
             refresh_remote=refresh_remote,
             accounting=accounting,
             accounting_sink=accounting_sink,
+            ignored_mode=ignored_mode,
+            ignored_sink=ignored_sink,
+            expected_ignored=(
+                None if expected_ignored is None else expected_ignored.get(item.name, ())
+            ),
         )
         for item in record.checkouts
     )
@@ -36334,8 +36641,18 @@ def _remove_preconditions(
     # as pull requests land and branches are deleted, so identity is the
     # checkout heads, not the recorded containment.
     accounting_sink: list[dict[str, object]] = []
+    expected_ignored = (
+        _handoff_ignored_by_checkout(record.handoff)
+        if record.handoff.ignored_files
+        else None
+    )
     slot_path, final_checkouts = _handoff_preconditions(
-        config, record, vcs, accounting=True, accounting_sink=accounting_sink
+        config,
+        record,
+        vcs,
+        accounting=True,
+        accounting_sink=accounting_sink,
+        expected_ignored=expected_ignored,
     )
     _landed, _opened, unaccounted = _accounting_totals(accounting_sink)
     allowed = frozenset(record.handoff.discarded_unaccounted)
@@ -57501,6 +57818,16 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         raise Refusal("finish requires at least one non-empty --validation entry")
     if any(not item.strip() for item in limitations):
         raise Refusal("finish limitations must be non-empty")
+    archive_ignored = bool(getattr(args, "archive_ignored", False))
+    discard_ignored = bool(getattr(args, "discard_ignored", False))
+    if archive_ignored and discard_ignored:
+        raise Refusal(
+            "--archive-ignored and --discard-ignored cannot be supplied together. "
+            "state: REFUSED -- no handoff was recorded"
+        )
+    ignored_mode: _IgnoredMode = (
+        "archive" if archive_ignored else "discard" if discard_ignored else "refuse"
+    )
     # Accounting is gathered with no lock held (#1488, pattern of
     # #1367/#1276); under the lock it is reused only while the record,
     # fingerprint, and landed tips still match, else it is regathered.
@@ -57530,7 +57857,16 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         if record.handoff is not None:
             raise Refusal(f"slot {record.slot} already has a recorded handoff")
         discard = bool(getattr(args, "discard_unaccounted", False))
+        if ignored_mode != "refuse" and any(
+            item.vcs == "eden" for item in record.checkouts
+        ):
+            raise Refusal(
+                "--archive-ignored and --discard-ignored apply to Git checkouts "
+                "only; Eden checkouts keep refusing ignored content. "
+                "state: REFUSED -- no handoff was recorded"
+            )
         accounting_sink: list[dict[str, object]] = []
+        ignored_sink: dict[str, tuple[_IgnoredFile, ...]] = {}
         vcs = _GitVcs()
         if prepared_accounting is not None and _prepared_finish_accounting_current(
             config, prepared_accounting, record, vcs
@@ -57540,8 +57876,55 @@ def _cmd_finish(args: argparse.Namespace) -> int:
             final_checkouts = prepared_accounting.final_checkouts
         else:
             _slot_path, final_checkouts = _handoff_preconditions(
-                config, record, vcs, accounting=True, accounting_sink=accounting_sink
+                config,
+                record,
+                vcs,
+                accounting=True,
+                accounting_sink=accounting_sink,
+                ignored_mode=ignored_mode,
+                ignored_sink=ignored_sink,
             )
+        ignored_checkouts: dict[str, tuple[Checkout, Path]] = {
+            item.name: (item, _stored_path(config, item.path, "checkout path"))
+            for item in final_checkouts
+        }
+        if ignored_mode != "refuse":
+            # Ignored files inside initialized submodules are judged
+            # under the submodule's own name, as salvage judges them.
+            for item in record.checkouts:
+                if item.vcs == "eden":
+                    continue
+                for submodule, submodule_path in _submodule_salvage_checkouts(
+                    config, item, vcs
+                ):
+                    files = _finish_ignored_subset(
+                        _ignored_files_outside_caches(
+                            config, submodule, submodule_path, vcs
+                        ),
+                        (),
+                        (),
+                        config.provisioned_allowlist,
+                    )
+                    # Provisioning output inside the submodule is the
+                    # parent checkout's recorded business (#1369).
+                    files = _finish_ignored_subset(
+                        files,
+                        tuple(
+                            entry.path[len(submodule.name) - len(item.name) :]
+                            for entry in item.provisioned
+                            if entry.path.startswith(
+                                submodule.name[len(item.name) + 1 :] + "/"
+                            )
+                        ),
+                        (),
+                        (),
+                    )
+                    if files:
+                        ignored_sink[submodule.name] = files
+                        ignored_checkouts[submodule.name] = (
+                            submodule,
+                            submodule_path,
+                        )
         landed_count, open_count, unaccounted = _accounting_totals(accounting_sink)
         discarded: tuple[str, ...] = ()
         bundle_paths: list[str] = []
@@ -57601,6 +57984,59 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                 )
                 vcs._run(path, ["bundle", "verify", str(bundle)])
                 bundle_paths.append(str(bundle))
+        ignored_entries: list[HandoffIgnoredFile] = []
+        ignored_archive_entries: list[HandoffIgnoredArchive] = []
+        if ignored_sink:
+            disposition = "archived" if ignored_mode == "archive" else "discarded"
+            total_ignored = sum(
+                item.size for files in ignored_sink.values() for item in files
+            )
+            archives: dict[str, dict[str, object]] = {}
+            if ignored_mode == "archive":
+                if total_ignored > _IGNORED_ARCHIVE_LIMIT_BYTES:
+                    raise Refusal(
+                        f"gitignored files outside the known regenerable caches total "
+                        f"{total_ignored} bytes, above the {_IGNORED_ARCHIVE_LIMIT_BYTES}-byte "
+                        "--archive-ignored limit; preserve them by hand or rerun with "
+                        "--discard-ignored. state: REFUSED -- no handoff was recorded"
+                    )
+                resolved_root = _default_salvage_archive_root(config)
+                for name in sorted(ignored_sink):
+                    checkout_obj, checkout_path = ignored_checkouts[name]
+                    archives[name] = _archive_ignored_files(
+                        config,
+                        resolved_root,
+                        record.machine,
+                        record.slot,
+                        record.generation,
+                        checkout_obj,
+                        checkout_path,
+                        ignored_sink[name],
+                    )
+            for name in sorted(ignored_sink):
+                for item in ignored_sink[name]:
+                    ignored_entries.append(
+                        HandoffIgnoredFile(
+                            checkout=name,
+                            path=item.path,
+                            size=item.size,
+                            sha256=item.sha256,
+                            disposition=disposition,
+                        )
+                    )
+                if name in archives:
+                    archive = archives[name]
+                    ignored_archive_entries.append(
+                        HandoffIgnoredArchive(
+                            checkout=name,
+                            archive_root=_as_str(
+                                archive["archive_root"], "ignored archive root"
+                            ),
+                            path=_as_str(archive["path"], "ignored archive path"),
+                            size=_as_int(archive["bytes"], "ignored archive bytes"),
+                            sha256=_as_str(archive["sha256"], "ignored archive sha256"),
+                        )
+                    )
         continuation = (
             f"wrkslots remove {record.slot} --coordinator-pid "
             f"<current-coordinator-pid> --expected-generation {record.generation}"
@@ -57614,6 +58050,8 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                 limitations=limitations,
                 continuation=continuation,
                 discarded_unaccounted=discarded,
+                ignored_files=tuple(ignored_entries),
+                ignored_archives=tuple(ignored_archive_entries),
             ),
         )
         _write_active_state(
@@ -57629,6 +58067,26 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                     "unaccounted": len(unaccounted),
                     "discarded_unaccounted": list(discarded),
                     "discard_bundles": bundle_paths,
+                    "ignored_files": [
+                        {
+                            "checkout": item.checkout,
+                            "path": item.path,
+                            "bytes": item.size,
+                            "sha256": item.sha256,
+                            "disposition": item.disposition,
+                        }
+                        for item in ignored_entries
+                    ],
+                    "ignored_archives": [
+                        {
+                            "checkout": item.checkout,
+                            "archive_root": item.archive_root,
+                            "path": item.path,
+                            "bytes": item.size,
+                            "sha256": item.sha256,
+                        }
+                        for item in ignored_archive_entries
+                    ],
                 },
             },
         )
@@ -57647,6 +58105,13 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         print(f"unaccounted {sha} {subject}")
     for bundle_path in bundle_paths:
         print(f"discard_bundle={bundle_path}")
+    for item in ignored_entries:
+        print(
+            f"ignored checkout={item.checkout} path={item.path} "
+            f"bytes={item.size} sha256={item.sha256} disposition={item.disposition}"
+        )
+    for item in ignored_archive_entries:
+        print(f"ignored_archive checkout={item.checkout} path={item.path}")
     print(
         f"recorded handoff slot={record.slot} generation={record.generation}; "
         "physical storage retained"
@@ -88997,8 +89462,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "and nested worktrees: landed (exact SHA or same patch-id on the landed ref), open "
             "(published to a remote-tracking ref), or unaccounted. Finish refuses while anything "
             "is unaccounted unless --discard-unaccounted records the discarded SHAs in the "
-            "handoff and bundles their history into the local salvage archive; then retain the "
-            "slot and record the handoff. finish never deletes."
+            "handoff and bundles their history into the local salvage archive. Gitignored "
+            "files outside the regenerable caches refuse unless --archive-ignored keeps "
+            "them in a verified tar or --discard-ignored records them as discarded in the "
+            "handoff for remove to delete; tracked or untracked work always refuses. Then "
+            "retain the slot and record the handoff. finish never deletes."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -89037,6 +89505,28 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "finish even though commits are neither landed nor published: bundle their "
             "history into the local salvage archive and record their SHAs in the handoff"
+        ),
+    )
+    finish.add_argument(
+        "--archive-ignored",
+        action="store_true",
+        help=(
+            "finish even though Git checkouts hold gitignored files outside the known "
+            "regenerable caches: keep every such file in a verified tar in the local "
+            "salvage archive, record each file (path, bytes, sha256) and the archive "
+            "in the handoff, and let remove delete the files against that record. "
+            "Tracked or untracked non-ignored work still refuses (Git checkouts only)"
+        ),
+    )
+    finish.add_argument(
+        "--discard-ignored",
+        action="store_true",
+        help=(
+            "finish even though Git checkouts hold gitignored files outside the known "
+            "regenerable caches: record each file (path, bytes, sha256) in the handoff "
+            "as discarded and let remove delete them with the checkout; nothing is "
+            "archived. Tracked or untracked non-ignored work still refuses "
+            "(Git checkouts only)"
         ),
     )
     finish.set_defaults(handler=_cmd_finish)
