@@ -6040,7 +6040,7 @@ const quoteOwner = createQuoting({
 
 
 const {
-  noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, quickReplyHolds,
+  noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, dismissSelection, quickReplyHolds,
   quickReplyListMoved, placeQuickReply, closeQuickReply, putDownQuickReply, dockQuickReply, sendQuickReply,
 } = quoteOwner;
 
@@ -8244,6 +8244,7 @@ application.track(mountQuickReplyListeners({
   leftById: (id) => leftEl(id),
   noteQuoteSelection: () => noteQuoteSelection(),
   pressSelectionChip: () => pressSelectionChip(),
+  dismissSelection: () => dismissSelection(),
   sendQuickReply: () => guardQuietly(sendQuickReply)(),
   cancelQuickReply: () => cancelQuickReply(),
   answerQuickReplyDiscard: (discard) => answerQuickReplyDiscard(discard),

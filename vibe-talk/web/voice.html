@@ -4083,6 +4083,12 @@
       under the selection's box. Hidden while nothing in a message is selected.
     -->
     <button id="selection-chip" class="selection-chip" type="button" title="Reply to this message, starting with the words you selected in it quoted" hidden>Quoted reply</button>
+    <!--
+      `#1717 vibe-talk-quote-reply-dismiss-x`. A little X beside the chip: clearing an accidental
+      selection without tapping the message, which would fold a very big one. Shown, hidden and
+      placed with the chip by `drawSelectionChip`; its press is stopped before any card handler.
+    -->
+    <button id="selection-chip-dismiss" class="selection-chip-dismiss" type="button" title="Clear the selection" aria-label="Clear the selection" hidden>&times;</button>
 
     <!--
       `#727 vt-selection-quick-reply`. The quick reply the Quoted reply chip opens: floating under the

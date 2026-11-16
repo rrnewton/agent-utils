@@ -224,6 +224,8 @@ export interface Quoting {
   placeSelectionChip(): void;
   /** A press of the chip: the quick reply to the words it stands under. */
   pressSelectionChip(): void;
+  /** `#1717 vibe-talk-quote-reply-dismiss-x`. A press of the chip's X: the selection is cleared and the chip and X go, nothing else moving. */
+  dismissSelection(): void;
   /** The `q` key: the chip's act without the chip. False with nothing held. */
   quoteSelectionNow(): boolean;
   /** Whether `area` is held still for a quick reply. */
@@ -386,16 +388,20 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
   /** Show the chip under the selection Quote reply would quote, or hide it where there is none. */
   function drawSelectionChip(): void {
     const chip = deps.byId("selection-chip");
+    // `#1717 vibe-talk-quote-reply-dismiss-x`. The X beside the chip: shown, hidden and placed with it.
+    const dismiss = deps.byId("selection-chip-dismiss");
     const box = quoteHeld ? selectionBox() : null;
     // A touch's held selection, gone from the page, keeps the chip where it was until the hold ends.
     // `#819 voice-page-quoted-reply-and-draft-chip`. And its twin in the read's strip, which nothing covers.
     const twin = deps.byId("read-steer-quote");
     if (!quoteHeld || (box === null && chip.hidden)) {
       setHiddenIfChanged(chip, true);
+      setHiddenIfChanged(dismiss, true);
       setHiddenIfChanged(twin, true);
       return;
     }
     setHiddenIfChanged(chip, false);
+    setHiddenIfChanged(dismiss, false);
     setHiddenIfChanged(twin, false);
     if (box === null) return;
     const size = chip.getBoundingClientRect();
@@ -422,6 +428,31 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     }
     chip.style.left = `${Math.round(left)}px`;
     chip.style.top = `${Math.round(top)}px`;
+    // The X just right of the chip, or just left of it where the window's edge leaves no room,
+    // centred on the chip's height and kept inside the window like the chip.
+    const dismissSize = dismiss.getBoundingClientRect();
+    const dismissWidth = Number(dismissSize.width) || 0;
+    const dismissHeight = Number(dismissSize.height) || 0;
+    let dismissLeft = left + width + SELECTION_CHIP_EDGE_PX;
+    if (dismissLeft + dismissWidth > viewWidth - SELECTION_CHIP_EDGE_PX) {
+      dismissLeft = left - SELECTION_CHIP_EDGE_PX - dismissWidth;
+    }
+    dismissLeft = Math.max(SELECTION_CHIP_EDGE_PX, dismissLeft);
+    const dismissTop = Math.max(SELECTION_CHIP_EDGE_PX,
+      Math.min(top + (height - dismissHeight) / 2, viewHeight - SELECTION_CHIP_EDGE_PX - dismissHeight));
+    dismiss.style.left = `${Math.round(dismissLeft)}px`;
+    dismiss.style.top = `${Math.round(dismissTop)}px`;
+  }
+
+  /**
+   * `#1717 vibe-talk-quote-reply-dismiss-x`. Let the selection and the held quote go: the words are
+   * unselected and the chip and its X hide with the Reply label restored (`holdQuote`). Nothing is
+   * focused, scrolled or folded: the press that calls this is stopped before it reaches the card.
+   */
+  function dismissSelection(): void {
+    const selection = typeof getSelection === "function" ? getSelection() : null;
+    if (selection && typeof selection.removeAllRanges === "function") selection.removeAllRanges();
+    holdQuote(null);
   }
 
   function pressSelectionChip(): void {
@@ -687,7 +718,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
   }
 
   return {
-    held: () => quoteHeld, holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip,
+    held: () => quoteHeld, holdQuote, noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, dismissSelection,
     quoteSelectionNow,
     quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null,
     quickReplyOpenKey: () => (quickReply ? quickReply.key : null), placeQuickReply,

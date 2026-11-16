@@ -571,6 +571,7 @@ export interface ElementById {
   "search-scope": HTMLParagraphElement;
   "search-toggle": HTMLButtonElement;
   "selection-chip": HTMLButtonElement;
+  "selection-chip-dismiss": HTMLButtonElement;
   "send-text": HTMLButtonElement;
   "server-hits": HTMLOListElement;
   "server-more": HTMLButtonElement;

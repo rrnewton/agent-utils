@@ -16,6 +16,8 @@ export interface QuickReplyListenersDependencies {
   noteQuoteSelection(): unknown;
   /** The selection chip, or its twin in the paused read's strip, pressed. */
   pressSelectionChip(): unknown;
+  /** `#1717 vibe-talk-quote-reply-dismiss-x`. The X beside the selection chip, pressed: clear the selection. */
+  dismissSelection(): unknown;
   /** The box's Send, Cancel, and its question answered. */
   sendQuickReply(): unknown;
   cancelQuickReply(): unknown;
@@ -72,6 +74,17 @@ export function mountQuickReplyListeners(deps: QuickReplyListenersDependencies):
     listen<Event>(left(id), "mousedown", keepSelection);
     listen<Event>(left(id), "click", () => deps.pressSelectionChip());
   }
+  // `#1717 vibe-talk-quote-reply-dismiss-x`. The X beside the chip: no focus taken on the way down,
+  // and the press stopped there, so it never reaches the card under it (which a tap would fold)
+  // nor any list handler that could move the reader's place.
+  const dismissChip = left("selection-chip-dismiss");
+  listen<Event>(dismissChip, "mousedown", keepSelection);
+  listen<PointerEvent>(dismissChip, "pointerdown", (event) => { event.stopPropagation(); });
+  listen<Event>(dismissChip, "click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    deps.dismissSelection();
+  });
   listen<Event>(el("quick-reply-dock"), "click", () => deps.dockQuickReply());
   listen<Event>(el("quick-reply-send"), "click", () => deps.sendQuickReply());
   listen<Event>(el("quick-reply-cancel"), "click", () => deps.cancelQuickReply());

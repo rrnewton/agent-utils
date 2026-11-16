@@ -297,6 +297,36 @@
   display: none;
 }
 
+/* `#1717 vibe-talk-quote-reply-dismiss-x`. The little X beside the chip: the chip's own panel and
+   accent, a round target at least 32px square for the thumb that selected, quieter than the chip. */
+#selection-chip-dismiss {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: var(--z-modal);
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--accent);
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 0.25);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: pointer;
+  opacity: 0.85;
+}
+
+#selection-chip-dismiss[hidden] {
+  display: none;
+}
+
 /* `#727 vt-selection-quick-reply`. The quick reply, floating under the words it quotes: absolute against the
    layout viewport like the chip, over the lists, its width and place set by web/voice.js. */
 #quick-reply {

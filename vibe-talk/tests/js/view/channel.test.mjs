@@ -1996,7 +1996,7 @@ test("quoteSelectionNow opens the quick reply for held words, and does nothing w
   const byIdMap = new Map();
   for (const id of ["quick-reply", "quick-reply-quote", "quick-reply-text", "quick-reply-state",
     "quick-reply-to-main", "quick-reply-to-main-row",
-    "selection-chip", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
+    "selection-chip", "selection-chip-dismiss", "read-steer-quote", "scroll-area", "side-scroll", "discord-log"]) {
     byIdMap.set(id, el(id === "quick-reply-to-main" ? { checked: false } : {}));
   }
   const quoting = createQuoting({
