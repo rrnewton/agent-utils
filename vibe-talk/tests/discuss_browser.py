@@ -157,7 +157,7 @@ def call(base: str, method: str, path: str, token: str,
     return parsed
 
 
-def walk(page: Page, base: str, width: int, height: int) -> None:
+def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -> None:
     """One Discuss walk at one size: open, read, mark, jump, close."""
     posts: list[dict[str, object]] = []
     writes: list[tuple[str, dict[str, object]]] = []
@@ -309,6 +309,66 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     if width < 900:
         check(close_box0 is not None and close_box0["height"] >= 44 and close_box0["width"] >= 44,
               f"the phone top-bar buttons are under 44px: {close_box0}")
+    # `#1724 vibe-talk-discuss-panel-ignores-light-theme`: the whole panel —
+    # its ground, its sticky head, its controls and its ink — takes the page's
+    # scheme tokens, so in the light scheme it stands light with dark ink and
+    # in the dark scheme dark with light ink, at 4.5:1 or better either way.
+    # The tokens are resolved through a probe element, never restated here.
+    theme = page.evaluate("""() => {
+      const probe = document.createElement('div');
+      document.body.appendChild(probe);
+      const token = (name) => {
+        probe.style.background = '';
+        probe.style.background = `var(${name})`;
+        return getComputedStyle(probe).backgroundColor;
+      };
+      const panel = document.getElementById('discuss-panel');
+      const head = document.querySelector('.discuss-head');
+      const btn = document.getElementById('discuss-summarize');
+      const out = {
+        panelBg: getComputedStyle(panel).backgroundColor,
+        panelInk: getComputedStyle(panel).color,
+        headBg: getComputedStyle(head).backgroundColor,
+        btnBg: getComputedStyle(btn).backgroundColor,
+        tokenPanel: token('--panel'), tokenInk: token('--ink'),
+        tokenRowHover: token('--row-hover'),
+      };
+      probe.remove();
+      return out;
+    }""")
+
+    def rgb(value: str) -> tuple[float, float, float]:
+        parts = value.removeprefix("rgb(").removeprefix("rgba(").rstrip(")").split(",")
+        return float(parts[0]), float(parts[1]), float(parts[2])
+
+    def luminance(value: str) -> float:
+        def lin(channel: float) -> float:
+            c = channel / 255
+            return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+        r, g, b = rgb(value)
+        return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+    def contrast(a: str, b: str) -> float:
+        la, lb = luminance(a), luminance(b)
+        hi, lo = max(la, lb), min(la, lb)
+        return (hi + 0.05) / (lo + 0.05)
+
+    check(theme["panelBg"] == theme["tokenPanel"],
+          f"the panel ground is not the scheme's --panel: {theme}")
+    check(theme["headBg"] == theme["tokenPanel"],
+          f"the panel head is not the scheme's --panel: {theme}")
+    check(theme["panelInk"] == theme["tokenInk"],
+          f"the panel ink is not the scheme's --ink: {theme}")
+    check(theme["btnBg"] == theme["tokenRowHover"],
+          f"the Summarize control is not the scheme's --row-hover: {theme}")
+    check(contrast(theme["panelInk"], theme["panelBg"]) >= 4.5,
+          f"the panel ink does not read on its ground: {theme}")
+    if scheme == "light":
+        check(luminance(theme["panelBg"]) > 0.5 and luminance(theme["panelInk"]) < 0.05,
+              f"the light-scheme panel did not stand light with dark ink: {theme}")
+    else:
+        check(luminance(theme["panelBg"]) < 0.05 and luminance(theme["panelInk"]) > 0.5,
+              f"the dark-scheme panel did not stand dark with light ink: {theme}")
     # Opening asks nothing: the bound is offered first, and only its press posts.
     page.wait_for_function(
         "() => document.getElementById('discuss-summarize').textContent === 'Summarize'"
@@ -917,16 +977,25 @@ def main() -> int:
 
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
+                # `#1724`: phone and desk each walk in both colour schemes;
+                # the walk asserts the panel follows the scheme every time.
                 phone = browser.new_context(
-                    viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
-                walk(phone.new_page(), base, 393, 852)
+                    viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True,
+                    color_scheme="dark")
+                walk(phone.new_page(), base, 393, 852, "dark")
                 phone_small = browser.new_context(
-                    viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
-                walk(phone_small.new_page(), base, 390, 844)
-                desk = browser.new_context(viewport={"width": 1280, "height": 800})
-                walk(desk.new_page(), base, 1280, 800)
+                    viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True,
+                    color_scheme="light")
+                walk(phone_small.new_page(), base, 390, 844, "light")
+                desk = browser.new_context(viewport={"width": 1280, "height": 800},
+                                            color_scheme="dark")
+                walk(desk.new_page(), base, 1280, 800, "dark")
+                desk_light = browser.new_context(viewport={"width": 1280, "height": 800},
+                                                 color_scheme="light")
+                walk(desk_light.new_page(), base, 1280, 800, "light")
                 browser.close()
-            print("discuss browser: phone (393x852, 390x844) and desk walks passed")
+            print("discuss browser: phone (393x852 dark, 390x844 light) and desk "
+                  "(1280x800 dark and light) walks passed")
             return 0
         finally:
             server.terminate()

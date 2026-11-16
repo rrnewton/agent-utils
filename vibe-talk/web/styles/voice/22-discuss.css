@@ -1,10 +1,15 @@
 /* Discuss (`catchup-side-agent`): the catch-up panel over the channel.
  *
- * An overlay in the outline pop-up's dress and values (21-documents.css): outside
+ * An overlay in the outline pop-up's layout (21-documents.css): outside
  * #scroll-area, so it never scrolls away, never reflows the list and never resizes
- * the scroller; its own overflow carries a long answer. ALWAYS DARK, in either
- * colour scheme, for the outline pop-up's reason: it reads as an overlay, a step
- * away from the window under it.
+ * the scroller; its own overflow carries a long answer. Its colours are the
+ * page's own scheme tokens (`--panel`, `--ink`, `--edge`, `--muted`, `--accent`,
+ * `--warn`, `--ok`, `--row-hover` from style.css and 00-frame.css), so the panel
+ * follows the active colour scheme like the rest of the page (`#1724
+ * vibe-talk-discuss-panel-ignores-light-theme`): it used to state dark literals
+ * in either scheme, copied from the outline pop-up, and stood black on a light
+ * page. The pop-up itself keeps its always-dark dress; that is its own choice,
+ * not this panel's.
  *
  * `#1344 discuss-panel-resize`. On a desk the overlay stands at the reader's kept
  * width (`--discuss-width`, per device; wider by default than slice 1's 24rem),
@@ -26,11 +31,11 @@
   /* `#1531 discuss-top-bar-slim-fixed`: no top padding — the sticky head
    * carries its own, so the fixed bar sits flush with the panel's top. */
   padding: 0 calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
-  border: 1px solid #3d4452;
+  border: 1px solid var(--edge);
   border-bottom: none;
   border-radius: 8px 8px 0 0;
-  background: #1f232b;
-  color: #e7e9ee;
+  background: var(--panel);
+  color: var(--ink);
   box-shadow: 0 -0.5rem 1.5rem rgb(0 0 0 / 35%);
   z-index: var(--z-modal);
 }
@@ -61,7 +66,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
     width: min(var(--discuss-width, 560px), calc(100vw - 16px));
     height: auto;
     max-height: calc(100vh - 6rem);
-    border-bottom: 1px solid #3d4452;
+    border-bottom: 1px solid var(--edge);
     border-radius: 8px;
     box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
   }
@@ -92,7 +97,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   }
 
   #discuss-resize:focus-visible {
-    outline: 2px solid #7ab3e3;
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 }
@@ -115,8 +120,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   container-type: inline-size;
   margin: 0 calc(-10px - env(safe-area-inset-right)) 0 calc(-10px - env(safe-area-inset-left));
   padding: 6px calc(10px + env(safe-area-inset-right)) 6px calc(10px + env(safe-area-inset-left));
-  background: #1f232b;
-  border-bottom: 1px solid #3d4452;
+  background: var(--panel);
+  border-bottom: 1px solid var(--edge);
 }
 
 .discuss-title {
@@ -143,9 +148,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
   border-radius: 6px;
   font: inherit;
 }
@@ -156,8 +161,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 }
 
 .discuss-icon-button[aria-pressed="true"] {
-  border-color: #7ab3e3;
-  color: #7ab3e3;
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 /* The dock toggle is a desk layout; a phone's sheet has no column to dock into. */
@@ -179,9 +184,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 #discuss-summarize {
   padding: 4px 10px;
   cursor: pointer;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
   border-radius: 6px;
   font: inherit;
   flex: 0 0 auto;
@@ -193,16 +198,16 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 }
 
 .discuss-bound {
-  color: #aab2c0;
+  color: var(--muted);
   font-size: 0.85rem;
   white-space: nowrap;
 }
 
 .discuss-bound input {
   box-sizing: border-box;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
   border-radius: 6px;
   font: inherit;
 }
@@ -250,13 +255,13 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
 #discuss-scope {
   margin: 2px 0 0;
-  color: #aab2c0;
+  color: var(--muted);
   font-size: 0.85rem;
 }
 
 #discuss-status {
   margin: 8px 0 0;
-  color: #aab2c0;
+  color: var(--muted);
   font-size: 0.85rem;
 }
 
@@ -306,7 +311,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 }
 
 #discuss-answer a {
-  color: #8ab8ff;
+  color: var(--accent);
 }
 
 /* `#1395 discuss-scope-binding` (Slack 017): a citation the server resolved
@@ -316,12 +321,12 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
  * address flag is the marker: it survives the sanitizer, which strips
  * classes the server did not allow. */
 #discuss-answer a[href*="scope=out"] {
-  color: #ffb86b;
+  color: var(--warn);
 }
 
 #discuss-terms {
   margin-top: 10px;
-  color: #aab2c0;
+  color: var(--muted);
   font-size: 0.85rem;
 }
 
@@ -331,16 +336,16 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
 #discuss-stale {
   margin: 8px 0 0;
-  color: #ffd479;
+  color: var(--warn);
   font-size: 0.85rem;
 }
 
 #discuss-update {
   padding: 2px 8px;
   cursor: pointer;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
   border-radius: 6px;
   font: inherit;
 }
@@ -350,12 +355,12 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 }
 
 .discuss-you {
-  color: #aab2c0;
+  color: var(--muted);
 }
 
 .discuss-old {
   margin-top: 10px;
-  color: #aab2c0;
+  color: var(--muted);
   font-size: 0.9rem;
 }
 
@@ -374,9 +379,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 #discuss-followup {
   flex: 1 1 auto;
   min-width: 0;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
   border-radius: 6px;
   font: inherit;
   padding: 6px 8px;
@@ -385,9 +390,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 #discuss-send {
   padding: 4px 10px;
   cursor: pointer;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
   border-radius: 6px;
   font: inherit;
 }
@@ -421,7 +426,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   padding: 10px 4px;
   cursor: pointer;
   background: none;
-  color: #8ab8ff;
+  color: var(--accent);
   border: none;
   border-radius: 6px;
   font: inherit;
@@ -430,7 +435,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 }
 
 .discuss-link:hover {
-  background: #2b323e;
+  background: var(--edge);
 }
 
 .discuss-link:focus-visible,
@@ -439,7 +444,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 #discuss-mark-read:focus-visible,
 #discuss-mark-unread:focus-visible,
 #discuss-retry:focus-visible {
-  outline: 2px solid #7ab3e3;
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
@@ -454,9 +459,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 #discuss-retry {
   padding: 6px 10px;
   cursor: pointer;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
+  background: var(--row-hover);
+  color: var(--ink);
+  border: 1px solid var(--edge);
   border-radius: 6px;
   font: inherit;
 }
@@ -469,7 +474,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
 #discuss-unmarkable {
   margin: 6px 0 0;
-  color: #aab2c0;
+  color: var(--muted);
   font-size: 0.8rem;
 }
 
@@ -480,7 +485,7 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 /* The stamp's debug line: small and muted, under everything it describes. */
 #discuss-stamp {
   margin: 10px 0 0;
-  color: #aab2c0;
+  color: var(--muted);
   font-size: 0.75rem;
 }
 
@@ -666,8 +671,8 @@ stay its owner's (#1524). The pane itself already ends above the
     margin-bottom: calc(-10px - env(safe-area-inset-bottom));
     margin-left: calc(-10px - env(safe-area-inset-left));
     padding: 8px calc(10px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
-    background: #1f232b;
-    border-top: 1px solid #3d4452;
+    background: var(--panel);
+    border-top: 1px solid var(--edge);
     z-index: 1;
   }
 
@@ -740,12 +745,12 @@ stay its owner's (#1524). The pane itself already ends above the
  * latest Update's unread parts are green until read or the next Update. */
 #discuss-answer li.discuss-struck {
   text-decoration: line-through;
-  color: #8a93a3;
+  color: var(--muted);
 }
 
 #discuss-answer details.discuss-struck-section > summary {
   text-decoration: line-through;
-  color: #8a93a3;
+  color: var(--muted);
 }
 
 #discuss-answer li.discuss-fresh {
@@ -754,7 +759,7 @@ stay its owner's (#1524). The pane itself already ends above the
 }
 
 #discuss-answer details.discuss-fresh > summary {
-  color: #7ee2a0;
+  color: var(--ok);
 }
 
 /* `#1526 discuss-docked-pane-mobile` (owner UI request 055): on a phone the
@@ -798,7 +803,7 @@ stay its owner's (#1524). The pane itself already ends above the
   height: 12px;
   align-self: center;
   border-radius: 6px;
-  color: #9aa3b2;
+  color: var(--muted);
   opacity: 0.85;
   background:
     linear-gradient(currentColor, currentColor) center 0 / 100% 2px no-repeat,
@@ -812,12 +817,12 @@ stay its owner's (#1524). The pane itself already ends above the
   }
 
   #discuss-panel[data-sheet="half"] .discuss-head:hover .discuss-grip {
-    color: #e7e9ee;
+    color: var(--ink);
     opacity: 1;
   }
 
   #discuss-panel[data-sheet="half"] .discuss-head:active .discuss-grip {
-    color: #7ab3e3;
+    color: var(--accent);
     opacity: 1;
   }
 
@@ -827,7 +832,7 @@ stay its owner's (#1524). The pane itself already ends above the
   }
 
   .discuss-head:focus-visible {
-    outline: 2px solid #7ab3e3;
+    outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
 }
