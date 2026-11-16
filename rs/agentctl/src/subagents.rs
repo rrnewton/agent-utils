@@ -12305,17 +12305,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         check_only: bool,
         now_millis: u64,
     ) -> Vec<Value> {
-        self.drain_pending_bounded(stale, check_only, now_millis, None)
+        self.drain_pending_bounded(stale, check_only, now_millis, None, None)
     }
 
     /// Drain each agent's queue with an optional per-pass prompt bound.
     /// The working-harness fallback shares that bound with the initial drain.
+    /// When supplied, only_names excludes every other agent before any write.
     pub fn drain_pending_bounded(
         &self,
         stale: std::time::Duration,
         check_only: bool,
         now_millis: u64,
         max_items: Option<usize>,
+        only_names: Option<&[String]>,
     ) -> Vec<Value> {
         let mut rows = Vec::new();
         let Ok(agents) = self.watch_rows() else {
@@ -12325,6 +12327,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             let Some(name) = row["name"].as_str() else {
                 continue;
             };
+            if only_names.is_some_and(|names| !names.iter().any(|allowed| allowed == name)) {
+                continue;
+            }
             if row["mode"].as_str() == Some("headless") {
                 // Headless queues are drained by their own wrapper, never by
                 // this pass — but their oldest item's age still alarms the

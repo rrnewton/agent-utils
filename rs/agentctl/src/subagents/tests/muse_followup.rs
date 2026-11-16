@@ -130,11 +130,24 @@ fn a_bounded_watch_pass_does_not_type_a_fourth_prompt_through_its_fallback() {
             )
             .unwrap();
     }
+    let excluded = manager.drain_pending_bounded(
+        std::time::Duration::from_secs(600),
+        false,
+        crate::agent::now_millis(),
+        Some(3),
+        Some(&["another-lane".to_owned()]),
+    );
+    assert!(excluded.is_empty());
+    assert!(
+        keys(&fixture).is_empty(),
+        "excluded queue must never be typed"
+    );
     let rows = manager.drain_pending_bounded(
         std::time::Duration::from_secs(600),
         false,
         crate::agent::now_millis(),
         Some(3),
+        None,
     );
     assert_eq!(rows[0]["typed"], 3, "{rows:?}");
     assert_eq!(rows[0]["remaining"], 2, "{rows:?}");
@@ -144,6 +157,7 @@ fn a_bounded_watch_pass_does_not_type_a_fourth_prompt_through_its_fallback() {
         false,
         crate::agent::now_millis(),
         Some(3),
+        None,
     );
     assert_eq!(rows[0]["typed"], 2, "{rows:?}");
     assert_eq!(rows[0]["remaining"], 0, "{rows:?}");

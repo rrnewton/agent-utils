@@ -4027,6 +4027,15 @@ fn service_failure(host: &dyn Host, timer: &TimerWatch) -> Check {
     )
 }
 
+fn watch_desires_agent(config: &RestoreConfig, name: &str) -> bool {
+    config.coordinator.as_deref() == Some(name)
+        || (!config.exclude.iter().any(|excluded| excluded == name)
+            && config
+                .agents
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|desired| desired == name)))
+}
+
 /// One pass of checks, repairs, and findings.
 ///
 /// Only a problem the service manager confirmed is repaired. A unit or timer that systemctl could
@@ -4356,12 +4365,16 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             // R1b on the watch pass too: a harness hand-restarted in its
             // recorded pane with its recorded session is re-pinned here,
             // not only when someone sends to it.
+            let desired_names = crate::subagents::restore_agent_names(registry)
+                .into_iter()
+                .filter(|name| watch_desires_agent(config, name))
+                .collect::<Vec<_>>();
             if !options.check_only {
-                for name in crate::subagents::restore_agent_names(registry) {
-                    if manager.auto_repin_resumed(&name) {
+                for name in &desired_names {
+                    if manager.auto_repin_resumed(name) {
                         findings.push(finding(
                             "repin",
-                            &name,
+                            name,
                             true,
                             "re-pinned a hand-restarted harness in its recorded pane",
                             Value::Null,
@@ -4376,6 +4389,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                     options.check_only,
                     now_millis,
                     options.queue_max_items,
+                    Some(&desired_names),
                 )
             } else {
                 Vec::new()
@@ -5045,6 +5059,23 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn watch_queue_selection_matches_the_desired_team() {
+        let config: RestoreConfig = serde_json::from_value(json!({
+            "schema": CONFIG_SCHEMA, "coordinator": "lead",
+            "agents": ["wanted", "excluded"], "exclude": ["excluded"]
+        }))
+        .unwrap();
+        assert!(watch_desires_agent(&config, "lead"));
+        assert!(watch_desires_agent(&config, "wanted"));
+        assert!(!watch_desires_agent(&config, "excluded"));
+        assert!(!watch_desires_agent(&config, "historical"));
+        let mut derived = config;
+        derived.agents = None;
+        assert!(watch_desires_agent(&derived, "historical"));
+        assert!(!watch_desires_agent(&derived, "excluded"));
+    }
 
     #[test]
     fn bounded_queue_pass_reserves_its_coordinator_notice_budget() {
