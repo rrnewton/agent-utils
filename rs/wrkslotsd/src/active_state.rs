@@ -301,10 +301,7 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
             if !is_digest(digest) {
                 return Err(format!("{entry_label} holds an invalid sha256: {digest:?}"));
             }
-            let disposition = as_str(
-                &entry["disposition"],
-                &format!("{entry_label}.disposition"),
-            )?;
+            let disposition = as_str(&entry["disposition"], &format!("{entry_label}.disposition"))?;
             if disposition != "archived" && disposition != "discarded" {
                 return Err(format!(
                     "{entry_label} holds an unknown disposition: {disposition:?}"
@@ -337,7 +334,10 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
                 &entry_label,
             )?;
             as_str(&entry["checkout"], &format!("{entry_label}.checkout"))?;
-            as_str(&entry["archive_root"], &format!("{entry_label}.archive_root"))?;
+            as_str(
+                &entry["archive_root"],
+                &format!("{entry_label}.archive_root"),
+            )?;
             as_str(&entry["path"], &format!("{entry_label}.path"))?;
             as_int(&entry["bytes"], &format!("{entry_label}.bytes"), 0)?;
             let digest = as_str(&entry["sha256"], &format!("{entry_label}.sha256"))?;
