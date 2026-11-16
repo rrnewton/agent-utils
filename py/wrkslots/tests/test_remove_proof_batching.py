@@ -73,6 +73,127 @@ def test_advertised_tips_not_memoized_outside_scope(
     assert calls == ["ls-remote", "ls-remote"]
 
 
+def _mirror_scope(root: Path) -> object:
+    return wrkslots._remote_containment_scope(root)
+
+
+def test_mirror_serves_second_proof_without_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repo, "origin")
+    root = tmp_path / "proof-mirrors"
+    with _mirror_scope(root):  # type: ignore[arg-type]
+        first = vcs._proof_mirror(repo, authority)
+        assert first is not None and first[0]
+
+        def no_network(*args: object, **kwargs: object) -> dict[str, str]:
+            raise AssertionError("network used for a fresh mirror proof")
+
+        monkeypatch.setattr(wrkslots._GitVcs, "_ls_remote_inventory", no_network)
+        second = vcs._proof_mirror(repo, authority)
+    assert second is not None and second[0] == first[0]
+
+
+def test_concurrent_removals_share_one_mirror_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import contextvars
+    import threading
+
+    repo = _repo(tmp_path)
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repo, "origin")
+    root = tmp_path / "proof-mirrors"
+    calls: list[str] = []
+    entered = threading.Event()
+    release = threading.Event()
+    original = wrkslots._GitVcs._ls_remote_inventory
+
+    def counting(self: wrkslots._GitVcs, *args: object, **kwargs: object) -> dict[str, str]:
+        calls.append("ls-remote")
+        entered.set()
+        release.wait(timeout=30)
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots._GitVcs, "_ls_remote_inventory", counting)
+    results: list[object] = []
+
+    def ask(ctx: contextvars.Context) -> None:
+        results.append(ctx.run(vcs._proof_mirror, repo, authority))
+
+    with _mirror_scope(root):  # type: ignore[arg-type]
+        ctx = contextvars.copy_context()
+        threads = [threading.Thread(target=ask, args=(ctx,)) for _ in range(2)]
+        # Each thread needs its own copy of the scope context.
+        threads = [
+            threading.Thread(target=ask, args=(contextvars.copy_context(),))
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        assert entered.wait(timeout=30)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=60)
+    assert all(result is not None for result in results)
+    assert calls == ["ls-remote"]
+
+
+def test_stale_mirror_with_unreachable_remote_falls_back(tmp_path: Path) -> None:
+    import hashlib as _hashlib
+
+    repo = _repo(tmp_path)
+    vcs = wrkslots._GitVcs()
+    url = str(tmp_path / "no-such-remote")
+    authority = wrkslots._RemoteAuthority(
+        url, _hashlib.sha256(url.encode()).hexdigest()
+    )
+    with _mirror_scope(tmp_path / "proof-mirrors"):  # type: ignore[arg-type]
+        assert vcs._proof_mirror(repo, authority) is None
+
+
+def test_corrupt_mirror_is_discarded(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repo, "origin")
+    root = tmp_path / "proof-mirrors"
+    with _mirror_scope(root):  # type: ignore[arg-type]
+        first = vcs._proof_mirror(repo, authority)
+        assert first is not None
+        directory = wrkslots._proof_mirror_directory(root, authority.url)
+        (directory / "mirror.git").rename(directory / "mirror.git.gone")
+        assert vcs._proof_mirror(repo, authority) is None
+        assert not directory.exists()
+
+
+def test_mirror_refresh_picks_up_force_push_past_bound(tmp_path: Path) -> None:
+    import json as _json
+    import time as _time
+
+    repo = _repo(tmp_path)
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(repo, "origin")
+    root = tmp_path / "proof-mirrors"
+    with _mirror_scope(root):  # type: ignore[arg-type]
+        first = vcs._proof_mirror(repo, authority)
+        assert first is not None
+        old_tip = first[0]["refs/heads/main"]
+        (repo / "h.txt").write_text("z\n")
+        _git(repo, "add", "h.txt")
+        _git(repo, "commit", "-q", "-m", "three")
+        new_tip = _git(repo, "rev-parse", "HEAD")
+        assert new_tip != old_tip
+        directory = wrkslots._proof_mirror_directory(root, authority.url)
+        record = _json.loads((directory / "record.json").read_text())
+        record["fetched_at"] = _time.time() - 10000
+        (directory / "record.json").write_text(_json.dumps(record))
+        wrkslots._PROOF_MIRROR_ATTEMPTS.get().clear()  # type: ignore[union-attr]
+        second = vcs._proof_mirror(repo, authority)
+    assert second is not None and second[0]["refs/heads/main"] == new_tip
+
+
 def test_thin_bundle_verify_skips_full_fsck(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

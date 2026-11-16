@@ -15654,6 +15654,104 @@ _REMOTE_CONTAINMENT_MEMO: contextvars.ContextVar[
     dict[tuple[str, str, str, bool], _RemoteContainmentEvidence] | None
 ] = contextvars.ContextVar("wrkslots_remote_containment_memo", default=None)
 
+# Root of the host-wide proof mirrors (#1692), set while one removal runs:
+# <control>/proof-mirrors. None outside a removal, or when the control
+# directory is unknown, and then every proof asks the remote directly.
+_PROOF_MIRROR_ROOT: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "wrkslots_proof_mirror_root", default=None
+)
+# Mirror evidence used by this removal, by remote URL digest: the record
+# (listed/fetched times and inventory fingerprint) receipts cite (#1692).
+_PROOF_MIRROR_EVIDENCE: contextvars.ContextVar[dict[str, dict[str, object]] | None] = (
+    contextvars.ContextVar("wrkslots_proof_mirror_evidence", default=None)
+)
+# Mirror attempt per URL in this removal, so a failed refresh is not retried
+# on every question; the value is the mirror directory or None (fall back).
+_PROOF_MIRROR_ATTEMPTS: contextvars.ContextVar[dict[str, Path | None] | None] = (
+    contextvars.ContextVar("wrkslots_proof_mirror_attempts", default=None)
+)
+
+_PROOF_MIRROR_RECORD_SCHEMA = "wrkslots-proof-mirror/v1"
+_PROOF_MIRROR_LOCK_SECONDS = 30.0
+
+
+def _proof_mirror_directory(root: Path, url: str) -> Path:
+    return root / hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+_PROOF_MIRROR_IDLE_SECONDS = 7 * 24 * 3600.0
+
+
+def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[str]:
+    """Drop proof mirrors idle past the retirement age; return their digests (#1692).
+
+    A mirror whose refresh lock is held (a removal is using it) is kept.
+    """
+
+    root = config.control / "proof-mirrors"
+    if not root.is_dir():
+        return []
+    moment = time.time() if now is None else now
+    dropped: list[str] = []
+    for entry in sorted(root.iterdir()):
+        record_path = entry / "record.json"
+        try:
+            raw = _read_bounded_regular_file(record_path, "proof mirror record", 1 << 20)
+            record = _strict_json_object(raw, "proof mirror record")
+            fetched_at = float(record.get("fetched_at", 0.0))  # type: ignore[arg-type]
+        except (Refusal, OSError, TypeError, ValueError):
+            fetched_at = 0.0
+        if moment - fetched_at <= _PROOF_MIRROR_IDLE_SECONDS:
+            continue
+        descriptor = os.open(
+            entry / ".lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            if not _flock_until(descriptor, fcntl.LOCK_EX, time.monotonic()):
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            dropped.append(entry.name)
+        finally:
+            os.close(descriptor)
+    return dropped
+
+
+def _proof_mirror_doctor_findings(config: Config) -> list[dict[str, object]]:
+    """Report the proof-mirror collection's size, read-only (#1692)."""
+
+    root = config.control / "proof-mirrors"
+    if not root.is_dir():
+        return []
+    entries = [entry for entry in root.iterdir() if entry.is_dir()]
+    if not entries:
+        return []
+    total = 0
+    for entry in entries:
+        for dirpath, _dirs, files in os.walk(entry):
+            for name in files:
+                with contextlib.suppress(OSError):
+                    total += (Path(dirpath) / name).stat().st_size
+    return [
+        _operational_finding(
+            "proof-mirrors",
+            "",
+            config.machine,
+            f"{len(entries)} proof mirror(s), {total} bytes under {root} "
+            "(regenerable cache; clean-caches drops mirrors idle for 7 days)",
+        )
+    ]
+
+
+def _proof_mirror_receipt(remote_url_sha256: str) -> dict[str, object] | None:
+    """The mirror evidence this removal used for one remote, if any (#1692)."""
+
+    evidence = _PROOF_MIRROR_EVIDENCE.get()
+    if evidence is None:
+        return None
+    record = evidence.get(remote_url_sha256)
+    return None if record is None else {"proof_mirror": dict(record)}
+
+
 # The advertised-tips answer of remote_advertised_tips (#1681), kept under
 # the same scope and age bound as _REMOTE_CONTAINMENT_MEMO: one removal asks
 # for a repository's advertised refs once, however many salvage attempts
@@ -15762,11 +15860,14 @@ def _advertised_fingerprint(inventory: Mapping[str, str]) -> str:
 
 
 @contextlib.contextmanager
-def _remote_containment_scope() -> Iterator[None]:
+def _remote_containment_scope(mirror_root: Path | None = None) -> Iterator[None]:
     """Keep remote containment answers, salvage facts and bundle verifications for one removal."""
 
     token = _REMOTE_CONTAINMENT_MEMO.set({})
     tips_token = _REMOTE_ADVERTISED_TIPS_MEMO.set({})
+    mirror_token = _PROOF_MIRROR_ROOT.set(mirror_root)
+    mirror_evidence_token = _PROOF_MIRROR_EVIDENCE.set({})
+    mirror_attempts_token = _PROOF_MIRROR_ATTEMPTS.set({})
     bundles = _VERIFIED_SALVAGE_BUNDLES.set(set())
     created = _CREATED_SHARED_SALVAGE_BUNDLES.set(set())
     facts = _SALVAGE_FACTS_MEMO.set({})
@@ -15780,6 +15881,9 @@ def _remote_containment_scope() -> Iterator[None]:
         _SALVAGE_FACTS_MEMO.reset(facts)
         _CREATED_SHARED_SALVAGE_BUNDLES.reset(created)
         _VERIFIED_SALVAGE_BUNDLES.reset(bundles)
+        _PROOF_MIRROR_ATTEMPTS.reset(mirror_attempts_token)
+        _PROOF_MIRROR_EVIDENCE.reset(mirror_evidence_token)
+        _PROOF_MIRROR_ROOT.reset(mirror_token)
         _REMOTE_ADVERTISED_TIPS_MEMO.reset(tips_token)
         _REMOTE_CONTAINMENT_MEMO.reset(token)
 
@@ -20617,6 +20721,177 @@ class _GitVcs:
             }
         return inventory
 
+    def _mirror_record(
+        self, directory: Path, url: str
+    ) -> dict[str, object] | None:
+        """The mirror's record when it is well-formed for ``url``, else None."""
+
+        try:
+            raw = _read_bounded_regular_file(
+                directory / "record.json", "proof mirror record", 1 << 20
+            )
+            record = _strict_json_object(raw, "proof mirror record")
+        except (Refusal, OSError):
+            return None
+        if record.get("schema") != _PROOF_MIRROR_RECORD_SCHEMA or record.get("url") != url:
+            return None
+        refs = record.get("refs")
+        if not isinstance(refs, dict) or not all(
+            isinstance(ref, str) and isinstance(tip, str) and SHA_RE.fullmatch(tip)
+            for ref, tip in refs.items()
+        ):
+            return None
+        if record.get("fingerprint") != _advertised_fingerprint(refs):  # type: ignore[arg-type]
+            return None
+        if not isinstance(record.get("listed_at"), (int, float)) or not isinstance(
+            record.get("fetched_at"), (int, float)
+        ):
+            return None
+        return record
+
+    def _mirror_self_check(self, directory: Path, refs: Mapping[str, str]) -> bool:
+        """True when every recorded tip is a commit in the mirror's store."""
+
+        git_path = directory / "mirror.git"
+        if not git_path.is_dir() or not refs:
+            return bool(refs) is False and git_path.is_dir()
+        result = self._run(
+            git_path,
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input_text="".join(f"{tip}\n" for tip in sorted(set(refs.values()))),
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        found = {
+            line.split()[0]
+            for line in result.stdout.splitlines()
+            if len(line.split()) == 2 and line.split()[1] == "commit"
+        }
+        return set(refs.values()) <= found
+
+    def _refresh_mirror(
+        self, checkout: Path, target: _RemoteAuthority, directory: Path
+    ) -> dict[str, object] | None:
+        """Refresh one mirror under its lock; None on any doubt (#1692)."""
+
+        prefixes = ("refs/heads/", "refs/tags/", "refs/salvage/", "refs/rescue/")
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(
+                directory / ".lock",
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                if not _flock_until(
+                    descriptor,
+                    fcntl.LOCK_EX,
+                    time.monotonic() + _PROOF_MIRROR_LOCK_SECONDS,
+                ):
+                    return None
+                record = self._mirror_record(directory, target.url)
+                if record is not None and (
+                    time.time() - float(record["fetched_at"])  # type: ignore[arg-type]
+                    <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+                ):
+                    return record
+                listed_at = time.time()
+                inventory = self._advertised_inventory(
+                    checkout, target, prefixes=prefixes
+                )
+                git_path = directory / "mirror.git"
+                if not git_path.is_dir():
+                    self._run(directory, ["init", "--bare", "--", str(git_path)])
+                if inventory:
+                    self._run_bytes(
+                        git_path,
+                        [
+                            "fetch",
+                            "--filter=tree:0",
+                            "--no-tags",
+                            "--no-write-fetch-head",
+                            "--no-auto-maintenance",
+                            "--force",
+                            "--no-recurse-submodules",
+                            "--stdin",
+                            "--",
+                            target.url,
+                        ],
+                        input_bytes="".join(
+                            f"+{ref}:{ref}\n" for ref in sorted(inventory)
+                        ).encode(),
+                        env_overrides={},
+                        timeout_seconds=_REMOTE_CONTAINMENT_FETCH_SECONDS,
+                        timeout_refusal="proof mirror fetch timed out",
+                    )
+                record = {
+                    "schema": _PROOF_MIRROR_RECORD_SCHEMA,
+                    "url": target.url,
+                    "listed_at": listed_at,
+                    "fetched_at": time.time(),
+                    "fingerprint": _advertised_fingerprint(inventory),
+                    "refs": dict(sorted(inventory.items())),
+                }
+                if not self._mirror_self_check(directory, inventory):
+                    raise Refusal("proof mirror self-check failed")
+                _atomic_write_json(directory / "record.json", record)
+                return record
+            finally:
+                os.close(descriptor)
+        except (Refusal, OSError, StateError):
+            return None
+
+    def _proof_mirror(
+        self, checkout: Path, target: _RemoteAuthority
+    ) -> tuple[dict[str, str], str] | None:
+        """Fresh mirror evidence for ``target``, or None to ask directly (#1692).
+
+        Returns the advertised inventory and the mirror repository path to
+        fetch missing commits from (a local fetch, no network). Any doubt --
+        no mirror root, stale record that cannot be refreshed, failed
+        self-check, URL mismatch, lock timeout -- returns None, and the
+        caller proves against the remote directly, as before.
+        """
+
+        root = _PROOF_MIRROR_ROOT.get()
+        attempts = _PROOF_MIRROR_ATTEMPTS.get()
+        if root is None or attempts is None or target.url.startswith("-"):
+            return None
+        if target.url in attempts and attempts[target.url] is None:
+            return None
+        directory = _proof_mirror_directory(root, target.url)
+        record = self._mirror_record(directory, target.url)
+        fresh = record is not None and (
+            time.time() - float(record["fetched_at"])  # type: ignore[arg-type]
+            <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+        )
+        if record is not None and not fresh:
+            record = None
+        if record is None:
+            # Another caller may be refreshing this mirror now: the refresh
+            # lock serializes us, and its double-check then serves us the
+            # fresh record instead of a second fetch (#1692).
+            attempts[target.url] = directory
+            record = self._refresh_mirror(checkout, target, directory)
+            if record is None:
+                attempts[target.url] = None
+                return None
+        elif not self._mirror_self_check(directory, record["refs"]):  # type: ignore[arg-type]
+            # Corrupt mirror: discard it and fall back to a direct proof.
+            shutil.rmtree(directory, ignore_errors=True)
+            attempts[target.url] = None
+            return None
+        evidence = _PROOF_MIRROR_EVIDENCE.get()
+        if evidence is not None:
+            digest = hashlib.sha256(target.url.encode("utf-8")).hexdigest()
+            evidence[digest] = {
+                "listed_at": record["listed_at"],
+                "fetched_at": record["fetched_at"],
+                "fingerprint": record["fingerprint"],
+            }
+        return dict(record["refs"]), str(directory / "mirror.git")  # type: ignore[arg-type]
+
     def remote_heads_containing(
         self,
         checkout: Path,
@@ -20763,14 +21038,20 @@ class _GitVcs:
                     raise cached.refusal
                 return cached.refs
         tags_prefix = "refs/tags/"
+        mirror = self._proof_mirror(checkout, target)
+        fetch_source = None if mirror is None else mirror[1]
         try:
             with self._isolated_repository(objects) as (isolated, object_env):
-                advertised = self._ls_remote_inventory(
-                    isolated,
-                    target.url,
-                    refs=(f"{tags_prefix}*",),
-                    env_overrides=object_env,
-                    timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+                advertised = (
+                    dict(mirror[0])
+                    if mirror is not None
+                    else self._ls_remote_inventory(
+                        isolated,
+                        target.url,
+                        refs=(f"{tags_prefix}*",),
+                        env_overrides=object_env,
+                        timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+                    )
                 )
                 tags = {
                     ref: tip for ref, tip in advertised.items() if ref.startswith(tags_prefix)
@@ -20791,6 +21072,7 @@ class _GitVcs:
                         target,
                         missing,
                         head,
+                        source_url=fetch_source,
                     )
         except Refusal as exc:
             if memo is not None:
@@ -20819,13 +21101,23 @@ class _GitVcs:
 
         objects = common / "objects"
         heads_prefix = "refs/heads/"
+        mirror = self._proof_mirror(checkout, target)
+        fetch_source = None if mirror is None else mirror[1]
         with self._isolated_repository(objects) as (isolated, object_env):
-            advertised = self._ls_remote_inventory(
-                isolated,
-                target.url,
-                heads_only=True,
-                env_overrides=object_env,
-                timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+            advertised = (
+                {
+                    ref: tip
+                    for ref, tip in mirror[0].items()
+                    if ref.startswith(heads_prefix)
+                }
+                if mirror is not None
+                else self._ls_remote_inventory(
+                    isolated,
+                    target.url,
+                    heads_only=True,
+                    env_overrides=object_env,
+                    timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+                )
             )
             for ref in advertised:
                 if not ref.startswith(heads_prefix):
@@ -20852,6 +21144,7 @@ class _GitVcs:
                     target,
                     missing,
                     head,
+                    source_url=fetch_source,
                 )
         prefix = f"refs/remotes/{remote}/"
         refs = tuple(
@@ -20941,6 +21234,8 @@ class _GitVcs:
         authority: _RemoteAuthority,
         missing: Mapping[str, str],
         head: str,
+        *,
+        source_url: str | None = None,
     ) -> list[str]:
         """Fetch the commits of ``missing`` into an empty store; return those containing ``head``.
 
@@ -20948,7 +21243,9 @@ class _GitVcs:
         """
 
         names = sorted(missing)
-        with self._fetched_proof_store(common, git_directory, authority, missing) as (
+        with self._fetched_proof_store(
+            common, git_directory, authority, missing, source_url=source_url
+        ) as (
             isolated,
             lazy_off,
             proof_root,
@@ -20977,6 +21274,8 @@ class _GitVcs:
         git_directory: Path,
         authority: _RemoteAuthority,
         missing: Mapping[str, str],
+        *,
+        source_url: str | None = None,
     ) -> Iterator[tuple[Path, Mapping[str, str], str]]:
         """Fetch the commits of ``missing`` into an empty store and yield it.
 
@@ -20997,7 +21296,9 @@ class _GitVcs:
         proof_config = (
             _NETWORK_CONFIG
             + b'[remote "proof"]\n\turl = '
-            + _git_config_quoted(authority.url, "remote URL")
+            + _git_config_quoted(
+                authority.url if source_url is None else source_url, "remote URL"
+            )
             + b"\n"
         )
         # With own_objects the first argument names no store that is used;
@@ -21204,6 +21505,15 @@ class _GitVcs:
                 return dict(
                     entry.split("\0", 1) for entry in cached.refs
                 )
+        mirror = self._proof_mirror(checkout, target)
+        if mirror is not None:
+            tips = dict(mirror[0])
+            if memo is not None:
+                memo[key] = _RemoteContainmentEvidence(
+                    tuple(sorted(f"{ref}\0{tip}" for ref, tip in tips.items())),
+                    time.monotonic(),
+                )
+            return tips
         try:
             with self._isolated_repository(objects) as (isolated, object_env):
                 tips = {
@@ -21239,18 +21549,24 @@ class _GitVcs:
 
         prefixes = ("refs/heads/", "refs/tags/", "refs/salvage/", "refs/rescue/")
         objects = common / "objects"
+        mirror = self._proof_mirror(checkout, target)
+        fetch_source = None if mirror is None else mirror[1]
         with self._isolated_repository(objects) as (isolated, object_env):
-            advertised = {
-                ref: tip
-                for ref, tip in self._ls_remote_inventory(
-                    isolated,
-                    target.url,
-                    refs=tuple(f"{prefix}*" for prefix in prefixes),
-                    env_overrides=object_env,
-                    timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
-                ).items()
-                if ref.startswith(prefixes)
-            }
+            advertised = (
+                dict(mirror[0])
+                if mirror is not None
+                else {
+                    ref: tip
+                    for ref, tip in self._ls_remote_inventory(
+                        isolated,
+                        target.url,
+                        refs=tuple(f"{prefix}*" for prefix in prefixes),
+                        env_overrides=object_env,
+                        timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+                    ).items()
+                    if ref.startswith(prefixes)
+                }
+            )
             peeled = self._present_peeled_commits(
                 isolated, set(advertised.values()), object_env
             )
@@ -21274,7 +21590,11 @@ class _GitVcs:
         missing = {ref: tip for ref, tip in advertised.items() if tip not in peeled}
         if remaining and missing:
             with self._fetched_proof_store(
-                common, self._private_git_directory(checkout), target, missing
+                common,
+                self._private_git_directory(checkout),
+                target,
+                missing,
+                source_url=fetch_source,
             ) as (fetched, lazy_off, _proof_root):
                 covering |= self._present_commits(fetched, remaining, lazy_off)
         return (
@@ -28564,6 +28884,7 @@ def _local_salvage_receipt_payload(
         "bundle_sha256": bundle_sha256,
         "bundle_bytes": bundle_size,
         "archive_ref": archive_ref,
+        **(_proof_mirror_receipt(checkout.remote_url_sha256) or {}),
         "verification": {
             "fresh_bare_clone": not thin_proof,
             "exact_ref": True,
@@ -32414,6 +32735,7 @@ def _salvage_one_checkout(
             "containing_remote_refs": list(containing),
             "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
             "private_history_counts": _facts_history_counts_obj(facts),
+            **(_proof_mirror_receipt(checkout.remote_url_sha256) or {}),
             **proof,
         }
         if _checkout_is_self_sourced(config, checkout, path, vcs):
@@ -49315,6 +49637,11 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as locks:
         locks.enter_context(_mutation_locks(config, args.wait_lock))
         _refuse_partial_state(config)
+        for dropped_mirror in _retire_proof_mirrors(config):
+            print(
+                f"clean-caches: dropped proof mirror {dropped_mirror} (idle)",
+                file=sys.stderr,
+            )
         # An interrupted absent-row recovery leaves its rows active and
         # archived until replayed; that split must not block cache
         # reclamation for every other slot
@@ -52515,6 +52842,7 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         )
         # #1206 check mode: primary submodule repositories that create
         # would need to prepare, and slot submodules still privately cloned.
+        findings.extend(_proof_mirror_doctor_findings(config))
         findings.extend(_shared_submodule_doctor_findings(config, states))
         findings.extend(_harness_checkout_doctor_findings(config, states))
         findings.extend(_eden_discovery_doctor_findings(config, states))
@@ -57434,7 +57762,12 @@ def _cmd_remove(
     emit: bool = True,
     agent_batch: _AgentRemoveBatchContext | None = None,
 ) -> int:
-    with _remote_containment_scope():
+    mirror_root: Path | None = None
+    try:
+        mirror_root = _load_config(args.project_root, args.machine).control / "proof-mirrors"
+    except Exception:
+        mirror_root = None
+    with _remote_containment_scope(mirror_root):
         return _cmd_remove_in_scope(
             args,
             private_cleanup=private_cleanup,
