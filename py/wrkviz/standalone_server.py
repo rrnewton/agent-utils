@@ -228,6 +228,13 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
         ".log": "text/plain",
     }
 
+    # The wire format is part of our Python/Rust contract, not the host
+    # interpreter's choice of HTML template or HTTPStatus.__str__ behavior.
+    error_message_format = '<!DOCTYPE HTML>\n<html lang="en">\n    <head>\n        <meta charset="utf-8">\n        <title>Error response</title>\n    </head>\n    <body>\n        <h1>Error response</h1>\n        <p>Error code: %(code)d</p>\n        <p>Message: %(message)s.</p>\n        <p>Error code explanation: %(code)s - %(explain)s.</p>\n    </body>\n</html>\n'
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        super().send_error(int(code), message, explain)
+
     _cache_control_sent = False
 
     def list_directory(self, path: str | os.PathLike[str]) -> io.BytesIO | None:
