@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import sys
 import time
@@ -73,7 +74,7 @@ def test_advertised_tips_not_memoized_outside_scope(
     assert calls == ["ls-remote", "ls-remote"]
 
 
-def _mirror_scope(root: Path) -> object:
+def _mirror_scope(root: Path) -> contextlib.AbstractContextManager[None]:
     return wrkslots._remote_containment_scope(root)
 
 
@@ -84,7 +85,7 @@ def test_mirror_serves_second_proof_without_network(
     vcs = wrkslots._GitVcs()
     authority = vcs.remote_authority(repo, "origin")
     root = tmp_path / "proof-mirrors"
-    with _mirror_scope(root):  # type: ignore[arg-type]
+    with _mirror_scope(root):
         first = vcs._proof_mirror(repo, authority)
         assert first is not None and first[0]
 
@@ -123,7 +124,7 @@ def test_concurrent_removals_share_one_mirror_refresh(
     def ask(ctx: contextvars.Context) -> None:
         results.append(ctx.run(vcs._proof_mirror, repo, authority))
 
-    with _mirror_scope(root):  # type: ignore[arg-type]
+    with _mirror_scope(root):
         ctx = contextvars.copy_context()
         threads = [threading.Thread(target=ask, args=(ctx,)) for _ in range(2)]
         # Each thread needs its own copy of the scope context.
@@ -150,7 +151,7 @@ def test_stale_mirror_with_unreachable_remote_falls_back(tmp_path: Path) -> None
     authority = wrkslots._RemoteAuthority(
         url, _hashlib.sha256(url.encode()).hexdigest()
     )
-    with _mirror_scope(tmp_path / "proof-mirrors"):  # type: ignore[arg-type]
+    with _mirror_scope(tmp_path / "proof-mirrors"):
         assert vcs._proof_mirror(repo, authority) is None
 
 
@@ -159,7 +160,7 @@ def test_corrupt_mirror_is_discarded(tmp_path: Path) -> None:
     vcs = wrkslots._GitVcs()
     authority = vcs.remote_authority(repo, "origin")
     root = tmp_path / "proof-mirrors"
-    with _mirror_scope(root):  # type: ignore[arg-type]
+    with _mirror_scope(root):
         first = vcs._proof_mirror(repo, authority)
         assert first is not None
         directory = wrkslots._proof_mirror_directory(root, authority.url)
@@ -176,7 +177,7 @@ def test_mirror_refresh_picks_up_force_push_past_bound(tmp_path: Path) -> None:
     vcs = wrkslots._GitVcs()
     authority = vcs.remote_authority(repo, "origin")
     root = tmp_path / "proof-mirrors"
-    with _mirror_scope(root):  # type: ignore[arg-type]
+    with _mirror_scope(root):
         first = vcs._proof_mirror(repo, authority)
         assert first is not None
         old_tip = first[0]["refs/heads/main"]

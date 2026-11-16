@@ -16670,7 +16670,14 @@ def test_agent_reclaim_archives_locally_when_remote_transport_is_unavailable(
     # The initial fetch is what failed; no push was attempted.
     assert "git ls-remote" in receipt["remote_failure"]
     calls = network_calls(tmp_path)
-    assert [call.split()[0] for call in calls] == ["default", "false", "default"]
+    # One extra leading ask is the proof mirror's failed refresh (#1692);
+    # on its failure the removal falls back to the direct proof below.
+    assert [call.split()[0] for call in calls] == [
+        "default",
+        "default",
+        "false",
+        "default",
+    ]
     assert all(" ls-remote " in call for call in calls)
     assert "CONNECT tunnel failed, response 403" in receipt["remote_failure"]
     assert git(remote, "for-each-ref", "refs/heads/salvage/").stdout == ""
@@ -16761,6 +16768,8 @@ def test_archive_root_does_not_absorb_remote_failures_other_than_an_outage(
 
     # The redirect-free retry would report an outage, so only the first
     # classification can refuse; it must refuse before that retry runs.
+    # The first of the two default-mode asks is the proof mirror's failed
+    # refresh (#1692), after which the direct proof refuses the same way.
     refused = local_archive_remove(
         project,
         archive_root,
@@ -16770,7 +16779,10 @@ def test_archive_root_does_not_absorb_remote_failures_other_than_an_outage(
     assert refused.returncode == 3
     assert output.splitlines()[-1] in refused.stderr
     assert "using verified local archive" not in refused.stderr
-    assert [call.split()[0] for call in network_calls(tmp_path)] == ["default"]
+    assert [call.split()[0] for call in network_calls(tmp_path)] == [
+        "default",
+        "default",
+    ]
     assert tree.is_dir()
     assert len(active_slots(project)) == 1
     assert list(archive_root.iterdir()) == []
@@ -37297,7 +37309,9 @@ def test_agent_remove_verifies_an_existing_local_archive_before_the_lock(
     (receipt,) = archive["records"][0]["salvage"]
     assert receipt["disposition"] == "archived-local"
     assert Path(receipt["archive_bundle"]) == bundle
-    calls = log.read_text(encoding="utf-8").splitlines()
+    # The proof mirror the refused attempt left may serve this removal
+    # without any network call at all (#1692); then the log was never made.
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
     # The existing bundle is not made again, and not restored either: it is
     # the shared bundle whose record says it passed the full verification
     # (#1153), so only its bytes are reread, before the lock and under it.

@@ -20741,13 +20741,13 @@ class _GitVcs:
             for ref, tip in refs.items()
         ):
             return None
-        if record.get("fingerprint") != _advertised_fingerprint(refs):  # type: ignore[arg-type]
+        if record.get("fingerprint") != _advertised_fingerprint(refs):
             return None
         if not isinstance(record.get("listed_at"), (int, float)) or not isinstance(
             record.get("fetched_at"), (int, float)
         ):
             return None
-        return record
+        return cast("dict[str, object]", record)
 
     def _mirror_self_check(self, directory: Path, refs: Mapping[str, str]) -> bool:
         """True when every recorded tip is a commit in the mirror's store."""
@@ -20768,7 +20768,13 @@ class _GitVcs:
             for line in result.stdout.splitlines()
             if len(line.split()) == 2 and line.split()[1] == "commit"
         }
-        return set(refs.values()) <= found
+        if not set(refs.values()) <= found:
+            return False
+        inventory = self._run(
+            git_path, ["for-each-ref", "--format=%(refname) %(objectname)"]
+        ).stdout.splitlines()
+        stored = dict(line.split(" ", 1) for line in inventory if " " in line)
+        return all(stored.get(ref) == tip for ref, tip in refs.items())
 
     def _refresh_mirror(
         self, checkout: Path, target: _RemoteAuthority, directory: Path
@@ -20803,8 +20809,16 @@ class _GitVcs:
                 git_path = directory / "mirror.git"
                 if not git_path.is_dir():
                     self._run(directory, ["init", "--bare", "--", str(git_path)])
+                    # Fetching into the branch HEAD names is refused; the
+                    # mirror's HEAD is never checked out, so park it aside.
+                    self._run(
+                        git_path, ["symbolic-ref", "HEAD", "refs/proof-mirror-head"]
+                    )
+                # A filtered fetch needs a named promisor remote; fetching
+                # from the raw URL cannot configure one and fails.
+                self._run(git_path, ["config", "remote.mirror.url", target.url])
                 if inventory:
-                    self._run_bytes(
+                    fetched = self._run_bytes(
                         git_path,
                         [
                             "fetch",
@@ -20816,7 +20830,7 @@ class _GitVcs:
                             "--no-recurse-submodules",
                             "--stdin",
                             "--",
-                            target.url,
+                            "mirror",
                         ],
                         input_bytes="".join(
                             f"+{ref}:{ref}\n" for ref in sorted(inventory)
@@ -20825,6 +20839,8 @@ class _GitVcs:
                         timeout_seconds=_REMOTE_CONTAINMENT_FETCH_SECONDS,
                         timeout_refusal="proof mirror fetch timed out",
                     )
+                    if fetched.returncode != 0:
+                        raise Refusal("proof mirror fetch failed")
                 record = {
                     "schema": _PROOF_MIRROR_RECORD_SCHEMA,
                     "url": target.url,
@@ -20890,7 +20906,11 @@ class _GitVcs:
                 "fetched_at": record["fetched_at"],
                 "fingerprint": record["fingerprint"],
             }
-        return dict(record["refs"]), str(directory / "mirror.git")  # type: ignore[arg-type]
+        refs_obj = record["refs"]
+        return (
+            dict(refs_obj) if isinstance(refs_obj, dict) else {},
+            str(directory / "mirror.git"),
+        )
 
     def remote_heads_containing(
         self,
@@ -49702,6 +49722,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 or not entry.is_dir()
                 or entry.is_symlink()
                 or entry.name.startswith("EVENTS.")
+                or entry.name == "proof-mirrors"
                 or _is_validate_storage_entry(config, entry)
                 or _is_eden_backing_entry(config, entry)
                 or _is_representation_directory(config, entry)
@@ -57762,11 +57783,14 @@ def _cmd_remove(
     emit: bool = True,
     agent_batch: _AgentRemoveBatchContext | None = None,
 ) -> int:
-    mirror_root: Path | None = None
-    try:
-        mirror_root = _load_config(args.project_root, args.machine).control / "proof-mirrors"
-    except Exception:
-        mirror_root = None
+    mirror_root: Path | None = _PROOF_MIRROR_ROOT.get()
+    if mirror_root is None:
+        try:
+            mirror_root = (
+                _load_config(args.project_root, args.machine).control / "proof-mirrors"
+            )
+        except Exception:
+            mirror_root = None
     with _remote_containment_scope(mirror_root):
         return _cmd_remove_in_scope(
             args,

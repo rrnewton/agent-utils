@@ -798,9 +798,17 @@ def test_remove_ignored_cache_target_still_removes_in_both_editions(tmp_path: Pa
         assert _python_remove(oracle_root) == 0
         result = _rust_remove(rust_root)
         assert result.returncode == 0, result.stderr
-        assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
-            oracle_root, "ARCHIVED.node-a.json"
-        )
+        rust_doc = _doc(rust_root, "ARCHIVED.node-a.json")
+        oracle_doc = _doc(oracle_root, "ARCHIVED.node-a.json")
+        # The proof mirror is Python-edition evidence (#1692); the Rust
+        # edition proves directly, so its receipts carry no such record.
+        for doc in (rust_doc, oracle_doc):
+            for record in cast(list[dict[str, object]], doc["records"]):
+                for receipt in cast(
+                    list[dict[str, object]], record.get("salvage", [])
+                ):
+                    receipt.pop("proof_mirror", None)
+        assert rust_doc == oracle_doc
         for root in (rust_root, oracle_root):
             archived = _doc(root, "ARCHIVED.node-a.json")
             records = cast(list[dict[str, object]], archived["records"])
