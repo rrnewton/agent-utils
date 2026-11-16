@@ -82,6 +82,24 @@ pub fn canonical_ts(ts: &str) -> Option<String> {
     Some(format!("{secs}.{fraction}"))
 }
 
+/// The bare Slack `ts` a stored thread or message id names in
+/// `conversation`: the id itself when it is a bare `ts`, or the `ts` of a
+/// provider-qualified `<conversation>/threads/<ts>` or
+/// `<conversation>/messages/<ts>` — the shapes real bridge records store
+/// (#1705). `None` when the embedded conversation is not `conversation` or
+/// the id has any other shape: a permalink is never built from an id whose
+/// thread it cannot prove.
+#[must_use]
+pub fn bare_ts(id: &str, conversation: &str) -> Option<String> {
+    if let Some(ts) = canonical_ts(id) {
+        return Some(ts);
+    }
+    ["threads", "messages"].iter().find_map(|kind| {
+        id.strip_prefix(&format!("{conversation}/{kind}/"))
+            .and_then(canonical_ts)
+    })
+}
+
 /// The permalink segment a `ts` names: its ten second digits and six
 /// microsecond digits, or `None` for any other shape — nothing Slack resolves.
 fn permalink_segment(ts: &str) -> Option<String> {
@@ -104,7 +122,7 @@ pub fn slack_thread_permalink(
     if !is_conversation_id(conversation) {
         return None;
     }
-    let segment = permalink_segment(thread_root_ts)?;
+    let segment = permalink_segment(&bare_ts(thread_root_ts, conversation)?)?;
     let url = format!("{origin}/archives/{conversation}/p{segment}");
     (url.len() <= MAX_URL_BYTES).then_some(url)
 }
@@ -123,11 +141,12 @@ pub fn slack_message_permalink(
     if !is_conversation_id(conversation) {
         return None;
     }
-    let segment = permalink_segment(ts)?;
+    let ts = bare_ts(ts, conversation)?;
+    let segment = permalink_segment(&ts)?;
     let mut url = format!("{origin}/archives/{conversation}/p{segment}");
     if let Some(root) = thread_root_ts {
-        let root = canonical_ts(root)?;
-        if root == canonical_ts(ts)? || permalink_segment(&root).is_none() {
+        let root = bare_ts(root, conversation)?;
+        if root == ts || permalink_segment(&root).is_none() {
             return None;
         }
         url.push_str(&format!("?thread_ts={root}&cid={conversation}"));
@@ -644,6 +663,105 @@ mod tests {
                 "https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn qualified_ids_name_the_same_permalinks_as_bare_ones() {
+        // Real bridge records qualify both ids with their conversation
+        // (#1705): the permalink must be the bare form's.
+        assert_eq!(
+            slack_thread_permalink(
+                WORKSPACE,
+                "C0CC755QYSK",
+                "C0CC755QYSK/threads/1794772223.198289"
+            ),
+            Some("https://acme.slack.com/archives/C0CC755QYSK/p1794772223198289".to_owned())
+        );
+        assert_eq!(
+            slack_message_permalink(
+                WORKSPACE,
+                "C0CC755QYSK",
+                "C0CC755QYSK/messages/1794772300.000200",
+                Some("C0CC755QYSK/threads/1794772223.198289"),
+            ),
+            Some(
+                "https://acme.slack.com/archives/C0CC755QYSK/p1794772300000200?thread_ts=1794772223.198289&cid=C0CC755QYSK"
+                    .to_owned()
+            )
+        );
+        // A top-level message's own permalink carries no thread query.
+        assert_eq!(
+            slack_message_permalink(
+                WORKSPACE,
+                "C0CC755QYSK",
+                "C0CC755QYSK/messages/1794772223.198289",
+                None,
+            ),
+            Some("https://acme.slack.com/archives/C0CC755QYSK/p1794772223198289".to_owned())
+        );
+    }
+
+    #[test]
+    fn bare_ts_reads_both_stored_shapes_and_refuses_the_rest() {
+        let conversation = "C0CC755QYSK";
+        assert_eq!(
+            bare_ts("1794772223.198289", conversation).as_deref(),
+            Some("1794772223.198289")
+        );
+        assert_eq!(
+            bare_ts("1794772223.1", conversation).as_deref(),
+            Some("1794772223.100000")
+        );
+        assert_eq!(
+            bare_ts("C0CC755QYSK/threads/1794772223.198289", conversation).as_deref(),
+            Some("1794772223.198289")
+        );
+        assert_eq!(
+            bare_ts("C0CC755QYSK/messages/1794772223.1", conversation).as_deref(),
+            Some("1794772223.100000")
+        );
+        // The embedded conversation must be the message's own.
+        assert_eq!(
+            bare_ts("C999999999/threads/1794772223.198289", conversation),
+            None
+        );
+        assert_eq!(
+            bare_ts("C999999999/messages/1794772223.198289", conversation),
+            None
+        );
+        // Any other shape is refused.
+        assert_eq!(
+            bare_ts("C0CC755QYSK/channels/1794772223.198289", conversation),
+            None
+        );
+        assert_eq!(
+            bare_ts("C0CC755QYSK/threads/1794772223.198289/extra", conversation),
+            None
+        );
+        assert_eq!(bare_ts("C0CC755QYSK/threads/soon", conversation), None);
+        assert_eq!(bare_ts("threads/1794772223.198289", conversation), None);
+        assert_eq!(bare_ts("", conversation), None);
+    }
+
+    #[test]
+    fn a_qualified_id_for_another_conversation_forms_no_permalink() {
+        assert_eq!(
+            slack_thread_permalink(
+                WORKSPACE,
+                "C0CC755QYSK",
+                "C999999999/threads/1794772223.198289"
+            ),
+            None
+        );
+        assert_eq!(
+            slack_message_permalink(
+                WORKSPACE,
+                "C0CC755QYSK",
+                "C999999999/messages/1794772223.198289",
+                None,
+            ),
+            None
         );
     }
 

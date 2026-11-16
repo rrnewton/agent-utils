@@ -12483,7 +12483,8 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
         let workspace = self.config.slack_workspace_url.as_deref()?;
         // A thread reply's root is its `thread_id`; a top-level message is its
         // own root. Trying both, in that order, lets either record shape name
-        // the thread; the builder refuses anything not `ts`-shaped.
+        // the thread; the builder reads bare and provider-qualified ids
+        // alike and refuses anything else (#1705).
         crate::chat_links::slack_thread_permalink(
             workspace,
             &message.channel_id,
@@ -12629,14 +12630,26 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
                             && other.message.thread_id == record.message.thread_id
                     })
                     .min_by_key(|(other, _)| other.admitted_at_millis);
+                // Stored ids may be provider-qualified (#1705); the file
+                // names bare `ts` values, and an entry whose ids yield none
+                // is omitted rather than written unresolvably.
                 let (root_ts, root_message) = match root {
                     Some((root, _)) => {
-                        let root_ts = if root.message.thread_reply {
-                            root.message.thread_id.clone()
+                        let root_id = if root.message.thread_reply {
+                            &root.message.thread_id
                         } else {
-                            root.message.message_id.clone()
+                            &root.message.message_id
                         };
-                        (root_ts, root.message.message_id.clone())
+                        let (Some(root_ts), Some(root_message)) = (
+                            crate::chat_links::bare_ts(root_id, &root.message.channel_id),
+                            crate::chat_links::bare_ts(
+                                &root.message.message_id,
+                                &root.message.channel_id,
+                            ),
+                        ) else {
+                            continue;
+                        };
+                        (root_ts, root_message)
                     }
                     None => continue,
                 };
@@ -12651,15 +12664,24 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
         let mut messages = Vec::new();
         for (record, _) in &records {
             if let Some(number) = record.message_number {
-                let thread_root_ts = if record.message.thread_reply {
-                    record.message.thread_id.clone()
+                let root_id = if record.message.thread_reply {
+                    &record.message.thread_id
                 } else {
-                    record.message.message_id.clone()
+                    &record.message.message_id
+                };
+                let (Some(message_ts), Some(thread_root_ts)) = (
+                    crate::chat_links::bare_ts(
+                        &record.message.message_id,
+                        &record.message.channel_id,
+                    ),
+                    crate::chat_links::bare_ts(root_id, &record.message.channel_id),
+                ) else {
+                    continue;
                 };
                 messages.push(json!({
                     "n": number,
                     "channel": record.message.channel_id,
-                    "message": record.message.message_id,
+                    "message": message_ts,
                     "thread_root_ts": thread_root_ts,
                 }));
             }
@@ -21898,6 +21920,124 @@ pub(crate) mod tests {
             status["requests"][0]["thread_permalink"],
             json!("https://acme.slack.com/archives/C0123ABCD/p1700000000000100")
         );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// #1705 chat-permalink-qualified-ids: real bridge records qualify both
+    /// ids with their conversation (`<channel>/threads/<ts>`,
+    /// `<channel>/messages/<ts>`). A top-level message and a reply in its
+    /// thread must still name permalinks everywhere: the prompt header, a
+    /// rendered `:thread:` citation, `chat status`, and `short-refs.json`
+    /// (bare `ts` values for vibe-talk's reader).
+    #[test]
+    fn qualified_record_ids_still_name_permalinks() {
+        let root = temporary("qualified-links");
+        let mut configuration = config_without_reaction();
+        configuration.channel_ids = vec!["C0CC755QYSK".to_owned()];
+        configuration.slack_workspace_url = Some("https://acme.slack.com".to_owned());
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let admit = |sequence: u64, message_id: &str, text: &str, thread_reply: bool| -> String {
+            let message = InboundMessage::new(
+                ChannelId::new("C0CC755QYSK").expect("channel"),
+                MessageId::new(message_id).expect("message"),
+                ThreadId::new("C0CC755QYSK/threads/1794772223.198289").expect("thread"),
+                SenderId::new("users/owner").expect("sender"),
+                text,
+                "2026-11-16T09:00:00Z",
+                thread_reply,
+            )
+            .expect("normalized message");
+            let batch = DeliveryBatch::new(
+                EventSequence::new(sequence).expect("sequence"),
+                ProviderCursor::new(format!("cursor-{sequence}")).expect("cursor"),
+                DeliveryId::new(format!("delivery-{sequence}")).expect("delivery"),
+                vec![CommittableEvent::message_created(message)],
+            )
+            .expect("delivery");
+            state
+                .admit_batch(&batch)
+                .expect("admission")
+                .new_request_keys
+                .into_iter()
+                .next()
+                .expect("key")
+        };
+        let top_key = admit(
+            1,
+            "C0CC755QYSK/messages/1794772223.198289",
+            "please look",
+            false,
+        );
+        let reply_key = admit(
+            2,
+            "C0CC755QYSK/messages/1794772300.000200",
+            "a reply in the thread",
+            true,
+        );
+        let permalink = "https://acme.slack.com/archives/C0CC755QYSK/p1794772223198289";
+        // Both prompts name the thread's ready permalink beside its number.
+        for key in [&top_key, &reply_key] {
+            let prompt = state.prompt(key, "").expect("prompt");
+            assert!(prompt.contains(permalink), "{prompt}");
+        }
+        // A reply citing the thread renders a link, not plain text.
+        state
+            .set_delivery_phase(&reply_key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        let route = state
+            .next_reply_route(&reply_key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(
+                &reply_key,
+                &format!(
+                    "<CHAT_REPLY_{0}>\nSee :thread:001 and :email:2.\n</CHAT_REPLY_{0}>",
+                    route.identifier
+                ),
+            )
+            .expect("capture reply");
+        let mut transport = FakeReplyTransport::default();
+        assert!(state
+            .publish_one(&reply_key, &mut transport)
+            .expect("sent")
+            .is_some());
+        let posted = &transport.submissions[0].2;
+        assert!(
+            posted.contains(&format!("<{permalink}|:thread:001>")),
+            "{posted}"
+        );
+        assert!(
+            posted.contains(
+                "<https://acme.slack.com/archives/C0CC755QYSK/p1794772300000200?thread_ts=1794772223.198289&cid=C0CC755QYSK|:email:2>"
+            ),
+            "{posted}"
+        );
+        // `short-refs.json` carries bare `ts` values, never qualified ids.
+        let short_refs: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("short-refs.json")).expect("file"))
+                .expect("short refs JSON");
+        assert_eq!(
+            short_refs["threads"][0]["root_ts"],
+            json!("1794772223.198289")
+        );
+        assert_eq!(
+            short_refs["threads"][0]["root_message"],
+            json!("1794772223.198289")
+        );
+        let message_refs = short_refs["messages"].as_array().expect("messages");
+        assert!(message_refs.iter().all(|entry| {
+            !entry["message"].as_str().expect("message").contains('/')
+                && !entry["thread_root_ts"]
+                    .as_str()
+                    .expect("root")
+                    .contains('/')
+        }));
+        // `chat status` names the same permalink for both requests.
+        let status = state.status().expect("status");
+        for request in status["requests"].as_array().expect("requests") {
+            assert_eq!(request["thread_permalink"], json!(permalink));
+        }
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
