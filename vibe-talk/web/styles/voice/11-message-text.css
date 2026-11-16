@@ -321,9 +321,16 @@
   text-align: right;
 }
 
-/* A mention is the id it is: no directory here turns it into a name. */
+/* A mention is the id it is: no directory here turns it into a name. A mention the
+   server could link to a profile (`#1722 vibe-talk-mention-link-not-clickable`) is an
+   anchor in the same colour, underlined on hover so it reads as a link. */
 .md .mention {
   color: var(--accent);
+}
+
+.md a.mention:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
 }
 
 /* An unresolvable short reference (`#1565 vibe-talk-short-ref-links`): plain text,

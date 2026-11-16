@@ -237,6 +237,28 @@ pub fn markup_for(config: &Config, channel: &ChannelInfo) -> Markup {
         .unwrap_or_default()
 }
 
+/// The origin a user mention's profile lives under for `channel`'s provider
+/// (`https://acme.slack.com`, so a mention links to `{origin}/team/{user id}`), when one
+/// can be derived: a Slack provider whose configured workspace address
+/// ([`crate::slack::SlackConfig::workspace_url`]) reads as an https origin. Any other
+/// provider, and a Slack provider with none configured, gives `None` and mentions stay
+/// chips. `#1722 vibe-talk-mention-link-not-clickable`.
+#[must_use]
+pub fn profile_base_for(config: &Config, channel: &ChannelInfo) -> Option<String> {
+    let provider = channel
+        .provider
+        .as_deref()
+        .or_else(|| config.default_provider_key())
+        .and_then(|key| config.provider(key))?;
+    let crate::config::ProviderKind::Slack(slack) = &provider.kind else {
+        return None;
+    };
+    slack
+        .workspace_url
+        .as_deref()
+        .and_then(crate::upstream_url::workspace_origin)
+}
+
 /// What the message cache's full-text index holds of a body: its text as the page draws it, and
 /// the addresses of its links. `#208 persistent-cache`.
 ///
@@ -315,6 +337,7 @@ impl SearchText {
             bot,
             &|_| false,
             mentions,
+            None,
         );
         if html.is_empty() {
             return crate::cache::Rendered {
@@ -574,6 +597,7 @@ fn fill_impl(
             }
         }
     }
+    let profiles = profile_base_for(config, channel);
     for message in messages {
         let confirmed = |tag: &str| headings.confirmed(&channel.id, &message.author_id, tag);
         (message.content_html, message.heading) = headed_body(
@@ -582,6 +606,7 @@ fn fill_impl(
             message.author_is_bot,
             &confirmed,
             &message.mentions,
+            profiles.as_deref(),
         );
     }
 }
@@ -648,9 +673,15 @@ pub fn fill_pins<'p>(
         };
         let confirmed = |tag: &str| headings.confirmed(&channel.id, &snapshot.author_id, tag);
         // A pin keeps the text it was pinned with and not who its mentions named: its chips are
-        // drawn by id.
-        (pin.content_html, pin.heading) =
-            headed_body(&text, markup, snapshot.author_is_bot, &confirmed, &[]);
+        // drawn by id, and linked like a read's are.
+        (pin.content_html, pin.heading) = headed_body(
+            &text,
+            markup,
+            snapshot.author_is_bot,
+            &confirmed,
+            &[],
+            profile_base_for(config, channel).as_deref(),
+        );
     }
 }
 
@@ -679,12 +710,13 @@ pub fn headed_body(
     bot: bool,
     confirmed: &dyn Fn(&str) -> bool,
     mentions: &[MentionName],
+    profiles: Option<&str>,
 ) -> (String, Option<crate::model::Heading>) {
-    headed_body_by(to_html_named, text, markup, bot, confirmed, mentions)
+    headed_body_by(to_html_named, text, markup, bot, confirmed, mentions, profiles)
 }
 
 /// How a body is rendered: [`to_html_named`], through the cache, or [`render_named`], past it.
-type Render = fn(&str, Markup, &[MentionName]) -> String;
+type Render = fn(&str, Markup, &[MentionName], Option<&str>) -> String;
 
 /// [`headed_body`], rendering with `render`.
 fn headed_body_by(
@@ -694,8 +726,9 @@ fn headed_body_by(
     bot: bool,
     confirmed: &dyn Fn(&str) -> bool,
     mentions: &[MentionName],
+    profiles: Option<&str>,
 ) -> (String, Option<crate::model::Heading>) {
-    let html = render(text, markup, mentions);
+    let html = render(text, markup, mentions, profiles);
     let plain = html == plain_html(text);
     let Some(found) = crate::heading::extract(text, bot, confirmed) else {
         return (if plain { String::new() } else { html }, None);
@@ -704,7 +737,7 @@ fn headed_body_by(
     if plain {
         return (String::new(), Some(heading));
     }
-    match mark_restated(render, &html, &text[..found.cut], markup, mentions) {
+    match mark_restated(render, &html, &text[..found.cut], markup, mentions, profiles) {
         Some(marked) => (marked, Some(heading)),
         None => (html, None),
     }
@@ -727,8 +760,9 @@ fn mark_restated(
     prefix: &str,
     markup: Markup,
     mentions: &[MentionName],
+    profiles: Option<&str>,
 ) -> Option<String> {
-    let alone = render(prefix, markup, mentions);
+    let alone = render(prefix, markup, mentions, profiles);
     let words = alone.strip_prefix("<p>")?.strip_suffix("</p>\n")?;
     if words.contains("<p>") || words.contains("</p>") {
         return None;
@@ -794,22 +828,31 @@ pub fn body_html_catchup(text: &str, markup: Markup, trusted: &HashSet<String>) 
 /// note, the [`plain_html`] the page would draw without it.
 #[must_use]
 pub fn to_html(text: &str, markup: Markup) -> String {
-    to_html_named(text, markup, &[])
+    to_html_named(text, markup, &[], None)
 }
 
 /// [`to_html`], drawing each user mention that `mentions` names as the person's name rather than
 /// their id: `<@U0123ABCD>` is the chip `@Ada Lovelace`. `#318 slack-mention-names`. A mention it
 /// does not name is drawn by id, as every mention was before.
 ///
+/// With `profiles` (see [`profile_base_for`]) a user mention is drawn as a link to that
+/// person's profile, `{profiles}/team/{id}`, keeping the chip's class so it reads as a
+/// mention; without one it stays a chip. `#1722 vibe-talk-mention-link-not-clickable`.
+///
 /// Answered from [`RENDERED`] when the same body was rendered recently.
 #[must_use]
-pub fn to_html_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
+pub fn to_html_named(
+    text: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+    profiles: Option<&str>,
+) -> String {
     let rule = newline_rule(text, markup);
-    if let Some(html) = RENDERED.get(text, markup, rule, mentions) {
+    if let Some(html) = RENDERED.get(text, markup, rule, mentions, profiles) {
         return html;
     }
-    let html = render_named(text, markup, mentions);
-    RENDERED.put(text, markup, rule, mentions, &html);
+    let html = render_named(text, markup, mentions, profiles);
+    RENDERED.put(text, markup, rule, mentions, profiles, &html);
     html
 }
 
@@ -828,22 +871,32 @@ pub(crate) enum Names {
 /// [`to_html_named`] without the cache: neither read nor written. For the message cache's
 /// full-text index, which renders every message it holds when it rebuilds, and would otherwise
 /// push the bodies the timeline is reading out of [`RENDERED`] with old ones.
-fn render_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
-    render_visiting(text, markup, mentions, Names::Page, |_, _| ()).0
+fn render_named(
+    text: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+    profiles: Option<&str>,
+) -> String {
+    render_visiting(text, markup, mentions, profiles, Names::Page, |_, _| ()).0
 }
 
 /// [`render_named`] for one Discuss answer: `trusted` addresses (see [`body_html_catchup`]) keep
 /// their links. Never cached in [`RENDERED`]: what a body renders to here depends on the trusted
 /// set, which the cache key does not hold, and a Discuss answer is rendered once.
 fn render_named_catchup(text: &str, markup: Markup, trusted: &HashSet<String>) -> String {
-    render_visiting_trusted(text, markup, &[], Names::Page, trusted, |_, _| ()).0
+    render_visiting_trusted(text, markup, &[], None, Names::Page, trusted, |_, _| ()).0
 }
 
 /// [`render_named`] for the search index: drawn as the page draws it but for thread names,
 /// which are neither drawn nor wanted ([`Names::TextOnly`]), so the index's text stays a
 /// function of the message alone and rebuilding it fetches nothing.
-fn render_named_for_index(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
-    render_visiting(text, markup, mentions, Names::TextOnly, |_, _| ()).0
+fn render_named_for_index(
+    text: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+    profiles: Option<&str>,
+) -> String {
+    render_visiting(text, markup, mentions, profiles, Names::TextOnly, |_, _| ()).0
 }
 
 /// The bytes one generation of [`RENDERED`] holds before it becomes the old one: its bodies' text
@@ -882,6 +935,7 @@ struct RenderedBody {
     rule: SingleNewline,
     text: String,
     mentions: Vec<MentionName>,
+    profiles: Option<String>,
     /// The thread-name stamp this body was drawn under ([`crate::pr_names::stamp`]).
     names_stamp: u64,
     html: String,
@@ -894,12 +948,14 @@ impl RenderedBody {
         markup: Markup,
         rule: SingleNewline,
         mentions: &[MentionName],
+        profiles: Option<&str>,
         names_stamp: u64,
     ) -> bool {
         self.markup == markup
             && self.rule == rule
             && self.text == text
             && self.mentions == mentions
+            && self.profiles.as_deref() == profiles
             && self.names_stamp == names_stamp
     }
 
@@ -913,7 +969,11 @@ impl RenderedBody {
             .iter()
             .map(|mention| mention.id.len() + mention.name.len() + 64)
             .sum();
-        OVERHEAD + self.text.len() + self.html.len() + mentions
+        OVERHEAD
+            + self.text.len()
+            + self.html.len()
+            + mentions
+            + self.profiles.as_ref().map_or(0, String::len)
     }
 }
 
@@ -924,6 +984,7 @@ impl RenderCache {
         markup: Markup,
         rule: SingleNewline,
         mentions: &[MentionName],
+        profiles: Option<&str>,
     ) -> u64 {
         self.hasher.hash_one((
             markup,
@@ -933,6 +994,7 @@ impl RenderCache {
                 .iter()
                 .map(|mention| (&mention.id, &mention.name))
                 .collect::<Vec<_>>(),
+            profiles,
         ))
     }
 
@@ -942,8 +1004,9 @@ impl RenderCache {
         markup: Markup,
         rule: SingleNewline,
         mentions: &[MentionName],
+        profiles: Option<&str>,
     ) -> Option<String> {
-        let key = self.key(text, markup, rule, mentions);
+        let key = self.key(text, markup, rule, mentions, profiles);
         let names_stamp = crate::pr_names::stamp();
         let mut generations = self
             .generations
@@ -952,14 +1015,14 @@ impl RenderCache {
         if let Some(found) = generations.young.get(&key).and_then(|bodies| {
             bodies
                 .iter()
-                .find(|body| body.is(text, markup, rule, mentions, names_stamp))
+                .find(|body| body.is(text, markup, rule, mentions, profiles, names_stamp))
         }) {
             return Some(found.html.clone());
         }
         let bodies = generations.old.get_mut(&key)?;
         let at = bodies
             .iter()
-            .position(|body| body.is(text, markup, rule, mentions, names_stamp))?;
+            .position(|body| body.is(text, markup, rule, mentions, profiles, names_stamp))?;
         let body = bodies.swap_remove(at);
         let html = body.html.clone();
         generations.insert(key, body);
@@ -972,14 +1035,16 @@ impl RenderCache {
         markup: Markup,
         rule: SingleNewline,
         mentions: &[MentionName],
+        profiles: Option<&str>,
         html: &str,
     ) {
-        let key = self.key(text, markup, rule, mentions);
+        let key = self.key(text, markup, rule, mentions, profiles);
         let body = RenderedBody {
             markup,
             rule,
             text: text.to_owned(),
             mentions: mentions.to_vec(),
+            profiles: profiles.map(str::to_owned),
             names_stamp: crate::pr_names::stamp(),
             html: html.to_owned(),
         };
@@ -999,6 +1064,7 @@ impl Generations {
                 body.markup,
                 body.rule,
                 &body.mentions,
+                body.profiles.as_deref(),
                 body.names_stamp,
             )
         }) {
@@ -1020,6 +1086,7 @@ pub fn to_html_as(text: &str, markup: Markup, rule: SingleNewline) -> String {
         text,
         markup,
         &[],
+        None,
         rule,
         Names::Page,
         &HashSet::new(),
@@ -1035,10 +1102,19 @@ fn render_visiting<T>(
     text: &str,
     markup: Markup,
     mentions: &[MentionName],
+    profiles: Option<&str>,
     names: Names,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
-    render_visiting_trusted(text, markup, mentions, names, &HashSet::new(), visit)
+    render_visiting_trusted(
+        text,
+        markup,
+        mentions,
+        profiles,
+        names,
+        &HashSet::new(),
+        visit,
+    )
 }
 
 /// [`render_visiting`] with a trusted-address set (see [`body_html_catchup`]).
@@ -1046,6 +1122,7 @@ fn render_visiting_trusted<T>(
     text: &str,
     markup: Markup,
     mentions: &[MentionName],
+    profiles: Option<&str>,
     names: Names,
     trusted: &HashSet<String>,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
@@ -1054,6 +1131,7 @@ fn render_visiting_trusted<T>(
         text,
         markup,
         mentions,
+        profiles,
         newline_rule(text, markup),
         names,
         trusted,
@@ -1066,6 +1144,7 @@ fn render_visiting_as<T>(
     text: &str,
     markup: Markup,
     mentions: &[MentionName],
+    profiles: Option<&str>,
     rule: SingleNewline,
     names: Names,
     trusted: &HashSet<String>,
@@ -1106,7 +1185,7 @@ fn render_visiting_as<T>(
         }
     }
     let linked = adjust(
-        &arena, root, &source, &inserted, markup, mentions, names, trusted,
+        &arena, root, &source, &inserted, markup, mentions, profiles, names, trusted,
     );
     // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
     if deeper_than(root, MAX_DEPTH) {
@@ -1350,7 +1429,7 @@ pub fn source_blocks(text: &str, markup: Markup, mentions: &[MentionName]) -> Ve
     // Read-aloud blocks are cut from the source, and a prefetch of them is no page read:
     // drawn without thread names ([`Names::TextOnly`]), which the block kinds never depended on.
     let (html, walked) =
-        render_visiting(text, markup, mentions, Names::TextOnly, |root, source| {
+        render_visiting(text, markup, mentions, None, Names::TextOnly, |root, source| {
             let lines = line_starts(source);
             let mut found = Vec::new();
             tree_blocks(root, source, &lines, Walk::Blocks, &mut found);
@@ -2629,6 +2708,9 @@ fn sanitizer_builder<'a>() -> ammonia::Builder<'a> {
                     .chain(highlight::CLASSES)
                     .collect(),
             ),
+            // A mention drawn as a link (`#1722 vibe-talk-mention-link-not-clickable`)
+            // keeps the chip's class, so it reads as a mention and not as prose.
+            ("a", HashSet::from([MENTION_CLASS])),
             ("p", HashSet::from([RESTATED_CLASS])),
             ("ul", HashSet::from(["contains-task-list"])),
             ("ol", HashSet::from(["contains-task-list"])),
@@ -2659,6 +2741,7 @@ fn adjust<'a>(
     inserted: &[usize],
     markup: Markup,
     mentions: &[MentionName],
+    profiles: Option<&str>,
     names: Names,
     trusted: &HashSet<String>,
 ) -> usize {
@@ -2747,9 +2830,9 @@ fn adjust<'a>(
                 label_link(node, names);
             }
             NodeValue::Text(text) => {
-                let pieces = mention_pieces(text, mentions);
+                let pieces = mention_pieces(text, mentions, profiles);
                 drop(ast);
-                if pieces.iter().any(|piece| matches!(piece, Piece::Chip(_))) {
+                if pieces.iter().any(|piece| matches!(piece, Piece::Chip { .. })) {
                     replace_with(arena, node, pieces);
                 }
             }
@@ -3189,15 +3272,18 @@ fn merge_text<'a>(root: &'a AstNode<'a>) {
     }
 }
 
-/// One piece of a text node: words, or a chip and the text it shows.
+/// One piece of a text node: words, or a chip and the text it shows. A user chip carries
+/// the profile address it links to when one could be derived (`profiles`), and a channel
+/// chip never does. `#1722 vibe-talk-mention-link-not-clickable`.
 enum Piece {
     Text(String),
-    Chip(String),
+    Chip { label: String, href: Option<String> },
 }
 
 /// A text node's text, cut at every mention. A user mention `mentions` names shows `@` and the
-/// name; any other shows its id with `@` or `#`.
-fn mention_pieces(text: &str, mentions: &[MentionName]) -> Vec<Piece> {
+/// name; any other shows its id with `@` or `#`. With `profiles` a user mention also carries
+/// its profile address, `{profiles}/team/{id}`; a channel mention never does.
+fn mention_pieces(text: &str, mentions: &[MentionName], profiles: Option<&str>) -> Vec<Piece> {
     let mut pieces = Vec::new();
     let mut plain = String::new();
     let mut rest = text;
@@ -3209,13 +3295,21 @@ fn mention_pieces(text: &str, mentions: &[MentionName]) -> Vec<Piece> {
                 if !plain.is_empty() {
                     pieces.push(Piece::Text(std::mem::take(&mut plain)));
                 }
-                let named = chip.strip_prefix('@').and_then(|id| {
+                let id = chip.strip_prefix('@');
+                let named = id.and_then(|id| {
                     mentions
                         .iter()
                         .find(|mention| mention.id == id)
                         .map(|mention| format!("@{}", mention.name))
                 });
-                pieces.push(Piece::Chip(named.unwrap_or(chip)));
+                let href = match (profiles, id) {
+                    (Some(base), Some(id)) => Some(format!("{base}/team/{id}")),
+                    _ => None,
+                };
+                pieces.push(Piece::Chip {
+                    label: named.unwrap_or(chip),
+                    href,
+                });
                 rest = &tail[length..];
             }
             None => {
@@ -3235,16 +3329,28 @@ fn mention_pieces(text: &str, mentions: &[MentionName]) -> Vec<Piece> {
 ///
 /// A chip is a raw node: its text is the mention's id with `@` or `#`, which
 /// [`crate::discord::markup::mention_at`] admits only as ASCII letters and digits, or `@` and the
-/// name of the person it names, which is anybody's choice and is escaped here. The sanitizer still
-/// reads it, keeping the `span` and its one allowed class and nothing else.
+/// name of the person it names, which is anybody's choice and is escaped here. Its address,
+/// when it has one, is a validated https origin, `/team/` and that same id, so it holds no
+/// character an attribute would have to escape. The sanitizer still reads it, keeping the
+/// element and its one allowed class and nothing else, and giving every link its new-tab
+/// target as it gives any other.
 fn replace_with<'a>(arena: &'a Arena<'a>, node: &'a AstNode<'a>, pieces: Vec<Piece>) {
     for piece in pieces {
         let value = match piece {
             Piece::Text(text) => NodeValue::Text(text.into()),
-            Piece::Chip(chip) => {
+            Piece::Chip { label, href: None } => {
                 let mut raw = format!("<span class=\"{MENTION_CLASS}\">");
-                escape_text(&mut raw, &chip);
+                escape_text(&mut raw, &label);
                 raw.push_str("</span>");
+                NodeValue::Raw(raw)
+            }
+            Piece::Chip {
+                label,
+                href: Some(href),
+            } => {
+                let mut raw = format!("<a class=\"{MENTION_CLASS}\" href=\"{href}\">");
+                escape_text(&mut raw, &label);
+                raw.push_str("</a>");
                 NodeValue::Raw(raw)
             }
         };
@@ -4109,7 +4215,8 @@ mod tests {
             super::to_html_named(
                 "hi <@U0ADA0001>, <@U0EVIL001> and <@U0GHOST01> in <#C0123>",
                 Markup::Slack,
-                &mentions
+                &mentions,
+                None
             ),
             "<p>hi <span class=\"mention\">@Ada Lovelace</span>, <span class=\"mention\">@&lt;b&gt;bold\
              &lt;/b&gt; &amp; co</span> and <span class=\"mention\">@U0GHOST01</span> in \
@@ -4122,7 +4229,7 @@ mod tests {
         );
         // A name inside code is not a mention at all.
         assert_eq!(
-            super::to_html_named("`<@U0ADA0001>`", Markup::Slack, &mentions),
+            super::to_html_named("`<@U0ADA0001>`", Markup::Slack, &mentions, None),
             "<p><code>&lt;@U0ADA0001&gt;</code></p>\n"
         );
         // A heading still finds the words it restates when the line names somebody.
@@ -4132,6 +4239,7 @@ mod tests {
             true,
             &|_| true,
             &mentions,
+            None,
         );
         assert_eq!(
             html,
@@ -4139,6 +4247,61 @@ mod tests {
              Lovelace</span> please look</p>\n"
         );
         assert!(heading.is_some(), "{html}");
+    }
+
+    #[test]
+    fn a_mention_with_a_workspace_is_a_profile_link_and_each_form_links() {
+        // `#1722 vibe-talk-mention-link-not-clickable`: a mention drawn blue must be a link.
+        let named = |id: &str, name: &str| crate::model::MentionName {
+            id: id.to_owned(),
+            name: name.to_owned(),
+        };
+        let mentions = [named("U0ADA0001", "Ada Lovelace")];
+        let base = Some("https://acme.slack.com");
+        // A plain user mention with a known display name: one anchor, the profile
+        // address, the name as its label.
+        assert_eq!(
+            super::to_html_named("hi <@U0ADA0001>", Markup::Slack, &mentions, base),
+            format!(
+                "<p>hi <a class=\"mention\" href=\"https://acme.slack.com/team/U0ADA0001\" {LINK}>@Ada Lovelace</a></p>\n"
+            )
+        );
+        // A plain user mention with no known display name: the id is the label,
+        // the same profile address.
+        assert_eq!(
+            super::to_html_named("hi <@U0GHOST01>", Markup::Slack, &mentions, base),
+            format!(
+                "<p>hi <a class=\"mention\" href=\"https://acme.slack.com/team/U0GHOST01\" {LINK}>@U0GHOST01</a></p>\n"
+            )
+        );
+        // No workspace to derive a profile from: the chip stays a chip, as before.
+        assert_eq!(
+            super::to_html_named("hi <@U0ADA0001>", Markup::Slack, &mentions, None),
+            "<p>hi <span class=\"mention\">@Ada Lovelace</span></p>\n"
+        );
+        // A channel chip is not a profile and stays a chip even with a workspace.
+        assert_eq!(
+            super::to_html_named("in <#C0123>", Markup::Slack, &mentions, base),
+            "<p>in <span class=\"mention\">#C0123</span></p>\n"
+        );
+        // The profile-link form Slack itself gives, `<https://…|label>`: one anchor
+        // to the address in the stored link, the label as its text.
+        assert_eq!(
+            super::to_html_named(
+                "see <https://profiles.example/careers/profile/10700614|Ada Lovelace> please",
+                Markup::Slack,
+                &mentions,
+                base
+            ),
+            format!(
+                "<p>see <a href=\"https://profiles.example/careers/profile/10700614\" {LINK}>Ada Lovelace</a> please</p>\n"
+            )
+        );
+        // A mention inside code is not a link either.
+        assert_eq!(
+            super::to_html_named("`<@U0ADA0001>`", Markup::Slack, &mentions, base),
+            "<p><code>&lt;@U0ADA0001&gt;</code></p>\n"
+        );
     }
 
     #[test]
@@ -4333,21 +4496,22 @@ mod tests {
             id: "U1".into(),
             name: "Ada".into(),
         }];
-        cache.put("<@U1> hi", Markup::Discord, S, &ada, "ada");
+        cache.put("<@U1> hi", Markup::Discord, S, &ada, None, "ada");
         assert_eq!(
-            cache.get("<@U1> hi", Markup::Discord, S, &ada),
+            cache.get("<@U1> hi", Markup::Discord, S, &ada, None),
             Some("ada".into())
         );
-        assert_eq!(cache.get("<@U1> hi", Markup::Discord, S, &[]), None);
-        assert_eq!(cache.get("<@U1> hi", Markup::Slack, S, &ada), None);
-        assert_eq!(cache.get("<@U1> hi!", Markup::Discord, S, &ada), None);
+        assert_eq!(cache.get("<@U1> hi", Markup::Discord, S, &[], None), None);
+        assert_eq!(cache.get("<@U1> hi", Markup::Slack, S, &ada, None), None);
+        assert_eq!(cache.get("<@U1> hi!", Markup::Discord, S, &ada, None), None);
         // `markdown-tables-render`: the single-newline rule is part of the key.
         assert_eq!(
             cache.get(
                 "<@U1> hi",
                 Markup::Discord,
                 super::SingleNewline::Hard,
-                &ada
+                &ada,
+                None
             ),
             None
         );
@@ -4355,22 +4519,22 @@ mod tests {
         // One body larger than a generation fills it at once and moves it to the old one, where
         // it is still found, and is brought back.
         let big = "x".repeat(super::RENDERED_GENERATION_BYTES);
-        cache.put(&big, Markup::Discord, S, &[], "big");
+        cache.put(&big, Markup::Discord, S, &[], None, "big");
         {
             let generations = cache.generations.lock().unwrap();
             assert!(generations.young.is_empty());
             assert_eq!(generations.old.values().map(Vec::len).sum::<usize>(), 2);
         }
         assert_eq!(
-            cache.get("<@U1> hi", Markup::Discord, S, &ada),
+            cache.get("<@U1> hi", Markup::Discord, S, &ada, None),
             Some("ada".into())
         );
         assert_eq!(cache.generations.lock().unwrap().young.len(), 1);
         // The next full generation drops what was not read again.
-        cache.put(&format!("{big}y"), Markup::Discord, S, &[], "bigger");
-        assert_eq!(cache.get(&big, Markup::Discord, S, &[]), None);
+        cache.put(&format!("{big}y"), Markup::Discord, S, &[], None, "bigger");
+        assert_eq!(cache.get(&big, Markup::Discord, S, &[], None), None);
         assert_eq!(
-            cache.get("<@U1> hi", Markup::Discord, S, &ada),
+            cache.get("<@U1> hi", Markup::Discord, S, &ada, None),
             Some("ada".into())
         );
 
@@ -5521,7 +5685,7 @@ mod tests {
     // ---- `#242 rich-headers`: the words a heading restates, marked --------------------------
 
     fn headed(text: &str, markup: Markup) -> (String, Option<crate::model::Heading>) {
-        super::headed_body(text, markup, true, &|_| true, &[])
+        super::headed_body(text, markup, true, &|_| true, &[], None)
     }
 
     /// `html` with the restated words unmarked: what the page draws with rich headers off.
@@ -6200,7 +6364,7 @@ mod single_newline_tests {
     fn an_agents_title_line_still_ends_where_it_was_written() {
         let _rule = SingleNewlineGuard::set(SingleNewline::Soft);
         let text = "[build-bot] Backup check, 10:52 PM\nAll green.\nNothing else.";
-        let (html, heading) = headed_body(text, Markup::Discord, true, &|_| false, &[]);
+        let (html, heading) = headed_body(text, Markup::Discord, true, &|_| false, &[], None);
         assert!(heading.is_some());
         assert_eq!(
             html,
@@ -6515,6 +6679,7 @@ mod message_link_tests {
             true,
             &|_| true,
             &[],
+            None,
         );
         assert!(
             html.contains("data-doc=\"github:octo/widgets@main:docs/guide.md\""),
@@ -6578,6 +6743,7 @@ mod message_link_tests {
             true,
             &|_| true,
             &[],
+            None,
         );
         assert!(heading.is_some(), "the heading was dropped: {html}");
         assert!(
@@ -6590,7 +6756,7 @@ mod message_link_tests {
     fn the_mark_survives_a_heading_being_marked_in_the_same_body() {
         // `mark_restated` sanitizes the marked body again and keeps it only if nothing changed.
         let text = format!("(plan) Status: done\nsee {PERMALINK}");
-        let (html, heading) = headed_body(&text, Markup::Discord, true, &|_| true, &[]);
+        let (html, heading) = headed_body(&text, Markup::Discord, true, &|_| true, &[], None);
         assert!(heading.is_some(), "{html}");
         assert!(html.contains(&format!("data-msg=\"{}\"", mark())), "{html}");
     }

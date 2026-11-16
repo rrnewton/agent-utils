@@ -702,6 +702,7 @@ mod tests {
                 text,
                 Markup::Discord,
                 &[],
+                None,
                 crate::render::Names::TextOnly,
                 |_, _| (),
             )

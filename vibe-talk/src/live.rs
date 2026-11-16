@@ -1848,6 +1848,9 @@ pub fn events(
         /// How the channel's provider writes, for the rendered body each message event carries.
         /// `#217 markdown-blocks`.
         markup: crate::render::Markup,
+        /// The origin mention profiles link to for this channel, when one can be derived
+        /// (`#1722 vibe-talk-mention-link-not-clickable`, [`crate::render::profile_base_for`]).
+        profiles: Option<String>,
         /// The rules as they stood when the replay burst began. Up to [`REPLAY_TAIL`] events go
         /// out back to back on attach, and two store reads for each would be the attach's whole
         /// cost for no change in the answer.
@@ -1866,6 +1869,7 @@ pub fn events(
         settings_receiver: broadcast::Receiver<Vec<crate::client_settings::SyncedSetting>>,
     }
     let markup = crate::render::markup_for(&app.config, &channel);
+    let profiles = crate::render::profile_base_for(&app.config, &channel);
     let settings_receiver = app.live.subscribe_settings();
     let start = State {
         replay: subscription.replay.into_iter().collect(),
@@ -1875,6 +1879,7 @@ pub fn events(
         app,
         channel: channel.id,
         markup,
+        profiles,
         replay_noise: None,
         caller,
         replay_hues: None,
@@ -1907,7 +1912,7 @@ pub fn events(
                 }
             }
             if let Some(noise) = &state.replay_noise {
-                judge(noise, &state.app, &state.channel, state.markup, &mut held);
+                judge(noise, &state.app, &state.channel, state.markup, state.profiles.as_deref(), &mut held);
             }
             return Some((Ok(message_event(&held, true)), state));
         }
@@ -1944,7 +1949,7 @@ pub fn events(
                     .await;
                 }
                 let noise = crate::noise::filter_for(&state.app, &state.channel).await;
-                judge(&noise, &state.app, &state.channel, state.markup, &mut live);
+                judge(&noise, &state.app, &state.channel, state.markup, state.profiles.as_deref(), &mut live);
                 Some((Ok(message_event(&live, false)), state))
             }
             Err(broadcast::error::RecvError::Lagged(missed)) => {
@@ -2058,7 +2063,8 @@ pub fn all_events(
         }
         let noise = crate::noise::filter_for(&state.app, &channel.id).await;
         let markup = crate::render::markup_for(&state.app.config, &channel);
-        judge(&noise, &state.app, &channel.id, markup, &mut live);
+        let profiles = crate::render::profile_base_for(&state.app.config, &channel);
+        judge(&noise, &state.app, &channel.id, markup, profiles.as_deref(), &mut live);
         Some((Ok(message_event_as(&live, from_tail, &cursor)), state))
     })
 }
@@ -2075,6 +2081,7 @@ fn judge(
     app: &AppState,
     channel: &ChannelId,
     markup: crate::render::Markup,
+    profiles: Option<&str>,
     live: &mut LiveMessage,
 ) {
     if live.kind != LiveKind::Delete {
@@ -2097,6 +2104,7 @@ fn judge(
             message.author_is_bot,
             &confirmed,
             &message.mentions,
+            profiles,
         );
         // `#408 copy-upstream-link`: as `ops::stamp` forms it on a read, so a message that
         // arrived live offers its link like one a read brought — and never the one an adapter
@@ -3159,6 +3167,7 @@ mod tests {
             &state,
             &channel,
             crate::render::Markup::default(),
+            None,
             &mut live,
         );
         assert_eq!(
