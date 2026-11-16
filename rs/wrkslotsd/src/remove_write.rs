@@ -2679,48 +2679,6 @@ pub(crate) fn archive_ignored_files(
     }))
 }
 
-/// Run Git with extra environment (object alternates for the
-/// private-history coverage reads).
-fn git_with_env(repo: &Path, args: &[&str], extra: &[(&str, String)]) -> Result<String> {
-    let mut command = Command::new("git");
-    command
-        .args([
-            "--no-replace-objects",
-            "-c",
-            "core.useReplaceRefs=false",
-            "-C",
-        ])
-        .arg(repo)
-        .args(args)
-        .env_clear();
-    for (key, value) in std::env::vars() {
-        if !key.starts_with("GIT_") {
-            command.env(key, value);
-        }
-    }
-    command
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_NO_REPLACE_OBJECTS", "1");
-    for (key, value) in extra {
-        command.env(key, value);
-    }
-    let output = command
-        .output()
-        .map_err(|error| format!("cannot execute Git: {error}"))?;
-    if output.status.code() != Some(0) {
-        return Err(format!(
-            "Git refused in {}: git {}: {}",
-            repo.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
 fn is_sha(text: &str) -> bool {
     text.len() == 40
         && text
@@ -3020,40 +2978,104 @@ fn submodule_private_history(
     } else {
         vec![("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates.join(":"))]
     };
+    // Tips in one pass (#1437), as Python `_commit_tips`: list the
+    // commits positives reach and negatives do not over stdin, then
+    // drop every commit another listed commit names as a parent. The
+    // earlier form asked merge-base once per commit pair and passed
+    // every commit as an argument.
+    let run_stdin = |args: &[&str], input: &str| -> Result<String> {
+        let mut command = Command::new("git");
+        command
+            .args([
+                "--no-replace-objects",
+                "-c",
+                "core.useReplaceRefs=false",
+                "-C",
+            ])
+            .arg(sub_path)
+            .args(args)
+            .env_clear();
+        for (key, value) in std::env::vars() {
+            if !key.starts_with("GIT_") {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_NO_REPLACE_OBJECTS", "1");
+        for (key, value) in &env {
+            command.env(key, value);
+        }
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("stdin");
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+        if output.status.code() != Some(0) {
+            return Err(format!(
+                "Git refused in {}: git {}: {}",
+                sub_path.display(),
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
     let compute = |positives: &std::collections::BTreeSet<String>,
                    negatives: &std::collections::BTreeSet<String>|
      -> Result<(Vec<String>, usize)> {
-        let mut args: Vec<String> = vec!["rev-list".to_string()];
-        args.extend(positives.iter().cloned());
-        args.push("--not".to_string());
-        args.extend(negatives.iter().cloned());
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let listing = git_with_env(sub_path, &arg_refs, &env)?;
+        let mut input = String::new();
+        for item in positives {
+            input.push_str(item);
+            input.push('\n');
+        }
+        for item in negatives {
+            input.push('^');
+            input.push_str(item);
+            input.push('\n');
+        }
+        let listing = run_stdin(&["rev-list", "--stdin"], &input)?;
         let commits: Vec<String> = listing
             .lines()
             .filter(|line| is_sha(line.trim()))
             .map(|line| line.trim().to_string())
             .collect();
-        // Maximal commits: not an ancestor of another in the set.
-        let mut tips: Vec<String> = Vec::new();
-        for candidate in &commits {
-            let mut maximal = true;
-            for other in &commits {
-                if other != candidate {
-                    let (code, _, _) = git_unchecked(
-                        sub_path,
-                        &["merge-base", "--is-ancestor", candidate, other],
-                    )?;
-                    if code == Some(0) {
-                        maximal = false;
-                        break;
-                    }
-                }
-            }
-            if maximal {
-                tips.push(candidate.clone());
+        if commits.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let mut parents_input = String::new();
+        for item in &commits {
+            parents_input.push_str(item);
+            parents_input.push('\n');
+        }
+        let walked = run_stdin(
+            &["rev-list", "--no-walk=unsorted", "--parents", "--stdin"],
+            &parents_input,
+        )?;
+        let mut parents: std::collections::BTreeSet<&str> = Default::default();
+        for line in walked.lines() {
+            for parent in line.split_whitespace().skip(1) {
+                parents.insert(parent);
             }
         }
+        let tips: Vec<String> = commits
+            .iter()
+            .filter(|commit| !parents.contains(commit.as_str()))
+            .cloned()
+            .collect();
         Ok((tips, commits.len()))
     };
     let (mut tips, mut total) = compute(&positives, &negatives)?;
@@ -4972,6 +4994,85 @@ mod link_tests {
         child.kill().unwrap();
         child.wait().unwrap();
         std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod private_history_tests {
+    use super::{submodule_private_history, Cfg};
+    use std::path::Path;
+
+    fn git(repo: &Path, args: &[&str], input: Option<&str>) -> String {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(["-C"])
+            .arg(repo)
+            .args(args)
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid");
+        if input.is_some() {
+            command.stdin(std::process::Stdio::piped());
+        }
+        command.stdout(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        if let Some(text) = input {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("stdin");
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn private_history_tips_are_the_maximal_commits() {
+        // Python `_commit_tips` parity (#1437): of two dangling commits
+        // where one is the other's parent, only the child is a tip.
+        let base = std::env::temp_dir().join(format!("wrkslots-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"], None);
+        std::fs::write(repo.join("f.txt"), "x\n").unwrap();
+        git(&repo, &["add", "f.txt"], None);
+        git(&repo, &["commit", "-q", "-m", "base"], None);
+        let kept = git(&repo, &["rev-parse", "HEAD"], None);
+        let tree = git(&repo, &["rev-parse", "HEAD^{tree}"], None);
+        let parent = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &kept],
+            Some("dangling parent\n"),
+        );
+        let _child = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &parent],
+            Some("dangling child\n"),
+        );
+        let cfg = Cfg {
+            root: base.clone(),
+            worktrees: base.clone(),
+            control: base.clone(),
+            layout: "flat".to_string(),
+            default_remote: "origin".to_string(),
+            default_landed_ref: "refs/heads/main".to_string(),
+            machine: "testhost".to_string(),
+            harness_repo: None,
+            eden_mount_root: None,
+        };
+        let history = submodule_private_history(&cfg, &repo, &repo, &kept)
+            .unwrap()
+            .expect("dangling commits are private history");
+        assert_eq!(history.commits, 2);
+        assert_eq!(history.unreferenced, 1);
+        assert!(history.refs.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

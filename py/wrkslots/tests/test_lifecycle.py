@@ -64213,6 +64213,120 @@ def test_private_history_not_kept_line_names_the_tip_and_prints_once(
     assert "dangling, slot-only, past prune expiry" in lines[0]
 
 
+def test_private_history_scan_is_cached_until_its_fingerprint_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1437: within one removal a scan is derived once, reused while its
+    fingerprint matches, and derived again as soon as the checkout changes."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    fresh = _dangling_commit(slot, base, "fresh", "fresh\n")
+    _set_loose_mtime(slot, fresh, _KEPT_SET_FIXED_NOW - 3600)
+    scans: list[int] = []
+    held = wrkslots._held_by_source_store
+
+    def counting(
+        vcs: wrkslots._GitVcs,
+        durable: Sequence[Path],
+        candidates: Sequence[str],
+    ) -> set[str]:
+        scans.append(1)
+        return held(vcs, durable, candidates)
+
+    monkeypatch.setattr(wrkslots, "_held_by_source_store", counting)
+    with wrkslots._remote_containment_scope():
+        first = _private_history(slot, base, parent)
+        second = _private_history(slot, base, parent)
+        assert first is not None and second is not None
+        assert second == first
+        assert len(scans) == 1
+        later = _dangling_commit(slot, base, "later", "later\n")
+        _set_loose_mtime(slot, later, _KEPT_SET_FIXED_NOW - 60)
+        third = _private_history(slot, base, parent)
+        assert third is not None
+        assert len(scans) == 2
+        assert set(third.tips) == set(first.tips) | {later}
+    # Outside a removal scope there is no memo: the scan runs in full.
+    fourth = _private_history(slot, base, parent)
+    assert fourth is not None
+    assert len(scans) == 3
+    assert fourth == third
+
+
+def test_private_history_held_answer_is_reproved_before_reuse(
+    tmp_path: Path,
+) -> None:
+    """#1437: a cached "held by source store" answer is re-proved on
+    reuse; a source store that pruned the object forces a rescan that
+    keeps the commit instead of dropping it."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    held = _dangling_commit(slot, base, "held", "held\n")
+    _set_loose_mtime(slot, held, _KEPT_SET_FIXED_NOW - 3600)
+    parent_objects = (
+        Path(git(parent, "rev-parse", "--absolute-git-dir").stdout.strip()) / "objects"
+    )
+    for oid in (
+        held,
+        git(slot, "rev-parse", f"{held}^{{tree}}").stdout.strip(),
+        git(slot, "rev-parse", f"{held}:held.txt").stdout.strip(),
+    ):
+        target = parent_objects / oid[:2] / oid[2:]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_loose_object(slot, oid), target)
+    with wrkslots._remote_containment_scope():
+        first = _private_history(slot, base, parent)
+        assert first is not None
+        assert dict(first.counts)["dangling, held by source store"] == 1
+        assert held not in first.tips
+        # The source store prunes the commit object it held.
+        (parent_objects / held[:2] / held[2:]).unlink()
+        second = _private_history(slot, base, parent)
+        assert second is not None
+        assert held in second.tips
+        assert dict(second.counts)["dangling, slot-only, kept"] == 1
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
+def test_agent_remove_scans_submodule_private_history_before_the_lock(
+    tmp_path: Path,
+) -> None:
+    """#1437: the submodule private-history scan runs before the
+    configuration lock; under the lock only its fingerprint is rechecked."""
+
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    _settle_racy_indexes(tree, tree / "component", tree / "component" / "leaf")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    lock = project / "worktrees" / "ACTIVE.global.lock"
+    fake_bin, log = _git_call_probe(tmp_path, lock, [("cat-file", "--batch-all-objects")])
+
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    calls = _probe_calls(log)
+    at_submodule = [
+        state
+        for state, _call, path in calls
+        if Path(path) in (tree / "component", tree / "component" / "leaf")
+    ]
+    assert "free" in at_submodule, calls
+    assert "held" not in at_submodule, calls
+
+
 def test_private_history_keeps_a_fresh_object_with_an_old_committer_date(
     tmp_path: Path,
 ) -> None:

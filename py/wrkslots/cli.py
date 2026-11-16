@@ -7221,6 +7221,29 @@ def _pregather_salvage_facts(
         for checkout in record.checkouts:
             try:
                 _salvage_candidate(config, record, checkout, vcs)
+                # The declared-submodule private-history scan is the
+                # expensive salvage read (#1437): warm it here, before
+                # the lock, so the locked removal only rechecks its
+                # fingerprint. A refusal is dropped, as above.
+                for submodule, submodule_path in _submodule_salvage_checkouts(
+                    config, checkout, vcs
+                ):
+                    try:
+                        submodule_facts = _salvage_candidate(
+                            config,
+                            record,
+                            submodule,
+                            vcs,
+                            path_override=submodule_path,
+                            allow_detached=True,
+                            verify_repository_membership=False,
+                            allow_shallow=True,
+                        )
+                        _declared_submodule_private_history(
+                            config, record, submodule, submodule_path, vcs, submodule_facts
+                        )
+                    except Exception:
+                        continue
             except Exception:
                 continue
         # Publication too, when the owner is already gone (the prefetch
@@ -16334,9 +16357,11 @@ def _remote_containment_scope(mirror_root: Path | None = None) -> Iterator[None]
     facts = _SALVAGE_FACTS_MEMO.set({})
     inventories = _SUBMODULE_INVENTORY_MEMO.set({})
     receipts = _PREGATHERED_SALVAGE_RECEIPTS.set({})
+    history = _PRIVATE_HISTORY_MEMO.set({})
     try:
         yield
     finally:
+        _PRIVATE_HISTORY_MEMO.reset(history)
         _PREGATHERED_SALVAGE_RECEIPTS.reset(receipts)
         _SUBMODULE_INVENTORY_MEMO.reset(inventories)
         _SALVAGE_FACTS_MEMO.reset(facts)
@@ -29178,13 +29203,21 @@ def _unbundleable_refusal(
     )
 
 
-def _reflog_reaches(vcs: _GitVcs, path: Path, tip: str) -> bool:
-    """Whether any reflog entry's history reaches ``tip`` (#1481)."""
+def _reflog_reached_tips(
+    vcs: _GitVcs, path: Path, tips: AbstractSet[str]
+) -> set[str]:
+    """Which of ``tips`` any reflog entry's history reaches (#1481, #1437).
 
+    One walk answers for every tip; asking per tip repeated the same
+    walk once per kept commit.
+    """
+
+    if not tips:
+        return set()
     listed = vcs._run(
         path, ["rev-list", "--reflog", "--all"], check=False
     )
-    return tip in listed.stdout.split()
+    return set(tips) & set(listed.stdout.split())
 
 
 def _partition_kept_commits(
@@ -31393,7 +31426,162 @@ def _held_by_source_store(
     return held
 
 
+#: Private-history scans kept for one removal (#1437), by
+#: _private_history_fingerprint: a removal scans each submodule checkout
+#: several times (before and after the fence, and the final pass), so the
+#: scan is warmed before the configuration lock (_pregather_salvage_facts)
+#: and reused under it only while the fingerprint still matches; a
+#: checkout that changed is rescanned there, never trusted stale. Audit
+#: and other callers outside a removal scope set no memo and always scan
+#: in full.
+_PRIVATE_HISTORY_MEMO: contextvars.ContextVar[
+    dict[tuple[object, ...], _PrivateHistory | None] | None
+] = contextvars.ContextVar("wrkslots_private_history_memo", default=None)
+
+
+def _private_history_fingerprint(
+    vcs: _GitVcs,
+    path: Path,
+    kept: str,
+    durable: Sequence[Path],
+) -> tuple[object, ...]:
+    """Read cheaply what _submodule_private_history's answer depends on (#1437).
+
+    That is the checkout's refs and configuration, the state of its
+    reflog files, its loose-object names and pack files, the kept commit,
+    every durable repository's refs, and the prune-expiry configuration.
+    No object walk is read: a scan is reused only while this matches.
+    """
+
+    common = vcs.common_directory(path)
+    git_directory = Path(
+        vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    )
+    objects = common / "objects"
+    reflog_state: list[tuple[str, int, int]] = []
+    for directory in dict.fromkeys((common, git_directory)):
+        for file in _reflog_files_under(directory / "logs"):
+            try:
+                observed = file.stat()
+            except OSError:
+                continue
+            reflog_state.append(
+                (
+                    str(file.relative_to(directory)),
+                    observed.st_size,
+                    observed.st_mtime_ns,
+                )
+            )
+    pack_state: list[tuple[str, int, int]] = []
+    pack_directory = objects / "pack"
+    if pack_directory.is_dir():
+        for file in sorted(pack_directory.iterdir()):
+            try:
+                observed = file.stat()
+            except OSError:
+                continue
+            pack_state.append((file.name, observed.st_size, observed.st_mtime_ns))
+    loose: list[str] = []
+    if objects.is_dir():
+        for entry in sorted(objects.iterdir()):
+            if (
+                len(entry.name) == 2
+                and all(char in "0123456789abcdef" for char in entry.name)
+                and entry.is_dir()
+            ):
+                loose.extend(
+                    f"{entry.name}/{name}" for name in sorted(os.listdir(entry))
+                )
+    prune = vcs._run(path, ["config", "--get", "gc.pruneExpire"], check=False)
+    return (
+        # The fence renames the tree between a removal's scans; fold it
+        # back so the same checkout keeps one identity (#1297's key).
+        _reported_not_kept_key(common),
+        kept,
+        tuple(str(repository) for repository in durable),
+        vcs._run(
+            path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
+        ).stdout,
+        _repository_config_sha256(vcs, path),
+        tuple(reflog_state),
+        tuple(pack_state),
+        hashlib.sha256("\n".join(loose).encode("utf-8")).hexdigest(),
+        tuple(
+            vcs._run(
+                repository, ["for-each-ref", "--format=%(objectname) %(refname)"]
+            ).stdout
+            for repository in durable
+        ),
+        prune.stdout.strip() if prune.returncode == 0 else "",
+    )
+
+
 def _submodule_private_history(
+    vcs: _GitVcs,
+    path: Path,
+    kept: str,
+    durable: Sequence[Path],
+    *,
+    remote_cover: Callable[[tuple[str, ...]], _RemoteCoverage] | None = None,
+    now: float | None = None,
+) -> _PrivateHistory | None:
+    """See _submodule_private_history_uncached.
+
+    While one removal runs (_PRIVATE_HISTORY_MEMO), a scan is derived
+    once and returned again while _private_history_fingerprint shows the
+    checkout unchanged (#1437).
+    """
+
+    memo = _PRIVATE_HISTORY_MEMO.get()
+    if memo is None:
+        return _submodule_private_history_uncached(
+            vcs, path, kept, durable, remote_cover=remote_cover, now=now
+        )
+    # The key names whether a remote was asked: without remote_cover a
+    # tracking tip classifies as named, with it as stale pushed or
+    # fetched, so the two answers never stand in for each other. `now`
+    # is not in the key: every caller in one removal passes the same
+    # value (None, the wall clock), and as time passes the prune-expiry
+    # cutoff only ever classifies more tips as kept, never fewer, so a
+    # reused answer keeps at least what a fresh scan would keep.
+    try:
+        before = _private_history_fingerprint(vcs, path, kept, durable)
+    except Refusal:
+        return _submodule_private_history_uncached(
+            vcs, path, kept, durable, remote_cover=remote_cover, now=now
+        )
+    key = (before, remote_cover is not None)
+    cached = memo.get(key)
+    if cached is not None or key in memo:
+        # A "held by source store" answer proves the durable store held
+        # the objects when scanned; if it has pruned them since, the
+        # commit exists nowhere and must be kept, not dropped (#1437).
+        # One batch check over the cached held set re-proves it.
+        held = (
+            ()
+            if cached is None
+            else tuple(
+                commit
+                for category, commit, _ref in cached.not_kept
+                if category == "dangling, held by source store"
+            )
+        )
+        if not held or _held_by_source_store(vcs, durable, held) == set(held):
+            return cached
+        del memo[key]
+    result = _submodule_private_history_uncached(
+        vcs, path, kept, durable, remote_cover=remote_cover, now=now
+    )
+    try:
+        after = _private_history_fingerprint(vcs, path, kept, durable)
+    except Refusal:
+        return result
+    if after == before:
+        memo[key] = result
+    return result
+
+
+def _submodule_private_history_uncached(
     vcs: _GitVcs,
     path: Path,
     kept: str,
@@ -31562,8 +31750,10 @@ def _submodule_private_history(
         and tip not in pseudorefs
     ]
     held = _held_by_source_store(vcs, durable, dangling) if dangling else set()
+    # Held tips are never kept, so their object mtimes are never read
+    # (#1437): only the dangling tips no durable store holds are aged.
     pack_mtimes = (
-        _pack_object_mtimes(objects, set(dangling)) if dangling else {}
+        _pack_object_mtimes(objects, set(dangling) - held) if dangling else {}
     )
     remote_name = None if coverage is None else coverage.remote
     counts_by_key: dict[str, int] = {key: 0 for key in _PRIVATE_HISTORY_COUNT_KEYS}
@@ -32031,11 +32221,7 @@ def _salvage_candidate_uncached(
         tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
     if history is not None:
         protected: set[str] = {commit for _ref, commit in history.refs}
-        protected.update(
-            tip
-            for tip in tips
-            if tip not in protected and _reflog_reaches(vcs, path, tip)
-        )
+        protected.update(_reflog_reached_tips(vcs, path, set(tips) - protected))
     else:
         protected = set(tips)
     kept_tips, excluded = _partition_kept_commits(
