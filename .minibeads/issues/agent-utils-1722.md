@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-mention-link-not-clickable: a mention that renders blue must be a real link'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-16T11:17:02-05:00
-updated_at: 2026-11-16T11:17:02-05:00
+updated_at: 2026-11-16T14:00:52-05:00
+closed_at: 2026-11-16T14:00:52-05:00
 ---
 
 # Description
@@ -21,3 +22,7 @@ In vibe-talk, a mention that renders blue/special must be a real link. The store
 - Unit/page tests for each mention form produce one anchor with the right href and label: a profile-link form; a plain user mention with and without a known display name.
 - Condition-based waits only (rule 346).
 - Acceptance screenshots on a TEST instance (phone and desktop) showing a mention as a link (hover/underline state if possible); paths in the report and handoff; the liaison reviews.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as `2ac10a96` (with `a5a01740`): the server renderer threads the channel provider's configured Slack workspace origin (`render::profile_base_for`) into the mention chips, so a user mention renders as `<a class="mention" href="{workspace}/team/{user id}">` with the display name (or `@<user id>`) as its label; the sanitizer admits the mention class on anchors and gives every link `target="_blank"`. The stored profile-link form renders as an anchor to its address, as before. Channel chips and mentions with no derivable workspace stay chips. Live-cache census (read-only): stored forms are `<@U…>` user mentions in message text (Slack `rich_text` blocks are not stored; the text fallback is), profile URLs as bare addresses, and the angle-bracket pipe form in pasted text. Tests: render unit test `a_mention_with_a_workspace_is_a_profile_link_and_each_form_links` (each form one anchor with the right href and label; named, unnamed, no-workspace and code negative controls) and `mention_link_browser.py` (one anchor per form at 412x915 and 1280x800, hover underline, tap opens the profile in a new tab with no fold, scroll move or selection). Screenshot matrix (liaison-approved): /tmp/mentionlink-matrix, 9 images over light/dark x keyboard open/closed x phone/desktop with the Discuss half-pane open in the phone keyboard-closed shots, plus the before (dead span chip) shot. Full local validate green; owner gate green but for `ios-keyboard-send-browser` under load, cleared by its solo rerun. Deploy is coordb's (midnight ET batch unless the owner says deploy now).

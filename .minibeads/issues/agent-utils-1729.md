@@ -1,13 +1,14 @@
 ---
 title: 'readerbar-overlap-browser-setup-dep: the reader-bar browser check declares no contract-tools dependency'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - validation
 created_at: 2026-11-16T13:32:54-05:00
-updated_at: 2026-11-16T13:32:54-05:00
+updated_at: 2026-11-16T14:00:52-05:00
+closed_at: 2026-11-16T14:00:52-05:00
 ---
 
 # Description
@@ -18,3 +19,7 @@ updated_at: 2026-11-16T13:32:54-05:00
 
 - `readerbar-overlap-browser` declares `deps: [setup.contract-tools]` plus the same `jobs_flag`/`timeout`/`cpu_timeout` shape as `quote-dismiss-browser`, with a hint block like its siblings.
 - Any other `*-browser` entry missing the same dependency is fixed in the same change (the audit above found none).
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as `daaf2f7f`: `readerbar-overlap-browser` now declares `deps: [setup.contract-tools]` with `jobs_flag: ""`, `timeout: 360`, `cpu_timeout: 45` and a sibling-shaped hint block. The audit of every `*-browser` entry in `vibe-talk/tests.dag.yaml` found no other entry missing the dependency. In the #1722 owner gate the step passed with the fix in place.
