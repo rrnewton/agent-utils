@@ -61,6 +61,71 @@ fn hook_drift_note(
     ))
 }
 
+/// Resolve a path through its longest existing ancestor, like
+/// `realpath` on a path whose tail may not exist yet.
+fn resolve_real(path: &Path) -> Option<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(mut resolved) => {
+                for component in rest.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(_) => {
+                rest.push(existing.file_name()?.to_os_string());
+                existing = existing.parent()?.to_path_buf();
+            }
+        }
+    }
+}
+
+/// Whether a create journal's whole plan stays in its own slot
+/// (#1436), mirroring Python `_create_plan_confined_to_slot`.
+fn create_plan_confined(cfg: &Cfg, path: &Path, journal_slot: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(raw) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let slot_type = raw
+        .get("slot_type")
+        .and_then(Value::as_str)
+        .unwrap_or("agent");
+    let Ok(own) = slot_directory(cfg, journal_slot, slot_type) else {
+        return false;
+    };
+    let Some(own) = resolve_real(&own) else {
+        return false;
+    };
+    let Some(planned) = raw.get("planned").and_then(Value::as_array) else {
+        return false;
+    };
+    for item in planned {
+        let Some(destination) = item.get("destination").and_then(Value::as_str) else {
+            return false;
+        };
+        let destination_path = {
+            let candidate = PathBuf::from(destination);
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                cfg.root.join(candidate)
+            }
+        };
+        let Some(resolved) = resolve_real(&destination_path) else {
+            return false;
+        };
+        if !within(&resolved, &own) {
+            return false;
+        }
+    }
+    true
+}
+
 /// The slot one journal provably concerns, for scoped refusal
 /// (#1436), mirroring Python `_journal_slot_for_scoping`.
 fn journal_slot_for_scoping(path: &Path) -> Option<String> {
@@ -1771,7 +1836,7 @@ fn classify_create_journals_inner(
                 }
                 if !HOST_WIDE.iter().any(|marker| error.contains(marker)) {
                     if let Some(journal_slot) = journal_slot_for_scoping(path) {
-                        if journal_slot != slot {
+                        if journal_slot != slot && create_plan_confined(&cfg, path, &journal_slot) {
                             continue;
                         }
                     }

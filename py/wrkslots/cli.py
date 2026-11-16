@@ -13624,6 +13624,43 @@ def _classify_eden_create_journal(
     )
 
 
+def _create_plan_confined_to_slot(
+    config: Config, raw: Mapping[str, object], slot: str
+) -> bool:
+    """Whether a create journal's whole plan stays in its own slot (#1436).
+
+    Every planned destination must resolve, after symlink
+    resolution, inside the journal's own slot directory. A plan
+    that cannot be decoded or resolved, or that reaches outside
+    its slot (including through a symlink), is not confined.
+    """
+
+    slot_type = raw.get("slot_type", "agent")
+    if not isinstance(slot_type, str) or slot_type not in SLOT_TYPES:
+        return False
+    try:
+        own = Path(
+            os.path.realpath(_slot_directory(config, slot, slot_type))
+        )
+        planned = _as_list(raw.get("planned", []), "create journal.planned")
+        for index, item in enumerate(planned):
+            entry = _planned_from_obj(item, f"create journal.planned[{index}]")
+            destination = Path(
+                os.path.realpath(
+                    _stored_path(
+                        config,
+                        entry.destination,
+                        "create journal checkout destination",
+                    )
+                )
+            )
+            if not _path_is_within(destination, own):
+                return False
+    except (Refusal, StateError, KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _classify_create_journal(
     config: Config,
     path: Path,
@@ -13710,10 +13747,13 @@ def _classify_create_journal(
         # create journal (its shape, plan and progress were checked
         # against its own recorded hooks above) refuses only
         # operations on its own slot. A caller that named a different
-        # slot skips it. Untrusted provenance, indeterminate or
-        # disagreeing liveness, archive and publication conflicts,
-        # and non-create journals all raised before this point and
-        # keep refusing host-wide.
+        # slot skips it only when the journal's whole plan stays
+        # inside its own slot directory: a plan reaching into
+        # another slot's paths is cross-target evidence and keeps
+        # refusing host-wide, as do untrusted provenance,
+        # indeterminate or disagreeing liveness, archive and
+        # publication conflicts, and non-create journals, which all
+        # raised before this point.
         named_slot = raw.get("slot")
         if (
             requested_slot is not None
@@ -13721,6 +13761,7 @@ def _classify_create_journal(
             and named_slot != requested_slot
             and "has already reached ACTIVE publication" not in str(error)
             and "conflicts with an archive" not in str(error)
+            and _create_plan_confined_to_slot(config, raw, named_slot)
         ):
             if skipped_paths is not None and path not in skipped_paths:
                 skipped_paths.append(path)

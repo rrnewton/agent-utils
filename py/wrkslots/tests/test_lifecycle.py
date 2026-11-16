@@ -32347,6 +32347,33 @@ def test_unclassifiable_create_journal_blocks_only_its_own_slot(
     assert journal.is_file()
 
 
+def test_create_plan_confinement_rejects_a_symlink_escape(tmp_path: Path) -> None:
+    # #1436: confinement is judged after symlink resolution; a
+    # planned destination that escapes its slot through a symlink
+    # is cross-target, never slot-confined.
+    project, _repository, _remote = make_project(tmp_path)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._create_plan_confined_to_slot(config, raw, "slot01")
+    slot_dir = checkout(project).parent
+    outside = slots_directory(project) / "slot02"
+    outside.mkdir(parents=True, exist_ok=True)
+    (slot_dir / "escape").symlink_to(outside, target_is_directory=True)
+    planned = wrkslots._as_list(raw["planned"], "test planned")
+    entry = dict(wrkslots._as_mapping(planned[0], "test planned entry"))
+    entry["destination"] = "worktrees/slot01/escape/product"
+    escaped = dict(raw)
+    escaped["planned"] = [entry]
+    assert not wrkslots._create_plan_confined_to_slot(config, escaped, "slot01")
+
+
 @pytest.mark.parametrize(
     ("entry", "message"),
     (
