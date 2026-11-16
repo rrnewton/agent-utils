@@ -219,6 +219,15 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
     which one is mandatory costs one inflate on the fallback path and removes both.
     """
 
+    # Keep browser assets stable across host mime databases and in parity with
+    # the Rust server. Ubuntu releases disagree on the default .js spelling.
+    extensions_map = {
+        **http.server.SimpleHTTPRequestHandler.extensions_map,
+        ".js": "application/javascript",
+        ".mjs": "text/javascript",
+        ".log": "text/plain",
+    }
+
     _cache_control_sent = False
 
     def list_directory(self, path: str | os.PathLike[str]) -> io.BytesIO | None:
