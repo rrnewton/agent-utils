@@ -781,7 +781,7 @@ pub struct BridgeConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slack_workspace_url: Option<String>,
     /// Issue link template holding exactly one `{n}` placeholder, such as
-    /// `https://github.com/OWNER/REPO/blob/main/.minibeads/issues/agent-utils-{n}.md`
+    /// `https://github.com/OWNER/REPO/blob/main/.minibeads/issues/project-{n}.md`
     /// or `https://github.com/OWNER/REPO/issues/{n}` (#658). Absent, issue
     /// tokens in replies stay plain text.
     #[serde(default, skip_serializing_if = "Option::is_none")]

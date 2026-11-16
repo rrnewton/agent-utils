@@ -473,6 +473,8 @@ fn replay_after_host_eviction_and_emoji_change_keeps_one_slack_rejection() {
 #[test]
 fn a_bridge_configuration_for_slack_is_accepted_by_the_plugin() {
     let configuration = BridgeConfiguration {
+        slack_workspace_url: None,
+        issue_url_template: None,
         unknown: Default::default(),
         subscription_plugin: "slack".to_owned(),
         subscription_environment: Vec::new(),

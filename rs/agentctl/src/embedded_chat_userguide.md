@@ -2860,7 +2860,7 @@ Thread and issue links. Two configuration keys name where links point, and both 
 optional: `slack_workspace_url` is the Slack workspace origin (for example
 `"slack_workspace_url": "https://acme.slack.com"`), and `issue_url_template` is an
 https address holding exactly one `{n}` placeholder (for example
-`"issue_url_template": "https://github.com/OWNER/REPO/blob/main/.minibeads/issues/agent-utils-{n}.md"`,
+`"issue_url_template": "https://github.com/OWNER/REPO/blob/main/.minibeads/issues/project-{n}.md"`,
 or `…/issues/{n}` for a plain issue tracker). With them, a request prompt's header
 prints its thread's permalink beside its number, `agentctl chat thread` and the
 per-request `reply_alias`/`thread_permalink` fields of `agentctl chat status` name

@@ -6,7 +6,7 @@
 //! provider, so nothing on the delivery path makes a network call. An issue
 //! link substitutes the number into the configured `issue_url_template`, which
 //! names minibeads files in this repository's layout and plain tracker issues
-//! alike (`.../agent-utils-{n}.md`, `.../issues/{n}`).
+//! alike (`.../project-{n}.md`, `.../issues/{n}`).
 //!
 //! Agents cite with tagged references only — `:thread:060`, `:email:1846`,
 //! `:issue:1234` — and [`render_reply_links`] rewrites only those, outside
@@ -598,7 +598,7 @@ mod tests {
 
     const WORKSPACE: &str = "https://acme.slack.com";
     const TEMPLATE: &str =
-        "https://github.com/OWNER/REPO/blob/main/.minibeads/issues/agent-utils-{n}.md";
+        "https://github.com/OWNER/REPO/blob/main/.minibeads/issues/project-{n}.md";
 
     fn thread_link(alias: u64) -> Option<String> {
         (alias == 60)
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(
             issue_url(TEMPLATE, 658),
             Some(
-                "https://github.com/OWNER/REPO/blob/main/.minibeads/issues/agent-utils-658.md"
+                "https://github.com/OWNER/REPO/blob/main/.minibeads/issues/project-658.md"
                     .to_owned()
             )
         );
@@ -689,7 +689,7 @@ mod tests {
         let rendered = render("See :thread:060, :email:1846 and :issue:658.");
         assert_eq!(
             rendered.text,
-            "See <https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:060>, <https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD|:email:1846> and <https://github.com/OWNER/REPO/blob/main/.minibeads/issues/agent-utils-658.md|:issue:658>."
+            "See <https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:060>, <https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD|:email:1846> and <https://github.com/OWNER/REPO/blob/main/.minibeads/issues/project-658.md|:issue:658>."
         );
         assert!(rendered.warnings.is_empty(), "{:?}", rendered.warnings);
         assert!(rendered.notices.is_empty(), "{:?}", rendered.notices);
