@@ -7,9 +7,10 @@ so the soak launcher can run the command in Rust. The printed line
 names the Python `run`/`box` entry in both editions: `run` and `box`
 are not ported yet, so the boxed step stays Python until they are.
 
-Both editions probe the systemd user D-Bus on the test host; when it
-is unavailable both refuse with the same text, and the comparison
-follows the Python edition either way.
+Both editions probe the systemd user D-Bus. Control that probe in this
+CLI comparison: a real manager can start between the two invocations,
+making a host transition look like a parser mismatch. Exercise both
+available and unavailable outcomes without creating any scopes.
 """
 
 from __future__ import annotations
@@ -28,6 +29,17 @@ from wrkslots.tests.rust_binary import rust_wrkslotsd
 
 
 AU_ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def stable_bus_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    bindir = tmp_path / "probe-bin"
+    bindir.mkdir()
+    probe = bindir / "busctl"
+    probe.write_text("#!/bin/sh\n[ \"$*\" = '--user status org.freedesktop.systemd1' ] || exit 99\nexit 0\n")
+    probe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
+    return probe
 
 
 def _upstream(tmp_path: Path) -> None:
@@ -67,7 +79,7 @@ def _both(root: Path, *args: str) -> tuple[subprocess.CompletedProcess[str], sub
         # A refusal (most likely the host has no user D-Bus): the Rust
         # edition must refuse too, with the same core text. The exact
         # refusal framing is the wrkslotsd-wide convention and differs.
-        assert rust_result.returncode != 0, rust_result.stdout
+        assert rust_result.returncode != 0, (python_result.stderr, rust_result.stdout)
         core = python_result.stderr.splitlines()[0].removeprefix("REFUSED: ") if python_result.stderr else ""
         if core:
             assert core.split(" (")[0] in rust_result.stderr, rust_result.stderr
@@ -123,6 +135,20 @@ def test_shell_command_box_matches_python(tmp_path: Path) -> None:
     assert python_document["box"] == "lead"
     assert python_document["slot_path"] == str(root)
     assert f" box --name lead --cwd {root} --writable worktrees -- /bin/echo x" in str(python_document["command"])
+
+
+def test_shell_command_unavailable_bus_refuses_in_both(
+    tmp_path: Path, stable_bus_probe: Path,
+) -> None:
+    stable_bus_probe.write_text("#!/bin/sh\nexit 1\n")
+    root = _root(tmp_path)
+    _upstream(tmp_path)
+    _fixture(root)
+    for args in (("slot-a",), ("--box", "--name", "lead")):
+        python_result, rust_result = _both(root, *args)
+        assert python_result.returncode != 0
+        assert rust_result.returncode != 0
+        assert "systemd user manager's D-Bus API" in python_result.stderr
 
 
 def test_shell_command_missing_repository_refuses_in_both(tmp_path: Path) -> None:

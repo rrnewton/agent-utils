@@ -41,6 +41,12 @@ if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
     sudo -n sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 fi
 unshare --user --map-root-user --mount --fork true
+# Lock delegation proves the coordinator's open file description with
+# pidfd_getfd. Permit same-user non-descendant ptrace on this disposable VM;
+# production retains its fail-closed proof on restricted hosts.
+if [[ -e /proc/sys/kernel/yama/ptrace_scope ]]; then
+    sudo -n sysctl -w kernel.yama.ptrace_scope=0
+fi
 
 # The image migration tests require a NOCOW-capable backing filesystem. An ext4
 # /tmp cannot satisfy that contract even if mkfs.btrfs and sudo are installed.

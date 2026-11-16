@@ -44570,9 +44570,11 @@ def test_recover_absent_agent_row_accepts_existing_remote_ref_containing_head(
     )
     head = record.checkouts[0].head
     descendant = child_commit(repository, head, "published on top of the agent commit")
-    # A push by URL updates no remote-tracking ref, so no local ref proves
-    # the remote holds the commit; only the remote itself can.
+    # Newer Git recognizes a configured remote's URL and updates its tracking
+    # ref even for a URL push. Remove that fixture ref explicitly: this test
+    # proves recovery consults the remote when no local tracking ref exists.
     git(repository, "push", str(remote), f"{descendant}:refs/heads/feature/kept")
+    git(repository, "update-ref", "-d", "refs/remotes/origin/feature/kept")
     assert (
         git(repository, "for-each-ref", "--contains", head, "refs/remotes/").stdout == ""
     )

@@ -283,7 +283,6 @@ def test_stats_help_and_errors_match_python(corpus: Path) -> None:
                  ["query", "--output", "/tmp/x", "stats", "extra"],
                  ["query", "--output", "/tmp/x", "stats", "--help=foo"],
                  ["query", "stats", "--help=foo"],
-                 ["query", "--output", "/tmp/x", "stats", "-hx"],
                  ["query", "--output", "/tmp/x", "stats", "-h=x"],
                  ["query", "--output", "/tmp/x", "stats", "--team"],
                  ["query", "--output", "/tmp/x", "stats", "--team", "--kind"],
@@ -297,3 +296,22 @@ def test_stats_help_and_errors_match_python(corpus: Path) -> None:
         assert result.returncode == oracle.returncode, (args, result.stderr, oracle.stderr)
         assert result.stdout == oracle.stdout, args
         assert result.stderr == oracle.stderr, args
+
+
+def test_stats_clustered_help_has_current_argparse_semantics() -> None:
+    # Python 3.10 rejects -hx before running the help action. Current argparse
+    # prints help first, which is the Rust CLI's stable contract on every host.
+    # Check both outcomes explicitly instead of treating a stdlib change as a
+    # Rust regression on the minimum-Python job.
+    args = ["query", "--output", "/tmp/x", "stats"]
+    expected = _cli([*args, "--help"], rust=False)
+    result = _cli([*args, "-hx"], rust=True)
+    assert result.returncode == expected.returncode == 0
+    assert result.stdout == expected.stdout
+    assert result.stderr == expected.stderr == ""
+    oracle = _cli([*args, "-hx"], rust=False)
+    if sys.version_info < (3, 11):
+        assert oracle.returncode == 2
+        assert "argument -h/--help: ignored explicit argument 'x'" in oracle.stderr
+    else:
+        assert (oracle.returncode, oracle.stdout, oracle.stderr) == (0, expected.stdout, "")

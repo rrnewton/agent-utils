@@ -429,7 +429,7 @@ def _main() -> None:
     root = Path(__file__).resolve().parent
     server = make_static_server(root, port=args.port)
     url = f"http://127.0.0.1:{server.server_address[1]}/"
-    print(f"Serving {root} at {url}")
+    print(f"Serving {root} at {url}", flush=True)
     if args.open:
         threading.Timer(0.2, lambda: webbrowser.open(url)).start()
     try:

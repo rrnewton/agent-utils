@@ -319,8 +319,15 @@ else
     fi
 
     nonce="gtverify-$(date +%s)-$$"
+    # Invoking this write check is an explicit request to send its test message.
+    # Exercise the same heard-request proof as the voice page; do not disable
+    # explicit_send_only or bypass the separate confirmation below.
+    user_request="Send this deployment check to the chat."
+    request POST /api/v1/voice-heard "$WRITE_TOKEN" \
+        "{\"key\":\"$nonce\",\"text\":\"$user_request\"}"
+    [ "$STATUS" = "204" ] || fail "check 6 (heard request): returned $STATUS, expected 204. Body was: $BODY"
     tool_call "$WRITE_TOKEN" post_reply \
-        "{\"channel_id\":\"$CHANNEL\",\"text\":\"vibe-talk deployment check $nonce — this message was posted by the verification script and can be deleted.\"}"
+        "{\"channel_id\":\"$CHANNEL\",\"text\":\"vibe-talk deployment check $nonce — this message was posted by the verification script and can be deleted.\",\"user_request\":\"$user_request\"}"
     [ "$STATUS" = "200" ] || fail "check 6 (propose): post_reply returned HTTP $STATUS, expected 200. Body was: $BODY"
     is_error="$(jget result.isError)"
     proposed="$(tool_text)"
