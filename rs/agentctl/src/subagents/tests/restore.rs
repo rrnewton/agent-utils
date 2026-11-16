@@ -755,22 +755,40 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
     let host = ScriptedHost::new();
     let config = config(&fixture, None);
     let registry = fixture.root.join("registry");
-    let findings = watch_once(
-        &fixture.client,
-        &registry,
-        &host,
-        &config,
-        &WatchOptions {
-            interval: Duration::from_secs(60),
-            once: true,
-            check_only: false,
-            wrkslots: None,
-            state_dir: None,
-            queue_stale: Duration::from_secs(600),
-        },
-        &mut Default::default(),
-        &mut Default::default(),
-    );
+    // One watch pass drains with the product's bounded send
+    // deadline, so under full-width contention for the pane lock a
+    // pass can leave the prompt pending for the next pass to type —
+    // by design. The condition is that repeated passes type it; the
+    // guard only reports a hang.
+    let drain_until = std::time::Instant::now() + Duration::from_secs(180);
+    let findings = loop {
+        let findings = watch_once(
+            &fixture.client,
+            &registry,
+            &host,
+            &config,
+            &WatchOptions {
+                interval: Duration::from_secs(60),
+                once: true,
+                check_only: false,
+                wrkslots: None,
+                state_dir: None,
+                queue_stale: Duration::from_secs(600),
+            },
+            &mut Default::default(),
+            &mut Default::default(),
+        );
+        if fixture
+            .manager()
+            .pending_prompts("lane")
+            .unwrap()
+            .is_empty()
+            || std::time::Instant::now() >= drain_until
+        {
+            break findings;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let queue = findings.iter().find(|row| row["check"] == "queue").unwrap();
     assert_eq!(queue["subject"], "lane", "{findings:?}");
     assert_eq!(queue["ok"], true, "{findings:?}");

@@ -192,10 +192,16 @@ fn herdr_093_missing_argv_uses_only_coherent_open_image_or_recorded_generation()
 
 #[test]
 fn herdr_093_malformed_argv_is_not_unknown_process_evidence() {
-    let executable = fs::canonicalize("/bin/sleep").unwrap();
-    let process = spawn_test_process(&executable);
-    let document = process_document(process.0.id(), &executable);
+    // The fixture first, the child second, and the identity only
+    // once the exec has landed: the fixture's process-wide mutex can
+    // queue behind every other client test at full width, and that
+    // wait must not be spent out of the child's life (or pin a
+    // pre-exec fork image's identity instead of the sleeper's).
     let herdr = FakeExecutable::new("{}");
+    let executable = fs::canonicalize("/bin/sleep").unwrap();
+    let process = spawn_long_lived_test_process(&executable);
+    wait_until_execd(process.0.id(), &executable);
+    let document = process_document(process.0.id(), &executable);
     let identity = live_custom_process(u64::from(process.0.id()))
         .unwrap()
         .identity;
