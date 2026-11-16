@@ -20009,6 +20009,111 @@ def test_validate_batch_census_bound_adds_one_allowance_per_further_slot(
     )
 
 
+def test_census_seconds_may_only_raise_the_computed_default() -> None:
+    # No flag keeps the computed default; an equal or larger value is used
+    # verbatim, so a raised value is what the census budget will receive.
+    assert wrkslots._resolve_census_seconds(None, 540.0) == 540.0
+    assert wrkslots._resolve_census_seconds(540.0, 540.0) == 540.0
+    assert wrkslots._resolve_census_seconds(1200.0, 540.0) == 1200.0
+    assert (
+        wrkslots._resolve_census_seconds(
+            wrkslots._VALIDATE_REMOVE_BATCH_CENSUS_MAX_SECONDS, 120.0
+        )
+        == 3600.0
+    )
+    with pytest.raises(wrkslots.Refusal, match="below the computed default"):
+        wrkslots._resolve_census_seconds(539.0, 540.0)
+    with pytest.raises(wrkslots.Refusal, match="below the computed default"):
+        wrkslots._resolve_census_seconds(119.0, 120.0)
+    with pytest.raises(wrkslots.Refusal, match="exceeds the maximum"):
+        wrkslots._resolve_census_seconds(3601.0, 120.0)
+    with pytest.raises(wrkslots.Refusal, match="must be a finite"):
+        wrkslots._resolve_census_seconds(float("inf"), 120.0)
+    with pytest.raises(wrkslots.Refusal, match="must be a finite"):
+        wrkslots._resolve_census_seconds(float("nan"), 120.0)
+
+
+def test_census_budget_timeout_names_the_rerun_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Stubbed clock only: the budget is expired by moving the fake clock,
+    # never by waiting.
+    monotonic_now = 100.0
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic_now)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=120.0,
+        stdout_limit=1024,
+        stderr_limit=1024,
+        rerun_census_seconds=wrkslots._census_rerun_seconds(120.0),
+    )
+    assert budget.deadline == pytest.approx(220.0)
+    monotonic_now = 221.0
+    with pytest.raises(wrkslots.Refusal) as refused:
+        budget.remaining_seconds()
+    assert "rerun with --census-seconds 240 to allow a slower census" in str(
+        refused.value
+    )
+    # A budget with no flag behind it keeps the old refusal text.
+    plain = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=120.0, stdout_limit=1024, stderr_limit=1024
+    )
+    monotonic_now = 400.0
+    with pytest.raises(wrkslots.Refusal) as plain_refused:
+        plain.remaining_seconds()
+    assert "--census-seconds" not in str(plain_refused.value)
+
+
+@pytest.mark.parametrize(
+    ("flag_value", "message"),
+    (
+        ("60", "below the computed default of 120 seconds"),
+        ("3601", "exceeds the maximum of 3600 seconds"),
+    ),
+)
+def test_remove_validate_batch_refuses_an_unraising_census_seconds(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    flag_value: str,
+    message: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("slot01",))
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove-validate-batch",
+            "--slot",
+            "slot01=1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--census-seconds",
+            flag_value,
+            "--format",
+            "json",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert message in captured.err
+    assert captured.out == ""
+
+
+def test_census_seconds_help_names_the_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for command in (
+        "remove-validate-batch",
+        "remove",
+        "recover-ownerless-validate-batch",
+        "classify-ownerless-validate-batch",
+    ):
+        with pytest.raises(SystemExit) as exited:
+            wrkslots.main([command, "--help"])
+        assert exited.value.code == 0
+        assert "--census-seconds" in capsys.readouterr().out
+
+
 def test_single_validate_complete_remove_shares_the_batch_census_bound_and_refusal_text(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -20079,6 +20184,71 @@ def test_single_validate_complete_remove_shares_the_batch_census_bound_and_refus
     assert not list(slot_path.parent.glob(".slot01.fenced.*"))
     state = wrkslots._load_active(config)
     assert [record.slot for record in state.slots] == ["slot01"]
+
+
+def test_raised_census_seconds_reaches_the_batch_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The exact defect: on a saturated host the census outlives the computed
+    # default.  With --census-seconds the budget deadline moves by the raised
+    # value (stubbed clock; no real wait), and expiring even that bound names
+    # the flag in the refusal.
+    project, _repository, _remote = make_project(tmp_path)
+    slot_path = prepare_dead_validate_slots(project, ("slot01",))["slot01"]
+    monotonic_now = 100.0
+    observed: list[tuple[float, float]] = []
+
+    def expire_during_shared_census(
+        _paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        nonlocal monotonic_now
+        assert budget is not None
+        observed.append((budget.timeout_seconds, budget.deadline))
+        monotonic_now = budget.deadline + 1.0
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(time, "monotonic", lambda: monotonic_now)
+    monkeypatch.setattr(
+        wrkslots, "_capture_process_path_census", expire_during_shared_census
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an expired census must not reach the fresh scan")
+        ),
+    )
+
+    rc = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove",
+            "slot01",
+            "--validate-complete",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--census-seconds",
+            "600",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3, captured.err
+    assert observed == [(600.0, pytest.approx(700.0))]
+    assert "(bound 600.0 s, elapsed 601.0 s)" in captured.err
+    assert (
+        "rerun with --census-seconds 1200 to allow a slower census"
+        in captured.err
+    )
+    assert slot_path.is_dir()
 
 
 def test_validate_batch_deadline_between_targets_never_enters_later_removals(

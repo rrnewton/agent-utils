@@ -1089,6 +1089,12 @@ _TRUSTED_EXECUTABLE_DIRECTORY = Path("/usr/bin")
 # bound stays finite.
 _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS = 120.0
 _VALIDATE_REMOVE_BATCH_ITEM_CENSUS_SECONDS = 60.0
+# An operator may raise the census bound above with --census-seconds, up to
+# this cap, when a saturated host makes the census legitimately slower than
+# the computed default.  The flag may only raise: the finite default above
+# (and the reasons for it) is unchanged, and 3600 seconds bounds how long
+# one invocation may hold its seal window open even when asked for more.
+_VALIDATE_REMOVE_BATCH_CENSUS_MAX_SECONDS = 3600.0
 # One walk of configured reclaimable build output (reclaimable_ignored_paths)
 # in a retained frozen checkout. A 30,515-file Cargo target walked in about
 # 0.3 s warm on 2026-11-08; the walk also stops at the batch census deadline it
@@ -59156,6 +59162,18 @@ def _cmd_remove(
     emit: bool = True,
     agent_batch: _AgentRemoveBatchContext | None = None,
 ) -> int:
+    if (
+        private_cleanup is None
+        and agent_batch is None
+        and getattr(args, "census_seconds", None) is not None
+        and not bool(getattr(args, "validate_complete", False))
+        and getattr(args, "validation_proof_manifest", None) is None
+    ):
+        raise Refusal(
+            "--census-seconds applies only to validation removal (remove "
+            "--validate-complete, remove --validation-proof-manifest, or "
+            "remove-validate-batch); rerun without it for an agent slot"
+        )
     mirror_root: Path | None = _PROOF_MIRROR_ROOT.get()
     if mirror_root is None:
         try:
@@ -60700,6 +60718,45 @@ def _validate_remove_batch_census_seconds(sealed_slots: int) -> float:
     )
 
 
+def _resolve_census_seconds(requested: float | None, default: float) -> float:
+    """Resolve ``--census-seconds`` against the computed census default.
+
+    The flag may only raise the bound: ``None`` keeps the default, a value
+    below the default refuses, and nothing may exceed the cap.  The default
+    itself is the caller's computed bound (scaled for a validation batch,
+    the flat base bound for the single-census commands).
+    """
+
+    if requested is None:
+        return default
+    if not math.isfinite(requested):
+        raise Refusal("--census-seconds must be a finite number of seconds")
+    if requested > _VALIDATE_REMOVE_BATCH_CENSUS_MAX_SECONDS:
+        raise Refusal(
+            f"--census-seconds {requested:g} exceeds the maximum of "
+            f"{_VALIDATE_REMOVE_BATCH_CENSUS_MAX_SECONDS:g} seconds; "
+            "rerun with a value at or below that maximum"
+        )
+    if requested < default:
+        raise Refusal(
+            f"--census-seconds {requested:g} is below the computed default of "
+            f"{default:g} seconds for this operation; the flag may only raise "
+            "the census bound, so rerun without it or with a larger value"
+        )
+    return float(requested)
+
+
+def _census_rerun_seconds(timeout_seconds: float) -> int:
+    """The ``--census-seconds`` value a census-timeout refusal suggests."""
+
+    return int(
+        min(
+            _VALIDATE_REMOVE_BATCH_CENSUS_MAX_SECONDS,
+            max(timeout_seconds * 2, timeout_seconds + 60.0),
+        )
+    )
+
+
 def _validate_remove_batch_census_stderr_bytes(sealed_slots: int) -> int:
     """Return the combined census stderr bound for a validation batch.
 
@@ -60720,6 +60777,14 @@ def _remove_validate_batch(
         )
     if len({slot for slot, _generation in requested}) != len(requested):
         raise Refusal("remove-validate-batch received the same slot more than once")
+    census_seconds_requested = getattr(args, "census_seconds", None)
+    # Validate before anything is sealed.  The budget below re-resolves
+    # against the sealed count, which cannot exceed the requested count
+    # whose computed default this check already used.
+    _resolve_census_seconds(
+        census_seconds_requested,
+        _validate_remove_batch_census_seconds(len(requested)),
+    )
     config = _load_config(args.project_root, args.machine)
     _assert_not_retire_frozen(config, "remove-validate-batch")
     raw_proofs = tuple(getattr(args, "validation_proof_manifests", ()) or ())
@@ -60806,15 +60871,18 @@ def _remove_validate_batch(
         # the census must cover, but are not census work.  Starting this budget
         # before Phase A made a slow registry preflight consume most or all of
         # the bounded evidence window before the first observer ran.
+        resolved_census_seconds = _resolve_census_seconds(
+            census_seconds_requested,
+            _validate_remove_batch_census_seconds(len(private_targets)),
+        )
         census_budget = _ReadOnlyCommandBudget.start(
-            timeout_seconds=_validate_remove_batch_census_seconds(
-                len(private_targets)
-            ),
+            timeout_seconds=resolved_census_seconds,
             stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
             stderr_limit=_validate_remove_batch_census_stderr_bytes(
                 len(private_targets)
             ),
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+            rerun_census_seconds=_census_rerun_seconds(resolved_census_seconds),
         )
         private_paths = [
             private_target.path for private_target in private_targets.values()
@@ -70638,6 +70706,7 @@ def _assert_excluded_validation_unused(
             stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
             stderr_limit=64 * 1024,
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+            rerun_census_seconds=batch_cleanup.census_budget.rerun_census_seconds,
         )
     expected_match = _assert_current_process_only_holds_excluded_payload(
         exclusion, target, fenced
@@ -79203,6 +79272,9 @@ class _ReadOnlyCommandBudget:
     # The configured bound, kept so a deadline refusal can say how large the
     # bound was and how long the census actually ran.  Zero means unknown.
     timeout_seconds: float = 0.0
+    # When this budget backs a command that accepts --census-seconds, the
+    # value its timeout refusal suggests rerunning with.  Zero names no flag.
+    rerun_census_seconds: int = 0
 
     @classmethod
     def start(
@@ -79213,6 +79285,7 @@ class _ReadOnlyCommandBudget:
         stderr_limit: int,
         input_limit: int = 16 * 1024 * 1024,
         observation_limit: int = _PROCESS_CENSUS_OBSERVATION_LIMIT,
+        rerun_census_seconds: int = 0,
     ) -> "_ReadOnlyCommandBudget":
         return cls(
             deadline=time.monotonic() + timeout_seconds,
@@ -79221,6 +79294,7 @@ class _ReadOnlyCommandBudget:
             input_remaining=input_limit,
             observations_remaining=observation_limit,
             timeout_seconds=timeout_seconds,
+            rerun_census_seconds=rerun_census_seconds,
         )
 
     def remaining_seconds(self) -> float:
@@ -79234,8 +79308,16 @@ class _ReadOnlyCommandBudget:
                     f" (bound {self.timeout_seconds:.1f} s, "
                     f"elapsed {elapsed:.1f} s)"
                 )
+            hint = ""
+            if self.rerun_census_seconds > 0:
+                hint = (
+                    f"; rerun with --census-seconds {self.rerun_census_seconds} "
+                    "to allow a slower census"
+                )
             raise Refusal(
-                "read-only census exceeded its operation-wide time bound" + detail
+                "read-only census exceeded its operation-wide time bound"
+                + detail
+                + hint
             )
         return remaining
 
@@ -83289,6 +83371,7 @@ class _OwnerlessValidationBatchContext:
             stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
             stderr_limit=64 * 1024,
             input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+            rerun_census_seconds=self.census_budget.rerun_census_seconds,
         )
         fresh = _capture_same_uid_process_path_census(
             (active,), budget=fresh_budget
@@ -86172,11 +86255,16 @@ def _cmd_recover_ownerless_validate_batch(args: argparse.Namespace) -> int:
         raise Refusal(
             "recover-ownerless-validate-batch resolved multiple checkouts to one directory"
         )
+    resolved_census_seconds = _resolve_census_seconds(
+        getattr(args, "census_seconds", None),
+        _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+    )
     census_budget = _ReadOnlyCommandBudget.start(
-        timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+        timeout_seconds=resolved_census_seconds,
         stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+        rerun_census_seconds=_census_rerun_seconds(resolved_census_seconds),
     )
     shared_census_count = int(bool(prepared))
     if prepared:
@@ -86450,11 +86538,16 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
         raise Refusal(
             "classify-ownerless-validate-batch resolved multiple checkouts to one directory"
         )
+    resolved_census_seconds = _resolve_census_seconds(
+        getattr(args, "census_seconds", None),
+        _VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+    )
     budget = _ReadOnlyCommandBudget.start(
-        timeout_seconds=_VALIDATE_REMOVE_BATCH_CENSUS_SECONDS,
+        timeout_seconds=resolved_census_seconds,
         stdout_limit=_PROCESS_CENSUS_OUTPUT_BYTES_LIMIT,
         stderr_limit=64 * 1024,
         input_limit=_MOUNTINFO_CENSUS_BYTES_LIMIT,
+        rerun_census_seconds=_census_rerun_seconds(resolved_census_seconds),
     )
     census_count = int(bool(prepared))
     if prepared:
@@ -89831,6 +89924,18 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     remove.add_argument(
+        "--census-seconds",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "with --validate-complete or --validation-proof-manifest, raise the "
+            "validation census time bound to SECONDS (default: 120 seconds; may "
+            "only raise that default, at most 3600 seconds; use when a saturated "
+            "host makes the census legitimately slower; default: not given, so "
+            "the computed default applies)"
+        ),
+    )
+    remove.add_argument(
         "--attest-agent-stopped",
         metavar="AGENT",
         help=(
@@ -89999,6 +90104,18 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "completed ignored/validate/runs/*.json record aligned positionally "
             "with --slot and --validation-proof-manifest"
+        ),
+    )
+    remove_validate_batch.add_argument(
+        "--census-seconds",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "raise the shared census time bound to SECONDS (default: 120 seconds "
+            "for one slot plus 60 seconds per further slot, 540 seconds for "
+            "eight; may only raise that computed default, at most 3600 seconds; "
+            "use when a saturated host makes the census legitimately slower; "
+            "default: not given, so the computed default applies)"
         ),
     )
     remove_validate_batch.add_argument(
@@ -90505,6 +90622,17 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="PATH",
     )
     classify_ownerless_batch.add_argument(
+        "--census-seconds",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "raise the shared census time bound to SECONDS (default: 120 seconds; "
+            "may only raise that default, at most 3600 seconds; use when a "
+            "saturated host makes the census legitimately slower; default: not "
+            "given, so the computed default applies)"
+        ),
+    )
+    classify_ownerless_batch.add_argument(
         "--format", choices=("human", "json"), default="human"
     )
     classify_ownerless_batch.set_defaults(
@@ -90580,6 +90708,17 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     recover_ownerless_batch.add_argument(
         "--coordinator-pid", type=int, required=True, metavar="PID"
+    )
+    recover_ownerless_batch.add_argument(
+        "--census-seconds",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "raise the shared census time bound to SECONDS (default: 120 seconds; "
+            "may only raise that default, at most 3600 seconds; use when a "
+            "saturated host makes the census legitimately slower; default: not "
+            "given, so the computed default applies)"
+        ),
     )
     recover_ownerless_batch.add_argument(
         "--format", choices=("human", "json"), default="human"

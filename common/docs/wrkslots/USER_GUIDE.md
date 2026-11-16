@@ -1091,6 +1091,19 @@ it judged. The slot-removed event lists each deleted repository with `contents_j
 Removal of a validation slot without `--validate-complete` still refuses any nested `.git`. Audit
 judges a validation row's caches the same way, so it predicts this removal.
 
+### Raising the validation census bound: `--census-seconds`
+
+The shared process census of a validation removal is bounded: 120 seconds for one slot plus
+60 seconds per further slot in `remove-validate-batch` (540 seconds for eight), and 120 seconds
+for `remove --validate-complete`, `remove --validation-proof-manifest`,
+`recover-ownerless-validate-batch`, and `classify-ownerless-validate-batch`. The bound stays
+finite by default. On a saturated host where the census legitimately runs slower, raise it for
+one invocation with `--census-seconds SECONDS`, for example
+`wrkslots remove-validate-batch --census-seconds 1200 ...`. The flag may only raise the bound:
+a value below the computed default refuses, and no value above 3600 seconds is accepted.
+Without the flag nothing changes. A census that still exceeds the raised bound refuses with a
+message naming the rerun, such as "rerun with --census-seconds 240 to allow a slower census".
+
 ## Slot-state homes
 
 A slot's private state home (`slot-state/<slot_type>/<slot>` under the control
