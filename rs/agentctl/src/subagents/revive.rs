@@ -2097,15 +2097,10 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                             let mut orphans = Vec::new();
                             if !journal_pending {
                                 for candidate in &repeated {
-                                    if self
-                                        .client
-                                        .pane_idle_shell_identity(&candidate.pane_id)
-                                        .ok()
-                                        .flatten()
-                                        .is_none()
-                                    {
-                                        continue;
-                                    }
+                                    // Cheap filters first (#1737): the idle-shell
+                                    // proof re-observes a shell's /proc identity,
+                                    // so it runs only for a pane already matching
+                                    // this record's cwd, label and ownership.
                                     let Ok(info) = self.client.pane_info(&candidate.pane_id) else {
                                         continue;
                                     };
@@ -2128,6 +2123,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                                         .ok()
                                         .flatten()
                                         .is_some()
+                                    {
+                                        continue;
+                                    }
+                                    if self
+                                        .client
+                                        .pane_idle_shell_identity(&candidate.pane_id)
+                                        .ok()
+                                        .flatten()
+                                        .is_none()
                                     {
                                         continue;
                                     }

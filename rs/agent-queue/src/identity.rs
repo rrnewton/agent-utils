@@ -695,16 +695,36 @@ pub fn executable_is_interpreter(path: &Path) -> bool {
         || name.starts_with("perl")
 }
 
+/// How long one identity must be observed unchanged before it is accepted:
+/// a short window for a final harness image, a longer one for an interpreter,
+/// whose launcher chain may still exec into the real harness (#1221). A shell
+/// whose final image IS its interpreter (every idle-shell proof) is accepted
+/// at the longer window instead of burning the caller's whole timeout on
+/// every look — the revive dry-run poll of #1737, where one proof paid the
+/// full timeout per candidate pane.
+const STABLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+const INTERPRETER_STABLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn identity_accepted(is_interpreter: bool, agreed_for: std::time::Duration) -> bool {
+    agreed_for
+        >= if is_interpreter {
+            INTERPRETER_STABLE_WINDOW
+        } else {
+            STABLE_WINDOW
+        }
+}
+
 /// Observe `pid` until its identity is stable and post-exec, bounded by
 /// `timeout` (#1221 headless-identity-exec-race).
 ///
-/// Polls [`observe`] with a short paced interval. Returns as soon as two
-/// consecutive observations agree and the executable is not an interpreter.
-/// At the deadline it returns the last pair of agreeing observations even
-/// when the executable is still an interpreter (a script harness whose final
-/// image is its interpreter), so a caller can pin provisionally and re-pin
-/// on the harness's init event or a later re-observation. It errors when no
-/// two observations ever agreed or the process could not be observed.
+/// Polls [`observe`] with a short paced interval. Returns as soon as one
+/// identity has been observed unchanged for its stable window (longer for
+/// an interpreter; see [`identity_accepted`]). At the deadline it returns
+/// the last pair of agreeing observations even when the executable is
+/// still an interpreter (a script harness whose final image is its
+/// interpreter), so a caller can pin provisionally and re-pin on the
+/// harness's init event or a later re-observation. It errors when no two
+/// observations ever agreed or the process could not be observed.
 pub fn observe_stable(pid: u64, timeout: std::time::Duration) -> Result<LiveProcess> {
     let deadline = std::time::Instant::now() + timeout;
     let mut previous: Option<LiveProcess> = None;
@@ -722,11 +742,13 @@ pub fn observe_stable(pid: u64, timeout: std::time::Duration) -> Result<LiveProc
                 }
                 // One pair of agreeing observations can still catch a
                 // transient stage of a multi-exec launcher chain: require
-                // the same identity continuously for a short window.
+                // the same identity continuously for its stable window.
                 if agreed
-                    && !executable_is_interpreter(&live.executable_path)
                     && stable_since.is_some_and(|since| {
-                        since.elapsed() >= std::time::Duration::from_millis(200)
+                        identity_accepted(
+                            executable_is_interpreter(&live.executable_path),
+                            since.elapsed(),
+                        )
                     })
                 {
                     return Ok(live);
@@ -1339,6 +1361,20 @@ mod tests {
         let mut reused = me.clone();
         reused.starttime_ticks += 1;
         assert!(!ancestry.contains(&reused));
+    }
+
+    #[test]
+    fn a_stable_interpreter_is_accepted_at_its_window_not_the_caller_timeout() {
+        // #1737: agreement durations are the stub process table here — the
+        // decision is pure, so no wall clock is asserted. An interpreter
+        // (a shell: the final image of every idle-shell proof) is accepted
+        // once its longer window of unchanged identity has passed, and not
+        // before; a final harness image at the short window.
+        assert!(!identity_accepted(true, INTERPRETER_STABLE_WINDOW / 2));
+        assert!(identity_accepted(true, INTERPRETER_STABLE_WINDOW));
+        assert!(!identity_accepted(false, STABLE_WINDOW / 2));
+        assert!(identity_accepted(false, STABLE_WINDOW));
+        assert!(identity_accepted(true, STABLE_WINDOW * 100));
     }
 
     #[cfg(target_os = "linux")]

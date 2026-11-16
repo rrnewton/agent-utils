@@ -1293,6 +1293,45 @@ fn revive_reuses_a_proved_idle_shell_pane_and_records_the_reanchor() {
 }
 
 #[test]
+fn revive_dry_run_with_a_gone_pane_never_proves_unrelated_shells() {
+    // #1737 agentctl-revive-dryrun-identity-poll-hang: with the recorded pane
+    // gone, the missing-pane proof scans the census for an orphan idle shell.
+    // The shell proof re-observes a process's /proc identity, so it must run
+    // only after the cheap cwd/label/ownership filters — on the old order
+    // every unrelated pane in the census paid a full identity poll and the
+    // dry run looked hung. Stub census: one unrelated pane whose tab is not
+    // labelled for this record; the plan must answer without proving it.
+    let (fixture, old) = recoverable("claude", false);
+    let pane = old.pane_id.clone().unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|row| row.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    fixture.client.panes.lock().unwrap().push(Pane {
+        pane_id: "other".to_owned(),
+        tab_id: "other-tab".to_owned(),
+        workspace_id: "workspace".to_owned(),
+    });
+    let plan = fixture
+        .manager()
+        .revive("worker", true, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(plan["action"], "revive", "{plan}");
+    assert!(
+        !fixture
+            .client
+            .idle_shell_proof_panes
+            .lock()
+            .unwrap()
+            .contains(&"other".to_owned()),
+        "unrelated pane paid an idle-shell identity proof"
+    );
+}
+
+#[test]
 fn revive_with_profile_environment_never_reuses_the_pane_and_delivers_the_values() {
     // #1139: the reused shell inherits its own environment, so an
     // env-carrying launch relaunched there silently loses the profile

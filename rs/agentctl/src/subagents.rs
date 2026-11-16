@@ -16333,6 +16333,7 @@ pub(crate) mod tests {
                     fail_read: AtomicBool::new(false),
                     fail_shell_proof: AtomicBool::new(false),
                     shell_proof_mutation: AtomicU64::new(0),
+                    idle_shell_proof_panes: Mutex::new(Vec::new()),
                     oversized_read: AtomicBool::new(false),
                     non_ascii_read: AtomicBool::new(false),
                     restart_foreign_on_read: AtomicBool::new(false),
@@ -16791,6 +16792,8 @@ pub(crate) mod tests {
         pub(crate) fail_read: AtomicBool,
         fail_shell_proof: AtomicBool,
         shell_proof_mutation: AtomicU64,
+        /// Panes whose idle-shell identity was proved, in call order (#1737).
+        idle_shell_proof_panes: Mutex<Vec<String>>,
         oversized_read: AtomicBool,
         non_ascii_read: AtomicBool,
         restart_foreign_on_read: AtomicBool,
@@ -18074,6 +18077,10 @@ pub(crate) mod tests {
                 && *expected == *self.foreign_shell_identity.lock().unwrap())
         }
         fn pane_idle_shell_identity(&self, pane: &str) -> AdapterResult<Option<PaneShellProof>> {
+            self.idle_shell_proof_panes
+                .lock()
+                .unwrap()
+                .push(pane.to_owned());
             if self.fail_shell_proof.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("injected procfs proof failure"));
             }
