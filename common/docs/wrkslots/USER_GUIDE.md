@@ -1812,7 +1812,9 @@ targets — naming each file with its size. `--archive-ignored` first keeps thos
 deterministic tar beside the salvage bundles under `wrkslots-salvage/` (at most
 536870912 bytes in total), reads it back, checks every file's sha256, and lists each file with
 its size and sha256 in the salvage receipt; `--discard-ignored` deletes them explicitly and the
-receipt still lists them. Ignored content inside the caches is deleted with the checkout and is
+receipt still lists them. `remove-agent-batch --archive-ignored` does the same for every slot of
+the batch; without it, a batch refuses a slot for its ignored files before the shared census or
+salvage work runs for that slot. Ignored content inside the caches is deleted with the checkout and is
 not listed. This guard covers agent slots and ownerless agent worktree recovery; validate slots
 are deleted as throwaway run checkouts behind their terminal-record and removal-proof gate and
 are not refused for ignored residue (retained validation recovery preserves it instead). Authored work that must survive belongs in tracked or ordinary untracked paths, or

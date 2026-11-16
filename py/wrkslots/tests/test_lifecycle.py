@@ -26,6 +26,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import threading
@@ -59108,6 +59109,94 @@ def test_remove_agent_batch_exit_status_counts_and_input_file(tmp_path: Path) ->
         (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
     )
     assert sorted(str(row["slot"]) for row in archive["records"]) == slots
+
+
+def ignored_agent_batch_project(
+    tmp_path: Path, count: int = 2
+) -> tuple[Path, Path, list[str]]:
+    """Finished dead-owner agent slots that gained gitignored files after finish."""
+
+    project, repository, _remote = make_project(tmp_path)
+    (repository / ".gitignore").write_text("provisioning/\n", encoding="utf-8")
+    git(repository, "add", ".gitignore")
+    git(repository, "commit", "-q", "-m", "ignore provisioning output")
+    git(repository, "push", "-q", "origin", "main")
+    slots = [f"slot{index:02d}" for index in range(1, count + 1)]
+    for index, slot in enumerate(slots, start=1):
+        made = create(project, slot=slot, agent=f"codex-{index}", branch=f"codex/{slot}")
+        assert made.returncode == 0, made.stderr
+        commit_task(repository, checkout(project, slot), f"codex/{slot}")
+        handed_off = finish(project, slot, f"codex-{index}")
+        assert handed_off.returncode == 0, handed_off.stderr
+        tree = checkout(project, slot)
+        (tree / "provisioning").mkdir()
+        (tree / "provisioning" / "local.cfg").write_text(
+            "provisioned\n", encoding="utf-8"
+        )
+    for slot in slots:
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    return project, repository, slots
+
+
+def test_remove_agent_batch_refuses_ignored_files_before_census_and_salvage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1753: without --archive-ignored the refusal costs no census or salvage."""
+
+    project, _repository, slots = ignored_agent_batch_project(tmp_path)
+    census_calls: list[tuple[Path, ...]] = []
+    salvage_calls: list[str] = []
+    original_census = wrkslots._capture_agent_remove_batch_census
+    original_salvage = wrkslots._salvage_agent_slot
+
+    def counting_census(targets: Sequence[Path]) -> object:
+        census_calls.append(tuple(targets))
+        return original_census(targets)
+
+    def counting_salvage(
+        config: object, record: object, vcs: object, **keywords: object
+    ) -> object:
+        salvage_calls.append(str(getattr(record, "slot", "")))
+        return original_salvage(config, record, vcs, **keywords)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots, "_capture_agent_remove_batch_census", counting_census)
+    monkeypatch.setattr(wrkslots, "_salvage_agent_slot", counting_salvage)
+
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "removed") == []
+    assert batch_slots(payload, "refused") == slots
+    for row in cast(list[Mapping[str, object]], payload["refused"]):
+        assert "gitignored file(s)" in str(row["reason"])
+        assert "--archive-ignored" in str(row["reason"])
+    assert census_calls == []
+    assert payload["shared_process_censuses"] == 0
+    assert salvage_calls == []
+    assert all(checkout(project, slot).is_dir() for slot in slots)
+
+
+def test_remove_agent_batch_archive_ignored_removes_slots(tmp_path: Path) -> None:
+    """#1753: --archive-ignored archives with read-back and removes, as remove does."""
+
+    project, _repository, slots = ignored_agent_batch_project(tmp_path)
+
+    returncode, payload, stderr = in_process_agent_batch(
+        project, slots, "--archive-ignored"
+    )
+
+    assert returncode == 0, stderr
+    assert batch_slots(payload, "removed") == slots
+    assert batch_slots(payload, "refused") == []
+    assert all(not checkout(project, slot).exists() for slot in slots)
+    archives = sorted(project.rglob("ignored-*.tar"))
+    assert len(archives) == len(slots)
+    for archive in archives:
+        with tarfile.open(archive, "r:") as bundle:
+            assert any(
+                name.endswith("provisioning/local.cfg") for name in bundle.getnames()
+            )
 
 
 def test_remove_agent_batch_refuses_validation_and_absent_rows_per_item(

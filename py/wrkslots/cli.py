@@ -59947,7 +59947,15 @@ def _cmd_remove_in_scope(
             "--archive-ignored and --discard-ignored cannot be supplied together. "
             "state: REFUSED -- no checkout was salvaged or removed"
         )
-    if (archive_ignored or discard_ignored) and (
+    batch_item = (
+        agent_batch is not None
+        and getattr(args, "_batch_candidate", None) is not None
+        and private_cleanup is None
+        and validation_removal_proof is None
+        and not bool(args.validate_complete)
+        and getattr(args, "_retirement_candidate", None) is None
+    )
+    if (archive_ignored or discard_ignored) and not batch_item and (
         agent_batch is not None
         or private_cleanup is not None
         or validation_removal_proof is not None
@@ -59956,8 +59964,8 @@ def _cmd_remove_in_scope(
     ):
         raise Refusal(
             "--archive-ignored and --discard-ignored apply only to one explicit "
-            "remove of an agent slot; retire-pending, remove-agent-batch and "
-            "validation removal never accept them. "
+            "remove of an agent slot or to a remove-agent-batch item; "
+            "retire-pending and validation removal never accept them. "
             "state: REFUSED -- no checkout was salvaged or removed"
         )
     ignored_mode: _IgnoredMode = (
@@ -64161,6 +64169,48 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
             image_targets[slot_path] = image.slot_image
         identities[slot_path] = identity
         eligible.append((slot, generation, slot_path))
+    if not bool(getattr(args, "archive_ignored", False)) and not bool(
+        getattr(args, "discard_ignored", False)
+    ):
+        # Decide the ignored-files refusal before the shared census and
+        # salvage (#1753): a slot whose gitignored files refuse removal
+        # must not pay for either. The probe reuses salvage's own
+        # collection over the record's checkouts; anything it cannot
+        # judge -- a finish-recorded ignored decision (#1686), an
+        # unreadable checkout, submodule checkouts salvage adds -- is
+        # left for salvage to decide exactly as before.
+        probe_vcs = _GitVcs()
+        uncondemned: list[tuple[str, int, Path]] = []
+        for slot, generation, slot_path in eligible:
+            record = records.get(slot)
+            if record is None or (
+                record.handoff is not None and record.handoff.ignored_files
+            ):
+                uncondemned.append((slot, generation, slot_path))
+                continue
+            ignored_by_checkout: dict[str, tuple[_IgnoredFile, ...]] = {}
+            try:
+                for checkout in record.checkouts:
+                    if checkout.vcs == "eden":
+                        continue
+                    files = _ignored_files_outside_caches(
+                        config,
+                        checkout,
+                        _stored_path(config, checkout.path, "checkout path"),
+                        probe_vcs,
+                    )
+                    if files:
+                        ignored_by_checkout[checkout.name] = files
+            except (Refusal, OSError):
+                ignored_by_checkout = {}
+            if ignored_by_checkout:
+                _warn_ignored_paths_referenced(config, ignored_by_checkout)
+                refuse(slot, generation, str(_ignored_refusal(ignored_by_checkout)))
+                identities.pop(slot_path, None)
+                image_targets.pop(slot_path, None)
+                continue
+            uncondemned.append((slot, generation, slot_path))
+        eligible = uncondemned
     context = _AgentRemoveBatchContext(
         identities,
         image_targets=image_targets,
@@ -90832,6 +90882,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--archive-private-history",
         action="store_true",
         help="as for remove, for every slot of the batch: " + _ARCHIVE_PRIVATE_HISTORY_HELP,
+    )
+    remove_agent_batch.add_argument(
+        "--archive-ignored",
+        action="store_true",
+        help="as for remove, for every slot of the batch: " + _ARCHIVE_IGNORED_HELP,
     )
     remove_agent_batch.add_argument(
         "--format", choices=("human", "json"), default="human"
