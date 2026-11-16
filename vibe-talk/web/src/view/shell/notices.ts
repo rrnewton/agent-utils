@@ -68,6 +68,12 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
   let bannerTimer: TimerHandle | null = null;
 
   function setStatus(text: unknown): void {
+    // `#1726 vibe-talk-empty-red-banner`: a notice with no words is a shell, not a
+    // message. Nothing to say takes the line away instead of showing it empty.
+    if (deps.redact(text).trim() === "") {
+      dismissStatus();
+      return;
+    }
     if (statusTimer !== null) {
       deps.clock.clearTimeout(statusTimer);
     }
@@ -113,7 +119,11 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     // So is Read with device voice, by a cloud read that failed (`cloudReadFailed`).
     el("read-on-device").hidden = true;
     deps.holdingReader(() => {
-      el("error").textContent = deps.redact(text);
+      // `#1726 vibe-talk-empty-red-banner`: a failure can arrive with no words of
+      // its own — an `Error` with an empty message, a server answer whose detail
+      // is empty. The panel must still say something, in the page's own
+      // convention (`failureWords`: "no reason was given"), never an empty shell.
+      el("error").textContent = deps.redact(text).trim() || "Something went wrong, but no reason was given.";
       el("error").hidden = false;
       box.hidden = false;
     });
@@ -170,6 +180,13 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     showDetail(text) {
       connectionDetail = String(text);
       renderDetail();
+      // `#1726 vibe-talk-empty-red-banner`: no detail, no banner. An empty
+      // connection line has nothing to announce, so it stays away rather than
+      // showing the banner's shell with a Dismiss button and no words.
+      if (deps.redact(connectionDetail).trim() === "") {
+        dismissBanner();
+        return;
+      }
       el("connection-banner").hidden = false;
       if (bannerTimer !== null) {
         deps.clock.clearTimeout(bannerTimer);
@@ -177,7 +194,9 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
       bannerTimer = deps.clock.setTimeout(dismissBanner, BANNER_DISMISS_MS);
     },
     addDetail(text) {
-      connectionDetail = `${connectionDetail} · ${text}`;
+      // `#1726 vibe-talk-empty-red-banner`: appending to nothing must not leave
+      // the banner holding a separator with no words before it.
+      connectionDetail = connectionDetail.trim() === "" ? String(text) : `${connectionDetail} · ${text}`;
       renderDetail();
     },
     dismissBanner,

@@ -61,6 +61,7 @@ const SUITES: &[&str] = &[
     "tests/js/view/settings.test.mjs",
     "tests/js/view/shell-promotion.test.mjs",
     "tests/js/view/shell-navigation.test.mjs",
+    "tests/js/view/shell-notices.test.mjs",
     "tests/js/view/shell-channelselection.test.mjs",
     "tests/js/view/shell-deployment.test.mjs",
     "tests/js/view/shell-channeldirectory.test.mjs",
@@ -70,7 +71,7 @@ const SUITES: &[&str] = &[
 
 /// How many tests the suites define between them. Raise it with them: it is a floor against a
 /// suite that stopped COLLECTING, so left behind it would keep passing while a file went missing.
-const COLLECTED_FLOOR: usize = 405;
+const COLLECTED_FLOOR: usize = 409;
 
 #[test]
 fn the_page_module_suites_pass() {
