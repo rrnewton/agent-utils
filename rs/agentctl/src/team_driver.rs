@@ -312,10 +312,10 @@ pub fn save_record(directory: &Path, record: &mut DriverRecord, now: f64) -> Res
 }
 
 /// The one-driver lock, held only while a run can still return it.
-/// Held as a [`agent_queue::fsio::HeldLock`], whose drop unlocks
-/// explicitly: releasing by closing the descriptor alone would keep
-/// the lock held while any child forked under it sits between fork
-/// and exec, and the next kick's try would spuriously find it busy.
+/// Its holder unlocks explicitly on drop: releasing by closing the
+/// descriptor alone would keep the lock held while any child forked
+/// under it sits between fork and exec, and the next kick's try
+/// would spuriously find it busy.
 pub struct DriverLock {
     _file: agent_queue::fsio::HeldLock,
 }
