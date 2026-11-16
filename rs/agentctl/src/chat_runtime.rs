@@ -22792,12 +22792,14 @@ pub(crate) mod tests {
         )
         .expect("JSON");
         let keys = |value: &Value| {
-            value
+            let mut keys = value
                 .as_object()
                 .expect("object")
                 .keys()
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            keys.sort();
+            keys
         };
         assert_eq!(keys(&stored), ["config", "version"]);
         assert_eq!(
