@@ -444,26 +444,30 @@ BOX_JS = """(selector) => {
 }"""
 
 
-ALL_CHANNELS_UNCOVERED_JS = """() => {
+ALL_CHANNELS_CLEAR_JS = """() => {
   const box = document.getElementById('search-all-channels');
-  if (!box || !box.getClientRects().length) return false;
-  const r = box.getBoundingClientRect();
-  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-  return Boolean(hit && (hit === box || box.contains(hit) ||
-    (hit.closest && hit.closest('.search-all-channels'))));
+  const rect = box.getBoundingClientRect();
+  const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+  return hit !== null && (hit === box || hit.closest('label') === box.closest('label'));
 }"""
 
 
 def press_all_channels(walk: Walk) -> None:
-    """Press All channels with the scope row uncovered (`#1734`).
-
-    Entering a search with no hit on screen now lands at the foot, so the
-    scope row at the head of the scroller stands under the sticky search
-    field; a press there lands on the field and never toggles. Scroll back
-    to the head and wait until the checkbox is uncovered, then press.
-    """
-    walk.page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
-    walk.until(ALL_CHANNELS_UNCOVERED_JS, "the All channels checkbox stayed under the search field")
+    """Tick or untick All channels with a real press, as a reader who has just been
+    taken to the newest hits does (`#1734 vibe-talk-search-view-scroll-default`): the
+    search-entry scroll leaves the bar's lower rows under the sticky field, so wheel
+    the list back to its head until the box's centre is clear, then press it."""
+    page = walk.page
+    if page.evaluate(ALL_CHANNELS_CLEAR_JS):
+        walk.press("#search-all-channels")
+        return
+    listed = page.locator("#discord-log").bounding_box()
+    walk.check(listed is not None, "the list is not on the screen to wheel back")
+    if listed is None:
+        return
+    page.mouse.move(listed["x"] + listed["width"] / 2, listed["y"] + listed["height"] / 2)
+    page.mouse.wheel(0, -10_000)
+    walk.until(ALL_CHANNELS_CLEAR_JS, "All channels did not come clear of the search field")
     walk.press("#search-all-channels")
 
 
