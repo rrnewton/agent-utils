@@ -20,6 +20,13 @@ The follow-up refresh after #339 workspace-json-features landed retains the
 same exact-SHA lease protection for this lane's own branch. It incorporates
 the extracted fixes from main and the upstream process-pin regression repair;
 focused tests remain a publication checkpoint, not complete validation evidence.
+## Recovery follow-up PR exception — November 16, 2026 ET
+
+The owner explicitly requested the recovery-reconciler fixes as a PR and the
+all-slots-memory-high option as a separate small PR. This supersedes direct-to-main
+publication and the one-exceptional-PR limit for those two assigned changes only.
+Memory pilots stay on the approved single lane; other live lanes are never migrated.
+
 
 ## Publication Policy
 

@@ -583,7 +583,7 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "$USER and $HOME expanded), env (NAME: value; leading ~ is $HOME), "
             "tmp_size, protect_system, coordinator_writable (worktrees|project: what `wrkslots box` "
             "may write), limits {memory_max, memory_high, cpu_quota, tasks_max, "
-            "io_weight, all_slots_memory_max, all_slots_cpu_quota}.\n\n"
+            "io_weight, all_slots_memory_max, all_slots_memory_high, all_slots_cpu_quota}.\n\n"
             "Examples:\n"
             "  wrkslots sandbox show-config\n"
             "  wrkslots sandbox write-defaults"

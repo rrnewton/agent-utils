@@ -519,6 +519,26 @@ def test_place_only_reads_the_slice_once_and_limits_exactly_those_names(
     assert not any("-wrkslots-s1-wrkslots" in line for line in _calls(log))
 
 
+@pytest.mark.parametrize("hard", [None, "58G"])
+def test_aggregate_memory_high_changes_only_the_shared_slice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hard: str | None,
+) -> None:
+    log = _fake_systemd_tools(tmp_path, monkeypatch)
+    limits = sandbox.limits_from_obj({
+        "memory_high": "28G", "memory_max": "32G",
+        "all_slots_memory_high": "52G", "all_slots_memory_max": hard,
+    })
+    sandbox.apply_slice_limits(_slot_view(tmp_path), limits, parent="app.slice")
+    updates = [line for line in _calls(log) if "set-property" in line]
+    expected = "MemoryMax=58G MemorySwapMax=0 " if hard else ""
+    assert updates == [
+        f"systemctl --user set-property --runtime app-wrkslots.slice {expected}MemoryHigh=52G",
+        "systemctl --user set-property --runtime app-wrkslots-s1.slice MemoryMax=32G MemorySwapMax=0 MemoryHigh=28G TasksMax=8192",
+    ]
+    encoded = sandbox.settings_to_obj(sandbox.SandboxSettings(limits=limits))
+    assert sandbox.settings_from_obj(encoded).limits == limits
+
+
 def test_explicit_absent_parent_is_not_rediscovered(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sandbox, "parent_slice", lambda cgroup_file=None: "moved.slice")
 

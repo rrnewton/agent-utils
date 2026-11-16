@@ -66,6 +66,7 @@ pub(crate) const LIMIT_DOCS: &[(&str, &str)] = &[
     ("tasks_max", "Slot process and thread limit (default 8192)."),
     ("io_weight", "Slot IO weight, 1 to 10000."),
     ("all_slots_memory_max", "Memory ceiling shared by all slots together."),
+    ("all_slots_memory_high", "Memory throttling threshold shared by all slots together."),
     ("all_slots_cpu_quota", "CPU ceiling shared by all slots together."),
     ("slot_cpu_quotas", "Ordered per-slot CPU ceilings: a list of {slot_prefix, cpu_quota}; the first prefix matching the slot name wins over cpu_quota."),
 ];

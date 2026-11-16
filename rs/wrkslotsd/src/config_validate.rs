@@ -867,17 +867,18 @@ const SANDBOX_KEYS: [&str; 14] = [
     "coordinator_writable",
     "limits",
 ];
-const LIMIT_KEYS: [&str; 8] = [
+const LIMIT_KEYS: [&str; 9] = [
     "memory_max",
     "memory_high",
     "cpu_quota",
     "tasks_max",
     "io_weight",
     "all_slots_memory_max",
+    "all_slots_memory_high",
     "all_slots_cpu_quota",
     "slot_cpu_quotas",
 ];
-const RENAMED_KEYS: [(&str, &str); 9] = [
+const RENAMED_KEYS: [(&str, &str); 10] = [
     ("home_writable", "home_private"),
     ("home_paths", "home_expose (with home: hidden)"),
     ("memory_max", "limits.memory_max"),
@@ -886,6 +887,7 @@ const RENAMED_KEYS: [(&str, &str); 9] = [
     ("tasks_max", "limits.tasks_max"),
     ("io_weight", "limits.io_weight"),
     ("all_slots_memory_max", "limits.all_slots_memory_max"),
+    ("all_slots_memory_high", "limits.all_slots_memory_high"),
     ("all_slots_cpu_quota", "limits.all_slots_cpu_quota"),
 ];
 
@@ -1134,7 +1136,7 @@ fn sandbox_settings(raw: &Map<String, Value>) -> Result<Value> {
     };
     let limits = match section.get("limits") {
         None => json!({
-            "all_slots_cpu_quota": null, "all_slots_memory_max": null,
+            "all_slots_cpu_quota": null, "all_slots_memory_max": null, "all_slots_memory_high": null,
             "cpu_quota": null, "io_weight": null, "memory_high": null,
             "memory_max": null, "tasks_max": 8192, "slot_cpu_quotas": []
         }),
@@ -1157,6 +1159,7 @@ fn sandbox_settings(raw: &Map<String, Value>) -> Result<Value> {
             json!({
                 "all_slots_cpu_quota": optional_limit(&get("all_slots_cpu_quota"), "configuration.sandbox.limits.all_slots_cpu_quota")?,
                 "all_slots_memory_max": optional_limit(&get("all_slots_memory_max"), "configuration.sandbox.limits.all_slots_memory_max")?,
+                "all_slots_memory_high": optional_limit(&get("all_slots_memory_high"), "configuration.sandbox.limits.all_slots_memory_high")?,
                 "cpu_quota": optional_limit(&get("cpu_quota"), "configuration.sandbox.limits.cpu_quota")?,
                 "io_weight": optional_positive_int(&get("io_weight"), "configuration.sandbox.limits.io_weight")?,
                 "memory_high": optional_limit(&get("memory_high"), "configuration.sandbox.limits.memory_high")?,
