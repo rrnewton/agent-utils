@@ -185,3 +185,53 @@ def test_quick_json_matches_rust(tmp_path: Path) -> None:
         for record in doc["active"]:
             record.pop("heartbeat_age_seconds", None)
     assert rust_doc == python_doc
+
+
+def test_declared_submodules_memo_reads_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both doctor walks share one declared-submodule read (#1706c)."""
+    calls: list[Path] = []
+    real = cli._declared_submodules
+
+    def counting(vcs: cli._GitVcs, repository: Path) -> list[tuple[str, str]]:
+        calls.append(repository)
+        return real(vcs, repository)
+
+    monkeypatch.setattr(cli, "_declared_submodules", counting)
+    token = cli._DECLARED_SUBMODULES_MEMO.set({})
+    try:
+        vcs = cli._GitVcs()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".gitmodules").write_text(
+            '[submodule "sub"]\n\tpath = sub\n\turl = ../sub.git\n',
+            encoding="utf-8",
+        )
+        first = cli._declared_submodules_cached(vcs, repo)
+        second = cli._declared_submodules_cached(vcs, repo)
+    finally:
+        cli._DECLARED_SUBMODULES_MEMO.reset(token)
+    assert first == second == [("sub", "sub")]
+    assert calls == [repo]
+
+
+def test_registered_liveness_answers_cover_every_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent probes return one answer per record (#1706c)."""
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    assert (
+        create(
+            project, slot="slot02", agent="codex-2", branch="codex/task2"
+        ).returncode
+        == 0
+    )
+    config = cli._load_config(str(project), "testhost")
+    records = cli._load_active(config).slots
+    answers = cli._registered_liveness_states(config, records)
+    assert {
+        (record.machine, record.slot, record.generation) for record in records
+    } == set(answers)
+    assert all(state in {"dead", "alive", "unverifiable"} for state, _ in answers.values())

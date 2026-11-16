@@ -24528,6 +24528,29 @@ def _registered_liveness_states(
     if not records:
         return {}
     if config.liveness_batch_command is None:
+        # No batch authority configured: the per-agent probes are
+        # independent subprocesses, so a read-only scan asks them
+        # concurrently instead of serially (#1706).  Answers are
+        # identical; only the wall time changes.
+        if len(records) > 1:
+            import concurrent.futures
+
+            if deadline is not None:
+                _check_scan_deadline(deadline)
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(records))
+            ) as pool:
+                probed = list(
+                    pool.map(
+                        lambda record: _registered_liveness_state(config, record),
+                        records,
+                    )
+                )
+            return {
+                (record.machine, record.slot, record.generation): answer
+                for record, answer in zip(records, probed, strict=True)
+            }
         answers: dict[tuple[str, str, int], tuple[str, str]] = {}
         for record in records:
             if deadline is not None:
@@ -40003,6 +40026,26 @@ def _submodule_git_dirs(
     return Path(git_dir.stdout.strip()).resolve(), Path(common.stdout.strip()).resolve()
 
 
+# One doctor run walks the same submodule trees twice (worktree-config
+# and shared-submodule checks); the declared list is read once per tree
+# per run in this memo (#1706).
+_DECLARED_SUBMODULES_MEMO: contextvars.ContextVar[
+    dict[str, list[tuple[str, str]]] | None
+] = contextvars.ContextVar("wrkslots_declared_submodules_memo", default=None)
+
+
+def _declared_submodules_cached(
+    vcs: _GitVcs, repository: Path
+) -> list[tuple[str, str]]:
+    memo = _DECLARED_SUBMODULES_MEMO.get()
+    if memo is None:
+        return _declared_submodules(vcs, repository)
+    key = str(repository)
+    if key not in memo:
+        memo[key] = _declared_submodules(vcs, repository)
+    return memo[key]
+
+
 def _declared_submodules(vcs: _GitVcs, repository: Path) -> list[tuple[str, str]]:
     """(name, path) pairs ``repository``'s .gitmodules declares, in file order."""
 
@@ -40428,7 +40471,7 @@ def _shared_submodule_doctor_findings(
                         )
                     )
                     return
-            for _name, raw in _declared_submodules(vcs, slot_sub):
+            for _name, raw in _declared_submodules_cached(vcs, slot_sub):
                 nested = Path(raw)
                 if nested.is_absolute() or ".." in nested.parts:
                     continue
@@ -40526,7 +40569,7 @@ def _worktree_config_doctor_findings(
     ) -> None:
         if depth > 8:
             return
-        for _name, raw in _declared_submodules(vcs, tree):
+        for _name, raw in _declared_submodules_cached(vcs, tree):
             relative = Path(raw)
             if relative.is_absolute() or ".." in relative.parts:
                 continue
@@ -55315,6 +55358,7 @@ def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
     scan_started = time.monotonic()
     subprocess_counter = [0]
     _DOCTOR_SUBPROCESS_TOKEN.set(_SCAN_SUBPROCESSES.set(subprocess_counter))
+    _DECLARED_SUBMODULES_MEMO.set({})
     phases: dict[str, float] = {}
 
     def timed(name: str, fn):  # type: ignore[no-untyped-def]

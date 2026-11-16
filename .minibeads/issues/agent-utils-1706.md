@@ -84,3 +84,15 @@ subprocess. Rust doctor-text implements the same `--quick` and
 envelope fields. The optimisation commit (liveness batching, one
 shared submodule census) follows separately with before/after
 timings.
+
+## Resolution (part 2: optimisation)
+
+Same registry, before -> after: total 12.91s -> 7.94s,
+owner_liveness 4.16s -> 0.60s (per-agent liveness probes now run
+concurrently, bounded at 8, answers unchanged), subprocesses
+392 -> 354 (the two submodule walks share one declared-submodule
+read per tree per run via `_declared_submodules_cached`). Findings
+byte-identical; active rows differ only in heartbeat ages. The
+remaining costs (worktree_config 3.18s, shared_submodule 2.37s)
+are per-repository git probes; `doctor --quick` (0.65s) is the
+bounded gate mode that skips them.
