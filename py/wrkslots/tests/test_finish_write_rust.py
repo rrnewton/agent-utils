@@ -251,6 +251,10 @@ def _events(root: Path) -> list[dict[str, object]]:
             handoff = record.get("handoff")
             if isinstance(handoff, dict):
                 _normalize_handoff(handoff)
+            for checkout in cast(list[dict[str, object]], record["checkouts"]):
+                checkout["head"] = "HEAD"
+                checkout["start_point"] = "HEAD"
+                checkout["remote_url_sha256"] = "URLSHA"
         evidence = payload.get("evidence")
         if isinstance(evidence, dict):
             accounting = evidence.get("accounting")
@@ -259,10 +263,6 @@ def _events(root: Path) -> list[dict[str, object]]:
                 if isinstance(archives, list):
                     for archive in cast(list[dict[str, object]], archives):
                         archive["archive_root"] = "ARCHIVEROOT"
-            for checkout in cast(list[dict[str, object]], record["checkouts"]):
-                checkout["head"] = "HEAD"
-                checkout["start_point"] = "HEAD"
-                checkout["remote_url_sha256"] = "URLSHA"
         events.append(event)
     return events
 

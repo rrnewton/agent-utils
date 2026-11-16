@@ -206,6 +206,82 @@
       ],
       "type": "object"
     },
+    "HandoffIgnoredArchive": {
+      "additionalProperties": false,
+      "description": "The verified tar one checkout's archived ignored files were kept in (#1686).",
+      "properties": {
+        "archive_root": {
+          "description": "Salvage archive root holding the tar.",
+          "type": "string"
+        },
+        "bytes": {
+          "description": "Tar size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "checkout": {
+          "description": "Checkout the tar belongs to.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Tar path relative to the archive root.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "SHA-256 of the tar bytes.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        }
+      },
+      "required": [
+        "checkout",
+        "archive_root",
+        "path",
+        "bytes",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "HandoffIgnoredFile": {
+      "additionalProperties": false,
+      "description": "One gitignored file finish judged under --archive/--discard-ignored (#1686).",
+      "properties": {
+        "bytes": {
+          "description": "File size in bytes (a symlink's target length).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "checkout": {
+          "description": "Checkout holding the file (a submodule is `parent/relative`).",
+          "type": "string"
+        },
+        "disposition": {
+          "description": "archived or discarded.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path relative to that checkout.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "SHA-256 of the file bytes (of the target text for a symlink).",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        }
+      },
+      "required": [
+        "checkout",
+        "path",
+        "bytes",
+        "sha256",
+        "disposition"
+      ],
+      "type": "object"
+    },
     "HandoffSummary": {
       "additionalProperties": false,
       "description": "The handoff summary embedded in an active record.",
@@ -218,6 +294,20 @@
           "description": "Commits finish discarded under --discard-unaccounted (#1364).",
           "items": {
             "type": "string"
+          },
+          "type": "array"
+        },
+        "ignored_archives": {
+          "description": "Verified tars for the archived ignored files (#1686).",
+          "items": {
+            "$ref": "#/$defs/HandoffIgnoredArchive"
+          },
+          "type": "array"
+        },
+        "ignored_files": {
+          "description": "Gitignored files finish archived or discarded (#1686), by checkout.",
+          "items": {
+            "$ref": "#/$defs/HandoffIgnoredFile"
           },
           "type": "array"
         },

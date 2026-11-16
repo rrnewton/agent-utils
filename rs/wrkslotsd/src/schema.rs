@@ -441,7 +441,9 @@ fn validate_handoff(value: &Value, label: &str) -> Result<(), ObserverError> {
             string(&entry["checkout"], &format!("{entry_label}.checkout"))?;
             string(&entry["path"], &format!("{entry_label}.path"))?;
             if entry["bytes"].as_u64().is_none() {
-                return Err(invalid(format!("{entry_label}.bytes must be an integer >= 0")));
+                return Err(invalid(format!(
+                    "{entry_label}.bytes must be an integer >= 0"
+                )));
             }
             digest(&entry["sha256"], 64, &format!("{entry_label}.sha256"))?;
             let disposition = string(&entry["disposition"], &format!("{entry_label}.disposition"))?;
@@ -476,10 +478,15 @@ fn validate_handoff(value: &Value, label: &str) -> Result<(), ObserverError> {
                 &entry_label,
             )?;
             string(&entry["checkout"], &format!("{entry_label}.checkout"))?;
-            string(&entry["archive_root"], &format!("{entry_label}.archive_root"))?;
+            string(
+                &entry["archive_root"],
+                &format!("{entry_label}.archive_root"),
+            )?;
             string(&entry["path"], &format!("{entry_label}.path"))?;
             if entry["bytes"].as_u64().is_none() {
-                return Err(invalid(format!("{entry_label}.bytes must be an integer >= 0")));
+                return Err(invalid(format!(
+                    "{entry_label}.bytes must be an integer >= 0"
+                )));
             }
             digest(&entry["sha256"], 64, &format!("{entry_label}.sha256"))?;
             archive_count += 1;

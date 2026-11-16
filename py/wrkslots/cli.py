@@ -57991,7 +57991,7 @@ def _cmd_finish(args: argparse.Namespace) -> int:
             total_ignored = sum(
                 item.size for files in ignored_sink.values() for item in files
             )
-            archives: dict[str, dict[str, object]] = {}
+            ignored_archive_map: dict[str, dict[str, object]] = {}
             if ignored_mode == "archive":
                 if total_ignored > _IGNORED_ARCHIVE_LIMIT_BYTES:
                     raise Refusal(
@@ -58001,9 +58001,9 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                         "--discard-ignored. state: REFUSED -- no handoff was recorded"
                     )
                 resolved_root = _default_salvage_archive_root(config)
-                for name in sorted(ignored_sink):
-                    checkout_obj, checkout_path = ignored_checkouts[name]
-                    archives[name] = _archive_ignored_files(
+                for ignored_name in sorted(ignored_sink):
+                    checkout_obj, checkout_path = ignored_checkouts[ignored_name]
+                    ignored_archive_map[ignored_name] = _archive_ignored_files(
                         config,
                         resolved_root,
                         record.machine,
@@ -58011,24 +58011,24 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                         record.generation,
                         checkout_obj,
                         checkout_path,
-                        ignored_sink[name],
+                        ignored_sink[ignored_name],
                     )
-            for name in sorted(ignored_sink):
-                for item in ignored_sink[name]:
+            for ignored_name in sorted(ignored_sink):
+                for ignored_file in ignored_sink[ignored_name]:
                     ignored_entries.append(
                         HandoffIgnoredFile(
-                            checkout=name,
-                            path=item.path,
-                            size=item.size,
-                            sha256=item.sha256,
+                            checkout=ignored_name,
+                            path=ignored_file.path,
+                            size=ignored_file.size,
+                            sha256=ignored_file.sha256,
                             disposition=disposition,
                         )
                     )
-                if name in archives:
-                    archive = archives[name]
+                if ignored_name in ignored_archive_map:
+                    archive = ignored_archive_map[ignored_name]
                     ignored_archive_entries.append(
                         HandoffIgnoredArchive(
-                            checkout=name,
+                            checkout=ignored_name,
                             archive_root=_as_str(
                                 archive["archive_root"], "ignored archive root"
                             ),
@@ -58105,13 +58105,13 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         print(f"unaccounted {sha} {subject}")
     for bundle_path in bundle_paths:
         print(f"discard_bundle={bundle_path}")
-    for item in ignored_entries:
+    for ignored_entry in ignored_entries:
         print(
-            f"ignored checkout={item.checkout} path={item.path} "
-            f"bytes={item.size} sha256={item.sha256} disposition={item.disposition}"
+            f"ignored checkout={ignored_entry.checkout} path={ignored_entry.path} "
+            f"bytes={ignored_entry.size} sha256={ignored_entry.sha256} disposition={ignored_entry.disposition}"
         )
-    for item in ignored_archive_entries:
-        print(f"ignored_archive checkout={item.checkout} path={item.path}")
+    for ignored_archive in ignored_archive_entries:
+        print(f"ignored_archive checkout={ignored_archive.checkout} path={ignored_archive.path}")
     print(
         f"recorded handoff slot={record.slot} generation={record.generation}; "
         "physical storage retained"

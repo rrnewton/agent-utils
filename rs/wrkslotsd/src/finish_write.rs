@@ -1505,10 +1505,19 @@ pub(crate) fn snapshot_provisioned(path: &Path) -> Result<Vec<Value>> {
 /// Name a changed provisioned path and how to restore it (#1686),
 /// mirroring the Python edition's `_provisioned_changed_refusal`.
 pub(crate) fn provisioned_changed_refusal(name: &str, entry: &Value) -> String {
-    let path = entry.get("path").and_then(Value::as_str).unwrap_or_default();
-    let kind = entry.get("kind").and_then(Value::as_str).unwrap_or_default();
+    let path = entry
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let kind = entry
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let (recorded, restore) = if kind == "symlink" {
-        let target = entry.get("target").and_then(Value::as_str).unwrap_or_default();
+        let target = entry
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         (
             format!("recorded symlink -> {target}"),
             format!("recreate it exactly with: ln -s {target} {path}"),
@@ -1519,7 +1528,10 @@ pub(crate) fn provisioned_changed_refusal(name: &str, entry: &Value) -> String {
             "restore the directory exactly as provisioning left it (same files, contents and links)".to_string(),
         )
     } else {
-        let sha = entry.get("sha256").and_then(Value::as_str).unwrap_or_default();
+        let sha = entry
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         (
             format!("recorded file sha256 {sha}"),
             "restore the file exactly as provisioning left it (same bytes)".to_string(),
@@ -1880,15 +1892,11 @@ pub(crate) fn assert_checkout_safe_judged(
             return Err(provisioned_changed_refusal(&name, entry));
         }
     }
-    let mut ignored_sink = ignored_sink;
     if let Some(expected) = expected {
         // A remove recheck of a finish-recorded decision (#1686).
         let collected = crate::remove_write::ignored_files_outside_caches(config, &name, &path)?;
-        let mut filtered = crate::remove_write::finish_ignored_subset(
-            collected,
-            &tolerated,
-            &allowlist,
-        );
+        let mut filtered =
+            crate::remove_write::finish_ignored_subset(collected, &tolerated, &allowlist);
         filtered.retain(|item| {
             !nested_prefixes.iter().any(|prefix| {
                 item.path == *prefix
@@ -1910,9 +1918,7 @@ pub(crate) fn assert_checkout_safe_judged(
         if !status.is_empty() {
             status.push('\n');
         }
-    } else if !status.is_empty()
-        && ignored_mode != crate::remove_write::IgnoredMode::Refuse
-    {
+    } else if !status.is_empty() && ignored_mode != crate::remove_write::IgnoredMode::Refuse {
         // Finish with --archive-ignored/--discard-ignored (#1686): only
         // ignored lines may remain; tracked or untracked work refuses.
         let blocking: Vec<&str> = status
@@ -1925,11 +1931,8 @@ pub(crate) fn assert_checkout_safe_judged(
             ));
         }
         let collected = crate::remove_write::ignored_files_outside_caches(config, &name, &path)?;
-        let mut filtered = crate::remove_write::finish_ignored_subset(
-            collected,
-            &tolerated,
-            &allowlist,
-        );
+        let mut filtered =
+            crate::remove_write::finish_ignored_subset(collected, &tolerated, &allowlist);
         filtered.retain(|item| {
             !nested_prefixes.iter().any(|prefix| {
                 item.path == *prefix
@@ -1939,7 +1942,7 @@ pub(crate) fn assert_checkout_safe_judged(
             })
         });
         if !filtered.is_empty() {
-            if let Some(sink) = ignored_sink.as_deref_mut() {
+            if let Some(sink) = ignored_sink {
                 sink.insert(name.clone(), filtered);
             }
         }
@@ -2273,8 +2276,13 @@ fn gather_finish_accounting(
     record: &Value,
     slot_path: &Path,
 ) -> Result<(Vec<Value>, Vec<AccountingEntry>)> {
-    let (final_checkouts, entries, _ignored) =
-        gather_finish_accounting_judged(cfg, config, record, slot_path, crate::remove_write::IgnoredMode::Refuse)?;
+    let (final_checkouts, entries, _ignored) = gather_finish_accounting_judged(
+        cfg,
+        config,
+        record,
+        slot_path,
+        crate::remove_write::IgnoredMode::Refuse,
+    )?;
     Ok((final_checkouts, entries))
 }
 
@@ -2310,8 +2318,7 @@ fn gather_finish_accounting_judged(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut ignored_sink: BTreeMap<String, Vec<crate::remove_write::IgnoredFile>> =
-        BTreeMap::new();
+    let mut ignored_sink: BTreeMap<String, Vec<crate::remove_write::IgnoredFile>> = BTreeMap::new();
     for checkout in &checkouts_now {
         let repository_raw = checkout
             .get("repository")
@@ -2466,7 +2473,6 @@ fn prepare_finish_accounting(
 }
 
 /// Record the finish handoff for the named slot.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_slot(
     root: Option<&Path>,
@@ -2637,9 +2643,9 @@ pub(crate) fn finish_slot(
         })
         .collect::<Result<Vec<_>>>()?;
     if ignored_mode != crate::remove_write::IgnoredMode::Refuse
-        && checkouts_now.iter().any(|checkout| {
-            checkout.get("vcs").and_then(Value::as_str) == Some("eden")
-        })
+        && checkouts_now
+            .iter()
+            .any(|checkout| checkout.get("vcs").and_then(Value::as_str) == Some("eden"))
     {
         return Err(
             "--archive-ignored and --discard-ignored apply to Git checkouts only; Eden checkouts keep refusing ignored content. state: REFUSED -- no handoff was recorded"
@@ -2657,13 +2663,7 @@ pub(crate) fn finish_slot(
                 BTreeMap::new(),
             )
         }
-        _ => gather_finish_accounting_judged(
-            &cfg,
-            &config,
-            &record,
-            &slot_path,
-            ignored_mode,
-        )?,
+        _ => gather_finish_accounting_judged(&cfg, &config, &record, &slot_path, ignored_mode)?,
     };
     let (landed_count, open_count, unaccounted) = accounting_totals(&entries);
     if !unaccounted.is_empty() && !discard_unaccounted {

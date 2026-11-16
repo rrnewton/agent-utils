@@ -2088,9 +2088,8 @@ pub(crate) fn finish_ignored_subset(
                 .collect();
             !allowlist.iter().any(|pattern| {
                 let pattern_parts = crate::finish_write::glob_parts(pattern);
-                (1..=parts.len()).any(|end| {
-                    crate::finish_write::glob_parts_match(&pattern_parts, &parts[..end])
-                })
+                (1..=parts.len())
+                    .any(|end| crate::finish_write::glob_parts_match(&pattern_parts, &parts[..end]))
             })
         })
         .collect()
@@ -3144,6 +3143,7 @@ fn private_history_refusal(slot: &str, sub_name: &str, history: &PrivateHistory)
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn salvage_gate(
     cfg: &Cfg,
     config: &Value,
@@ -3177,9 +3177,7 @@ fn salvage_gate(
         .map(|items| {
             items
                 .iter()
-                .filter(|item| {
-                    item.get("checkout").and_then(Value::as_str) == Some(name.as_str())
-                })
+                .filter(|item| item.get("checkout").and_then(Value::as_str) == Some(name.as_str()))
                 .collect()
         })
         .unwrap_or_default();
@@ -3204,9 +3202,7 @@ fn salvage_gate(
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| {
-                        item.get("path").and_then(Value::as_str).map(str::to_string)
-                    })
+                    .filter_map(|item| item.get("path").and_then(Value::as_str).map(str::to_string))
                     .collect()
             })
             .unwrap_or_default();
@@ -3229,7 +3225,9 @@ fn salvage_gate(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    item.get("bytes").and_then(Value::as_u64).unwrap_or_default(),
+                    item.get("bytes")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
                     item.get("sha256")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
