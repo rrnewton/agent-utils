@@ -2666,6 +2666,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1714 vibe-talk-split-parts-not-regrouped` in the browser engine, at 412x915 by touch and
+  # 1280x800 with a mouse, in a thread: the three parts of one bridge reply (1.4 s and 1.7 s
+  # apart, one bot author) are three rows with Combine messages off — the owner's state — and
+  # one row standing for all three ids when it is turned on, no row wider than the screen, and
+  # no page error.
+  - group: check
+    job: thread-split-regroup-browser
+    desc: three parts of one bridge reply in a thread regroup when Combine messages is turned on, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_split_regroup_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 6
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#377 compact-collapsed-rows` in the browser engine, at 393x852 by touch and 1280x800 with a mouse, in
   # All: every collapsed row's header is one line inside its row (the name cut by an ellipsis, never under
   # a few letters; the time; the Thread tag; ⋯) with no Reply, Done, Unarchive or Not noise drawn or in the

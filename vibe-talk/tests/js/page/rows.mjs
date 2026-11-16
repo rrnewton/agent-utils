@@ -3220,6 +3220,72 @@ test("...and two messages seconds apart from DIFFERENT AUTHORS stay two rows", a
   assert.equal(rows.length, 2, "two authors were drawn as one speaker");
 });
 
+// `#1714 vibe-talk-split-parts-not-regrouped`. The owner's report, in the shape Slack really
+// leaves it: one long bridge reply posted as three thread replies 1.4 s and 1.7 s apart by the
+// bridge app. On the stored copies every combining condition holds (one thread, one bot author,
+// adjacent, inside the window), so in every view and on live arrival they are one row — and
+// with Combine messages off they stay three rows, which is the switch doing what it says.
+/** The three parts of one bridge reply in a thread, 1.4 s and 1.7 s apart, and their root. */
+function threadedSplitPost() {
+  const at = (ms) => new Date(Date.parse("2026-08-19T04:31:00.000Z") + ms).toISOString();
+  const thread = { id: "1714000000.000100", root_message_id: "1714000000000000001", is_root: true,
+    reply_count: 3, reply_count_exact: true };
+  const root = message({ id: "1714000000000000001", content: "the root question", timestamp: at(0),
+    thread, author: "owner", author_id: "171401", author_is_bot: false });
+  const part = (id, content, ms) => message({ id, content, timestamp: at(ms),
+    thread: { ...thread, is_root: false }, ...CODER });
+  const parts = [part("1714000000000000002", "part one of the reply", 10000),
+    part("1714000000000000003", "part two of the reply", 11401),
+    part("1714000000000000004", "part three of the reply", 13136)];
+  return { thread, root, parts, messages: [root, ...parts] };
+}
+
+/** A page holding `data`'s thread. Signed in, unless `live` — `withLiveChannel` signs in itself. */
+async function threadedSplitPage(live = false) {
+  const data = threadedSplitPost();
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = [{ id: data.thread.id, root: data.root, reply_count: 3, reply_count_exact: true,
+    updated_at: data.parts[2].timestamp }];
+  if (!live) await signIn(page);
+  return { page, data };
+}
+
+const rowIds = (page) => [...page.el("discord-log").children].map((li) => li.getAttribute("data-ids"));
+
+test("`#1714 vibe-talk-split-parts-not-regrouped`: THREE PARTS OF ONE BRIDGE REPLY IN A THREAD ARE ONE ROW, read in the thread and in All", async () => {
+  const { page, data } = await threadedSplitPage();
+  await showDiscord(page, data.messages);
+  assert.deepEqual(rowIds(page), ["1714000000000000001", "1714000000000000002 1714000000000000003 1714000000000000004"],
+    "the parts were not combined in All");
+  await pickThread(page, `thread:${data.thread.id}`);
+  assert.deepEqual(rowIds(page), ["1714000000000000001", "1714000000000000002 1714000000000000003 1714000000000000004"],
+    "the parts were not combined in the thread");
+});
+
+test("`#1714 vibe-talk-split-parts-not-regrouped`: ...AND AS THEY ARRIVE LIVE IN THE THREAD", async () => {
+  const { page, data } = await threadedSplitPage(true);
+  const stream = await withLiveChannel(page, [data.root]);
+  await pickThread(page, `thread:${data.thread.id}`);
+  for (const part of data.parts) await deliver(page, stream, sseMessage(part));
+  assert.deepEqual(rowIds(page), ["1714000000000000001", "1714000000000000002 1714000000000000003 1714000000000000004"],
+    "the parts arriving live were not combined");
+});
+
+test("`#1714 vibe-talk-split-parts-not-regrouped`: WITH COMBINE MESSAGES OFF THE PARTS STAY THREE ROWS, and come together when it is turned on", async () => {
+  const { page, data } = await threadedSplitPage();
+  await showDiscord(page, data.messages);
+  await page.el("combine-messages").setChecked(false);
+  await page.settle();
+  assert.deepEqual(rowIds(page),
+    ["1714000000000000001", "1714000000000000002", "1714000000000000003", "1714000000000000004"],
+    "the parts were combined with Combine messages off");
+  await page.el("combine-messages").setChecked(true);
+  await page.settle();
+  assert.deepEqual(rowIds(page), ["1714000000000000001", "1714000000000000002 1714000000000000003 1714000000000000004"],
+    "the parts did not combine when Combine messages was turned on");
+});
+
 test("`#1557 discord-split-merge-regression`: A POST THE PLUGIN SPLIT AT THE DISCORD CAP IS ONE ROW", async () => {
   // The owner's report, in the shape Discord really leaves it: three chunks at the 2,000-char
   // cap, the first answering the prompt, each its own unanswered potential root on the server.
