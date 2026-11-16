@@ -6,6 +6,16 @@ For the assigned recovery automation work, publish fixes as pull requests as
 explicitly requested by the owner. This supersedes direct-to-main publication
 for this lane only; validation and linear history requirements still apply.
 
+The coordinator's November 16, 2026, 2:05pm ET instruction explicitly authorizes
+rebasing the recovery branch to remove the six tool paths extracted into
+#339 workspace-json-features, while retaining the canonical numeric-hash and
+agentctl fixes. Publish this rewrite only to `codex/recovery-reconciler` with
+an exact expected-SHA lease. This supersedes the no-force-push rule below only
+for this requested rewrite; it does not permit rewriting main or another
+lane's branch, or modifying the extraction PR. For this extraction checkpoint,
+the requested focused regression tests precede publication; complete current-head
+validation remains separately pending and must not be described as green.
+
 ## Publication Policy
 
 Routine changes to this repository go directly to `rrnewton/agent-utils:main`.
