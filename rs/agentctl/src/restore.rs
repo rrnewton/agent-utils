@@ -3564,6 +3564,9 @@ pub fn restore<A: ManagedApi + ?Sized>(
             let options = DrainOptions {
                 ready_timeout: Duration::from_secs(60),
                 deliver_while_working: true,
+                deadline: Some(Duration::from_secs(10)),
+                lock_timeout: Some(Duration::from_secs(1)),
+                max_items: Some(1),
                 ..DrainOptions::default()
             };
             report["notice"] = match manager.send_identified(
@@ -4581,13 +4584,19 @@ fn alert<A: ManagedApi + ?Sized>(
             DrainOptions {
                 ready_timeout: Duration::from_secs(30),
                 deliver_while_working: true,
+                deadline: Some(Duration::from_secs(10)),
+                lock_timeout: Some(Duration::from_secs(1)),
+                max_items: Some(1),
                 ..DrainOptions::default()
             },
             Some(&message_id),
-            None,
+            Some("watch-health"),
         )
     });
-    for row in &due {
+    let delivered = result
+        .as_ref()
+        .is_ok_and(|result| result.delivered.contains(&message_id));
+    for row in due.iter().filter(|_| delivered) {
         let key = format!(
             "{}:{}",
             row["check"].as_str().unwrap_or(""),
@@ -4597,7 +4606,7 @@ fn alert<A: ManagedApi + ?Sized>(
     }
     match result {
         Ok(result) => {
-            json!({"sent": true, "message_id": message_id, "outcome": json!(result)["outcome"]})
+            json!({"sent": delivered, "message_id": message_id, "outcome": json!(result)["outcome"]})
         }
         Err(error) => json!({"sent": false, "message_id": message_id, "reason": error.to_string()}),
     }

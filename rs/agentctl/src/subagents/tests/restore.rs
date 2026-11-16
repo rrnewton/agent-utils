@@ -3921,3 +3921,47 @@ fn automatic_recovery_never_discovers_an_unrecorded_shared_directory_session() {
         .contains("never infer ownership"));
     assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
 }
+
+#[test]
+fn watch_writes_health_when_coordinator_lifecycle_is_locked() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "coordinator",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let mut config = config(&fixture, Some("coordinator"));
+    config.duties.queue_drain = false;
+    config.duties.tab_hygiene = false;
+    let registry = fixture.root.join("registry");
+    let options = WatchOptions {
+        once: true,
+        state_dir: Some(fixture.root.join("watch")),
+        ..repair_watch_options()
+    };
+    let manager = fixture.manager();
+    let _held = manager.lock("coordinator").unwrap();
+    let started = std::time::Instant::now();
+    let health = crate::restore::watch(
+        &fixture.client,
+        &registry,
+        &ScriptedHost::new(),
+        &config,
+        &options,
+    )
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_eq!(health["notice"]["sent"], false, "{health}");
+    assert!(
+        health["alerted"].as_object().unwrap().is_empty(),
+        "failed sends must retry"
+    );
+    assert!(fixture.root.join("watch/health.json").is_file());
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+}
