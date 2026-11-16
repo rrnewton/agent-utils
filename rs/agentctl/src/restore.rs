@@ -4540,6 +4540,17 @@ fn health_path(options: &WatchOptions) -> Option<PathBuf> {
         .map(|dir| dir.join("health.json"))
 }
 
+fn queue_owned_notice_budget(findings: &[Value], coordinator: Option<&str>) -> bool {
+    coordinator.is_some()
+        && findings.iter().any(|row| {
+            row["check"] == "queue"
+                && row["subject"].as_str() == coordinator
+                && row["repair"]["queued"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+        })
+}
+
 /// Tell the coordinator about failing findings, each at most once an hour, when it can hear.
 fn alert<A: ManagedApi + ?Sized>(
     client: &A,
@@ -4548,7 +4559,17 @@ fn alert<A: ManagedApi + ?Sized>(
     host: &dyn Host,
     findings: &[Value],
     alerted: &mut BTreeMap<String, f64>,
+    queue_max_items: Option<usize>,
 ) -> Value {
+    if queue_max_items.is_some()
+        && queue_owned_notice_budget(findings, config.coordinator.as_deref())
+    {
+        // send_identified also drains older queued prompts. Reserve this
+        // pass for the bounded queue drain, even if it used less than its
+        // cap: concurrent enqueues make queue-length differences inexact.
+        // Findings still go to stderr/health.json and retry next pass.
+        return json!({"sent": false, "reason": "queue delivery owns this pass's prompt budget; alert deferred to next pass"});
+    }
     let now = host.now();
     let due = findings
         .iter()
@@ -4941,7 +4962,15 @@ pub fn watch<A: ManagedApi + ?Sized>(
         } else if options.check_only {
             json!({"sent": false, "reason": "check only"})
         } else {
-            alert(client, registry, config, host, &findings, &mut alerted)
+            alert(
+                client,
+                registry,
+                config,
+                host,
+                &findings,
+                &mut alerted,
+                options.queue_max_items,
+            )
         };
         let line = |row: &Value| {
             format!(
@@ -5016,6 +5045,21 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn bounded_queue_pass_reserves_its_coordinator_notice_budget() {
+        let rows = vec![finding(
+            "queue",
+            "lead",
+            true,
+            "typed three",
+            json!({"queued": 5, "typed": 3, "remaining": 2}),
+        )];
+        assert!(queue_owned_notice_budget(&rows, Some("lead")));
+        assert!(!queue_owned_notice_budget(&rows, Some("other")));
+        assert!(!queue_owned_notice_budget(&rows, None));
+        assert!(!queue_owned_notice_budget(&[], Some("lead")));
+    }
 
     #[test]
     fn restore_notice_keeps_durable_delivery_failures_visible() {
