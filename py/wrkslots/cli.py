@@ -13690,20 +13690,42 @@ def _classify_create_journal(
                 f"state: owner={owner_state} ({owner_detail}); "
                 f"coordinator={coordinator_state} ({coordinator_detail})"
             )
-    (
-        machine,
-        slot,
-        agent,
-        slot_type,
-        slot_path,
-        planned,
-        created,
-        observed,
-        dirty,
-        hook_drift,
-    ) = _create_journal_items(
-        config, raw, states, archives, completed=completed
-    )
+    try:
+        (
+            machine,
+            slot,
+            agent,
+            slot_type,
+            slot_path,
+            planned,
+            created,
+            observed,
+            dirty,
+            hook_drift,
+        ) = _create_journal_items(
+            config, raw, states, archives, completed=completed
+        )
+    except StateError as error:
+        # #1436: a content-integrity failure of a provenance-verified
+        # create journal (its shape, plan and progress were checked
+        # against its own recorded hooks above) refuses only
+        # operations on its own slot. A caller that named a different
+        # slot skips it. Untrusted provenance, indeterminate or
+        # disagreeing liveness, archive and publication conflicts,
+        # and non-create journals all raised before this point and
+        # keep refusing host-wide.
+        named_slot = raw.get("slot")
+        if (
+            requested_slot is not None
+            and isinstance(named_slot, str)
+            and named_slot != requested_slot
+            and "has already reached ACTIVE publication" not in str(error)
+            and "conflicts with an archive" not in str(error)
+        ):
+            if skipped_paths is not None and path not in skipped_paths:
+                skipped_paths.append(path)
+            return None
+        raise
     rebound_coordinator_state, _rebound_coordinator_detail = _process_state(coordinator)
     rebound_owner_state, _rebound_owner_detail = _create_journal_owner_state(
         owner, rebound_coordinator_state
@@ -14766,52 +14788,6 @@ def _cmd_recover_tail_event(args: argparse.Namespace) -> int:
     return 0
 
 
-def _journal_slot_for_scoping(path: Path) -> str | None:
-    """The slot one journal provably concerns, for scoped refusal (#1436).
-
-    A scoped ``CREATE.``/``FINISH.`` filename names its slot; any
-    other journal must name it in bytes that parse. A journal that
-    proves no slot keeps the host-wide refusal, because no operation
-    can show it is unrelated.
-    """
-
-    for prefix in ("CREATE.", "FINISH."):
-        if not path.name.startswith(prefix):
-            continue
-        rest = path.name[len(prefix) :]
-        digits, separator, rest = rest.partition(".")
-        if not separator or not digits.isdigit():
-            return None
-        length = int(digits)
-        machine, remainder = rest[:length], rest[length:]
-        if len(machine) != length or not remainder.startswith("."):
-            return None
-        slot_digits, separator, slot = remainder[1:].partition(".")
-        if (
-            not separator
-            or not slot_digits.isdigit()
-            or not slot.endswith(".journal")
-            or len(slot[: -len(".journal")]) != int(slot_digits)
-        ):
-            return None
-        return slot[: -len(".journal")]
-    try:
-        raw: object = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    named = raw.get("slot")
-    if isinstance(named, str) and named:
-        return named
-    record = raw.get("record")
-    if isinstance(record, dict):
-        named = record.get("slot")
-        if isinstance(named, str) and named:
-            return named
-    return None
-
-
 def _classify_create_journals(
     config: Config,
     states: Sequence[ActiveState],
@@ -14840,18 +14816,6 @@ def _classify_create_journals(
         except _JournalBusy:
             raise
         except Refusal as error:
-            # #1436: a stranded or unclassifiable journal refuses
-            # only operations on its own slot. A caller that named
-            # the slot it operates on skips a journal that provably
-            # concerns a different slot; the stranded slot's own
-            # operations, and any journal that proves no slot, keep
-            # the host-fault refusal with its remedy.
-            if requested_slot is not None:
-                journal_slot = _journal_slot_for_scoping(path)
-                if journal_slot is not None and journal_slot != requested_slot:
-                    if skipped_paths is not None and path not in skipped_paths:
-                        skipped_paths.append(path)
-                    continue
             raise _journal_classification_refusal(path, error) from error
         if row is not None:
             classified.append(row)

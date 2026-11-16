@@ -1744,18 +1744,36 @@ fn classify_create_journals_inner(
         // disjoint from the requested slot, which is skipped.  A busy
         // result stays bare and retryable; every other per-journal
         // refusal names its journal as a host fault (#1086).
-        // #1436: a stranded or unclassifiable journal refuses only
-        // operations on its own slot; one that provably concerns a
-        // different slot is skipped, never a host fault here.
+        // #1436: only a content-integrity failure of a
+        // provenance-verified create journal for a different slot
+        // is skipped. Untrusted provenance, indeterminate liveness,
+        // archive/publication conflicts and non-create journals
+        // keep refusing host-wide, as in the Python edition.
+        const HOST_WIDE: &[&str] = &[
+            "append-only",
+            "reused after completion",
+            "reopened with the identity",
+            "completion has no preceding progress",
+            "indeterminate",
+            "disagreeing process state",
+            "conflicts with an archive",
+            "has already reached ACTIVE publication",
+            "cannot coexist",
+            "changed liveness while read",
+            "changed while it was classified",
+            "still names it",
+        ];
         let row = match classify_one(&cfg, &config, path, &states, &archives, &slot, slot_type) {
             Ok(row) => row,
             Err(error) => {
                 if error.starts_with("busy:") {
                     return Err(ClassifyError::Other(error));
                 }
-                if let Some(journal_slot) = journal_slot_for_scoping(path) {
-                    if journal_slot != slot {
-                        continue;
+                if !HOST_WIDE.iter().any(|marker| error.contains(marker)) {
+                    if let Some(journal_slot) = journal_slot_for_scoping(path) {
+                        if journal_slot != slot {
+                            continue;
+                        }
                     }
                 }
                 return Err(ClassifyError::Other(journal_refusal(path, &error)));

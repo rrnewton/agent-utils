@@ -32320,9 +32320,16 @@ def test_unclassifiable_create_journal_blocks_only_its_own_slot(
     assert refused.returncode != 0, refused.stderr
     journal = create_journal_path(project)
     assert journal.is_file()
-    raw = json.loads(journal.read_text(encoding="utf-8"))
-    raw["hook_progress"] = 999
-    journal.write_text(json.dumps(raw), encoding="utf-8")
+    # A provenance-valid but unclassifiable journal: the progress
+    # bound breaks against its own recorded hooks, recorded through
+    # the journal writer so append-only evidence agrees.
+    config = wrkslots._load_config(str(project), "testhost")
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    changed = dict(raw)
+    changed["hook_progress"] = 999
+    wrkslots._write_journal(config, changed, journal_path=journal)
     _set_post_provision_hooks(project, ["true"])
 
     made = create(project, slot="slot02", agent="codex-2", branch="codex/other")
