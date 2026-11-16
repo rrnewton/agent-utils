@@ -6,6 +6,7 @@
 //! `extra.headless.session`, and the harness arguments in `arguments`.
 
 use super::*;
+use crate::headless::adapter::HarnessAdapter as _;
 use crate::headless::{self as hl, claude, control as hcontrol, events, wrapper};
 
 mod takeover;
@@ -58,6 +59,9 @@ pub struct HeadlessStart {
     pub purpose: Option<String>,
     /// Record the calling agent as creator and manager.
     pub record_edges: bool,
+    /// Muse transport (`serve` or `exec`), recorded for Muse agents;
+    /// `None` selects the harness default. Never switched at runtime.
+    pub transport: Option<String>,
 }
 
 impl AgentRecord {
@@ -341,10 +345,22 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .duration_since(UNIX_EPOCH)
             .map_err(|error| fail(error.to_string()))?;
         let mut extra = BTreeMap::new();
-        extra.insert(
-            "headless".to_owned(),
-            json!({"schema": SPEC_SCHEMA, "harness": options.harness, "session": session}),
-        );
+        let mut spec =
+            json!({"schema": SPEC_SCHEMA, "harness": options.harness, "session": session});
+        if let Some(transport) = options.transport.as_deref() {
+            let parsed = hl::muse::Transport::parse(transport).ok_or_else(|| {
+                fail(format!(
+                    "headless Muse transport is \"serve\" or \"exec\", not {transport:?}"
+                ))
+            })?;
+            if options.harness != "muse" {
+                return Err(fail(
+                    "--transport applies only to a headless Muse (--harness muse)".to_owned(),
+                ));
+            }
+            spec["transport"] = json!(parsed.as_str());
+        }
+        extra.insert("headless".to_owned(), spec);
         let mut record = AgentRecord {
             storage_directory: None,
             nested: None,
@@ -613,6 +629,33 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             config.tool_preview_lines = adapter.preview_lines();
             config.config_directory = adapter.config_directory();
             config.adapter = adapter;
+        }
+        // A Muse recorded on the exec transport runs the per-turn relay
+        // (selected at start, never switched at runtime): the wrapper's
+        // harness process is this binary's internal relay, which drives
+        // one `muse exec --json` per prompt behind the same adapter.
+        let recorded_transport = record
+            .extra
+            .get("headless")
+            .and_then(|spec| spec["transport"].as_str())
+            .and_then(hl::muse::Transport::parse);
+        if recorded_transport == Some(hl::muse::Transport::Exec) {
+            let relay = hl::muse::MuseHarness::exec();
+            if claude_bin.is_none() {
+                config.command = vec![relay.default_binary().to_owned()];
+            }
+            let harness_bin = config.command[0].clone();
+            let executable = std::env::current_exe()
+                .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
+            config.command = vec![
+                executable.display().to_string(),
+                "headless-muse-exec-relay".to_owned(),
+                "--muse-bin".to_owned(),
+                harness_bin,
+            ];
+            config.tool_preview_lines = relay.preview_lines();
+            config.config_directory = relay.config_directory();
+            config.adapter = std::sync::Arc::new(relay);
         }
         if let Some(bin) = claude_bin {
             // Spawn the launcher as given (#1221 follow-up): canonicalising

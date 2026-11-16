@@ -468,15 +468,16 @@ impl HarnessAdapter for MuseHarness {
             "mid_turn_input": self.transport == Transport::Serve,
             "input_lifecycle": "by-caller-id",
             "receiver_record": "session-journal",
-            "interrupt": self.transport == Transport::Serve,
+            "interrupt": true,
             "cancel_queued": self.transport == Transport::Serve,
-            "compact": "command",
+            "compact": if self.transport == Transport::Serve { "command" } else { "prompt" },
             "resume": "session-id",
             "self_started_turns": false,
             "send_boundary": "acceptance",
             "settle_on": "started",
             "streams_text": "per-message",
-            "approvals": true,
+            "tool_events": self.transport == Transport::Serve,
+            "approvals": self.transport == Transport::Serve,
             "user_input": false,
         })
     }
@@ -488,10 +489,36 @@ impl HarnessAdapter for MuseHarness {
     fn launch_arguments(
         &self,
         _resume: bool,
-        _session: &str,
+        session: &str,
         arguments: &[String],
         _approvals: bool,
     ) -> Vec<String> {
+        if self.transport == Transport::Exec {
+            // The wrapper's harness process is the exec relay (this
+            // binary's internal `headless-muse-exec-relay`); it takes
+            // the recorded session and the model, and the effort per turn.
+            let mut argv = vec!["--session".to_owned(), session.to_owned()];
+            let mut iter = arguments.iter();
+            while let Some(argument) = iter.next() {
+                match argument.as_str() {
+                    "--effort" => {
+                        let _ = iter.next();
+                    }
+                    "--model" | "--provider" => {
+                        argv.push(argument.clone());
+                        if let Some(value) = iter.next() {
+                            argv.push(value.clone());
+                        }
+                    }
+                    other if other.starts_with("--effort=") => {}
+                    other if other.starts_with("--model=") => argv.push(other.to_owned()),
+                    other if other.starts_with("--provider=") => argv.push(other.to_owned()),
+                    other if other.starts_with("--provider") => argv.push(other.to_owned()),
+                    _ => {}
+                }
+            }
+            return argv;
+        }
         // `muse serve` takes its model (and provider) at launch; the
         // declared effort is per-turn on the wire, never a serve flag,
         // and approval mode is selected per session in the handshake.
@@ -528,6 +555,11 @@ impl HarnessAdapter for MuseHarness {
         _effort: Option<&str>,
         approvals: bool,
     ) -> Vec<String> {
+        if self.transport == Transport::Exec {
+            // The relay opens the session itself and reports it as the
+            // same `Init` the serve handshake produces.
+            return Vec::new();
+        }
         if let Ok(mut cached) = self.session.lock() {
             *cached = Some(session.to_owned());
         }
@@ -556,6 +588,12 @@ impl HarnessAdapter for MuseHarness {
     }
 
     fn input_line(&self, uuid: &str, text: &str, session: &str, effort: Option<&str>) -> String {
+        if self.transport == Transport::Exec {
+            // One relay instruction; the relay runs one `muse exec`.
+            return line(json!({
+                "relay": "turn", "id": uuid, "text": text, "effort": effort,
+            }));
+        }
         if text == "/compact" {
             return line(json!({
                 "jsonrpc": "2.0", "id": uuid, "method": "session/compact",
@@ -599,6 +637,10 @@ impl HarnessAdapter for MuseHarness {
     }
 
     fn interrupt_line(&self, request_id: &str, session: &str, turn: Option<&str>) -> String {
+        if self.transport == Transport::Exec {
+            // The relay ends the running `muse exec` process group.
+            return line(json!({"relay": "interrupt", "id": request_id}));
+        }
         let mut params = json!({"commandId": uuid_v7(), "sessionId": session});
         if let Some(turn) = turn {
             params["turnId"] = json!(turn);
@@ -662,7 +704,8 @@ impl HarnessAdapter for MuseHarness {
     }
 
     fn asks_wrapper(&self, _arguments: &[String], approvals: bool) -> bool {
-        approvals
+        // `muse exec` has no approval wire; its harness decides alone.
+        approvals && self.transport == Transport::Serve
     }
 
     fn mask_secrets(&self, text: &str) -> String {
@@ -733,6 +776,213 @@ impl HarnessAdapter for MuseHarness {
         }
         Ok(())
     }
+}
+
+/// The exec transport's persistent relay (`agentctl headless-muse-exec-relay`,
+/// an internal subcommand): the wrapper's harness process for a Muse
+/// recorded on the exec transport. It reads one relay instruction per
+/// queue prompt from stdin, runs one `muse exec --json` for it, and
+/// translates the session journal into the same MSP-shaped lines the
+/// serve translation parses — so the wrapper cannot tell the transports
+/// apart except through the declared capabilities. An interrupt
+/// instruction ends the running exec's process group.
+pub fn run_exec_relay(
+    session: &str,
+    muse_bin: &str,
+    model: Option<&str>,
+    provider: Option<&str>,
+) -> i32 {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let stdout = std::io::stdout();
+    let emit = |value: Value| {
+        let mut handle = stdout.lock();
+        let _ = writeln!(handle, "{}", value);
+        let _ = handle.flush();
+    };
+    emit(json!({
+        "id": HELLO_SESSION_ID,
+        "result": {"session": {
+            "sessionId": session,
+            "modelId": model.unwrap_or_default(),
+            "approvalMode": {"mode": "onRequest"},
+        }},
+    }));
+
+    let running: std::sync::Arc<Mutex<Option<u32>>> = std::sync::Arc::new(Mutex::new(None));
+    let interrupted: std::sync::Arc<Mutex<bool>> = std::sync::Arc::new(Mutex::new(false));
+    let (sender, receiver) = mpsc::channel::<String>();
+    {
+        let running = running.clone();
+        let interrupted = interrupted.clone();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            for row in stdin.lock().lines() {
+                let Ok(row) = row else { break };
+                // Interrupts land at once, even mid-turn: end the
+                // running exec's process group from here.
+                if let Ok(instruction) = serde_json::from_str::<Value>(&row) {
+                    if instruction["relay"].as_str() == Some("interrupt") {
+                        if let Some(pid) = running.lock().ok().and_then(|slot| *slot) {
+                            if let Ok(mut flag) = interrupted.lock() {
+                                *flag = true;
+                            }
+                            // SAFETY: pid is the relay's own child,
+                            // spawned in its own process group below.
+                            unsafe {
+                                libc::killpg(pid as i32, libc::SIGTERM);
+                            }
+                        }
+                        let mut handle = std::io::stdout().lock();
+                        let _ = writeln!(
+                            handle,
+                            "{}",
+                            json!({
+                                "id": instruction["id"].as_str().unwrap_or_default(),
+                                "result": {},
+                            })
+                        );
+                        let _ = handle.flush();
+                        continue;
+                    }
+                }
+                if sender.send(row).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    while let Ok(row) = receiver.recv() {
+        let Ok(instruction) = serde_json::from_str::<Value>(&row) else {
+            continue;
+        };
+        if instruction["relay"].as_str() == Some("turn") {
+            {
+                let id = instruction["id"].as_str().unwrap_or_default().to_owned();
+                let text = instruction["text"].as_str().unwrap_or_default().to_owned();
+                emit(json!({
+                    "id": id,
+                    "result": {"disposition": "queued", "turnId": id},
+                }));
+                let mut command = Command::new(muse_bin);
+                command
+                    .args(["exec", "--json", "--session-id", session])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit());
+                if let Some(effort) = instruction["effort"].as_str() {
+                    command.args(["--reasoning-effort", effort]);
+                }
+                if let Some(model) = model {
+                    command.args(["--model", model]);
+                }
+                if let Some(provider) = provider {
+                    command.args(["--provider", provider]);
+                }
+                command.arg(&text);
+                std::os::unix::process::CommandExt::process_group(&mut command, 0);
+                let started = Instant::now();
+                let Ok(mut child) = command.spawn() else {
+                    emit(json!({
+                        "method": "turn/completed",
+                        "params": {"turnId": id, "terminal": "failed"},
+                    }));
+                    continue;
+                };
+                if let Ok(mut slot) = running.lock() {
+                    *slot = Some(child.id());
+                }
+                let mut saw_start = false;
+                let mut final_text = String::new();
+                let mut terminal = "failed".to_owned();
+                let mut usage = json!({});
+                if let Some(out) = child.stdout.take() {
+                    for row in BufReader::new(out).lines() {
+                        let Ok(row) = row else { break };
+                        let Ok(record) = serde_json::from_str::<Value>(&row) else {
+                            continue;
+                        };
+                        let payload = &record["payload"];
+                        match record["payload_type"].as_str() {
+                            Some("run.lifecycle.started") if !saw_start => {
+                                saw_start = true;
+                                emit(json!({
+                                    "method": "turn/started",
+                                    "params": {"turnId": id},
+                                }));
+                            }
+                            Some("run.usage") => {
+                                if let Some(first) = payload["models"]
+                                    .as_array()
+                                    .and_then(|models| models.first())
+                                {
+                                    usage = json!({
+                                        "input_tokens": first["input_tokens"],
+                                        "output_tokens": first["output_tokens"],
+                                        "cache_read_input_tokens": first["cached_tokens"],
+                                        "cache_creation_input_tokens": 0,
+                                    });
+                                }
+                            }
+                            Some("run.terminal.completed") => {
+                                terminal = payload["terminal"]
+                                    .as_str()
+                                    .unwrap_or("completed")
+                                    .to_owned();
+                                final_text =
+                                    payload["text"].as_str().unwrap_or_default().to_owned();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let status = child.wait().ok();
+                if let Ok(mut slot) = running.lock() {
+                    *slot = None;
+                }
+                let _ = status;
+                if interrupted.lock().map(|flag| *flag).unwrap_or(false) {
+                    terminal = "cancelled".to_owned();
+                    if let Ok(mut flag) = interrupted.lock() {
+                        *flag = false;
+                    }
+                }
+                if !saw_start {
+                    emit(json!({
+                        "method": "turn/started",
+                        "params": {"turnId": id},
+                    }));
+                }
+                if !final_text.is_empty() {
+                    emit(json!({
+                        "method": "item/completed",
+                        "params": {"item": {
+                            "itemId": format!("{id}-msg"),
+                            "kind": "agentMessage",
+                            "messagePhase": "finalAnswer",
+                            "status": "completed",
+                            "text": final_text,
+                            "turnId": id,
+                        }, "sessionId": session},
+                    }));
+                }
+                emit(json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "turnId": id,
+                        "terminal": terminal,
+                        "durationMs": started.elapsed().as_millis() as u64,
+                        "usage": usage,
+                    },
+                }));
+            }
+        }
+    }
+    0
 }
 
 #[cfg(test)]

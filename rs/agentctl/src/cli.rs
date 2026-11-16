@@ -336,6 +336,9 @@ enum Commands {
     /// Internal: the pane command of a takeover (holds the headless lock and runs the interactive Claude Code)
     #[command(hide = true)]
     TakeoverHold(TakeoverHold),
+    /// Internal: the headless Muse exec transport's relay (one `muse exec` per prompt, behind the wrapper)
+    #[command(hide = true, name = "headless-muse-exec-relay")]
+    HeadlessMuseExecRelay(MuseExecRelay),
     /// Queue /compact for a headless agent; it runs when the current turn ends and the log records compact.started and compact.completed with token counts
     #[command(after_help = "Example: agentctl compact coordinator")]
     Compact(Named),
@@ -1024,6 +1027,22 @@ struct TakeoverHold {
 }
 
 #[derive(Args)]
+struct MuseExecRelay {
+    /// The recorded Muse session each `muse exec` resumes
+    #[arg(long, value_name = "UUID")]
+    session: String,
+    /// Muse executable
+    #[arg(long, value_name = "PATH", default_value = "muse")]
+    muse_bin: String,
+    /// Model passed to each `muse exec`
+    #[arg(long, value_name = "ID")]
+    model: Option<String>,
+    /// Provider passed to each `muse exec`
+    #[arg(long, value_name = "ID")]
+    provider: Option<String>,
+}
+
+#[derive(Args)]
 struct ApprovalAnswer {
     #[command(flatten)]
     agent: Named,
@@ -1601,6 +1620,9 @@ struct Start {
     /// Extra literal harness argument; repeat or use --harness-arg=--flag
     #[arg(long = "harness-arg", value_name = "ARG")]
     harness_args: Vec<String>,
+    /// Headless Muse only: transport recorded for the agent — serve (one persistent `muse serve` MSP host; default) or exec (one `muse exec` per prompt); never switched at runtime
+    #[arg(long, value_name = "serve|exec")]
+    transport: Option<String>,
     /// Set a literal KEY=VALUE variable in the created interactive Herdr tab; repeatable and omitted from status. A PATH set here is reordered by the pane shell's startup files (and replaced by tmux); give a team tool directory with the top-level launch_env key of profiles.json instead, which every interactive start and revive types into the pane after those files have run
     #[arg(long = "env", value_name = "KEY=VALUE", value_parser = environment_value)]
     environment: Vec<String>,
@@ -5010,6 +5032,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         brief,
                         purpose: start_purpose.clone(),
                         record_edges,
+                        transport: value.transport.clone(),
                     },
                 )?
             } else if mode != "interactive" {
@@ -5599,6 +5622,14 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 &value.token,
                 value.claude_bin.as_deref(),
             )?);
+        }
+        Commands::HeadlessMuseExecRelay(value) => {
+            return Ok(crate::headless::muse::run_exec_relay(
+                &value.session,
+                &value.muse_bin,
+                value.model.as_deref(),
+                value.provider.as_deref(),
+            ));
         }
         Commands::RunHeadless(value) => {
             let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
