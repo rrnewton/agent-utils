@@ -1139,7 +1139,7 @@ fn create_slot_inner(
         let (stored_repository, repository, _resolved) =
             crate::active_state::stored_repository_parts(&cfg, raw_repository)?;
         let top = git(&repository, &["rev-parse", "--show-toplevel"])?;
-        if top != repository {
+        if Path::new(&top) != repository {
             return Err(format!(
                 "repository path is not its Git worktree root: {}",
                 repository.display()

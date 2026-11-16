@@ -2660,6 +2660,17 @@ pub(crate) fn derived_lifecycle(
         .ok_or_else(|| format!("{} records no lifecycle", path.display()))
 }
 
+fn restore_notice_failure(message_id: &str, error: &AgentError) -> Value {
+    // Typed delivery failures carry a durable queue artifact. Do not tell the
+    // operator nothing was queued when the coordinator still has that prompt.
+    let outcome = match error {
+        AgentError::Pending(_) => "pending",
+        AgentError::PossiblySubmitted(_) => "possibly-submitted",
+        AgentError::Client(_) | AgentError::Delivery(_) => "not-queued",
+    };
+    json!({"message_id": message_id, "outcome": outcome, "detail": error.to_string()})
+}
+
 fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
     let rows = |key: &str| report[key].as_array().cloned().unwrap_or_default();
     let mut agents = rows("agents");
@@ -3580,9 +3591,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 Ok(result) => {
                     json!({"message_id": message_id, "outcome": json!(result)["outcome"]})
                 }
-                Err(error) => {
-                    json!({"message_id": message_id, "outcome": "not-queued", "detail": error.to_string()})
-                }
+                Err(error) => restore_notice_failure(&message_id, &error),
             };
         }
     }
@@ -4411,7 +4420,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 name,
                 alive,
                 match &plan {
-                    Ok(plan) if alive => "harness alive".to_owned(),
+                    Ok(_) if alive => "harness alive".to_owned(),
                     Ok(plan) => format!(
                         "{}: {}",
                         plan["action"].as_str().unwrap_or("?"),
@@ -5000,6 +5009,27 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn restore_notice_keeps_durable_delivery_failures_visible() {
+        let pending = crate::agent::UndeliveredMessage {
+            message: "waiting for coordinator".to_owned(),
+            message_id: "restore-boot".to_owned(),
+            artifact: PathBuf::from("queue/inbox/restore-boot.json"),
+        };
+        for (error, expected) in [
+            (AgentError::Pending(pending.clone()), "pending"),
+            (AgentError::PossiblySubmitted(pending), "possibly-submitted"),
+            (
+                AgentError::Delivery("failed before enqueue".to_owned()),
+                "not-queued",
+            ),
+        ] {
+            let report = restore_notice_failure("restore-boot", &error);
+            assert_eq!(report["outcome"], expected);
+            assert_eq!(report["message_id"], "restore-boot");
+        }
+    }
 
     #[test]
     fn initial_pid_namespace_reads_nspid_levels() {
