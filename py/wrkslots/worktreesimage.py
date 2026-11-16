@@ -33,6 +33,7 @@ import fcntl
 import json
 import os
 import subprocess
+import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -392,7 +393,7 @@ def ensure_validate_bind(slots_dir: Path) -> None:
     external.mkdir(parents=True, exist_ok=True)
     if _mounted_at(external):
         return
-    _run(["mount", "--bind", str(internal), str(external)], sudo=True)
+    _bind_private(internal, external)
 
 
 def unmount_validate_bind(slots_dir: Path) -> None:
@@ -402,7 +403,7 @@ def unmount_validate_bind(slots_dir: Path) -> None:
     if external == validate_image_dir(slots_dir):
         return
     if _mounted_at(external):
-        _run(["umount", str(external)], sudo=True)
+        unmount_bind(external)
 
 
 def ensure_image_mounted(
@@ -978,6 +979,248 @@ def save_binds(control: Path, binds: dict[str, str]) -> None:
     )
 
 
+#: Bounded unmount retries after privatising (#1733): a holder that is
+#: exiting gets a short backoff to release its copy; a holder that stays
+#: is named by ``describe_mount_holders`` instead of retried forever.
+UMOUNT_ATTEMPTS = 3
+UMOUNT_BACKOFF_SECONDS = 0.2
+
+#: Injectable wait between unmount retries (tests substitute a counter,
+#: never a wall clock).
+_sleep = time.sleep
+
+#: Injectable process-tree root for the holder scan (fixtures only).
+_PROC_ROOT = Path("/proc")
+
+
+def _top_entry(
+    target: Path, entries: Sequence[slotimage.MountEntry]
+) -> slotimage.MountEntry | None:
+    found: slotimage.MountEntry | None = None
+    for entry in entries:
+        if entry.mount_point == target:
+            found = entry
+    return found
+
+
+def peer_views(
+    target: Path, entries: Sequence[slotimage.MountEntry]
+) -> list[Path]:
+    """Every mount point showing the same bind as ``target``.
+
+    A slot bind under a mirrored tree appears once per mirror root with
+    the same device and mount root. All of them share one peer group
+    while the bind is shared, so privatising or unmounting only the
+    canonical path leaves the mirror copy able to pin the slot (#1733).
+    Falls back to ``target`` alone when the table shows no mount there.
+    """
+
+    top = _top_entry(target, entries)
+    if top is None:
+        return [target]
+    views = sorted(
+        {
+            entry.mount_point
+            for entry in entries
+            if entry.device == top.device and entry.root == top.root
+        }
+        | {target}
+    )
+    return views
+
+
+def make_private(
+    target: Path, entries: Sequence[slotimage.MountEntry] | None = None
+) -> None:
+    """Make the bind at ``target`` (and every peer view) private.
+
+    Private, not slave: nothing outside wrkslots legitimately needs
+    mounts to propagate into a slot bind — a sandbox that needs the
+    slot contents reads them through the path, and propagation inward
+    is exactly how foreign namespaces came to hold pinning copies.
+    """
+
+    table = slotimage.mount_table() if entries is None else entries
+    for view in peer_views(target, table):
+        _run(["mount", "--make-private", str(view)], sudo=True)
+
+
+def _bind_private(source: Path, target: Path) -> None:
+    """Bind ``source`` at ``target`` and privatise every view at once.
+
+    A bind created shared is copied into every private namespace that
+    starts while it exists, so the privatise is part of creating the
+    bind, never a later fix-up. If it fails the fresh bind comes down
+    again rather than staying shared.
+    """
+
+    _run(["mount", "--bind", str(source), str(target)], sudo=True)
+    try:
+        make_private(target)
+    except BaseException:
+        with contextlib.suppress(WorktreesImageError):
+            _run(["umount", str(target)], sudo=True)
+        raise
+
+
+def _unit_for_pid(proc_root: Path, pid: str) -> str | None:
+    try:
+        text = (proc_root / pid / "cgroup").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+    for line in text.splitlines():
+        for part in line.rsplit("/", 1)[-1].split("/"):
+            if part.endswith((".service", ".scope")):
+                return part
+    return None
+
+
+def describe_mount_holders(
+    target: Path,
+    proc_root: Path | None = None,
+    entries: Sequence[slotimage.MountEntry] | None = None,
+) -> str:
+    """Name the processes whose mount namespaces still hold ``target``.
+
+    Scans each process's mount table for the bind's identity (device
+    and mount root) or any of its peer views, and names the PID and,
+    when the cgroup names one, its unit (#1733).
+    """
+
+    root = _PROC_ROOT if proc_root is None else proc_root
+    table = slotimage.mount_table() if entries is None else entries
+    top = _top_entry(target, table)
+    views = set(peer_views(target, table))
+    holders: list[str] = []
+    try:
+        pid_dirs = sorted(
+            (entry for entry in root.iterdir() if entry.name.isdigit()),
+            key=lambda entry: int(entry.name),
+        )
+    except OSError:
+        return "holder scan unavailable (process tree unreadable)"
+    for pid_dir in pid_dirs:
+        try:
+            theirs = slotimage._parse_mount_table(
+                (pid_dir / "mountinfo").read_text(
+                    encoding="utf-8", errors="surrogateescape"
+                )
+            )
+        except (slotimage.ImageError, OSError):
+            continue
+        held = any(
+            entry.mount_point in views
+            or (
+                top is not None
+                and entry.device == top.device
+                and entry.root == top.root
+            )
+            for entry in theirs
+        )
+        if not held:
+            continue
+        unit = _unit_for_pid(root, pid_dir.name)
+        holders.append(
+            f"pid {pid_dir.name} ({unit})" if unit else f"pid {pid_dir.name}"
+        )
+    if not holders:
+        return "no process mount namespace still holds it"
+    return ", ".join(holders)
+
+
+def unmount_bind(
+    target: Path,
+    *,
+    attempts: int = UMOUNT_ATTEMPTS,
+    sleeper: Callable[[float], None] | None = None,
+    proc_root: Path | None = None,
+) -> None:
+    """Privatise then unmount the bind at ``target`` and its peer views.
+
+    After the fence, privatising first stops the unmount from being
+    pinned by copies handed to namespaces that started earlier, and
+    detaches the mirror view so it cannot re-pin the canonical path
+    (#1733). A busy unmount retries a bounded number of times with
+    backoff; a still-busy unmount names its holders.
+    """
+
+    wait = _sleep if sleeper is None else sleeper
+    last_error: WorktreesImageError | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            table = slotimage.mount_table()
+        except slotimage.ImageError:
+            table = []
+        views = peer_views(target, table)
+        try:
+            for view in views:
+                _run(["mount", "--make-private", str(view)], sudo=True)
+            was_mounted = target in {entry.mount_point for entry in table}
+            for view in views:
+                # Unmounting one view can take its peers down with it
+                # (the parent tree is still shared), so re-read the
+                # table and skip a view that is already gone. With no
+                # table entry at all (a stubbed table in tests) the
+                # target is still unmounted unconditionally.
+                try:
+                    fresh = slotimage.mount_table()
+                except slotimage.ImageError:
+                    fresh = table
+                mounted = {entry.mount_point for entry in fresh}
+                if view in mounted or (view == target and not was_mounted):
+                    _run(["umount", str(view)], sudo=True)
+            return
+        except WorktreesImageError as exc:
+            last_error = exc
+            if "busy" not in str(exc).lower():
+                raise
+            if attempt + 1 < max(1, attempts):
+                wait(UMOUNT_BACKOFF_SECONDS * (2**attempt))
+    holders = describe_mount_holders(target, proc_root=proc_root)
+    raise WorktreesImageError(
+        f"umount {target}: target is busy after {max(1, attempts)} attempts; "
+        f"still held by {holders}"
+    ) from last_error
+
+
+def removal_journaled_slots(control: Path) -> set[str]:
+    """Slots with an outstanding removal journal in ``control``.
+
+    A finish journal names its slot directly; a validate-batch seal
+    names each target. An unreadable journal proves nothing either way
+    and is left to the journal machinery, as before (#1733).
+    """
+
+    slots: set[str] = set()
+    patterns = ("FINISH.*.journal", "VALIDATE-BATCH-SEAL.*.journal")
+    for pattern in patterns:
+        for path in sorted(control.glob(pattern)):
+            try:
+                raw: object = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            payload = raw.get("journal") if isinstance(raw, dict) else None
+            record = payload if isinstance(payload, dict) else raw
+            if not isinstance(record, dict):
+                continue
+            slot = record.get("slot")
+            if isinstance(slot, str):
+                slots.add(slot)
+            targets = record.get("targets")
+            if isinstance(targets, list):
+                for item in targets:
+                    if isinstance(item, dict) and isinstance(item.get("slot"), str):
+                        slots.add(item["slot"])
+                    elif isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
+                        slots.add(item[0])
+            listed = record.get("slots")
+            if isinstance(listed, list):
+                slots.update(name for name in listed if isinstance(name, str))
+    return slots
+
+
 def mount_id_at(mount_point: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> int | None:
     """The mount ID of the topmost mount at ``mount_point``, or None."""
 
@@ -1010,7 +1253,7 @@ def bind_slot(control: Path, mount_dir: Path, slot: str, slot_path: Path) -> Non
     if not source.is_dir():
         raise WorktreesImageError(f"slot subvolume is missing: {source}")
     slot_path.mkdir(parents=True, exist_ok=True)
-    _run(["mount", "--bind", str(source), str(slot_path)], sudo=True)
+    _bind_private(source, slot_path)
     mount_id = mount_id_at(slot_path)
 
     def record(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
@@ -1040,13 +1283,13 @@ def relocate_bind(control: Path, mount_dir: Path, slot: str, source: Path, desti
     current = load_bind_records(control).get(slot)
     if current is None:
         raise WorktreesImageError(f"slot {slot} has no recorded worktrees-image bind")
-    _run(["umount", str(source)], sudo=True)
+    unmount_bind(source)
     try:
         source.rename(destination)
     except OSError:
-        _run(["mount", "--bind", str(mount_dir / current.subvolume), str(source)], sudo=True)
+        _bind_private(mount_dir / current.subvolume, source)
         raise
-    _run(["mount", "--bind", str(mount_dir / current.subvolume), str(destination)], sudo=True)
+    _bind_private(mount_dir / current.subvolume, destination)
     mount_id = mount_id_at(destination)
 
     def relocate(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
@@ -1070,9 +1313,9 @@ def forget_bind(control: Path, slot: str) -> None:
 
 
 def umount_point(path: Path) -> None:
-    """Unmount whatever is mounted at ``path``; the bind record is untouched."""
+    """Unmount the bind at ``path``; the bind record is untouched."""
 
-    _run(["umount", str(path)], sudo=True)
+    unmount_bind(path)
 
 
 def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
@@ -1086,7 +1329,7 @@ def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
     ``ensure_binds``, never re-created and never a load failure.
     """
 
-    _run(["umount", str(slot_path)], sudo=True)
+    unmount_bind(slot_path)
 
     def drop(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
         records.pop(slot, None)
@@ -1106,7 +1349,12 @@ def ensure_binds(
     Each bind goes back at its recorded target. A slot whose canonical path
     has a fenced sibling is mid-removal: its bind lives at (or is headed to)
     the fenced path, and resurrecting the canonical mount would make every
-    later recovery refuse that both paths exist, so it is left alone.
+    later recovery refuse that both paths exist, so it is left alone. A slot
+    whose removal is journaled (a finish journal or a validate-batch seal)
+    is likewise left alone: re-binding it, shared, is what pinned the
+    removal that journaled it (#1733). A bind that is already mounted but
+    still shared is made private here, so existing binds migrate without
+    an operator step.
 
     The direct layout has no binds at all: with direct ``settings`` this
     returns before any record is read or written.
@@ -1120,16 +1368,23 @@ def ensure_binds(
     records = load_bind_records(control)
     entries = slotimage.mount_table()
     mounted_points = {entry.mount_point for entry in entries}
+    journaled = removal_journaled_slots(control)
     for slot in sorted(records):
         record = records[slot]
         canonical = slots_dir / slot
         target = Path(record.target) if record.target else canonical
+        if slot in journaled:
+            continue
         if target == canonical and any(
             sibling.name.startswith(f".{slot}.fenced.")
             for sibling in slots_dir.glob(f".{slot}.fenced.*")
         ):
             continue
         if target in mounted_points:
+            top = _top_entry(target, entries)
+            if top is not None and "shared:" in top.propagation:
+                make_private(target, entries)
+                actions.append(f"made slot {slot} bind private")
             continue
         if not (mount_dir / record.subvolume).is_dir():
             # The record outlived its subvolume (a remove deleted the

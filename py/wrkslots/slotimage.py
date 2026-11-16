@@ -148,6 +148,8 @@ class MountEntry:
     ``device`` is the mounted file system's ``MAJOR:MINOR`` (field 3) and
     ``root`` the directory of that file system the mount shows (field 4): ``/``
     for a whole file system, a subdirectory for a bind mount of part of one.
+    ``propagation`` is the mount's optional-field text (for example
+    ``shared:12`` or ``master:8``), empty when the table names none.
     """
 
     mount_point: Path
@@ -155,6 +157,7 @@ class MountEntry:
     source: str
     device: str = ""
     root: str = "/"
+    propagation: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -743,6 +746,7 @@ def _parse_mount_table(text: str) -> list[MountEntry]:
                 source=_unescape(right_fields[1]),
                 device=left_fields[2],
                 root=_unescape(left_fields[3]),
+                propagation=" ".join(left_fields[5:]),
             )
         )
     return entries

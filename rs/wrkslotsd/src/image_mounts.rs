@@ -23,6 +23,8 @@ pub(crate) struct MountEntry {
     pub(crate) source: String,
     pub(crate) device: String,
     pub(crate) root: String,
+    /// Optional-field text (for example `shared:12`), empty when none.
+    pub(crate) propagation: String,
 }
 
 fn unescape_mount_field(field: &str) -> String {
@@ -52,6 +54,7 @@ pub(crate) fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
             source: unescape_mount_field(right_fields[1]),
             device: left_fields[2].to_string(),
             root: unescape_mount_field(left_fields[3]),
+            propagation: left_fields[5..].join(" "),
         });
     }
     entries
@@ -286,6 +289,7 @@ garbage row without separator
             source: "/dev/loop3".to_string(),
             device: "7:3".to_string(),
             root: "/".to_string(),
+            propagation: String::new(),
         }];
         let (state, _) = classify_mount(single.first(), &kernel_facts);
         assert_eq!(state, "kernel");

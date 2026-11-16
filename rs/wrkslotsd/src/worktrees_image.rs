@@ -807,13 +807,164 @@ pub(crate) fn subvolume_plan(
 }
 
 pub(crate) fn bind_plan(source: &Path, target: &Path) -> Vec<CommandSpec> {
-    vec![spec(sudo_argv(&[
-        "mount".to_string(),
-        "--bind".to_string(),
-        source.to_string_lossy().into_owned(),
-        target.to_string_lossy().into_owned(),
-    ]))]
+    // #1733: a bind created shared is copied into every private
+    // namespace that starts while it exists, so privatising the new
+    // bind is part of creating it, never a later fix-up.
+    vec![
+        spec(sudo_argv(&[
+            "mount".to_string(),
+            "--bind".to_string(),
+            source.to_string_lossy().into_owned(),
+            target.to_string_lossy().into_owned(),
+        ])),
+        spec(sudo_argv(&[
+            "mount".to_string(),
+            "--make-private".to_string(),
+            target.to_string_lossy().into_owned(),
+        ])),
+    ]
 }
+
+/// Every mount point showing the same bind as `target` (same device
+/// and mount root), mirroring Python `peer_views` (#1733).
+pub(crate) fn peer_views(target: &Path, entries: &[MountEntry]) -> Vec<PathBuf> {
+    let Some(top) = crate::image_mounts::top_entry(target, entries) else {
+        return vec![target.to_path_buf()];
+    };
+    let mut views: Vec<PathBuf> = entries
+        .iter()
+        .filter(|entry| entry.device == top.device && entry.root == top.root)
+        .map(|entry| entry.mount_point.clone())
+        .collect();
+    if !views.contains(&target.to_path_buf()) {
+        views.push(target.to_path_buf());
+    }
+    views.sort();
+    views.dedup();
+    views
+}
+
+/// `mount --make-private` for `target` and every peer view (#1733).
+/// Private, not slave: nothing outside wrkslots legitimately needs
+/// mounts to propagate into a slot bind.
+pub(crate) fn make_private_plan(target: &Path, entries: &[MountEntry]) -> Vec<CommandSpec> {
+    peer_views(target, entries)
+        .iter()
+        .map(|view| {
+            spec(sudo_argv(&[
+                "mount".to_string(),
+                "--make-private".to_string(),
+                view.to_string_lossy().into_owned(),
+            ]))
+        })
+        .collect()
+}
+
+/// Slots with an outstanding removal journal in `control`,
+/// mirroring Python `removal_journaled_slots` (#1733).
+pub(crate) fn removal_journaled_slots(control: &Path) -> std::collections::BTreeSet<String> {
+    let mut slots = std::collections::BTreeSet::new();
+    let Ok(read) = std::fs::read_dir(control) else {
+        return slots;
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let journal = (name.starts_with("FINISH.") && name.ends_with(".journal"))
+            || (name.starts_with("VALIDATE-BATCH-SEAL.") && name.ends_with(".journal"));
+        if !journal {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(raw) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let record = raw.get("journal").unwrap_or(&raw);
+        if let Some(slot) = record.get("slot").and_then(Value::as_str) {
+            slots.insert(slot.to_string());
+        }
+        if let Some(targets) = record.get("targets").and_then(Value::as_array) {
+            for item in targets {
+                if let Some(slot) = item.get("slot").and_then(Value::as_str) {
+                    slots.insert(slot.to_string());
+                } else if let Some(slot) = item
+                    .as_array()
+                    .and_then(|row| row.first())
+                    .and_then(Value::as_str)
+                {
+                    slots.insert(slot.to_string());
+                }
+            }
+        }
+        if let Some(listed) = record.get("slots").and_then(Value::as_array) {
+            for item in listed {
+                if let Some(slot) = item.as_str() {
+                    slots.insert(slot.to_string());
+                }
+            }
+        }
+    }
+    slots
+}
+
+fn unit_for_pid(proc_root: &Path, pid: &str) -> Option<String> {
+    let text = std::fs::read_to_string(proc_root.join(pid).join("cgroup")).ok()?;
+    for line in text.lines() {
+        for part in line.rsplit('/').next().unwrap_or_default().split('/') {
+            if part.ends_with(".service") || part.ends_with(".scope") {
+                return Some(part.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Name the processes whose mount namespaces still hold `target`,
+/// mirroring Python `describe_mount_holders` (#1733).
+pub(crate) fn describe_mount_holders(
+    proc_root: &Path,
+    target: &Path,
+    entries: &[MountEntry],
+) -> String {
+    let top = crate::image_mounts::top_entry(target, entries);
+    let views = peer_views(target, entries);
+    let Ok(read) = std::fs::read_dir(proc_root) else {
+        return "holder scan unavailable (process tree unreadable)".to_string();
+    };
+    let mut pids: Vec<String> = read
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()))
+        .collect();
+    pids.sort_by_key(|name| name.parse::<u64>().unwrap_or(0));
+    let mut holders: Vec<String> = Vec::new();
+    for pid in pids {
+        let Ok(text) = std::fs::read_to_string(proc_root.join(&pid).join("mountinfo")) else {
+            continue;
+        };
+        let theirs = crate::image_mounts::parse_mountinfo(&text);
+        let held = theirs.iter().any(|entry| {
+            views.contains(&entry.mount_point)
+                || top.is_some_and(|top| entry.device == top.device && entry.root == top.root)
+        });
+        if !held {
+            continue;
+        }
+        match unit_for_pid(proc_root, &pid) {
+            Some(unit) => holders.push(format!("pid {pid} ({unit})")),
+            None => holders.push(format!("pid {pid}")),
+        }
+    }
+    if holders.is_empty() {
+        "no process mount namespace still holds it".to_string()
+    } else {
+        holders.join(", ")
+    }
+}
+
+/// Bounded unmount attempts after privatising (#1733).
+pub(crate) const UMOUNT_ATTEMPTS: usize = 3;
 
 // ---------------------------------------------------------- handlers (#1141)
 //
@@ -1306,7 +1457,13 @@ pub(crate) fn wt_mount(
             .iter()
             .map(|e| crate::image_mounts::normalize_absolute(&e.mount_point))
             .collect();
+        // #1733: never re-bind a slot whose removal is journaled, and
+        // migrate an already-mounted shared bind to private here.
+        let journaled = removal_journaled_slots(ctx.control);
         for (slot, record) in records {
+            if journaled.contains(&slot) {
+                continue;
+            }
             let canonical = ctx.worktrees.join(&slot);
             let target = record
                 .target
@@ -1330,6 +1487,17 @@ pub(crate) fn wt_mount(
                 }
             }
             if mounted_points.contains(&crate::image_mounts::normalize_absolute(&target)) {
+                // Migration (#1733): a still-shared bind becomes
+                // private at this re-establish, peer views included.
+                let shared = crate::image_mounts::top_entry(&target, ctx.entries)
+                    .is_some_and(|top| top.propagation.contains("shared:"));
+                if shared {
+                    for spec in make_private_plan(&target, ctx.entries) {
+                        if let Err(outcome) = run_one(runner, &spec) {
+                            return outcome;
+                        }
+                    }
+                }
                 continue;
             }
             let source = mount_dir.join(&record.subvolume);
@@ -1338,6 +1506,19 @@ pub(crate) fn wt_mount(
             }
             let _ = std::fs::create_dir_all(&target);
             for spec in bind_plan(&source, &target) {
+                if let Err(outcome) = run_one(runner, &spec) {
+                    return outcome;
+                }
+            }
+            for view in peer_views(&target, ctx.entries) {
+                if view == target {
+                    continue;
+                }
+                let spec = spec(sudo_argv(&[
+                    "mount".to_string(),
+                    "--make-private".to_string(),
+                    view.to_string_lossy().into_owned(),
+                ]));
                 if let Err(outcome) = run_one(runner, &spec) {
                     return outcome;
                 }
@@ -1529,12 +1710,67 @@ pub(crate) fn unbind_slot(
     slot_path: &Path,
     runner: &dyn crate::image_ops::PrivilegedRunner,
 ) -> HandlerOutcome {
-    let spec = spec(sudo_argv(&[
-        "umount".to_string(),
-        slot_path.to_string_lossy().into_owned(),
-    ]));
-    if let Err(outcome) = run_one(runner, &spec) {
-        return outcome;
+    // #1733: privatise every view after the fence, then unmount with
+    // a bounded busy retry; a still-busy unmount names its holders.
+    let views = peer_views(slot_path, ctx.entries);
+    let mut unmounted = false;
+    for attempt in 0..UMOUNT_ATTEMPTS {
+        let mut busy = false;
+        let mut failed: Option<HandlerOutcome> = None;
+        for spec in make_private_plan(slot_path, ctx.entries) {
+            if let Err(outcome) = run_one(runner, &spec) {
+                failed = Some(outcome);
+                break;
+            }
+        }
+        if failed.is_none() {
+            for view in &views {
+                let spec = spec(sudo_argv(&[
+                    "umount".to_string(),
+                    view.to_string_lossy().into_owned(),
+                ]));
+                match runner.run(&spec) {
+                    Ok(outcome) if outcome.returncode == 0 => {}
+                    Ok(outcome) => {
+                        let detail = format!("{} {}", outcome.stdout, outcome.stderr);
+                        if detail.to_lowercase().contains("busy") {
+                            busy = true;
+                        } else {
+                            failed = Some(wt_refusal(&format!(
+                                "{} failed: {}",
+                                spec.argv.join(" "),
+                                detail.trim()
+                            )));
+                        }
+                        break;
+                    }
+                    Err(message) => {
+                        failed = Some(wt_refusal(&message));
+                        break;
+                    }
+                }
+                if failed.is_some() {
+                    break;
+                }
+            }
+        }
+        if failed.is_none() && !busy {
+            unmounted = true;
+            break;
+        }
+        if let Some(outcome) = failed {
+            return outcome;
+        }
+        if attempt + 1 < UMOUNT_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+        }
+    }
+    if !unmounted {
+        let holders = describe_mount_holders(Path::new("/proc"), slot_path, ctx.entries);
+        return wt_refusal(&format!(
+            "umount {}: target is busy after {UMOUNT_ATTEMPTS} attempts; still held by {holders}",
+            slot_path.display()
+        ));
     }
     let slot_name = slot.to_string();
     if let Err(message) = update_bind_records(ctx.control, move |mut records| {
@@ -1792,6 +2028,7 @@ mod tests {
             source: "/dev/loop0".to_string(),
             device: "0:7".to_string(),
             root: "/".to_string(),
+            propagation: String::new(),
         }];
         assert_eq!(classify_mount(&slots, &btrfs, true, false), MOUNTED);
 
@@ -2036,6 +2273,130 @@ mod tests {
                 .contains_key("slot-a"),
             "successful unmount must drop the bind record"
         );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn bind_plan_privatizes_and_holders_are_named() {
+        // #1733: bind creation privatises; peer views share the
+        // bind identity; a busy holder is named by pid and unit.
+        let plan = bind_plan(Path::new("/img/s1"), Path::new("/slots/s1"));
+        assert_eq!(plan.len(), 2);
+        assert!(plan[1].argv.contains(&"--make-private".to_string()));
+        let entries = vec![
+            MountEntry {
+                mount_point: PathBuf::from("/slots/s1"),
+                fstype: "btrfs".to_string(),
+                source: "/dev/loop9".to_string(),
+                device: "0:999".to_string(),
+                root: "/s1".to_string(),
+                propagation: "shared:42".to_string(),
+            },
+            MountEntry {
+                mount_point: PathBuf::from("/mirror/s1"),
+                fstype: "btrfs".to_string(),
+                source: "/dev/loop9".to_string(),
+                device: "0:999".to_string(),
+                root: "/s1".to_string(),
+                propagation: "shared:42".to_string(),
+            },
+        ];
+        assert_eq!(
+            peer_views(Path::new("/slots/s1"), &entries),
+            [PathBuf::from("/mirror/s1"), PathBuf::from("/slots/s1")]
+        );
+        assert_eq!(make_private_plan(Path::new("/slots/s1"), &entries).len(), 2);
+
+        let root = temp_root("holders");
+        let proc_root = root.join("proc");
+        let holder = proc_root.join("4321");
+        std::fs::create_dir_all(&holder).expect("holder");
+        std::fs::write(
+            holder.join("mountinfo"),
+            "36 25 0:999 /s1 /slots/s1 rw,relatime shared:7 - btrfs /dev/loop9 rw\n",
+        )
+        .expect("mountinfo");
+        std::fs::write(
+            holder.join("cgroup"),
+            "0::/system.slice/holder-crash.service\n",
+        )
+        .expect("cgroup");
+        assert_eq!(
+            describe_mount_holders(&proc_root, Path::new("/slots/s1"), &entries),
+            "pid 4321 (holder-crash.service)"
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn journaled_slots_are_not_rebound() {
+        // #1733: finish and seal journals block re-establishing.
+        let root = temp_root("journaled");
+        std::fs::create_dir_all(&root).expect("control");
+        std::fs::write(
+            root.join("FINISH.1.s1.journal"),
+            "{\"kind\":\"finish\",\"slot\":\"s1\"}",
+        )
+        .expect("finish");
+        std::fs::write(
+            root.join("VALIDATE-BATCH-SEAL.testhost.journal"),
+            "{\"kind\":\"validate-batch-seal\",\"targets\":[{\"slot\":\"s2\"}]}",
+        )
+        .expect("seal");
+        let slots = removal_journaled_slots(&root);
+        assert!(slots.contains("s1") && slots.contains("s2"));
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn unbind_busy_names_holders_after_bounded_retries() {
+        use crate::image_ops::RunOutcome;
+        use std::cell::RefCell;
+        struct Busy {
+            umounts: RefCell<usize>,
+        }
+        impl crate::image_ops::PrivilegedRunner for Busy {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                let busy = spec.argv.iter().any(|arg| arg == "umount");
+                if busy {
+                    *self.umounts.borrow_mut() += 1;
+                }
+                Ok(RunOutcome {
+                    returncode: if busy { 1 } else { 0 },
+                    stdout: String::new(),
+                    stderr: if busy {
+                        "umount: target is busy".to_string()
+                    } else {
+                        String::new()
+                    },
+                })
+            }
+        }
+        let root = temp_root("unbind-busy");
+        let control = root.join("control");
+        let worktrees = root.join("worktrees");
+        std::fs::create_dir_all(&control).expect("control");
+        std::fs::create_dir_all(&worktrees).expect("worktrees");
+        let slot_path = worktrees.join("slot-a");
+        std::fs::create_dir_all(&slot_path).expect("slot");
+        let ctx = WtCtx {
+            root: &root,
+            control: &control,
+            worktrees: &worktrees,
+            entries: &[],
+            skipped: None,
+        };
+        let busy = Busy {
+            umounts: RefCell::new(0),
+        };
+        let outcome = unbind_slot(&ctx, "slot-a", &slot_path, &busy);
+        assert_eq!(outcome.exit, 3);
+        assert!(
+            outcome.stderr.contains("target is busy after 3 attempts"),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(*busy.umounts.borrow(), UMOUNT_ATTEMPTS);
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 

@@ -289,7 +289,16 @@ def test_bind_fence_and_remove_cycle(
     assert fenced.is_dir() and not slot_path.exists()
     assert worktreesimage.load_binds(control) == {"s1": "s1"}
     assert worktreesimage.load_bind_records(control)["s1"].target == str(fenced)
-    assert [call[0] for call in fake.calls] == ["mount", "umount", "mount"]
+    # #1733: every bind is privatised at creation, and the fence
+    # privatises again before unmounting.
+    assert fake.calls == [
+        ["mount", "--bind", str(mount_dir / "s1"), str(slot_path)],
+        ["mount", "--make-private", str(slot_path)],
+        ["mount", "--make-private", str(slot_path)],
+        ["umount", str(slot_path)],
+        ["mount", "--bind", str(mount_dir / "s1"), str(fenced)],
+        ["mount", "--make-private", str(fenced)],
+    ]
 
     cli._remove_slot_directory(config, fenced)
     assert not fenced.exists()
@@ -330,7 +339,12 @@ def test_validate_mount_fence_without_a_bind_record(
     fenced = slot_path.parent / (".v1.fenced.1." + "c" * 32)
     cli._rename_slot_path(config, slot_path, fenced)
     assert fenced.is_dir() and not slot_path.exists()
-    assert [call[0] for call in fake.calls] == ["umount", "mount"]
+    assert fake.calls == [
+        ["mount", "--make-private", str(slot_path)],
+        ["umount", str(slot_path)],
+        ["mount", "--bind", str(mount_dir / "v1"), str(fenced)],
+        ["mount", "--make-private", str(fenced)],
+    ]
     assert worktreesimage.load_bind_records(control)["v1"].target == str(fenced)
 
 
@@ -347,6 +361,7 @@ def test_validate_mount_fence_refuses_when_the_unmount_fails(
     slot_path.mkdir(parents=True)
     failing = _FakeMounts(fail_umount=True)
     monkeypatch.setattr(worktreesimage, "_run", failing.run)
+    monkeypatch.setattr(worktreesimage, "_sleep", lambda seconds: None)
     monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 777)
     monkeypatch.setattr(
         slotimage,
@@ -383,6 +398,7 @@ def test_remove_refuses_when_the_bind_unmount_fails_and_a_retry_finishes(
     )
     failing = _FakeMounts(fail_umount=True)
     monkeypatch.setattr(worktreesimage, "_run", failing.run)
+    monkeypatch.setattr(worktreesimage, "_sleep", lambda seconds: None)
     with pytest.raises(OSError):
         cli._remove_slot_directory(config, slot_path)
     # Nothing was dropped: slot, subvolume and record are all still there.
@@ -393,6 +409,177 @@ def test_remove_refuses_when_the_bind_unmount_fails_and_a_retry_finishes(
     cli._remove_slot_directory(config, slot_path)
     assert not slot_path.exists() and not (mount_dir / "s1").exists()
     assert worktreesimage.load_binds(control) == {}
+
+
+def _bind_entry(point: Path, propagation: str = "") -> slotimage.MountEntry:
+    return slotimage.MountEntry(
+        mount_point=point,
+        fstype="btrfs",
+        source="/dev/loop9",
+        device="0:999",
+        root="/s1",
+        propagation=propagation,
+    )
+
+
+def test_bind_creates_private_on_every_peer_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1733: a bind under a mirrored tree shows once per mirror root;
+    # creation privatises every view, not only the canonical path.
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slot_path = config.worktrees / "s1"
+    mirror = tmp_path / "mirror" / "s1"
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 777)
+    monkeypatch.setattr(
+        slotimage, "mount_table", lambda: [_bind_entry(slot_path), _bind_entry(mirror)]
+    )
+
+    worktreesimage.bind_slot(control, mount_dir, "s1", slot_path)
+    assert ["mount", "--make-private", str(mirror)] in fake.calls
+    assert ["mount", "--make-private", str(slot_path)] in fake.calls
+    assert fake.calls[0] == ["mount", "--bind", str(mount_dir / "s1"), str(slot_path)]
+
+
+def test_ensure_binds_privatizes_an_existing_shared_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1733 migration: a shared bind left by an older version becomes
+    # private at the next re-establish, with no operator step.
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    canonical = config.worktrees / "s1"
+    canonical.mkdir(parents=True)
+    mirror = tmp_path / "mirror" / "s1"
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", target=str(canonical))},
+    )
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(
+        slotimage,
+        "mount_table",
+        lambda: [
+            _bind_entry(canonical, "shared:42"),
+            _bind_entry(mirror, "shared:42"),
+        ],
+    )
+
+    actions = worktreesimage.ensure_binds(control, mount_dir, config.worktrees)
+    assert actions == ["made slot s1 bind private"]
+    assert ["mount", "--make-private", str(canonical)] in fake.calls
+    assert ["mount", "--make-private", str(mirror)] in fake.calls
+    assert not any(call[:2] == ["mount", "--bind"] for call in fake.calls)
+
+
+def test_ensure_binds_skips_a_journaled_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1733: config-load healing must not re-bind a slot whose removal
+    # is journaled (finish journal or validate-batch seal).
+    import json as json_module
+
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    (mount_dir / "s2").mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {
+            "s1": worktreesimage.BindRecord(subvolume="s1"),
+            "s2": worktreesimage.BindRecord(subvolume="s2"),
+        },
+    )
+    (control / "FINISH.1.s1.journal").write_text(
+        json_module.dumps({"kind": "finish", "slot": "s1"}), encoding="utf-8"
+    )
+    (control / "VALIDATE-BATCH-SEAL.testhost.journal").write_text(
+        json_module.dumps(
+            {"kind": "validate-batch-seal", "targets": [{"slot": "s2"}]}
+        ),
+        encoding="utf-8",
+    )
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [])
+
+    assert worktreesimage.ensure_binds(control, mount_dir, config.worktrees) == []
+    assert fake.calls == []
+    assert not (config.worktrees / "s1").exists()
+    assert not (config.worktrees / "s2").exists()
+
+
+def test_unmount_busy_names_the_holding_pid_and_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1733: a busy unmount that never clears names its holders
+    # instead of a bare 'target is busy'.
+    target = tmp_path / "slots" / "s1"
+    target.mkdir(parents=True)
+    proc = tmp_path / "proc"
+    holder = proc / "4321"
+    holder.mkdir(parents=True)
+    (holder / "mountinfo").write_text(
+        f"36 25 0:999 /s1 {target} rw,relatime shared:7 - btrfs /dev/loop9 rw\n",
+        encoding="utf-8",
+    )
+    (holder / "cgroup").write_text(
+        "0::/system.slice/holder-crash.service\n", encoding="utf-8"
+    )
+    fake = _FakeMounts(fail_umount=True)
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [_bind_entry(target)])
+    waits: list[float] = []
+
+    with pytest.raises(
+        worktreesimage.WorktreesImageError,
+        match=r"pid 4321 \(holder-crash\.service\)",
+    ):
+        worktreesimage.unmount_bind(
+            target, sleeper=waits.append, proc_root=proc
+        )
+    assert len(waits) == worktreesimage.UMOUNT_ATTEMPTS - 1
+    assert [call for call in fake.calls if call[0] == "umount"] == [
+        ["umount", str(target)]
+    ] * worktreesimage.UMOUNT_ATTEMPTS
+
+
+def test_unmount_busy_clears_on_a_bounded_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1733: a holder that exits during the backoff lets the retry
+    # succeed without any holder diagnostic.
+    target = tmp_path / "slots" / "s1"
+    target.mkdir(parents=True)
+
+    class _BusyTwice:
+        def __init__(self) -> None:
+            self.umounts = 0
+
+        def run(self, argv: list[str], *, sudo: bool = False) -> None:
+            if argv[:1] == ["umount"]:
+                self.umounts += 1
+                if self.umounts < 3:
+                    raise worktreesimage.WorktreesImageError("umount: target is busy")
+            return None
+
+    busy = _BusyTwice()
+    monkeypatch.setattr(worktreesimage, "_run", busy.run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [_bind_entry(target)])
+    waits: list[float] = []
+
+    worktreesimage.unmount_bind(target, sleeper=waits.append)
+    assert busy.umounts == 3
+    assert len(waits) == 2
 
 
 def test_reload_never_rebinds_a_fenced_slot_at_its_canonical_path(
@@ -1235,7 +1422,12 @@ def test_remove_refuses_before_deleting_when_content_sits_beneath(
     assert (mount_dir / "s1").is_dir()
     assert worktreesimage.load_binds(control) == {"s1": "s1"}
     assert (slot_path / "stale-original.txt").is_file()
-    assert [call[0] for call in fake.calls] == ["umount", "mount"]
+    assert fake.calls == [
+        ["mount", "--make-private", str(slot_path)],
+        ["umount", str(slot_path)],
+        ["mount", "--bind", str(mount_dir / "s1"), str(slot_path)],
+        ["mount", "--make-private", str(slot_path)],
+    ]
 
 
 def test_binds_migrate_reclaims_the_original(

@@ -150,6 +150,13 @@ fn fence_slot_path(cfg: &Cfg, slot: &str, slot_path: &Path, fenced_path: &Path) 
                 )
             })?;
         }
+        // #1733: privatise before unmounting, as Python
+        // `unmount_bind` does after the fence.
+        let _ = run_mount_command(&[
+            "mount".to_string(),
+            "--make-private".to_string(),
+            slot_path.to_string_lossy().into_owned(),
+        ]);
         run_mount_command(&[
             "umount".to_string(),
             slot_path.to_string_lossy().into_owned(),
@@ -173,6 +180,17 @@ fn fence_slot_path(cfg: &Cfg, slot: &str, slot_path: &Path, fenced_path: &Path) 
             "mount".to_string(),
             "--bind".to_string(),
             mount_dir.join(&subvolume).to_string_lossy().into_owned(),
+            fenced_path.to_string_lossy().into_owned(),
+        ])
+        .map_err(|error| {
+            format!(
+                "cannot unmount image mount at {} before the path fence: {error}",
+                slot_path.display()
+            )
+        })?;
+        run_mount_command(&[
+            "mount".to_string(),
+            "--make-private".to_string(),
             fenced_path.to_string_lossy().into_owned(),
         ])
         .map_err(|error| {

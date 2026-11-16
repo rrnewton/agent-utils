@@ -3114,7 +3114,13 @@ The image file is created owner-only (0600): it holds every slot.
 
 - `binds` (the default): the image mounts at `<control>/.slots-image` and each slot subvolume is
   bind-mounted at its slot path, recorded in `<control>/.worktrees-image.json`. Validation slots
-  stay at `worktrees/validate/<slot>` and are bound the same way.
+  stay at `worktrees/validate/<slot>` and are bound the same way. Every such bind is made private
+  at creation, on every mirrored view of the slot path, so a mount namespace that starts later
+  (a sandbox, a system service with a private mount namespace) does not inherit a copy that
+  could pin the slot's removal; removal privatises again before unmounting, retries a busy
+  unmount a bounded number of times, and otherwise names the processes and units still holding
+  the mount. A bind an older version left shared becomes private at the next mount or removal,
+  and config load never re-binds a slot whose removal is journaled or fenced.
 - `worktrees_dir`: the image mounts at the slots directory itself and agent slot subvolumes are
   its top-level entries; there are no per-slot binds and no bind records. Validation slots stay
   at `worktrees/validate/<slot>` in this layout too: their storage is the image's top-level
