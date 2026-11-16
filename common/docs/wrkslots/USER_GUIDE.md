@@ -2771,6 +2771,78 @@ wrkslots recover-ownerless-agent-cache --apply --coordinator-authorized \
 This command accepts no arbitrary path, refuses symlinks, mounts, `.git`, `HANDOFF.md`, unexpected
 top-level content, live use, or an occupied destination, and journals the same-inode relocation.
 
+## Eden slots
+
+A slot can hold one EdenFS checkout instead of Git worktrees
+(`create --eden NAME=BACKING`). The mount always lands at
+`<slot>/checkout`, with the daemon state at `<slot>/.eden-state` — a
+private `--config-dir`, so every Eden slot gets its own `edenfs`
+daemon and never registers with the user's default daemon. Keep Eden
+mounts outside any other working tree: discovery from inside a mount
+can walk past its `.hg` symlink to an outer repository.
+
+Register one with an isolated project (its own `.wrkslots.yml`, its
+own worktrees root, never another team's registry):
+
+```bash
+wrkslots init <project> --worktrees-dir worktrees/slots \
+    --liveness-command <probe>
+# in <project>/.wrkslots.yml, under configuration:
+#   eden_host_cap: 10        # see the cap note below
+wrkslots --project-root <project> create <slot> --slot-type agent \
+    --coordinator-authorized --coordinator-pid <coordinator-pid> \
+    --owner-pid <owner-pid> --agent <agent> --task <task> \
+    --purpose <text> --representation worktree \
+    --eden main=<backing-repo>
+wrkslots --project-root <project> status   # eden: outer=N cap=C
+eden --config-dir <slot>/.eden-state list
+eden --config-dir <slot>/.eden-state info <slot>/checkout
+```
+
+The coordinator PID must be live for the whole create-to-remove
+sequence; a PID read from a short-lived shell is dead by the next
+command. Run the sequence under one long-lived coordinator process
+(or one script whose `$$` is the coordinator), and record that in
+the run book.
+
+The host cap counts only OUTER Eden checkouts (checkouts inside a
+worktrees image are bounded by the image instead). It is
+`configuration.eden_host_cap` (default 3, minimum 1; count a large
+number as unlimited). A host that already runs several outer
+checkouts on the default daemon refuses at the default: raise the
+cap in your own project's configuration only, never by editing
+another project's. The cap counts checkouts across every daemon
+config dir and refuses closed when a daemon cannot be queried.
+
+Clones live at `<slot>/checkout` on the project's worktrees root;
+measure the disk with `df` on that filesystem, never with `du` or
+`find` over the mount (walking a mount fetches the whole repository
+and the daemon escapes caller scopes). A large backing repo needs
+its own disk and authentication budget, decided before cloning;
+a small local Sapling repo is enough to exercise the path.
+
+Retirement is `wrkslots remove <slot> --coordinator-pid <pid>
+--expected-generation N` (there is no `retire` verb;
+`retire-pending` only batches `remove`). For an agent slot, remove
+first salvages Sapling work (patch plus draft bundle with read-back
+under `<control>/wrkslots-salvage/<slot>-<name>/`), then runs its
+process, mount, Git and path checks, then `eden remove` and stops
+the slot's private daemon. Salvage that cannot complete refuses
+removal; nothing is deleted first. A validate slot skips salvage —
+use an agent slot when the salvage evidence matters. Never delete
+a checkout by hand to make a registry look consistent.
+
+Authentication is Sapling's and the submit tool's, tested inside
+the checkout once it exists: `sl id` and `sl status` must answer in
+`<slot>/checkout`, and the submit tool must accept its session
+before any work is entrusted to the slot. Test outside any existing
+checkout that belongs to someone else.
+
+Daemon containment (#1423) remains open: an Eden daemon is not
+confined to the slot's scopes, so never walk a mount and treat any
+daemon you cannot stop with `eden --config-dir <dir> stop` as a
+finding, not a process to kill.
+
 ## Disk-image slots
 
 A slot can be stored in one of two representations, chosen per slot when it is created:
