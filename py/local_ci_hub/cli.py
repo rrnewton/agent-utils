@@ -76,7 +76,17 @@ def main(argv: list[str] | None = None) -> int:
     rem = sub.add_parser("remote"); rem.add_argument("op", choices=["status", "dispatch"]); rem.add_argument("--workflow", default=""); rem.add_argument("--ref", default="")
     hea = sub.add_parser("health"); hea.add_argument("--probe", default="")
     lan = sub.add_parser("land"); lan.add_argument("op", choices=["acquire", "release", "run", "verify"]); lan.add_argument("--holder", default="agent"); lan.add_argument("--commit", default=""); lan.add_argument("--target", default="HEAD"); lan.add_argument("command", nargs="*")
-    args = p.parse_args(argv)
+    raw_args = list(argv if argv is not None else sys.argv[1:])
+    command_tail: list[str] = []
+    if "--" in raw_args:
+        separator = raw_args.index("--")
+        command_tail = raw_args[separator + 1:]
+        raw_args = raw_args[:separator]
+    args = p.parse_args(raw_args)
+    if command_tail:
+        if args.cmd != "land" or args.op != "run":
+            p.error("a command after -- is only supported by land run")
+        args.command.extend(command_tail)
     if args.cmd == "quickstart":
         print(QUICKSTART); return 0
     if args.cmd == "userguide":

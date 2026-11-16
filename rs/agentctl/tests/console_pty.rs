@@ -78,8 +78,10 @@ if os.fork() > 0:
     os._exit(0)
 os.setsid()
 fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-with open(pidfile, "w") as handle:
+# The reader waits for existence, so publish only the complete PID.
+with open(pidfile + ".tmp", "w") as handle:
     handle.write(str(os.getpid()))
+os.replace(pidfile + ".tmp", pidfile)
 os.execvpe(agentctl, [agentctl, "--registry", registry, "console", "worker"], os.environ)
 "##;
 
