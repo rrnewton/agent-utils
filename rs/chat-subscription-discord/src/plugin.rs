@@ -639,37 +639,43 @@ impl DiscordDriver {
         Ok(())
     }
 
-    /// The root of the reply chain `parent` belongs to: from memory when known, else read back
-    /// from Discord (at most [`MAX_ROOT_HOPS`] messages). A read failure ends the walk at the
-    /// last message reached, which is logged.
-    fn resolve_root(&mut self, channel: Snowflake, parent: Snowflake) -> Snowflake {
+    /// The root of the reply chain `parent` belongs to, and whether it is settled: from memory
+    /// when known, else read back from Discord (at most [`MAX_ROOT_HOPS`] messages). A deleted
+    /// message (404) or the hop limit ends the walk with a settled answer, the same every time.
+    /// Any other read failure ends it at the last message reached, unsettled: that guess is used
+    /// for this one post but never remembered, so the next reply retries the walk.
+    fn resolve_root(&mut self, channel: Snowflake, parent: Snowflake) -> (Snowflake, bool) {
         let mut current = parent;
         for _ in 0..MAX_ROOT_HOPS {
             if let Some(root) = self.roots.get(&current) {
-                return *root;
+                return (*root, true);
             }
             match self.rest.get_message(channel, current) {
                 Ok(found) => match found.reply_to {
                     Some(next) => current = next,
-                    None => return current,
+                    None => return (current, true),
                 },
+                Err(error) if error.code == "not_found" => return (current, true),
                 Err(error) => {
                     eprintln!(
                         "agentctl-discord-plugin: thread root of {} not resolved past {current}: {error}",
                         ids::message_resource(channel, parent)
                     );
-                    return current;
+                    return (current, false);
                 }
             }
         }
-        current
+        (current, true)
     }
 
     fn thread_root(&mut self, message: &DiscordMessage) -> Snowflake {
-        let root = match message.reply_to {
-            None => message.id,
+        let (root, settled) = match message.reply_to {
+            None => (message.id, true),
             Some(parent) => self.resolve_root(message.channel_id, parent),
         };
+        if !settled {
+            return root;
+        }
         if self.root_order.len() == ROOT_MAP_CAPACITY {
             if let Some(old) = self.root_order.pop_front() {
                 self.roots.remove(&old);

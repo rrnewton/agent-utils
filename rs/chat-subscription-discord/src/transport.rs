@@ -64,6 +64,9 @@ pub struct DiscordMessage {
     pub webhook: bool,
     /// Discord's message type ([`USER_MESSAGE_TYPES`] for ordinary posts).
     pub kind: u64,
+    /// Reactions this bot has already added (`me: true`): the emoji's name, and `name:id` for
+    /// a custom emoji.
+    pub own_reactions: Vec<String>,
     /// Text content (empty when the bot lacks the message-content intent).
     pub content: String,
     /// ISO 8601 creation time as Discord reports it.
@@ -93,6 +96,24 @@ pub fn parse_message(value: &Value) -> Result<DiscordMessage, String> {
         .get("type")
         .and_then(Value::as_u64)
         .ok_or("message has no numeric type")?;
+    let mut own_reactions = Vec::new();
+    for reaction in value
+        .get("reactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if reaction.get("me").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let emoji = reaction.get("emoji");
+        if let Some(name) = emoji.and_then(|e| e.get("name")).and_then(Value::as_str) {
+            own_reactions.push(name.to_owned());
+            if let Some(id) = emoji.and_then(|e| e.get("id")).and_then(Value::as_str) {
+                own_reactions.push(format!("{name}:{id}"));
+            }
+        }
+    }
     let content = value
         .get("content")
         .and_then(Value::as_str)
@@ -116,6 +137,7 @@ pub fn parse_message(value: &Value) -> Result<DiscordMessage, String> {
         author_is_system,
         webhook,
         kind,
+        own_reactions,
         content,
         timestamp,
         reply_to,
@@ -141,6 +163,7 @@ impl DiscordMessage {
             author_is_system: false,
             webhook: false,
             kind: if reply_to.is_some() { 19 } else { 0 },
+            own_reactions: Vec::new(),
             content: content.to_owned(),
             timestamp: "2026-11-15T16:45:00.123000+00:00".to_owned(),
             reply_to,
@@ -397,6 +420,12 @@ pub trait DiscordRest: Send {
         message: Snowflake,
         emoji: &str,
     ) -> Result<(), RestError>;
+
+    /// Bound each later call to `seconds` (at least 1). Transports without a per-call timeout
+    /// ignore it.
+    fn set_timeout(&mut self, seconds: u32) {
+        let _ = seconds;
+    }
 
     /// Read one message, as the authority on who wrote it.
     ///
@@ -715,6 +744,10 @@ impl DiscordRest for CurlTransport {
         self.call("PUT", &path, None).map(|_| ())
     }
 
+    fn set_timeout(&mut self, seconds: u32) {
+        self.timeout_seconds = seconds.clamp(1, 120);
+    }
+
     fn get_message(
         &mut self,
         channel: Snowflake,
@@ -818,6 +851,10 @@ pub struct FakeRest {
     pub fail_next: VecDeque<RestError>,
     /// Number of calls of any kind.
     pub calls: usize,
+    /// Every per-call timeout set, in order.
+    pub timeouts: Vec<u32>,
+    /// One-shot failures for `get_message` only, consumed before the shared ones.
+    pub fail_get: VecDeque<RestError>,
 }
 
 impl FakeRest {
@@ -895,7 +932,20 @@ impl DiscordRest for FakeRest {
             return Err(error);
         }
         self.reactions.push((channel, message, emoji.to_owned()));
+        if let Some(listed) = self
+            .channels
+            .get_mut(&channel)
+            .and_then(|messages| messages.iter_mut().find(|listed| listed.id == message))
+        {
+            if !listed.own_reactions.iter().any(|own| own == emoji) {
+                listed.own_reactions.push(emoji.to_owned());
+            }
+        }
         Ok(())
+    }
+
+    fn set_timeout(&mut self, seconds: u32) {
+        self.timeouts.push(seconds);
     }
 
     fn get_message(
@@ -903,6 +953,10 @@ impl DiscordRest for FakeRest {
         channel: Snowflake,
         message: Snowflake,
     ) -> Result<DiscordMessage, RestError> {
+        if let Some(error) = self.fail_get.pop_front() {
+            self.calls += 1;
+            return Err(error);
+        }
         if let Some(error) = self.failure() {
             return Err(error);
         }
@@ -1011,6 +1065,17 @@ mod tests {
         webhook["webhook_id"] = json!("9");
         let mut system = base.clone();
         system["author"]["system"] = json!(true);
+        let mut reacted = base.clone();
+        reacted["reactions"] = json!([
+            {"emoji": {"name": "👀", "id": null}, "me": true, "count": 2},
+            {"emoji": {"name": "party", "id": "77"}, "me": true, "count": 1},
+            {"emoji": {"name": "✅", "id": null}, "me": false, "count": 1}
+        ]);
+        assert_eq!(
+            parse_message(&reacted).expect("parses").own_reactions,
+            ["👀", "party", "party:77"],
+            "only this bot's own reactions"
+        );
         let mut bot = base.clone();
         bot["author"]["bot"] = json!(true);
         let mut notice = base.clone();

@@ -27,13 +27,21 @@ const MARKDOWN_SPECIALS: &[char] = &[
 /// A zero-width space, inserted to break mention syntax without changing what a reader sees.
 const ZWSP: char = '\u{200B}';
 
+/// Whether `line` opens or closes a fenced block: it starts with ``` and holds an odd number of
+/// them. A one-line fence (```` ```x``` ````) opens and closes on the same line, so it toggles
+/// nothing.
+#[must_use]
+pub fn toggles_fence(line: &str) -> bool {
+    line.trim_start().starts_with("```") && line.matches("```").count() % 2 == 1
+}
+
 /// Apply `transform` to the text outside fenced (```) code blocks only.
 fn outside_fences(text: &str, transform: impl Fn(&str) -> String) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_fence = false;
     let mut prose = String::new();
     for line in text.split_inclusive('\n') {
-        if line.trim_start().starts_with("```") {
+        if toggles_fence(line) {
             if !in_fence {
                 out.push_str(&transform(&prose));
                 prose.clear();
@@ -214,7 +222,7 @@ impl Chunker {
     }
 
     fn line(&mut self, line: &str) {
-        if !line.trim_start().starts_with("```") {
+        if !toggles_fence(line) {
             self.push_text(line);
             return;
         }
@@ -227,6 +235,15 @@ impl Chunker {
             self.current.push_str(line);
             self.count += chars;
             self.fence = None;
+        } else if chars > self.limit / 2 {
+            // Too long to repeat at every break (no real language tag is this long): enter the
+            // fence first, so a split inside the opener line is closed like any other, and reopen
+            // later chunks with a bare fence.
+            if self.count > self.base {
+                self.break_chunk();
+            }
+            self.fence = Some(FENCE_CLOSE.to_owned());
+            self.push_text(line);
         } else {
             // Keep the opener with at least one line of its block.
             if !self.fits(chars + FENCE_CLOSE.len()) && self.count > self.base {
@@ -307,10 +324,7 @@ mod tests {
                 "chunk {index}: {}",
                 part.chars().count()
             );
-            let fences = part
-                .lines()
-                .filter(|line| line.trim_start().starts_with("```"))
-                .count();
+            let fences = part.lines().filter(|line| toggles_fence(line)).count();
             assert_eq!(fences % 2, 0, "chunk {index} leaves a fence open:\n{part}");
         }
         chunks
@@ -338,5 +352,25 @@ mod tests {
         // A tiny limit and a single over-long fenced line still terminate within the limit.
         let long_line = format!("```\n{}\n```\n", "x".repeat(300));
         assert_fenced_split(&long_line, 50);
+    }
+
+    #[test]
+    fn one_line_fences_and_overlong_openers_stay_within_the_limit() {
+        assert!(toggles_fence("```rust\n") && toggles_fence("```\n"));
+        assert!(
+            !toggles_fence("```x``` is inline\n"),
+            "a one-line fence toggles nothing"
+        );
+        // One-line fences are content: no fence is reopened after them.
+        let text: String = (0..300).map(|n| format!("```v{n}``` note\n")).collect();
+        let chunks = assert_fenced_split(&text, 2000);
+        assert!(chunks.iter().all(|part| !part.ends_with("\n```\n")));
+        assert_eq!(chunks.concat(), text, "nothing was inserted");
+        // An opener line near the limit: split inside it, closed, reopened bare.
+        let text = format!("intro\n```{}\ncode\n```\n", "y".repeat(1990));
+        let chunks = assert_fenced_split(&text, 2000);
+        assert_eq!(chunks[0], "intro\n", "the opener starts a fresh chunk");
+        assert!(chunks[1].starts_with("```yyy") && chunks[1].ends_with("\n```\n"));
+        assert!(chunks[2].starts_with("```\n"), "reopened bare");
     }
 }

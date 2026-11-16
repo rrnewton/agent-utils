@@ -54,7 +54,9 @@ splits, an over-long relay post (one with an `agent-teams-` fence), so set the
 relay route's `max_post_bytes` to about 1900: neutralising mentions in the
 visible text adds a few characters before the limit applies. Other replies are
 split at line breaks, and a code fence crossing a break is closed and reopened
-with its language, so long replies with code arrive whole.
+with its language, so long replies with code arrive whole. A one-line fence
+(```` ```x``` ````) is ordinary text, and an opener line longer than half a post
+is reopened as a bare fence.
 
 curl 7.83 or later is needed for the rate-limit headers (`%header{}` in
 `--write-out`); an older curl still works but reads only the 429 body.
@@ -97,7 +99,12 @@ addressing rule to find the agent (`agent=NAME@HOST`, else the bridge agent; a
 reply inside an existing reply chain names the host only, because the bridge
 may route it to an agent bound to that thread). Because it is triggered by the
 bridge's own acknowledgement, a post the bridge refuses never gets one. It is
-best effort and carries no mention; relay posts get none.
+best effort and carries no mention; relay posts get none. The helper reads the
+request before reacting: if its acknowledgement is already there (the bridge
+re-ran the operation), it posts no second line, however late, and reports
+`already_present: true`. The read and the post share an 8 s budget, with
+per-call timeouts cut to what is left and no rate-limit waits, so the line
+cannot push the helper past the bridge's 25 s timeout.
 
 ## Peer-bot posts
 

@@ -63,6 +63,9 @@ impl DiscordRest for Shared {
     ) -> Result<DiscordMessage, RestError> {
         self.with(|fake| fake.get_message(channel, message))
     }
+    fn set_timeout(&mut self, seconds: u32) {
+        self.with(|fake| fake.set_timeout(seconds));
+    }
 }
 
 fn message(
@@ -442,6 +445,98 @@ fn a_restart_mid_thread_keeps_the_reply_chain_on_its_root() {
         created(&event).2,
         format!("{CHANNEL}/threads/200"),
         "the root is read back from Discord, not taken to be the direct parent"
+    );
+    subscription.close().expect("close");
+}
+
+#[test]
+fn a_failed_root_lookup_is_not_remembered() {
+    let shared = Shared::default();
+    shared.with(|fake| {
+        fake.push(message(
+            300,
+            OWNER,
+            false,
+            &format!("<@{OURS}> start"),
+            None,
+        ));
+        fake.push(message(301, OURS, true, "bot reply", Some(300)));
+    });
+    // Resume past both, as a restarted process would: no root memory.
+    let mut backend = make_backend(&shared);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(Some(&format!("discord.v1;{CHANNEL}=301"))),
+    )
+    .expect("resume");
+    shared.with(|fake| {
+        fake.push(message(
+            302,
+            OWNER,
+            false,
+            &format!("<@{OURS}> one"),
+            Some(301),
+        ));
+        fake.push(message(
+            303,
+            OWNER,
+            false,
+            &format!("<@{OURS}> two"),
+            Some(302),
+        ));
+    });
+    // The root lookup for 302 fails transiently (a server error reading 301).
+    shared.with(|fake| fake.fail_get.push_back(RestError::from_status(502, "{}")));
+    let (event, _) = take(&mut subscription);
+    assert_eq!(
+        created(&event).2,
+        format!("{CHANNEL}/threads/301"),
+        "the best guess for this one post"
+    );
+    let (event, _) = take(&mut subscription);
+    assert_eq!(
+        created(&event).2,
+        format!("{CHANNEL}/threads/300"),
+        "the failed guess was not remembered, so the next reply finds the real root"
+    );
+    subscription.close().expect("close");
+}
+
+#[test]
+fn a_deleted_parent_is_a_settled_root_and_is_read_once() {
+    let shared = Shared::default();
+    shared.with(|fake| fake.push(message(500, OWNER, false, "history", None)));
+    let mut backend = make_backend(&shared);
+    let mut subscription = ChatSubscription::open(
+        &mut backend,
+        &request(Some(&format!("discord.v1;{CHANNEL}=500"))),
+    )
+    .expect("resume");
+    // 501 was deleted before this process saw it; 502 replies to it, 503 to 502.
+    shared.with(|fake| {
+        fake.push(message(
+            502,
+            OWNER,
+            false,
+            &format!("<@{OURS}> one"),
+            Some(501),
+        ));
+        fake.push(message(
+            503,
+            OWNER,
+            false,
+            &format!("<@{OURS}> two"),
+            Some(502),
+        ));
+    });
+    let (event, _) = take(&mut subscription);
+    assert_eq!(created(&event).2, format!("{CHANNEL}/threads/501"));
+    let (event, _) = take(&mut subscription);
+    assert_eq!(created(&event).2, format!("{CHANNEL}/threads/501"));
+    assert_eq!(
+        shared.with(|fake| fake.calls),
+        2,
+        "one list call and one read of the deleted parent; the answer is remembered"
     );
     subscription.close().expect("close");
 }
@@ -891,6 +986,34 @@ fn the_ack_line_follows_the_bridge_acknowledgement_and_names_host_and_agent() {
         "one line per acknowledged owner request; none for a relay post or a receipt"
     );
     assert_eq!(shared.with(|fake| fake.reactions.len()), 5);
+
+    // Each ACK call is bounded by the 8 s budget, and the reaction gets its own timeout back.
+    let timeouts = shared.with(|fake| fake.timeouts.clone());
+    assert!(!timeouts.is_empty());
+    assert!(
+        timeouts
+            .iter()
+            .all(|seconds| *seconds <= 8 || *seconds == 20),
+        "an ACK call within its 8 s budget, the reaction at its own timeout: {timeouts:?}"
+    );
+    assert!(
+        timeouts.windows(2).any(|pair| pair[0] <= 8 && pair[1] == 20),
+        "the helper's own --timeout-seconds (default 20) is restored for the reaction: {timeouts:?}"
+    );
+    // The bridge re-runs the acknowledgement (a lost response, long after the nonce window):
+    // the reaction is already there, so no second line, and the receipt says so.
+    let before = shared.with(|fake| fake.posts.len());
+    let response = run_with(&shared, &react("ack-0-again", 401, "👀"), &config);
+    assert_eq!(
+        response["receipt"]["already_present"],
+        json!(true),
+        "{response}"
+    );
+    assert_eq!(
+        shared.with(|fake| fake.posts.len()),
+        before,
+        "no duplicate ACK line"
+    );
 
     // Without --ack-host no line is ever posted, and a failed line never fails the reaction.
     let before = shared.with(|fake| fake.posts.len());

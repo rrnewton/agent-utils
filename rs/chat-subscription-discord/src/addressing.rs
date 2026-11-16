@@ -168,10 +168,23 @@ impl AddressingPolicy {
         } else {
             return Verdict::Ignore(IgnoreReason::NotAddressed);
         };
-        let body = self.strip_header(post.content);
-        let (specs, request) = match split_agent_specs(body) {
+        // The header (mentions, aliases, `agent=` specs) is read from the poster's own words, so a
+        // leading quote cannot hide it. The request keeps the quoted context: the consumed header
+        // is cut from the original text where it occurs.
+        let body = self.strip_header(&own_words);
+        let (specs, request_words) = match split_agent_specs(body) {
             Ok(split) => split,
             Err(()) => return Verdict::Reject(RejectReason::MalformedTarget),
+        };
+        let consumed = &own_words[..own_words.len() - request_words.len()];
+        let request = match post.content.find(consumed) {
+            Some(at) if !consumed.is_empty() => format!(
+                "{}{}",
+                &post.content[..at],
+                post.content[at + consumed.len()..].trim_start_matches([' ', '\t'])
+            ),
+            _ if own_words == post.content => request_words.to_owned(),
+            _ => post.content.to_owned(),
         };
         let request = request.trim().to_owned();
         if request.is_empty() {
@@ -256,7 +269,7 @@ pub fn own_words(content: &str) -> String {
     let mut in_fence = false;
     for line in content.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
+        if crate::markdown::toggles_fence(trimmed) {
             in_fence = !in_fence;
             continue;
         }
@@ -617,6 +630,26 @@ mod tests {
             !addressed.also_addressed_peer,
             "a quoted peer mention is not addressing it"
         );
+    }
+
+    #[test]
+    fn a_header_after_a_leading_quote_is_still_the_header() {
+        let addressed = deliver(owner(&format!(
+            "> the build failed at step 3\n<@{OURS}> agent=lane-a@newton-fedora: please rebase"
+        )));
+        assert_eq!(
+            addressed.target,
+            Target::Agent {
+                name: "lane-a".to_owned()
+            }
+        );
+        assert_eq!(
+            addressed.request, "> the build failed at step 3\nplease rebase",
+            "the quote stays as context; the header is removed"
+        );
+        let addressed = deliver(owner(&format!("> context\n<@{OURS}> status?")));
+        assert_eq!(addressed.target, Target::Bridge);
+        assert_eq!(addressed.request, "> context\nstatus?");
     }
 
     #[test]

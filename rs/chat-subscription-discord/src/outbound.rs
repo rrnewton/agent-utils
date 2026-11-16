@@ -30,7 +30,12 @@
 //! (`agent=NAME@HOST` names `NAME`; otherwise `--ack-bridge-agent`, default `bridge`). A reply
 //! inside an existing reply chain names the host only, because the bridge may route it to an
 //! agent bound to that thread. The line is best effort (a failure is logged and the reaction
-//! response is unchanged) and its nonce is derived from the message.
+//! response is unchanged) and its nonce is derived from the message. The helper reads the
+//! request before reacting: when its own acknowledgement is already there (the bridge re-ran
+//! the operation), it posts no second line, however long after, and reports
+//! `already_present: true`. The read and the post share [`ACK_BUDGET`] (8 s) with per-call
+//! timeouts cut to what is left and no rate-limit waits, so the line cannot push the helper past
+//! the bridge's timeout.
 //!
 //! Every post sets `allowed_mentions.parse = []` and a nonce derived from the request id with
 //! `enforce_nonce`, so a retried request does not post twice within Discord's nonce window.
@@ -74,7 +79,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
@@ -364,26 +369,59 @@ pub fn ack_text(ack: &AckLine, message: &DiscordMessage) -> Option<String> {
     })
 }
 
-/// Post the ACK line for an acknowledged request. Best effort: every failure is logged.
-fn post_ack_line(
+/// The whole time the ACK line may add to an acknowledgement: its read of the request and its
+/// post share it, and neither waits out a rate limit. With the reaction's own
+/// `--timeout-seconds` (10 in the example) this stays well inside the bridge's 25 s helper
+/// timeout.
+pub const ACK_BUDGET: Duration = Duration::from_secs(8);
+
+/// Seconds left before `deadline`, or `None` when under one second remains.
+fn seconds_left(deadline: Instant) -> Option<u32> {
+    let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+    u32::try_from(left).ok().filter(|left| *left >= 1)
+}
+
+/// Read the request before the acknowledgement reaction: whether this bot's reaction is already
+/// there (a re-run of the same acknowledgement), and the ACK line to post after it, if any.
+fn prepare_ack_line(
     rest: &mut dyn DiscordRest,
     ack: &AckLine,
     channel: Snowflake,
     message: Snowflake,
-) {
-    let found = match with_rate_retry(|| rest.get_message(channel, message)) {
-        Ok(found) => found,
+    deadline: Instant,
+) -> (bool, Option<String>) {
+    let Some(seconds) = seconds_left(deadline) else {
+        return (false, None);
+    };
+    rest.set_timeout(seconds);
+    match rest.get_message(channel, message) {
+        Ok(found) => {
+            let already = found.own_reactions.contains(&ack.emoji);
+            // A re-run after the reaction landed posts no second line, even past Discord's
+            // nonce window.
+            (already, (!already).then(|| ack_text(ack, &found)).flatten())
+        }
         Err(error) => {
             eprintln!("agentctl-discord-outbound: ACK line skipped, request unreadable: {error}");
-            return;
+            (false, None)
         }
-    };
-    let Some(text) = ack_text(ack, &found) else {
+    }
+}
+
+/// Post a prepared ACK line within what is left of its budget. Best effort: logged on failure.
+fn post_ack_line(
+    rest: &mut dyn DiscordRest,
+    channel: Snowflake,
+    message: Snowflake,
+    text: &str,
+    deadline: Instant,
+) {
+    let Some(seconds) = seconds_left(deadline) else {
+        eprintln!("agentctl-discord-outbound: ACK line skipped, its time budget is spent");
         return;
     };
-    let nonce = format!("ack{message}");
-    if let Err(error) =
-        with_rate_retry(|| rest.create_message(channel, &text, Some(message), &nonce))
+    rest.set_timeout(seconds);
+    if let Err(error) = rest.create_message(channel, text, Some(message), &format!("ack{message}"))
     {
         eprintln!("agentctl-discord-outbound: ACK line not posted: {error}");
     }
@@ -804,14 +842,24 @@ pub fn handle_request(
                     return fail(Refusal::not_applied("helper_misconfigured", problem, true))
                 }
             };
+            let ack_deadline = Instant::now() + ACK_BUDGET;
+            let (already, ack_line) = match config.ack.as_ref().filter(|ack| ack.emoji == emoji) {
+                Some(ack) => {
+                    let prepared =
+                        prepare_ack_line(rest.as_mut(), ack, channel, message, ack_deadline);
+                    rest.set_timeout(config.timeout_seconds);
+                    prepared
+                }
+                None => (false, None),
+            };
             match with_rate_retry(|| rest.add_reaction(channel, message, emoji)) {
                 Ok(()) => {
-                    if let Some(ack) = config.ack.as_ref().filter(|ack| ack.emoji == emoji) {
-                        post_ack_line(rest.as_mut(), ack, channel, message);
+                    if let Some(text) = &ack_line {
+                        post_ack_line(rest.as_mut(), channel, message, text, ack_deadline);
                     }
                     line(&json!({
                     "version": 1, "id": id, "action": action, "ok": true,
-                    "receipt": reaction_receipt(channel, message, emoji, false),
+                    "receipt": reaction_receipt(channel, message, emoji, already),
                     }))
                 }
                 Err(error) => fail(Refusal::from(error)),
@@ -889,6 +937,41 @@ fn trim_newline(input: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spent_ack_budget_makes_no_call() {
+        use crate::transport::FakeRest;
+        let ack = AckLine {
+            host: "h".to_owned(),
+            bot_user_id: Snowflake::from_u64(5),
+            aliases: BTreeSet::new(),
+            bridge_agent: "bridge".to_owned(),
+            emoji: "👀".to_owned(),
+        };
+        let mut rest = FakeRest::default();
+        let spent = Instant::now();
+        let (channel, message) = (Snowflake::from_u64(1), Snowflake::from_u64(2));
+        assert_eq!(
+            prepare_ack_line(&mut rest, &ack, channel, message, spent),
+            (false, None)
+        );
+        post_ack_line(&mut rest, channel, message, "ACK h/bridge: received", spent);
+        assert_eq!(
+            rest.calls, 0,
+            "nothing is attempted once the budget is spent"
+        );
+        assert!(rest.posts.is_empty());
+        // With budget left, the per-call timeout is cut to what remains.
+        post_ack_line(
+            &mut rest,
+            channel,
+            message,
+            "ACK h/bridge: received",
+            Instant::now() + Duration::from_millis(3_500),
+        );
+        assert_eq!(rest.timeouts, [3]);
+        assert_eq!(rest.posts.len(), 1);
+    }
 
     #[test]
     fn nonce_fits_discord_limit_and_differs_per_chunk() {
