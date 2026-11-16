@@ -1,13 +1,14 @@
 ---
 title: 'standalone-wrkslots-scenario-wall-clock-budget: standalone wrkslots scenario depends on the 60-second remove budget'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-removegaps
 labels:
 - wrkslots
 created_at: 2026-11-16T16:44:12-05:00
-updated_at: 2026-11-16T16:44:12-05:00
+updated_at: 2026-11-16T18:00:00-05:00
+closed_at: 2026-11-16T18:00:00-05:00
 ---
 
 # Description
@@ -28,3 +29,7 @@ updated_at: 2026-11-16T16:44:12-05:00
 # Notes
 
 Owner rule: a gating scenario must not depend on a wall-clock budget.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 31a8ebc9 on main. The standalone wrkslots scenario's removal now passes --no-lock-budget, so the lifecycle it proves no longer races the product's 60-second remove budget under host load; the default is unchanged and the lifecycle assertions are untouched. Validated and gated on the exact tree before landing.
