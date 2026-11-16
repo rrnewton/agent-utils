@@ -130,6 +130,14 @@ pub trait HarnessAdapter: std::fmt::Debug + Send + Sync {
     /// Whether the transcript proves the model received input `uuid`.
     fn transcript_received(&self, transcript: &Path, uuid: &str) -> bool;
 
+    /// Whether the transcript proves the model received the input with
+    /// this `uuid` and queue `text`. Harnesses whose journal records the
+    /// submitted prompt but not the caller id (Muse serve) prove by
+    /// prompt; the default is the id proof alone.
+    fn transcript_received_for(&self, transcript: &Path, uuid: &str, _text: &str) -> bool {
+        self.transcript_received(transcript, uuid)
+    }
+
     /// Lines of each tool result kept as its preview by default.
     fn preview_lines(&self) -> usize;
 

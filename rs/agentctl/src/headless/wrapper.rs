@@ -676,10 +676,15 @@ impl Wrapper {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             let written = document.contains_key("paste_started_at");
+            let text = document
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let proven = match (&uuid, &transcript) {
-                (Some(uuid), Some(transcript)) if written => {
-                    self.config.adapter.transcript_received(transcript, uuid)
-                }
+                (Some(uuid), Some(transcript)) if written => self
+                    .config
+                    .adapter
+                    .transcript_received_for(transcript, uuid, text),
                 _ => false,
             };
             if !proven {

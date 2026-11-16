@@ -778,6 +778,34 @@ impl HarnessAdapter for MuseHarness {
         })
     }
 
+    fn transcript_received_for(&self, transcript: &Path, uuid: &str, text: &str) -> bool {
+        if self.transcript_received(transcript, uuid) {
+            // An exec journal records the turn's command id outright.
+            return true;
+        }
+        if text.is_empty() {
+            return false;
+        }
+        // A serve journal records the submitted prompt, not the client
+        // command id: exactly one turn intake carrying this prompt
+        // proves the model received it. Zero or several matches prove
+        // nothing (a duplicated prompt stays quarantined, never dropped
+        // on a guess and never replayed either).
+        let Ok(journal) = std::fs::read_to_string(transcript) else {
+            return false;
+        };
+        let matches = journal
+            .lines()
+            .filter(|row| {
+                let Ok(record) = serde_json::from_str::<Value>(row) else {
+                    return false;
+                };
+                record["payload"]["record"]["command"]["prompt"].as_str() == Some(text)
+            })
+            .count();
+        matches == 1
+    }
+
     fn preview_lines(&self) -> usize {
         claude::PREVIEW_LINES
     }
@@ -1089,6 +1117,36 @@ mod tests {
             }
             other => panic!("unexpected signals: {other:?}"),
         }
+    }
+
+    #[test]
+    fn recovery_proves_by_command_id_or_unique_prompt() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentctl-muse-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("session.jsonl");
+        std::fs::write(
+            &journal,
+            concat!(
+                "{\"payload\":{\"command_id\":\"u-exec\",\"kind\":\"turn_input_user\"}}\n",
+                "{\"payload\":{\"record\":{\"command\":{\"kind\":\"turn_submit\",\"prompt\":\"hello once\"}}}}\n",
+                "{\"payload\":{\"record\":{\"command\":{\"kind\":\"turn_submit\",\"prompt\":\"twice\"}}}}\n",
+                "{\"payload\":{\"record\":{\"command\":{\"kind\":\"turn_submit\",\"prompt\":\"twice\"}}}}\n",
+            ),
+        )
+        .unwrap();
+        let h = harness();
+        assert!(h.transcript_received_for(&journal, "u-exec", "anything"));
+        assert!(h.transcript_received_for(&journal, "u-other", "hello once"));
+        assert!(!h.transcript_received_for(&journal, "u-other", "twice"));
+        assert!(!h.transcript_received_for(&journal, "u-other", "never sent"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
