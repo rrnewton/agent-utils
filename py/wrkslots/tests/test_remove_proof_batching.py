@@ -110,6 +110,35 @@ def test_thin_bundle_verify_skips_full_fsck(
     assert "fsck" not in seen
 
 
+def test_thin_bundle_verify_fails_closed_without_prerequisite(tmp_path: Path) -> None:
+    import hashlib as _hashlib
+
+    repo = _repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "g.txt").write_text("y\n")
+    _git(repo, "add", "g.txt")
+    _git(repo, "commit", "-q", "-m", "two")
+    head = _git(repo, "rev-parse", "HEAD")
+    ref = "refs/heads/wrkslots-salvage/test"
+    _git(repo, "update-ref", ref, head)
+    bundle = tmp_path / "thin.bundle"
+    _git(repo, "bundle", "create", str(bundle), ref, f"^{base}")
+    empty = tmp_path / "empty.git"
+    _git(tmp_path, "init", "--bare", "-q", str(empty))
+    data = bundle.read_bytes()
+    with pytest.raises(wrkslots.Refusal):
+        wrkslots._verify_local_salvage_bundle(
+            bundle,
+            _hashlib.sha256(data).hexdigest(),
+            len(data),
+            ref,
+            head,
+            wrkslots._GitVcs(),
+            prerequisites=(base,),
+            prerequisite_stores=(empty / "objects",),
+        )
+
+
 def test_expired_heads_evidence_revalidated_without_fetch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
