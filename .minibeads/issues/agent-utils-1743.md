@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-umount-ebusy-name-holder-and-retry: name the mount holder on EBUSY and retry transient holders'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-removegaps
 labels:
 - wrkslots
 created_at: 2026-11-16T16:30:20-05:00
-updated_at: 2026-11-16T16:30:20-05:00
+updated_at: 2026-11-16T19:00:00-05:00
+closed_at: 2026-11-16T19:00:00-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ updated_at: 2026-11-16T16:30:20-05:00
 # Notes
 
 Depends on the private-bind change landing first; base on it rather than duplicating its privatise step.
+
+## Resolution
+
+[watermelon-full-preview] Landed as dbb1804e on main, on top of the private-bind change. A busy bind unmount now names each holder by pid, comm, mount-namespace id and unit from /proc mountinfo scans in both editions; a holder proven older than the bind fails fast with that naming, and transient holders are retried a bounded number of times waiting on holder re-checks instead of a fixed sleep budget. Holders are only read, never killed or entered. Validated and gated on the exact tree before landing.
