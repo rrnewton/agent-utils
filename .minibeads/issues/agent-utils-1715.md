@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-refresh-refused-stale-page: an owner page refresh loses the Slack budget to backfill/relist and stands stale until the next read'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -58,3 +58,20 @@ budget refused 1-3 reads in many windows
 - A refused refresh retries on the server's own schedule within seconds and
   recovers without the owner reading again; the banner clears on success.
 - Focused tests pass; the owner-tier gate passes with path selection.
+
+## Resolution
+
+[watermelon-full-preview] Landed on `github/main` as 6df5e81b (gate green on the
+full run; gated tree e18b8f35, replay-base 9a5e0ff7). Owner-facing refreshes now
+run at a new budget priority ahead of live/background work with the last quarter
+of each method's ceiling reserved for them and wait for that budget's room
+(never out a provider Retry-After); a refusal made by this server's own budget
+without sending retries in its own task when the refresh schedule comes due
+(5 s doubling to 60 s), and a success clears the schedule so the banner clears
+on the landed/live read. Unit tests with a fake budget cover admission in the
+reserved share, the seconds-scale refused-retry, and the never-sent
+classification; the full vibe-talk suite and the four previously failing
+cache-serve integration contracts pass. Banner states screenshot on a test
+instance (fake API, phone and desktop): stale
+"Refresh failed · showing messages from 04:54", then cleared
+"Live · updated 05:46". Deployment is coordb's step.
