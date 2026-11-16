@@ -13090,6 +13090,7 @@ def test_abort_create_refuses_a_checked_out_submodule_tree(
         "submodule",
         "update",
         "--init",
+        "--force",
         "component",
     )
     assert (target / "component" / "component.txt").is_file()
