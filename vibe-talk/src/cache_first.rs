@@ -76,6 +76,16 @@ pub const REFRESH_BACKOFF_BASE: Duration = Duration::from_secs(60);
 /// The longest back-off after repeated failed refreshes of a view. `#1227 poll-storm-stale-thread`.
 pub const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
+/// The first retry after a refresh this server's own budget refused: the reservation a
+/// refresh holds frees as the minute's window slides, so a refused refresh is due again
+/// in seconds, not on the failure back-off above. Each further refusal doubles it, to
+/// [`REFUSAL_RETRY_MAX`]. `#1715 vibe-talk-refresh-refused-stale-page`.
+pub const REFUSAL_RETRY_BASE: Duration = Duration::from_secs(5);
+
+/// The longest wait between retries of a budget-refused refresh. `#1715
+/// vibe-talk-refresh-refused-stale-page`.
+pub const REFUSAL_RETRY_MAX: Duration = Duration::from_secs(60);
+
 /// When each view may next be refreshed upstream, and how its refreshes have fared: the server's
 /// own schedule for the reads it begins behind answers from the cache, so a page's read rate
 /// never sets the upstream read rate. One entry per view read. `#1227 poll-storm-stale-thread`.
@@ -146,6 +156,39 @@ impl RefreshSchedule {
             .min(REFRESH_BACKOFF_MAX)
             .max(REFRESH_EVERY);
         slot.next_at = slot.next_at.max(now + backoff);
+    }
+
+    /// Note that the budget refused the refresh of `view` without sending it: it is due
+    /// again after [`REFUSAL_RETRY_BASE`], doubling to [`REFUSAL_RETRY_MAX`] — the window
+    /// that refused it slides within the minute, unlike a provider failure's back-off.
+    /// A success ([`Self::note_outcome`]) clears the count. `#1715
+    /// vibe-talk-refresh-refused-stale-page`.
+    pub fn note_refusal(&self, view: &RefreshKey) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let slot = inner.entry(view.clone()).or_insert(Slot {
+            next_at: now + REFUSAL_RETRY_BASE,
+            failures: 0,
+        });
+        slot.failures = slot.failures.saturating_add(1);
+        let shift = slot.failures.saturating_sub(1).min(16);
+        let wait = REFUSAL_RETRY_BASE
+            .saturating_mul(1u32 << shift)
+            .min(REFUSAL_RETRY_MAX);
+        slot.next_at = now + wait;
+    }
+
+    /// When a refresh of `view` may next start: `None` when one may start now (nothing
+    /// scheduled, or its instant has come). A retry waits until this instant — a
+    /// condition on the schedule, not a poll of it. `#1715
+    /// vibe-talk-refresh-refused-stale-page`.
+    #[must_use]
+    pub fn next_due(&self, view: &RefreshKey) -> Option<Instant> {
+        let now = Instant::now();
+        self.lock()
+            .get(view)
+            .map(|slot| slot.next_at)
+            .filter(|next_at| *next_at > now)
     }
 
     /// Whether a refresh of `view` may start now, without scheduling one. For tests.
@@ -527,6 +570,28 @@ mod tests {
             schedule.try_schedule(&view()),
             "success cleared the back-off"
         );
+    }
+
+    #[test]
+    fn a_budget_refused_refresh_is_due_again_in_seconds_and_a_success_clears_it() {
+        // `#1715 vibe-talk-refresh-refused-stale-page`: a refusal by this server's own
+        // budget is not a provider failure — the window slides within the minute, so
+        // the retry is due in seconds, and a success clears the refusal count.
+        let schedule = RefreshSchedule::new();
+        assert!(schedule.try_schedule(&view()));
+        schedule.note_refusal(&view());
+        assert!(!schedule.is_due(&view()), "not at once");
+        let due = schedule.next_due(&view()).expect("a due instant");
+        assert!(
+            due.duration_since(Instant::now()) <= REFUSAL_RETRY_BASE,
+            "due within the first refusal retry, not the failure back-off"
+        );
+        schedule.age(REFUSAL_RETRY_BASE);
+        assert!(schedule.is_due(&view()), "the refusal retry came");
+        assert!(schedule.try_schedule(&view()), "the retry starts");
+        schedule.note_outcome(&view(), true);
+        schedule.age(REFRESH_EVERY);
+        assert!(schedule.try_schedule(&view()), "success cleared it");
     }
 
     #[tokio::test]

@@ -181,6 +181,19 @@ impl ChatError {
         }
     }
 
+    /// Whether this failure is this server's own budget refusing the request without
+    /// ever sending it (`attempts` is how many times it was actually sent): a rate
+    /// limit the provider never saw, so sending again once the budget's window slides
+    /// asks a new question — unlike a provider rate limit, which backs off.
+    /// `#1715 vibe-talk-refresh-refused-stale-page`.
+    #[must_use]
+    pub fn never_sent(&self) -> bool {
+        match self.cause() {
+            Self::RateLimited(detail) => detail.attempts == 0,
+            _ => false,
+        }
+    }
+
     /// How long the provider still wants us to wait, when this failure is a rate limit.
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
@@ -2968,6 +2981,36 @@ mod threads_tests {
                 .expect("in range")
                 .to_string(),
         )
+    }
+
+    #[test]
+    fn a_budget_refusal_was_never_sent_and_a_provider_limit_was() {
+        // `#1715 vibe-talk-refresh-refused-stale-page`: only a refusal this server's
+        // own budget made, without sending, retries soon; a provider limit backs off.
+        let limited = |attempts: u32| {
+            ChatError::RateLimited(RateLimitExhausted {
+                provider: "slack",
+                route: "conversations.history".to_owned(),
+                attempts,
+                waited: Duration::ZERO,
+                budget: Duration::from_secs(30),
+                retry_after: Duration::from_secs(5),
+                global: false,
+            })
+        };
+        assert!(limited(0).never_sent(), "refused without being sent");
+        assert!(
+            !limited(2).never_sent(),
+            "sent, and the provider limited it"
+        );
+        assert!(
+            !ChatError::Transport("down".to_owned()).never_sent(),
+            "not a rate limit at all"
+        );
+        assert!(
+            limited(0).with_provider("slack").never_sent(),
+            "the provider label does not hide it"
+        );
     }
 
     fn page(messages: Vec<Message>, root: Message, has_more: bool) -> TimelinePage {

@@ -146,6 +146,11 @@ pub enum ReadReason {
     /// goes into, proved there before posting. Placed ahead of every other read by Slack's shared
     /// budget. `#699 vt-send-priority`; a send's reads used to be untagged.
     Write,
+    /// The server: the upstream refresh of a page it has already answered from its own copy
+    /// (owner-facing: the reader is looking at the stale copy until this lands). Placed ahead
+    /// of live and background work in Slack's shared budget, with a reserved share of each
+    /// method's ceiling. `#1715 vibe-talk-refresh-refused-stale-page`.
+    Refresh,
     /// A reason was given, but it is not one the page sends.
     Other,
     /// No reason was given at all.
@@ -153,7 +158,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 31] = [
+pub const ALL: [ReadReason; 32] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -183,6 +188,7 @@ pub const ALL: [ReadReason; 31] = [
     ReadReason::Backfill,
     ReadReason::LivePoll,
     ReadReason::Write,
+    ReadReason::Refresh,
     ReadReason::Other,
     ReadReason::Untagged,
 ];
@@ -221,6 +227,7 @@ impl ReadReason {
             Self::Backfill => "backfill",
             Self::LivePoll => "live-poll",
             Self::Write => "write",
+            Self::Refresh => "refresh",
             Self::Other => "other",
             Self::Untagged => "untagged",
         }

@@ -121,11 +121,14 @@ pub fn gives_way(method: &str) -> bool {
 /// it never waits out a `Retry-After`, its own or another's. Live work, naming and crawl work.
 /// Page work is not one-try: with no cache standing in for it, it waits out a short limit like
 /// a person's read; the reads the cache does stand in for give up through `hurried` instead.
+/// An owner-facing refresh is one-try too (`#1715 vibe-talk-refresh-refused-stale-page`):
+/// it waits for this server's own budget to have room, but nobody is waiting on it, so a
+/// provider rate limit ends it at once and the schedule backs off as before.
 #[must_use]
 pub fn one_try_while_limiting(priority: Priority) -> bool {
     matches!(
         priority,
-        Priority::Crawl | Priority::Background | Priority::Live
+        Priority::Crawl | Priority::Background | Priority::Live | Priority::Refresh
     )
 }
 
@@ -166,6 +169,9 @@ pub fn while_limiting(priority: Priority, hurried: bool, writes_in_flight: bool)
         Priority::Page | Priority::Interactive if hurried => WhileLimiting::Pause,
         Priority::Page | Priority::Interactive if writes_in_flight => WhileLimiting::HoldForWrites,
         Priority::Page | Priority::Interactive => WhileLimiting::Go,
+        Priority::Refresh if hurried => WhileLimiting::Pause,
+        Priority::Refresh if writes_in_flight => WhileLimiting::HoldForWrites,
+        Priority::Refresh => WhileLimiting::Go,
     }
 }
 
@@ -181,6 +187,11 @@ pub enum Priority {
     Page,
     /// What keeps the page current without being asked: the live poller, relist, the probe.
     Live,
+    /// The upstream refresh of a page already answered from this server's copy: the reader is
+    /// looking at that stale copy until this lands, so it comes before live and background
+    /// work and keeps a reserved share of each method's ceiling. `#1715
+    /// vibe-talk-refresh-refused-stale-page`.
+    Refresh,
     /// What a person is waiting on.
     Interactive,
     /// A write, and the reads a post makes before it is sent. `#699 vt-send-priority`.
@@ -200,6 +211,7 @@ impl Priority {
             | ReadReason::Probe
             | ReadReason::ReplyMark
             | ReadReason::LivePoll => Self::Live,
+            ReadReason::Refresh => Self::Refresh,
             _ => Self::Interactive,
         }
     }
@@ -207,15 +219,19 @@ impl Priority {
 
 impl Priority {
     /// How many requests of a method with `ceiling` a minute may have been sent in the last minute,
-    /// by everyone, for a request at this priority to go: the whole ceiling for a person's request
-    /// and live work, three quarters for naming and summaries, half for the page's background
-    /// reads and for crawl work. So what keeps the page current always has room the rest cannot
-    /// take. A write is never held to a ceiling; this is its whole for completeness.
+    /// by everyone, for a request at this priority to go: the whole ceiling for a person's
+    /// request and for an owner-facing refresh, three quarters for naming and summaries
+    /// and for live work, half for the page's background reads and for crawl work. Live
+    /// work's quarter below the whole is the reservation an owner-facing refresh (and a
+    /// person's read) can always spend: relist and the live poller cannot take the last
+    /// quarter of a method, however busy they are. `#1715
+    /// vibe-talk-refresh-refused-stale-page`. A write is never held to a ceiling; this is
+    /// its whole for completeness.
     #[must_use]
     pub fn share(self, ceiling: usize) -> usize {
         match self {
-            Self::Write | Self::Interactive | Self::Live => ceiling,
-            Self::Background => (ceiling * 3 / 4).max(1),
+            Self::Write | Self::Interactive | Self::Refresh => ceiling,
+            Self::Background | Self::Live => (ceiling * 3 / 4).max(1),
             Self::Page | Self::Crawl => (ceiling / 2).max(1),
         }
     }
@@ -497,6 +513,11 @@ mod tests {
         assert_eq!(Priority::of(ReadReason::Untagged), Priority::Interactive);
         assert_eq!(Priority::of(ReadReason::Relist), Priority::Live);
         assert_eq!(Priority::of(ReadReason::LivePoll), Priority::Live);
+        // `#1715 vibe-talk-refresh-refused-stale-page`: an owner-facing refresh comes
+        // before live work, and is not a person's read itself.
+        assert_eq!(Priority::of(ReadReason::Refresh), Priority::Refresh);
+        assert!(Priority::Refresh > Priority::Live);
+        assert!(Priority::Refresh < Priority::Interactive);
         assert_eq!(Priority::of(ReadReason::Naming), Priority::Background);
         assert_eq!(Priority::of(ReadReason::Backfill), Priority::Crawl);
         assert_eq!(Priority::of(ReadReason::Shadow), Priority::Crawl);
@@ -588,11 +609,18 @@ mod tests {
         for _ in 0..5 {
             sent.record(METHOD, Priority::Live, now);
         }
-        // Fifteen: naming waits too.
+        // Fifteen: naming waits too, and so does live work — its three quarters are spent,
+        // and the last quarter is reserved for an owner-facing refresh and a person's read
+        // (`#1715 vibe-talk-refresh-refused-stale-page`).
         assert!(sent
             .ceiling_wait(METHOD, Priority::Background, 20, now)
             .is_some());
-        assert_eq!(sent.ceiling_wait(METHOD, Priority::Live, 20, now), None);
+        assert!(sent.ceiling_wait(METHOD, Priority::Live, 20, now).is_some());
+        assert_eq!(sent.ceiling_wait(METHOD, Priority::Refresh, 20, now), None);
+        assert_eq!(
+            sent.ceiling_wait(METHOD, Priority::Interactive, 20, now),
+            None
+        );
         let later = now + Duration::from_secs(10);
         for _ in 0..5 {
             sent.record(METHOD, Priority::Interactive, later);
@@ -625,10 +653,13 @@ mod tests {
             sent.ceiling_wait(METHOD, Priority::Interactive, 20, now),
             None
         );
-        // The shares themselves: page and crawl half, naming three quarters, the rest whole.
+        // The shares: page and crawl half, naming and live work three quarters (live
+        // work's last quarter is an owner-facing refresh's reservation, `#1715`), and a
+        // person's read and the refresh itself the whole ceiling.
         assert_eq!(Priority::Page.share(20), 10);
         assert_eq!(Priority::Background.share(20), 15);
-        assert_eq!(Priority::Live.share(20), 20);
+        assert_eq!(Priority::Live.share(20), 15);
+        assert_eq!(Priority::Refresh.share(20), 20);
         // Another method's allowance is its own, and a minute later the count has gone.
         assert_eq!(
             sent.ceiling_wait("conversations.history", Priority::Page, 20, now),
@@ -637,6 +668,52 @@ mod tests {
         assert_eq!(
             sent.ceiling_wait(METHOD, Priority::Page, 20, now + WINDOW),
             None
+        );
+    }
+
+    #[test]
+    fn a_refresh_is_admitted_in_the_share_live_and_crawl_cannot_take() {
+        // `#1715 vibe-talk-refresh-refused-stale-page`, with a fake budget: relist and
+        // backfill fill a method to live work's share; the refresh of a page the owner is
+        // looking at still goes, in the reserved quarter, and only waits once the whole
+        // ceiling — the unchanged overall rate — is spent.
+        const METHOD: &str = "conversations.history";
+        let now = Instant::now();
+        let mut sent = Sent::default();
+        for _ in 0..10 {
+            sent.record(METHOD, Priority::Live, now);
+        }
+        for _ in 0..5 {
+            sent.record(METHOD, Priority::Crawl, now);
+        }
+        // Fifteen of twenty, all of it live or crawl work.
+        assert!(sent.ceiling_wait(METHOD, Priority::Live, 20, now).is_some());
+        assert!(sent
+            .ceiling_wait(METHOD, Priority::Crawl, 20, now)
+            .is_some());
+        assert_eq!(sent.ceiling_wait(METHOD, Priority::Refresh, 20, now), None);
+        assert!(sent.admits(METHOD, Priority::Refresh, now));
+        for _ in 0..5 {
+            sent.record(METHOD, Priority::Refresh, now);
+        }
+        // The whole ceiling spent: even a refresh waits for the oldest to leave.
+        assert!(sent
+            .ceiling_wait(METHOD, Priority::Refresh, 20, now)
+            .is_some_and(|wait| wait <= WINDOW));
+        assert_eq!(
+            sent.ceiling_wait(METHOD, Priority::Refresh, 20, now + WINDOW),
+            None
+        );
+        // While the provider is limiting, a refresh is one-try work: it waits for this
+        // server's budget, never out the provider's own Retry-After.
+        assert!(one_try_while_limiting(Priority::Refresh));
+        assert_eq!(
+            while_limiting(Priority::Refresh, false, false),
+            WhileLimiting::Go
+        );
+        assert_eq!(
+            while_limiting(Priority::Refresh, false, true),
+            WhileLimiting::HoldForWrites
         );
     }
 

@@ -643,7 +643,9 @@ fn spawn_timeline_refresh(
     pending: PendingServe,
 ) {
     // `#617 cold-load-first-paint`: under the reason of the read it stands behind, which a spawned
-    // task does not inherit; it was counted as untagged.
+    // task does not inherit; it was counted as untagged. Its budget priority is already a
+    // person's (the whole ceiling), and live work now keeps a quarter of each method back
+    // for it (`#1715 vibe-talk-refresh-refused-stale-page`).
     let reason = crate::read_reason::ReadReason::current();
     drop(tokio::spawn(reason.scope(async move {
         let _claim = claim;
@@ -655,30 +657,55 @@ fn spawn_timeline_refresh(
         let fetch_began = std::time::Instant::now();
         let began = view_read_began(&state);
         let fill = state.message_cache.begin_for(caller, &channel);
-        let mut page = match state.chat.fetch_timeline(&channel, &request).await {
-            Ok(page) => page,
-            Err(_) => {
-                tracing::warn!(
-                    consumer = "timeline_fallback",
-                    "a page answered from the message cache could not be refreshed; it stands \
-                     until the next read"
-                );
-                // Unless the failure is the provider refusing the channel, which the routed
-                // read has already reported: what was served of a channel the cache now
-                // refuses comes off the page at once.
-                if channel_blocked(&state, &channel, &served).await {
-                    for was in served {
-                        state.live.publish_correction(
-                            &channel,
-                            crate::live::LiveKind::Delete,
-                            was.clone(),
-                            &was,
+        // A budget-refused refresh retries in this task, waiting until the schedule says
+        // it is due (a condition on the schedule, not the next owner read); other
+        // failures stand as they did. Bounded, so a route that keeps refusing is not
+        // kept busy. `#1715 vibe-talk-refresh-refused-stale-page`.
+        let mut attempts = 0u32;
+        let mut page = loop {
+            match state.chat.fetch_timeline(&channel, &request).await {
+                Ok(page) => break page,
+                Err(error) => {
+                    let refused = error.never_sent();
+                    if refused && attempts < REFRESH_REFUSAL_RETRIES {
+                        attempts += 1;
+                        let view_key = RefreshKey::view(
+                            channel.clone(),
+                            request.view,
+                            request.thread_id.as_deref(),
                         );
+                        state.refresh_schedule.note_refusal(&view_key);
+                        if let Some(due) = state.refresh_schedule.next_due(&view_key) {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+                        }
+                        continue;
                     }
+                    tracing::warn!(
+                        consumer = "timeline_fallback",
+                        "a page answered from the message cache could not be refreshed; it stands \
+                     until the next read"
+                    );
+                    // Unless the failure is the provider refusing the channel, which the routed
+                    // read has already reported: what was served of a channel the cache now
+                    // refuses comes off the page at once.
+                    if channel_blocked(&state, &channel, &served).await {
+                        for was in served {
+                            state.live.publish_correction(
+                                &channel,
+                                crate::live::LiveKind::Delete,
+                                was.clone(),
+                                &was,
+                            );
+                        }
+                    }
+                    return;
                 }
-                return;
             }
         };
+        state.refresh_schedule.note_outcome(
+            &RefreshKey::view(channel.clone(), request.view, request.thread_id.as_deref()),
+            true,
+        );
         // Before the read is offered, as in `timeline`, so the comparison knows its own writes.
         pending.compare(Upstream::of(&page.messages, page.has_more));
         if let Some(fill) = fill {
@@ -2390,14 +2417,30 @@ fn spawn_behind_cache_first(
     key: RefreshKey,
     served: Vec<Message>,
 ) {
-    let reason = crate::read_reason::ReadReason::current();
+    // `#1715 vibe-talk-refresh-refused-stale-page`: an owner-facing refresh, budgeted
+    // ahead of live and background work with a reserved share, and patient — a hurried
+    // read is refused at once at the ceiling, which is how the refresh starved while
+    // relist and the live poller waited for room and took it. The exception is the
+    // reads that fail fast by contract (the right column's and All's counts,
+    // [`fails_fast`]): they keep their reason and their hurry, as the cache answers
+    // them (`#614 timeline-read-failures`).
+    let standing = crate::read_reason::ReadReason::current();
+    let hurried = matches!(
+        standing,
+        crate::read_reason::ReadReason::Side | crate::read_reason::ReadReason::Counts
+    );
+    let reason = if hurried {
+        standing
+    } else {
+        crate::read_reason::ReadReason::Refresh
+    };
     let (state, channel, request) = (state.clone(), channel.clone(), request.clone());
     // As the request's own read would have been versioned: from before it began.
     let began_ms = crate::store::now_ms();
     let fetch_began = std::time::Instant::now();
     let generation = state.landed.generation();
     drop(tokio::spawn(reason.scope(crate::read_reason::hurry(
-        true,
+        hurried,
         async move {
             let _claim = claim;
             let noted_ms = state
@@ -2476,7 +2519,26 @@ fn spawn_behind_cache_first(
                     );
                 }
                 Err(error) => {
-                    state.refresh_schedule.note_outcome(&view_key, false);
+                    // `#1715 vibe-talk-refresh-refused-stale-page`: a refusal by this
+                    // server's own budget retries soon, in a task of its own — it does
+                    // not stand until the next owner read, on the long failure back-off.
+                    let refused = match &error {
+                        OpError::Chat(chat) => chat.never_sent(),
+                        _ => false,
+                    };
+                    if refused && !hurried {
+                        state.refresh_schedule.note_refusal(&view_key);
+                        spawn_behind_refresh_retry(
+                            state.clone(),
+                            channel.clone(),
+                            request.clone(),
+                            key.clone(),
+                            served.clone(),
+                            1,
+                        );
+                    } else {
+                        state.refresh_schedule.note_outcome(&view_key, false);
+                    }
                     tracing::info!(
                         consumer = "cache_first",
                         view = ?request.view,
@@ -2485,6 +2547,94 @@ fn spawn_behind_cache_first(
                         "the read behind a page answered from the message cache failed; the next \
                          read is answered from the cache again, dated by the last read that answered"
                     );
+                }
+            }
+        },
+    ))));
+}
+
+/// Retry a budget-refused refresh behind a cache-first answer, on the refresh
+/// schedule's own due instant: wait until it is due (a condition on the schedule, not
+/// the next owner read), then read once more, as an owner-facing refresh. Bounded by
+/// [`REFRESH_REFUSAL_RETRIES`]. `#1715 vibe-talk-refresh-refused-stale-page`.
+fn spawn_behind_refresh_retry(
+    state: AppState,
+    channel: ChannelId,
+    request: crate::threads::TimelineRequest,
+    key: RefreshKey,
+    served: Vec<Message>,
+    attempt: u32,
+) {
+    if attempt > REFRESH_REFUSAL_RETRIES {
+        return;
+    }
+    let reason = crate::read_reason::ReadReason::Refresh;
+    drop(tokio::spawn(reason.scope(crate::read_reason::hurry(
+        false,
+        async move {
+            let view_key =
+                RefreshKey::view(channel.clone(), request.view, request.thread_id.as_deref());
+            if let Some(due) = state.refresh_schedule.next_due(&view_key) {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+            }
+            if !state.refresh_schedule.try_schedule(&view_key) {
+                return;
+            }
+            let Some(claim) = state.message_cache.claim_refresh(key.clone()) else {
+                return;
+            };
+            let _claim = claim;
+            if allowed(&state, channel.as_str()).await.is_err() {
+                return;
+            }
+            let generation = state.landed.generation();
+            let began_ms = crate::store::now_ms();
+            let fetch_began = std::time::Instant::now();
+            match state.chat.fetch_timeline(&channel, &request).await {
+                Ok(page) => {
+                    state.refresh_schedule.note_outcome(&view_key, true);
+                    note_upstream_read(&state.message_cache, &channel, &request, &page, began_ms);
+                    for message in &page.messages {
+                        if served.iter().any(|was| was.id == message.id) {
+                            continue;
+                        }
+                        match &message.thread {
+                            Some(thread) if !thread.is_root => {
+                                state.live.publish_reply(&channel, message.clone());
+                            }
+                            _ => state.live.publish(&channel, message.clone()),
+                        }
+                    }
+                    state.landed.keep(
+                        key,
+                        request.after.clone(),
+                        generation,
+                        crate::cache_first::LandedAnswer::Page(Box::new(
+                            crate::cache_first::LandedRead {
+                                page,
+                                position: None,
+                                began_ms,
+                                fetch_began,
+                            },
+                        )),
+                    );
+                    publish_serve_corrections(&state, &channel, served).await;
+                }
+                Err(error) => {
+                    let refused = error.never_sent();
+                    if refused {
+                        state.refresh_schedule.note_refusal(&view_key);
+                        spawn_behind_refresh_retry(
+                            state,
+                            channel,
+                            request,
+                            key,
+                            served,
+                            attempt + 1,
+                        );
+                    } else {
+                        state.refresh_schedule.note_outcome(&view_key, false);
+                    }
                 }
             }
         },
@@ -2511,6 +2661,11 @@ fn too_slow(state: &AppState) -> OpError {
 
 /// How often a read waiting for another read of its view to end looks again.
 const FLIGHT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How many times one owner-facing refresh retries in its own task after this server's
+/// budget refuses it, each time waiting until the refresh schedule says it is due.
+/// `#1715 vibe-talk-refresh-refused-stale-page`.
+const REFRESH_REFUSAL_RETRIES: u32 = 4;
 
 /// The single-flight key of an upstream timeline read: a newest page's is the one its serve's
 /// refresh claims ([`RefreshKey::timeline`]), so a stand-in read and a refresh never run together
