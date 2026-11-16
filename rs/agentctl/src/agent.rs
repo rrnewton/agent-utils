@@ -5518,15 +5518,18 @@ mod tests {
         }
     }
 
-    /// A fake clock that stops on its first sleep after the inflight
+    /// A fake clock that stops on a chosen sleep after the inflight
     /// item carries `paste_started_at`: at that point a submission has
     /// started and the drain has released the queue lock, so a test
-    /// can take that lock itself before submission continues.
+    /// can take that lock itself before submission continues. With
+    /// `recheck_only`, the chosen sleep is the delayed re-check after
+    /// a verified submission instead of the first sleep of any kind.
     struct PasteGateRuntime {
         clock: FakeRuntime,
         root: PathBuf,
         gate: Arc<RunGate>,
         gated: AtomicBool,
+        recheck_only: bool,
     }
 
     impl PasteGateRuntime {
@@ -5547,7 +5550,8 @@ mod tests {
         }
 
         fn sleep(&self, duration: Duration) {
-            if !self.gated.load(AtomicOrdering::SeqCst) && self.paste_started() {
+            let chosen = !self.recheck_only || duration == crate::submission::RECHECK_DELAY;
+            if chosen && !self.gated.load(AtomicOrdering::SeqCst) && self.paste_started() {
                 self.gated.store(true, AtomicOrdering::SeqCst);
                 self.gate.enter_and_wait();
             }
@@ -5556,6 +5560,10 @@ mod tests {
 
         fn delivery_wait_chunk(&self) -> Option<Duration> {
             Some(Duration::from_millis(1))
+        }
+
+        fn second_enter_enabled(&self) -> bool {
+            true
         }
     }
 
@@ -8304,6 +8312,25 @@ mod tests {
         );
     }
 
+    /// Take a queue's delivery lock from outside its drain, once the
+    /// drain has released it for typing.
+    fn acquire_queue_lock(root: &Path) -> Option<agent_queue::fsio::HeldLock> {
+        let lock_file = open_private_lock(&root.join(".delivery.lock"), "held test lock")
+            .expect("open queue lock holder");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&lock_file) {
+                Ok(()) => return Some(agent_queue::fsio::HeldLock::new(lock_file)),
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// A send whose submission starts under the paste gate, letting
     /// this test hold the queue lock across the drain's commit retake.
     fn send_typed_then_fail_queue_lock_retake(
@@ -8326,6 +8353,7 @@ mod tests {
             root: root.clone(),
             gate: Arc::clone(&gate),
             gated: AtomicBool::new(false),
+            recheck_only: false,
         };
         let target = target_for(pane_id);
         let result = std::thread::scope(|scope| {
@@ -8352,24 +8380,7 @@ mod tests {
                     1,
                     "the gated submission's item is claimed"
                 );
-                let lock_file = open_private_lock(&root.join(".delivery.lock"), "held test lock")
-                    .expect("open queue lock holder");
-                let deadline = Instant::now() + Duration::from_secs(120);
-                loop {
-                    match fs2::FileExt::try_lock_exclusive(&lock_file) {
-                        Ok(()) => {
-                            holder = Some(agent_queue::fsio::HeldLock::new(lock_file));
-                            break;
-                        }
-                        Err(error)
-                            if error.kind() == io::ErrorKind::WouldBlock
-                                && Instant::now() < deadline =>
-                        {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(_) => break,
-                    }
-                }
+                holder = acquire_queue_lock(&root);
             }
             gate.release();
             let result = sender.join().expect("send thread");
@@ -8464,6 +8475,214 @@ mod tests {
             "the next drain must not type the prompt again: {:?}",
             state.inputs
         );
+    }
+
+    struct ScreenTypedThenLocked {
+        directory: TestDirectory,
+        agent: FakeAgent,
+        error: AgentError,
+        submitted_at_gate: usize,
+        keys_at_gate: usize,
+    }
+
+    /// A verified screen submission stopped by the paste gate after
+    /// its first input (or, with `recheck_only`, during the delayed
+    /// re-check), letting this test hold the queue lock across the
+    /// rest of submission and the drain's commit retake.
+    fn send_screen_typed_then_fail_queue_lock_retake(
+        label: &str,
+        pane_id: &str,
+        recheck_only: bool,
+        put_back_at_gate: bool,
+    ) -> ScreenTypedThenLocked {
+        let text = "typed before the commit lock fails";
+        let directory = TestDirectory::new(label);
+        let root = directory.path().to_path_buf();
+        let agent =
+            FakeAgent::with_screen(crate::submission::fake::FakeScreen::new("claude", false))
+                .on_pane(pane_id);
+        let gate = Arc::new(RunGate::default());
+        let runtime = PasteGateRuntime {
+            clock: FakeRuntime::default(),
+            root: root.clone(),
+            gate: Arc::clone(&gate),
+            gated: AtomicBool::new(false),
+            recheck_only,
+        };
+        let target = target_for(pane_id);
+        let (error, submitted_at_gate, keys_at_gate) = std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                send_identified_with_runtime(
+                    &agent,
+                    &target,
+                    &root,
+                    text,
+                    DrainOptions {
+                        ready_timeout: Duration::ZERO,
+                        lock_timeout: Some(Duration::from_millis(50)),
+                        ..DrainOptions::default()
+                    },
+                    &runtime,
+                    Some("typed-then-locked"),
+                )
+            });
+            let entered = gate.wait_for_entries(1, Duration::from_secs(120));
+            let (submitted_at_gate, keys_at_gate) = {
+                let state = agent.screen.as_ref().expect("fake screen").state();
+                (state.submitted.len(), state.keys.len())
+            };
+            let mut holder = None;
+            if entered {
+                assert_eq!(
+                    json_paths(&root.join("inflight")).expect("inflight").len(),
+                    1,
+                    "the gated submission's item is claimed"
+                );
+                if put_back_at_gate {
+                    agent
+                        .screen
+                        .as_ref()
+                        .expect("fake screen")
+                        .leave_draft(text);
+                }
+                holder = acquire_queue_lock(&root);
+            }
+            gate.release();
+            let result = sender.join().expect("send thread");
+            assert!(entered, "submission never reached its chosen sleep");
+            assert!(holder.is_some(), "queue lock was not free during typing");
+            drop(holder);
+            (result.unwrap_err(), submitted_at_gate, keys_at_gate)
+        });
+        ScreenTypedThenLocked {
+            directory,
+            agent,
+            error,
+            submitted_at_gate,
+            keys_at_gate,
+        }
+    }
+
+    #[test]
+    fn a_queue_lock_failure_after_the_second_enter_is_possibly_submitted_not_pending() {
+        let outcome = send_screen_typed_then_fail_queue_lock_retake(
+            "lock-failure-after-second-enter",
+            "w1:p-lock-after-second-enter",
+            false,
+            false,
+        );
+        let error = &outcome.error;
+        assert_eq!(
+            error.outcome(),
+            Some(QueueOutcome::PossiblySubmitted),
+            "{error}"
+        );
+        assert_eq!(error.exit_code(), EXIT_TIMEOUT, "{error}");
+        assert!(!error.safe_to_retry(), "{error}");
+        let inflight =
+            json_paths(&outcome.directory.path().join("inflight")).expect("inflight artifacts");
+        assert_eq!(inflight.len(), 1);
+        let document = read_json(&inflight[0]).unwrap();
+        assert!(
+            document["second_enter_at"].as_f64().is_some(),
+            "second Enter did not run before the retake: {document}"
+        );
+        let state = outcome.agent.screen.as_ref().expect("fake screen").state();
+        assert_eq!(state.pastes.len(), 1);
+        assert_eq!(state.submitted, ["typed before the commit lock fails"]);
+        assert!(
+            state.keys.len() > outcome.keys_at_gate,
+            "no submission key followed the paste: {:?}",
+            state.keys
+        );
+    }
+
+    #[test]
+    fn a_queue_lock_failure_after_the_delayed_recheck_is_possibly_submitted_not_pending() {
+        let outcome = send_screen_typed_then_fail_queue_lock_retake(
+            "lock-failure-after-recheck",
+            "w1:p-lock-after-recheck",
+            true,
+            true,
+        );
+        let error = &outcome.error;
+        assert_eq!(
+            error.outcome(),
+            Some(QueueOutcome::PossiblySubmitted),
+            "{error}"
+        );
+        assert_eq!(error.exit_code(), EXIT_TIMEOUT, "{error}");
+        assert!(!error.safe_to_retry(), "{error}");
+        assert_eq!(outcome.submitted_at_gate, 1);
+        assert_eq!(outcome.keys_at_gate, 1);
+        let state = outcome.agent.screen.as_ref().expect("fake screen").state();
+        assert_eq!(
+            state.pastes.len(),
+            1,
+            "the re-check must submit the put-back paste without typing it again: {:?}",
+            state.pastes
+        );
+        // The first submission started a turn, so the re-check's key
+        // queues the put-back prompt behind it instead of taking it
+        // as a second submitted turn.
+        assert_eq!(state.submitted, ["typed before the commit lock fails"]);
+        assert_eq!(state.queued, ["typed before the commit lock fails"]);
+        assert!(
+            state.keys.len() > outcome.keys_at_gate,
+            "the delayed re-check sent no key: {:?}",
+            state.keys
+        );
+    }
+
+    #[test]
+    fn a_prompt_submitted_by_the_second_enter_is_delivered_not_quarantined_by_the_next_drain() {
+        let outcome = send_screen_typed_then_fail_queue_lock_retake(
+            "second-enter-next-drain",
+            "w1:p-second-enter-next-drain",
+            false,
+            false,
+        );
+        assert_eq!(
+            outcome.error.outcome(),
+            Some(QueueOutcome::PossiblySubmitted),
+            "{}",
+            outcome.error
+        );
+        let inflight =
+            json_paths(&outcome.directory.path().join("inflight")).expect("inflight artifacts");
+        assert_eq!(inflight.len(), 1);
+        let document = read_json(&inflight[0]).unwrap();
+        assert!(
+            document["second_enter_at"].as_f64().is_some(),
+            "second Enter did not run before the retake: {document}"
+        );
+
+        let result = drain_with_runtime(
+            &outcome.agent,
+            &target_for("w1:p-second-enter-next-drain"),
+            outcome.directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered, "{result:?}");
+        assert_eq!(result.delivered, ["typed-then-locked"], "{result:?}");
+        assert!(result.quarantined.is_empty(), "{result:?}");
+        assert_eq!(
+            message_state(outcome.directory.path(), "typed-then-locked").unwrap(),
+            Some(QueueMessageState::Processed)
+        );
+        let state = outcome.agent.screen.as_ref().expect("fake screen").state();
+        assert_eq!(
+            state.pastes.len(),
+            1,
+            "the next drain must not type the prompt again: {:?}",
+            state.pastes
+        );
+        assert_eq!(state.submitted, ["typed before the commit lock fails"]);
     }
 
     #[test]
