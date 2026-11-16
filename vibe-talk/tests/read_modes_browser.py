@@ -666,9 +666,10 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
         " .read-run-peel[data-peel=\"first\"]'); return b && b.getClientRects().length > 0; }",
         timeout=5_000)
     geo = page.evaluate(PEEL_JS)
-    check(isinstance(geo, dict) and geo.get("first") and geo.get("last"),
-          f"{size}: the peels are not on the line: {geo!r}")
+    check(isinstance(geo, dict), f"{size}: the peels are not on the line: {geo!r}")
     assert isinstance(geo, dict)
+    check(bool(geo.get("first")) and bool(geo.get("last")),
+          f"{size}: the peels are not on the line: {geo!r}")
     check(geo["firstText"] == "First 5" and geo["lastText"] == "Last 5",
           f"{size}: the peels say {geo['firstText']!r} and {geo['lastText']!r}, not First 5 / Last 5")
     check(abs(geo["first"]["left"] - geo["head"]["left"]) <= 3,
