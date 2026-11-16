@@ -4365,7 +4365,9 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             // R1b on the watch pass too: a harness hand-restarted in its
             // recorded pane with its recorded session is re-pinned here,
             // not only when someone sends to it.
-            let desired_names = crate::subagents::restore_agent_names(registry)
+            let desired_names = manager
+                .listed_names()
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|name| watch_desires_agent(config, name))
                 .collect::<Vec<_>>();

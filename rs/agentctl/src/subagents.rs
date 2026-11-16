@@ -12171,7 +12171,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// (restore's old report directory, #1359) is not an agent and is
     /// skipped, while a record that exists but cannot be read still gets
     /// its own error row from the caller.
-    fn listed_names(&self) -> Result<Vec<String>> {
+    pub(crate) fn listed_names(&self) -> Result<Vec<String>> {
         Ok(self
             .registered_names()?
             .into_iter()

@@ -726,6 +726,57 @@ fn restore_reports_queued_delivered_and_archived_counts_per_agent() {
 }
 
 #[test]
+fn watch_drains_the_declared_coordinator_but_not_unlisted_historical_agents() {
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    for name in ["lead", "historical"] {
+        fixture
+            .manager()
+            .start(
+                name,
+                &fixture.root,
+                StartOptions {
+                    harness: "codex".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture
+            .manager()
+            .queue_identified(name, "pending prompt", None, None, Some(name))
+            .unwrap();
+    }
+    let mut cfg = config(&fixture, Some("lead"));
+    cfg.agents = Some(Vec::new());
+    let findings = watch_pass(&fixture, &ScriptedHost::new(), &cfg);
+    assert!(
+        findings
+            .iter()
+            .any(|row| row["check"] == "queue" && row["subject"] == "lead"),
+        "{findings:?}"
+    );
+    assert!(fixture
+        .manager()
+        .pending_prompts("lead")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fixture
+            .manager()
+            .pending_prompts("historical")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!findings
+        .iter()
+        .any(|row| row["check"] == "queue" && row["subject"] == "historical"));
+}
+
+#[test]
 fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
     let fixture = Fixture::new();
     fixture
