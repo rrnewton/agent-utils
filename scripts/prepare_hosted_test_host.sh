@@ -20,7 +20,7 @@ if [[ ${ID:-} != ubuntu || ${VERSION_ID:-} != 24.04 ]]; then
     exit 2
 fi
 sudo -n apt-get update -qq
-sudo -n apt-get install -y -qq btrfs-progs fuse3 lsof zstd
+sudo -n apt-get install -y -qq btrfs-progs fuse3 fuse2fs lsof zstd
 test "$(readlink -f /usr/bin/sudo)" = /usr/bin/sudo
 test "$(stat -c %u /usr/bin/sudo)" = 0
 PYTHONPATH=py python3 - <<'PY'

@@ -1280,12 +1280,12 @@ def test_privileged_ci_jobs_prepare_their_declared_host_before_testing() -> None
     for name in ("rust-msrv", "validate", "python-minimum-tests"):
         job = _job(workflow, name)
         assert job["runs-on"] == "ubuntu-24.04"
-        environment = job["env"]
-        assert isinstance(environment, dict)
-        assert environment["AGENT_UTILS_RUNNER_ENVIRONMENT"] == "${{ runner.environment }}"
         steps = _steps(job)
         [prepare] = [i for i, step in enumerate(steps)
                      if step.get("run") == "bash scripts/prepare_hosted_test_host.sh"]
+        environment = steps[prepare]["env"]
+        assert isinstance(environment, dict)
+        assert environment["AGENT_UTILS_RUNNER_ENVIRONMENT"] == "${{ runner.environment }}"
         assert steps[prepare - 1]["uses"] == "actions/checkout@v5"
         assert "continue-on-error" not in steps[prepare]
         assert all(i > prepare for i, step in enumerate(steps)

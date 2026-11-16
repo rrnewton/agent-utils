@@ -74,8 +74,6 @@ jobs:
     needs: plan
     if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-24.04
-    env:
-      AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
     # With its test step (30 runs, 2026-09-21..25) this job took 2.9-25.1 min in its 21 green
     # runs, median 6.8; the longest of 9 red runs took 30.0. 45 bounds a hang, not a slow build.
     timeout-minutes: 45
@@ -85,6 +83,8 @@ jobs:
       # import pytest even though this job's primary toolchain is Rust, so install that explicit
       # test dependency instead of depending on the runner image's ambient Python packages.
       - name: prepare and verify the privileged Linux test host
+        env:
+          AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: bash scripts/prepare_hosted_test_host.sh
       - uses: actions/setup-python@v6
         with:
@@ -110,8 +110,6 @@ jobs:
     # jobs below use older language versions; they are not a second definition of this contract.
     needs: plan
     runs-on: ubuntu-24.04
-    env:
-      AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
     # The nightly's budget. A workflow edit selects the complete graph, and the graph now keeps
     # going past a failure (validate.py --keep-going), so a red run lasts as long as a green one;
     # the complete graph alone has taken about fifty minutes on a hosted runner.
@@ -123,6 +121,8 @@ jobs:
           # checkout cannot answer that question and must not silently become a full run.
           fetch-depth: 0
       - name: prepare and verify the privileged Linux test host
+        env:
+          AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: bash scripts/prepare_hosted_test_host.sh
       - uses: actions/setup-python@v6
         with:
@@ -201,8 +201,6 @@ jobs:
     needs: plan
     if: needs.plan.outputs.python == 'true'
     runs-on: ubuntu-24.04
-    env:
-      AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
     # Every distribution declares requires-python >=3.10, and the selected graph runs the tests
     # only on 3.12. Run serially, the whole suite outgrew its 35 minutes by 2026-10-10 and was
     # cancelled at about 92% in every run after that, so nothing said which tests fail here.
@@ -228,6 +226,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: prepare and verify the privileged Linux test host
+        env:
+          AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: bash scripts/prepare_hosted_test_host.sh
       - uses: actions/setup-python@v6
         with:
