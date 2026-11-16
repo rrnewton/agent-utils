@@ -11,16 +11,18 @@
       "bot_user_id": "1545796614826889226",
       "host": "newton-fedora",
       "aliases": ["newton-fedora"],
-      "peer_bots": {"1532416065114607829": "deepscry@<PEER_HOST>"},
+      "peer_bots": {"1532416065114607829": "fleet@<PEER_HOST>"},
       "token_file": "/root/.claude/channels/discord/.env",
       "token_key": "DISCORD_BOT_TOKEN",
-      "poll_seconds": 5
+      "poll_seconds": 5,
+      "bridge_agent": "coordinator",
+      "ack_reply": true
     }
   },
   "relay_channels": [
     {
       "channel": "1566504459499217097",
-      "peer_senders": {"1532416065114607829": "deepscry@<PEER_HOST>"},
+      "peer_senders": {"1532416065114607829": "fleet@<PEER_HOST>"},
       "command": ["agent-teams", "relay-in", "--route", "relay-discord"]
     }
   ],
@@ -28,7 +30,9 @@
     "executable": "/absolute/path/to/agentctl-discord-outbound",
     "arguments": [
       "--channel=1566504459499217097",
-      "--token-file=/root/.claude/channels/discord/.env"
+      "--token-file=/root/.claude/channels/discord/.env",
+      "--ledger=/root/.local/state/agentctl/chat/discord-outbound",
+      "--timeout-seconds=10"
     ],
     "environment": [],
     "timeout_millis": 25000,

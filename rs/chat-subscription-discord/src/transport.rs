@@ -6,12 +6,27 @@
 //! (`curl -K -`). The token therefore never appears in an argument list (visible to every
 //! local user through `/proc`), and no error or log line in this crate ever includes it.
 //! [`FakeRest`] is the deterministic in-memory transport the tests use.
+//!
+//! # Rate limits
+//!
+//! Discord publishes a per-route bucket on every response (`X-RateLimit-Remaining`,
+//! `X-RateLimit-Reset-After`) and answers an exceeded bucket with HTTP 429 and a JSON
+//! `retry_after` in seconds (<https://discord.com/developers/docs/topics/rate-limits>). The
+//! curl transport reads both. When a response says the bucket is empty, or a 429 names a wait,
+//! the transport refuses every later call until that wait has passed, without contacting
+//! Discord, as `rate_limited` with [`RestError::retry_after`] set. Callers schedule around it:
+//! the subscription delays its next poll ([`crate::plugin`]) and the outbound helper waits a
+//! short `retry_after` once and retries ([`crate::outbound`]). The transport never sleeps
+//! itself, so a cancelled subscription is not held up by a rate-limit wait. Refusing early also
+//! keeps a misbehaving caller away from Discord's invalid-request limit (10,000 responses of
+//! 401, 403 or 429 per 10 minutes, after which Discord blocks the address).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -23,6 +38,11 @@ pub const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
 pub const MAX_CONTENT_CHARS: usize = 2000;
 /// Discord's message `nonce` limit, in characters.
 pub const MAX_NONCE_CHARS: usize = 25;
+/// The longest rate-limit wait honoured as given; a longer `retry_after` is clamped to this.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
+/// Message types that carry a person's or bot's own text: `DEFAULT` (0) and `REPLY` (19).
+/// Every other type is a system notice (joins, pins, thread events, ...).
+pub const USER_MESSAGE_TYPES: [u64; 2] = [0, 19];
 
 /// One Discord message, reduced to what the provider uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +55,12 @@ pub struct DiscordMessage {
     pub author_id: Snowflake,
     /// Whether the author is a bot account.
     pub author_is_bot: bool,
+    /// Whether Discord marks the author as an official system user.
+    pub author_is_system: bool,
+    /// Whether a webhook posted it (its author is then not a real account).
+    pub webhook: bool,
+    /// Discord's message type ([`USER_MESSAGE_TYPES`] for ordinary posts).
+    pub kind: u64,
     /// Text content (empty when the bot lacks the message-content intent).
     pub content: String,
     /// ISO 8601 creation time as Discord reports it.
@@ -55,6 +81,15 @@ pub fn parse_message(value: &Value) -> Result<DiscordMessage, String> {
     let author = value.get("author").ok_or("message has no author")?;
     let author_id = snowflake_field(author, "id")?;
     let author_is_bot = author.get("bot").and_then(Value::as_bool).unwrap_or(false);
+    let author_is_system = author
+        .get("system")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let webhook = value.get("webhook_id").is_some_and(|id| !id.is_null());
+    let kind = value
+        .get("type")
+        .and_then(Value::as_u64)
+        .ok_or("message has no numeric type")?;
     let content = value
         .get("content")
         .and_then(Value::as_str)
@@ -75,10 +110,53 @@ pub fn parse_message(value: &Value) -> Result<DiscordMessage, String> {
         channel_id,
         author_id,
         author_is_bot,
+        author_is_system,
+        webhook,
+        kind,
         content,
         timestamp,
         reply_to,
     })
+}
+
+impl DiscordMessage {
+    /// An ordinary post with no bot, system or webhook marks: the fields tests and fixtures
+    /// usually vary.
+    #[must_use]
+    pub fn new(
+        id: Snowflake,
+        channel_id: Snowflake,
+        author_id: Snowflake,
+        content: &str,
+        reply_to: Option<Snowflake>,
+    ) -> Self {
+        Self {
+            id,
+            channel_id,
+            author_id,
+            author_is_bot: false,
+            author_is_system: false,
+            webhook: false,
+            kind: if reply_to.is_some() { 19 } else { 0 },
+            content: content.to_owned(),
+            timestamp: "2026-11-15T16:45:00.123000+00:00".to_owned(),
+            reply_to,
+        }
+    }
+
+    /// Whether this is an ordinary user post (not a system notice).
+    #[must_use]
+    pub fn is_user_message(&self) -> bool {
+        USER_MESSAGE_TYPES.contains(&self.kind)
+    }
+
+    /// Whether the author is verifiably a person: an ordinary post by a real account that
+    /// Discord marks neither bot nor system, and not a webhook. Discord omits `bot` and
+    /// `system` for people, so their absence is the human case.
+    #[must_use]
+    pub fn author_is_human(&self) -> bool {
+        self.is_user_message() && !self.author_is_bot && !self.author_is_system && !self.webhook
+    }
 }
 
 fn snowflake_field(value: &Value, field: &str) -> Result<Snowflake, String> {
@@ -111,6 +189,8 @@ pub struct RestError {
     pub retryable: bool,
     /// Whether the call may have taken effect.
     pub applied: Applied,
+    /// For `rate_limited`: how long Discord asked us to wait before the next call.
+    pub retry_after: Option<Duration>,
 }
 
 impl RestError {
@@ -129,7 +209,25 @@ impl RestError {
             detail,
             retryable,
             applied,
+            retry_after: None,
         }
+    }
+
+    /// A refusal issued without contacting Discord because a rate-limit wait is in force.
+    #[must_use]
+    pub fn rate_limited(wait: Duration) -> Self {
+        let mut error = Self::new(
+            "rate_limited",
+            format!(
+                "rate limited; retry after {} ms (not sent)",
+                wait.as_millis()
+            ),
+            true,
+            Applied::NotApplied,
+        );
+        error.status = Some(429);
+        error.retry_after = Some(wait);
+        error
     }
 
     /// Classify an HTTP error status.
@@ -144,8 +242,86 @@ impl RestError {
         };
         let mut error = Self::new(code, format!("HTTP {status}: {body}"), retryable, applied);
         error.status = Some(status);
+        if status == 429 {
+            error.retry_after = Some(retry_after_from_body(body).unwrap_or(Duration::from_secs(1)));
+        }
         error
     }
+}
+
+/// The `retry_after` (seconds, fractional) from a 429 body, clamped to [`MAX_RETRY_AFTER`].
+#[must_use]
+pub fn retry_after_from_body(body: &str) -> Option<Duration> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("retry_after")
+        .and_then(Value::as_f64)
+        .and_then(seconds)
+}
+
+fn seconds(value: f64) -> Option<Duration> {
+    (value.is_finite() && value >= 0.0)
+        .then(|| Duration::from_secs_f64(value.min(MAX_RETRY_AFTER.as_secs_f64())))
+}
+
+/// The rate-limit headers of one response, as curl's `--write-out` reports them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RateHeaders {
+    /// `X-RateLimit-Remaining`: calls left in this route's bucket.
+    pub remaining: Option<u64>,
+    /// `X-RateLimit-Reset-After`: seconds until the bucket refills.
+    pub reset_after: Option<f64>,
+    /// `Retry-After`: seconds to wait (429 only).
+    pub retry_after: Option<f64>,
+}
+
+impl RateHeaders {
+    /// How long to hold every later call after a response with this `status` and `body`:
+    /// a 429's `retry_after` (body, then header), or the bucket's reset time once it is empty.
+    #[must_use]
+    pub fn hold(&self, status: u16, body: &str) -> Option<Duration> {
+        if status == 429 {
+            return retry_after_from_body(body)
+                .or_else(|| self.retry_after.and_then(seconds))
+                .or(Some(Duration::from_secs(1)));
+        }
+        if self.remaining == Some(0) {
+            return self.reset_after.and_then(seconds);
+        }
+        None
+    }
+}
+
+/// The `--write-out` trailer: status and rate headers on the last line, `|`-separated.
+const WRITE_OUT: &str = "\n%{http_code}|%header{x-ratelimit-remaining}|%header{x-ratelimit-reset-after}|%header{retry-after}";
+
+/// Split curl's output into the body, the HTTP status (0 when none) and the rate headers.
+#[must_use]
+pub fn parse_curl_output(stdout: &str) -> (&str, u16, RateHeaders) {
+    let (body, trailer) = stdout.rsplit_once('\n').unwrap_or(("", stdout));
+    let mut fields = trailer.trim().split('|');
+    let status = fields
+        .next()
+        .and_then(|status| status.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+    let mut next = || {
+        fields
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let remaining = next().and_then(|value| value.parse().ok());
+    let reset_after = next().and_then(|value| value.parse().ok());
+    let retry_after = next().and_then(|value| value.parse().ok());
+    (
+        body,
+        status,
+        RateHeaders {
+            remaining,
+            reset_after,
+            retry_after,
+        },
+    )
 }
 
 impl fmt::Display for RestError {
@@ -195,6 +371,17 @@ pub trait DiscordRest: Send {
         message: Snowflake,
         emoji: &str,
     ) -> Result<(), RestError>;
+
+    /// Read one message, as the authority on who wrote it.
+    ///
+    /// # Errors
+    ///
+    /// Any REST failure, including `not_found` for a deleted message.
+    fn get_message(
+        &mut self,
+        channel: Snowflake,
+        message: Snowflake,
+    ) -> Result<DiscordMessage, RestError>;
 }
 
 /// A bot token. Its `Debug` never shows the value.
@@ -295,6 +482,7 @@ pub struct CurlTransport {
     api_base: String,
     token: Token,
     timeout_seconds: u32,
+    hold_until: Option<Instant>,
 }
 
 impl CurlTransport {
@@ -320,6 +508,7 @@ impl CurlTransport {
             api_base: api_base.trim_end_matches('/').to_owned(),
             token,
             timeout_seconds: timeout_seconds.clamp(1, 120),
+            hold_until: None,
         })
     }
 
@@ -350,7 +539,14 @@ impl CurlTransport {
         config
     }
 
-    fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, RestError> {
+    fn call(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, RestError> {
+        if let Some(until) = self.hold_until {
+            let wait = until.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                return Err(RestError::rate_limited(wait));
+            }
+            self.hold_until = None;
+        }
         let config = self.config_text(method, path, body);
         let mut child = Command::new(&self.curl)
             .args([
@@ -359,7 +555,7 @@ impl CurlTransport {
                 "--max-time",
                 &self.timeout_seconds.to_string(),
                 "--write-out",
-                "\n%{http_code}",
+                WRITE_OUT,
                 "--config",
                 "-",
             ])
@@ -391,8 +587,10 @@ impl CurlTransport {
             ));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (body_text, status_text) = stdout.rsplit_once('\n').unwrap_or(("", &stdout));
-        let status = status_text.trim().parse::<u16>().unwrap_or(0);
+        let (body_text, status, headers) = parse_curl_output(&stdout);
+        if let Some(hold) = headers.hold(status, body_text) {
+            self.hold_until = Some(Instant::now() + hold);
+        }
         if status == 0 {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(RestError::new(
@@ -403,7 +601,11 @@ impl CurlTransport {
             ));
         }
         if !(200..300).contains(&status) {
-            return Err(RestError::from_status(status, body_text.trim()));
+            let mut error = RestError::from_status(status, body_text.trim());
+            if status == 429 {
+                error.retry_after = headers.hold(status, body_text);
+            }
+            return Err(error);
         }
         if body_text.trim().is_empty() {
             return Ok(Value::Null);
@@ -489,6 +691,30 @@ impl DiscordRest for CurlTransport {
         );
         self.call("PUT", &path, None).map(|_| ())
     }
+
+    fn get_message(
+        &mut self,
+        channel: Snowflake,
+        message: Snowflake,
+    ) -> Result<DiscordMessage, RestError> {
+        let value = self.call(
+            "GET",
+            &format!("/channels/{channel}/messages/{message}"),
+            None,
+        )?;
+        let parsed = parse_message(&value).map_err(|problem| {
+            RestError::new("invalid_response", problem, false, Applied::NotApplied)
+        })?;
+        if parsed.id != message || parsed.channel_id != channel {
+            return Err(RestError::new(
+                "invalid_response",
+                "Discord returned a different message",
+                false,
+                Applied::NotApplied,
+            ));
+        }
+        Ok(parsed)
+    }
 }
 
 /// The JSON body of a create-message call. Mentions in replies never ping anyone
@@ -565,6 +791,10 @@ pub struct FakeRest {
     pub next_id: u64,
     /// When set, every call fails with this error.
     pub fail_with: Option<RestError>,
+    /// One-shot failures, consumed one per call before `fail_with` is consulted.
+    pub fail_next: VecDeque<RestError>,
+    /// Number of calls of any kind.
+    pub calls: usize,
 }
 
 impl FakeRest {
@@ -574,6 +804,13 @@ impl FakeRest {
             .entry(message.channel_id)
             .or_default()
             .push(message);
+    }
+
+    fn failure(&mut self) -> Option<RestError> {
+        self.calls += 1;
+        self.fail_next
+            .pop_front()
+            .or_else(|| self.fail_with.clone())
     }
 }
 
@@ -585,8 +822,8 @@ impl DiscordRest for FakeRest {
         limit: u8,
     ) -> Result<Vec<DiscordMessage>, RestError> {
         self.list_calls += 1;
-        if let Some(error) = &self.fail_with {
-            return Err(error.clone());
+        if let Some(error) = self.failure() {
+            return Err(error);
         }
         let mut messages: Vec<DiscordMessage> =
             self.channels.get(&channel).cloned().unwrap_or_default();
@@ -612,8 +849,8 @@ impl DiscordRest for FakeRest {
         reply_to: Option<Snowflake>,
         nonce: &str,
     ) -> Result<Snowflake, RestError> {
-        if let Some(error) = &self.fail_with {
-            return Err(error.clone());
+        if let Some(error) = self.failure() {
+            return Err(error);
         }
         self.next_id += 1;
         self.posts.push(FakePost {
@@ -631,11 +868,26 @@ impl DiscordRest for FakeRest {
         message: Snowflake,
         emoji: &str,
     ) -> Result<(), RestError> {
-        if let Some(error) = &self.fail_with {
-            return Err(error.clone());
+        if let Some(error) = self.failure() {
+            return Err(error);
         }
         self.reactions.push((channel, message, emoji.to_owned()));
         Ok(())
+    }
+
+    fn get_message(
+        &mut self,
+        channel: Snowflake,
+        message: Snowflake,
+    ) -> Result<DiscordMessage, RestError> {
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        self.channels
+            .get(&channel)
+            .and_then(|messages| messages.iter().find(|listed| listed.id == message))
+            .cloned()
+            .ok_or_else(|| RestError::from_status(404, "{\"message\": \"Unknown Message\"}"))
     }
 }
 
@@ -649,6 +901,7 @@ mod tests {
             "id": "1300000000000000002",
             "channel_id": "1566504459499217097",
             "author": {"id": "111222333444555666", "username": "owner"},
+            "type": 19,
             "content": "thanks",
             "timestamp": "2026-11-15T16:45:00.123000+00:00",
             "mentions": [{"id": "1545796614826889226", "bot": true}],
@@ -657,6 +910,7 @@ mod tests {
         let message = parse_message(&value).expect("parses");
         assert_eq!(message.id, Snowflake::from_u64(1_300_000_000_000_000_002));
         assert!(!message.author_is_bot);
+        assert!(message.author_is_human());
         assert_eq!(
             message.reply_to,
             Some(Snowflake::from_u64(1_300_000_000_000_000_001))
@@ -720,6 +974,94 @@ mod tests {
         assert_eq!(body["allowed_mentions"]["replied_user"], json!(false));
         assert_eq!(body["message_reference"]["message_id"], json!("5"));
         assert_eq!(body["nonce"].as_str().map(str::len), Some(MAX_NONCE_CHARS));
+    }
+
+    #[test]
+    fn webhooks_system_users_and_notices_are_not_human() {
+        let base = json!({
+            "id": "2", "channel_id": "1", "type": 0, "content": "x",
+            "timestamp": "2026-11-15T16:45:00+00:00",
+            "author": {"id": "3", "username": "someone"}
+        });
+        assert!(parse_message(&base).expect("parses").author_is_human());
+        let mut webhook = base.clone();
+        webhook["webhook_id"] = json!("9");
+        let mut system = base.clone();
+        system["author"]["system"] = json!(true);
+        let mut bot = base.clone();
+        bot["author"]["bot"] = json!(true);
+        let mut notice = base.clone();
+        notice["type"] = json!(7);
+        for other in [webhook, system, bot, notice] {
+            assert!(
+                !parse_message(&other).expect("parses").author_is_human(),
+                "{other}"
+            );
+        }
+        let mut untyped = base;
+        untyped.as_object_mut().expect("object").remove("type");
+        assert!(
+            parse_message(&untyped).is_err(),
+            "a message with no type is refused"
+        );
+    }
+
+    #[test]
+    fn curl_trailer_carries_status_and_rate_headers() {
+        let (body, status, headers) = parse_curl_output("[]\n200|0|1.250|");
+        assert_eq!((body, status), ("[]", 200));
+        assert_eq!(headers.remaining, Some(0));
+        assert_eq!(
+            headers.hold(status, body),
+            Some(Duration::from_millis(1250)),
+            "an emptied bucket holds until it resets"
+        );
+        let (body, status, headers) = parse_curl_output("[]\n200|4|1.250|");
+        assert_eq!(headers.hold(status, body), None, "calls remain");
+        let limited = "{\"message\": \"You are being rate limited.\", \"retry_after\": 0.75, \"global\": false}";
+        let output = format!("{limited}\n429|0|0.5|1");
+        let (body, status, headers) = parse_curl_output(&output);
+        assert_eq!(status, 429);
+        assert_eq!(
+            headers.hold(status, body),
+            Some(Duration::from_millis(750)),
+            "the body's fractional retry_after wins over the whole-second header"
+        );
+        let (body, status, headers) = parse_curl_output("not json\n429|||2");
+        assert_eq!(headers.hold(status, body), Some(Duration::from_secs(2)));
+        let error = RestError::from_status(429, limited);
+        assert_eq!(error.retry_after, Some(Duration::from_millis(750)));
+        assert_eq!(error.applied, Applied::NotApplied);
+        // An old curl that prints no trailer fields still yields the status.
+        let (_, status, headers) = parse_curl_output("{}\n204");
+        assert_eq!((status, headers), (204, RateHeaders::default()));
+        assert_eq!(
+            retry_after_from_body("{\"retry_after\": 1e12}"),
+            Some(MAX_RETRY_AFTER)
+        );
+    }
+
+    #[test]
+    fn a_held_transport_refuses_without_running_curl() {
+        let token = Token::new("abc".to_owned()).expect("token");
+        let mut transport = CurlTransport::new(
+            PathBuf::from("/nonexistent/curl"),
+            DEFAULT_API_BASE.to_owned(),
+            token,
+            10,
+        )
+        .expect("transport");
+        transport.hold_until = Some(Instant::now() + Duration::from_secs(30));
+        let error = transport
+            .list_messages(Snowflake::from_u64(1), None, 1)
+            .expect_err("held");
+        assert_eq!(
+            error.code, "rate_limited",
+            "not curl_unavailable: curl never ran"
+        );
+        assert!(error
+            .retry_after
+            .is_some_and(|wait| wait > Duration::from_secs(25)));
     }
 
     #[test]

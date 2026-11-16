@@ -309,9 +309,9 @@ fn valid_label(label: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// DeepscryCoder2: this host's bot (newton-fedora).
+    /// HostBot2: this host's bot (newton-fedora).
     const OURS: u64 = 1_545_796_614_826_889_226;
-    /// DeepScryCoder1: the other machine's bot.
+    /// HostBot1: the other machine's bot.
     const OTHER: u64 = 1_532_416_065_114_607_829;
     const OWNER: u64 = 111_222_333_444_555_666;
 
@@ -321,7 +321,7 @@ mod tests {
             host: "newton-fedora".to_owned(),
             peer_bots: BTreeMap::from([(
                 Snowflake::from_u64(OTHER),
-                "deepscry@lead-host".to_owned(),
+                "fleet@lead-host".to_owned(),
             )]),
             aliases: BTreeSet::from(["newton-team".to_owned()]),
             local_agents: Some(BTreeSet::from(["coord".to_owned(), "lane-a".to_owned()])),
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn msg1_mentioning_only_the_other_bot_is_ignored() {
-        // The incident: a message for DeepScryCoder1 was ACKed by DeepscryCoder2.
+        // The incident: a message for HostBot1 was ACKed by HostBot2.
         assert_eq!(
             owner(&format!("<@{OTHER}> please rebase #3071 and report")),
             Verdict::Ignore(IgnoreReason::NotAddressed)
@@ -383,8 +383,8 @@ mod tests {
     fn substrings_names_and_bare_ids_do_not_address() {
         for content in [
             // Bot display name in text.
-            "DeepscryCoder2 please look".to_owned(),
-            "@DeepscryCoder2 please look".to_owned(),
+            "HostBot2 please look".to_owned(),
+            "@HostBot2 please look".to_owned(),
             // Bare id in prose.
             format!("bot {OURS} is ours"),
             // Our id as a substring of a longer number inside mention syntax.
@@ -553,7 +553,7 @@ mod tests {
         assert_eq!(
             verdict,
             Verdict::Relay {
-                peer_team: "deepscry@lead-host".to_owned()
+                peer_team: "fleet@lead-host".to_owned()
             }
         );
     }

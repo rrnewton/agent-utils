@@ -641,6 +641,7 @@ struct WireRejectedMessage {
 enum WireRejectionReason {
     SenderNotAllowed,
     IgnoredPrefix,
+    TargetRefused,
 }
 
 impl From<RejectionReason> for WireRejectionReason {
@@ -648,6 +649,7 @@ impl From<RejectionReason> for WireRejectionReason {
         match value {
             RejectionReason::SenderNotAllowed => Self::SenderNotAllowed,
             RejectionReason::IgnoredPrefix => Self::IgnoredPrefix,
+            RejectionReason::TargetRefused => Self::TargetRefused,
         }
     }
 }
@@ -657,6 +659,7 @@ impl From<WireRejectionReason> for RejectionReason {
         match value {
             WireRejectionReason::SenderNotAllowed => Self::SenderNotAllowed,
             WireRejectionReason::IgnoredPrefix => Self::IgnoredPrefix,
+            WireRejectionReason::TargetRefused => Self::TargetRefused,
         }
     }
 }
@@ -3568,6 +3571,7 @@ mod tests {
         for (reason, spelling) in [
             (RejectionReason::SenderNotAllowed, "sender_not_allowed"),
             (RejectionReason::IgnoredPrefix, "ignored_prefix"),
+            (RejectionReason::TargetRefused, "target_refused"),
         ] {
             let event = CommittableEvent::message_rejected(RejectedMessage::new(
                 ChannelId::new("channels/one").expect("channel"),

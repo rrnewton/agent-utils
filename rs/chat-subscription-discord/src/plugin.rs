@@ -6,9 +6,37 @@
 //! | Post | Event |
 //! |---|---|
 //! | Owner post addressed to this host ([`crate::addressing`]), sender allowed | `message_created` (a request, through the bridge's durable queue) |
-//! | Same, sender not allowed | `message_rejected` (`sender_not_allowed`) |
-//! | Configured peer bot in a relay channel, also a subscription relay sender | `message_created` with the peer's id, text unchanged (the bridge hands it to `agent-teams relay-in`, never a prompt) |
-//! | Everything else: unaddressed (MSG-1), own posts, other bots, rejected targets | `checkpoint` (no reaction, no reply) |
+//! | Same, sender not allowed (whatever its target) | `message_rejected` (`sender_not_allowed`) |
+//! | Allowed sender, but the `agent=` target is refused (unknown agent, another host, malformed) | `message_rejected` (`target_refused`): the bridge marks the post with its rejection reaction |
+//! | Configured peer bot in a relay channel, also a subscription relay sender, and the text carries an `agent-teams-` block | `message_created` with the peer's id, text unchanged (the bridge hands it to `agent-teams relay-in`, never a prompt) |
+//! | Everything else: unaddressed (MSG-1), own posts, other bots, webhooks, system notices, a peer bot's ordinary chat | `checkpoint` (no reaction, no reply) |
+//!
+//! A peer bot shares the channel with its owner, so most of its posts are ordinary replies, not
+//! relay traffic. `agent-teams relay-in` quarantines and alarms on any post from a confirmed
+//! peer that does not parse, so only posts naming an `agent-teams-` block (envelope, receipt,
+//! announce) or the relay's plain-text receipt go to it.
+//!
+//! # ACK reply (`ack_reply`)
+//!
+//! The bridge acknowledges an admitted request with a reaction, which Discord attributes only
+//! to the reacting bot. With `ack_reply: true` this plugin also posts one line, as a Discord
+//! reply to the request, naming this host and the agent it is for
+//! ([`crate::admission::Admission::ack_line`]), once the bridge has durably committed it. It is
+//! best effort: a failure is logged and the reaction still stands. Its nonce is derived from
+//! the message, so a retried post is refused by Discord rather than duplicated.
+//!
+//! # Polling and the rate budget
+//!
+//! Each poll is one `GET /channels/{id}/messages?after=<cursor>&limit=100` per channel (the
+//! fake-provider tests count this); heartbeats make no call. At the default `poll_seconds: 5`
+//! that is 12 calls a minute per channel, 0.2 a second, against Discord's global limit of 50 a
+//! second per bot; each host's bot has its own budget. A new post is seen within
+//! `poll_seconds` (2.5 s on average) plus one REST round trip, so an owner-to-other-host relay
+//! hop costs at most two poll intervals. The per-route bucket for listing messages is not
+//! published; the transport reads it from every response and pauses before it empties
+//! ([`crate::transport`]). A 429 delays the next poll by its `retry_after` (never less than
+//! `poll_seconds`); other retryable failures back off 30 s. A Gateway subscription would cut
+//! the latency to one round trip; it is a later increment.
 //!
 //! A request for one named agent (`agent=NAME@HOST:`) is delivered as the bridge's existing
 //! owner command `!@NAME <request>`, which opens a thread bound to that agent and delivers to
@@ -23,9 +51,10 @@
 //! ```json
 //! {"bot_user_id": "1545796614826889226", "host": "newton-fedora",
 //!  "aliases": ["newton-team"], "local_agents": ["coord"],
-//!  "peer_bots": {"1532416065114607829": "deepscry@lead-host"},
+//!  "peer_bots": {"1532416065114607829": "fleet@lead-host"},
 //!  "token_file": "/root/.claude/channels/discord/.env", "token_key": "DISCORD_BOT_TOKEN",
-//!  "poll_seconds": 5, "heartbeat_seconds": 30, "curl_path": "/usr/bin/curl"}
+//!  "poll_seconds": 5, "heartbeat_seconds": 30, "curl_path": "/usr/bin/curl",
+//!  "bridge_agent": "coordinator", "ack_reply": true}
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -73,6 +102,10 @@ pub struct DiscordConfig {
     pub curl_path: PathBuf,
     /// REST base URL.
     pub api_base: String,
+    /// The bridge's own target, as named in ACK lines (default `bridge`).
+    pub bridge_agent: String,
+    /// Whether to post an ACK line naming host and agent once a request is committed.
+    pub ack_reply: bool,
 }
 
 impl DiscordConfig {
@@ -104,6 +137,8 @@ impl DiscordConfig {
             "heartbeat_seconds",
             "curl_path",
             "api_base",
+            "bridge_agent",
+            "ack_reply",
         ];
         if let Some(unknown) = data.keys().find(|key| !known.contains(&key.as_str())) {
             return Err(format!("unknown discord setting {unknown}"));
@@ -199,6 +234,24 @@ impl DiscordConfig {
                 .and_then(Value::as_str)
                 .unwrap_or(DEFAULT_API_BASE)
                 .to_owned(),
+            bridge_agent: match data.get("bridge_agent") {
+                None => "bridge".to_owned(),
+                Some(value) => value
+                    .as_str()
+                    .filter(|name| {
+                        !name.is_empty()
+                            && name.len() <= 64
+                            && name.bytes().all(|b| {
+                                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
+                            })
+                    })
+                    .ok_or("bridge_agent must be an agent name")?
+                    .to_owned(),
+            },
+            ack_reply: match data.get("ack_reply") {
+                None => false,
+                Some(value) => value.as_bool().ok_or("ack_reply must be a boolean")?,
+            },
         })
     }
 }
@@ -341,6 +394,9 @@ impl ChatSubscriptionBackend for DiscordBackend {
         };
         Ok(Box::new(DiscordDriver {
             rest,
+            bridge_agent: config.bridge_agent,
+            ack_reply: config.ack_reply,
+            pending_acks: VecDeque::new(),
             poll: Duration::from_secs(config.poll_seconds),
             heartbeat: Duration::from_secs(config.heartbeat_seconds),
             policy: config.policy,
@@ -396,10 +452,69 @@ struct InFlight {
     delivery_id: String,
     cursor: BTreeMap<Snowflake, Snowflake>,
     dedupe_key: Option<String>,
+    ack: Option<AckPost>,
+}
+
+/// One ACK line to post once its request is committed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AckPost {
+    channel: Snowflake,
+    message: Snowflake,
+    text: String,
+}
+
+/// What [`DiscordDriver::classify`] decided for one message.
+struct Classified {
+    event: CommittableEvent,
+    dedupe_key: Option<String>,
+    ack: Option<AckPost>,
+}
+
+impl Classified {
+    fn checkpoint() -> Self {
+        Self {
+            event: CommittableEvent::Checkpoint,
+            dedupe_key: None,
+            ack: None,
+        }
+    }
+}
+
+/// The plain-text receipt `agent-teams relay-in` posts for a post it cannot parse.
+const RELAY_PLAIN_RECEIPT: &str = "agent-teams receipt:";
+
+/// Whether a peer bot's post is relay traffic for `agent-teams relay-in`: it names an
+/// `agent-teams-` block (the envelope, receipt and announce fences, and the schema ids inside
+/// them, all carry that prefix) or is the relay's plain-text receipt. A peer's ordinary chat
+/// replies are not, and handing them over would quarantine each one as unparseable.
+#[must_use]
+pub fn is_relay_post(content: &str) -> bool {
+    content.contains("agent-teams-") || content.trim_start().starts_with(RELAY_PLAIN_RECEIPT)
+}
+
+/// When to poll again after a failed poll, or `None` when the failure is not retryable.
+#[must_use]
+pub fn poll_backoff(error: &RestError, poll: Duration) -> Option<Duration> {
+    if !error.retryable {
+        return None;
+    }
+    Some(match error.retry_after {
+        Some(wait) if error.code == "rate_limited" => wait.max(poll),
+        _ => poll.max(Duration::from_secs(30)),
+    })
+}
+
+/// The nonce of the ACK line for one message: stable, so a retried post is a duplicate Discord
+/// refuses, and distinct from the outbound helper's request-derived nonces.
+fn ack_nonce(message: Snowflake) -> String {
+    format!("ack{message}")
 }
 
 struct DiscordDriver {
     rest: Box<dyn DiscordRest>,
+    bridge_agent: String,
+    ack_reply: bool,
+    pending_acks: VecDeque<AckPost>,
     policy: AddressingPolicy,
     channels: Vec<Snowflake>,
     allowed: HashSet<String>,
@@ -430,9 +545,13 @@ impl DiscordDriver {
     fn batch(
         &mut self,
         cursor: BTreeMap<Snowflake, Snowflake>,
-        event: CommittableEvent,
-        dedupe_key: Option<String>,
+        classified: Classified,
     ) -> Result<SubscriptionItem, BackendFailure> {
+        let Classified {
+            event,
+            dedupe_key,
+            ack,
+        } = classified;
         let sequence = self.next_sequence()?;
         let delivery_id = format!("discord-delivery-{}", sequence.get());
         let invalid = |error: chat_subscription::ValidationError| {
@@ -449,6 +568,7 @@ impl DiscordDriver {
             delivery_id,
             cursor,
             dedupe_key,
+            ack,
         });
         self.last_item = Instant::now();
         Ok(SubscriptionItem::Batch(batch))
@@ -528,29 +648,79 @@ impl DiscordDriver {
         root
     }
 
-    /// The single event for one listed message, and its dedupe key when it is admitted.
-    fn classify(&mut self, message: &DiscordMessage) -> (CommittableEvent, Option<String>) {
+    /// Post the ACK lines of committed requests. Best effort: a failure is logged, never fatal,
+    /// and the bridge's reaction still marks the request.
+    fn post_pending_acks(&mut self) {
+        while let Some(ack) = self.pending_acks.pop_front() {
+            if let Err(error) = self.rest.create_message(
+                ack.channel,
+                &ack.text,
+                Some(ack.message),
+                &ack_nonce(ack.message),
+            ) {
+                eprintln!(
+                    "agentctl-discord-plugin: ACK line for {} not posted: {error}",
+                    ids::message_resource(ack.channel, ack.message)
+                );
+            }
+        }
+    }
+
+    fn rejection(message: &DiscordMessage, reason: RejectionReason) -> Classified {
+        match (
+            ChannelId::new(message.channel_id.to_string()),
+            MessageId::new(ids::message_resource(message.channel_id, message.id)),
+            SenderId::new(message.author_id.to_string()),
+        ) {
+            (Ok(channel), Ok(id), Ok(sender)) => Classified {
+                event: CommittableEvent::message_rejected(RejectedMessage::new(
+                    channel, id, sender, reason,
+                )),
+                dedupe_key: None,
+                ack: None,
+            },
+            _ => Classified::checkpoint(),
+        }
+    }
+
+    /// The single event for one listed message, its dedupe key when it is admitted, and the
+    /// ACK line to post once it is committed.
+    fn classify(&mut self, message: &DiscordMessage) -> Classified {
         let root = self.thread_root(message);
+        if !message.is_user_message() {
+            // Joins, pins, thread notices and other system messages are never requests.
+            return Classified::checkpoint();
+        }
         let verdict = self.policy.classify(&Post {
             author: message.author_id,
-            author_is_bot: message.author_is_bot,
+            // A webhook or system post is never a person, whatever its author fields say.
+            author_is_bot: message.author_is_bot || message.webhook || message.author_is_system,
             content: &message.content,
         });
         let author = message.author_id.to_string();
         let channel = message.channel_id.to_string();
         let (origin, target, text) = match verdict {
-            Verdict::Ignore(_) => return (CommittableEvent::Checkpoint, None),
+            Verdict::Ignore(_) => return Classified::checkpoint(),
             Verdict::Reject(reason) => {
+                let typed = if self.allowed.contains(&author) {
+                    RejectionReason::TargetRefused
+                } else {
+                    // Authorization comes first: a stranger learns nothing about targets.
+                    RejectionReason::SenderNotAllowed
+                };
                 eprintln!(
-                    "agentctl-discord-plugin: refused {}: {reason:?}",
-                    ids::message_resource(message.channel_id, message.id)
+                    "agentctl-discord-plugin: refused {} as {}: {reason:?}",
+                    ids::message_resource(message.channel_id, message.id),
+                    typed.as_str()
                 );
-                return (CommittableEvent::Checkpoint, None);
+                return Self::rejection(message, typed);
             }
             Verdict::Relay { peer_team } => {
-                if !self.relay_senders.contains(&author) || !self.relay_channels.contains(&channel)
+                if !self.relay_senders.contains(&author)
+                    || !self.relay_channels.contains(&channel)
+                    || !is_relay_post(&message.content)
                 {
-                    return (CommittableEvent::Checkpoint, None);
+                    return Classified::checkpoint();
                 }
                 (
                     Origin::PeerBot {
@@ -563,22 +733,7 @@ impl DiscordDriver {
             }
             Verdict::Deliver(addressed) => {
                 if !self.allowed.contains(&author) {
-                    return match (
-                        ChannelId::new(channel),
-                        MessageId::new(ids::message_resource(message.channel_id, message.id)),
-                        SenderId::new(author),
-                    ) {
-                        (Ok(channel), Ok(id), Ok(sender)) => (
-                            CommittableEvent::message_rejected(RejectedMessage::new(
-                                channel,
-                                id,
-                                sender,
-                                RejectionReason::SenderNotAllowed,
-                            )),
-                            None,
-                        ),
-                        _ => (CommittableEvent::Checkpoint, None),
-                    };
+                    return Self::rejection(message, RejectionReason::SenderNotAllowed);
                 }
                 let text = match &addressed.target {
                     Target::Bridge => addressed.request.clone(),
@@ -601,6 +756,12 @@ impl DiscordDriver {
             message: message.id,
         };
         let key = admission.dedupe_key();
+        let ack =
+            (self.ack_reply && matches!(admission.origin, Origin::Owner { .. })).then(|| AckPost {
+                channel: message.channel_id,
+                message: message.id,
+                text: admission.ack_line(&self.bridge_agent),
+            });
         let built = (|| -> Result<InboundMessage, String> {
             let inbound = InboundMessage::new(
                 ChannelId::new(channel).map_err(|e| e.to_string())?,
@@ -617,13 +778,17 @@ impl DiscordDriver {
             Ok(inbound.with_provider_payload(admission.to_payload()?))
         })();
         match built {
-            Ok(inbound) => (CommittableEvent::message_created(inbound), Some(key)),
+            Ok(inbound) => Classified {
+                event: CommittableEvent::message_created(inbound),
+                dedupe_key: Some(key),
+                ack,
+            },
             Err(problem) => {
                 eprintln!(
                     "agentctl-discord-plugin: skipped {}: {problem}",
                     ids::message_resource(message.channel_id, message.id)
                 );
-                (CommittableEvent::Checkpoint, None)
+                Classified::checkpoint()
             }
         }
     }
@@ -646,33 +811,37 @@ impl ChatSubscriptionDriver for DiscordDriver {
             if self.cancelled() {
                 return Err(failure("cancelled", "discord subscription cancelled", true));
             }
+            self.post_pending_acks();
             if self.needs_boundary || self.next_poll.is_none() {
                 let changed = self.baseline().map_err(rest_failure)?;
                 self.next_poll = Some(Instant::now());
                 if changed || self.needs_boundary {
                     self.needs_boundary = false;
                     let cursor = self.cursor.clone();
-                    return self
-                        .batch(cursor, CommittableEvent::Checkpoint, None)
-                        .map(Some);
+                    return self.batch(cursor, Classified::checkpoint()).map(Some);
                 }
             }
             if let Some(message) = self.pending.pop_front() {
                 let mut cursor = self.cursor.clone();
                 cursor.insert(message.channel_id, message.id);
-                let (event, key) = self.classify(&message);
-                return self.batch(cursor, event, key).map(Some);
+                let classified = self.classify(&message);
+                return self.batch(cursor, classified).map(Some);
             }
             let now = Instant::now();
             let next_poll = self.next_poll.unwrap_or(now);
             if now >= next_poll {
                 match self.poll_channels() {
                     Ok(()) => self.next_poll = Some(now + self.poll),
-                    Err(error) if error.retryable => {
-                        eprintln!("agentctl-discord-plugin: poll failed, backing off: {error}");
-                        self.next_poll = Some(now + self.poll.max(Duration::from_secs(30)));
-                    }
-                    Err(error) => return Err(rest_failure(error)),
+                    Err(error) => match poll_backoff(&error, self.poll) {
+                        Some(wait) => {
+                            eprintln!(
+                                "agentctl-discord-plugin: poll failed, next poll in {} ms: {error}",
+                                wait.as_millis()
+                            );
+                            self.next_poll = Some(now + wait);
+                        }
+                        None => return Err(rest_failure(error)),
+                    },
                 }
                 continue;
             }
@@ -693,6 +862,8 @@ impl ChatSubscriptionDriver for DiscordDriver {
                 if let Some(key) = in_flight.dedupe_key {
                     self.dedupe.insert(key);
                 }
+                // Posted from the next `next_item`, so the commit itself makes no REST call.
+                self.pending_acks.extend(in_flight.ack);
                 Ok(())
             }
             other => {
@@ -752,6 +923,63 @@ mod tests {
             }
         );
         assert_eq!(config.poll_seconds, 5);
+        assert_eq!(config.bridge_agent, "bridge");
+        assert!(!config.ack_reply, "ACK lines are opt-in");
         let _unused: Option<FakeRest> = None;
+        for (key, bad) in [
+            ("ack_reply", serde_json::json!("yes")),
+            ("bridge_agent", serde_json::json!("two words")),
+        ] {
+            let mut data = serde_json::json!({"bot_user_id": "5", "host": "h"});
+            data[key] = bad;
+            let configuration = BackendConfiguration::new(
+                CONFIG_SCHEMA,
+                data.as_object().cloned().expect("object"),
+            )
+            .expect("configuration");
+            assert!(
+                DiscordConfig::from_backend_configuration(&configuration)
+                    .expect_err(key)
+                    .contains(key),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_limits_set_the_next_poll() {
+        let poll = Duration::from_secs(5);
+        let mut limited = RestError::from_status(429, r#"{"retry_after": 12.5}"#);
+        assert_eq!(
+            poll_backoff(&limited, poll),
+            Some(Duration::from_millis(12_500)),
+            "a 429 waits exactly its retry_after"
+        );
+        limited.retry_after = Some(Duration::from_millis(100));
+        assert_eq!(
+            poll_backoff(&limited, poll),
+            Some(poll),
+            "never sooner than the poll interval"
+        );
+        assert_eq!(
+            poll_backoff(&RestError::from_status(502, ""), poll),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(poll_backoff(&RestError::from_status(403, ""), poll), None);
+    }
+
+    #[test]
+    fn only_relay_shaped_peer_posts_go_to_relay_in() {
+        assert!(is_relay_post("hi\n```agent-teams-envelope\n{}\n```"));
+        assert!(is_relay_post(
+            "```\n{\"schema\":\"agent-teams-receipt/v1\"}\n```"
+        ));
+        assert!(is_relay_post(
+            "agent-teams receipt: not-recorded (unparseable relay post)"
+        ));
+        assert!(!is_relay_post(
+            "Bound to lane-a. Messages in this thread go to it."
+        ));
+        assert!(!is_relay_post("ACK lead-host/coordinator: received"));
     }
 }

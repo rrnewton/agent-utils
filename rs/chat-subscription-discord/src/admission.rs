@@ -62,25 +62,25 @@ impl Admission {
     }
 
     /// The agent this admission is for, for log and ACK lines: the named agent, `relay` for a
-    /// relay post, or `bridge` for the bridge's own target.
+    /// relay post, or `bridge_agent` (the bridge's own target, normally its coordinator).
     #[must_use]
-    pub fn agent_label(&self) -> &str {
+    pub fn agent_label<'a>(&'a self, bridge_agent: &'a str) -> &'a str {
         match &self.target {
             Some(Target::Agent { name }) => name,
-            Some(Target::Bridge) => "bridge",
+            Some(Target::Bridge) => bridge_agent,
             None => "relay",
         }
     }
 
-    /// The one-line ACK this host would post: it names the host and the agent, so two bots
-    /// acknowledging one post are distinguishable.
+    /// The one-line ACK this host posts as a reply when `ack_reply` is on. It names the host
+    /// and the agent, so when two bots take one post the owner can see which host took it and
+    /// for whom. It says "received", not "delivered": the bridge's reactions report delivery.
     #[must_use]
-    pub fn ack_line(&self) -> String {
+    pub fn ack_line(&self, bridge_agent: &str) -> String {
         format!(
-            "ACK {}/{} ({})",
+            "ACK {}/{}: received",
             self.host,
-            self.agent_label(),
-            self.dedupe_key()
+            self.agent_label(bridge_agent)
         )
     }
 
@@ -204,7 +204,19 @@ mod tests {
                 name: "lane-a".to_owned(),
             }),
         );
-        assert!(env.ack_line().starts_with("ACK newton-fedora/lane-a "));
+        assert_eq!(
+            env.ack_line("coordinator"),
+            "ACK newton-fedora/lane-a: received"
+        );
+        let bridge = envelope("newton-fedora", Some(Target::Bridge));
+        assert_eq!(
+            bridge.ack_line("coordinator"),
+            "ACK newton-fedora/coordinator: received"
+        );
+        assert!(
+            crate::addressing::mention_ids(&bridge.ack_line("coordinator")).is_empty(),
+            "an ACK can never address a bot"
+        );
     }
 
     #[test]

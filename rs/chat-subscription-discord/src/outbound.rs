@@ -6,6 +6,7 @@
 //! ```json
 //! {"version":1,"id":"<uuid>","action":"send","channel_id":"<chan>","thread_id":"<chan>/threads/<root>"|null,"text":"…"}
 //! {"version":1,"id":"<uuid>","action":"ensure_reaction","channel_id":"<chan>","message_id":"<chan>/messages/<id>","emoji":"✅"}
+//! {"version":1,"id":"<uuid>","action":"ensure_rejection","channel_id":"<chan>","message_id":"<chan>/messages/<id>","sender_id":"<user>","emoji":"❌"}
 //! ```
 //!
 //! A `send` with a thread posts a Discord reply to the thread's root message (this is how relay
@@ -17,11 +18,46 @@
 //!
 //! Every post sets `allowed_mentions.parse = []` and a nonce derived from the request id with
 //! `enforce_nonce`, so a retried request does not post twice within Discord's nonce window.
-//! Other actions (`update`, `delete`, `ensure_rejection`, `resolve_sender`, `list_members`)
-//! are refused as `unsupported_action`, outcome `not_applied`: rejection reactions need a
-//! human-author check this draft does not yet implement, so it never adds one unguarded.
+//! Other actions (`update`, `delete`, `resolve_sender`, `list_members`) are refused as
+//! `unsupported_action`, outcome `not_applied`.
+//!
+//! # Rate limits
+//!
+//! A call refused with HTTP 429 (or held by the transport because the route's bucket is empty)
+//! is retried once after its `retry_after` when that is at most [`MAX_INLINE_WAIT`]; a longer
+//! wait is returned as `rate_limited`, retryable, outcome `not_applied`, with the wait in the
+//! detail. A 429 proves nothing was written, and a retried post keeps its nonce.
+//!
+//! # `ensure_rejection`
+//!
+//! The bridge asks for a rejection reaction on a post it refused (a sender who is not an owner,
+//! or an `agent=` target this host refuses). The helper adds it only to a post whose author is
+//! verifiably a person:
+//!
+//! 1. It binds the operation UUID, before any write, in `--ledger=DIR`'s
+//!    `rejections/<UUID>.json`: channel, message, sender and the first emoji. The binding is
+//!    created atomically (a hard link of a synced temporary file), so a concurrent run with the
+//!    same UUID cannot bind different values. A UUID already bound to another channel, message
+//!    or sender is refused as `operation_conflict`. A retry uses the bound emoji even after the
+//!    configured one changes.
+//! 2. It reads that exact message from Discord (`GET /channels/{c}/messages/{m}`) and requires
+//!    the author id to equal `sender_id`, the author not marked `bot` or `system`, no
+//!    `webhook_id`, and an ordinary message type. Otherwise, or when the message is gone, it
+//!    answers `author_not_human`, nonretryable, `not_applied`, and records the refusal. The
+//!    stream's own bot flag is never trusted for this.
+//! 3. It adds the reaction (idempotent on Discord), records completion, and returns the
+//!    standard reaction receipt. A completed UUID replays its receipt with
+//!    `already_present: true` and contacts nothing.
+//!
+//! When an earlier attempt for the UUID may have written the reaction (its binding exists but
+//! never completed), a later failure is reported with outcome `unknown`. Without `--ledger`
+//! the action is refused as `helper_misconfigured` before Discord is contacted, so no
+//! rejection reaction is ever added unguarded. Concurrent runs need no lock: the binding is
+//! the only state they could disagree about, and adding the same reaction twice is a no-op.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
@@ -34,6 +70,10 @@ use crate::transport::{
 
 /// Largest request accepted on standard input.
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
+/// The longest rate-limit wait the helper sits out before retrying once.
+pub const MAX_INLINE_WAIT: Duration = Duration::from_secs(5);
+/// Schema of one rejection ledger record.
+pub const REJECTION_SCHEMA: &str = "agentctl-discord-rejection/v1";
 
 /// How visible text is prepared before posting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,12 +101,14 @@ pub struct OutboundConfig {
     pub timeout_seconds: u32,
     /// Text preparation.
     pub text_mode: TextMode,
+    /// Directory holding the rejection journal; required for `ensure_rejection`.
+    pub ledger: Option<PathBuf>,
 }
 
 impl OutboundConfig {
     /// Parse `--channel=ID` (repeatable, required), `--token-file=PATH` [`--token-key=KEY`]
     /// or `--token-env=NAME`, `--curl=PATH`, `--api-base=URL`, `--timeout-seconds=N`,
-    /// `--text=mentions|literal|raw`.
+    /// `--text=mentions|literal|raw`, `--ledger=DIR` (absolute; enables `ensure_rejection`).
     ///
     /// # Errors
     ///
@@ -80,6 +122,7 @@ impl OutboundConfig {
         let mut api_base = DEFAULT_API_BASE.to_owned();
         let mut timeout_seconds = 20;
         let mut text_mode = TextMode::Mentions;
+        let mut ledger = None;
         for argument in arguments {
             let (key, value) = argument
                 .split_once('=')
@@ -91,6 +134,13 @@ impl OutboundConfig {
                 "--token-key" => value.clone_into(&mut token_key),
                 "--token-env" => token_env = Some(value.to_owned()),
                 "--curl" => curl_path = PathBuf::from(value),
+                "--ledger" => {
+                    let path = PathBuf::from(value);
+                    if !path.is_absolute() {
+                        return Err("--ledger must be an absolute directory".to_owned());
+                    }
+                    ledger = Some(path);
+                }
                 "--api-base" => value.clone_into(&mut api_base),
                 "--timeout-seconds" => {
                     timeout_seconds = value
@@ -131,6 +181,7 @@ impl OutboundConfig {
             api_base,
             timeout_seconds,
             text_mode,
+            ledger,
         })
     }
 
@@ -199,6 +250,258 @@ fn respond_error(id: &Value, action: &Value, refusal: &Refusal) -> Vec<u8> {
             "retryable": refusal.retryable,
         }
     }))
+}
+
+/// Run `call`, and once more after a rate-limit wait of at most [`MAX_INLINE_WAIT`].
+fn with_rate_retry<T>(mut call: impl FnMut() -> Result<T, RestError>) -> Result<T, RestError> {
+    match call() {
+        Err(error) if error.code == "rate_limited" => match error.retry_after {
+            Some(wait) if wait <= MAX_INLINE_WAIT => {
+                std::thread::sleep(wait + Duration::from_millis(50));
+                call()
+            }
+            _ => Err(error),
+        },
+        other => other,
+    }
+}
+
+/// One rejection ledger record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RejectionRecord {
+    channel: Snowflake,
+    message: Snowflake,
+    sender: Snowflake,
+    emoji: String,
+    /// `intent` (bound, a write may have happened), `refused` or `done`.
+    state: String,
+}
+
+impl RejectionRecord {
+    fn to_json(&self) -> Value {
+        json!({
+            "schema": REJECTION_SCHEMA,
+            "channel": self.channel.to_string(),
+            "message": self.message.to_string(),
+            "sender": self.sender.to_string(),
+            "emoji": self.emoji,
+            "state": self.state,
+        })
+    }
+
+    fn from_json(value: &Value) -> Option<Self> {
+        if value.get("schema")? != REJECTION_SCHEMA {
+            return None;
+        }
+        let snowflake = |key: &str| value.get(key)?.as_str().and_then(Snowflake::parse);
+        let state = value.get("state")?.as_str()?;
+        if !matches!(state, "intent" | "refused" | "done") {
+            return None;
+        }
+        Some(Self {
+            channel: snowflake("channel")?,
+            message: snowflake("message")?,
+            sender: snowflake("sender")?,
+            emoji: value.get("emoji")?.as_str()?.to_owned(),
+            state: state.to_owned(),
+        })
+    }
+}
+
+fn valid_operation_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn ledger_error(context: &str, error: &std::io::Error) -> Refusal {
+    Refusal::not_applied("ledger_unavailable", format!("{context}: {error}"), true)
+}
+
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    std::fs::File::open(directory)?.sync_all()
+}
+
+/// Write `record` to a synced temporary file in `directory` and return its path.
+fn write_temporary(
+    directory: &Path,
+    id: &str,
+    record: &RejectionRecord,
+) -> std::io::Result<PathBuf> {
+    let temporary = directory.join(format!(".{id}.{}.tmp", std::process::id()));
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(record.to_json().to_string().as_bytes())?;
+    file.sync_all()?;
+    Ok(temporary)
+}
+
+/// The rejection journal under one ledger directory.
+struct RejectionJournal {
+    directory: PathBuf,
+}
+
+impl RejectionJournal {
+    fn open(ledger: &Path) -> Result<Self, Refusal> {
+        let directory = ledger.join("rejections");
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| ledger_error("creating the rejection journal", &error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| ledger_error("restricting the rejection journal", &error))?;
+        }
+        Ok(Self { directory })
+    }
+
+    fn path(&self, id: &str) -> PathBuf {
+        self.directory.join(format!("{id}.json"))
+    }
+
+    fn read(&self, id: &str) -> Result<Option<RejectionRecord>, Refusal> {
+        match std::fs::read(self.path(id)) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .as_ref()
+                .and_then(RejectionRecord::from_json)
+                .map(Some)
+                .ok_or_else(|| {
+                    Refusal::not_applied(
+                        "ledger_unavailable",
+                        format!("rejection record {id} is unreadable"),
+                        false,
+                    )
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ledger_error("reading a rejection record", &error)),
+        }
+    }
+
+    /// Bind `record` to `id` unless a binding exists; return the binding in force and whether
+    /// it existed before this call.
+    fn bind(&self, id: &str, record: &RejectionRecord) -> Result<(RejectionRecord, bool), Refusal> {
+        if let Some(existing) = self.read(id)? {
+            return Ok((existing, true));
+        }
+        let temporary = write_temporary(&self.directory, id, record)
+            .map_err(|error| ledger_error("writing a rejection record", &error))?;
+        let linked = std::fs::hard_link(&temporary, self.path(id));
+        let _ = std::fs::remove_file(&temporary);
+        match linked {
+            Ok(()) => {
+                sync_directory(&self.directory)
+                    .map_err(|error| ledger_error("syncing the rejection journal", &error))?;
+                Ok((record.clone(), false))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => self
+                .read(id)?
+                .map(|existing| (existing, true))
+                .ok_or_else(|| ledger_error("reading a rejection record", &error)),
+            Err(error) => Err(ledger_error("binding a rejection record", &error)),
+        }
+    }
+
+    /// Replace `id`'s record with `record` in a new state.
+    fn update(&self, id: &str, record: &RejectionRecord) -> Result<(), Refusal> {
+        let temporary = write_temporary(&self.directory, id, record)
+            .map_err(|error| ledger_error("writing a rejection record", &error))?;
+        std::fs::rename(&temporary, self.path(id))
+            .and_then(|()| sync_directory(&self.directory))
+            .map_err(|error| ledger_error("updating a rejection record", &error))
+    }
+}
+
+fn reaction_receipt(channel: Snowflake, message: Snowflake, emoji: &str, already: bool) -> Value {
+    json!({
+        "reaction_id": format!("{}/reactions/{emoji}", ids::message_resource(channel, message)),
+        "already_present": already,
+    })
+}
+
+/// The guarded rejection reaction (see the module documentation).
+fn ensure_rejection(
+    config: &OutboundConfig,
+    id: &str,
+    channel: Snowflake,
+    message: Snowflake,
+    sender: Snowflake,
+    emoji: &str,
+    transport: &mut dyn FnMut() -> Result<Box<dyn DiscordRest>, String>,
+) -> Result<Value, Refusal> {
+    let Some(ledger) = &config.ledger else {
+        return Err(Refusal::not_applied(
+            "helper_misconfigured",
+            "ensure_rejection needs --ledger=DIR for its rejection journal",
+            false,
+        ));
+    };
+    if !valid_operation_id(id) {
+        return Err(Refusal::not_applied(
+            "request_invalid",
+            "id must be 1-64 ASCII letters, digits or hyphens",
+            false,
+        ));
+    }
+    let journal = RejectionJournal::open(ledger)?;
+    let (mut record, existed) = journal.bind(
+        id,
+        &RejectionRecord {
+            channel,
+            message,
+            sender,
+            emoji: emoji.to_owned(),
+            state: "intent".to_owned(),
+        },
+    )?;
+    if (record.channel, record.message, record.sender) != (channel, message, sender) {
+        return Err(Refusal::not_applied(
+            "operation_conflict",
+            "this operation id is bound to another channel, message or sender",
+            false,
+        ));
+    }
+    match record.state.as_str() {
+        "done" => return Ok(reaction_receipt(channel, message, &record.emoji, true)),
+        "refused" => {
+            return Err(Refusal::not_applied(
+                "author_not_human",
+                "the author was not verified as a person",
+                false,
+            ))
+        }
+        _ => {}
+    }
+    // An earlier attempt bound this operation and did not finish: it may have reacted.
+    let uncertain = existed;
+    let inherit = |mut refusal: Refusal| {
+        if uncertain {
+            refusal.applied = Applied::Unknown;
+        }
+        refusal
+    };
+    let mut rest = transport()
+        .map_err(|problem| inherit(Refusal::not_applied("helper_misconfigured", problem, true)))?;
+    let author = match with_rate_retry(|| rest.get_message(channel, message)) {
+        Ok(found) => Some(found),
+        Err(error) if error.code == "not_found" => None,
+        Err(error) => return Err(inherit(Refusal::from(error))),
+    };
+    let human = author.is_some_and(|found| found.author_id == sender && found.author_is_human());
+    if !human {
+        if !uncertain {
+            record.state = "refused".to_owned();
+            journal.update(id, &record)?;
+        }
+        return Err(inherit(Refusal::not_applied(
+            "author_not_human",
+            "the message is gone, or its author is not this sender or is a bot, system user or webhook",
+            false,
+        )));
+    }
+    let bound_emoji = record.emoji.clone();
+    with_rate_retry(|| rest.add_reaction(channel, message, &bound_emoji))
+        .map_err(|error| inherit(Refusal::from(error)))?;
+    record.state = "done".to_owned();
+    journal.update(id, &record)?;
+    Ok(reaction_receipt(channel, message, &bound_emoji, false))
 }
 
 /// A Discord nonce (at most 25 characters) for chunk `index` of request `id`.
@@ -318,7 +621,8 @@ pub fn handle_request(
                 } else {
                     first.or(reply_to)
                 };
-                match rest.create_message(channel, chunk, reply, &nonce(request_id, index)) {
+                let chunk_nonce = nonce(request_id, index);
+                match with_rate_retry(|| rest.create_message(channel, chunk, reply, &chunk_nonce)) {
                     Ok(posted) => {
                         first.get_or_insert(posted);
                     }
@@ -363,20 +667,70 @@ pub fn handle_request(
                     return fail(Refusal::not_applied("helper_misconfigured", problem, true))
                 }
             };
-            match rest.add_reaction(channel, message, emoji) {
+            match with_rate_retry(|| rest.add_reaction(channel, message, emoji)) {
                 Ok(()) => line(&json!({
                     "version": 1, "id": id, "action": action, "ok": true,
-                    "receipt": {
-                        "reaction_id": format!("{}/reactions/{emoji}", ids::message_resource(channel, message)),
-                        "already_present": false,
-                    },
+                    "receipt": reaction_receipt(channel, message, emoji, false),
                 })),
                 Err(error) => fail(Refusal::from(error)),
             }
         }
+        Some("ensure_rejection") => {
+            let expected = [
+                "version",
+                "id",
+                "action",
+                "channel_id",
+                "message_id",
+                "sender_id",
+                "emoji",
+            ];
+            if object.len() != expected.len()
+                || !expected.iter().all(|key| object.contains_key(*key))
+            {
+                return fail(Refusal::not_applied(
+                    "request_invalid",
+                    "a rejection request has exactly version, id, action, channel_id, message_id, sender_id and emoji",
+                    false,
+                ));
+            }
+            let message = match field("message_id").and_then(ids::parse_message_resource) {
+                Some((message_channel, message)) if message_channel == channel => message,
+                _ => {
+                    return fail(Refusal::not_applied(
+                        "request_invalid",
+                        "message_id is not <channel>/messages/<id> in this channel",
+                        false,
+                    ))
+                }
+            };
+            let Some(sender) = field("sender_id").and_then(Snowflake::parse) else {
+                return fail(Refusal::not_applied(
+                    "request_invalid",
+                    "sender_id must be a Discord user id",
+                    false,
+                ));
+            };
+            let Some(emoji) = field("emoji").filter(|emoji| !emoji.is_empty() && emoji.len() <= 64)
+            else {
+                return fail(Refusal::not_applied(
+                    "request_invalid",
+                    "emoji must be a nonempty string",
+                    false,
+                ));
+            };
+            match ensure_rejection(
+                config, request_id, channel, message, sender, emoji, transport,
+            ) {
+                Ok(receipt) => line(&json!({
+                    "version": 1, "id": id, "action": action, "ok": true, "receipt": receipt,
+                })),
+                Err(refusal) => fail(refusal),
+            }
+        }
         _ => fail(Refusal::not_applied(
             "unsupported_action",
-            "the Discord helper supports send and ensure_reaction",
+            "the Discord helper supports send, ensure_reaction and ensure_rejection",
             false,
         )),
     }

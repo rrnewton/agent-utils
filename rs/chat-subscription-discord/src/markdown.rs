@@ -153,7 +153,7 @@ mod tests {
     use super::*;
     use crate::addressing::mention_ids;
 
-    const FENCED: &str = "relay deepscry@a -> deepscry@b: hi <@1545796614826889226>\n\
+    const FENCED: &str = "relay fleet@a -> fleet@b: hi <@1545796614826889226>\n\
 ```agent-teams-envelope\n{\"body\":\"a_b *c* <@1>\"}\n```\n";
 
     #[test]
@@ -187,7 +187,7 @@ mod tests {
         }
         let escaped = escape_markdown(FENCED);
         assert!(escaped.ends_with("```agent-teams-envelope\n{\"body\":\"a_b *c* <@1>\"}\n```\n"));
-        assert!(escaped.starts_with("relay deepscry@a \\-\\> deepscry@b: hi <\u{200B}@"));
+        assert!(escaped.starts_with("relay fleet@a \\-\\> fleet@b: hi <\u{200B}@"));
     }
 
     #[test]
