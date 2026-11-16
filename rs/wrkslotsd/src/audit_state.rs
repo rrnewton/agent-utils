@@ -4066,7 +4066,10 @@ fn heartbeat_diagnosis(record: &Value) -> Result<(i64, bool)> {
 /// (#1736), mirroring `_audit_validate_batch_seal_reason`.
 fn audit_seal_reason(control: &Path, machine: &str) -> String {
     let path = control.join(format!("VALIDATE-BATCH-SEAL.{machine}.journal"));
-    let root = control.parent().map(|parent| parent.to_path_buf()).unwrap_or_default();
+    let root = control
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_default();
     let (state, pid, since, detail) = crate::ensure_states::seal_owner_liveness(&path, &root);
     match state.as_str() {
         "live" => format!(
@@ -4085,6 +4088,7 @@ fn audit_seal_reason(control: &Path, machine: &str) -> String {
 /// in the oracle's order: an interrupted journal blocks the row,
 /// then (for DELETABLE/BLOCKED rows with the directory present) stray
 /// Git registrations block it too.
+#[allow(clippy::too_many_arguments)]
 fn apply_overrides(
     row: &mut Value,
     journals: &BTreeMap<String, ValidatedJournal>,

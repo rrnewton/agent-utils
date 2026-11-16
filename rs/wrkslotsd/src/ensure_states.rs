@@ -531,20 +531,28 @@ pub(crate) fn require_fixture() -> Result<()> {
 /// Whether an argv runs a wrkslots removal command, mirroring
 /// `_is_wrkslots_command`.
 fn is_wrkslots_command(argv: &[String]) -> bool {
-    const OPERATORS: [&str; 4] = ["remove", "remove-validate-batch", "remove-agent-batch", "retire-pending"];
+    const OPERATORS: [&str; 4] = [
+        "remove",
+        "remove-validate-batch",
+        "remove-agent-batch",
+        "retire-pending",
+    ];
     let mut runs = false;
     for (index, argument) in argv.iter().enumerate() {
-        if argument == "wrkslots" && index > 0 && argv[index - 1] == "-m" {
-            runs = true;
-        } else if argument.ends_with("/wrkslots/__main__.py") {
-            runs = true;
-        } else if index <= 1
-            && std::path::Path::new(argument).file_name().and_then(|name| name.to_str()) == Some("wrkslots")
-        {
+        let module_form = argument == "wrkslots" && index > 0 && argv[index - 1] == "-m";
+        let script_form = argument.ends_with("/wrkslots/__main__.py");
+        let binary_form = index <= 1
+            && std::path::Path::new(argument)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("wrkslots");
+        if module_form || script_form || binary_form {
             runs = true;
         }
     }
-    runs && argv.iter().any(|argument| OPERATORS.contains(&argument.as_str()))
+    runs && argv
+        .iter()
+        .any(|argument| OPERATORS.contains(&argument.as_str()))
 }
 
 fn path_within(candidate: &Path, root: &Path) -> bool {
@@ -562,7 +570,9 @@ pub(crate) fn other_live_wrkslots_processes(root: &Path, targets: &[String]) -> 
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(pid) = name.parse::<i64>() else { continue };
+        let Ok(pid) = name.parse::<i64>() else {
+            continue;
+        };
         if pid == own {
             continue;
         }
@@ -608,7 +618,8 @@ pub(crate) fn other_live_wrkslots_processes(root: &Path, targets: &[String]) -> 
         let same_project = match &project {
             None => true,
             Some(candidate) => {
-                let resolved = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone());
+                let resolved =
+                    std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone());
                 path_within(&resolved, &root)
             }
         };
@@ -689,9 +700,14 @@ pub(crate) fn seal_owner_liveness(
 /// of `_refuse_partial_state`: live owners are in progress and never
 /// pointed at recovery; only proven-dead owners are "interrupted".
 pub(crate) fn seal_blocking_message(paths: &[PathBuf], root: &Path) -> String {
-    let first = paths.first().map(|path| path.display().to_string()).unwrap_or_default();
-    let statuses: Vec<(String, Option<i64>, Option<String>, String)> =
-        paths.iter().map(|path| seal_owner_liveness(path, root)).collect();
+    let first = paths
+        .first()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let statuses: Vec<(String, Option<i64>, Option<String>, String)> = paths
+        .iter()
+        .map(|path| seal_owner_liveness(path, root))
+        .collect();
     for (state, pid, since, _detail) in &statuses {
         if state == "live" {
             if let (Some(pid), Some(since)) = (pid, since) {
@@ -809,7 +825,10 @@ fn refuse_partial_state_inner(control: &Path, allow_validate_batch_seals: bool) 
         .collect();
     seals.sort();
     if !seals.is_empty() {
-        let root = control.parent().map(|parent| parent.to_path_buf()).unwrap_or_default();
+        let root = control
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_default();
         return Err(seal_blocking_message(&seals, &root));
     }
     Ok(())
