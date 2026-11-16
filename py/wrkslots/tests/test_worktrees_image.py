@@ -547,7 +547,7 @@ def test_unmount_busy_names_the_holding_pid_and_unit(
         worktreesimage.unmount_bind(
             target, sleeper=waits.append, proc_root=proc
         )
-    assert len(waits) == worktreesimage.UMOUNT_ATTEMPTS - 1
+    assert len(waits) == (worktreesimage.UMOUNT_ATTEMPTS - 1) * worktreesimage.UMOUNT_RECHECKS
     assert [call for call in fake.calls if call[0] == "umount"] == [
         ["umount", str(target)]
     ] * worktreesimage.UMOUNT_ATTEMPTS
@@ -579,7 +579,101 @@ def test_unmount_busy_clears_on_a_bounded_retry(
 
     worktreesimage.unmount_bind(target, sleeper=waits.append)
     assert busy.umounts == 3
+    # No holder exists, so each re-check wait ends on its first rescan.
     assert len(waits) == 2
+
+
+def _holder_proc(
+    proc: Path, target: Path, *, start_epoch: float, comm: str = "holder-svc"
+) -> Path:
+    """One fake holder process: mountinfo, cgroup unit, comm, ns, stat (#1743)."""
+    holder = proc / "4321"
+    holder.mkdir(parents=True)
+    (holder / "mountinfo").write_text(
+        f"36 25 0:999 /s1 {target} rw,relatime shared:7 - btrfs /dev/loop9 rw\n",
+        encoding="utf-8",
+    )
+    (holder / "cgroup").write_text(
+        "0::/system.slice/holder-svc.service\n", encoding="utf-8"
+    )
+    (holder / "comm").write_text(f"{comm}\n", encoding="utf-8")
+    (holder / "ns").mkdir()
+    (holder / "ns" / "mnt").symlink_to("mnt:[4026532001]")
+    ticks = int(start_epoch * os.sysconf("SC_CLK_TCK"))
+    fields = ["0"] * 20
+    fields[0] = "S"
+    fields[19] = str(ticks)
+    (holder / "stat").write_text(
+        f"4321 ({comm}) " + " ".join(fields) + "\n", encoding="utf-8"
+    )
+    (proc / "stat").write_text("btime 0\n", encoding="utf-8")
+    return holder
+
+
+def test_unmount_busy_names_holder_pid_comm_namespace_and_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1743: a holder proven older than the bind is named in full --
+    # pid, comm, namespace id and unit -- without wasted retries.
+    target = tmp_path / "slots" / "s1"
+    target.mkdir(parents=True)
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    _holder_proc(proc, target, start_epoch=500.0, comm="old-svc")
+    fake = _FakeMounts(fail_umount=True)
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [_bind_entry(target)])
+
+    with pytest.raises(worktreesimage.WorktreesImageError) as raised:
+        worktreesimage.unmount_bind(
+            target, sleeper=lambda _seconds: None, proc_root=proc, bind_epoch=1000.0
+        )
+    message = str(raised.value)
+    assert "pid 4321" in message
+    assert "old-svc" in message
+    assert "4026532001" in message
+    assert "holder-svc.service" in message
+    assert [call for call in fake.calls if call[0] == "umount"] == [
+        ["umount", str(target)]
+    ]
+
+
+def test_unmount_transient_holder_disappearing_on_recheck_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1743: a young holder that disappears on re-check lets a bounded,
+    # condition-driven retry succeed; no holder is killed or entered.
+    target = tmp_path / "slots" / "s1"
+    target.mkdir(parents=True)
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    holder = _holder_proc(proc, target, start_epoch=2000.0, comm="young-svc")
+
+    class _BusyWhileHeld:
+        def __init__(self) -> None:
+            self.umounts = 0
+
+        def run(self, argv: list[str], *, sudo: bool = False) -> None:
+            if argv[:1] == ["umount"]:
+                self.umounts += 1
+                if holder.exists():
+                    raise worktreesimage.WorktreesImageError("umount: target is busy")
+            return None
+
+    busy = _BusyWhileHeld()
+    monkeypatch.setattr(worktreesimage, "_run", busy.run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [_bind_entry(target)])
+    waits: list[float] = []
+
+    def vanish(_seconds: float) -> None:
+        waits.append(_seconds)
+        shutil.rmtree(holder, ignore_errors=True)
+
+    worktreesimage.unmount_bind(
+        target, sleeper=vanish, proc_root=proc, bind_epoch=1000.0
+    )
+    assert busy.umounts == 2
+    assert waits  # waited on a re-check, not a fixed sleep budget
 
 
 def test_reload_never_rebinds_a_fenced_slot_at_its_canonical_path(

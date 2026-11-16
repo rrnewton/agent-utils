@@ -980,10 +980,16 @@ def save_binds(control: Path, binds: dict[str, str]) -> None:
 
 
 #: Bounded unmount retries after privatising (#1733): a holder that is
-#: exiting gets a short backoff to release its copy; a holder that stays
+#: exiting gets a chance to release its copy; a holder that stays
 #: is named by ``describe_mount_holders`` instead of retried forever.
 UMOUNT_ATTEMPTS = 3
-UMOUNT_BACKOFF_SECONDS = 0.2
+
+#: Re-checks of the holder scan waited on between unmount attempts
+#: (#1743): the wait ends when the holder set changes or vanishes, and
+#: is bounded by this count, never by a wall-clock budget. The poll
+#: interval below only paces the re-checks; it decides nothing.
+UMOUNT_RECHECKS = 5
+UMOUNT_RECHECK_SECONDS = 0.05
 
 #: Injectable wait between unmount retries (tests substitute a counter,
 #: never a wall clock).
@@ -1077,30 +1083,112 @@ def _unit_for_pid(proc_root: Path, pid: str) -> str | None:
     return None
 
 
-def describe_mount_holders(
+@dataclasses.dataclass(frozen=True)
+class _MountHolder:
+    """One process whose mount namespace still holds a slot bind (#1743)."""
+
+    pid: str
+    comm: str | None
+    namespace: str | None
+    unit: str | None
+    start_epoch: float | None
+
+    @property
+    def signature(self) -> tuple[str, str | None]:
+        return (self.pid, self.namespace)
+
+    def proven_older_than(self, bind_epoch: float | None) -> bool:
+        """Whether this holder certainly starts before the slot's bind."""
+        return (
+            bind_epoch is not None
+            and self.start_epoch is not None
+            and self.start_epoch <= bind_epoch
+        )
+
+    def describe(self) -> str:
+        parts = [
+            part
+            for part in (
+                self.comm,
+                f"mnt:[{self.namespace}]" if self.namespace else None,
+                self.unit,
+            )
+            if part
+        ]
+        return f"pid {self.pid} ({', '.join(parts)})" if parts else f"pid {self.pid}"
+
+
+def _process_start_epoch(proc_root: Path, pid_dir: Path) -> float | None:
+    """Start time of one process as an epoch, from its stat and boot time."""
+    try:
+        text = (pid_dir / "stat").read_text(encoding="utf-8", errors="replace")
+        boot = (proc_root / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    close = text.rfind(")")
+    if close < 0:
+        return None
+    fields = text[close + 1 :].split()
+    # fields[0] is state (field 3 overall); start time is field 22.
+    if len(fields) <= 19:
+        return None
+    btime = None
+    for line in boot.splitlines():
+        if line.startswith("btime "):
+            try:
+                btime = int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+            break
+    if btime is None:
+        return None
+    try:
+        ticks = int(fields[19])
+        hertz = os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError):
+        return None
+    return btime + ticks / hertz
+
+
+def _namespace_id(pid_dir: Path) -> str | None:
+    """Mount-namespace id of one process, from its ``ns/mnt`` link."""
+    link = pid_dir / "ns" / "mnt"
+    try:
+        raw = os.readlink(link)
+    except OSError:
+        try:
+            raw = link.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return None
+    start = raw.find("[")
+    end = raw.find("]", start + 1) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None
+    return raw[start + 1 : end] or None
+
+
+def scan_mount_holders(
     target: Path,
     proc_root: Path | None = None,
     entries: Sequence[slotimage.MountEntry] | None = None,
-) -> str:
-    """Name the processes whose mount namespaces still hold ``target``.
+) -> list[_MountHolder] | None:
+    """Every holder of ``target``; None when the process tree is unreadable.
 
-    Scans each process's mount table for the bind's identity (device
-    and mount root) or any of its peer views, and names the PID and,
-    when the cgroup names one, its unit (#1733).
+    Read-only (#1743): a holder is never killed or entered, only named.
     """
 
     root = _PROC_ROOT if proc_root is None else proc_root
     table = slotimage.mount_table() if entries is None else entries
     top = _top_entry(target, table)
     views = set(peer_views(target, table))
-    holders: list[str] = []
     try:
         pid_dirs = sorted(
             (entry for entry in root.iterdir() if entry.name.isdigit()),
             key=lambda entry: int(entry.name),
         )
     except OSError:
-        return "holder scan unavailable (process tree unreadable)"
+        return None
+    holders: list[_MountHolder] = []
     for pid_dir in pid_dirs:
         try:
             theirs = slotimage._parse_mount_table(
@@ -1121,13 +1209,72 @@ def describe_mount_holders(
         )
         if not held:
             continue
-        unit = _unit_for_pid(root, pid_dir.name)
+        try:
+            comm = (pid_dir / "comm").read_text(
+                encoding="utf-8", errors="replace"
+            ).strip() or None
+        except OSError:
+            comm = None
         holders.append(
-            f"pid {pid_dir.name} ({unit})" if unit else f"pid {pid_dir.name}"
+            _MountHolder(
+                pid=pid_dir.name,
+                comm=comm,
+                namespace=_namespace_id(pid_dir),
+                unit=_unit_for_pid(root, pid_dir.name),
+                start_epoch=_process_start_epoch(root, pid_dir),
+            )
         )
+    return holders
+
+
+def describe_mount_holders(
+    target: Path,
+    proc_root: Path | None = None,
+    entries: Sequence[slotimage.MountEntry] | None = None,
+) -> str:
+    """Name the processes whose mount namespaces still hold ``target``.
+
+    Scans each process's mount table for the bind's identity (device
+    and mount root) or any of its peer views, and names the pid, comm,
+    namespace id and, when the cgroup names one, its unit (#1743).
+    """
+
+    holders = scan_mount_holders(target, proc_root=proc_root, entries=entries)
+    if holders is None:
+        return "holder scan unavailable (process tree unreadable)"
     if not holders:
         return "no process mount namespace still holds it"
-    return ", ".join(holders)
+    return ", ".join(holder.describe() for holder in holders)
+
+
+def _wait_on_holder_recheck(
+    target: Path,
+    previous: list[_MountHolder] | None,
+    *,
+    wait: Callable[[float], None],
+    proc_root: Path | None,
+    entries: Sequence[slotimage.MountEntry],
+) -> None:
+    """Wait until the holder set changes or vanishes (#1743).
+
+    Bounded by UMOUNT_RECHECKS re-checks, never by a wall-clock budget:
+    each re-check rescans the holders, and the wait ends as soon as the
+    signature set differs. Holders are only read, never disturbed.
+    """
+
+    before = (
+        None
+        if previous is None
+        else tuple(holder.signature for holder in previous)
+    )
+    for _recheck in range(UMOUNT_RECHECKS):
+        wait(UMOUNT_RECHECK_SECONDS)
+        current = scan_mount_holders(target, proc_root=proc_root, entries=entries)
+        if current is None:
+            return
+        now = tuple(holder.signature for holder in current)
+        if not now or now != before:
+            return
 
 
 def unmount_bind(
@@ -1136,17 +1283,29 @@ def unmount_bind(
     attempts: int = UMOUNT_ATTEMPTS,
     sleeper: Callable[[float], None] | None = None,
     proc_root: Path | None = None,
+    bind_epoch: float | None = None,
 ) -> None:
     """Privatise then unmount the bind at ``target`` and its peer views.
 
     After the fence, privatising first stops the unmount from being
     pinned by copies handed to namespaces that started earlier, and
     detaches the mirror view so it cannot re-pin the canonical path
-    (#1733). A busy unmount retries a bounded number of times with
-    backoff; a still-busy unmount names its holders.
+    (#1733). A busy unmount whose every holder is transient -- younger
+    than the bind, or gone on re-check -- retries a bounded number of
+    times, waiting on holder re-checks between tries (#1743); a holder
+    proven older than the bind, and a still-busy unmount after the
+    bound, are named in full instead of retried forever. ``bind_epoch``
+    defaults to the bind target's own change time, which the slot's
+    creation sets before the bind, so an older holder is proven, never
+    guessed. Holders are never killed or entered.
     """
 
     wait = _sleep if sleeper is None else sleeper
+    if bind_epoch is None:
+        try:
+            bind_epoch = target.stat().st_ctime
+        except OSError:
+            bind_epoch = None
     last_error: WorktreesImageError | None = None
     for attempt in range(max(1, attempts)):
         try:
@@ -1177,7 +1336,16 @@ def unmount_bind(
             if "busy" not in str(exc).lower():
                 raise
             if attempt + 1 < max(1, attempts):
-                wait(UMOUNT_BACKOFF_SECONDS * (2**attempt))
+                holders_now = scan_mount_holders(
+                    target, proc_root=proc_root, entries=table
+                )
+                if holders_now and all(
+                    holder.proven_older_than(bind_epoch) for holder in holders_now
+                ):
+                    break
+                _wait_on_holder_recheck(
+                    target, holders_now, wait=wait, proc_root=proc_root, entries=table
+                )
     holders = describe_mount_holders(target, proc_root=proc_root)
     raise WorktreesImageError(
         f"umount {target}: target is busy after {max(1, attempts)} attempts; "

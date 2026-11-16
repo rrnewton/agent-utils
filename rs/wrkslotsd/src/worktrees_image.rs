@@ -920,27 +920,114 @@ fn unit_for_pid(proc_root: &Path, pid: &str) -> Option<String> {
     None
 }
 
-/// Name the processes whose mount namespaces still hold `target`,
-/// mirroring Python `describe_mount_holders` (#1733).
-pub(crate) fn describe_mount_holders(
+/// One process whose mount namespace still holds a slot bind (#1743).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MountHolder {
+    pub(crate) pid: String,
+    pub(crate) comm: Option<String>,
+    pub(crate) namespace: Option<String>,
+    pub(crate) unit: Option<String>,
+    pub(crate) start_epoch: Option<f64>,
+}
+
+impl MountHolder {
+    pub(crate) fn signature(&self) -> (String, Option<String>) {
+        (self.pid.clone(), self.namespace.clone())
+    }
+
+    /// Whether this holder certainly predates the slot's bind.
+    pub(crate) fn proven_older_than(&self, bind_epoch: Option<f64>) -> bool {
+        match (bind_epoch, self.start_epoch) {
+            (Some(bind), Some(start)) => start <= bind,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(comm) = &self.comm {
+            parts.push(comm.clone());
+        }
+        if let Some(namespace) = &self.namespace {
+            parts.push(format!("mnt:[{namespace}]"));
+        }
+        if let Some(unit) = &self.unit {
+            parts.push(unit.clone());
+        }
+        if parts.is_empty() {
+            format!("pid {}", self.pid)
+        } else {
+            format!("pid {} ({})", self.pid, parts.join(", "))
+        }
+    }
+}
+
+fn process_start_epoch(proc_root: &Path, pid_dir: &Path) -> Option<f64> {
+    let text = std::fs::read_to_string(pid_dir.join("stat")).ok()?;
+    let boot = std::fs::read_to_string(proc_root.join("stat")).ok()?;
+    let close = text.rfind(')')?;
+    let fields: Vec<&str> = text[close + 1..].split_whitespace().collect();
+    if fields.len() <= 19 {
+        return None;
+    }
+    let btime: i64 = boot
+        .lines()
+        .find(|line| line.starts_with("btime "))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let ticks: i64 = fields[19].parse().ok()?;
+    // AT_CLKTCK from our own auxv: no unsafe block needed.
+    let auxv = std::fs::read("/proc/self/auxv").ok()?;
+    let mut hertz: Option<i64> = None;
+    for pair in auxv.chunks_exact(16) {
+        let kind = u64::from_ne_bytes(pair[..8].try_into().ok()?);
+        let value = u64::from_ne_bytes(pair[8..].try_into().ok()?);
+        if kind == 17 {
+            hertz = i64::try_from(value).ok();
+            break;
+        }
+        if kind == 0 {
+            break;
+        }
+    }
+    let hertz = hertz.filter(|value| *value > 0)?;
+    Some(btime as f64 + ticks as f64 / hertz as f64)
+}
+
+fn namespace_id(pid_dir: &Path) -> Option<String> {
+    let link = pid_dir.join("ns").join("mnt");
+    let raw = std::fs::read_link(&link)
+        .map(|target| target.to_string_lossy().into_owned())
+        .or_else(|_| std::fs::read_to_string(&link).map(|text| text.trim().to_string()))
+        .ok()?;
+    let start = raw.find('[')?;
+    let end = raw[start + 1..].find(']')? + start + 1;
+    let id = &raw[start + 1..end];
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Every holder of `target`; None when the process tree is unreadable.
+/// Read-only (#1743): a holder is never killed or entered, only named.
+pub(crate) fn scan_mount_holders(
     proc_root: &Path,
     target: &Path,
     entries: &[MountEntry],
-) -> String {
+) -> Option<Vec<MountHolder>> {
     let top = crate::image_mounts::top_entry(target, entries);
     let views = peer_views(target, entries);
-    let Ok(read) = std::fs::read_dir(proc_root) else {
-        return "holder scan unavailable (process tree unreadable)".to_string();
-    };
+    let read = std::fs::read_dir(proc_root).ok()?;
     let mut pids: Vec<String> = read
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()))
         .collect();
     pids.sort_by_key(|name| name.parse::<u64>().unwrap_or(0));
-    let mut holders: Vec<String> = Vec::new();
+    let mut holders = Vec::new();
     for pid in pids {
-        let Ok(text) = std::fs::read_to_string(proc_root.join(&pid).join("mountinfo")) else {
+        let pid_dir = proc_root.join(&pid);
+        let Ok(text) = std::fs::read_to_string(pid_dir.join("mountinfo")) else {
             continue;
         };
         let theirs = crate::image_mounts::parse_mountinfo(&text);
@@ -951,20 +1038,49 @@ pub(crate) fn describe_mount_holders(
         if !held {
             continue;
         }
-        match unit_for_pid(proc_root, &pid) {
-            Some(unit) => holders.push(format!("pid {pid} ({unit})")),
-            None => holders.push(format!("pid {pid}")),
-        }
+        let comm = std::fs::read_to_string(pid_dir.join("comm"))
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        holders.push(MountHolder {
+            unit: unit_for_pid(proc_root, &pid),
+            namespace: namespace_id(&pid_dir),
+            start_epoch: process_start_epoch(proc_root, &pid_dir),
+            pid,
+            comm,
+        });
     }
-    if holders.is_empty() {
-        "no process mount namespace still holds it".to_string()
-    } else {
-        holders.join(", ")
+    Some(holders)
+}
+
+/// Name the processes whose mount namespaces still hold `target`,
+/// mirroring Python `describe_mount_holders` (#1743): pid, comm,
+/// namespace id and, when the cgroup names one, its unit.
+pub(crate) fn describe_mount_holders(
+    proc_root: &Path,
+    target: &Path,
+    entries: &[MountEntry],
+) -> String {
+    match scan_mount_holders(proc_root, target, entries) {
+        None => "holder scan unavailable (process tree unreadable)".to_string(),
+        Some(holders) if holders.is_empty() => {
+            "no process mount namespace still holds it".to_string()
+        }
+        Some(holders) => holders
+            .iter()
+            .map(MountHolder::describe)
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 
 /// Bounded unmount attempts after privatising (#1733).
 pub(crate) const UMOUNT_ATTEMPTS: usize = 3;
+
+/// Re-checks of the holder scan waited on between unmount attempts
+/// (#1743): the wait ends when the holder set changes or vanishes, and
+/// is bounded by this count, never by a wall-clock budget.
+pub(crate) const UMOUNT_RECHECKS: usize = 5;
 
 // ---------------------------------------------------------- handlers (#1141)
 //
@@ -1762,7 +1878,42 @@ pub(crate) fn unbind_slot(
             return outcome;
         }
         if attempt + 1 < UMOUNT_ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+            // #1743: wait on holder re-checks, not a fixed sleep
+            // budget. A holder proven older than the bind ends the
+            // retry at once; otherwise rescan until the holder set
+            // changes or vanishes, bounded by UMOUNT_RECHECKS.
+            let bind_epoch = std::fs::metadata(slot_path)
+                .and_then(|meta| meta.created())
+                .ok()
+                .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_secs_f64());
+            let holders_now = scan_mount_holders(Path::new("/proc"), slot_path, ctx.entries);
+            if let Some(holders) = &holders_now {
+                if !holders.is_empty()
+                    && holders
+                        .iter()
+                        .all(|holder| holder.proven_older_than(bind_epoch))
+                {
+                    break;
+                }
+            }
+            let before: Vec<_> = holders_now
+                .unwrap_or_default()
+                .iter()
+                .map(MountHolder::signature)
+                .collect();
+            for _recheck in 0..UMOUNT_RECHECKS {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let current = scan_mount_holders(Path::new("/proc"), slot_path, ctx.entries);
+                let now: Vec<_> = current
+                    .unwrap_or_default()
+                    .iter()
+                    .map(MountHolder::signature)
+                    .collect();
+                if now.is_empty() || now != before {
+                    break;
+                }
+            }
         }
     }
     if !unmounted {
@@ -2325,6 +2476,29 @@ mod tests {
             describe_mount_holders(&proc_root, Path::new("/slots/s1"), &entries),
             "pid 4321 (holder-crash.service)"
         );
+        // #1743: comm and namespace id join the unit in the naming,
+        // and a holder's age against the bind is proven, not guessed.
+        std::fs::write(holder.join("comm"), "old-svc\n").expect("comm");
+        std::fs::create_dir_all(holder.join("ns")).expect("ns");
+        std::os::unix::fs::symlink("mnt:[4026532001]", holder.join("ns/mnt")).expect("ns link");
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[19] = "50000";
+        std::fs::write(
+            holder.join("stat"),
+            format!("4321 (old-svc) {}\n", fields.join(" ")),
+        )
+        .expect("stat");
+        std::fs::write(proc_root.join("stat"), "btime 0\n").expect("boot");
+        assert_eq!(
+            describe_mount_holders(&proc_root, Path::new("/slots/s1"), &entries),
+            "pid 4321 (old-svc, mnt:[4026532001], holder-crash.service)"
+        );
+        let holders =
+            scan_mount_holders(&proc_root, Path::new("/slots/s1"), &entries).expect("scan");
+        assert_eq!(holders.len(), 1);
+        assert!(holders[0].proven_older_than(Some(1000.0)));
+        assert!(!holders[0].proven_older_than(Some(100.0)));
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
