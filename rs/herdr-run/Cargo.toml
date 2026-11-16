@@ -22,7 +22,7 @@ ryu = "1"
 serde = { version = "1", features = ["derive"] }
 # `float_roundtrip` makes every float read as the nearest `f64`, as the other edition's reader
 # does. Without it the result would depend on whether another crate in the build enabled it.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 sha2 = "0.10"
 
 [[bin]]

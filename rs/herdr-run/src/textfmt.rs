@@ -631,7 +631,75 @@ pub const JSON_MAX_DEPTH: usize = 128;
 /// in a build select, which is what the other edition's reader does.
 #[must_use]
 pub fn strict_json(text: &str) -> Option<Value> {
-    serde_json::from_str(text).ok()
+    fn decode(text: &str, depth: usize) -> Option<Value> {
+        use serde_json::value::RawValue;
+
+        // Raw lexemes distinguish -0 and rounded finite floats even when another
+        // workspace crate enables arbitrary_precision. Never interpret private
+        // serde number tags: they can also be literal user object keys.
+        let raw: &RawValue = serde_json::from_str(text).ok()?;
+        let text = raw.get();
+        let first = text.as_bytes()[0];
+        if matches!(first, b'[' | b'{') && depth >= JSON_MAX_DEPTH - 1 {
+            return None;
+        }
+        match first {
+            b'[' => {
+                let items: Vec<&RawValue> = serde_json::from_str(text).ok()?;
+                items
+                    .into_iter()
+                    .map(|item| decode(item.get(), depth + 1))
+                    .collect::<Option<Vec<_>>>()
+                    .map(Value::Array)
+            }
+            b'{' => {
+                use serde::de::{Deserializer, MapAccess, Visitor};
+                struct Pairs;
+                impl<'de> Visitor<'de> for Pairs {
+                    type Value = Vec<(String, &'de RawValue)>;
+                    fn expecting(
+                        &self,
+                        formatter: &mut std::fmt::Formatter<'_>,
+                    ) -> std::fmt::Result {
+                        formatter.write_str("a JSON object")
+                    }
+                    fn visit_map<A: MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        let mut items = Vec::new();
+                        while let Some(item) = map.next_entry()? {
+                            items.push(item);
+                        }
+                        Ok(items)
+                    }
+                }
+                let items = serde_json::Deserializer::from_str(text)
+                    .deserialize_map(Pairs)
+                    .ok()?;
+                // Validate every occurrence before last-key-wins collection.
+                // An overwritten bad surrogate or overflowing number still refuses.
+                items
+                    .into_iter()
+                    .map(|(key, item)| Some((key, decode(item.get(), depth + 1)?)))
+                    .collect::<Option<serde_json::Map<_, _>>>()
+                    .map(Value::Object)
+            }
+            b'-' | b'0'..=b'9' => {
+                if !text.contains(['.', 'e', 'E']) && text != "-0" {
+                    if let Ok(integer) = text.parse::<i64>() {
+                        return Some(Value::Number(integer.into()));
+                    }
+                    if let Ok(integer) = text.parse::<u64>() {
+                        return Some(Value::Number(integer.into()));
+                    }
+                }
+                serde_json::Number::from_f64(text.parse().ok()?).map(Value::Number)
+            }
+            _ => serde_json::from_str(text).ok(),
+        }
+    }
+    decode(text, 0)
 }
 
 fn write_json_string(out: &mut String, value: &str) {

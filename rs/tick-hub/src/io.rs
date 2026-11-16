@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 
 use indexmap::IndexMap;
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
@@ -43,11 +43,51 @@ impl<'de, const YAML: bool> Deserialize<'de> for StrictValue<YAML> {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(StrictValueVisitor::<YAML>)
+        StrictValueSeed::<YAML>(0).deserialize(deserializer)
     }
 }
 
-struct StrictValueVisitor<const YAML: bool>;
+struct StrictValueSeed<const YAML: bool>(usize);
+
+impl<'de, const YAML: bool> DeserializeSeed<'de> for StrictValueSeed<YAML> {
+    type Value = StrictValue<YAML>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        if YAML {
+            return deserializer.deserialize_any(StrictValueVisitor::<YAML>(self.0));
+        }
+        // A generic serde visitor sees arbitrary-precision numbers as private
+        // maps. Read the JSON lexeme instead, without treating real user keys
+        // as serde metadata or losing duplicate-key detection.
+        let raw = <&serde_json::value::RawValue>::deserialize(deserializer)?;
+        let text = raw.get();
+        let first = text.as_bytes()[0];
+        if matches!(first, b'[' | b'{') && self.0 >= 127 {
+            return Err(de::Error::custom("recursion limit exceeded"));
+        }
+        if first == b'-' || first.is_ascii_digit() {
+            if !text.contains(['.', 'e', 'E']) && text != "-0" {
+                if let Ok(value) = text.parse::<i64>() {
+                    return Ok(StrictValue::I64(value));
+                }
+                if let Ok(value) = text.parse::<u64>() {
+                    return Ok(StrictValue::U64(value));
+                }
+            }
+            let value = text.parse::<f64>().map_err(de::Error::custom)?;
+            if !value.is_finite() {
+                return Err(de::Error::custom("non-finite numbers are not allowed"));
+            }
+            return Ok(StrictValue::F64(value));
+        }
+        let mut parser = serde_json::Deserializer::from_str(text);
+        parser
+            .deserialize_any(StrictValueVisitor::<YAML>(self.0))
+            .map_err(de::Error::custom)
+    }
+}
+
+struct StrictValueVisitor<const YAML: bool>(usize);
 
 impl<'de, const YAML: bool> Visitor<'de> for StrictValueVisitor<YAML> {
     type Value = StrictValue<YAML>;
@@ -100,7 +140,7 @@ impl<'de, const YAML: bool> Visitor<'de> for StrictValueVisitor<YAML> {
         A: SeqAccess<'de>,
     {
         let mut values = Vec::new();
-        while let Some(value) = sequence.next_element()? {
+        while let Some(value) = sequence.next_element_seed(StrictValueSeed::<YAML>(self.0 + 1))? {
             values.push(value);
         }
         Ok(StrictValue::Sequence(values))
@@ -111,11 +151,22 @@ impl<'de, const YAML: bool> Visitor<'de> for StrictValueVisitor<YAML> {
         A: MapAccess<'de>,
     {
         let mut values = IndexMap::new();
-        while let Some(raw_key) = mapping.next_key::<StrictValue<YAML>>()? {
-            let StrictValue::String(key) = raw_key else {
-                return Err(<A::Error as de::Error>::custom(
-                    "mapping keys must be strings",
-                ));
+        loop {
+            let key = if YAML {
+                match mapping.next_key::<StrictValue<YAML>>()? {
+                    Some(StrictValue::String(key)) => key,
+                    None => break,
+                    _ => {
+                        return Err(<A::Error as de::Error>::custom(
+                            "mapping keys must be strings",
+                        ))
+                    }
+                }
+            } else {
+                let Some(key) = mapping.next_key::<String>()? else {
+                    break;
+                };
+                key
             };
             if key == "<<" {
                 return Err(<A::Error as de::Error>::custom(
@@ -129,7 +180,7 @@ impl<'de, const YAML: bool> Visitor<'de> for StrictValueVisitor<YAML> {
                     string_repr(&key)
                 )));
             }
-            let value = mapping.next_value()?;
+            let value = mapping.next_value_seed(StrictValueSeed::<YAML>(self.0 + 1))?;
             values.insert(key, value);
         }
         Ok(StrictValue::Mapping(values))
@@ -829,7 +880,7 @@ pub fn config_to_json(config: &TickConfig) -> Result<String, TickConfigError> {
 /// interchange invariant.
 pub fn config_to_yaml(config: &TickConfig) -> Result<String, TickConfigError> {
     validate_serializable(config)?;
-    serde_norway::to_string(&config_to_value(config))
+    yaml_from_json(&config_to_value(config))
         .map_err(|error| TickConfigError(format!("cannot serialize YAML: {error}")))
 }
 
@@ -845,9 +896,71 @@ fn value_type(value: &Value) -> &'static str {
     }
 }
 
+// Serialize numbers as primitive scalars rather than serde_json's private
+// arbitrary-precision map representation, which other serializers cannot decode.
+pub(crate) fn yaml_from_json(value: &Value) -> Result<String, serde_norway::Error> {
+    fn convert(value: &Value) -> Result<serde_norway::Value, serde_norway::Error> {
+        match value {
+            Value::Null => Ok(serde_norway::Value::Null),
+            Value::Bool(value) => serde_norway::to_value(value),
+            Value::String(value) => serde_norway::to_value(value),
+            Value::Number(value) => {
+                if let Some(value) = value.as_i64() {
+                    serde_norway::to_value(value)
+                } else if let Some(value) = value.as_u64() {
+                    serde_norway::to_value(value)
+                } else {
+                    let value = value
+                        .as_f64()
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| {
+                            <serde_norway::Error as serde::ser::Error>::custom(
+                                "non-finite YAML number",
+                            )
+                        })?;
+                    serde_norway::to_value(value)
+                }
+            }
+            Value::Array(values) => values
+                .iter()
+                .map(convert)
+                .collect::<Result<Vec<_>, _>>()
+                .map(serde_norway::Value::Sequence),
+            Value::Object(values) => {
+                let mut mapping = serde_norway::Mapping::new();
+                for (key, value) in values {
+                    mapping.insert(serde_norway::Value::String(key.clone()), convert(value)?);
+                }
+                Ok(serde_norway::Value::Mapping(mapping))
+            }
+        }
+    }
+    serde_norway::to_string(&convert(value)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_numbers_and_private_serde_keys_keep_their_document_meaning() {
+        let source = r#"[1.5,-0,1e2,{"$serde_json::private::Number":"1.5"}]"#;
+        let parsed: StrictValue<false> = serde_json::from_str(source).unwrap();
+        let value = strict_value_to_json(parsed).unwrap();
+        assert_eq!(value[0].as_f64(), Some(1.5));
+        assert_eq!(value[1].as_f64().unwrap().to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(value[2].as_f64(), Some(100.0));
+        assert_eq!(value[3]["$serde_json::private::Number"], "1.5");
+        assert!(serde_json::from_str::<StrictValue<false>>("1e400").is_err());
+        assert!(serde_json::from_str::<StrictValue<false>>(r#"{"x":"\ud800","x":1}"#).is_err());
+    }
+
+    #[test]
+    fn raw_json_values_keep_the_container_depth_limit() {
+        let nested = |depth: usize| format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(serde_json::from_str::<StrictValue<false>>(&nested(127)).is_ok());
+        assert!(serde_json::from_str::<StrictValue<false>>(&nested(128)).is_err());
+    }
 
     #[test]
     fn canonical_json_matches_stable_contract() {

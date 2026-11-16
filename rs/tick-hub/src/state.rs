@@ -188,7 +188,7 @@ impl OpsState {
     /// Serialize to stable YAML with flags sorted by key.
     pub fn to_yaml(&self) -> Result<String, StateError> {
         let canonical = Self::from_value(&self.to_value())?;
-        serde_norway::to_string(&canonical.to_value())
+        crate::io::yaml_from_json(&canonical.to_value())
             .map_err(|error| StateError(format!("cannot serialize YAML: {error}")))
     }
 

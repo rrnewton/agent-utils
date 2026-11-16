@@ -92,6 +92,9 @@ fn to_serde(value: &PyValue) -> Option<serde_json::Value> {
             for (key, child) in pairs {
                 map.insert(key.clone(), to_serde(child)?);
             }
+            // Generic receipt extensions have a sorted-key byte contract even
+            // when another workspace crate enables preserve_order.
+            map.sort_keys();
             Some(serde_json::Value::Object(map))
         }
     }
