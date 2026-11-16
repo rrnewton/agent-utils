@@ -268,6 +268,9 @@ def _scrub_doc(doc: dict[str, object]) -> dict[str, object]:
         for item in cast(list[dict[str, object]], record.get("salvage", [])):
             item["source_head"] = "HEAD"
             item["salvage_commit"] = "HEAD"
+            # Python-edition mirror evidence (#1692); the Rust edition
+            # proves directly and records none.
+            item.pop("proof_mirror", None)
             archive = item.get("ignored_archive")
             if isinstance(archive, dict):
                 archive["archive_root"] = "ARCHIVE_ROOT"
