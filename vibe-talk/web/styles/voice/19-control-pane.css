@@ -479,8 +479,13 @@
      where the three Undo chips (a dismissal, a dismissed send, a removed bookmark) stay
      reachable without covering the box being written in or its row. The chips' own hidden
      state is untouched, so the whole row stands again at the list's foot, exactly as it was
-     drawn, the moment the keyboard goes down or the field loses the focus. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #scroll-tools {
+     drawn, the moment the keyboard goes down or the field loses the focus.
+     `#1725 vibe-talk-undo-chip-stretched`: the row is named through `#screen-main >` so this
+     `bottom: auto` outranks the docked Discuss half-pane's `bottom` in 22-discuss.css
+     (three ids there against two here as first written): with both `top` and that `bottom`
+     standing, the strip stretched between them down the pane's right edge and its lone
+     visible Undo chip stretched with it, over the reply box and its Send. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #screen-main > #scroll-tools {
     bottom: auto;
     top: 0.35rem;
   }

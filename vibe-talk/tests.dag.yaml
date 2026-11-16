@@ -2577,6 +2577,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1725 vibe-talk-undo-chip-stretched` in the browser engine: at a 412x915 phone (device scale
+  # 2.6) in the light scheme and the dark, with the Discuss half-pane docked open and a dismissal's
+  # Undo up, replying with the keyboard up (the viewport 360px shorter) keeps the Undo chip at a
+  # chip's height, the chips strip one line, neither over the reply box or Send reply, and the
+  # keyboard down puts the chip back at the list's foot above the pane; at a 1280x800 desk with
+  # Discuss open the chip never moves or stretches when the window shortens.
+  - group: check
+    job: undo-chip-stretch-browser
+    desc: the Undo chip keeps its size with the keyboard up and Discuss docked, in current Chromium at a 412x915 phone in light and dark and a 1280x800 desk
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/undo_chip_stretch_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 16
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#300 reply-marks-read` in the browser engine, at 1280x800 in two columns with a mouse and the keys:
   # Reply docked in the left column on a Main message and in the right on a thread's reply, sent with
   # Enter, each marks the message it answers Done on the server, asks the provider to mark it
