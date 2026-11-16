@@ -11510,6 +11510,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         keys.into_iter().collect()
     }
 
+    /// Validated durable metadata without probing a terminal that may no longer exist.
+    pub(crate) fn recovery_record(&self, agent_name: &str) -> Result<Value> {
+        self.load(agent_name)?.document()
+    }
+
+    pub(crate) fn recovery_has_recorded_session(&self, agent_name: &str) -> Result<bool> {
+        let record = self.load(agent_name)?;
+        Ok(record.effective_native_session().is_some()
+            || record.resume.is_some()
+            || record.session_value.is_some())
+    }
+
     /// Report live state or an explicit probe error without reaping durable records.
     pub fn status(&self, agent_name: &str) -> Result<Value> {
         let record = self.load(agent_name)?;

@@ -1,6 +1,6 @@
 //! Claude Code: its composer, launch arguments, screen hints, and transcript.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{FollowupPolicy, HarnessAdapter, ScreenMarkers};
 use crate::submission::{composer_from, is_labelled_rule, is_rule, join_rows, ComposerView};
@@ -34,6 +34,31 @@ const TRUST_ACCEPT: &str = "Yes, I trust this folder";
 pub const TRUST_REFUSE: &str = "No, exit";
 
 impl HarnessAdapter for ClaudeCode {
+    fn native_group_leader(&self, executable: &Path) -> bool {
+        // Native installs resolve the `claude` symlink to
+        // .../claude/versions/Major.Minor.Patch. Node/Bun launch wrappers
+        // are not native harness leaders and must remain refused.
+        if executable.file_name().is_some_and(|name| name == "claude") {
+            return true;
+        }
+        let version = executable.file_name().and_then(|name| name.to_str());
+        let Some(versions) = executable.parent() else {
+            return false;
+        };
+        versions.file_name().is_some_and(|name| name == "versions")
+            && versions
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "claude")
+            && version.is_some_and(|value| {
+                let parts: Vec<_> = value.split('.').collect();
+                parts.len() == 3
+                    && parts
+                        .iter()
+                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            })
+    }
+
     fn transient_recovery(&self) -> bool {
         true
     }
@@ -696,6 +721,27 @@ pub(crate) fn transcript_took_prompt(
 mod tests {
     use super::super::transcript::{Activity, Hints, ToolLimit};
     use super::*;
+
+    #[test]
+    fn native_claude_leader_accepts_versioned_installs_but_not_wrappers() {
+        for path in [
+            "/opt/bin/claude",
+            "/home/owner/.local/share/claude/versions/2.1.325",
+        ] {
+            assert!(ClaudeCode.native_group_leader(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/usr/bin/node",
+            "/usr/bin/bun",
+            "/bin/bash",
+            "/tmp/2.1.325",
+            "/tmp/other/versions/2.1.325",
+            "/tmp/claude/versions/current",
+            "/tmp/claude/versions/2..325",
+        ] {
+            assert!(!ClaudeCode.native_group_leader(Path::new(path)), "{path}");
+        }
+    }
 
     const FIXTURE: &str = include_str!("../../testdata/transcripts/claude.jsonl");
     /// 2026-10-27T10:00:00Z, the fixture's first entry.

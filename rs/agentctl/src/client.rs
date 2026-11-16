@@ -458,8 +458,16 @@ fn supported_shell_name(path: &Path) -> bool {
 }
 
 pub(crate) fn supported_shell_process(pid: u64) -> Result<Option<LiveCustomProcess>> {
-    let observed = live_custom_process(pid)?;
-    Ok(supported_shell_name(&observed.executable_path).then_some(observed))
+    // A shell is the desired final image here, not an interpreter waiting to
+    // exec a harness. observe_stable waits its full five seconds for every
+    // shell, multiplying a recovery census into minutes. Require two coherent
+    // identical kernel observations; the caller also brackets its shell proof.
+    let observed = agent_queue::identity::observe(pid).map_err(identity_error)?;
+    if !supported_shell_name(&observed.executable_path) {
+        return Ok(None);
+    }
+    let confirmed = agent_queue::identity::observe(pid).map_err(identity_error)?;
+    Ok((observed == confirmed).then_some(observed))
 }
 
 /// The sorted task ids of `pid` under `proc_root`, or `None` when the
@@ -4487,6 +4495,49 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn native_claude_leader_can_be_anchored_with_foreground_helpers() {
+        let herdr = FakeExecutable::new("{}");
+        let harness = herdr.root.join("claude/versions/2.1.325");
+        fs::create_dir_all(harness.parent().unwrap()).unwrap();
+        install_test_elf("/bin/sleep", &harness);
+        let leader = spawn_test_process(&harness);
+        let pid = leader.0.id();
+        let mut child = Command::new("/bin/sleep");
+        child.arg("30").process_group(pid as i32);
+        let helper = ChildGuard(child.spawn().unwrap());
+        let response = serde_json::json!({"result": {"process_info": {
+            "pane_id": "pane", "shell_pid": std::process::id(),
+            "foreground_process_group_id": pid,
+            "foreground_processes": [{"pid": pid}, {"pid": helper.0.id()}]
+        }}});
+        herdr.set_response(&response.to_string());
+        let identity = herdr
+            .client()
+            .harness_identity("pane", "claude")
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.pid, u64::from(pid));
+        assert!(herdr
+            .client()
+            .verify_harness_identity("pane", &identity)
+            .unwrap());
+        assert!(herdr
+            .client()
+            .harness_identity("pane", "codex")
+            .unwrap()
+            .is_none());
+        let mut wrong_group = response.clone();
+        wrong_group["result"]["process_info"]["foreground_process_group_id"] =
+            serde_json::json!(helper.0.id());
+        herdr.set_response(&wrong_group.to_string());
+        assert!(!herdr
+            .client()
+            .verify_harness_identity("pane", &identity)
+            .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
     fn process_info_response(pid: u32, executable: &Path) -> String {
         serde_json::json!({
             "result": {
@@ -5149,11 +5200,16 @@ mod tests {
             .to_string()
         };
         let herdr = FakeExecutable::new(&response(&executable));
+        let started = Instant::now();
         let identity = herdr.client().pane_shell_identity("pane").unwrap();
         assert!(herdr
             .client()
             .pane_is_same_idle_shell("pane", &identity)
             .unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "a settled shell must not wait for an exec that will never happen"
+        );
 
         let mut mismatches = Vec::new();
         let mut value = identity.clone();

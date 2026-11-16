@@ -1943,10 +1943,23 @@ fn recover_agent<A: ManagedApi + ?Sized>(
     options: &RestoreOptions,
     require_recorded_session: bool,
 ) -> Value {
-    let status = manager.status(name).ok();
+    // A full status probe resolves the old Herdr name before looking at
+    // death evidence. Missing native names can wait for control timeouts;
+    // lifecycle selection needs only the validated durable record.
+    let status = manager.recovery_record(name).ok();
     let lifecycle = status
         .as_ref()
         .and_then(|value| value["lifecycle"].as_str().map(str::to_owned));
+    if require_recorded_session {
+        match manager.recovery_has_recorded_session(name) {
+            Ok(true) => {}
+            other => {
+                return json!({"name": name, "action": "refused", "reason": format!(
+                "recorded session required; never infer ownership from the newest transcript in a shared directory: {}",
+                other.err().map(|error| error.to_string()).unwrap_or_else(|| "record has no conversation ID; bind its verified session first".to_owned()))})
+            }
+        }
+    }
     if lifecycle.as_deref() == Some("launch_failed") {
         if options.dry_run {
             return json!({"name": name, "action": "promote", "dry_run": true});

@@ -3849,3 +3849,75 @@ fn repair_watch_options() -> WatchOptions {
         queue_stale: Duration::from_secs(600),
     }
 }
+
+#[test]
+fn watch_agent_repair_refuses_a_missing_recorded_conversation() {
+    let fixture = Fixture::new();
+    let old = dead_claude_agent(&fixture);
+    let claude = fixture.root.join("claude-config");
+    fs::create_dir_all(claude.join("projects")).unwrap();
+    let _roots = pretend_claude_roots(vec![claude]);
+    let mut config = config(&fixture, Some("lane"));
+    config.units.clear();
+    config.duties.agent_repair = true;
+    config.duties.queue_drain = false;
+    let findings = watch_pass(&fixture, &ScriptedHost::new(), &config);
+    let row = findings
+        .iter()
+        .find(|row| row["check"] == "agent_repair")
+        .unwrap();
+    assert_eq!(row["ok"], false, "{row}");
+    assert_eq!(row["repair"]["coordinator"]["action"], "refused", "{row}");
+    assert!(row["repair"]["coordinator"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("recorded session required"));
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+    assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn recovery_lifecycle_metadata_never_probes_the_dead_terminal() {
+    let fixture = Fixture::new();
+    let old = dead_agent(&fixture);
+    fixture.client.fail_panes.store(true, Ordering::Relaxed);
+    let before = fixture.client.pane_info_calls.load(Ordering::Relaxed);
+    let record = fixture.manager().recovery_record("lane").unwrap();
+    assert_eq!(record["token"], old.token);
+    assert_eq!(record["lifecycle"], "running");
+    assert_eq!(
+        fixture.client.pane_info_calls.load(Ordering::Relaxed),
+        before
+    );
+}
+
+#[test]
+fn automatic_recovery_never_discovers_an_unrecorded_shared_directory_session() {
+    let fixture = Fixture::new();
+    let mut old = dead_agent(&fixture);
+    old.native_session = None;
+    old.resume = None;
+    old.session_agent = None;
+    old.session_value = None;
+    old.launch_spec = None;
+    fixture.manager().save(&old).unwrap();
+    let mut config = config(&fixture, Some("lane"));
+    config.require_recorded_session = true;
+    let report = restore(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        &ScriptedHost::new(),
+        &config,
+        &RestoreOptions {
+            dry_run: true,
+            ..options(None)
+        },
+    )
+    .unwrap();
+    assert_eq!(report["coordinator"]["action"], "refused", "{report}");
+    assert!(report["coordinator"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("never infer ownership"));
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+}
