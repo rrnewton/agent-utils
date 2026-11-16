@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-audit-systemerror-journal-cache-slots: audit crashes with SystemError under its scan memory bound instead of reporting partial results'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -78,3 +78,28 @@ worktree (read-only toward the source): a 1 GiB bound raises
 current code; the reporter's heavier run reached the same C-allocation
 failure a few lines later, in the `_all_journal_cache_slots`
 comprehension. With the bound disabled the same copy completes.
+
+## Resolution
+
+Fixed in `py/wrkslots/cli.py`. `_is_memory_bound_system_error`
+recognizes only `SystemError("error return without exception set")`
+while a positive `--scan-memory-limit` is active; `_cmd_audit`,
+`_cmd_unpushed`, `_cmd_doctor_scan` and `_cmd_status_in_context`
+convert exactly that form, beside their existing `MemoryError`
+paths, into the usual partial result (exit 2) whose detail names
+the conversion (`_MEMORY_BOUND_SYSTEM_ERROR_DETAIL`). Every other
+`SystemError`, and the allocation form with the bound disabled,
+keeps its traceback. Regression tests in
+`py/wrkslots/tests/test_read_scan_bounds.py` inject each form and
+pin both directions; the two conversion tests fail on the base.
+
+Default bound raised from 4.0 to 10.0 GiB: a full audit of the
+~85k-event registry peaks at 4.96 GiB address space (4.67 GiB RSS)
+at serial and default parallelism, so the new default is twice the
+measured peak. `--help` already names the limit as address space.
+
+Verified end to end on the scratch copy: a 1 GiB bound now prints
+the partial JSON with the conversion named and exits 2 (was exit 1
+with a traceback). The Rust reader installs no such bound and
+needed no change. Whole-log retention (the 4.63 GiB validate peak)
+is filed as #1750 wrkslots-read-scan-event-retention.
