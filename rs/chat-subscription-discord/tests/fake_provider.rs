@@ -173,8 +173,20 @@ fn addressing_cursoring_and_relay_through_the_host() {
 
     shared.with(|fake| {
         // MSG-1: a message for the other bot only. Must draw nothing from us.
-        fake.push(message(101, OWNER, false, &format!("<@{OTHER}> please rebase"), None));
-        fake.push(message(102, OWNER, false, &format!("<@{OURS}> status?"), None));
+        fake.push(message(
+            101,
+            OWNER,
+            false,
+            &format!("<@{OTHER}> please rebase"),
+            None,
+        ));
+        fake.push(message(
+            102,
+            OWNER,
+            false,
+            &format!("<@{OURS}> status?"),
+            None,
+        ));
         fake.push(message(
             103,
             OWNER,
@@ -182,7 +194,13 @@ fn addressing_cursoring_and_relay_through_the_host() {
             &format!("<@{OURS}> agent=lane-a@newton-fedora: rebase onto integration"),
             Some(102),
         ));
-        fake.push(message(104, STRANGER, false, &format!("<@{OURS}> do my bidding"), None));
+        fake.push(message(
+            104,
+            STRANGER,
+            false,
+            &format!("<@{OURS}> do my bidding"),
+            None,
+        ));
         fake.push(message(
             105,
             OTHER,
@@ -190,19 +208,67 @@ fn addressing_cursoring_and_relay_through_the_host() {
             "relay fleet@lead-host -> fleet@newton-fedora: hi\n```agent-teams-envelope\n{}\n```\n",
             None,
         ));
-        fake.push(message(106, OURS, true, &format!("<@{OURS}> my own echo"), None));
-        fake.push(message(107, RANDOM_BOT, true, &format!("<@{OURS}> spam"), None));
-        fake.push(message(108, OWNER, false, &format!("<@{OURS}> agent=coordinator@lead-host: x"), None));
+        fake.push(message(
+            106,
+            OURS,
+            true,
+            &format!("<@{OURS}> my own echo"),
+            None,
+        ));
+        fake.push(message(
+            107,
+            RANDOM_BOT,
+            true,
+            &format!("<@{OURS}> spam"),
+            None,
+        ));
+        fake.push(message(
+            108,
+            OWNER,
+            false,
+            &format!("<@{OURS}> agent=coordinator@lead-host: x"),
+            None,
+        ));
         // The peer's ordinary chat reply is not relay traffic: relay-in would quarantine it.
-        fake.push(message(109, OTHER, true, "Bound to lane-b. Messages in this thread go to it.", None));
-        let mut webhook = message(110, 424_242, false, &format!("<@{OURS}> from a webhook"), None);
+        fake.push(message(
+            109,
+            OTHER,
+            true,
+            "Bound to lane-b. Messages in this thread go to it.",
+            None,
+        ));
+        let mut webhook = message(
+            110,
+            424_242,
+            false,
+            &format!("<@{OURS}> from a webhook"),
+            None,
+        );
         webhook.webhook = true;
         fake.push(webhook);
-        let mut notice = message(111, OWNER, false, &format!("<@{OURS}> pinned a message"), None);
+        let mut notice = message(
+            111,
+            OWNER,
+            false,
+            &format!("<@{OURS}> pinned a message"),
+            None,
+        );
         notice.kind = 6;
         fake.push(notice);
-        fake.push(message(112, OWNER, false, &format!("<@{OURS}> agent=nobody@newton-fedora: x"), None));
-        fake.push(message(113, STRANGER, false, &format!("<@{OURS}> agent=nobody@newton-fedora: x"), None));
+        fake.push(message(
+            112,
+            OWNER,
+            false,
+            &format!("<@{OURS}> agent=nobody@newton-fedora: x"),
+            None,
+        ));
+        fake.push(message(
+            113,
+            STRANGER,
+            false,
+            &format!("<@{OURS}> agent=nobody@newton-fedora: x"),
+            None,
+        ));
     });
 
     let (event, cursor) = take(&mut subscription);
@@ -301,99 +367,116 @@ fn addressing_cursoring_and_relay_through_the_host() {
 }
 
 #[test]
-fn ack_reply_names_host_and_agent_after_the_commit() {
+fn a_backlog_over_one_page_is_delivered_in_order_with_one_list_call_per_page() {
     let shared = Shared::default();
-    shared.with(|fake| fake.push(message(100, OWNER, false, "history", None)));
+    shared.with(|fake| fake.push(message(1_000, OWNER, false, "history", None)));
     let mut backend = make_backend(&shared);
-    let mut subscription = ChatSubscription::open(
-        &mut backend,
-        &request_with(
-            None,
-            &json!({"ack_reply": true, "bridge_agent": "coordinator"}),
-        ),
-    )
-    .expect("open");
-    let (event, _) = take(&mut subscription);
-    assert_eq!(event, CommittableEvent::Checkpoint);
+    let mut subscription = ChatSubscription::open(&mut backend, &request(None)).expect("open");
+    assert_eq!(take(&mut subscription).0, CommittableEvent::Checkpoint);
     assert_eq!(
         shared.with(|fake| fake.list_calls),
         1,
-        "the boundary costs one list call per channel"
+        "the boundary is one call"
     );
     shared.with(|fake| {
-        fake.push(message(
-            101,
-            OWNER,
-            false,
-            &format!("<@{OURS}> status?"),
-            None,
-        ));
-        fake.push(message(
-            102,
-            OWNER,
-            false,
-            &format!("<@{OURS}> agent=lane-a@newton-fedora: rebase"),
-            None,
-        ));
-        fake.push(message(
-            103,
-            OTHER,
-            true,
-            "```agent-teams-envelope\n{}\n```",
-            None,
-        ));
+        for n in 1..=150 {
+            fake.push(message(
+                1_000 + n,
+                OWNER,
+                false,
+                &format!("<@{OURS}> item {n}"),
+                None,
+            ));
+        }
     });
-    let (event, _) = take(&mut subscription);
-    assert_eq!(created(&event).1, "status?");
+    for n in 1..=150 {
+        let (event, cursor) = take(&mut subscription);
+        assert_eq!(created(&event).1, format!("item {n}"));
+        assert_eq!(cursor, format!("discord.v1;{CHANNEL}={}", 1_000 + n));
+    }
     assert_eq!(
         shared.with(|fake| fake.list_calls),
-        2,
-        "one poll pass is one list call per channel, however many posts it returns"
+        3,
+        "one list call per page of 100, however many posts it returns"
     );
-    assert!(
-        shared.with(|fake| fake.posts.is_empty()),
-        "nothing is posted before the bridge commits and asks for the next item"
-    );
-    let (event, _) = take(&mut subscription);
-    assert_eq!(created(&event).1, "!@lane-a rebase");
-    let (event, _) = take(&mut subscription);
-    assert_eq!(created(&event).0, OTHER.to_string());
-    let posts = shared.with(|fake| fake.posts.clone());
-    let lines: Vec<(&str, Option<u64>)> = posts
-        .iter()
-        .map(|post| (post.content.as_str(), post.reply_to.map(Snowflake::get)))
-        .collect();
-    assert_eq!(
-        lines,
-        [
-            ("ACK newton-fedora/coordinator: received", Some(101)),
-            ("ACK newton-fedora/lane-a: received", Some(102)),
-        ],
-        "one ACK per owner request, none for relay posts"
-    );
-    assert_eq!(posts[0].nonce, "ack101");
-    // A failed ACK post is logged, never fatal: the subscription keeps delivering.
+    subscription.close().expect("close");
+}
+
+#[test]
+fn a_restart_mid_thread_keeps_the_reply_chain_on_its_root() {
+    let shared = Shared::default();
+    shared.with(|fake| fake.push(message(100, OWNER, false, "history", None)));
+    let mut backend = make_backend(&shared);
+    let mut subscription = ChatSubscription::open(&mut backend, &request(None)).expect("open");
+    take(&mut subscription);
     shared.with(|fake| {
         fake.push(message(
-            104,
+            200,
             OWNER,
             false,
-            &format!("<@{OURS}> again"),
+            &format!("<@{OURS}> start"),
             None,
         ));
-        fake.push(message(
-            105,
-            OWNER,
-            false,
-            &format!("<@{OURS}> and again"),
-            None,
-        ));
+        fake.push(message(201, OURS, true, "reply from this bot", Some(200)));
     });
     let (event, _) = take(&mut subscription);
-    assert_eq!(created(&event).1, "again");
-    shared.with(|fake| fake.fail_next.push_back(RestError::from_status(500, "{}")));
+    assert_eq!(created(&event).2, format!("{CHANNEL}/threads/200"));
+    let (_, cursor) = take(&mut subscription);
+    subscription.close().expect("close");
+
+    // A fresh process has no root memory; the owner answers the bot's reply.
+    shared.with(|fake| {
+        fake.push(message(
+            202,
+            OWNER,
+            false,
+            &format!("<@{OURS}> follow-up"),
+            Some(201),
+        ))
+    });
+    let mut backend = make_backend(&shared);
+    let mut subscription =
+        ChatSubscription::open(&mut backend, &request(Some(&cursor))).expect("resume");
     let (event, _) = take(&mut subscription);
-    assert_eq!(created(&event).1, "and again");
+    assert_eq!(
+        created(&event).2,
+        format!("{CHANNEL}/threads/200"),
+        "the root is read back from Discord, not taken to be the direct parent"
+    );
+    subscription.close().expect("close");
+}
+
+#[test]
+fn an_unparsable_message_and_a_rate_limited_baseline_do_not_end_the_subscription() {
+    let shared = Shared::default();
+    shared.with(|fake| {
+        fake.push(message(100, OWNER, false, "history", None));
+        fake.fail_next.push_back(RestError::from_status(
+            429,
+            r#"{"retry_after": 0.1, "global": false}"#,
+        ));
+    });
+    let mut backend = make_backend(&shared);
+    let mut subscription = ChatSubscription::open(&mut backend, &request(None)).expect("open");
+    let (event, cursor) = take(&mut subscription);
+    assert_eq!(event, CommittableEvent::Checkpoint, "the baseline retried");
+    assert_eq!(cursor, format!("discord.v1;{CHANNEL}=100"));
+    assert_eq!(shared.with(|fake| fake.list_calls), 2);
+    shared.with(|fake| {
+        let mut broken = message(101, OWNER, false, &format!("<@{OURS}> lost"), None);
+        broken.kind = chat_subscription_discord::transport::UNPARSABLE_MESSAGE_TYPE;
+        fake.push(broken);
+        fake.push(message(102, OWNER, false, &format!("<@{OURS}> next"), None));
+    });
+    let (event, cursor) = take(&mut subscription);
+    assert_eq!(event, CommittableEvent::Checkpoint, "skipped, not fatal");
+    assert_eq!(
+        cursor,
+        format!("discord.v1;{CHANNEL}=101"),
+        "the cursor moves past it"
+    );
+    let (event, _) = take(&mut subscription);
+    assert_eq!(created(&event).1, "next");
     subscription.close().expect("close");
 }
 
@@ -719,4 +802,164 @@ fn outbound_waits_out_a_short_rate_limit_and_reports_a_long_one() {
     );
     assert_eq!(response["error"]["retryable"], json!(true), "{response}");
     assert_eq!(shared.with(|fake| fake.posts.len()), 1);
+}
+
+fn ack_config() -> OutboundConfig {
+    OutboundConfig::parse(&[
+        format!("--channel={CHANNEL}"),
+        "--token-file=/nonexistent/.env".to_owned(),
+        "--ack-host=newton-fedora".to_owned(),
+        format!("--ack-bot-user-id={OURS}"),
+        "--ack-alias=newton-team".to_owned(),
+        "--ack-bridge-agent=coordinator".to_owned(),
+    ])
+    .expect("config")
+}
+
+fn react(id: &str, message: u64, emoji: &str) -> Value {
+    json!({"version": 1, "id": id, "action": "ensure_reaction",
+           "channel_id": CHANNEL.to_string(),
+           "message_id": format!("{CHANNEL}/messages/{message}"), "emoji": emoji})
+}
+
+#[test]
+fn the_ack_line_follows_the_bridge_acknowledgement_and_names_host_and_agent() {
+    let shared = Shared::default();
+    shared.with(|fake| {
+        fake.push(message(
+            401,
+            OWNER,
+            false,
+            &format!("<@{OURS}> status?"),
+            None,
+        ));
+        fake.push(message(
+            402,
+            OWNER,
+            false,
+            &format!("<@{OURS}> agent=lane-a@newton-fedora: rebase"),
+            None,
+        ));
+        fake.push(message(
+            403,
+            OWNER,
+            false,
+            &format!("<@{OURS}> and this"),
+            Some(401),
+        ));
+        fake.push(message(
+            404,
+            OTHER,
+            true,
+            "```agent-teams-envelope\n{}\n```",
+            None,
+        ));
+    });
+    let config = ack_config();
+    for (index, target) in [401, 402, 403, 404].into_iter().enumerate() {
+        let response = run_with(
+            &shared,
+            &react(&format!("ack-{index}"), target, "👀"),
+            &config,
+        );
+        assert_eq!(response["ok"], json!(true), "{response}");
+    }
+    // The receipt reaction is not the acknowledgement: no line.
+    run_with(&shared, &react("receipt", 401, "✅"), &config);
+    let posts = shared.with(|fake| fake.posts.clone());
+    let lines: Vec<(&str, Option<u64>, &str)> = posts
+        .iter()
+        .map(|post| {
+            (
+                post.content.as_str(),
+                post.reply_to.map(Snowflake::get),
+                post.nonce.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                "ACK newton-fedora/coordinator: received",
+                Some(401),
+                "ack401"
+            ),
+            ("ACK newton-fedora/lane-a: received", Some(402), "ack402"),
+            ("ACK newton-fedora: received", Some(403), "ack403"),
+        ],
+        "one line per acknowledged owner request; none for a relay post or a receipt"
+    );
+    assert_eq!(shared.with(|fake| fake.reactions.len()), 5);
+
+    // Without --ack-host no line is ever posted, and a failed line never fails the reaction.
+    let before = shared.with(|fake| fake.posts.len());
+    run(&shared, &react("plain", 401, "👀"));
+    assert_eq!(shared.with(|fake| fake.posts.len()), before);
+    // The request cannot be read back (deleted): the line is skipped, the reaction succeeds.
+    let response = run_with(&shared, &react("gone", 499, "👀"), &config);
+    assert_eq!(response["ok"], json!(true), "{response}");
+    assert_eq!(shared.with(|fake| fake.posts.len()), before);
+}
+
+#[test]
+fn a_long_reply_with_an_ordinary_fence_is_posted_in_balanced_parts() {
+    let shared = Shared::default();
+    let code: String = (0..150).map(|n| format!("let v{n} = {n};\n")).collect();
+    let text = format!("Patch:\n```rust\n{code}```\nDone.\n");
+    let response = run(
+        &shared,
+        &json!({"version": 1, "id": "11111111-2222-3333-4444-666666666666", "action": "send",
+                "channel_id": CHANNEL.to_string(), "thread_id": format!("{CHANNEL}/threads/7"),
+                "text": text}),
+    );
+    assert_eq!(response["ok"], json!(true), "{response}");
+    let posts = shared.with(|fake| fake.posts.clone());
+    assert!(posts.len() > 1);
+    for post in &posts {
+        assert!(post.content.chars().count() <= 2000);
+        assert_eq!(
+            post.content.matches("```").count() % 2,
+            0,
+            "{}",
+            post.content
+        );
+    }
+    // The first part replies to the thread root; later parts reply to the first part, which
+    // the plugin resolves back to the same root.
+    assert_eq!(posts[0].reply_to, Some(Snowflake::from_u64(7)));
+    assert!(posts[1..]
+        .iter()
+        .all(|post| post.reply_to == Some(Snowflake::from_u64(1_000_001))));
+    assert!(posts[1].content.starts_with("```rust\n"));
+}
+
+#[test]
+fn the_shipped_example_configures_both_the_plugin_and_the_helper() {
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/bridge-newton-fedora.json"),
+    )
+    .expect("example")
+    .replace("<OWNER_CHANNEL_ID>", "1600000000000000001")
+    .replace("<OWNER_DISCORD_USER_ID>", "111222333444555666")
+    .replace("<PEER_HOST>", "peer-host")
+    .replace("<TOKEN_FILE>", "/nonexistent/discord.env");
+    let example: Value = serde_json::from_str(&text).expect("json");
+    let backend = &example["backend_configuration"];
+    let configuration = BackendConfiguration::new(
+        backend["schema"].as_str().expect("schema"),
+        backend["data"].as_object().cloned().expect("data"),
+    )
+    .expect("configuration");
+    chat_subscription_discord::plugin::DiscordConfig::from_backend_configuration(&configuration)
+        .expect("the plugin accepts the example");
+    let arguments: Vec<String> = example["outbound_command"]["arguments"]
+        .as_array()
+        .expect("arguments")
+        .iter()
+        .map(|argument| argument.as_str().expect("string").to_owned())
+        .collect();
+    let helper = OutboundConfig::parse(&arguments).expect("the helper accepts the example");
+    assert!(helper.ack.is_some() && helper.ledger.is_some());
+    assert_eq!(helper.channels.len(), 2, "owner channel and relay channel");
 }

@@ -11,6 +11,9 @@
 //!   array when the reply pings), or the bot's name in the text does not address it. This
 //!   module therefore reads only the text; it never consults the `mentions` array or the
 //!   referenced message.
+//! * Only the post's own words address it: a mention or alias inside a fenced code block, a
+//!   `> ` quoted line, or after a `>>> ` (quote-the-rest) marker is someone else's text being
+//!   shown, and never addresses this host.
 //! * A post addressing both bots is handled by each bot for itself.
 //! * A post addressed only to another bot is ignored: no ACK, no rejection, nothing.
 //! * Ambiguous posts get no action.
@@ -153,10 +156,11 @@ impl AddressingPolicy {
         if post.author_is_bot {
             return Verdict::Ignore(IgnoreReason::UnknownBot);
         }
-        let mentions = mention_ids(post.content);
+        let own_words = own_words(post.content);
+        let mentions = mention_ids(&own_words);
         let mentions_us = mentions.contains(&self.own_bot);
         let mentions_peer = mentions.iter().any(|id| self.peer_bots.contains_key(id));
-        let alias = self.alias_in(post.content);
+        let alias = self.alias_in(&own_words);
         let via = if mentions_us {
             AddressedVia::Mention
         } else if let Some(alias) = alias {
@@ -244,6 +248,32 @@ impl AddressingPolicy {
     }
 }
 
+/// The post's own words: its text without fenced code blocks, `> ` quoted lines, and anything
+/// after a `>>> ` marker (Discord quotes the rest of the message from there).
+#[must_use]
+pub fn own_words(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut in_fence = false;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if trimmed.starts_with(">>> ") || trimmed.trim_end() == ">>>" {
+            break;
+        }
+        if trimmed.starts_with("> ") || trimmed.trim_end() == ">" {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// Every user mention in `content`, in order: `<@ID>` and the legacy nickname form `<@!ID>`.
 /// Role (`<@&ID>`) and channel (`<#ID>`) mentions are not user mentions.
 #[must_use]
@@ -319,10 +349,7 @@ mod tests {
         AddressingPolicy {
             own_bot: Snowflake::from_u64(OURS),
             host: "newton-fedora".to_owned(),
-            peer_bots: BTreeMap::from([(
-                Snowflake::from_u64(OTHER),
-                "fleet@lead-host".to_owned(),
-            )]),
+            peer_bots: BTreeMap::from([(Snowflake::from_u64(OTHER), "fleet@lead-host".to_owned())]),
             aliases: BTreeSet::from(["newton-team".to_owned()]),
             local_agents: Some(BTreeSet::from(["coord".to_owned(), "lane-a".to_owned()])),
         }
@@ -566,6 +593,30 @@ mod tests {
             content: &format!("<@{OURS}> do a thing"),
         });
         assert_eq!(verdict, Verdict::Ignore(IgnoreReason::UnknownBot));
+    }
+
+    #[test]
+    fn quoted_or_fenced_mentions_do_not_address() {
+        for content in [
+            format!("> <@{OURS}> said this earlier\nwhat do you think?"),
+            format!("look:\n```\n<@{OURS}> status?\n```\n"),
+            format!("forwarding\n>>> <@{OURS}> run it\nand more"),
+            "> @newton-team please\nnot for you".to_owned(),
+        ] {
+            assert_eq!(
+                owner(&content),
+                Verdict::Ignore(IgnoreReason::NotAddressed),
+                "{content}"
+            );
+        }
+        // The owner's own words still address it, wherever the quote is.
+        let addressed = deliver(owner(&format!(
+            "<@{OURS}> see this:\n> <@{OTHER}> pinged earlier"
+        )));
+        assert!(
+            !addressed.also_addressed_peer,
+            "a quoted peer mention is not addressing it"
+        );
     }
 
     #[test]

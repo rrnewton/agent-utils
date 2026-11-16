@@ -11,7 +11,8 @@ receipts and exactly-once delivery stay in `rs/agent-teams/src/relay.rs`.
   advances only when the bridge commits.
 * `agentctl-discord-outbound` is the bridge's `outbound_command`. It handles
   `send`, which replies to the thread root (used for relay receipts) or posts at
-  channel level, `ensure_reaction`, and the guarded `ensure_rejection`.
+  channel level, `ensure_reaction` (followed by the ACK line, below), and the
+  guarded `ensure_rejection`.
 
 ## Addressing (`src/addressing.rs`)
 
@@ -29,14 +30,34 @@ own posts are never acted on.
 ## Configuration
 
 `examples/bridge-newton-fedora.json` is an `agentctl chat init` configuration
-for this host. The bot token is read from a dotenv file (`token_file`,
-`token_key`; default key `DISCORD_BOT_TOKEN`) or from an environment variable
-(`token_env`). The token reaches `curl` only through its standard input
-(`curl --config -`). It never appears in argv, a log line or an error.
+for this host. **It uses two channels.** The bridge treats a relay channel as
+relay-only: anyone but a listed peer bot posting there, the owner included, is
+refused (with the rejection reaction) and never typed. So the owner talks to
+this host in an owner channel (`<OWNER_CHANNEL_ID>`, listed only in
+`channel_ids`), and the two hosts' bots exchange envelopes in
+#agent-teams-relay, which is in both `channel_ids` and `relay_channels`. The
+bridge also requires the relay list to be repeated under
+`backend_configuration.data.relay_channels` (channel and peer ids); the
+plugin checks it against `peer_bots`. agentctl's test
+`discord_example_config_admits_owner_requests_outside_the_relay_channel` admits
+the shipped example through the real bridge.
 
-Discord limits a post to 2,000 characters, so set the relay route's
-`max_post_bytes` to 2000 or less. The helper refuses, rather than splits, an
-over-long post that contains a fenced block.
+The bot token is read from a dotenv file (`token_file`, `token_key`; default
+key `DISCORD_BOT_TOKEN`) or from an environment variable (`token_env`). The
+token reaches `curl` only through its standard input (`curl --config -`). It
+never appears in argv, a log line or an error. Prefer a token used by nothing
+else: another process using the same bot (a Claude session's Discord channel
+plugin, for example) shares its rate budget and sees the same posts.
+
+Discord limits a post to 2,000 characters. The helper refuses, rather than
+splits, an over-long relay post (one with an `agent-teams-` fence), so set the
+relay route's `max_post_bytes` to about 1900: neutralising mentions in the
+visible text adds a few characters before the limit applies. Other replies are
+split at line breaks, and a code fence crossing a break is closed and reopened
+with its language, so long replies with code arrive whole.
+
+curl 7.83 or later is needed for the rate-limit headers (`%header{}` in
+`--write-out`); an older curl still works but reads only the 429 body.
 
 ## Markdown (`src/markdown.rs`)
 
@@ -64,25 +85,42 @@ target another message or sender and keeps its first emoji; a finished one
 replays its receipt without contacting Discord. Without `--ledger` the action is
 refused.
 
-## ACK line (`ack_reply`)
+## ACK line (`--ack-host`)
 
-The bridge acknowledges a request with a reaction, and Discord attributes a
-reaction only to the bot that added it. With `"ack_reply": true` the plugin
-also replies to each owner request it hands to the bridge, once the bridge has
-committed it, with one line naming this host and the agent:
-`ACK newton-fedora/lane-a: received` (the bridge's own target is named by
-`bridge_agent`). When two bots take one post, the owner sees which took it and
-for whom. It is best effort and carries no mention. Relay posts get none: their
-receipts already go in the post's thread.
+The bridge acknowledges a request with a reaction once it has durably admitted
+it, and Discord attributes a reaction only to the bot that added it. With
+`--ack-host=HOST --ack-bot-user-id=ID` (plus `--ack-alias`, `--ack-bridge-agent`
+and, if the bridge's acknowledgement is not 👀, `--ack-emoji`), the outbound
+helper follows that reaction with one reply line naming the host and agent:
+`ACK newton-fedora/lane-a: received`. It re-reads the post and applies the same
+addressing rule to find the agent (`agent=NAME@HOST`, else the bridge agent; a
+reply inside an existing reply chain names the host only, because the bridge
+may route it to an agent bound to that thread). Because it is triggered by the
+bridge's own acknowledgement, a post the bridge refuses never gets one. It is
+best effort and carries no mention; relay posts get none.
 
 ## Peer-bot posts
 
-A peer bot shares the channel with its own owner, so most of its posts are
-ordinary replies. Only posts that name an `agent-teams-` block (the envelope,
-receipt and announce fences and the schema ids inside them) or carry the
-relay's plain-text receipt go to `agent-teams relay-in`; that command
+A peer bot may post more than relay traffic in the relay channel. Only a post
+with a line that opens an `agent-teams-` fence (envelope, receipt, announce),
+or the relay's plain-text receipt, goes to `agent-teams relay-in`; that command
 quarantines anything it cannot parse, so handing it a peer's chat would raise
-an alarm for every reply.
+an alarm for every reply. Prose that merely names the channel or a fence is not
+relay traffic.
+
+## Thread roots
+
+A Discord reply chain is one bridge thread, keyed by its root message. The
+plugin remembers recent roots; for a reply whose parent it does not know (after
+a restart, for instance) it reads the parent chain back from Discord, at most 8
+messages, so a restart does not split a thread.
+
+## Robustness
+
+A listed message that does not parse is checkpointed past, never fatal, so one
+bad item cannot wedge the cursor. A rate limit or server error during the
+initial baseline backs off like a poll (heartbeats continue meanwhile); only a
+401 or 403 ends the subscription.
 
 ## Polling, latency and the rate budget
 
@@ -96,7 +134,7 @@ the default `poll_seconds: 5`:
 | Discord's global limit per bot | 50 a second |
 | Time until a new post is seen | at most 5 s plus one round trip; 2.5 s on average |
 | Owner to the other host's agent, via the relay | at most two poll intervals plus the bridge's own delivery |
-| Posts per owner request | the reply's chunks, plus one ACK line with `ack_reply` |
+| Posts per owner request | the reply's chunks, plus one ACK line with `--ack-host` |
 
 `poll_seconds` accepts 2-60. Discord publishes the per-route bucket on every
 response rather than documenting it, so the transport reads
@@ -108,7 +146,8 @@ failures back off 30 s. The outbound helper waits out a `retry_after` of at most
 5 s once and retries with the same nonce; a longer one is returned as
 `rate_limited`, retryable, `not_applied`. Refusing early keeps the bot clear of
 Discord's invalid-request limit (10,000 responses of 401, 403 or 429 in 10
-minutes). A 401 or 403 ends the subscription instead of polling on. These
+minutes). A 401 or 403 ends the subscription instead of polling on. A reply whose thread
+root is unknown costs up to 8 extra reads, once. These
 figures follow from Discord's published limits
 (<https://discord.com/developers/docs/topics/rate-limits>) and the call counts
 above; no live traffic has measured them yet.
@@ -128,4 +167,6 @@ mention the bot, which includes every relay post from the peer bot.
 
 The Gateway subscription, true Discord threads (replies stay Discord reply
 chains rooted at the request, which the bridge's `!@NAME` binding uses as its
-thread), and a live two-host end-to-end check.
+thread), and a live two-host end-to-end check. Inline code spans (single
+backticks) still count as the owner's own words for addressing; fenced blocks
+and quotes do not.

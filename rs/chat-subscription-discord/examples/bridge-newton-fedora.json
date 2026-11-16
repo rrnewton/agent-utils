@@ -1,6 +1,6 @@
 {
   "subscription_plugin": "discord",
-  "channel_ids": ["1566504459499217097"],
+  "channel_ids": ["<OWNER_CHANNEL_ID>", "1566504459499217097"],
   "allowed_senders": ["<OWNER_DISCORD_USER_ID>"],
   "agent_name": "coordinator",
   "agent_label": "newton-fedora coordinator",
@@ -12,11 +12,12 @@
       "host": "newton-fedora",
       "aliases": ["newton-fedora"],
       "peer_bots": {"1532416065114607829": "fleet@<PEER_HOST>"},
-      "token_file": "/root/.claude/channels/discord/.env",
+      "token_file": "<TOKEN_FILE>",
       "token_key": "DISCORD_BOT_TOKEN",
       "poll_seconds": 5,
-      "bridge_agent": "coordinator",
-      "ack_reply": true
+      "relay_channels": [
+        {"channel": "1566504459499217097", "peer_senders": ["1532416065114607829"]}
+      ]
     }
   },
   "relay_channels": [
@@ -29,10 +30,15 @@
   "outbound_command": {
     "executable": "/absolute/path/to/agentctl-discord-outbound",
     "arguments": [
+      "--channel=<OWNER_CHANNEL_ID>",
       "--channel=1566504459499217097",
-      "--token-file=/root/.claude/channels/discord/.env",
+      "--token-file=<TOKEN_FILE>",
       "--ledger=/root/.local/state/agentctl/chat/discord-outbound",
-      "--timeout-seconds=10"
+      "--timeout-seconds=10",
+      "--ack-host=newton-fedora",
+      "--ack-bot-user-id=1545796614826889226",
+      "--ack-alias=newton-fedora",
+      "--ack-bridge-agent=coordinator"
     ],
     "environment": [],
     "timeout_millis": 25000,

@@ -11,10 +11,26 @@
 //!
 //! A `send` with a thread posts a Discord reply to the thread's root message (this is how relay
 //! receipts land "in the post's thread"); with `thread_id: null` it posts at channel level.
-//! Text over Discord's 2,000-character limit is split at line breaks, except that a post
-//! containing a fenced block (a relay envelope) is refused as `too_long` rather than split: a
-//! later chunk would carry no fence opener. Configure the relay route's `max_post_bytes` at or
-//! below 2000 for Discord.
+//! Text over Discord's 2,000-character limit is split at line breaks. A fenced block crossing a
+//! break is closed and reopened with its opener ([`markdown::chunk`]), except a relay block (a
+//! line opening an `agent-teams-` fence): such a post is refused as `too_long` rather than
+//! split, because its receiver needs the envelope whole. Configure the relay route's
+//! `max_post_bytes` to about 1900 for Discord: neutralising mentions in the visible text adds a
+//! few characters, and the limit applies after that.
+//!
+//! # ACK line (`--ack-host`)
+//!
+//! The bridge marks a request with its acknowledgement reaction only once it has durably
+//! admitted it, through this helper's `ensure_reaction`. With `--ack-host=HOST` and
+//! `--ack-bot-user-id=ID`, when that reaction is the acknowledgement (`--ack-emoji`, default the
+//! bridge's built-in 👀) and succeeds, the helper also replies to the request with one line
+//! naming the host and the agent: `ACK HOST/AGENT: received`. Discord attributes a reaction only
+//! to the bot that added it, so this is what tells the owner which host took a post and for
+//! whom. The agent comes from re-reading the post with the same addressing rule the plugin used
+//! (`agent=NAME@HOST` names `NAME`; otherwise `--ack-bridge-agent`, default `bridge`). A reply
+//! inside an existing reply chain names the host only, because the bridge may route it to an
+//! agent bound to that thread. The line is best effort (a failure is logged and the reaction
+//! response is unchanged) and its nonce is derived from the message.
 //!
 //! Every post sets `allowed_mentions.parse = []` and a nonce derived from the request id with
 //! `enforce_nonce`, so a retried request does not post twice within Discord's nonce window.
@@ -55,16 +71,18 @@
 //! rejection reaction is ever added unguarded. Concurrent runs need no lock: the binding is
 //! the only state they could disagree about, and adding the same reaction twice is a no-op.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
+use crate::addressing::{AddressingPolicy, Post, Target, Verdict};
 use crate::ids::{self, Snowflake};
 use crate::markdown;
 use crate::transport::{
-    Applied, CurlTransport, DiscordRest, RestError, TokenSource, DEFAULT_API_BASE,
+    Applied, CurlTransport, DiscordMessage, DiscordRest, RestError, TokenSource, DEFAULT_API_BASE,
     MAX_CONTENT_CHARS,
 };
 
@@ -103,12 +121,31 @@ pub struct OutboundConfig {
     pub text_mode: TextMode,
     /// Directory holding the rejection journal; required for `ensure_rejection`.
     pub ledger: Option<PathBuf>,
+    /// The ACK line settings; `None` posts no ACK line.
+    pub ack: Option<AckLine>,
+}
+
+/// Settings for the ACK line (see the module documentation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AckLine {
+    /// This host's name.
+    pub host: String,
+    /// This host's bot user id.
+    pub bot_user_id: Snowflake,
+    /// This host's `@alias`es.
+    pub aliases: BTreeSet<String>,
+    /// The bridge's own target, as named in the line.
+    pub bridge_agent: String,
+    /// The bridge's acknowledgement emoji.
+    pub emoji: String,
 }
 
 impl OutboundConfig {
     /// Parse `--channel=ID` (repeatable, required), `--token-file=PATH` [`--token-key=KEY`]
     /// or `--token-env=NAME`, `--curl=PATH`, `--api-base=URL`, `--timeout-seconds=N`,
-    /// `--text=mentions|literal|raw`, `--ledger=DIR` (absolute; enables `ensure_rejection`).
+    /// `--text=mentions|literal|raw`, `--ledger=DIR` (absolute; enables `ensure_rejection`),
+    /// and for the ACK line `--ack-host=HOST` with `--ack-bot-user-id=ID`, `--ack-alias=A`
+    /// (repeatable), `--ack-bridge-agent=NAME` and `--ack-emoji=E`.
     ///
     /// # Errors
     ///
@@ -123,6 +160,13 @@ impl OutboundConfig {
         let mut timeout_seconds = 20;
         let mut text_mode = TextMode::Mentions;
         let mut ledger = None;
+        let mut ack_host = None;
+        let mut ack_bot = None;
+        let mut ack_aliases = BTreeSet::new();
+        let mut ack_bridge_agent = "bridge".to_owned();
+        let mut ack_emoji = chat_subscription::reactions::DEFAULT_ACK_REACTION
+            .emoji
+            .to_owned();
         for argument in arguments {
             let (key, value) = argument
                 .split_once('=')
@@ -142,6 +186,21 @@ impl OutboundConfig {
                     ledger = Some(path);
                 }
                 "--api-base" => value.clone_into(&mut api_base),
+                "--ack-host" => ack_host = Some(label(value, "--ack-host")?),
+                "--ack-bot-user-id" => {
+                    ack_bot =
+                        Some(Snowflake::parse(value).ok_or("--ack-bot-user-id must be a user id")?);
+                }
+                "--ack-alias" => {
+                    ack_aliases.insert(label(value, "--ack-alias")?);
+                }
+                "--ack-bridge-agent" => ack_bridge_agent = label(value, "--ack-bridge-agent")?,
+                "--ack-emoji" => {
+                    if value.is_empty() || value.len() > 64 {
+                        return Err("--ack-emoji must be one emoji".to_owned());
+                    }
+                    value.clone_into(&mut ack_emoji);
+                }
                 "--timeout-seconds" => {
                     timeout_seconds = value
                         .parse()
@@ -163,6 +222,17 @@ impl OutboundConfig {
         if channels.is_empty() {
             return Err("at least one --channel is required".to_owned());
         }
+        let ack = match (ack_host, ack_bot) {
+            (Some(host), Some(bot_user_id)) => Some(AckLine {
+                host,
+                bot_user_id,
+                aliases: ack_aliases,
+                bridge_agent: ack_bridge_agent,
+                emoji: ack_emoji,
+            }),
+            (None, None) => None,
+            _ => return Err("--ack-host and --ack-bot-user-id go together".to_owned()),
+        };
         let token = match (token_file, token_env) {
             (Some(_), Some(_)) => {
                 return Err("use --token-file or --token-env, not both".to_owned())
@@ -182,6 +252,7 @@ impl OutboundConfig {
             timeout_seconds,
             text_mode,
             ledger,
+            ack,
         })
     }
 
@@ -250,6 +321,72 @@ fn respond_error(id: &Value, action: &Value, refusal: &Refusal) -> Vec<u8> {
             "retryable": refusal.retryable,
         }
     }))
+}
+
+fn label(value: &str, flag: &str) -> Result<String, String> {
+    if !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "{flag} must be a name of letters, digits, '.', '_' or '-'"
+        ))
+    }
+}
+
+/// The ACK line for `message`, or `None` when the post is not an owner request addressed to
+/// this host (the acknowledgement reaction went on something else).
+#[must_use]
+pub fn ack_text(ack: &AckLine, message: &DiscordMessage) -> Option<String> {
+    let policy = AddressingPolicy {
+        own_bot: ack.bot_user_id,
+        host: ack.host.clone(),
+        peer_bots: BTreeMap::new(),
+        aliases: ack.aliases.clone(),
+        local_agents: None,
+    };
+    let verdict = policy.classify(&Post {
+        author: message.author_id,
+        author_is_bot: !message.author_is_human(),
+        content: &message.content,
+    });
+    let Verdict::Deliver(addressed) = verdict else {
+        return None;
+    };
+    Some(match addressed.target {
+        Target::Agent { name } => format!("ACK {}/{name}: received", ack.host),
+        Target::Bridge if message.reply_to.is_some() => format!("ACK {}: received", ack.host),
+        Target::Bridge => format!("ACK {}/{}: received", ack.host, ack.bridge_agent),
+    })
+}
+
+/// Post the ACK line for an acknowledged request. Best effort: every failure is logged.
+fn post_ack_line(
+    rest: &mut dyn DiscordRest,
+    ack: &AckLine,
+    channel: Snowflake,
+    message: Snowflake,
+) {
+    let found = match with_rate_retry(|| rest.get_message(channel, message)) {
+        Ok(found) => found,
+        Err(error) => {
+            eprintln!("agentctl-discord-outbound: ACK line skipped, request unreadable: {error}");
+            return;
+        }
+    };
+    let Some(text) = ack_text(ack, &found) else {
+        return;
+    };
+    let nonce = format!("ack{message}");
+    if let Err(error) =
+        with_rate_retry(|| rest.create_message(channel, &text, Some(message), &nonce))
+    {
+        eprintln!("agentctl-discord-outbound: ACK line not posted: {error}");
+    }
 }
 
 /// Run `call`, and once more after a rate-limit wait of at most [`MAX_INLINE_WAIT`].
@@ -604,7 +741,7 @@ pub fn handle_request(
             let Some(chunks) = markdown::chunk(&prepared, MAX_CONTENT_CHARS) else {
                 return fail(Refusal::not_applied(
                     "too_long",
-                    "a post with a fenced block exceeds 2000 characters and cannot be split",
+                    "a relay post (an agent-teams- fence) exceeds 2000 characters and cannot be split",
                     false,
                 ));
             };
@@ -668,10 +805,15 @@ pub fn handle_request(
                 }
             };
             match with_rate_retry(|| rest.add_reaction(channel, message, emoji)) {
-                Ok(()) => line(&json!({
+                Ok(()) => {
+                    if let Some(ack) = config.ack.as_ref().filter(|ack| ack.emoji == emoji) {
+                        post_ack_line(rest.as_mut(), ack, channel, message);
+                    }
+                    line(&json!({
                     "version": 1, "id": id, "action": action, "ok": true,
                     "receipt": reaction_receipt(channel, message, emoji, false),
-                })),
+                    }))
+                }
                 Err(error) => fail(Refusal::from(error)),
             }
         }

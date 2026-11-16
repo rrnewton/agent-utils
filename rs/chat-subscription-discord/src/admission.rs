@@ -61,29 +61,6 @@ impl Admission {
         dedupe_key(self.channel, self.message, &self.host)
     }
 
-    /// The agent this admission is for, for log and ACK lines: the named agent, `relay` for a
-    /// relay post, or `bridge_agent` (the bridge's own target, normally its coordinator).
-    #[must_use]
-    pub fn agent_label<'a>(&'a self, bridge_agent: &'a str) -> &'a str {
-        match &self.target {
-            Some(Target::Agent { name }) => name,
-            Some(Target::Bridge) => bridge_agent,
-            None => "relay",
-        }
-    }
-
-    /// The one-line ACK this host posts as a reply when `ack_reply` is on. It names the host
-    /// and the agent, so when two bots take one post the owner can see which host took it and
-    /// for whom. It says "received", not "delivered": the bridge's reactions report delivery.
-    #[must_use]
-    pub fn ack_line(&self, bridge_agent: &str) -> String {
-        format!(
-            "ACK {}/{}: received",
-            self.host,
-            self.agent_label(bridge_agent)
-        )
-    }
-
     /// The JSON form carried as the bridge event's provider payload.
     #[must_use]
     pub fn to_json(&self) -> Map<String, Value> {
@@ -193,29 +170,6 @@ mod tests {
         assert_eq!(
             ours.dedupe_key(),
             "discord:1566504459499217097:99@newton-fedora"
-        );
-    }
-
-    #[test]
-    fn ack_names_host_and_agent() {
-        let env = envelope(
-            "newton-fedora",
-            Some(Target::Agent {
-                name: "lane-a".to_owned(),
-            }),
-        );
-        assert_eq!(
-            env.ack_line("coordinator"),
-            "ACK newton-fedora/lane-a: received"
-        );
-        let bridge = envelope("newton-fedora", Some(Target::Bridge));
-        assert_eq!(
-            bridge.ack_line("coordinator"),
-            "ACK newton-fedora/coordinator: received"
-        );
-        assert!(
-            crate::addressing::mention_ids(&bridge.ack_line("coordinator")).is_empty(),
-            "an ACK can never address a bot"
         );
     }
 

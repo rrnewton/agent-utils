@@ -43,6 +43,9 @@ pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 /// Message types that carry a person's or bot's own text: `DEFAULT` (0) and `REPLY` (19).
 /// Every other type is a system notice (joins, pins, thread events, ...).
 pub const USER_MESSAGE_TYPES: [u64; 2] = [0, 19];
+/// The type given to a listed message that has an id but does not otherwise parse: it is never
+/// a user message, so the subscription checkpoints past it instead of failing the whole page.
+pub const UNPARSABLE_MESSAGE_TYPE: u64 = u64::MAX;
 
 /// One Discord message, reduced to what the provider uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +159,29 @@ impl DiscordMessage {
     #[must_use]
     pub fn author_is_human(&self) -> bool {
         self.is_user_message() && !self.author_is_bot && !self.author_is_system && !self.webhook
+    }
+}
+
+/// Parse one listed message; one that has valid `id` and `channel_id` but is otherwise invalid
+/// becomes a placeholder of [`UNPARSABLE_MESSAGE_TYPE`] (logged), so a single malformed item can
+/// never wedge the cursor. `None` only when even the id is unusable; later ids still advance
+/// the cursor past it.
+#[must_use]
+pub fn parse_listed_message(value: &Value) -> Option<DiscordMessage> {
+    match parse_message(value) {
+        Ok(message) => Some(message),
+        Err(problem) => {
+            let id = snowflake_field(value, "id").ok();
+            let channel = snowflake_field(value, "channel_id").ok();
+            eprintln!(
+                "agentctl-discord: skipping an unparsable message ({}): {problem}",
+                id.map_or_else(|| "no id".to_owned(), |id| id.to_string())
+            );
+            let (id, channel) = (id?, channel?);
+            let mut placeholder = DiscordMessage::new(id, channel, id, "", None);
+            placeholder.kind = UNPARSABLE_MESSAGE_TYPE;
+            Some(placeholder)
+        }
     }
 }
 
@@ -642,12 +668,9 @@ impl DiscordRest for CurlTransport {
                 Applied::NotApplied,
             )
         })?;
-        let mut messages = Vec::with_capacity(array.len());
-        for item in array {
-            messages.push(parse_message(item).map_err(|problem| {
-                RestError::new("invalid_response", problem, false, Applied::NotApplied)
-            })?);
-        }
+        let mut messages: Vec<DiscordMessage> =
+            array.iter().filter_map(parse_listed_message).collect();
+        messages.retain(|message| message.channel_id == channel);
         messages.sort_by_key(|message| message.id);
         Ok(messages)
     }
@@ -1004,6 +1027,16 @@ mod tests {
             parse_message(&untyped).is_err(),
             "a message with no type is refused"
         );
+    }
+
+    #[test]
+    fn an_unparsable_listed_message_becomes_a_skippable_placeholder() {
+        let bad = json!({"id": "7", "channel_id": "1", "content": "no author or type"});
+        let placeholder = parse_listed_message(&bad).expect("placeholder");
+        assert_eq!(placeholder.id, Snowflake::from_u64(7));
+        assert!(!placeholder.is_user_message());
+        assert!(!placeholder.author_is_human());
+        assert_eq!(parse_listed_message(&json!({"content": "no id"})), None);
     }
 
     #[test]

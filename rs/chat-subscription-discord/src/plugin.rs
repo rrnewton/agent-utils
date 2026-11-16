@@ -8,22 +8,24 @@
 //! | Owner post addressed to this host ([`crate::addressing`]), sender allowed | `message_created` (a request, through the bridge's durable queue) |
 //! | Same, sender not allowed (whatever its target) | `message_rejected` (`sender_not_allowed`) |
 //! | Allowed sender, but the `agent=` target is refused (unknown agent, another host, malformed) | `message_rejected` (`target_refused`): the bridge marks the post with its rejection reaction |
-//! | Configured peer bot in a relay channel, also a subscription relay sender, and the text carries an `agent-teams-` block | `message_created` with the peer's id, text unchanged (the bridge hands it to `agent-teams relay-in`, never a prompt) |
-//! | Everything else: unaddressed (MSG-1), own posts, other bots, webhooks, system notices, a peer bot's ordinary chat | `checkpoint` (no reaction, no reply) |
+//! | Configured peer bot in a relay channel, also a subscription relay sender, and a line of its text opens an `agent-teams-` fence | `message_created` with the peer's id, text unchanged (the bridge hands it to `agent-teams relay-in`, never a prompt) |
+//! | Everything else: unaddressed (MSG-1), own posts, other bots, webhooks, system notices, unparsable messages, a peer bot's ordinary chat | `checkpoint` (no reaction, no reply) |
 //!
-//! A peer bot shares the channel with its owner, so most of its posts are ordinary replies, not
-//! relay traffic. `agent-teams relay-in` quarantines and alarms on any post from a confirmed
-//! peer that does not parse, so only posts naming an `agent-teams-` block (envelope, receipt,
-//! announce) or the relay's plain-text receipt go to it.
+//! **Owner channels and relay channels are separate.** The bridge treats a relay channel as
+//! relay-only: anyone but a listed peer posting there, the owner included, is refused. So the
+//! owner talks to this host in a channel listed only in `channel_ids`, and the peer bots'
+//! envelopes travel in a channel that is also in `relay_channels`. The plugin still reports an
+//! owner's addressed post in a relay channel, and the bridge answers it with its rejection
+//! reaction, so a post in the wrong channel is visibly refused, never silently lost.
 //!
-//! # ACK reply (`ack_reply`)
+//! A peer bot's posts in the relay channel are not all relay traffic (it may answer there too).
+//! `agent-teams relay-in` quarantines and alarms on any post from a confirmed peer that does not
+//! parse, so only a post with a line opening an `agent-teams-` fence (envelope, receipt,
+//! announce), or the relay's plain-text receipt, goes to it ([`is_relay_post`]).
 //!
-//! The bridge acknowledges an admitted request with a reaction, which Discord attributes only
-//! to the reacting bot. With `ack_reply: true` this plugin also posts one line, as a Discord
-//! reply to the request, naming this host and the agent it is for
-//! ([`crate::admission::Admission::ack_line`]), once the bridge has durably committed it. It is
-//! best effort: a failure is logged and the reaction still stands. Its nonce is derived from
-//! the message, so a retried post is refused by Discord rather than duplicated.
+//! The ACK line naming host and agent is posted by the outbound helper, when the bridge adds its
+//! acknowledgement reaction: that is, only after the bridge has admitted the request
+//! ([`crate::outbound`]).
 //!
 //! # Polling and the rate budget
 //!
@@ -35,8 +37,16 @@
 //! hop costs at most two poll intervals. The per-route bucket for listing messages is not
 //! published; the transport reads it from every response and pauses before it empties
 //! ([`crate::transport`]). A 429 delays the next poll by its `retry_after` (never less than
-//! `poll_seconds`); other retryable failures back off 30 s. A Gateway subscription would cut
-//! the latency to one round trip; it is a later increment.
+//! `poll_seconds`); other retryable failures back off 30 s, including during the initial
+//! baseline (heartbeats continue meanwhile). A Gateway subscription would cut the latency to one
+//! round trip; it is a later increment.
+//!
+//! # Thread roots
+//!
+//! A Discord reply chain maps to the bridge thread of its root message. The plugin remembers
+//! the last 4,096 roots it saw; for a reply whose parent it does not know (after a restart, or
+//! older than that window) it reads the parent chain back from Discord, at most
+//! [`MAX_ROOT_HOPS`] messages, so a restart does not split a thread.
 //!
 //! A request for one named agent (`agent=NAME@HOST:`) is delivered as the bridge's existing
 //! owner command `!@NAME <request>`, which opens a thread bound to that agent and delivers to
@@ -53,8 +63,7 @@
 //!  "aliases": ["newton-team"], "local_agents": ["coord"],
 //!  "peer_bots": {"1532416065114607829": "fleet@lead-host"},
 //!  "token_file": "/root/.claude/channels/discord/.env", "token_key": "DISCORD_BOT_TOKEN",
-//!  "poll_seconds": 5, "heartbeat_seconds": 30, "curl_path": "/usr/bin/curl",
-//!  "bridge_agent": "coordinator", "ack_reply": true}
+//!  "poll_seconds": 5, "heartbeat_seconds": 30, "curl_path": "/usr/bin/curl"}
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -102,10 +111,6 @@ pub struct DiscordConfig {
     pub curl_path: PathBuf,
     /// REST base URL.
     pub api_base: String,
-    /// The bridge's own target, as named in ACK lines (default `bridge`).
-    pub bridge_agent: String,
-    /// Whether to post an ACK line naming host and agent once a request is committed.
-    pub ack_reply: bool,
 }
 
 impl DiscordConfig {
@@ -137,8 +142,7 @@ impl DiscordConfig {
             "heartbeat_seconds",
             "curl_path",
             "api_base",
-            "bridge_agent",
-            "ack_reply",
+            "relay_channels",
         ];
         if let Some(unknown) = data.keys().find(|key| !known.contains(&key.as_str())) {
             return Err(format!("unknown discord setting {unknown}"));
@@ -185,6 +189,40 @@ impl DiscordConfig {
                     return Err("this host's bot must not also be a peer bot".to_owned());
                 }
                 peer_bots.insert(id, team.to_owned());
+            }
+        }
+        // The bridge requires its relay channel list to be repeated here (it refuses a backend
+        // configuration whose list drifts from its own). The subscription's own relay authority
+        // still comes from the Start request; this copy is checked against `peer_bots`.
+        if let Some(relay) = data.get("relay_channels") {
+            let entries = relay
+                .as_array()
+                .filter(|entries| entries.len() <= 32)
+                .ok_or(
+                    "relay_channels must be a list of at most 32 {channel, peer_senders} entries",
+                )?;
+            for entry in entries {
+                entry
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .and_then(Snowflake::parse)
+                    .ok_or("relay_channels entries need a Discord channel id")?;
+                let peers = entry
+                    .get("peer_senders")
+                    .and_then(Value::as_array)
+                    .filter(|peers| !peers.is_empty())
+                    .ok_or("relay_channels peer_senders must be a nonempty list of user ids")?;
+                for peer in peers {
+                    let id = peer
+                        .as_str()
+                        .and_then(Snowflake::parse)
+                        .ok_or("relay_channels peer_senders must be Discord user ids")?;
+                    if !peer_bots.contains_key(&id) {
+                        return Err(format!(
+                            "relay_channels names peer {id}, which is not in peer_bots"
+                        ));
+                    }
+                }
             }
         }
         let token = match (data.get("token_file"), data.get("token_env")) {
@@ -234,24 +272,6 @@ impl DiscordConfig {
                 .and_then(Value::as_str)
                 .unwrap_or(DEFAULT_API_BASE)
                 .to_owned(),
-            bridge_agent: match data.get("bridge_agent") {
-                None => "bridge".to_owned(),
-                Some(value) => value
-                    .as_str()
-                    .filter(|name| {
-                        !name.is_empty()
-                            && name.len() <= 64
-                            && name.bytes().all(|b| {
-                                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
-                            })
-                    })
-                    .ok_or("bridge_agent must be an agent name")?
-                    .to_owned(),
-            },
-            ack_reply: match data.get("ack_reply") {
-                None => false,
-                Some(value) => value.as_bool().ok_or("ack_reply must be a boolean")?,
-            },
         })
     }
 }
@@ -394,9 +414,7 @@ impl ChatSubscriptionBackend for DiscordBackend {
         };
         Ok(Box::new(DiscordDriver {
             rest,
-            bridge_agent: config.bridge_agent,
-            ack_reply: config.ack_reply,
-            pending_acks: VecDeque::new(),
+            baselined: false,
             poll: Duration::from_secs(config.poll_seconds),
             heartbeat: Duration::from_secs(config.heartbeat_seconds),
             policy: config.policy,
@@ -452,22 +470,12 @@ struct InFlight {
     delivery_id: String,
     cursor: BTreeMap<Snowflake, Snowflake>,
     dedupe_key: Option<String>,
-    ack: Option<AckPost>,
-}
-
-/// One ACK line to post once its request is committed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AckPost {
-    channel: Snowflake,
-    message: Snowflake,
-    text: String,
 }
 
 /// What [`DiscordDriver::classify`] decided for one message.
 struct Classified {
     event: CommittableEvent,
     dedupe_key: Option<String>,
-    ack: Option<AckPost>,
 }
 
 impl Classified {
@@ -475,21 +483,31 @@ impl Classified {
         Self {
             event: CommittableEvent::Checkpoint,
             dedupe_key: None,
-            ack: None,
         }
     }
 }
 
+/// The most parent messages read back from Discord to find one reply's thread root.
+pub const MAX_ROOT_HOPS: usize = 8;
+
 /// The plain-text receipt `agent-teams relay-in` posts for a post it cannot parse.
 const RELAY_PLAIN_RECEIPT: &str = "agent-teams receipt:";
 
-/// Whether a peer bot's post is relay traffic for `agent-teams relay-in`: it names an
-/// `agent-teams-` block (the envelope, receipt and announce fences, and the schema ids inside
-/// them, all carry that prefix) or is the relay's plain-text receipt. A peer's ordinary chat
-/// replies are not, and handing them over would quarantine each one as unparseable.
+/// The fence opener every relay block starts with (`agent-teams-envelope`, `-receipt`,
+/// `-announce`).
+const RELAY_FENCE_OPENER: &str = "```agent-teams-";
+
+/// Whether a peer bot's post is relay traffic for `agent-teams relay-in`: a line of it opens an
+/// `agent-teams-` fence, or it is the relay's plain-text receipt. Discord stores text
+/// byte-for-byte, so the fence info string survives and is the authority. A peer's ordinary
+/// chat is not relay traffic, even when it mentions agent-teams or the channel's name, and
+/// handing it over would quarantine each such post as unparseable.
 #[must_use]
 pub fn is_relay_post(content: &str) -> bool {
-    content.contains("agent-teams-") || content.trim_start().starts_with(RELAY_PLAIN_RECEIPT)
+    content.trim_start().starts_with(RELAY_PLAIN_RECEIPT)
+        || content
+            .lines()
+            .any(|line| line.trim_start().starts_with(RELAY_FENCE_OPENER))
 }
 
 /// When to poll again after a failed poll, or `None` when the failure is not retryable.
@@ -504,17 +522,9 @@ pub fn poll_backoff(error: &RestError, poll: Duration) -> Option<Duration> {
     })
 }
 
-/// The nonce of the ACK line for one message: stable, so a retried post is a duplicate Discord
-/// refuses, and distinct from the outbound helper's request-derived nonces.
-fn ack_nonce(message: Snowflake) -> String {
-    format!("ack{message}")
-}
-
 struct DiscordDriver {
     rest: Box<dyn DiscordRest>,
-    bridge_agent: String,
-    ack_reply: bool,
-    pending_acks: VecDeque<AckPost>,
+    baselined: bool,
     policy: AddressingPolicy,
     channels: Vec<Snowflake>,
     allowed: HashSet<String>,
@@ -547,11 +557,7 @@ impl DiscordDriver {
         cursor: BTreeMap<Snowflake, Snowflake>,
         classified: Classified,
     ) -> Result<SubscriptionItem, BackendFailure> {
-        let Classified {
-            event,
-            dedupe_key,
-            ack,
-        } = classified;
+        let Classified { event, dedupe_key } = classified;
         let sequence = self.next_sequence()?;
         let delivery_id = format!("discord-delivery-{}", sequence.get());
         let invalid = |error: chat_subscription::ValidationError| {
@@ -568,7 +574,6 @@ impl DiscordDriver {
             delivery_id,
             cursor,
             dedupe_key,
-            ack,
         });
         self.last_item = Instant::now();
         Ok(SubscriptionItem::Batch(batch))
@@ -634,10 +639,37 @@ impl DiscordDriver {
         Ok(())
     }
 
+    /// The root of the reply chain `parent` belongs to: from memory when known, else read back
+    /// from Discord (at most [`MAX_ROOT_HOPS`] messages). A read failure ends the walk at the
+    /// last message reached, which is logged.
+    fn resolve_root(&mut self, channel: Snowflake, parent: Snowflake) -> Snowflake {
+        let mut current = parent;
+        for _ in 0..MAX_ROOT_HOPS {
+            if let Some(root) = self.roots.get(&current) {
+                return *root;
+            }
+            match self.rest.get_message(channel, current) {
+                Ok(found) => match found.reply_to {
+                    Some(next) => current = next,
+                    None => return current,
+                },
+                Err(error) => {
+                    eprintln!(
+                        "agentctl-discord-plugin: thread root of {} not resolved past {current}: {error}",
+                        ids::message_resource(channel, parent)
+                    );
+                    return current;
+                }
+            }
+        }
+        current
+    }
+
     fn thread_root(&mut self, message: &DiscordMessage) -> Snowflake {
-        let root = message.reply_to.map_or(message.id, |parent| {
-            self.roots.get(&parent).copied().unwrap_or(parent)
-        });
+        let root = match message.reply_to {
+            None => message.id,
+            Some(parent) => self.resolve_root(message.channel_id, parent),
+        };
         if self.root_order.len() == ROOT_MAP_CAPACITY {
             if let Some(old) = self.root_order.pop_front() {
                 self.roots.remove(&old);
@@ -646,24 +678,6 @@ impl DiscordDriver {
         self.roots.insert(message.id, root);
         self.root_order.push_back(message.id);
         root
-    }
-
-    /// Post the ACK lines of committed requests. Best effort: a failure is logged, never fatal,
-    /// and the bridge's reaction still marks the request.
-    fn post_pending_acks(&mut self) {
-        while let Some(ack) = self.pending_acks.pop_front() {
-            if let Err(error) = self.rest.create_message(
-                ack.channel,
-                &ack.text,
-                Some(ack.message),
-                &ack_nonce(ack.message),
-            ) {
-                eprintln!(
-                    "agentctl-discord-plugin: ACK line for {} not posted: {error}",
-                    ids::message_resource(ack.channel, ack.message)
-                );
-            }
-        }
     }
 
     fn rejection(message: &DiscordMessage, reason: RejectionReason) -> Classified {
@@ -677,18 +691,16 @@ impl DiscordDriver {
                     channel, id, sender, reason,
                 )),
                 dedupe_key: None,
-                ack: None,
             },
             _ => Classified::checkpoint(),
         }
     }
 
-    /// The single event for one listed message, its dedupe key when it is admitted, and the
-    /// ACK line to post once it is committed.
+    /// The single event for one listed message, and its dedupe key when it is admitted.
     fn classify(&mut self, message: &DiscordMessage) -> Classified {
-        let root = self.thread_root(message);
         if !message.is_user_message() {
-            // Joins, pins, thread notices and other system messages are never requests.
+            // Joins, pins, thread notices, unparsable messages and other system messages are
+            // never requests.
             return Classified::checkpoint();
         }
         let verdict = self.policy.classify(&Post {
@@ -756,12 +768,7 @@ impl DiscordDriver {
             message: message.id,
         };
         let key = admission.dedupe_key();
-        let ack =
-            (self.ack_reply && matches!(admission.origin, Origin::Owner { .. })).then(|| AckPost {
-                channel: message.channel_id,
-                message: message.id,
-                text: admission.ack_line(&self.bridge_agent),
-            });
+        let root = self.thread_root(message);
         let built = (|| -> Result<InboundMessage, String> {
             let inbound = InboundMessage::new(
                 ChannelId::new(channel).map_err(|e| e.to_string())?,
@@ -781,7 +788,6 @@ impl DiscordDriver {
             Ok(inbound) => Classified {
                 event: CommittableEvent::message_created(inbound),
                 dedupe_key: Some(key),
-                ack,
             },
             Err(problem) => {
                 eprintln!(
@@ -811,15 +817,40 @@ impl ChatSubscriptionDriver for DiscordDriver {
             if self.cancelled() {
                 return Err(failure("cancelled", "discord subscription cancelled", true));
             }
-            self.post_pending_acks();
-            if self.needs_boundary || self.next_poll.is_none() {
-                let changed = self.baseline().map_err(rest_failure)?;
-                self.next_poll = Some(Instant::now());
-                if changed || self.needs_boundary {
-                    self.needs_boundary = false;
-                    let cursor = self.cursor.clone();
-                    return self.batch(cursor, Classified::checkpoint()).map(Some);
+            if !self.baselined && self.next_poll.is_none_or(|at| Instant::now() >= at) {
+                match self.baseline() {
+                    Ok(changed) => {
+                        self.baselined = true;
+                        self.next_poll = Some(Instant::now());
+                        if changed || self.needs_boundary {
+                            self.needs_boundary = false;
+                            let cursor = self.cursor.clone();
+                            return self.batch(cursor, Classified::checkpoint()).map(Some);
+                        }
+                    }
+                    Err(error) => match poll_backoff(&error, self.poll) {
+                        // Heartbeats continue while the baseline waits.
+                        Some(wait) => {
+                            eprintln!(
+                                "agentctl-discord-plugin: baseline failed, retrying in {} ms: {error}",
+                                wait.as_millis()
+                            );
+                            self.next_poll = Some(Instant::now() + wait);
+                        }
+                        None => return Err(rest_failure(error)),
+                    },
                 }
+            }
+            if !self.baselined {
+                let now = Instant::now();
+                let heartbeat_due = self.last_item + self.heartbeat;
+                if now >= heartbeat_due {
+                    let sequence = self.next_sequence()?;
+                    self.last_item = now;
+                    return Ok(Some(SubscriptionItem::Heartbeat(Heartbeat::new(sequence))));
+                }
+                self.wait_until(self.next_poll.unwrap_or(now).min(heartbeat_due));
+                continue;
             }
             if let Some(message) = self.pending.pop_front() {
                 let mut cursor = self.cursor.clone();
@@ -862,8 +893,6 @@ impl ChatSubscriptionDriver for DiscordDriver {
                 if let Some(key) = in_flight.dedupe_key {
                     self.dedupe.insert(key);
                 }
-                // Posted from the next `next_item`, so the commit itself makes no REST call.
-                self.pending_acks.extend(in_flight.ack);
                 Ok(())
             }
             other => {
@@ -923,27 +952,7 @@ mod tests {
             }
         );
         assert_eq!(config.poll_seconds, 5);
-        assert_eq!(config.bridge_agent, "bridge");
-        assert!(!config.ack_reply, "ACK lines are opt-in");
         let _unused: Option<FakeRest> = None;
-        for (key, bad) in [
-            ("ack_reply", serde_json::json!("yes")),
-            ("bridge_agent", serde_json::json!("two words")),
-        ] {
-            let mut data = serde_json::json!({"bot_user_id": "5", "host": "h"});
-            data[key] = bad;
-            let configuration = BackendConfiguration::new(
-                CONFIG_SCHEMA,
-                data.as_object().cloned().expect("object"),
-            )
-            .expect("configuration");
-            assert!(
-                DiscordConfig::from_backend_configuration(&configuration)
-                    .expect_err(key)
-                    .contains(key),
-                "{key}"
-            );
-        }
     }
 
     #[test]
@@ -971,9 +980,11 @@ mod tests {
     #[test]
     fn only_relay_shaped_peer_posts_go_to_relay_in() {
         assert!(is_relay_post("hi\n```agent-teams-envelope\n{}\n```"));
-        assert!(is_relay_post(
-            "```\n{\"schema\":\"agent-teams-receipt/v1\"}\n```"
-        ));
+        assert!(is_relay_post("```agent-teams-receipt\n{}\n```"));
+        assert!(
+            !is_relay_post("see #agent-teams-relay for the agent-teams-envelope format"),
+            "naming the channel or a fence in prose is not relay traffic"
+        );
         assert!(is_relay_post(
             "agent-teams receipt: not-recorded (unparseable relay post)"
         ));
