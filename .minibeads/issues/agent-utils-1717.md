@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-quote-reply-dismiss-x: a dismiss X beside the inline quote-reply chip'
-status: open
+status: closed
 priority: 0
 issue_type: task
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-16T14:45:00+00:00
-updated_at: 2026-11-16T14:45:00+00:00
+updated_at: 2026-11-16T15:45:00+00:00
+closed_at: 2026-11-16T15:45:00+00:00
 ---
 
 # Description
@@ -27,3 +28,7 @@ Reuse the selection chip's styling and placement owner (`drawSelectionChip` in `
 - The message card stays as it was (an expanded long message stays expanded) and the list's scroll position does not move.
 - A page test at a phone viewport (about 412x915, device scale 2.6) covers the above with condition-based waits only.
 - Acceptance screenshots on a local test instance at phone width: selection with chip and X shown, and after the tap.
+
+## Resolution
+
+[watermelon-full-preview] Landed as `d3ebe690` on main: `#selection-chip-dismiss` beside the Quoted reply chip, shown/hidden/placed with it in `drawSelectionChip`, clearing the selection on press with the press stopped before any card handler. Gate validate OK (full green). Acceptance screenshots (test instance, 412x915 @ 2.6): quote-dismiss-before.png / quote-dismiss-after.png, reviewed by the liaison via coordb. Deploy is coordb's (midnight ET batch unless the owner says deploy now).
