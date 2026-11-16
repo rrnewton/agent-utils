@@ -23,7 +23,7 @@ fn write_value(value: &Value, output: &mut String) -> Result<(), ObserverError> 
         Value::Bool(true) => output.push_str("true"),
         Value::Bool(false) => output.push_str("false"),
         Value::Number(number) => {
-            output.push_str(&python_number(number));
+            output.push_str(&python_number(number)?);
         }
         Value::String(string) => write_string(string, output),
         Value::Array(values) => {
@@ -54,23 +54,35 @@ fn write_value(value: &Value, output: &mut String) -> Result<(), ObserverError> 
     Ok(())
 }
 
-fn python_number(number: &serde_json::Number) -> String {
-    let rendered = number.to_string();
+fn python_number(number: &serde_json::Number) -> Result<String, ObserverError> {
     if number.is_i64() || number.is_u64() {
-        return rendered;
+        return Ok(number.to_string());
     }
+    // Workspace feature unification may retain the original decimal token.
+    // The event authority hashes the rounded binary64 value, not that token.
+    let token = number.to_string();
+    if !token.contains(['.', 'e', 'E']) {
+        return Err(ObserverError::invalid(
+            "integer exceeds the supported 64-bit JSON domain",
+        ));
+    }
+    let rounded = number
+        .as_f64()
+        .and_then(serde_json::Number::from_f64)
+        .ok_or_else(|| ObserverError::invalid("number exceeds the finite binary64 JSON domain"))?;
+    let rendered = rounded.to_string();
     if let Some((mantissa, exponent)) = rendered.split_once('e') {
-        return format!("{mantissa}e{}", python_exponent(exponent));
+        return Ok(format!("{mantissa}e{}", python_exponent(exponent)));
     }
     let (sign, magnitude) = rendered
         .strip_prefix('-')
         .map_or(("", rendered.as_str()), |magnitude| ("-", magnitude));
     let Some(fraction) = magnitude.strip_prefix("0.") else {
-        return rendered;
+        return Ok(rendered);
     };
     let zeroes = fraction.bytes().take_while(|byte| *byte == b'0').count();
     if zeroes < 4 || zeroes == fraction.len() {
-        return rendered;
+        return Ok(rendered);
     }
     let digits = &fraction[zeroes..];
     let (first, rest) = digits.split_at(1);
@@ -80,7 +92,7 @@ fn python_number(number: &serde_json::Number) -> String {
         format!("{first}.{rest}")
     };
     let exponent = format!("-{}", zeroes + 1);
-    format!("{sign}{mantissa}e{}", python_exponent(&exponent))
+    Ok(format!("{sign}{mantissa}e{}", python_exponent(&exponent)))
 }
 
 fn python_exponent(exponent: &str) -> String {
