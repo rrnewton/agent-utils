@@ -970,7 +970,7 @@ class AgentRecord:
             fields["native_session"] = dict(native)
         if (custom_identity is not None
                 and ((document.get("adapter", "herdr"), document.get("harness"))
-                     not in (("herdr-pane", "muse"), ("herdr-relay", "claude"), ("herdr-relay", "codex"))
+                     not in (("herdr-pane", "muse"), ("herdr-relay", "claude"), ("herdr-relay", "codex"), ("herdr-relay", "muse"))
                      or not isinstance(document.get("pane_id"), str)
                      or not document["pane_id"])):
             raise AgentDeliveryError(
@@ -7294,7 +7294,7 @@ _LAUNCH_ENV_RELAY_REFUSAL = (
     "profile config launch_env does not apply under root slot isolation; "
     "use userns or cgroup isolation, or remove launch_env"
 )
-RELAY_HARNESSES = ("claude", "codex")
+RELAY_HARNESSES = ("claude", "codex", "muse")
 #: Both relayed harnesses show this hint only while a turn is running.
 RELAY_WORKING_MARKER = "esc to interrupt"
 

@@ -2224,7 +2224,7 @@ impl AgentRecord {
                 .is_some_and(|identity| {
                     !matches!(
                         (self.adapter.as_str(), self.harness.as_str()),
-                        ("herdr-pane", "muse") | ("herdr-relay", "claude" | "codex")
+                        ("herdr-pane", "muse") | ("herdr-relay", "claude" | "codex" | "muse")
                     ) || self.pane_id.as_deref().is_none_or(str::is_empty)
                         || !identity.valid()
                 })
@@ -6321,7 +6321,7 @@ pub const SLOT_ISOLATIONS: [&str; 3] = ["userns", "cgroup", "root"];
 
 /// Harnesses agentctl can drive behind a root slot relay: Herdr has screen rules for them and
 /// agentctl has verified composer models.
-pub const RELAY_HARNESSES: [&str; 2] = ["claude", "codex"];
+pub const RELAY_HARNESSES: [&str; 3] = ["claude", "codex", "muse"];
 
 /// Both relayed harnesses show this hint only while a turn is running.
 const RELAY_WORKING_MARKER: &str = "esc to interrupt";
@@ -18904,12 +18904,19 @@ fi
         );
         assert_eq!(slot_from_cwd(Path::new("/p/worktrees/sandbox")), None);
         assert_eq!(slot_from_cwd(Path::new("/p")), None);
+        // Muse is a relay harness (#1583): root stays root for it too.
         assert_eq!(
             resolve_box_isolation("muse", "root", false, true).unwrap(),
-            "userns"
+            "root"
         );
-        assert!(resolve_box_isolation("muse", "root", true, true).is_err());
-        assert!(resolve_box_isolation("muse", "root", false, false).is_err());
+        assert_eq!(
+            resolve_box_isolation("muse", "root", true, true).unwrap(),
+            "root"
+        );
+        assert_eq!(
+            resolve_box_isolation("muse", "root", false, false).unwrap(),
+            "root"
+        );
         assert_eq!(
             resolve_box_isolation("claude", "root", false, true).unwrap(),
             "root"
@@ -18944,12 +18951,12 @@ fi
             (
                 "root",
                 None,
-                "--slot with root isolation supports claude, codex, not \"muse\"",
+                "--slot with root isolation supports claude, codex, muse, not \"agy\"",
             ),
         ];
         for (behaviour, isolation, expected) in cases {
             let executable = fake_wrkslots(&fixture.root, &slot_path, behaviour);
-            let harness = if behaviour == "root" { "muse" } else { "codex" };
+            let harness = if behaviour == "root" { "agy" } else { "codex" };
             let error = fixture
                 .manager()
                 .start(

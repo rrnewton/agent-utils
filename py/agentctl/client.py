@@ -2129,7 +2129,15 @@ class HerdrClient:
         while time.monotonic() < deadline and observed is None:
             try:
                 observed = self.relay_process(pane_id)
-            except HerdrUnavailable:
+            except HerdrUnavailable as exc:
+                if "pane_not_found" in str(exc):
+                    # The pane shell exec'd into the relay line, so an
+                    # instantly failing boxed command takes the pane with
+                    # it (#1583).
+                    raise HerdrUnavailable(
+                        f"the slot relay pane {pane_id} exited during startup; "
+                        f"the boxed command likely failed instantly (check the wrkslots line for {kind!r})"
+                    ) from exc
                 observed = None
             if observed is None:
                 self._sleep(min(0.1, max(0.0, deadline - time.monotonic())))
@@ -2157,7 +2165,15 @@ class HerdrClient:
             state = self.relay_screen_state(kind, state, screen)
             # Herdr's title rule can read idle before the harness has drawn
             # anything; the verified composer on screen is the ready signal.
-            if agent_kind == kind and state == "idle" and composer_view(kind, screen) is not None:
+            # Muse has no composer view; its verified editor proof serves
+            # instead (#1583 muse relay readiness), on the plain screen.
+            composer_ready = composer_view(kind, screen) is not None or (
+                kind == "muse"
+                and muse_verified_process_idle_composer(
+                    self.read(pane_id, source="visible", lines=200)
+                )
+            )
+            if agent_kind == kind and state == "idle" and composer_ready:
                 break
             if agent_kind == kind and state == "blocked":
                 raise HerdrUnavailable(

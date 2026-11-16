@@ -2658,7 +2658,19 @@ impl HerdrClient {
         let deadline = Instant::now() + timeout;
         let mut observed = None;
         while observed.is_none() && Instant::now() < deadline {
-            observed = self.relay_process(pane_id).ok().flatten();
+            match self.relay_process(pane_id) {
+                Ok(found) => observed = found,
+                Err(error) if error.to_string().contains("pane_not_found") => {
+                    // The pane's shell exec'd into the relay line, so an
+                    // instantly failing boxed command takes the pane with
+                    // it; name that instead of a bare Herdr refusal (#1583).
+                    return Err(AdapterError::unavailable(format!(
+                        "the slot relay pane {pane_id} exited during startup; \
+                         the boxed command likely failed instantly (check the wrkslots line for {kind:?})"
+                    )));
+                }
+                Err(_) => {}
+            }
             if observed.is_none() {
                 thread::sleep(
                     Duration::from_millis(100)
@@ -2696,11 +2708,17 @@ impl HerdrClient {
             let screen = self.read_screen_with_cancellation(pane_id, &|| false)?;
             state = relay_screen_state(kind, &observed_state, &screen);
             // Herdr's title rule can read idle before the harness has drawn anything; the
-            // verified composer on screen is the ready signal.
-            if agent.as_deref() == Some(kind)
-                && state == "idle"
-                && crate::submission::composer_view(kind, &screen).is_some()
-            {
+            // verified composer on screen is the ready signal. Muse has no
+            // composer view; its verified-process editor proof serves instead
+            // (#1583 muse relay readiness), on the plain screen it parses.
+            let composer_ready = crate::submission::composer_view(kind, &screen).is_some()
+                || (kind == "muse"
+                    && muse_verified_process_idle_composer(&self.read(
+                        pane_id,
+                        "visible",
+                        Some(200),
+                    )?));
+            if agent.as_deref() == Some(kind) && state == "idle" && composer_ready {
                 break;
             }
             if agent.as_deref() == Some(kind) && state == "blocked" {

@@ -593,12 +593,22 @@ harness without that step — the box is the sandbox.
 - **Claude Code**: none under userns — its native binary performs the
   failing step itself, and its sandbox-disable flag refuses inside
   the box view. Limits-only `cgroup` boxing works (no mount view).
-  Root isolation is refused for Muse's sibling reason below.
+  Mount-sandboxed Claude Code uses root isolation (the relay below).
 - **Codex**: none under userns — same launcher failure. A runtime
   beside its launcher exists, but Codex launches through the terminal
-  host, not a pane command agentctl owns; root-relay boxing exists
-  for Codex (and Claude Code) and is the current mount-sandboxed
-  route for them.
+  host, not a pane command agentctl owns; root-relay boxing is the
+  current mount-sandboxed route for it.
+- **Root isolation (all three known TUIs)**: supported as a relay —
+  the boxed harness line runs in the pane directly behind the slot's
+  root launcher, and agentctl owns its lifecycle state
+  (`RELAY_HARNESSES` in `rs/agentctl/src/subagents.rs`). Muse joined
+  the relay in #1583: its readiness is the verified-process editor
+  proof on the plain screen (`start_relay_agent` in
+  `rs/agentctl/src/client.rs`). Muse relay delivery is partial: a
+  relayed Muse starts, reports state, and stops, but `send` is
+  blocked (no composer model for a relayed Muse yet). An instantly
+  failing boxed command takes its exec'd pane with it; the relay
+  launch now names that instead of a bare pane refusal.
 - **Unknown TUI**: none — no boxed form is declared.
 
 ### Transient-failure recovery; stalled-goal resume

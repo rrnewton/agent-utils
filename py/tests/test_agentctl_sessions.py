@@ -1053,15 +1053,15 @@ def test_slot_start_leaves_isolation_to_the_project_configuration(tmp_path: Path
         ("fail", None, "wrkslots shell-command 's9' failed: unknown slot s9"),
         ("junk", None, "wrkslots shell-command 's9' returned invalid JSON"),
         ("ok", "namespace", "--slot-isolation must be userns, cgroup, or root"),
-        ("root-muse", None, "--slot with root isolation supports claude, codex, not 'muse'"),
+        ("root-agy", None, "--slot with root isolation supports claude, codex, muse, not 'agy'"),
     ],
 )
 def test_slot_failures_are_refused_before_registry_or_tab_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, behaviour: str, isolation: str | None, expected: str,
 ) -> None:
     sessions, fake, _calls = setup(tmp_path, monkeypatch)
-    harness = "muse" if behaviour == "root-muse" else "codex"
-    behaviour = "root" if behaviour == "root-muse" else behaviour
+    harness = "agy" if behaviour == "root-agy" else "codex"
+    behaviour = "root" if behaviour == "root-agy" else behaviour
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, behaviour)))
     project = tmp_path / "project"
     project.mkdir(exist_ok=True)
@@ -1174,7 +1174,7 @@ def test_relay_records_round_trip_and_admit_only_relay_harnesses(tmp_path: Path)
     record = AgentRecord("w", "t", "codex", str(tmp_path), 1.0, adapter="herdr-relay",
                          pane_id="w1:p1", lifecycle="running", custom_process_identity=identity)
     path = tmp_path / "agent.json"
-    for harness, accepted in (("codex", True), ("claude", True), ("muse", False)):
+    for harness, accepted in (("codex", True), ("claude", True), ("muse", True), ("agy", False)):
         document = {**record.to_document(), "harness": harness}
         path.write_text(json.dumps(document), encoding="utf-8")
         path.chmod(0o600)
