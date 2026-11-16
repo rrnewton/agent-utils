@@ -155,6 +155,26 @@ pub enum Signal {
         /// The response body.
         body: Value,
     },
+    /// A permission prompt was decided somewhere else (the harness's
+    /// own judge, a policy, another surface): settle it locally without
+    /// answering again.
+    PermissionResolved {
+        /// The prompt's request identifier.
+        request_id: String,
+        /// The decision that landed: `approved`, `denied`, or another
+        /// harness decision string.
+        decision: String,
+    },
+    /// A held prompt's decision stage or offered choices changed
+    /// (a multi-stage approval advancing): update what an answer names.
+    PermissionUpdated {
+        /// The prompt's request identifier.
+        request_id: String,
+        /// The requirement the next decision must target.
+        requirement: Option<Value>,
+        /// The choices now offered, `(id, decision, scope)`.
+        choices: Vec<(String, String, String)>,
+    },
     /// Opening the recorded session failed; the wrapper logs it and
     /// restarts the harness, whose next handshake corrects course.
     SessionOpenFailed {

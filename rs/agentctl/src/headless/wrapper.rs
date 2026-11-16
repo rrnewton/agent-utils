@@ -1461,6 +1461,42 @@ impl Wrapper {
                         self.settle_approval(index, "cancelled", "harness", None)?;
                     }
                 }
+                Signal::PermissionResolved {
+                    request_id,
+                    decision,
+                } => {
+                    if let Some(index) = self
+                        .approvals
+                        .iter()
+                        .position(|pending| pending.request_id == request_id)
+                    {
+                        let settled = match decision.as_str() {
+                            "approved" | "approvedForSession" | "approvedPolicyAmendment" => {
+                                "approved"
+                            }
+                            _ => "denied",
+                        };
+                        self.settle_approval(index, settled, "harness-resolved", None)?;
+                    }
+                }
+                Signal::PermissionUpdated {
+                    request_id,
+                    requirement,
+                    choices,
+                } => {
+                    if let Some(pending) = self
+                        .approvals
+                        .iter_mut()
+                        .find(|pending| pending.request_id == request_id)
+                    {
+                        if requirement.is_some() {
+                            pending.requirement = requirement;
+                        }
+                        if !choices.is_empty() {
+                            pending.choices = choices;
+                        }
+                    }
+                }
                 Signal::UnknownControlRequest {
                     request_id,
                     subtype,
@@ -1661,6 +1697,21 @@ impl Wrapper {
 
     /// Hold a permission prompt for the owner's answer and log it.
     fn permission_request(&mut self, request: claude::PermissionRequest) -> Result<()> {
+        // A re-presented prompt (a session resume re-issues it) updates
+        // the held one; it never holds twice for the same prompt.
+        if let Some(pending) = self
+            .approvals
+            .iter_mut()
+            .find(|pending| pending.request_id == request.request_id)
+        {
+            if request.requirement.is_some() {
+                pending.requirement = request.requirement;
+            }
+            if !request.choices.is_empty() {
+                pending.choices = request.choices;
+            }
+            return Ok(());
+        }
         let causation = self.turn_causation.clone();
         if !self
             .config
@@ -1755,7 +1806,7 @@ impl Wrapper {
             }
             _ => String::new(),
         };
-        if decision != "cancelled" {
+        if decision != "cancelled" && by != "harness-resolved" {
             let allow = decision == "approved";
             let line = self.config.adapter.permission_answer_line(
                 &pending.request_id,

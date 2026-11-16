@@ -332,6 +332,29 @@ impl MuseHarness {
                 signals
             }
             "item/started" | "item/completed" => self.parse_item(method, params),
+            "approval/resolved" => vec![Signal::PermissionResolved {
+                request_id: text_of(params, "approvalId"),
+                decision: text_of(params, "decision"),
+            }],
+            "approval/updated" => vec![Signal::PermissionUpdated {
+                request_id: text_of(params, "approvalId"),
+                requirement: params.get("currentRequirementId").cloned(),
+                choices: params["availableChoices"]
+                    .as_array()
+                    .map(|choices| {
+                        choices
+                            .iter()
+                            .map(|choice| {
+                                (
+                                    text_of(choice, "choiceId"),
+                                    text_of(choice, "decision"),
+                                    text_of(choice, "scope"),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }],
             _ => Vec::new(),
         }
     }
