@@ -179,6 +179,9 @@ steps:
     hint:
       est_duration_s: 5
       classification: light
+      # cargo metadata peaks ~57 MiB on a good run; the learned ~70 MiB cap
+      # OOMs under gate concurrency (#1704). Real headroom, still small.
+      hard_mem_max_bytes: 268435456
 
   - group: dagrun
     job: testrun-core-deps
@@ -191,6 +194,8 @@ steps:
     hint:
       est_duration_s: 5
       classification: light
+      # Same cargo-metadata cap problem as dagrun-model-deps above (#1704).
+      hard_mem_max_bytes: 268435456
 
   - group: herdr-run
     job: test
