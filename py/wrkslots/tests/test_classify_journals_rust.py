@@ -141,6 +141,38 @@ def test_classify_typed_hook_journal_matches_python(tmp_path: Path) -> None:
     assert _norm(result.stdout, rust_root) == _norm(out, oracle_root)
 
 
+def test_classify_hook_drift_matches_python(tmp_path: Path) -> None:
+    """#1436 wrkslots-create-journal-hook-drift: hooks changed after
+    the create started; both editions classify the journal against
+    its recorded hooks and report the drift, never refuse."""
+
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    _interrupted(rust_root)
+    _interrupted(oracle_root)
+    for root in (rust_root, oracle_root):
+        config = root / ".wrkslots.yml"
+        config.write_text(
+            config.read_text().replace("echo hook-broken >&2; exit 3", "true")
+        )
+    rc, out = _python_classify(oracle_root, fmt="json")
+    assert rc == 0
+    assert "hook_drift" in out
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 0, result.stderr
+
+    def scrub(text: str) -> str:
+        return re.sub(r'"journal_identity": \{[^}]*\}', '"journal_identity": {}', text)
+
+    assert scrub(_norm(result.stdout, rust_root)) == scrub(_norm(out, oracle_root))
+    rc, out = _python_classify(oracle_root, fmt="human")
+    assert rc == 0
+    result = _rust_classify(rust_root, fmt="human")
+    assert result.returncode == 0, result.stderr
+    assert _norm(result.stdout, rust_root) == _norm(out, oracle_root)
+    assert "differ from the current configuration" in result.stdout
+
+
 def _write_import_journal(root: Path, owner: dict[str, object]) -> Path:
     active = root / "worktrees" / "ACTIVE.node-a.json"
     document = json.loads(active.read_text(encoding="utf-8"))

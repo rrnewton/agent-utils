@@ -12847,6 +12847,326 @@ def test_abort_create_still_refuses_a_failed_non_init_hook(
     assert not (target / "component" / "component.txt").exists()
 
 
+def _create_with_never_checked_out_submodule(
+    tmp_path: Path, *, hook_status: str
+) -> tuple[Path, Path, Path]:
+    """An interrupted create whose submodule clone was never checked out.
+
+    The clone sits at its recorded gitlink with no index and only the
+    ``.git`` pointer in its directory, so the superproject's status
+    reads it as a staged deletion. The journal's only hook is a
+    non-init hook held at `hook_status`.
+    """
+
+    project, repository, _remote = make_project(
+        tmp_path, post_provision_hooks=("false",)
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    target = checkout(project)
+    git(
+        target,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "component",
+    )
+    component = target / "component"
+    gitdir = Path(
+        (component / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+    )
+    if not gitdir.is_absolute():
+        gitdir = (component / gitdir).resolve()
+    (gitdir / "index").unlink()
+    for entry in list(component.iterdir()):
+        if entry.name == ".git":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    assert [entry.name for entry in component.iterdir()] == [".git"]
+    assert not (gitdir / "index").exists()
+    journal = create_journal_path(project)
+    config = wrkslots._load_config(str(project), "testhost")
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    changed = dict(raw)
+    changed["post_provision_hooks"] = ["false"]
+    if hook_status == "not-started":
+        changed["hook_failure"] = None
+        changed["hook_progress"] = 0
+    elif hook_status == "running":
+        changed["hook_failure"] = {
+            "checkout": "product",
+            "hook_index": 0,
+            "command": "false",
+            "status": "running",
+        }
+        changed["hook_progress"] = 0
+    elif hook_status == "failed":
+        changed["hook_failure"] = {
+            "checkout": "product",
+            "hook_index": 0,
+            "command": "false",
+            "status": "failed",
+            "returncode": 9,
+        }
+        changed["hook_progress"] = 0
+    elif hook_status == "completed":
+        changed["hook_failure"] = None
+        changed["hook_progress"] = 1
+    else:  # pragma: no cover - fixture misuse
+        raise AssertionError(f"unknown hook status {hook_status}")
+    wrkslots._write_journal(config, changed, journal_path=journal)
+    return project, journal, target
+
+
+@pytest.mark.parametrize(
+    "hook_status", ["completed", "not-started", "running", "failed"]
+)
+def test_abort_create_forgives_a_never_checked_out_submodule(
+    tmp_path: Path, hook_status: str
+) -> None:
+    # #1436: a submodule uninitialized at create start, cloned but
+    # never checked out (no index, HEAD at its gitlink, only the .git
+    # pointer in its directory), counts as unchanged whatever the
+    # journal's hook status -- completed (the live incident), not
+    # started, running, or failed.
+    project, journal, target = _create_with_never_checked_out_submodule(
+        tmp_path, hook_status=hook_status
+    )
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+
+
+def test_abort_create_refuses_never_checked_out_shape_with_an_index(
+    tmp_path: Path,
+) -> None:
+    # Negative: an index present (here still holding the checkout's
+    # entries while the worktree was stripped) is authored state.
+    project, journal, target = _create_with_never_checked_out_submodule(
+        tmp_path, hook_status="completed"
+    )
+    component = target / "component"
+    gitdir = Path(
+        (component / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+    )
+    if not gitdir.is_absolute():
+        gitdir = (component / gitdir).resolve()
+    git(component, "read-tree", "HEAD")
+    assert (gitdir / "index").exists()
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
+def test_abort_create_refuses_never_checked_out_shape_with_moved_head(
+    tmp_path: Path,
+) -> None:
+    # Negative: the clone's HEAD moved off its recorded gitlink.
+    project, journal, target = _create_with_never_checked_out_submodule(
+        tmp_path, hook_status="completed"
+    )
+    component = target / "component"
+    # Restore a populated clone, move its HEAD, then strip again so
+    # only the HEAD condition differs from the forgiven shape.
+    git(
+        target,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "component",
+    )
+    tree = git(component, "rev-parse", "HEAD^{tree}").stdout.strip()
+    moved = git(
+        component, "commit-tree", tree, "-p", "HEAD", "-m", "moved"
+    ).stdout.strip()
+    git(component, "checkout", "-q", moved)
+    gitdir = Path(
+        (component / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+    )
+    if not gitdir.is_absolute():
+        gitdir = (component / gitdir).resolve()
+    (gitdir / "index").unlink()
+    for entry in list(component.iterdir()):
+        if entry.name == ".git":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
+def test_abort_create_refuses_never_checked_out_shape_with_authored_files(
+    tmp_path: Path,
+) -> None:
+    # Negative: an authored file beside the .git pointer is work an
+    # abort would lose.
+    project, journal, target = _create_with_never_checked_out_submodule(
+        tmp_path, hook_status="completed"
+    )
+    (target / "component" / "authored.txt").write_text(
+        "authored\n", encoding="utf-8"
+    )
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
+def test_abort_create_refuses_a_checked_out_submodule_tree(
+    tmp_path: Path,
+) -> None:
+    # Negative (#1436 narrowness): a checked-out tree -- tracked
+    # files beyond the .git pointer, with an index -- is never
+    # forgiven under the never-checked-out rule.
+    project, journal, target = _create_with_never_checked_out_submodule(
+        tmp_path, hook_status="completed"
+    )
+    git(
+        target,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "component",
+    )
+    assert (target / "component" / "component.txt").is_file()
+    git(target / "component", "rm", "-q", "component.txt")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
+def test_abort_create_refuses_never_checked_out_shape_with_local_commits(
+    tmp_path: Path,
+) -> None:
+    # Negative (#1436 narrowness): HEAD is back at the gitlink and
+    # the tree is stripped, but a local branch carries a commit no
+    # remote-tracking ref holds.
+    project, journal, target = _create_with_never_checked_out_submodule(
+        tmp_path, hook_status="completed"
+    )
+    component = target / "component"
+    git(
+        target,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "component",
+    )
+    git(component, "checkout", "-q", "-b", "local-work")
+    (component / "local.txt").write_text("local\n", encoding="utf-8")
+    git(component, "add", "local.txt")
+    git(component, "commit", "-q", "-m", "local submodule work")
+    gitlink = git(target, "ls-tree", "HEAD", "component").stdout.split()[2]
+    git(component, "checkout", "-q", gitlink)
+    gitdir = Path(
+        (component / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+    )
+    if not gitdir.is_absolute():
+        gitdir = (component / gitdir).resolve()
+    (gitdir / "index").unlink()
+    for entry in list(component.iterdir()):
+        if entry.name == ".git":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    assert git(component, "rev-parse", "HEAD").stdout.strip() == gitlink
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
 def test_abort_create_still_refuses_a_moved_gitlink_after_failed_init(
     tmp_path: Path,
 ) -> None:
@@ -31864,6 +32184,159 @@ def test_an_interrupted_create_journal_records_its_slot_types_hooks(tmp_path: Pa
         "--slot-type", "agent",
     )
     assert "differ from configuration" not in classified.stderr, classified.stderr
+
+
+def test_hook_drift_mid_create_abort_uses_the_journals_recorded_hooks(
+    tmp_path: Path,
+) -> None:
+    # #1436 wrkslots-create-journal-hook-drift: the configuration's
+    # hooks changed while a create was in flight. Abort retires the
+    # create against the hooks its journal recorded, not the current
+    # configuration's.
+    project, _repository, _remote = make_project(
+        tmp_path, post_provision_hooks=("true",)
+    )
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    assert journal.is_file()
+    _set_post_provision_hooks(project, ["false"])
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not checkout(project).exists()
+
+
+def test_hook_drift_mid_create_recover_completes_with_journal_hooks(
+    tmp_path: Path,
+) -> None:
+    # #1436: resume runs the journal's recorded hooks, never the
+    # hooks the current configuration names for the slot type.
+    journal_hook = python_hook(
+        "from pathlib import Path; Path('journal-hook-ran').write_text('journal')"
+    )
+    config_hook = python_hook(
+        "from pathlib import Path; Path('config-hook-ran').write_text('config')"
+    )
+    project, _repository, _remote = make_project(
+        tmp_path, post_provision_hooks=(journal_hook,)
+    )
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journal = create_journal_path(project)
+    assert journal.is_file()
+    _set_post_provision_hooks(project, [config_hook])
+
+    recovered = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert "differ from the current configuration" in (
+        recovered.stdout + recovered.stderr
+    )
+    assert len(active_slots(project)) == 1
+    assert not journal.exists()
+    tree = checkout(project)
+    assert (tree / "journal-hook-ran").read_text(encoding="utf-8") == "journal"
+    assert not (tree / "config-hook-ran").exists()
+
+
+def test_hook_drift_is_an_audit_note_in_classification_and_doctor(
+    tmp_path: Path,
+) -> None:
+    # #1436: hook drift is reported, never a refusal: classification
+    # carries the note and doctor names the slot, informational only.
+    project, _repository, _remote = make_project(
+        tmp_path, post_provision_hooks=("true",)
+    )
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    _set_post_provision_hooks(project, ["false"])
+
+    classified = command(
+        project,
+        "classify-create-journals",
+        "slot02",
+        "--agent",
+        "codex-2",
+        "--slot-type",
+        "agent",
+        "--format",
+        "json",
+    )
+    assert classified.returncode == 0, classified.stderr
+    payload = json.loads(classified.stdout)
+    assert payload["blocking"] is False
+    assert len(payload["journals"]) == 1
+    note = payload["journals"][0]["hook_drift"]
+    assert isinstance(note, str)
+    assert "slot01" in note
+
+    doctor = command(project, "doctor", "--format", "json")
+    assert doctor.returncode == 0, doctor.stderr
+    findings = json.loads(doctor.stdout)["findings"]
+    drift = [
+        item for item in findings if item["kind"] == "create-journal-hook-drift"
+    ]
+    assert len(drift) == 1
+    assert drift[0]["slot"] == "slot01"
+    assert "slot01" in drift[0]["detail"]
+
+
+def test_unclassifiable_create_journal_blocks_only_its_own_slot(
+    tmp_path: Path,
+) -> None:
+    # #1436: one slot's stranded, unclassifiable create journal
+    # refuses operations on that slot only; an unrelated create on
+    # the same host still succeeds.
+    project, _repository, _remote = make_project(
+        tmp_path, post_provision_hooks=("exit 9",)
+    )
+    refused = create(project)
+    assert refused.returncode != 0, refused.stderr
+    journal = create_journal_path(project)
+    assert journal.is_file()
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    raw["hook_progress"] = 999
+    journal.write_text(json.dumps(raw), encoding="utf-8")
+    _set_post_provision_hooks(project, ["true"])
+
+    made = create(project, slot="slot02", agent="codex-2", branch="codex/other")
+    assert made.returncode == 0, made.stderr
+    rows = active_slots(project)
+    assert len(rows) == 1
+    only = rows[0]
+    assert isinstance(only, dict)
+    assert only["slot"] == "slot02"
+
+    blocked = create(project, slot="slot01", agent="codex-3", branch="codex/third")
+    assert blocked.returncode != 0
+    assert "slot01" in blocked.stderr
+    assert "wrkslots recover" in blocked.stderr
+    assert journal.is_file()
 
 
 @pytest.mark.parametrize(

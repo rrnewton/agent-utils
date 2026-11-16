@@ -1671,6 +1671,7 @@ class _CreateJournalClassification:
     coordinator_state: str
     coordinator_detail: str
     state: str
+    hook_drift: str | None = None
 
     def to_obj(self) -> dict[str, object]:
         return {
@@ -1689,6 +1690,7 @@ class _CreateJournalClassification:
             "coordinator_state": self.coordinator_state,
             "created": len(self.created),
             "dirty_checkouts": list(self.dirty_checkouts),
+            "hook_drift": self.hook_drift,
             "journal": str(self.path),
             "journal_identity": {
                 "device": self.file_identity.device,
@@ -12591,6 +12593,26 @@ def _validate_journal_shape(
         raise StateError(f"unsupported recovery journal kind {kind!r}")
 
 
+def _hook_drift_note(
+    config: Config, slot: str, slot_type: str, hooks: tuple[str, ...]
+) -> str | None:
+    """Audit note for a create journal whose recorded hooks drifted (#1436).
+
+    A create journal describes what was actually started, so its
+    recorded hooks govern its classification, completion and abort.
+    A difference from the current configuration is reported as an
+    audit note, never a refusal.
+    """
+
+    if hooks == _post_provision_hooks_for(config, slot_type):
+        return None
+    return (
+        f"create journal for slot {slot} records post-provision hooks that "
+        "differ from the current configuration; the journal's recorded "
+        "hooks govern its classification, completion and abort"
+    )
+
+
 def _completed_create_record(
     config: Config, raw: Mapping[str, object]
 ) -> ActiveRecord:
@@ -12645,9 +12667,9 @@ def _completed_create_record(
         _validate_hook,
         unique=False,
     )
-    # The journal records the hooks of its slot's type (#1122).
-    if hooks != _post_provision_hooks_for(config, slot_type):
-        raise StateError("create journal post-provision hooks differ from configuration")
+    # The journal's recorded hooks govern, even when the current
+    # configuration has since changed them (#1436); drift is an
+    # audit note on the classification, never a refusal here.
     if (
         _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
         != len(planned) * len(hooks)
@@ -13088,6 +13110,7 @@ def _create_journal_items(
     tuple[Checkout, ...],
     tuple[Checkout, ...],
     tuple[str, ...],
+    str | None,
 ]:
     machine = _as_str(raw["machine"], "create journal.machine")
     slot = _validate_name(_as_str(raw["slot"], "create journal.slot"), "slot")
@@ -13133,9 +13156,10 @@ def _create_journal_items(
         _validate_hook,
         unique=False,
     )
-    # The journal records the hooks of its slot's type (#1122).
-    if hooks != _post_provision_hooks_for(config, slot_type):
-        raise StateError("create journal post-provision hooks differ from configuration")
+    # The journal's recorded hooks govern (#1436): a difference
+    # from the current configuration is an audit note, never a
+    # refusal. Every other integrity check below stays exact.
+    hook_drift = _hook_drift_note(config, slot, slot_type, hooks)
     if raw.get("failure_policy") != "leave-for-inspection":
         raise StateError("create journal has an unsupported hook failure policy")
     progress = _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
@@ -13308,6 +13332,7 @@ def _create_journal_items(
         created,
         tuple(observed),
         tuple(dirty),
+        hook_drift,
     )
 
 
@@ -13665,10 +13690,19 @@ def _classify_create_journal(
                 f"state: owner={owner_state} ({owner_detail}); "
                 f"coordinator={coordinator_state} ({coordinator_detail})"
             )
-    machine, slot, agent, slot_type, slot_path, planned, created, observed, dirty = (
-        _create_journal_items(
-            config, raw, states, archives, completed=completed
-        )
+    (
+        machine,
+        slot,
+        agent,
+        slot_type,
+        slot_path,
+        planned,
+        created,
+        observed,
+        dirty,
+        hook_drift,
+    ) = _create_journal_items(
+        config, raw, states, archives, completed=completed
     )
     rebound_coordinator_state, _rebound_coordinator_detail = _process_state(coordinator)
     rebound_owner_state, _rebound_owner_detail = _create_journal_owner_state(
@@ -13704,6 +13738,7 @@ def _classify_create_journal(
         coordinator_state,
         coordinator_detail,
         "completed-create" if completed else f"{owner_state}-incomplete-create",
+        hook_drift=hook_drift,
     )
 
 
@@ -14731,6 +14766,52 @@ def _cmd_recover_tail_event(args: argparse.Namespace) -> int:
     return 0
 
 
+def _journal_slot_for_scoping(path: Path) -> str | None:
+    """The slot one journal provably concerns, for scoped refusal (#1436).
+
+    A scoped ``CREATE.``/``FINISH.`` filename names its slot; any
+    other journal must name it in bytes that parse. A journal that
+    proves no slot keeps the host-wide refusal, because no operation
+    can show it is unrelated.
+    """
+
+    for prefix in ("CREATE.", "FINISH."):
+        if not path.name.startswith(prefix):
+            continue
+        rest = path.name[len(prefix) :]
+        digits, separator, rest = rest.partition(".")
+        if not separator or not digits.isdigit():
+            return None
+        length = int(digits)
+        machine, remainder = rest[:length], rest[length:]
+        if len(machine) != length or not remainder.startswith("."):
+            return None
+        slot_digits, separator, slot = remainder[1:].partition(".")
+        if (
+            not separator
+            or not slot_digits.isdigit()
+            or not slot.endswith(".journal")
+            or len(slot[: -len(".journal")]) != int(slot_digits)
+        ):
+            return None
+        return slot[: -len(".journal")]
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    named = raw.get("slot")
+    if isinstance(named, str) and named:
+        return named
+    record = raw.get("record")
+    if isinstance(record, dict):
+        named = record.get("slot")
+        if isinstance(named, str) and named:
+            return named
+    return None
+
+
 def _classify_create_journals(
     config: Config,
     states: Sequence[ActiveState],
@@ -14759,6 +14840,18 @@ def _classify_create_journals(
         except _JournalBusy:
             raise
         except Refusal as error:
+            # #1436: a stranded or unclassifiable journal refuses
+            # only operations on its own slot. A caller that named
+            # the slot it operates on skips a journal that provably
+            # concerns a different slot; the stranded slot's own
+            # operations, and any journal that proves no slot, keep
+            # the host-fault refusal with its remedy.
+            if requested_slot is not None:
+                journal_slot = _journal_slot_for_scoping(path)
+                if journal_slot is not None and journal_slot != requested_slot:
+                    if skipped_paths is not None and path not in skipped_paths:
+                        skipped_paths.append(path)
+                    continue
             raise _journal_classification_refusal(path, error) from error
         if row is not None:
             classified.append(row)
@@ -14852,6 +14945,7 @@ def _assert_create_journal_classifications_stable(
             _created,
             observed,
             dirty,
+            _hook_drift,
         ) = _create_journal_items(
             config, raw, states, archives, completed=completed
         )
@@ -38596,7 +38690,19 @@ def _run_post_provision_hooks(
     event_writer: _EventWriter | None = None,
 ) -> int:
     slot_type = _as_str(journal.get("slot_type", "agent"), "create journal.slot_type")
-    hooks = _post_provision_hooks_for(config, slot_type)
+    # A journal that records its hooks runs exactly those (#1436):
+    # recovery resumes what was started, even when the current
+    # configuration names different hooks for the slot type. A
+    # journal without the field falls back to the configuration.
+    if "post_provision_hooks" in journal:
+        hooks = _string_tuple(
+            journal["post_provision_hooks"],
+            "create journal.post_provision_hooks",
+            _validate_hook,
+            unique=False,
+        )
+    else:
+        hooks = _post_provision_hooks_for(config, slot_type)
     total = len(created) * len(hooks)
     if start < 0 or start > total:
         raise StateError("create journal hook progress is out of range")
@@ -41561,6 +41667,8 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
                 f"JOURNAL: state={row.state} machine={row.machine} slot={row.slot} "
                 f"agent={row.agent} dirty_checkouts={dirty} journal={row.path}"
             )
+            if row.hook_drift is not None:
+                print(f"AUDIT: {row.hook_drift}")
         _print_foreign_shard_notes(foreign_notes)
     return 0
 
@@ -54109,6 +54217,62 @@ def _image_attachment_findings(config: Config) -> list[dict[str, object]]:
     return findings
 
 
+def _create_journal_hook_drift_findings(
+    config: Config,
+) -> list[dict[str, object]]:
+    """Doctor's informational hook-drift findings (#1436).
+
+    One finding per outstanding create journal whose recorded hooks
+    differ from the current configuration, naming its slot. The
+    journal's recorded hooks govern its recovery, so no action is
+    required; an unreadable journal is left to the journal report.
+    """
+
+    findings: list[dict[str, object]] = []
+    for path in _outstanding_journals(config):
+        try:
+            if path.exists() or path.is_symlink():
+                raw = _as_mapping(
+                    _read_json(path, "recovery journal"), "recovery journal"
+                )
+            else:
+                pending = _pending_journal_for_path(config, path)
+                if pending is None:
+                    continue
+                raw = pending
+        except (Refusal, StateError, OSError):
+            continue
+        if raw.get("kind") != "create":
+            continue
+        slot = raw.get("slot")
+        slot_type = raw.get("slot_type", "agent")
+        if not isinstance(slot, str) or not isinstance(slot_type, str):
+            continue
+        if slot_type not in SLOT_TYPES:
+            continue
+        try:
+            hooks = _string_tuple(
+                raw.get("post_provision_hooks", []),
+                "create journal.post_provision_hooks",
+                _validate_hook,
+                unique=False,
+            )
+        except (Refusal, StateError):
+            continue
+        note = _hook_drift_note(config, slot, slot_type, hooks)
+        if note is None:
+            continue
+        finding = _operational_finding(
+            "create-journal-hook-drift", slot, config.machine, note
+        )
+        finding["remedy"] = (
+            "informational: recover resumes or aborts the create with "
+            "the hooks its journal recorded"
+        )
+        findings.append(finding)
+    return findings
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     restore_memory_limit = _apply_scan_memory_limit(args)
     try:
@@ -54210,6 +54374,7 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
                 "operation; diagnosis alone authorizes no mutation"
             )
             findings.append(finding)
+        findings.extend(_create_journal_hook_drift_findings(config))
         doctor_records = [record for state in states for record in state.slots]
         doctor_liveness = cache.owner_liveness(config, doctor_records)
         rows = [
@@ -65265,6 +65430,131 @@ def _hook_partial_init_dirt(vcs: _GitVcs, destination: Path, status: str) -> boo
     return True
 
 
+def _submodule_never_checked_out(vcs: _GitVcs, submodule: Path, gitlink: str) -> bool:
+    """Whether a submodule clone was never checked out (#1436).
+
+    Uninitialized at create start and cloned but never populated:
+    its directory holds only the ``.git`` pointer, it has no index,
+    and its HEAD is the gitlink its superproject records. It holds
+    no local commits: HEAD and every local branch and reflog entry
+    are already on a remote-tracking ref. Such a clone holds
+    nothing an abort would lose, whatever the create's hooks did
+    or did not do.
+    """
+
+    try:
+        entries = list(submodule.iterdir())
+    except OSError:
+        return False
+    if len(entries) != 1 or entries[0].name != ".git":
+        return False
+    pointer = submodule / ".git"
+    if not pointer.is_file():
+        return False
+    try:
+        text = pointer.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if not text.startswith("gitdir:"):
+        return False
+    gitdir = Path(text.split(":", 1)[1].strip())
+    if not gitdir.is_absolute():
+        gitdir = Path(os.path.normpath(submodule / gitdir))
+    if (gitdir / "index").exists():
+        return False
+    try:
+        head = vcs.head(submodule)
+    except Refusal:
+        return False
+    if head != gitlink:
+        return False
+    unique = vcs._run(
+        submodule, ["rev-list", "--count", "HEAD", "--not", "--remotes"]
+    ).stdout.strip()
+    if unique != "0":
+        return False
+    branches = vcs._run(
+        submodule,
+        ["for-each-ref", "--format=%(objectname)", "refs/heads"],
+    ).stdout
+    for branch_head in branches.splitlines():
+        branch_head = branch_head.strip()
+        if not branch_head:
+            continue
+        unique = vcs._run(
+            submodule, ["rev-list", "--count", branch_head, "--not", "--remotes"]
+        ).stdout.strip()
+        if unique != "0":
+            return False
+    reflog = vcs._run(
+        submodule, ["reflog", "show", "--format=%H", "HEAD"], check=False
+    )
+    if reflog.returncode == 0:
+        entries_seen = [
+            line.strip() for line in reflog.stdout.splitlines() if line.strip()
+        ]
+        if entries_seen:
+            unique = vcs._run(
+                submodule,
+                ["rev-list", "--count", *entries_seen, "--not", "--remotes"],
+            ).stdout.strip()
+            if unique != "0":
+                return False
+    return True
+
+
+def _never_checked_out_submodule_dirt(
+    vcs: _GitVcs, destination: Path, status: str
+) -> bool:
+    """Whether checkout dirt is only never-checked-out clones (#1436).
+
+    The superproject reads each such clone as a staged deletion of
+    its gitlink. Every status line must name a recorded submodule
+    whose clone was never checked out; any other line is authored
+    or unknown dirt.
+    """
+
+    lines = [line for line in status.splitlines() if line]
+    if not lines:
+        return True
+    gitlinks = set(vcs.submodule_paths(destination))
+    for line in lines:
+        parts = line.split(" ", 8)
+        if len(parts) != 9 or parts[0] != "1":
+            return False
+        if parts[3] != "160000":
+            return False
+        path = parts[8]
+        if path not in gitlinks:
+            return False
+        if not _submodule_never_checked_out(vcs, destination / path, parts[6]):
+            return False
+    return True
+
+
+def _abort_dirt_forgiven(
+    vcs: _GitVcs,
+    destination: Path,
+    status: str,
+    *,
+    hook_checkout: str | None,
+    checkout_name: str,
+) -> bool:
+    """Whether abort may retire a dirty provisional checkout.
+
+    The hook's own partial init (#1337, #1431) and a clone that was
+    never checked out (#1436) both hold nothing an abort would
+    lose; the second counts as unchanged whatever the journal's
+    hook status, the first only under its hook conditions.
+    """
+
+    if hook_checkout == checkout_name and _hook_partial_init_dirt(
+        vcs, destination, status
+    ):
+        return True
+    return _never_checked_out_submodule_dirt(vcs, destination, status)
+
+
 def _abort_create(
     config: Config,
     journal_path: Path,
@@ -65363,8 +65653,13 @@ def _abort_create(
             )
             forgiven_partial = bool(
                 status
-                and hook_checkout == item.name
-                and _hook_partial_init_dirt(vcs, destination, status)
+                and _abort_dirt_forgiven(
+                    vcs,
+                    destination,
+                    status,
+                    hook_checkout=hook_checkout,
+                    checkout_name=item.name,
+                )
             )
             if status and not forgiven_partial:
                 first = status.splitlines()[0]
@@ -65457,8 +65752,13 @@ def _abort_create(
             )
             if status and not (
                 forgiven_partial
-                and hook_checkout == item.name
-                and _hook_partial_init_dirt(vcs, destination, status)
+                and _abort_dirt_forgiven(
+                    vcs,
+                    destination,
+                    status,
+                    hook_checkout=hook_checkout,
+                    checkout_name=item.name,
+                )
             ):
                 first = status.splitlines()[0]
                 raise Refusal(
@@ -65759,8 +66059,12 @@ def _recover_create(
             unique=False,
         )
     )
-    if journal_hooks != _post_provision_hooks_for(config, slot_type):
-        raise StateError("create journal post-provision hooks differ from configuration")
+    # The journal's recorded hooks govern recovery (#1436): drift
+    # from the current configuration is an audit note, never a
+    # refusal, on both the resume and the abort path.
+    hook_drift = _hook_drift_note(config, slot, slot_type, journal_hooks)
+    if hook_drift is not None:
+        print(f"audit note: {hook_drift}")
     hook_progress = _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
     total_hook_steps = len(plan) * len(journal_hooks)
     if hook_progress > total_hook_steps:

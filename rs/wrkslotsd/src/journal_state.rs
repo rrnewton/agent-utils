@@ -3246,11 +3246,10 @@ fn completed_create_expected(config: &Value, raw: &Map<String, Value>) -> Result
         validate_hook(hook)?;
         hooks.push(hook.to_owned());
     }
-    let config_hooks: Vec<String> =
-        crate::config_validate::post_provision_hooks_for(config, slot_type);
-    if hooks != config_hooks {
-        return Err("create journal post-provision hooks differ from configuration".to_owned());
-    }
+    // The journal's recorded hooks govern (#1436): drift from the
+    // current configuration is an audit note on classification,
+    // never a refusal here. Progress below is measured against the
+    // recorded hooks.
     let hook_progress = as_int(
         raw.get("hook_progress").unwrap_or(&Value::from(0)),
         "create journal.hook_progress",

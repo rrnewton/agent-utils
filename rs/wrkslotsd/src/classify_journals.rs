@@ -40,6 +40,70 @@ struct Row {
     state: String,
     journal: PathBuf,
     identity: FileIdentity,
+    hook_drift: Option<String>,
+}
+
+/// The audit note for a create journal whose recorded hooks drifted
+/// from the current configuration (#1436), mirroring Python
+/// `_hook_drift_note`. The journal's recorded hooks govern.
+fn hook_drift_note(
+    config: &Value,
+    slot: &str,
+    slot_type: &str,
+    journal_hooks: &[String],
+) -> Option<String> {
+    let current = crate::config_validate::post_provision_hooks_for(config, slot_type);
+    if journal_hooks == current.as_slice() {
+        return None;
+    }
+    Some(format!(
+        "create journal for slot {slot} records post-provision hooks that differ from the current configuration; the journal's recorded hooks govern its classification, completion and abort"
+    ))
+}
+
+/// The slot one journal provably concerns, for scoped refusal
+/// (#1436), mirroring Python `_journal_slot_for_scoping`.
+fn journal_slot_for_scoping(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    for prefix in ["CREATE.", "FINISH."] {
+        let Some(rest) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let (digits, rest) = rest.split_once('.')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let length: usize = digits.parse().ok()?;
+        if rest.len() < length {
+            return None;
+        }
+        let (machine, remainder) = rest.split_at(length);
+        if machine.len() != length {
+            return None;
+        }
+        let remainder = remainder.strip_prefix('.')?;
+        let (slot_digits, slot) = remainder.split_once('.')?;
+        if slot_digits.is_empty() || !slot_digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let slot = slot.strip_suffix(".journal")?;
+        if slot.len() != slot_digits.parse::<usize>().ok()? {
+            return None;
+        }
+        return Some(slot.to_string());
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let raw: Value = serde_json::from_slice(&bytes).ok()?;
+    if let Some(slot) = raw.get("slot").and_then(Value::as_str) {
+        if !slot.is_empty() {
+            return Some(slot.to_string());
+        }
+    }
+    raw.get("record")?
+        .get("slot")
+        .and_then(Value::as_str)
+        .filter(|slot| !slot.is_empty())
+        .map(str::to_owned)
 }
 
 fn within(candidate: &Path, parent: &Path) -> bool {
@@ -1075,6 +1139,7 @@ fn row_obj(row: &Row) -> Value {
         "coordinator_state": row.coordinator_state,
         "created": row.created.len(),
         "dirty_checkouts": row.dirty,
+        "hook_drift": row.hook_drift,
         "journal": row.journal.to_string_lossy(),
         "journal_identity": {
             "device": row.identity.0,
@@ -1242,7 +1307,6 @@ fn classify_one(
             );
         }
     }
-    let hooks: Vec<String> = crate::config_validate::post_provision_hooks_for(config, &slot_type);
     let journal_hooks: Vec<String> = raw
         .get("post_provision_hooks")
         .and_then(Value::as_array)
@@ -1253,9 +1317,10 @@ fn classify_one(
                 .collect()
         })
         .unwrap_or_default();
-    if journal_hooks != hooks {
-        return Err("create journal post-provision hooks differ from configuration".to_string());
-    }
+    // The journal's recorded hooks govern (#1436): drift from the
+    // current configuration is an audit note, never a refusal, and
+    // progress is measured against the recorded hooks.
+    let hook_drift = hook_drift_note(config, &slot, &slot_type, &journal_hooks);
     if raw.get("failure_policy").and_then(Value::as_str) != Some("leave-for-inspection") {
         return Err("create journal has an unsupported hook failure policy".to_string());
     }
@@ -1264,7 +1329,7 @@ fn classify_one(
         "create journal.hook_progress",
         0,
     )?;
-    if progress > (created.len() * hooks.len()) as i64 {
+    if progress > (created.len() * journal_hooks.len()) as i64 {
         return Err("create journal ran hooks for an unrecorded checkout".to_string());
     }
     let slot_path = slot_directory(cfg, &slot, &slot_type)?;
@@ -1486,6 +1551,7 @@ fn classify_one(
         state,
         journal: path.to_path_buf(),
         identity,
+        hook_drift,
     }))
 }
 
@@ -1678,15 +1744,23 @@ fn classify_create_journals_inner(
         // disjoint from the requested slot, which is skipped.  A busy
         // result stays bare and retryable; every other per-journal
         // refusal names its journal as a host fault (#1086).
-        let row = classify_one(&cfg, &config, path, &states, &archives, &slot, slot_type).map_err(
-            |error| {
+        // #1436: a stranded or unclassifiable journal refuses only
+        // operations on its own slot; one that provably concerns a
+        // different slot is skipped, never a host fault here.
+        let row = match classify_one(&cfg, &config, path, &states, &archives, &slot, slot_type) {
+            Ok(row) => row,
+            Err(error) => {
                 if error.starts_with("busy:") {
-                    error
-                } else {
-                    journal_refusal(path, &error)
+                    return Err(ClassifyError::Other(error));
                 }
-            },
-        )?;
+                if let Some(journal_slot) = journal_slot_for_scoping(path) {
+                    if journal_slot != slot {
+                        continue;
+                    }
+                }
+                return Err(ClassifyError::Other(journal_refusal(path, &error)));
+            }
+        };
         if let Some(row) = row {
             rows.push(row);
         }
@@ -1749,6 +1823,7 @@ fn classify_create_journals_inner(
                 "coordinator_state": row.coordinator_state,
                 "created": row.created.len(),
                 "dirty_checkouts": row.dirty,
+                "hook_drift": row.hook_drift,
                 "journal": row.journal.to_string_lossy(),
                 "journal_identity": {
                     "device": row.identity.0,
@@ -1817,6 +1892,9 @@ fn classify_create_journals_inner(
             dirty,
             row.journal.display()
         ));
+        if let Some(note) = &row.hook_drift {
+            out.push_str(&format!("AUDIT: {note}\n"));
+        }
     }
     out.push_str(&crate::global_state::foreign_shard_note_lines(
         &foreign_notes,

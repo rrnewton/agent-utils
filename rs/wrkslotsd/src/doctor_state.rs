@@ -8,7 +8,7 @@
 //! event-derived owner releases stay with the existing `doctor`.
 //! Read-only.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -525,6 +525,68 @@ fn doctor_cli_once(
                 .unwrap_or_default()
         ));
         findings.push(finding);
+    }
+    // Informational hook drift (#1436): a create journal whose
+    // recorded hooks differ from the current configuration, naming
+    // its slot. The journal's recorded hooks govern its recovery.
+    if let Ok(entries) = std::fs::read_dir(&cfg.control) {
+        let mut journal_paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("CREATE.") && name.ends_with(".journal"))
+            })
+            .collect();
+        journal_paths.sort();
+        for path in journal_paths {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(raw) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            if raw.get("kind").and_then(Value::as_str) != Some("create") {
+                continue;
+            }
+            let Some(slot) = raw.get("slot").and_then(Value::as_str) else {
+                continue;
+            };
+            let slot_type = raw
+                .get("slot_type")
+                .and_then(Value::as_str)
+                .unwrap_or("agent");
+            if !matches!(slot_type, "agent" | "validate") {
+                continue;
+            }
+            let journal_hooks: Vec<String> = raw
+                .get("post_provision_hooks")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if journal_hooks == crate::config_validate::post_provision_hooks_for(&config, slot_type)
+            {
+                continue;
+            }
+            let mut finding = note(
+                "create-journal-hook-drift",
+                Some(slot),
+                Some(selected.as_str()),
+                format!(
+                    "create journal for slot {slot} records post-provision hooks that differ from the current configuration; the journal's recorded hooks govern its classification, completion and abort"
+                ),
+            );
+            finding["remedy"] = json!(
+                "informational: recover resumes or aborts the create with the hooks its journal recorded"
+            );
+            findings.push(finding);
+        }
     }
     if !all_machines {
         findings.retain(|item| {
