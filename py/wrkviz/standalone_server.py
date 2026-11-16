@@ -233,6 +233,8 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
     error_message_format = '<!DOCTYPE HTML>\n<html lang="en">\n    <head>\n        <meta charset="utf-8">\n        <title>Error response</title>\n    </head>\n    <body>\n        <h1>Error response</h1>\n        <p>Error code: %(code)d</p>\n        <p>Message: %(message)s.</p>\n        <p>Error code explanation: %(code)s - %(explain)s.</p>\n    </body>\n</html>\n'
 
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        """Render errors with integer status codes on every supported Python version."""
+
         super().send_error(int(code), message, explain)
 
     _cache_control_sent = False
