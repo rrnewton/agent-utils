@@ -822,7 +822,8 @@ def test_suggestion13_unknown_argv_can_verify_only_kernel_generation_or_opened_l
     executable = tmp_path / "muse"
     shutil.copyfile("/usr/bin/sleep", executable)
     executable.chmod(0o700)
-    process = subprocess.Popen([str(executable), "30"], start_new_session=True)
+    # Multicall coreutils still needs the sleep applet in argv[0].
+    process = subprocess.Popen(["sleep", "30"], executable=str(executable), start_new_session=True)
     try:
         foreground: dict[str, object] = {
             "pid": process.pid, "name": "untrusted-name", "cmdline": "untrusted-command", "argv": None,
@@ -1776,7 +1777,7 @@ def test_recorded_custom_process_identity_survives_atomic_executable_replacement
     shutil.copyfile("/bin/sleep", executable)
     executable.chmod(0o700)
     client = HerdrClient(herdr_bin="fixture-herdr", run=Runner({}))
-    first = subprocess.Popen([str(executable), "60"], start_new_session=True)
+    first = subprocess.Popen(["sleep", "60"], executable=str(executable), start_new_session=True)
     second: subprocess.Popen[bytes] | None = None
     try:
         metadata = executable.stat()
@@ -1821,7 +1822,7 @@ def test_recorded_custom_process_identity_survives_atomic_executable_replacement
         )
         assert client._pane_process_identity(duplicated, None, identity) is None
 
-        second = subprocess.Popen([str(executable), "60"], start_new_session=True)
+        second = subprocess.Popen(["sleep", "60"], executable=str(executable), start_new_session=True)
         second_info = ProcessInfo(
             pane_id="p1", shell_pid=1, foreground_pgid=second.pid,
             foreground=((second.pid, "muse", str(executable), str(executable), None),),

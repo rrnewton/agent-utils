@@ -482,7 +482,7 @@ def test_leftover_test_binaries_finds_a_running_artifact(tmp_path: Path) -> None
     # running, and goes quiet once it is gone.
     sleeper = tmp_path / "agentctl-fake-test-binary"
     shutil.copy("/bin/sleep", sleeper)
-    process = subprocess.Popen([sleeper, "60"])
+    process = subprocess.Popen(["sleep", "60"], executable=sleeper)
     try:
         artifacts = [("agentctl", "fake", str(sleeper))]
         assert case_timings._leftover_test_binaries(artifacts)

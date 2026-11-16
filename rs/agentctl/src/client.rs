@@ -4439,7 +4439,9 @@ mod tests {
         // while the copy was open for writing: that child holds the descriptor until it execs.
         for _ in 0..100 {
             let mut command = Command::new(executable);
-            command.arg("30").process_group(0);
+            // Multicall coreutils selects its applet using argv[0], even when the
+            // copied executable has a harness name. Keep /proc/PID/exe renamed.
+            command.arg0("sleep").arg("30").process_group(0);
             match command.spawn() {
                 Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                     std::thread::sleep(Duration::from_millis(20));
