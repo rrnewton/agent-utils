@@ -37153,12 +37153,13 @@ def test_agent_remove_builds_and_verifies_a_local_archive_before_the_lock(
     ).stdout
     assert receipt["salvage_commit"] in shown
     calls = log.read_text(encoding="utf-8").splitlines()
-    # The bundle is made and restored into a fresh clone once, before the
-    # registry lock; the rechecks under the lock reread only its bytes.
+    # The thin bundle is made and verified once, before the registry lock
+    # (bundle create + bundle verify; its carried objects are checked
+    # without an fsck over the prerequisites' history, #1681); the
+    # rechecks under the lock reread only its bytes.
     assert [line for line in calls if line.split()[0] in {"bundle", "clone", "fsck"}] == [
         "bundle free",
         "bundle free",
-        "fsck free",
     ], calls
     assert all(line.endswith(" free") for line in calls), calls
     # Nothing is left beside the shared bundle but the bundle, its record of
