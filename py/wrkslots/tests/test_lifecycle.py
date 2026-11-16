@@ -59283,6 +59283,12 @@ def test_remove_of_an_image_backed_agent_slot_checks_use_outside_the_lock(
         monkeypatch.setattr(wrkslots, "_lsof_slot_use", count_ordinary)
         monkeypatch.setattr(slotimage, "sole_file_system_doubt", count_doubt)
 
+        # The shared btrfs backing image is not an ext4 slot image. Its UUID
+        # is learned through udev; finish the fixture's asynchronous device
+        # events before asking the real fail-closed removal proof to decide.
+        if shutil.which("udevadm") is not None:
+            subprocess.run(["udevadm", "settle", "--timeout=10"], check=True, timeout=12)
+
         returncode, stderr = single_remove(project, "slot01")
 
         assert returncode == 0, stderr

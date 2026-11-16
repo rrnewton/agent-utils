@@ -30,6 +30,14 @@ print(_root_owned_executable(Path('/usr/bin/sudo'), 'sudo'))
 PY
 sudo -n true
 
+# Image-removal safety proves every bound loop filesystem's identity. Hosted
+# images may leave udev inactive; without its UUID database, the btrfs test
+# backing device looks unidentified and the production guard rightly refuses.
+# Start it only on this disposable VM, before creating any test loop devices.
+sudo -n systemctl start systemd-udevd.service
+sudo -n udevadm trigger --action=change --subsystem-match=block
+sudo -n udevadm settle --timeout=30
+
 # Replay/commit-tree fixtures create fresh bare repositories, so repository-local
 # identity from the checkout cannot supply their committer. This VM is disposable.
 git config --global user.name 'agent-utils CI'
@@ -66,6 +74,13 @@ sudo -n chown root:root "$test_tmp"
 sudo -n chmod 1777 "$test_tmp"
 sudo -n mount --bind "$test_tmp" /tmp
 test "$(findmnt -n -o FSTYPE --target /tmp)" = btrfs
+test_loop_device=$(findmnt -n -o SOURCE --target "$test_tmp")
+sudo -n udevadm settle --timeout=30
+test_loop_uuid=$(sudo -n blkid -s UUID -o value "$test_loop_device")
+test -n "$test_loop_uuid"
+# Read the same world-readable udev evidence the unprivileged tests consume.
+udevadm info --query=property --name="$test_loop_device" | \
+    grep -Fx "ID_FS_UUID=$test_loop_uuid"
 probe=$(mktemp /tmp/nocow.XXXXXX)
 chattr +C "$probe"
 lsattr "$probe"
