@@ -28469,7 +28469,42 @@ def _verify_local_salvage_bundle(
                 f"local salvage bundle ref {archive_ref} names {restored_commit}, not {commit}"
             )
         vcs._run(restored, ["cat-file", "-e", f"{commit}^{{tree}}"])
-        vcs._run(restored, ["fsck", "--full", "--strict", "--no-dangling"])
+        if prerequisites:
+            # Thin bundle (#1681): fsck --full would walk the prerequisites'
+            # whole history in the durable stores, which is theirs to vouch
+            # for and the expensive pass on a huge repository. Instead check
+            # exactly what the bundle itself carries: every object reachable
+            # from the commit but not from any prerequisite must be present
+            # (the fetch from the bundle already validated each pack object's
+            # hash via index-pack). This still proves pack integrity, the
+            # prerequisites' presence (bundle verify above), the exact ref
+            # and commit, and the presence of every bundle-carried object; it
+            # no longer proves fsck's format strictness over the bundle's
+            # objects or anything about prerequisite history.
+            carried = vcs._run(
+                restored,
+                [
+                    "rev-list",
+                    "--objects",
+                    commit,
+                    *[f"^{item}" for item in prerequisites],
+                ],
+            ).stdout.splitlines()
+            names = [line.split(" ", 1)[0] for line in carried if line.strip()]
+            if names:
+                checked = vcs._run(
+                    restored,
+                    ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                    input_text="".join(f"{name}\n" for name in names),
+                ).stdout.splitlines()
+                if len(checked) != len(names) or any(
+                    len(line.split()) != 2 for line in checked
+                ):
+                    raise Refusal(
+                        "thin salvage bundle does not carry every object it must"
+                    )
+        else:
+            vcs._run(restored, ["fsck", "--full", "--strict", "--no-dangling"])
     if verified is not None:
         verified.add(key)
 
@@ -28532,7 +28567,7 @@ def _local_salvage_receipt_payload(
         "verification": {
             "fresh_bare_clone": not thin_proof,
             "exact_ref": True,
-            "full_fsck": True,
+            "full_fsck": not thin_proof,
             "complete_history": not thin_proof,
         },
     }
@@ -28680,7 +28715,7 @@ def _shared_salvage_metadata(
         "verification": {
             "fresh_bare_clone": not thin_proof,
             "exact_ref": True,
-            "full_fsck": True,
+            "full_fsck": not thin_proof,
             "complete_history": not thin_proof,
             "result": "pass",
         },
