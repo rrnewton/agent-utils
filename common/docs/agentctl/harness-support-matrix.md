@@ -431,7 +431,10 @@ arguments and conversation (`split_conversation`, `fresh_arguments`,
 
 - **Claude Code**: supported — selectors (`--session-id`, `--resume`,
   `--continue`, `-r`, `-c`) are split, refused when ambiguous, and
-  replayed exactly.
+  replayed exactly. Native foreground process-group leaders remain provable
+  when helper children share that group, including versioned native installs
+  (`ClaudeCode::native_group_leader` and `harness_identity` in
+  `rs/agentctl/src/client.rs`). Script wrappers remain refused.
 - **Codex**: supported — a leading `resume ID` is split and replayed; a
   selector with no id (`--last`) is refused rather than guessed.
 - **Muse**: partial — a trailing `resume ID` replays, but a fresh start
@@ -441,6 +444,15 @@ arguments and conversation (`split_conversation`, `fresh_arguments`,
   harness (`split_conversation` returns `None`; replay errors).
 - **Headless**: supported — the wrapper resumes its recorded session;
   restore skips live wrappers and never repeats a published revive.
+
+Opt-in `watch` agent repair uses the existing restore transaction for the
+configured desired set, including within-boot outages (#333 recovery-reconciler).
+It requires a recorded conversation and refuses fresh fallback. Native Claude
+and Codex panes may retain matching stale session metadata after independent
+process-death, owned-pane and stable empty-shell proofs; a different session
+remains refused. The manual restore default keeps its existing fresh-fallback
+policy unless `require_recorded_session` is set. Unknown and unresumable harnesses
+do not gain automatic recovery support.
 
 ### Effort control
 
