@@ -385,6 +385,9 @@ pub(crate) enum Writers {
 pub(crate) enum Readers {
     /// Print the Python `doctor` command's envelope (JSON) or human form
     DoctorText {
+        /// Snapshot-only fast mode for periodic gates (#1706)
+        #[arg(long)]
+        quick: bool,
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -2612,6 +2615,7 @@ pub fn run() -> u8 {
         },
         Command::Readers(inner) => match inner {
             Readers::DoctorText {
+                quick,
                 root,
                 machine,
                 all_machines,
@@ -2621,6 +2625,7 @@ pub fn run() -> u8 {
                 machine.as_deref(),
                 all_machines,
                 format == "human",
+                quick,
             ) {
                 Ok(text) => {
                     print!("{text}");

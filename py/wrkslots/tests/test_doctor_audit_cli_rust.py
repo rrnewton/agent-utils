@@ -48,6 +48,10 @@ def _normalized(document: dict[str, object]) -> dict[str, object]:
     for record in active:
         age = cast(int, record.pop("heartbeat_age_seconds"))
         assert age >= 0
+    # #1706: per-phase timings and subprocess counts describe the run,
+    # not the registry; two editions never agree on them exactly.
+    document.pop("timings", None)
+    document.pop("subprocesses", None)
     return document
 
 

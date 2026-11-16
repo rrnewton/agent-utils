@@ -18822,6 +18822,7 @@ class _GitVcs:
         command, env, what = _GitVcs._invocation(
             repository, args, env_overrides, config=config
         )
+        _count_subprocess()
         pacing_deadline: float | None = None
         while True:
             seconds, expired = _GitVcs._bound(what, timeout_seconds, timeout_refusal)
@@ -54295,6 +54296,20 @@ class _ScanTimeout(Exception):
         self.snapshot = snapshot
 
 
+# Subprocesses spawned by the current read-only scan (#1706): doctor
+# reports the count so a slowdown names its own cost.  A one-element
+# list in a ContextVar, like the other per-command diagnostics.
+_SCAN_SUBPROCESSES: contextvars.ContextVar[list[int] | None] = (
+    contextvars.ContextVar("wrkslots_scan_subprocesses", default=None)
+)
+
+
+def _count_subprocess() -> None:
+    counter = _SCAN_SUBPROCESSES.get()
+    if counter is not None:
+        counter[0] += 1
+
+
 def _scan_deadline(
     args: argparse.Namespace,
     *,
@@ -55100,8 +55115,193 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         restore_memory_limit()
 
 
+_QUICK_SKIPPED = (
+    "storage census (filesystem and Git registration checks)",
+    "identity drift",
+    "slot-image lock findings",
+    "owner liveness probes (rows report liveness unverifiable)",
+    "proof-mirror findings",
+    "shared-submodule findings",
+    "worktree-config findings",
+    "harness-checkout findings",
+    "Eden discovery and backing findings",
+)
+
+
+def _doctor_quick(args: argparse.Namespace, config: Config) -> int:
+    """Snapshot-only doctor for periodic gates (#1706).
+
+    Reads the registry snapshot under the shared lock and reports only
+    what it carries: holds, owner releases, dead owners (local /proc
+    identity check, no probe subprocess), and interrupted journals.
+    Every slower check is named in ``skipped``; the full doctor stays
+    the complete check.  No subprocess is spawned.
+    """
+
+    started = time.monotonic()
+    counter = [0]
+    token = _SCAN_SUBPROCESSES.set(counter)
+    try:
+        with _locked(
+            config.control / "ACTIVE",
+            exclusive=False,
+            wait_seconds=float(args.wait_lock),
+        ):
+            all_states, _archives, _absent_paths, _absent_slots = (
+                _validate_global_state_beside_absent_batch(
+                    config, require_repository=False, announce=False
+                )
+            )
+            attachments, control_findings = _slot_findings_registry_tail(
+                config, all_states
+            )
+        snapshot_seconds = time.monotonic() - started
+        states = (
+            all_states
+            if args.all_machines
+            else [state for state in all_states if state.machine == config.machine]
+        )
+        hold_results = _load_record_holds(config, all_states)
+        releases = _owner_release_states(config, all_states)
+        findings: list[dict[str, object]] = [
+            dict(item) for item in (*attachments, *control_findings)
+        ]
+        if not args.all_machines:
+            findings = [
+                item
+                for item in findings
+                if item["machine"] is None or item["machine"] == config.machine
+            ]
+        for state in states:
+            for record in state.slots:
+                hold_result = hold_results[(record.machine, record.slot)]
+                if hold_result.error is not None:
+                    findings.append(
+                        _operational_finding(
+                            "invalid-hold", record.slot, state.machine,
+                            hold_result.error,
+                        )
+                    )
+                process_state, process_detail = _process_state(record.owner)
+                if process_state == "dead":
+                    findings.append(
+                        _operational_finding(
+                            "dead-owner", record.slot, state.machine,
+                            f"recorded owner is not running ({process_detail}); "
+                            "the slot is held by a row whose owner has exited",
+                        )
+                    )
+        journal_paths = [
+            *_outstanding_journals(config),
+            *_validate_batch_seal_journals(config),
+        ]
+        reports = _interrupted_journal_reports(config, journal_paths)
+        for report in reports:
+            finding = _operational_finding(
+                (
+                    "journal-in-progress"
+                    if report["state"] == "in-progress"
+                    else "interrupted-mutation"
+                ),
+                report["slot"] if isinstance(report["slot"], str) else None,
+                config.machine,
+                _format_journal_report(report) + f" ({report['reason']})",
+            )
+            finding["remedy"] = (
+                f"run '{report['recover_command']}' to resume the recorded "
+                "operation; diagnosis alone authorizes no mutation"
+            )
+            findings.append(finding)
+        rows = [
+            _status_record(
+                config,
+                record,
+                hold_result=hold_results[(record.machine, record.slot)],
+                tolerate_hold_error=True,
+                owner_release=releases.get((record.machine, record.slot)),
+                liveness=(
+                    "unverifiable",
+                    "quick mode: liveness probes skipped",
+                ),
+            )
+            for state in states
+            for record in state.slots
+        ]
+        total_seconds = time.monotonic() - started
+        timings: dict[str, float] = {
+            "snapshot": round(snapshot_seconds, 3),
+            "total": round(total_seconds, 3),
+        }
+        counts: dict[str, int] = {}
+        for item in findings:
+            kind = str(item["kind"])
+            counts[kind] = counts.get(kind, 0) + 1
+        slowest = max(timings, key=lambda name: timings[name])
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema": SCHEMA,
+                        "quick": True,
+                        "project_root": str(config.root),
+                        "worktrees_dir": str(config.worktrees),
+                        "control_dir": str(config.control),
+                        "layout": config.layout,
+                        "machines": [state.machine for state in states],
+                        "active": rows,
+                        "max_active_slots": config.max_active_slots,
+                        "findings": findings,
+                        "counts_by_kind": counts,
+                        "interrupted_journals": reports,
+                        "skipped": list(_QUICK_SKIPPED),
+                        "slowest_check": slowest,
+                        "timings": timings,
+                        "subprocesses": counter[0],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(
+                f"project={config.root} worktrees={config.worktrees} "
+                f"control={config.control} layout={config.layout} "
+                f"active={len(rows)} findings={len(findings)} quick=true"
+            )
+            for kind in sorted(counts):
+                print(f"  {counts[kind]:4d}  {kind}")
+            for report in reports:
+                print(_format_journal_report(report))
+            print(f"SKIPPED: {'; '.join(_QUICK_SKIPPED)}")
+            print(
+                f"timing: total={timings['total']}s slowest={slowest} "
+                f"subprocesses={counter[0]}"
+            )
+        return 0
+    finally:
+        _SCAN_SUBPROCESSES.reset(token)
+
+
 def _cmd_doctor_scan(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
+    if getattr(args, "quick", False):
+        return _doctor_quick(args, config)
+    try:
+        return _cmd_doctor_scan_timed(args, config)
+    finally:
+        token = _DOCTOR_SUBPROCESS_TOKEN.get()
+        if token is not None:
+            _SCAN_SUBPROCESSES.reset(token)
+            _DOCTOR_SUBPROCESS_TOKEN.set(None)
+
+
+# Token for the full doctor's subprocess counter, reset by the wrapper.
+_DOCTOR_SUBPROCESS_TOKEN: contextvars.ContextVar[
+    "contextvars.Token[list[int] | None] | None"
+] = contextvars.ContextVar("wrkslots_doctor_subprocess_token", default=None)
+
+
+def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
     _prewarm_registry_read(
         lambda: _validate_global_state_beside_absent_batch(
             config, require_repository=False, announce=False
@@ -55110,6 +55310,19 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
     deadline = _scan_deadline(args)
     _bound_event_retention()
     cache = _PhasedReadCache(deadline=deadline)
+    # Per-phase timing and subprocess counts for --json (#1706): the
+    # next slowdown must be visible before a periodic gate times out.
+    scan_started = time.monotonic()
+    subprocess_counter = [0]
+    _DOCTOR_SUBPROCESS_TOKEN.set(_SCAN_SUBPROCESSES.set(subprocess_counter))
+    phases: dict[str, float] = {}
+
+    def timed(name: str, fn):  # type: ignore[no-untyped-def]
+        start = time.monotonic()
+        try:
+            return fn()
+        finally:
+            phases[name] = phases.get(name, 0.0) + (time.monotonic() - start)
 
     def snapshot() -> tuple[
         list[ActiveState],
@@ -55122,12 +55335,16 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         # to 12:45:29Z, the health tick's doctor ran in that window, and the
         # whole report refused. Any overlap the batch does not name still
         # refuses.
-        all_states, _archives, _absent_paths, _absent_slots = (
-            _validate_global_state_beside_absent_batch(
+        all_states, _archives, _absent_paths, _absent_slots = timed(
+            "snapshot",
+            lambda: _validate_global_state_beside_absent_batch(
                 config, require_repository=False, announce=False
-            )
+            ),
         )
-        return all_states, _slot_findings_registry_tail(config, all_states)
+        return all_states, timed(
+            "registry_tail",
+            lambda: _slot_findings_registry_tail(config, all_states),
+        )
 
     def measure(
         taken: tuple[
@@ -55149,10 +55366,19 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
             config,
             all_states,
             hold_results,
-            storage=cache.storage_inconsistencies(config, all_states),
+            storage=timed(
+                "storage_census",
+                lambda: cache.storage_inconsistencies(config, all_states),
+            ),
             releases=releases,
-            drift=cache.identity_drift(config, all_states),
-            image_locks=cache.image_lock_findings(config, all_states),
+            drift=timed(
+                "identity_drift",
+                lambda: cache.identity_drift(config, all_states),
+            ),
+            image_locks=timed(
+                "image_locks",
+                lambda: cache.image_lock_findings(config, all_states),
+            ),
             registry_tail=registry_tail,
         )
         findings = (
@@ -55166,12 +55392,39 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         )
         # #1206 check mode: primary submodule repositories that create
         # would need to prepare, and slot submodules still privately cloned.
-        findings.extend(_proof_mirror_doctor_findings(config))
-        findings.extend(_shared_submodule_doctor_findings(config, states))
-        findings.extend(_worktree_config_doctor_findings(config, states))
-        findings.extend(_harness_checkout_doctor_findings(config, states))
-        findings.extend(_eden_discovery_doctor_findings(config, states))
-        findings.extend(_eden_backing_doctor_findings(config, states))
+        findings.extend(
+            timed("proof_mirror", lambda: _proof_mirror_doctor_findings(config))
+        )
+        findings.extend(
+            timed(
+                "shared_submodule",
+                lambda: _shared_submodule_doctor_findings(config, states),
+            )
+        )
+        findings.extend(
+            timed(
+                "worktree_config",
+                lambda: _worktree_config_doctor_findings(config, states),
+            )
+        )
+        findings.extend(
+            timed(
+                "harness_checkout",
+                lambda: _harness_checkout_doctor_findings(config, states),
+            )
+        )
+        findings.extend(
+            timed(
+                "eden_discovery",
+                lambda: _eden_discovery_doctor_findings(config, states),
+            )
+        )
+        findings.extend(
+            timed(
+                "eden_backing",
+                lambda: _eden_backing_doctor_findings(config, states),
+            )
+        )
         # Interrupted mutations, as status reports them (#1700).
         journal_paths = [
             *_outstanding_journals(config),
@@ -55195,7 +55448,9 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
             findings.append(finding)
         findings.extend(_create_journal_hook_drift_findings(config))
         doctor_records = [record for state in states for record in state.slots]
-        doctor_liveness = cache.owner_liveness(config, doctor_records)
+        doctor_liveness = timed(
+            "owner_liveness", lambda: cache.owner_liveness(config, doctor_records)
+        )
         rows = [
             _status_record(
                 config,
@@ -55313,6 +55568,20 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
                     "active": rows,
                     "max_active_slots": cap,
                     "findings": findings,
+                    "counts_by_kind": {
+                        kind: sum(
+                            1 for item in findings if str(item["kind"]) == kind
+                        )
+                        for kind in sorted({str(item["kind"]) for item in findings})
+                    },
+                    "timings": {
+                        **{
+                            name: round(seconds, 3)
+                            for name, seconds in sorted(phases.items())
+                        },
+                        "total": round(time.monotonic() - scan_started, 3),
+                    },
+                    "subprocesses": subprocess_counter[0],
                     **(
                         {"partial": True, "scan_timeout": partial_detail}
                         if partial_detail is not None
@@ -81048,6 +81317,7 @@ def _run_bounded_read_only_command(
     for executable in trusted_executables:
         _recheck_trusted_executable(executable)
     deadline = time.monotonic() + timeout_seconds
+    _count_subprocess()
     try:
         process = subprocess.Popen(
             list(command),
@@ -89906,6 +90176,18 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="list every registry/storage disagreement at once (read-only)",
     )
     doctor.add_argument("--all-machines", action="store_true", help="read every ACTIVE shard")
+    doctor.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "snapshot-only fast mode for periodic gates: registry rows, holds, "
+            "dead owners and interrupted journals, with per-class counts, the "
+            "interrupted list, per-phase timings and a SKIPPED list naming every "
+            "check it omits (storage/Git censuses, liveness probes, submodule "
+            "walks); designed to finish in seconds on a busy host and bounded "
+            "by --scan-timeout like the full scan"
+        ),
+    )
     doctor.add_argument("--format", choices=("human", "json"), default="human")
     doctor.add_argument(
         "--scan-timeout",

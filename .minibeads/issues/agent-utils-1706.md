@@ -58,3 +58,29 @@ event-log scans, /proc scans, and how long the lock is held.
 Related: #1700 (status and doctor report interrupted mutations), #1701
 (recover-absent holds every lock while thrashing), #1276 (create and adopt
 validate the whole registry under the exclusive lock).
+
+## Profile (before, 2026-11-16)
+
+cProfile of `wrkslots doctor --format json` on this host's real
+registry (20 active slots, 124 findings): 8.7 s bare (3.5 user +
+4.6 sys), 12.4 s under profiler. 452 subprocess.run calls (392
+through `_GitVcs._run`), 10.8 s in subprocess wait. Top phases on
+the same registry with timings enabled: owner_liveness 4.16 s,
+worktree_config 4.08 s, shared_submodule 2.61 s, identity_drift
+0.80 s, storage_census 0.55 s, snapshot 0.02 s; 392 git
+subprocesses. Per-slot liveness probes (0.178 s each) and the two
+submodule walks dominate; the lock is not held during them
+(phased read). `doctor --quick` on the same registry: 0.65 s,
+0 subprocesses.
+
+## Resolution (part 1: timings + quick mode)
+
+Full doctor --json now carries `timings` (per phase plus total),
+`subprocesses`, and `counts_by_kind`. `doctor --quick` is the
+snapshot-only gate mode: holds/releases/dead owners from the
+snapshot, interrupted journals, per-class counts, `slowest_check`,
+and a `skipped` list naming every omitted check; it spawns no
+subprocess. Rust doctor-text implements the same `--quick` and
+envelope fields. The optimisation commit (liveness batching, one
+shared submodule census) follows separately with before/after
+timings.

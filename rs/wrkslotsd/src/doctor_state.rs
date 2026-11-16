@@ -285,7 +285,11 @@ pub(crate) fn doctor_cli(
     machine_override: Option<&str>,
     all_machines: bool,
     human: bool,
+    quick: bool,
 ) -> Result<String> {
+    if quick {
+        return doctor_quick(root, machine_override, all_machines, human);
+    }
     // Published only from a read the registry did not change under
     // (#1200 rust-status-consistency).
     let (cfg, _selected) = load_cfg(root, machine_override)?;
@@ -294,12 +298,150 @@ pub(crate) fn doctor_cli(
     })
 }
 
+/// Snapshot-only doctor for periodic gates (#1706), mirroring the
+/// Python `doctor --quick`: scoped snapshot findings plus interrupted
+/// journals, with per-class counts and the skipped list. No Git census
+/// and no liveness probe runs.
+fn doctor_quick(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    all_machines: bool,
+    human: bool,
+) -> Result<String> {
+    let started = std::time::Instant::now();
+    let (cfg, _selected) = load_cfg(root, machine_override)?;
+    let envelope = parse_doctor(root, machine_override, all_machines)?;
+    let mut findings = envelope
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let journals = parse_journals(root)?;
+    let names: Vec<String> = journals
+        .get("journals")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let reports = crate::journals_state::journal_reports(&cfg.control, &names);
+    for report in &reports {
+        let kind = if report.get("state").and_then(Value::as_str) == Some("in-progress") {
+            "journal-in-progress"
+        } else {
+            "interrupted-mutation"
+        };
+        let mut finding = note(
+            kind,
+            report.get("slot").and_then(Value::as_str),
+            Some(cfg.machine.as_str()),
+            format!(
+                "{} ({})",
+                crate::journals_state::format_journal_report(report),
+                report
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            ),
+        );
+        finding["remedy"] = json!(format!(
+            "run '{}' to resume the recorded operation; diagnosis alone authorizes no mutation",
+            report
+                .get("recover_command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ));
+        findings.push(finding);
+    }
+    let mut counts = serde_json::Map::new();
+    for item in &findings {
+        if let Some(kind) = item.get("kind").and_then(Value::as_str) {
+            let entry = counts.entry(kind.to_string()).or_insert_with(|| json!(0));
+            if let Some(number) = entry.as_i64() {
+                *entry = json!(number + 1);
+            }
+        }
+    }
+    let total = started.elapsed().as_secs_f64();
+    let skipped = json!([
+        "storage census (filesystem and Git registration checks)",
+        "identity drift",
+        "slot-image lock findings",
+        "owner liveness probes (rows report liveness unverifiable)",
+        "proof-mirror findings",
+        "shared-submodule findings",
+        "worktree-config findings",
+        "harness-checkout findings",
+        "Eden discovery and backing findings",
+    ]);
+    if !human {
+        let quick_envelope = json!({
+            "schema": 2,
+            "quick": true,
+            "project_root": cfg.root.to_string_lossy(),
+            "worktrees_dir": cfg.worktrees.to_string_lossy(),
+            "control_dir": cfg.control.to_string_lossy(),
+            "layout": cfg.layout,
+            "machines": envelope.get("machines").cloned().unwrap_or(json!([])),
+            "active": envelope.get("active").cloned().unwrap_or(json!([])),
+            "max_active_slots": envelope.get("max_active_slots").cloned().unwrap_or(Value::Null),
+            "findings": findings,
+            "counts_by_kind": counts,
+            "interrupted_journals": reports,
+            "skipped": skipped,
+            "slowest_check": "snapshot",
+            "timings": {"snapshot": total, "total": total},
+            "subprocesses": 0,
+        });
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&quick_envelope)
+                .map_err(|error| format!("cannot encode doctor: {error}"))?
+        ));
+    }
+    let active = envelope
+        .get("active")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let mut out = format!(
+        "project={} worktrees={} control={} layout={} active={} findings={} quick=true\n",
+        cfg.root.display(),
+        cfg.worktrees.display(),
+        cfg.control.display(),
+        cfg.layout,
+        active,
+        findings.len(),
+    );
+    let mut kinds: Vec<(&String, &Value)> = counts.iter().collect();
+    kinds.sort_by(|a, b| a.0.cmp(b.0));
+    for (kind, number) in kinds {
+        out.push_str(&format!("  {number:>4}  {kind}\n"));
+    }
+    for report in &reports {
+        out.push_str(&format!(
+            "{}\n",
+            crate::journals_state::format_journal_report(report)
+        ));
+    }
+    out.push_str(
+        "SKIPPED: storage census (filesystem and Git registration checks); identity drift; slot-image lock findings; owner liveness probes (rows report liveness unverifiable); proof-mirror findings; shared-submodule findings; worktree-config findings; harness-checkout findings; Eden discovery and backing findings\n",
+    );
+    out.push_str(&format!(
+        "timing: total={total:.3}s slowest=total subprocesses=0\n"
+    ));
+    Ok(out)
+}
+
 fn doctor_cli_once(
     root: Option<&Path>,
     machine_override: Option<&str>,
     all_machines: bool,
     human: bool,
 ) -> Result<String> {
+    let doctor_started = std::time::Instant::now();
     let (cfg, selected) = load_cfg(root, machine_override)?;
     let config = load_config(root, machine_override)?;
     let cap = config
@@ -658,6 +800,17 @@ fn doctor_cli_once(
         None
     };
     if !human {
+        let mut counts_by_kind = serde_json::Map::new();
+        for item in &findings {
+            if let Some(kind) = item.get("kind").and_then(Value::as_str) {
+                let entry = counts_by_kind
+                    .entry(kind.to_string())
+                    .or_insert_with(|| json!(0));
+                if let Some(number) = entry.as_i64() {
+                    *entry = json!(number + 1);
+                }
+            }
+        }
         let event_counts: serde_json::Map<String, Value> = machines
             .iter()
             .map(|machine| {
@@ -678,6 +831,9 @@ fn doctor_cli_once(
             "active": records,
             "max_active_slots": cap,
             "findings": findings,
+            "counts_by_kind": counts_by_kind,
+            "timings": {"total": doctor_started.elapsed().as_secs_f64()},
+            "subprocesses": Value::Null,
         });
         if let (Some(scope), Some(object)) = (&wt_scope, envelope.as_object_mut()) {
             object.insert("worktrees_image".to_string(), json!(scope));
