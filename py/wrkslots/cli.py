@@ -51949,6 +51949,30 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     _bound_event_retention()
     try:
         return _cmd_audit_scan(args)
+    except SystemError as exc:
+        if not _is_memory_bound_system_error(args, exc):
+            raise
+        # Allocation failure under the bound, in its SystemError form
+        # (#1749): publish the same partial result as a MemoryError hit.
+        detail = _MEMORY_BOUND_SYSTEM_ERROR_DETAIL
+        if getattr(args, "format", "human") == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema": SCHEMA,
+                        "partial": True,
+                        "scan_timeout": detail,
+                        "state": "unknown",
+                        "summary": detail,
+                        "slots": [],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"PARTIAL: {detail}")
+        return 2
     except (_ScanTimeout, MemoryError) as exc:
         # Partial results (#1247): the scan stopped at its wall or memory
         # bound, so no verdicts are published; the marker keeps that from
@@ -53110,6 +53134,28 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
     restore_memory_limit = _apply_scan_memory_limit(args)
     try:
         return _cmd_unpushed_scan(args)
+    except SystemError as exc:
+        if not _is_memory_bound_system_error(args, exc):
+            raise
+        # Registry validation runs before the scan's guarded section;
+        # a bound hit there gets the same partial result (#1749).
+        detail = _MEMORY_BOUND_SYSTEM_ERROR_DETAIL
+        if getattr(args, "format", "human") == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema": SCHEMA,
+                        "slots": [],
+                        "partial": True,
+                        "scan_timeout": detail,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"PARTIAL: {detail}")
+        return 2
     finally:
         restore_memory_limit()
 
@@ -53186,6 +53232,10 @@ def _cmd_unpushed_scan(args: argparse.Namespace) -> int:
             "read-only scan exceeded its --scan-memory-limit bound; "
             "rerun with a larger bound if a full scan is required"
         )
+    except SystemError as exc:
+        if not _is_memory_bound_system_error(args, exc):
+            raise
+        partial_detail = _MEMORY_BOUND_SYSTEM_ERROR_DETAIL
     payload: dict[str, object] = {"schema": SCHEMA, "slots": rows}
     if partial_detail is not None:
         payload["partial"] = True
@@ -53344,8 +53394,51 @@ def _check_scan_deadline(deadline: float, snapshot: object = None) -> None:
 
 #: Default address-space self-limit for one read-only scan, in GiB (#1247).
 #: A scan that reaches it fails its next allocation and reports partial
-#: results instead of growing until the host OOM-kills it.
-_SCAN_MEMORY_LIMIT_DEFAULT_GIB = 4.0
+#: results instead of growing until the host OOM-kills it. Sized from a
+#: full audit of an ~85,000-event registry (#1749): measured peak
+#: address space 4.96 GiB (peak RSS 4.67 GiB) at both serial and
+#: default parallelism, so 10 GiB is twice that peak; the previous
+#: 4.0 GiB sat below the peak and made every such audit report
+#: partial results.
+_SCAN_MEMORY_LIMIT_DEFAULT_GIB = 10.0
+
+
+#: Detail for a bound hit whose allocation failure surfaced as a
+#: SystemError instead of MemoryError (#1749). Named, so an operator can
+#: tell this conversion from an ordinary MemoryError bound hit.
+_MEMORY_BOUND_SYSTEM_ERROR_DETAIL = (
+    "read-only scan exceeded its --scan-memory-limit bound "
+    "(allocation failure reported as SystemError: "
+    "error return without exception set); "
+    "rerun with a larger bound if a full scan is required"
+)
+
+
+def _scan_memory_bound_active(args: argparse.Namespace) -> bool:
+    """Whether this invocation installed a positive scan memory bound."""
+
+    gib = getattr(args, "scan_memory_limit", None)
+    if gib is None:
+        gib = _SCAN_MEMORY_LIMIT_DEFAULT_GIB
+    return math.isfinite(gib) and gib > 0
+
+
+def _is_memory_bound_system_error(
+    args: argparse.Namespace, exc: BaseException
+) -> bool:
+    """Whether ``exc`` is a memory-bound allocation failure in disguise.
+
+    Under RLIMIT_AS a C allocation can fail without setting MemoryError;
+    CPython then raises SystemError with exactly this message (#1749).
+    Only that form, and only while the bound is active, is a bound hit:
+    any other SystemError is a real bug and keeps its traceback.
+    """
+
+    return (
+        isinstance(exc, SystemError)
+        and str(exc).strip() == "error return without exception set"
+        and _scan_memory_bound_active(args)
+    )
 
 
 def _apply_scan_memory_limit(args: argparse.Namespace) -> Callable[[], None]:
@@ -54178,6 +54271,11 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
             "rerun with a larger bound if a full scan is required"
         )
         states, findings, rows = [], [], []
+    except SystemError as exc:
+        if not _is_memory_bound_system_error(args, exc):
+            raise
+        partial_detail = _MEMORY_BOUND_SYSTEM_ERROR_DETAIL
+        states, findings, rows = [], [], []
     eden_section = (
         _eden_cap_section(config, states) if partial_detail is None else None
     )
@@ -54422,6 +54520,11 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             "read-only scan exceeded its --scan-memory-limit bound; "
             "rerun with a larger bound if a full scan is required"
         )
+        states, storage_inconsistencies, records, journals = [], (), [], []
+    except SystemError as exc:
+        if not _is_memory_bound_system_error(args, exc):
+            raise
+        partial_detail = _MEMORY_BOUND_SYSTEM_ERROR_DETAIL
         states, storage_inconsistencies, records, journals = [], (), [], []
     eden_section = (
         _eden_cap_section(config, states) if partial_detail is None else None

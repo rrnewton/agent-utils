@@ -508,3 +508,93 @@ def test_handoff_publication_parses_each_historical_record_once(
     # intents follow it. The per-intent rescan parsed the whole prefix for
     # each intent (here 6 x 24 parses).
     assert calls["n"] == historical
+
+
+def test_status_memory_bound_systemerror_reports_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Allocation failure in its SystemError form is a bound hit (#1749).
+
+    Under RLIMIT_AS a C allocation can fail without setting MemoryError;
+    CPython raises SystemError("error return without exception set").
+    With the bound active that is the partial result, never a traceback.
+    """
+
+    root = _registry(tmp_path / "case", 2)
+
+    def exhausted(*args: object, **kwargs: object) -> object:
+        raise SystemError("error return without exception set")
+
+    monkeypatch.setattr(wrkslots_cli, "_owner_liveness_states", exhausted)
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(io.StringIO()):
+        rc = wrkslots_cli._cmd_status(
+            _status_args(root, scan_memory_limit=64.0)
+        )
+    assert rc == 2
+    payload = json.loads(stream.getvalue())
+    assert payload["partial"] is True
+    assert "SystemError" in payload["scan_timeout"]
+    assert "scan-memory-limit" in payload["scan_timeout"]
+
+
+def test_status_other_systemerror_keeps_its_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any other SystemError is a real bug, bound or not (#1749)."""
+
+    root = _registry(tmp_path / "case", 2)
+
+    def broken(*args: object, **kwargs: object) -> object:
+        raise SystemError("some unrelated interpreter failure")
+
+    monkeypatch.setattr(wrkslots_cli, "_owner_liveness_states", broken)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+        io.StringIO()
+    ):
+        with pytest.raises(SystemError, match="unrelated interpreter"):
+            wrkslots_cli._cmd_status(_status_args(root, scan_memory_limit=64.0))
+
+
+def test_status_systemerror_without_the_bound_keeps_its_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The allocation form converts only while the bound is active (#1749)."""
+
+    root = _registry(tmp_path / "case", 2)
+
+    def exhausted(*args: object, **kwargs: object) -> object:
+        raise SystemError("error return without exception set")
+
+    monkeypatch.setattr(wrkslots_cli, "_owner_liveness_states", exhausted)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+        io.StringIO()
+    ):
+        with pytest.raises(SystemError, match="error return without"):
+            # _status_args defaults scan_memory_limit to 0.0 (disabled).
+            wrkslots_cli._cmd_status(_status_args(root))
+
+
+def test_audit_memory_bound_systemerror_reports_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The audit handler publishes its partial JSON, exit 2 (#1749)."""
+
+    root = _registry(tmp_path / "case", 1)
+
+    def exhausted(*args: object, **kwargs: object) -> object:
+        raise SystemError("error return without exception set")
+
+    monkeypatch.setattr(wrkslots_cli, "_cmd_audit_scan", exhausted)
+    args = argparse.Namespace(
+        project_root=str(root), format="json", scan_memory_limit=64.0
+    )
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(io.StringIO()):
+        rc = wrkslots_cli._cmd_audit(args)
+    assert rc == 2
+    payload = json.loads(stream.getvalue())
+    assert payload["partial"] is True
+    assert payload["state"] == "unknown"
+    assert payload["slots"] == []
+    assert "SystemError" in payload["summary"]
