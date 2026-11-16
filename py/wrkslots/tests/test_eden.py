@@ -37,6 +37,24 @@ def test_eden_checkout_round_trip() -> None:
     assert wrkslots_cli._checkout_to_obj(checkout) == _eden_obj()
 
 
+def test_eden_checkout_destination_is_always_checkout() -> None:
+    slot = Path("/slots/s1")
+    for layout in ("nested", "flat"):
+        assert (
+            wrkslots_cli._checkout_destination(slot, layout, "main", vcs="eden")
+            == slot / "checkout"
+        )
+    assert (
+        wrkslots_cli._checkout_destination(slot, "nested", "main")
+        == slot / "main"
+    )
+    assert wrkslots_cli._checkout_destination(slot, "flat", "main") == slot
+
+
+
+
+
+
 def test_parse_proc_stat_allows_pid1_zero_start() -> None:
     raw = (
         b"1 (systemd) S 0 1 1 0 -1 4194560 100 200 0 0 "
@@ -46,6 +64,102 @@ def test_parse_proc_stat_allows_pid1_zero_start() -> None:
     assert parsed is not None and parsed.pid == 1 and parsed.start_ticks == 0
     other = raw.replace(b"1 (systemd)", b"2 (kthreadd)", 1)
     assert wrkslots_cli._parse_proc_stat(other) is not None
+
+
+def test_slot_eden_daemon_cmdline_recognition() -> None:
+    slot = Path("/slots/s1")
+    own = "/usr/local/libexec/eden/edenfs --edenfs --edenDir /slots/s1/.eden-state --foreground"
+    other = "/usr/local/libexec/eden/edenfs --edenfs --edenDir /slots/s2/.eden-state"
+    assert wrkslots_cli._cmdline_is_slot_eden_daemon(own, slot)
+    assert wrkslots_cli._cmdline_is_slot_eden_daemon(
+        "edenfs --edenDir=/slots/s1/.eden-state", slot
+    )
+    assert not wrkslots_cli._cmdline_is_slot_eden_daemon(other, slot)
+    assert not wrkslots_cli._cmdline_is_slot_eden_daemon("vim /slots/s1/x", slot)
+    assert wrkslots_cli._cmdline_is_slot_eden_daemon(
+        "edenfs_privhelper --privhelper_uid=1", slot
+    )
+
+
+def test_eden_remote_unchanged_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkout = wrkslots_cli.Checkout(
+        name="main",
+        path="worktrees/slots/s1/checkout",
+        repository="/backing/repo",
+        branch=eden.EDEN_BRANCH,
+        start_point=REV,
+        remote=eden.EDEN_REMOTE,
+        remote_url_sha256=DIGEST,
+        landed_ref=eden.EDEN_LANDED_REF,
+        head=REV,
+        containing_remote_refs=(),
+        vcs="eden",
+    )
+    path = Path("/slots/s1/checkout")
+    vcs = wrkslots_cli._GitVcs()
+    monkeypatch.setattr(
+        wrkslots_cli, "_eden_runner", lambda argv: (1, "", "daemon down")
+    )
+    assert not wrkslots_cli._checkout_remote_unchanged(vcs, path, checkout)
+    monkeypatch.setattr(
+        wrkslots_cli, "_eden_runner", lambda argv: (0, "not json", "")
+    )
+    assert not wrkslots_cli._checkout_remote_unchanged(vcs, path, checkout)
+    good = (
+        '{"mount": "/slots/s1/checkout", "state_dir": "/s",'
+        ' "backing_repo": "/backing/repo",'
+        f' "checked_out_revision": "{REV}"}}'
+    )
+    monkeypatch.setattr(
+        wrkslots_cli, "_eden_runner", lambda argv: (0, good, "")
+    )
+    assert wrkslots_cli._checkout_remote_unchanged(vcs, path, checkout)
+    other = good.replace("/backing/repo", "/backing/other")
+    monkeypatch.setattr(
+        wrkslots_cli, "_eden_runner", lambda argv: (0, other, "")
+    )
+    assert not wrkslots_cli._checkout_remote_unchanged(vcs, path, checkout)
+
+
+def test_eden_record_paths_accept_new_and_legacy_forms(
+    tmp_path: Path,
+) -> None:
+    config = _direct_config(tmp_path)
+    record = _eden_validate_record(config, "/backing/repo")
+    new_path = record.checkouts[0].path
+    legacy_path = new_path.rsplit("/", 1)[0] + "/main"
+    for path in (new_path, legacy_path):
+        legacy = dataclasses.replace(
+            record,
+            checkouts=(
+                dataclasses.replace(record.checkouts[0], path=path),
+            ),
+        )
+        wrkslots_cli._assert_record_paths(
+            config, legacy, require_repository=False, historical=True
+        )
+        wrkslots_cli._assert_record_paths(
+            config, legacy, require_repository=False
+        )
+
+
+def test_census_record_drops_owner_only_for_eden(tmp_path: Path) -> None:
+    config = _direct_config(tmp_path)
+    eden_record = _eden_validate_record(config, "/backing/repo")
+    assert wrkslots_cli._census_record(None) is None
+    git_record = dataclasses.replace(
+        eden_record,
+        checkouts=(
+            dataclasses.replace(eden_record.checkouts[0], vcs="git"),
+        ),
+    )
+    assert wrkslots_cli._census_record(git_record) is None
+    census = wrkslots_cli._census_record(eden_record)
+    assert census is not None
+    assert census.owner is None
+    assert wrkslots_cli._record_is_eden(census)
 
 
 def test_eden_checkout_rejects_wrong_markers() -> None:
@@ -104,7 +218,11 @@ def test_salvage_and_remove_verification() -> None:
     assert eden.salvage_needed("", "c" * 40, REV)
     assert not eden.salvage_needed("", REV, REV)
     commands = eden.salvage_commands("/m/one", Path("/salvage/slot"))
-    assert commands[-1][-1].endswith("draft-stack.bundle")
+    assert commands[-1][0][-1].endswith("draft-stack.bundle")
+    assert commands[0][1] is not None and commands[0][1].endswith(
+        "working-copy.patch"
+    )
+    assert "-o" not in commands[0][0]
     assert eden.verify_removed((), "/m/one", ("/t/buck",), (), 10, 10) == ()
     problems = eden.verify_removed(
         ("/m/one",), "/m/one", ("/t/buck",), ("/t/buck",), 10, 99

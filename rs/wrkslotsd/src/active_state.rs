@@ -935,10 +935,32 @@ fn assert_record_paths(cfg: &Cfg, record: &RecordRec) -> Result<()> {
                 record.slot, checkout.name
             ));
         }
-        let expected_absolute = if layout == "flat" {
+        // Eden mounts always live at <slot>/checkout; pre-fix nested
+        // rows recorded <slot>/<name>, and both forms stay readable.
+        let expected_absolute = if checkout.vcs == "eden" {
+            expected_slot.join("checkout")
+        } else if layout == "flat" {
             expected_slot.clone()
         } else {
             expected_slot.join(&checkout.name)
+        };
+        let legacy_absolute = if checkout.vcs == "eden" {
+            Some(if layout == "flat" {
+                expected_slot.clone()
+            } else {
+                expected_slot.join(&checkout.name)
+            })
+        } else {
+            None
+        };
+        let legacy_relative = legacy_absolute
+            .as_ref()
+            .map(|path| posix_relative(&cfg.root, path))
+            .transpose()?;
+        let expected_absolute = if Some(checkout.path.as_str()) == legacy_relative.as_deref() {
+            legacy_absolute.unwrap_or(expected_absolute)
+        } else {
+            expected_absolute
         };
         let expected_relative = posix_relative(&cfg.root, &expected_absolute)?;
         if checkout.path != expected_relative {

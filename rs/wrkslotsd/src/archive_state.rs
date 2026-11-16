@@ -226,9 +226,12 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
             let alt_slot_path = cfg.worktrees.join("validate").join(&slot);
             let mut expecteds = Vec::new();
             for candidate in [slot_path, alt_slot_path] {
-                let destination = if checkout.vcs == "eden" && record_layout == "flat" {
-                    candidate.join("checkout")
-                } else if record_layout == "flat" {
+                // Eden mounts live at <slot>/checkout; pre-fix rows
+                // recorded the legacy form too, and both stay valid.
+                if checkout.vcs == "eden" {
+                    expecteds.push(posix_relative(&cfg.root, &candidate.join("checkout"))?);
+                }
+                let destination = if record_layout == "flat" {
                     candidate
                 } else {
                     candidate.join(&checkout.name)

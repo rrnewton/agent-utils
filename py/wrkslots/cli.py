@@ -11722,8 +11722,21 @@ def _registry_storage_inconsistencies(
                     machine=record.machine,
                 )
             else:
-                wanted = {checkout.name for checkout in record.checkouts}
+                wanted = {
+                    _checkout_destination(
+                        slot_path,
+                        _record_layout(config, record),
+                        checkout.name,
+                        checkout.vcs,
+                    ).name
+                    for checkout in record.checkouts
+                }
                 allowed = set(wanted)
+                if any(checkout.vcs == "eden" for checkout in record.checkouts):
+                    allowed.add(".eden-state")
+                    allowed.update(
+                        name for name in actual if name.endswith("-target")
+                    )
                 if record.slot_type == "agent":
                     allowed.add("HANDOFF.md")
                 for name in sorted(wanted - actual):
@@ -23003,8 +23016,20 @@ def _checkout_destination(
 ) -> Path:
     """The one rule for where a checkout lives inside its slot (#1204)."""
 
-    if vcs == "eden" and layout == "flat":
+    if vcs == "eden":
         return slot_path / "checkout"
+    return slot_path if layout == "flat" else slot_path / name
+
+
+def _eden_legacy_destination(slot_path: Path, layout: str, name: str) -> Path:
+    """Where pre-fix Eden rows recorded their checkout (#1432).
+
+    Eden mounts always lived at ``<slot>/checkout``, but nested rows
+    recorded ``<slot>/<name>``. Readers accept both forms so old
+    rows and archives stay readable; new rows always record
+    ``checkout``.
+    """
+
     return slot_path if layout == "flat" else slot_path / name
 
 
@@ -26681,6 +26706,16 @@ def _observe_slot_use_once(
             threads = ()
         surviving_threads.update(threads)
         pending.extend(reversed(threads))
+        if uses and record is not None and _record_is_eden(record):
+            daemon_use = all(
+                u.startswith("mount=") or "/.eden-state/" in u for u in uses
+            )
+            if not daemon_use and pid_dir.name.isdigit():
+                daemon_use = _pid_is_slot_eden_daemon(
+                    int(pid_dir.name), slot_path
+                )
+            if daemon_use:
+                uses = None
         if uses:
             refusal = Refusal(
                 f"live {_walked_process_label(pid_dir)} uses slot {slot_path}: "
@@ -27762,6 +27797,13 @@ def _assert_record_paths(
                 if checkout.path == absolute.relative_to(config.root).as_posix():
                     matched = absolute
                     break
+                if checkout.vcs == "eden":
+                    legacy = _eden_legacy_destination(
+                        candidate, layout, checkout.name
+                    )
+                    if checkout.path == legacy.relative_to(config.root).as_posix():
+                        matched = legacy
+                        break
             if matched is None:
                 expected_absolute = (
                     expected_slot if layout == "flat" else expected_slot / checkout.name
@@ -27782,6 +27824,13 @@ def _assert_record_paths(
                 expected_slot, layout, checkout.name, checkout.vcs
             )
             expected_relative = expected_absolute.relative_to(config.root).as_posix()
+        if checkout.vcs == "eden" and checkout.path != expected_relative:
+            legacy = _eden_legacy_destination(
+                expected_slot, layout, checkout.name
+            )
+            if checkout.path == legacy.relative_to(config.root).as_posix():
+                expected_absolute = legacy
+                expected_relative = checkout.path
         if checkout.path != expected_relative:
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} path does not match its slot: "
@@ -32544,6 +32593,22 @@ def _recorded_remote_names_same_repository(
 def _checkout_remote_unchanged(
     vcs: _GitVcs, path: Path, checkout: Checkout
 ) -> bool:
+    if checkout.vcs == "eden":
+        # Eden rows carry a fixed remote marker; the daemon is the
+        # authority for the backing repo, never Git. Fail closed:
+        # only a daemon answer naming the recorded backing counts
+        # as unchanged; anything unsure refuses salvage (#1432).
+        config_dir = str(path.parent / ".eden-state")
+        rc, out, _err = _eden_runner(
+            ["eden", "--config-dir", config_dir, "info", str(path)]
+        )
+        if rc != 0:
+            return False
+        try:
+            info = eden.parse_info(out)
+        except eden.EdenError:
+            return False
+        return info.backing_repo == checkout.repository
     authority_fn = getattr(vcs, "remote_authority", None)
     if authority_fn is None:
         # A test-double VCS may offer only the digest; exact comparison
@@ -33688,6 +33753,10 @@ def _salvage_agent_slot(
     candidates: list[tuple[Checkout, Path, bool, _CheckoutDrift | None, bool]] = []
     self_sourced_names: set[str] = set()
     for checkout in record.checkouts:
+        if checkout.vcs == "eden":
+            # Eden salvage runs in the Eden remove sequence
+            # (_finish_remove_paths), never through Git (#1204).
+            continue
         path = _stored_path(config, checkout.path, "checkout path")
         drift = _observe_checkout_drift(vcs, checkout, path) if archive_drifted else None
         if drift is not None and drift_refusal is not None:
@@ -34581,14 +34650,21 @@ def _assert_slot_contents_values(
                 f"slot {slot} checkout path does not equal the flat slot root"
             )
         return slot_path
-    expected_names = {checkout.name for checkout in checkouts}
+    expected_names = {
+        _checkout_destination(slot_path, layout, checkout.name, checkout.vcs).name
+        for checkout in checkouts
+    }
     allowed_names = set(expected_names)
+    if any(checkout.vcs == "eden" for checkout in checkouts):
+        allowed_names.add(".eden-state")
     if slot_type == "agent":
         allowed_names.add("HANDOFF.md")
     try:
         actual = {entry.name for entry in slot_path.iterdir()}
     except OSError as exc:
         raise Refusal(f"cannot inspect slot directory {slot_path}: {exc}") from exc
+    if any(checkout.vcs == "eden" for checkout in checkouts):
+        allowed_names.update(name for name in actual if name.endswith("-target"))
     extras = sorted(actual - allowed_names)
     missing = sorted(expected_names - actual)
     if extras or missing:
@@ -36398,6 +36474,10 @@ def _record_for_slot_use_check(
             # direct cwd/root/exe/descriptor/mapping use test fully active.
             return dataclasses.replace(record, owner=None)
         return record
+    if _record_is_eden(record):
+        # Keep the record (owner dropped, as in the None cases below)
+        # so the use checks can exempt the slot's own Eden daemon.
+        return dataclasses.replace(record, owner=None)
     if allow_live_validate_owner:
         return None
     if (
@@ -55789,9 +55869,8 @@ def _archive_fenced_slot_residue(
 def _record_is_eden(record: ActiveRecord) -> bool:
     """Whether every checkout of ``record`` is an Eden checkout (#1554)."""
 
-    return bool(record.checkouts) and all(
-        item.vcs == "eden" for item in record.checkouts
-    )
+    checkouts = getattr(record, "checkouts", None) or ()
+    return bool(checkouts) and all(item.vcs == "eden" for item in checkouts)
 
 
 def _finish_remove_paths(
@@ -55825,7 +55904,9 @@ def _finish_remove_paths(
         for checkout in record.checkouts:
             if checkout.name in removed:
                 continue
-            mount = _stored_path(config, checkout.path, "checkout path")
+            # The mount always lives at <slot>/checkout, even for
+            # rows recorded with the legacy <slot>/<name> path.
+            mount = slot_path / "checkout"
             config_dir = str(mount.parent / ".eden-state")
             if record.slot_type == "agent":
                 rc, status, stderr = _eden_runner(["sl", "-R", str(mount), "status"])
@@ -55836,10 +55917,19 @@ def _finish_remove_paths(
                 if eden.salvage_needed(status, current, checkout.head):
                     dest = config.control / "wrkslots-salvage" / f"{record.slot}-{checkout.name}"
                     dest.mkdir(parents=True, exist_ok=True)
-                    for argv in eden.salvage_commands(str(mount), dest):
-                        rc3, _o, err3 = _eden_runner(list(argv))
+                    for argv, output_file in eden.salvage_commands(
+                        str(mount), dest
+                    ):
+                        rc3, out3, err3 = _eden_runner(list(argv))
                         if rc3 != 0:
                             raise Refusal(f"Eden salvage failed: {err3.strip()}")
+                        if output_file is not None:
+                            Path(output_file).write_text(
+                                out3, encoding="utf-8", errors="surrogateescape"
+                            )
+                    for saved in dest.iterdir():
+                        if saved.is_file():
+                            saved.read_bytes()
             rc, out, stderr = _eden_runner(
                 ["eden", "--config-dir", config_dir, "redirect", "list",
                  "--mount", str(mount), "--json"]
@@ -57645,6 +57735,13 @@ def _removal_salvage(
         )
         for item in salvage
     )
+    if _record_is_eden(record):
+        # Eden salvage runs in the Eden remove sequence; the handoff
+        # must still name that evidence, never an empty validation.
+        evidence += tuple(
+            f"checkout {item.name}: eden salvage in Eden remove sequence"
+            for item in record.checkouts
+        )
     return salvage, evidence
 
 
@@ -57997,7 +58094,7 @@ def _prepare_retirement_removal(
             raise unlocked_refusal
         if agent_batch is not None:
             agent_batch.census.assert_slot_unused(
-                slot_path, None, ignore_current_process=False
+                slot_path, _census_record(record), ignore_current_process=False
             )
         _assert_slot_unused(
             slot_path,
@@ -58984,7 +59081,7 @@ def _cmd_remove_in_scope(
                 # reported for it was inherited and is a use, which the ordinary
                 # lsof check refused as it refuses any other.
                 agent_batch.census.assert_slot_unused(
-                    slot_path, None, ignore_current_process=False
+                    slot_path, _census_record(record), ignore_current_process=False
                 )
             _assert_slot_unused(
                 slot_path,
@@ -60288,6 +60385,13 @@ def _agent_batch_fresh_use(
                         uses.append(f"map={mapped}")
                         break
         _note_process_gone(pid_dir, gone)
+        if uses and record is not None and _record_is_eden(record) and (
+            _pid_is_slot_eden_daemon(pid, slot_path)
+            or all(
+                u.startswith("mount=") or "/.eden-state/" in u for u in uses
+            )
+        ):
+            uses = []
         if uses:
             refusal = Refusal(
                 f"live {_walked_process_label(pid_dir)} uses slot {slot_path}: "
@@ -60372,6 +60476,17 @@ class _AgentBatchFreshCensus:
                 continue
             if isinstance(outcome, Refusal):
                 raise outcome
+            if record is not None and _record_is_eden(record):
+                if outcome.startswith("mount=") or "/.eden-state/" in outcome:
+                    continue
+                try:
+                    cmdline = (entry.pid_dir / "cmdline").read_bytes().decode(
+                        "utf-8", errors="surrogateescape"
+                    ).replace("\0", " ")
+                except OSError:
+                    cmdline = ""
+                if _cmdline_is_slot_eden_daemon(cmdline, slot_path):
+                    continue
             refusal = Refusal(
                 f"live {_walked_process_label(entry.pid_dir)} uses slot {slot_path}: "
                 f"{outcome}; stop it and retry"
@@ -61957,7 +62072,12 @@ class _AgentRemoveBatchContext:
         finally:
             self.fresh_scan_seconds += time.monotonic() - started
 
-    def _assert_shared_evidence(self, check_path: Path, canonical_path: Path) -> None:
+    def _assert_shared_evidence(
+        self,
+        check_path: Path,
+        canonical_path: Path,
+        record: ActiveRecord | None = None,
+    ) -> None:
         if check_path != canonical_path:
             raise StateError(
                 f"an agent removal batch checks only the unfenced slot path "
@@ -61979,7 +62099,7 @@ class _AgentRemoveBatchContext:
                 "shared process census covered"
             )
         _set_item_phase("process census")
-        self.census.assert_slot_unused(canonical_path, None)
+        self.census.assert_slot_unused(canonical_path, _census_record(record))
 
     def observe_unlocked(
         self,
@@ -61999,7 +62119,7 @@ class _AgentRemoveBatchContext:
         is the scan after the path fence (see _remove_unlocked_use_pass).
         """
 
-        self._assert_shared_evidence(check_path, canonical_path)
+        self._assert_shared_evidence(check_path, canonical_path, record)
         if (
             self.fresh is not None
             and canonical_path in self.fresh.targets
@@ -62037,8 +62157,8 @@ class _AgentRemoveBatchContext:
         still the one the shared evidence covered.
         """
 
-        del record, capture_generation
-        self._assert_shared_evidence(check_path, canonical_path)
+        del capture_generation
+        self._assert_shared_evidence(check_path, canonical_path, record)
         if canonical_path not in self.unlocked_records:
             raise StateError(
                 f"slot {canonical_path} reached its use check under the registry "
@@ -79881,6 +80001,41 @@ def _capture_same_uid_process_path_census(
         _REREAD_GENERATIONS.reset(reread_token)
         _FOLLOWED_VANISHED_HOLDERS.reset(token)
 
+def _census_record(record: ActiveRecord | None) -> ActiveRecord | None:
+    """Record for a batch census: Eden rows keep their identity so
+    the slot's own daemon is exempt, owner evidence stays dropped
+    exactly as when no record was passed (#1432)."""
+
+    if record is None or not _record_is_eden(record):
+        return None
+    return dataclasses.replace(record, owner=None)
+
+
+def _cmdline_is_slot_eden_daemon(cmdline: str, slot_path: Path) -> bool:
+    """Whether a process cmdline names this slot's own Eden daemon.
+
+    The slot's daemon holds its log open under ``.eden-state`` for the
+    whole life of the mount; it is the process ``eden remove`` stops,
+    never a foreign user of the slot (#1204).
+    """
+
+    config_dir = str(slot_path / ".eden-state")
+    if "edenfs_privhelper" in cmdline:
+        # The root-owned privhelper serves only edenfs daemons; the
+        # one holding this slot's mount is its daemon's other half.
+        return True
+    return config_dir in eden.config_dirs_from_cmdlines((cmdline,))
+
+
+def _pid_is_slot_eden_daemon(pid: int, slot_path: Path) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    cmdline = raw.decode("utf-8", errors="surrogateescape").replace("\0", " ")
+    return _cmdline_is_slot_eden_daemon(cmdline, slot_path)
+
+
 @dataclasses.dataclass(frozen=True)
 class _ProcessPathCensus:
     processes: tuple[_AbsentProcessObservation, ...]
@@ -79946,6 +80101,14 @@ class _ProcessPathCensus:
         label = str(slot_path)
         for pid, slot, kind, detail in self.matches:
             if slot == label and not is_ignored(pid):
+                if record is not None and _record_is_eden(record) and (
+                    _pid_is_slot_eden_daemon(pid, slot_path)
+                    or kind == "mount"
+                    or detail.startswith("mount=")
+                    or f'file="{slot_path}/.eden-state/' in detail
+                    or "/.eden-state/" in detail
+                ):
+                    continue
                 raise Refusal(
                     f"live {holder(pid)} uses slot {slot_path}: {kind}={detail}; "
                     "stop it and retry"
@@ -82457,9 +82620,17 @@ def _assert_absent_validate_processes_unrelated(
             match = _absent_validate_mount_match(processes, targets, budget)
             if match is not None:
                 pid, slot, kind, detail = match
-                raise Refusal(
-                    f"live process {pid} may still use validation row {slot}: " f"{kind}={detail}"
+                # An Eden row's own mount is its checkout, alive until
+                # the Eden remove sequence unmounts it (#1204).
+                eden_mount = kind == "mount" and any(
+                    record.slot == slot and _record_is_eden(record)
+                    for record, _paths in rows
                 )
+                if not eden_mount:
+                    raise Refusal(
+                        f"live process {pid} may still use validation row {slot}: "
+                        f"{kind}={detail}"
+                    )
             match = _absent_validate_privileged_path_match(processes, targets, budget)
             _recheck_thread_group_observations(processes, budget)
         except _ProcessEvidenceChanged:
@@ -82475,6 +82646,22 @@ def _assert_absent_validate_processes_unrelated(
                 _process_start_ticks(Path("/proc") / str(pid)) != observed.start_ticks
             ):
                 continue
+            eden_paths = [
+                paths
+                for record, paths in rows
+                if record.slot == slot and _record_is_eden(record)
+            ]
+            eden_daemon = bool(eden_paths) and (
+                kind == "mount"
+                or any(
+                    _pid_is_slot_eden_daemon(pid, path)
+                    for paths in eden_paths
+                    for path in paths
+                    if path.name == slot
+                )
+            )
+            if eden_daemon:
+                return processes
             raise Refusal(
                 f"live process {pid} may still use validation row {slot}: " f"{kind}={detail}"
             )
@@ -83956,7 +84143,19 @@ def _assert_absent_validate_systemd_unrelated(
     if resolver is None:
         resolver = _UnitPathResolver()
     targets = tuple((record, resolver.row(path)) for record, paths in rows for path in paths)
+    # A slot's own Eden daemon unit names its slot by design; it is
+    # stopped by the Eden remove sequence, never a validation run
+    # still using the row (#1204).
+    eden_units = {
+        _edenfs_unit_name(str(path.parent / ".eden-state"))
+        for record, paths in rows
+        if _record_is_eden(record)
+        for path in paths
+        if path.name == "checkout"
+    }
     for unit in snapshot:
+        if unit["Id"] in eden_units:
+            continue
         active = unit["ActiveState"] not in {"inactive", "failed"}
         queued = unit["PendingJob"] == "yes"
         if not active and not queued:

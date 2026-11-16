@@ -238,20 +238,26 @@ def salvage_needed(sl_status: str, current: str, recorded: str) -> bool:
     return bool(sl_status.strip()) or current != recorded
 
 
-def salvage_commands(mount: str, dest: Path) -> tuple[tuple[str, ...], ...]:
+def salvage_commands(
+    mount: str, dest: Path
+) -> tuple[tuple[tuple[str, ...], str | None], ...]:
     """Commands preserving uncommitted work as a patch plus a bundle.
 
-    The bundle holds the draft stack; the patch holds the working-copy
-    diff. Both land in the salvage archive and are read back by the
-    caller before removal proceeds, exactly like git bundles.
+    Each entry is ``(argv, output_file)``: when ``output_file`` is not
+    None the caller writes the command's stdout to that file (``sl
+    diff`` has no ``-o`` option); the other commands write their own
+    files. The bundle holds the draft stack; the patch holds the
+    working-copy diff. Both land in the salvage archive and are read
+    back by the caller before removal proceeds, exactly like git
+    bundles.
     """
 
     patch = str(dest / "working-copy.patch")
     bundle = str(dest / "draft-stack.bundle")
     return (
-        ("sl", "-R", mount, "diff", "--git", "-o", patch),
-        ("sl", "-R", mount, "export", "--git", "-o", patch + ".stack", "."),
-        ("sl", "-R", mount, "bundle", "--all", bundle),
+        (("sl", "-R", mount, "diff", "--git"), patch),
+        (("sl", "-R", mount, "export", "--git", "-o", patch + ".stack", "."), None),
+        (("sl", "-R", mount, "bundle", "--all", bundle), None),
     )
 
 
