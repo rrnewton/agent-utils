@@ -3631,6 +3631,8 @@ pub struct WatchOptions {
     pub state_dir: Option<PathBuf>,
     /// A queued prompt pending longer than this is a finding, with its age (#804).
     pub queue_stale: Duration,
+    /// Maximum prompts per agent per pass; None retains unbounded delivery.
+    pub queue_max_items: Option<usize>,
 }
 
 /// Seconds a finding waits before the coordinator is told about it again.
@@ -4369,7 +4371,12 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             }
             let now_millis = (host.now() * 1000.0) as u64;
             for row in if duties.queue_drain {
-                manager.drain_pending(options.queue_stale, options.check_only, now_millis)
+                manager.drain_pending_bounded(
+                    options.queue_stale,
+                    options.check_only,
+                    now_millis,
+                    options.queue_max_items,
+                )
             } else {
                 Vec::new()
             } {

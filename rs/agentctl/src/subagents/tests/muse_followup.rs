@@ -116,6 +116,40 @@ fn a_watchers_drain_types_a_queued_prompt_into_a_busy_muse() {
 }
 
 #[test]
+fn a_bounded_watch_pass_does_not_type_a_fourth_prompt_through_its_fallback() {
+    let fixture = Fixture::new();
+    let manager = start_busy_muse(&fixture, false);
+    for i in 0..5 {
+        manager
+            .queue_identified(
+                "worker",
+                &format!("queued {i}"),
+                None,
+                None,
+                Some(&format!("watch-bounded-{i}")),
+            )
+            .unwrap();
+    }
+    let rows = manager.drain_pending_bounded(
+        std::time::Duration::from_secs(600),
+        false,
+        crate::agent::now_millis(),
+        Some(3),
+    );
+    assert_eq!(rows[0]["typed"], 3, "{rows:?}");
+    assert_eq!(rows[0]["remaining"], 2, "{rows:?}");
+    assert_eq!(keys(&fixture), ["Enter", "Enter", "Enter"]);
+    let rows = manager.drain_pending_bounded(
+        std::time::Duration::from_secs(600),
+        false,
+        crate::agent::now_millis(),
+        Some(3),
+    );
+    assert_eq!(rows[0]["typed"], 2, "{rows:?}");
+    assert_eq!(rows[0]["remaining"], 0, "{rows:?}");
+}
+
+#[test]
 fn a_follow_up_muse_never_accepts_is_taken_back_out_and_stays_pending() {
     let fixture = Fixture::new();
     let manager = start_busy_muse(&fixture, false);

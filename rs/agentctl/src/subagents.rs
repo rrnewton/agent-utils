@@ -12305,6 +12305,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         check_only: bool,
         now_millis: u64,
     ) -> Vec<Value> {
+        self.drain_pending_bounded(stale, check_only, now_millis, None)
+    }
+
+    /// Drain each agent's queue with an optional per-pass prompt bound.
+    /// The working-harness fallback shares that bound with the initial drain.
+    pub fn drain_pending_bounded(
+        &self,
+        stale: std::time::Duration,
+        check_only: bool,
+        now_millis: u64,
+        max_items: Option<usize>,
+    ) -> Vec<Value> {
         let mut rows = Vec::new();
         let Ok(agents) = self.watch_rows() else {
             return rows;
@@ -12372,6 +12384,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         working_timeout: std::time::Duration::from_secs(10),
                         deadline: Some(std::time::Duration::from_secs(30)),
                         deliver_while_working: true,
+                        max_items,
                         ..DrainOptions::default()
                     },
                 );
@@ -12392,6 +12405,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         }
                     }
                 }
+                // Count this drain's confirmed/uncertain submissions, not the
+                // change in queue length: other senders may enqueue meanwhile.
+                // An error cannot prove an unused budget, so a bounded pass
+                // leaves the fallback for the next pass in that case.
+                let budget_left = max_items.is_none_or(|limit| {
+                    drained.as_ref().is_ok_and(|result| {
+                        result.delivered.len() + result.quarantined.len() < limit
+                    })
+                });
                 let drain_error = drained.err().map(|error| error.to_string());
                 let mut remaining = self
                     .pending_prompts(name)
@@ -12402,7 +12424,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 // prompt the way an urgent send does, waiting inside the call
                 // for the boundary instead of sampling it.
                 let harness = row["harness"].as_str().unwrap_or_default();
-                if remaining > 0 && (harness == "muse" || harness.starts_with("claude")) {
+                if budget_left
+                    && remaining > 0
+                    && (harness == "muse" || harness.starts_with("claude"))
+                {
                     if let Some((identifier, _)) = self
                         .pending_prompts(name)
                         .ok()

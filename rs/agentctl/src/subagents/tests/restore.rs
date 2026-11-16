@@ -774,6 +774,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
                 wrkslots: None,
                 state_dir: None,
                 queue_stale: Duration::from_secs(600),
+                queue_max_items: None,
             },
             &mut Default::default(),
             &mut Default::default(),
@@ -817,6 +818,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::ZERO,
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -1070,6 +1072,7 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
             wrkslots: None,
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -1115,6 +1118,7 @@ fn timer_pass(
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         repaired,
         stopped_noted,
@@ -1502,6 +1506,7 @@ fn watch_reports_a_failed_unit_it_cannot_start() {
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -1630,6 +1635,7 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
         wrkslots: None,
         state_dir: Some(fixture.root.join("watch")),
         queue_stale: Duration::from_secs(600),
+        queue_max_items: None,
     };
     let first =
         crate::restore::watch(&fixture.client, &registry, &host, &config, &options).unwrap();
@@ -1699,6 +1705,7 @@ fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it(
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -2592,6 +2599,7 @@ fn slot_image_finding(fixture: &Fixture, host: &ScriptedHost) -> Value {
             wrkslots: Some(PathBuf::from("/opt/wrkslots")),
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -2734,6 +2742,7 @@ fn watch_pass(fixture: &Fixture, host: &ScriptedHost, config: &RestoreConfig) ->
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -2807,6 +2816,7 @@ fn watch_never_repairs_or_alerts_on_a_unit_it_could_not_check() {
             wrkslots: None,
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
     )
     .unwrap();
@@ -3601,6 +3611,7 @@ fn watch_notify_off_and_tab_hygiene_off_report_skipped_in_health() {
             wrkslots: None,
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
     )
     .unwrap();
@@ -3847,6 +3858,7 @@ fn repair_watch_options() -> WatchOptions {
         wrkslots: None,
         state_dir: None,
         queue_stale: Duration::from_secs(600),
+        queue_max_items: None,
     }
 }
 
