@@ -73,7 +73,9 @@ jobs:
   rust-msrv:
     needs: plan
     if: needs.plan.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
     # With its test step (30 runs, 2026-09-21..25) this job took 2.9-25.1 min in its 21 green
     # runs, median 6.8; the longest of 9 red runs took 30.0. 45 bounds a hang, not a slow build.
     timeout-minutes: 45
@@ -82,6 +84,8 @@ jobs:
       # Several Rust interoperability tests execute the real Python recovery fixtures.  They
       # import pytest even though this job's primary toolchain is Rust, so install that explicit
       # test dependency instead of depending on the runner image's ambient Python packages.
+      - name: prepare and verify the privileged Linux test host
+        run: bash scripts/prepare_hosted_test_host.sh
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -105,7 +109,9 @@ jobs:
     # The same selector and the same flattened graph as `make validate` locally. Compatibility
     # jobs below use older language versions; they are not a second definition of this contract.
     needs: plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
     # The nightly's budget. A workflow edit selects the complete graph, and the graph now keeps
     # going past a failure (validate.py --keep-going), so a red run lasts as long as a green one;
     # the complete graph alone has taken about fifty minutes on a hosted runner.
@@ -116,6 +122,8 @@ jobs:
           # Selection compares the checked-out commit with the event's real base. A depth-one
           # checkout cannot answer that question and must not silently become a full run.
           fetch-depth: 0
+      - name: prepare and verify the privileged Linux test host
+        run: bash scripts/prepare_hosted_test_host.sh
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -192,7 +200,9 @@ jobs:
   python-minimum-tests:
     needs: plan
     if: needs.plan.outputs.python == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}
     # Every distribution declares requires-python >=3.10, and the selected graph runs the tests
     # only on 3.12. Run serially, the whole suite outgrew its 35 minutes by 2026-10-10 and was
     # cancelled at about 92% in every run after that, so nothing said which tests fail here.
@@ -207,9 +217,9 @@ jobs:
     # failing test the moment it fails (the component-test plugin), and its test step's own limit
     # sits below the job's, so a slow shard still reaches the summary and upload steps.
     #
-    # Tests that fail on 3.10 are tracked by minibeads issue #367 python-minimum-failures: until
-    # it is closed a red shard is expected, and a failure it does not list is a new regression.
-    # Not skipped, and not marked continue-on-error. `#361 python-minimum-timeout`.
+    # Historical 3.10 defects in minibeads #367 python-minimum-failures were closed October 20.
+    # Red shards are failures, not an expected exemption. #336 validation-host-contract makes
+    # their host prerequisites explicit; no skips or continue-on-error conceal missing coverage.
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -217,6 +227,8 @@ jobs:
         shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
+      - name: prepare and verify the privileged Linux test host
+        run: bash scripts/prepare_hosted_test_host.sh
       - uses: actions/setup-python@v6
         with:
           python-version: '3.10'

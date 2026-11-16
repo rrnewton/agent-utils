@@ -1275,6 +1275,40 @@ def test_ci_runs_the_whole_graph_past_a_failure() -> None:
     assert "python3 scripts/validate.py --all --keep-going" in _runs(nightly)
 
 
+def test_privileged_ci_jobs_prepare_their_declared_host_before_testing() -> None:
+    workflow = _workflow("cross-dagrun.yml")
+    for name in ("rust-msrv", "validate", "python-minimum-tests"):
+        job = _job(workflow, name)
+        assert job["runs-on"] == "ubuntu-24.04"
+        environment = job["env"]
+        assert isinstance(environment, dict)
+        assert environment["AGENT_UTILS_RUNNER_ENVIRONMENT"] == "${{ runner.environment }}"
+        steps = _steps(job)
+        [prepare] = [i for i, step in enumerate(steps)
+                     if step.get("run") == "bash scripts/prepare_hosted_test_host.sh"]
+        assert steps[prepare - 1]["uses"] == "actions/checkout@v5"
+        assert "continue-on-error" not in steps[prepare]
+        assert all(i > prepare for i, step in enumerate(steps)
+                   if any(command in str(step.get("run", ""))
+                          for command in ("cargo test", "scripts/validate.py", "run_pytest_shard.py")))
+
+
+@pytest.mark.parametrize("actions,runner", [("false", "github-hosted"), ("true", "self-hosted")])
+def test_host_preparation_refuses_developer_and_self_hosted_machines(
+    tmp_path: Path, actions: str, runner: str,
+) -> None:
+    environment = dict(os.environ, GITHUB_ACTIONS=actions,
+                       AGENT_UTILS_RUNNER_ENVIRONMENT=runner, RUNNER_TEMP=str(tmp_path),
+                       GITHUB_ENV=str(tmp_path / "environment"))
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "prepare_hosted_test_host.sh")],
+        env=environment, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 2
+    assert "only for an ephemeral GitHub-hosted runner" in result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_the_rust_suites_run_past_a_failing_test_binary() -> None:
     by_tag = dag_from_path(REPO_ROOT / "validation.dag.yaml").by_tag()
     unit = by_tag["vibe-talk.test.unit"].cmd
