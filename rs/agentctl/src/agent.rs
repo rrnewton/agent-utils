@@ -1945,19 +1945,34 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         Some(bounded) => bounded,
         None => runtime,
     };
-    // Whether this drain has begun typing a prompt yet. A lock wait
-    // given up on before that — its lock bound passed, or its
-    // runtime was cancelled — has typed nothing, and every prompt
-    // it might have typed is durable in this queue: that is
-    // Pending, whichever of the drain's locks the wait was for.
-    // Passing such a wait through as an untyped delivery error
-    // instead would make the same unsubmitted state report
-    // differently depending on which lock happened to be contended.
-    // Once typing may have happened, the error stands as it is: a
-    // typed prompt reported pending could be typed again.
+    // Whether this drain has begun typing the prompt it is currently
+    // delivering. It is reset once that prompt's outcome is safely
+    // committed under the retaken queue lock. A lock wait given up
+    // on before typing — its lock bound passed, or its runtime was
+    // cancelled — has typed nothing, and every prompt it might have
+    // typed is durable in this queue: that is Pending, whichever of
+    // the drain's locks the wait was for. Passing such a wait
+    // through as an untyped delivery error instead would make the
+    // same unsubmitted state report differently depending on which
+    // lock happened to be contended. Once typing may have happened,
+    // that same given-up wait is possibly submitted instead: a
+    // typed prompt reported pending (safe to resend) could be
+    // typed again.
     let typing_started = std::cell::Cell::new(false);
     let lock_limit = |error: AgentError| {
         if typing_started.get() {
+            if lock_runtime.cancelled() {
+                return AgentError::PossiblySubmitted(UndeliveredMessage {
+                    message: format!(
+                        "a lock of queue {} could not be taken after a prompt may already \
+                         have been typed; it must not be resent — it stays claimed in \
+                         inflight: {error}",
+                        root.display()
+                    ),
+                    message_id: String::new(),
+                    artifact: root.to_path_buf(),
+                });
+            }
             return error;
         }
         if runtime.cancelled() {
@@ -2513,6 +2528,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             batch_runtime,
                         );
                         queue_lock = take_queue_lock(lock_runtime)?;
+                        typing_started.set(false);
                         // A paste that may have been typed keeps the placeholder it was drawn as.
                         if !matches!(
                             outcome,
@@ -2819,6 +2835,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 delivery_runtime,
             );
             queue_lock = take_queue_lock(lock_runtime)?;
+            typing_started.set(false);
             // A paste that may have been typed keeps the placeholder it was drawn as.
             if !matches!(
                 outcome,
@@ -5494,6 +5511,47 @@ mod tests {
 
         fn cancelled(&self) -> bool {
             self.cancelled.load(AtomicOrdering::SeqCst)
+        }
+
+        fn delivery_wait_chunk(&self) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+    }
+
+    /// A fake clock that stops on its first sleep after the inflight
+    /// item carries `paste_started_at`: at that point a submission has
+    /// started and the drain has released the queue lock, so a test
+    /// can take that lock itself before submission continues.
+    struct PasteGateRuntime {
+        clock: FakeRuntime,
+        root: PathBuf,
+        gate: Arc<RunGate>,
+        gated: AtomicBool,
+    }
+
+    impl PasteGateRuntime {
+        fn paste_started(&self) -> bool {
+            let Ok(entries) = fs::read_dir(self.root.join("inflight")) else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                fs::read_to_string(entry.path())
+                    .is_ok_and(|document| document.contains("\"paste_started_at\""))
+            })
+        }
+    }
+
+    impl AgentRuntime for PasteGateRuntime {
+        fn monotonic(&self) -> Duration {
+            self.clock.monotonic()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            if !self.gated.load(AtomicOrdering::SeqCst) && self.paste_started() {
+                self.gated.store(true, AtomicOrdering::SeqCst);
+                self.gate.enter_and_wait();
+            }
+            self.clock.sleep(duration);
         }
 
         fn delivery_wait_chunk(&self) -> Option<Duration> {
@@ -8243,6 +8301,168 @@ mod tests {
                 .expect("failed artifacts")
                 .len(),
             1
+        );
+    }
+
+    /// A send whose submission starts under the paste gate, letting
+    /// this test hold the queue lock across the drain's commit retake.
+    fn send_typed_then_fail_queue_lock_retake(
+        label: &str,
+        pane_id: &str,
+    ) -> (TestDirectory, GenericTuiAgent, Target, AgentError) {
+        let directory = TestDirectory::new(label);
+        let root = directory.path().to_path_buf();
+        let agent = GenericTuiAgent {
+            inner: FakeAgent::with_pane(&["idle"], pane_id),
+            tui: crate::unknown_harness::fake::FakeTui::new(),
+        };
+        // Enter takes the prompt without showing it submitted. The
+        // first outcome is therefore unproven, and a later stranded
+        // pass has no transcript evidence to call it delivered.
+        agent.tui.state().swallow = true;
+        let gate = Arc::new(RunGate::default());
+        let runtime = PasteGateRuntime {
+            clock: FakeRuntime::default(),
+            root: root.clone(),
+            gate: Arc::clone(&gate),
+            gated: AtomicBool::new(false),
+        };
+        let target = target_for(pane_id);
+        let result = std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                send_identified_with_runtime(
+                    &agent,
+                    &target,
+                    &root,
+                    "typed before the commit lock fails",
+                    DrainOptions {
+                        ready_timeout: Duration::ZERO,
+                        lock_timeout: Some(Duration::from_millis(50)),
+                        ..DrainOptions::default()
+                    },
+                    &runtime,
+                    Some("typed-then-locked"),
+                )
+            });
+            let entered = gate.wait_for_entries(1, Duration::from_secs(120));
+            let mut holder = None;
+            if entered {
+                assert_eq!(
+                    json_paths(&root.join("inflight")).expect("inflight").len(),
+                    1,
+                    "the gated submission's item is claimed"
+                );
+                let lock_file = open_private_lock(&root.join(".delivery.lock"), "held test lock")
+                    .expect("open queue lock holder");
+                let deadline = Instant::now() + Duration::from_secs(120);
+                loop {
+                    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+                        Ok(()) => {
+                            holder = Some(agent_queue::fsio::HeldLock::new(lock_file));
+                            break;
+                        }
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            gate.release();
+            let result = sender.join().expect("send thread");
+            assert!(entered, "submission never reached its first input");
+            assert!(holder.is_some(), "queue lock was not free during typing");
+            drop(holder);
+            result
+        });
+        (directory, agent, target, result.unwrap_err())
+    }
+
+    #[test]
+    fn a_queue_lock_failure_after_typing_is_possibly_submitted_not_pending() {
+        let (directory, agent, _target, error) = send_typed_then_fail_queue_lock_retake(
+            "lock-failure-after-typing",
+            "w1:p-lock-after-typing",
+        );
+        assert_eq!(
+            error.outcome(),
+            Some(QueueOutcome::PossiblySubmitted),
+            "{error}"
+        );
+        assert_eq!(error.exit_code(), EXIT_TIMEOUT, "{error}");
+        assert_ne!(error.exit_code(), 75, "{error}");
+        assert!(!error.safe_to_retry(), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("may already have been typed"), "{message}");
+        assert!(message.contains("must not be resent"), "{message}");
+        assert!(!message.contains("nothing was typed"), "{message}");
+        assert_eq!(
+            agent
+                .tui
+                .state()
+                .inputs
+                .iter()
+                .filter(|input| input.starts_with("paste:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            message_state(directory.path(), "typed-then-locked").unwrap(),
+            Some(QueueMessageState::Inflight)
+        );
+    }
+
+    #[test]
+    fn a_typed_prompt_whose_commit_lock_failed_is_quarantined_by_the_next_drain_without_retyping() {
+        let (directory, agent, target, first_error) = send_typed_then_fail_queue_lock_retake(
+            "typed-then-locked-next-drain",
+            "w1:p-typed-then-locked",
+        );
+        assert_eq!(
+            first_error.outcome(),
+            Some(QueueOutcome::PossiblySubmitted),
+            "{first_error}"
+        );
+        assert_eq!(
+            message_state(directory.path(), "typed-then-locked").unwrap(),
+            Some(QueueMessageState::Inflight)
+        );
+
+        let result = drain_with_runtime(
+            &agent,
+            &target,
+            directory.path(),
+            DrainOptions {
+                ready_timeout: Duration::ZERO,
+                ..DrainOptions::default()
+            },
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.outcome,
+            QueueOutcome::PossiblySubmitted,
+            "{result:?}"
+        );
+        assert_eq!(result.quarantined, ["typed-then-locked"], "{result:?}");
+        assert!(result.delivered.is_empty(), "{result:?}");
+        assert_eq!(
+            message_state(directory.path(), "typed-then-locked").unwrap(),
+            Some(QueueMessageState::Failed)
+        );
+        let state = agent.tui.state();
+        assert_eq!(
+            state
+                .inputs
+                .iter()
+                .filter(|input| input.starts_with("paste:"))
+                .count(),
+            1,
+            "the next drain must not type the prompt again: {:?}",
+            state.inputs
         );
     }
 
