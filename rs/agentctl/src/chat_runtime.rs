@@ -279,6 +279,32 @@ pub const DEFAULT_THREAD_HISTORY_MESSAGES: u32 = 10;
 pub const MAX_THREAD_HISTORY_MESSAGES: u32 = 100;
 /// Stable JSON schema emitted by `agentctl chat sent --json`.
 pub const SENT_REPLIES_SCHEMA: &str = "agentctl-chat-sent/v1";
+/// Where the bridge keeps the next short message number (`:email:NNNN`, #658).
+const MESSAGE_NUMBERS_FILE: &str = "message-numbers.json";
+/// Where the bridge publishes its short thread/message references for
+/// vibe-talk's reader (`agentctl-short-refs/v1`, #658): one file per bridge
+/// state directory, written from local state alone.
+const SHORT_REFS_FILE: &str = "short-refs.json";
+/// The schema of that file.
+const SHORT_REFS_SCHEMA: &str = "agentctl-short-refs/v1";
+/// Where the bridge counts bare-number guard hits for `chat status` (#658).
+const BARE_REF_WARNINGS_FILE: &str = "bare-ref-warnings.json";
+
+/// The next short message number to assign, kept in `message-numbers.json`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MessageNumberRecord {
+    version: u32,
+    next_number: u64,
+}
+
+/// Bare-number guard hits, kept in `bare-ref-warnings.json` for `chat status`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct BareRefRecord {
+    #[serde(default)]
+    count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recent: Vec<String>,
+}
 // How much of each reply's text `chat sent` prints; `--json` carries the whole text.
 const SENT_PREVIEW_CHARACTERS: usize = 300;
 
@@ -2877,6 +2903,10 @@ struct RequestRecord {
     /// prompt (#1136 raw-message-bridge).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     raw_ignored: Option<String>,
+    /// The short message number assigned at admission, cited as `:email:NNNN`
+    /// (#658). Absent in records written before numbers were assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_number: Option<u64>,
     /// Keys a newer agentctl added, kept when this record is written back (#809
     /// chat-bridge-json-forward-compat).
     #[serde(flatten)]
@@ -3002,6 +3032,7 @@ impl RequestRecord {
             target_token: None,
             raw_text: None,
             raw_ignored: None,
+            message_number: None,
             key,
             message: source,
         })
@@ -8484,7 +8515,11 @@ impl BridgeState {
 
     /// Admit one provider batch durably.
     pub fn admit_batch(&self, batch: &DeliveryBatch) -> Result<BatchAdmission> {
-        self.admit_batch_scoped(batch, None)
+        let outcome = self.admit_batch_scoped(batch, None);
+        if outcome.is_ok() {
+            self.write_short_refs();
+        }
+        outcome
     }
 
     fn admit_batch_scoped(
@@ -9015,6 +9050,9 @@ impl BridgeState {
                         raw::Classification::Raw(text) => record.raw_text = Some(text),
                         raw::Classification::Ignored(note) => record.raw_ignored = Some(note),
                     }
+                    // The short message number (`:email:NNNN`, #658), assigned
+                    // once at admission and never reused.
+                    record.message_number = Some(self.assign_message_number()?);
                     record.admitted_at_millis = admitted_at_millis;
                     record.sender_grant = if permanent_owner { None } else { sender_grant };
                     record.admitted_host_batch_sequence = Some(host_batch_sequence);
@@ -9609,6 +9647,13 @@ impl BridgeState {
         // The replies a restart held back as stale (#781 chat-no-stale-replies-on-restart).
         status["held_replies"] = serde_json::to_value(self.held_replies_locked()?)
             .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        // Bare-number guard hits (#658): how many, and the most recent few.
+        let bare_refs: BareRefRecord =
+            read_document(&self.root.join(BARE_REF_WARNINGS_FILE), 16_384).unwrap_or_default();
+        status["bare_ref_warnings"] = json!({
+            "count": bare_refs.count,
+            "recent": bare_refs.recent,
+        });
         Ok(status).map(|mut status| {
             if let Some(object) = status.as_object_mut() {
                 object.insert("slack_format".to_owned(), Value::from(slack_format));
@@ -10868,10 +10913,16 @@ adding one to the last number in both lines for each later reply.",
         // The thread's ready permalink beside its number (#658): the agent
         // copies the link, never a bare id the owner cannot open.
         if let (Some(alias), Some(link)) = (alias_number, self.message_thread_permalink(message)) {
+            // A `key: value` field, as the header grammar requires, so header
+            // parsers read this prompt as one they know with a field they may
+            // ignore.
             fields.push(format!(
-                "thread {} {link}",
+                "thread: :thread:{} {link}",
                 crate::chat_links::thread_label(alias)
             ));
+        }
+        if let Some(number) = record.message_number {
+            fields.push(format!("message: :email:{number}"));
         }
         let executable = || env::current_exe();
         // Decided for this delivery, from the target served now (#896): a target whose replies
@@ -11451,10 +11502,14 @@ complete record.\n",
                 let quoting = quoted_parent_name(&request.message)
                     .map(|name| format!(", quoting {name}"))
                     .unwrap_or_default();
+                let email = request
+                    .message_number
+                    .map(|number| format!(" (:email:{number})"))
+                    .unwrap_or_default();
                 entries.push((
                     (admitted, admitted, request.key.clone(), 0),
                     format!(
-                        "[{}, {}] {} wrote message {message_id}{quoting}:\n{}",
+                        "[{}, {}] {} wrote message {message_id}{email}{quoting}:\n{}",
                         utc_timestamp(admitted),
                         format_age(now, admitted),
                         single_line(&request.message.sender_id),
@@ -12461,17 +12516,49 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
         links
     }
 
-    /// Render `body`'s link tokens for the wire: the rendered text and the
-    /// warnings for tokens that stayed plain. Resolution reads only local
-    /// state; the send proceeds either way.
-    fn render_outbound_links(&self, body: &str) -> (String, Vec<String>) {
-        let links = self.thread_link_map();
+    /// Every retained message number's permalink, from local state alone.
+    fn message_link_map(&self) -> std::collections::BTreeMap<u64, String> {
+        let mut links = std::collections::BTreeMap::new();
+        if let Ok(records) = self.request_records() {
+            for (record, _) in &records {
+                if let Some(number) = record.message_number {
+                    if let Some(link) = self.message_permalink(&record.message) {
+                        links.insert(number, link);
+                    }
+                }
+            }
+        }
+        links
+    }
+
+    /// The Slack permalink of one message: its own id, in its thread when it
+    /// is a reply there. `None` under the same rules as
+    /// [`Self::message_thread_permalink`].
+    fn message_permalink(&self, message: &SavedMessage) -> Option<String> {
+        let workspace = self.config.slack_workspace_url.as_deref()?;
+        let root = message.thread_reply.then_some(message.thread_id.as_str());
+        crate::chat_links::slack_message_permalink(
+            workspace,
+            &message.channel_id,
+            &message.message_id,
+            root,
+        )
+    }
+
+    /// Render `body`'s references for the wire: the rendered text, the
+    /// warnings for references that stayed plain, and the bare-number guard's
+    /// notices. Resolution reads only local state; the send proceeds either
+    /// way.
+    fn render_outbound_links(&self, body: &str) -> (String, Vec<String>, Vec<String>) {
+        let threads = self.thread_link_map();
+        let messages = self.message_link_map();
         let rendered = crate::chat_links::render_reply_links(
             body,
-            &|alias| links.get(&alias).cloned(),
+            &|alias| threads.get(&alias).cloned(),
+            &|number| messages.get(&number).cloned(),
             self.config.issue_url_template.as_deref(),
         );
-        (rendered.text, rendered.warnings)
+        (rendered.text, rendered.warnings, rendered.notices)
     }
 
     /// The link warnings a reply with `body` would earn, without sending it:
@@ -12479,6 +12566,134 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
     #[must_use]
     pub fn reply_link_warnings(&self, body: &str) -> Vec<String> {
         self.render_outbound_links(body).1
+    }
+
+    /// The bare-number guard notices a reply with `body` would earn, without
+    /// sending it: `agentctl chat reply` prints them beside the warnings.
+    #[must_use]
+    pub fn reply_link_notices(&self, body: &str) -> Vec<String> {
+        self.render_outbound_links(body).2
+    }
+
+    /// The next short message number, assigned at admission and never reused
+    /// (`message-numbers.json`, the reply-alias rule). A number burned by an
+    /// admission that later fails is simply skipped.
+    fn assign_message_number(&self) -> Result<u64> {
+        let path = self.root.join(MESSAGE_NUMBERS_FILE);
+        let mut record: MessageNumberRecord = if path.exists() {
+            read_document(&path, 4_096)?
+        } else {
+            MessageNumberRecord {
+                version: 1,
+                next_number: 1,
+            }
+        };
+        let number = record.next_number;
+        record.next_number = number
+            .checked_add(1)
+            .ok_or_else(|| ChatRuntimeError::invalid("short message numbers are exhausted"))?;
+        write_document(&path, &record)?;
+        Ok(number)
+    }
+
+    /// Rewrite `short-refs.json` from retained local state
+    /// (`agentctl-short-refs/v1`): vibe-talk's reader resolves `:thread:` and
+    /// `:email:` references from this file alone, so no delivery path — the
+    /// bridge's or vibe-talk's — makes a network call for a short reference.
+    /// Best-effort beside admission and alias assignment: a failed write
+    /// leaves the previous file, never blocks a delivery.
+    pub(crate) fn write_short_refs(&self) {
+        let document = self.short_refs_document();
+        if let Err(error) = write_document(&self.root.join(SHORT_REFS_FILE), &document) {
+            eprintln!("agentctl: short references not written: {error}");
+        }
+    }
+
+    fn short_refs_document(&self) -> Value {
+        let records = self.request_records().unwrap_or_default();
+        let aliases = self.read_reply_aliases().ok();
+        let mut threads = Vec::new();
+        if let Some(aliases) = &aliases {
+            for entry in &aliases.aliases {
+                let Some((record, _)) = records
+                    .iter()
+                    .find(|(record, _)| record.key == entry.request_key)
+                else {
+                    continue;
+                };
+                // The thread's root: the earliest retained message in it.
+                let root = records
+                    .iter()
+                    .filter(|(other, _)| {
+                        other.message.channel_id == record.message.channel_id
+                            && other.message.thread_id == record.message.thread_id
+                    })
+                    .min_by_key(|(other, _)| other.admitted_at_millis);
+                let (root_ts, root_message) = match root {
+                    Some((root, _)) => {
+                        let root_ts = if root.message.thread_reply {
+                            root.message.thread_id.clone()
+                        } else {
+                            root.message.message_id.clone()
+                        };
+                        (root_ts, root.message.message_id.clone())
+                    }
+                    None => continue,
+                };
+                threads.push(json!({
+                    "n": entry.alias,
+                    "channel": record.message.channel_id,
+                    "root_ts": root_ts,
+                    "root_message": root_message,
+                }));
+            }
+        }
+        let mut messages = Vec::new();
+        for (record, _) in &records {
+            if let Some(number) = record.message_number {
+                let thread_root_ts = if record.message.thread_reply {
+                    record.message.thread_id.clone()
+                } else {
+                    record.message.message_id.clone()
+                };
+                messages.push(json!({
+                    "n": number,
+                    "channel": record.message.channel_id,
+                    "message": record.message.message_id,
+                    "thread_root_ts": thread_root_ts,
+                }));
+            }
+        }
+        json!({
+            "schema": SHORT_REFS_SCHEMA,
+            "threads": threads,
+            "messages": messages,
+        })
+    }
+
+    /// Record bare-number guard `notices` for `chat status`
+    /// (`bare-ref-warnings.json`: a running count and the most recent few).
+    /// Best-effort: failing to record never changes a send.
+    fn record_bare_ref_notices(&self, notices: &[String]) {
+        if notices.is_empty() {
+            return;
+        }
+        let Ok(state_lock) =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")
+        else {
+            return;
+        };
+        if state_lock.lock_exclusive().is_err() {
+            return;
+        }
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
+        let path = self.root.join(BARE_REF_WARNINGS_FILE);
+        let mut record: BareRefRecord = read_document(&path, 16_384).unwrap_or_default();
+        record.count = record.count.saturating_add(notices.len() as u64);
+        record.recent.extend(notices.iter().cloned());
+        let excess = record.recent.len().saturating_sub(20);
+        record.recent.drain(..excess);
+        let _ = write_document(&path, &record);
     }
 
     /// The page `agentctl chat help REPLY_ID` prints for request `key` of this state (#707
@@ -12680,6 +12895,8 @@ still skipped, but a block under an old number that is out of view then could re
             .retain(|withheld| !forgotten.contains(&withheld.alias));
         record.validate()?;
         write_document(&self.reply_alias_path(), &record)?;
+        // A new alias is a new short thread reference for vibe-talk (#658).
+        self.write_short_refs();
         Ok(alias)
     }
 
@@ -14503,14 +14720,32 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         // `operation_conflict`, when the thread's parent is a channel-level event rather
         // than a message) is never retried as-is: it used to be retried on every pass,
         // hundreds of times, and the reply never posted.
-        // Link tokens become Slack link markup on the wire only (#658): the
+        // References become Slack link markup on the wire only (#658): the
         // stored reply keeps the agent's own text, so retries render the same
-        // and `chat sent` shows what the agent wrote. Unresolvable tokens
-        // stay plain; the warnings reach the service log, never the owner.
-        let (linked_body, link_warnings) = self.render_outbound_links(&reply.body);
+        // and `chat sent` shows what the agent wrote. Unresolvable references
+        // stay tagged and plain; warnings and guard notices reach the service
+        // log (and `chat status`), never the owner.
+        let (linked_body, link_warnings, guard_notices) = self.render_outbound_links(&reply.body);
         for warning in &link_warnings {
             eprintln!("agentctl: chat reply link: {warning}");
         }
+        for notice in &guard_notices {
+            eprintln!("agentctl: chat reply guard: {notice}");
+        }
+        self.record_bare_ref_notices(&guard_notices);
+        // In Markdown mode the vendor renders the text itself, and a Markdown
+        // link title can hold markup of its own that the vendor mangles
+        // (#658 Q2): drop titles before the handoff. The converted path's own
+        // converter already discards them.
+        let effective_format = self
+            .config
+            .effective_slack_format(&request_snapshot.message.channel_id)
+            .ok()
+            .flatten();
+        let linked_body = match effective_format {
+            Some(SlackFormat::Converted) => linked_body,
+            _ => crate::chat_links::strip_link_titles(&linked_body),
+        };
         let body_text = outbound_text(&self.config.agent_label, &linked_body);
         let mut fallback = reply.send_fallback_request_id.is_some();
         let mut active_request_id = reply
@@ -21581,8 +21816,17 @@ pub(crate) mod tests {
             .expect("key");
         let prompt = state.prompt(&key, "").expect("prompt");
         assert!(
-            prompt
-                .contains("thread 001 https://acme.slack.com/archives/C0123ABCD/p1700000000000100"),
+            prompt.contains(
+                ":thread:001 https://acme.slack.com/archives/C0123ABCD/p1700000000000100"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.contains("message: :email:1"), "{prompt}");
+        assert!(prompt.contains("<CHAT_REPLY_001>"), "{prompt}");
+        // The new header fields are ones a header parser may ignore, never a
+        // header it cannot read.
+        assert!(
+            crate::sender_header::parse(prompt.lines().next().expect("header")).is_some(),
             "{prompt}"
         );
         state
@@ -21596,15 +21840,15 @@ pub(crate) mod tests {
         state
             .capture_replies(
                 &key,
-                "<CHAT_REPLY_001>\nSee [[thread:001]], [[issue:658]] and [[thread:999]]; plain 060 and #658 stay.\n</CHAT_REPLY_001>",
+                "<CHAT_REPLY_001>\nSee :thread:001, :email:1, :issue:658 and :thread:999; per your 0001; plain 060 and #658 stay.\n</CHAT_REPLY_001>",
             )
             .expect("capture reply");
-        // The stored reply is the agent's own text, tokens and all.
+        // The stored reply is the agent's own text, references and all.
         assert!(state
             .read_reply(&key, 1)
             .expect("stored reply")
             .body
-            .contains("[[thread:001]]"));
+            .contains(":thread:001"));
         let mut transport = FakeReplyTransport::default();
         assert!(state
             .publish_one(&key, &mut transport)
@@ -21613,17 +21857,40 @@ pub(crate) mod tests {
         assert_eq!(transport.submissions.len(), 1);
         let posted = &transport.submissions[0].2;
         assert!(
-            posted.contains("<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|001>"),
+            posted.contains(
+                "<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:001>"
+            ),
             "{posted}"
         );
         assert!(
-            posted.contains("<https://github.com/OWNER/REPO/issues/658|#658>"),
+            posted
+                .contains("<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:email:1>"),
             "{posted}"
         );
         assert!(
-            posted.contains("and 999; plain 060 and #658 stay."),
+            posted.contains("<https://github.com/OWNER/REPO/issues/658|:issue:658>"),
             "{posted}"
         );
+        // The guard rewrote `per your 0001`; unknown and plain forms stay.
+        assert!(
+            posted.contains(
+                "per your <https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:001>"
+            ),
+            "{posted}"
+        );
+        assert!(posted.contains("and :thread:999;"), "{posted}");
+        assert!(posted.contains("plain 060 and #658 stay."), "{posted}");
+        // The short-reference file names the thread and the message.
+        let short_refs: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("short-refs.json")).expect("file"))
+                .expect("short refs JSON");
+        assert_eq!(short_refs["schema"], json!("agentctl-short-refs/v1"));
+        assert_eq!(short_refs["threads"][0]["n"], json!(1));
+        assert_eq!(
+            short_refs["threads"][0]["root_ts"],
+            json!("1700000000.000100")
+        );
+        assert_eq!(short_refs["messages"][0]["n"], json!(1));
         // `chat status` names the same number and link for the request.
         let status = state.status().expect("status");
         assert_eq!(status["requests"][0]["reply_alias"], json!("001"));
@@ -27156,7 +27423,7 @@ pub(crate) mod tests {
                 .expect("the queue reads the marker");
         assert!(
             queued.text.starts_with(
-                "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT · reply: "
+                "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT · message: :email:1 · reply: "
             ),
             "{}",
             queued.text
@@ -36060,7 +36327,7 @@ recent or unresolved reply reservations (limit 8 per 60 s)"
             prompt.lines().next(),
             Some(
                 "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT · \
-reply: CHAT_REPLY_001]"
+message: :email:1 · reply: CHAT_REPLY_001]"
             ),
             "{prompt}"
         );
@@ -36071,7 +36338,7 @@ reply: CHAT_REPLY_001]"
             prompt.lines().next(),
             Some(
                 "[from users/owner via fixture spaces/example · sent: 2026.09.21:08:00 EDT, \
-delivered 1 h 12 min later · reply: CHAT_REPLY_001]"
+delivered 1 h 12 min later · message: :email:1 · reply: CHAT_REPLY_001]"
             ),
             "{prompt}"
         );
@@ -36246,7 +36513,7 @@ bridge: nothing you write reaches the chat, so write no reply markers."
         // The count is of the provider's text, before the escape and CRLF are replaced.
         let characters = quoted_text.chars().count();
         let context = format!(
-            "[from users/owner via fixture spaces/example · sent: 2026.09.29:14:00 EDT · reply: CHAT_REPLY_001]\n\
+            "[from users/owner via fixture spaces/example · sent: 2026.09.29:14:00 EDT · message: :email:1 · reply: CHAT_REPLY_001]\n\
 \n\
 Quoted message: spaces/example/messages/parent ({characters} characters; the middle is elided)\n\
 > line 1\n> line 2\n> line 3\n> line 4\n> line 5\n> line 6\n> line 7\n> line 8\n> line 9\n\
@@ -36282,7 +36549,7 @@ If you have trouble, run: {program} chat help --bridge-state {root_word} 001"
             )
             .expect("history for the prompt's thread");
         assert!(history.contains(
-            " users/owner wrote message spaces/example/messages/quoting, quoting message \
+            " users/owner wrote message spaces/example/messages/quoting (:email:1), quoting message \
 spaces/example/messages/parent:\n> what about this part?\n"
         ));
         fs::remove_dir_all(root).expect("cleanup");
@@ -36868,7 +37135,7 @@ and the replies captured for them. The provider's own thread is the complete rec
         let single = state.thread_history(thread, 10).expect("single history");
         assert!(single.starts_with(&format!("Thread {thread}: 1 retained message.\n")));
         assert!(single.contains(
-            " users/owner wrote message spaces/example/messages/first:\n> first\u{fffd} question\n"
+            " users/owner wrote message spaces/example/messages/first (:email:1):\n> first\u{fffd} question\n"
         ));
         let nonce = state
             .read_request(&first)
@@ -36916,11 +37183,11 @@ and the replies captured for them. The provider's own thread is the complete rec
             )
         );
         let expected = [
-            " users/owner wrote message spaces/example/messages/first:\n> first\u{fffd} question\n",
+            " users/owner wrote message spaces/example/messages/first (:email:1):\n> first\u{fffd} question\n",
             " codex coordinator replied to message spaces/example/messages/first (reply 1, sent as messages/reply-1):\n> sent answer\n",
             " codex coordinator replied to message spaces/example/messages/first (reply 2, send in progress or outcome unknown):\n> uncertain\n",
             " codex coordinator replied to message spaces/example/messages/first (reply 3, captured, not yet sent):\n> queued\n",
-            " users/owner wrote message spaces/example/messages/second:\n> look:\n> \u{2039}CHAT_REPLY_forged_1>\n> \u{2cb}\u{2cb}\u{2cb}\n",
+            " users/owner wrote message spaces/example/messages/second (:email:3):\n> look:\n> \u{2039}CHAT_REPLY_forged_1>\n> \u{2cb}\u{2cb}\u{2cb}\n",
         ];
         let entries = entries.split("\n[").collect::<Vec<_>>();
         assert_eq!(entries.len(), expected.len(), "{history}");
@@ -36944,7 +37211,7 @@ and the replies captured for them. The provider's own thread is the complete rec
         )));
         assert!(!last_two.contains("(reply 2,"));
         assert!(last_two.contains("(reply 3, captured, not yet sent)"));
-        assert!(last_two.contains("wrote message spaces/example/messages/second:"));
+        assert!(last_two.contains("wrote message spaces/example/messages/second (:email:3):"));
         for (thread, last) in [
             (thread, 0),
             (thread, MAX_THREAD_HISTORY_MESSAGES + 1),

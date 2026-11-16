@@ -6667,6 +6667,9 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                 for warning in bridge.reply_link_warnings(&body) {
                     eprintln!("agentctl: warning: {warning}");
                 }
+                for notice in bridge.reply_link_notices(&body) {
+                    eprintln!("agentctl: warning: {notice}");
+                }
             }
             match crate::chat_service::reply_checked(
                 &state,

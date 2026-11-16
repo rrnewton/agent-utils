@@ -2864,13 +2864,19 @@ https address holding exactly one `{n}` placeholder (for example
 or `…/issues/{n}` for a plain issue tracker). With them, a request prompt's header
 prints its thread's permalink beside its number, `agentctl chat thread` and the
 per-request `reply_alias`/`thread_permalink` fields of `agentctl chat status` name
-the same link, and the reply tokens `[[thread:060]]` and `[[issue:658]]` render as
-clickable links. Permalinks are built locally from the configured origin, the
+the same link, and the reply references `:thread:060`, `:email:1846` and
+`:issue:658` render as clickable links (each message's `:email:` number is printed
+beside it). Permalinks are built locally from the configured origin, the
 channel id and the thread root `ts`; no provider call is made to form one, and a
 part that cannot be read forms no link. Plain numbers and bare `#658` are never
-rewritten. An unresolvable token stays plain text and is reported as a warning by
-`agentctl chat reply` (captured replies log it). Without the keys, numbers stay
-plain, exactly as before.
+rewritten by the reference pass. An unresolvable reference stays tagged plain
+text and is reported as a warning by `agentctl chat reply` (captured replies
+log it); `thread NNN`, `reply NNN` and `per your NNNN` naming a retained thread
+are rewritten to the linked tagged form and reported, and other bare-looking
+references are reported only (`chat status` counts them as
+`bare_ref_warnings`). Short references for other renderers are published in
+`short-refs.json` in the state directory (`agentctl-short-refs/v1`). Without
+the keys, numbers stay plain, exactly as before.
 
 Resource names. The channel is the Slack conversation ID (`C…`). A message is
 `C…/messages/<ts>`, a thread is `C…/threads/<root ts>`, and a reaction receipt

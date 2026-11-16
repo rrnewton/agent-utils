@@ -228,17 +228,21 @@ in the reply.
 
 ## Link threads and issues, never bare numbers
 
-Never show the owner a bare internal id: not a thread number like `(060)`, not a reply
-alias, not a bare `#658`. A request prompt's header prints its thread's ready permalink
-beside its number (`thread 060 https://…`); paste that link, or cite the thread with the
-token `[[thread:060]]` (the number exactly as the prompt and `agentctl chat thread 060`
-write it) anywhere in a reply: the bridge renders it as a clickable link to that Slack
-thread. Cite a tracker issue the same way, as `[[issue:658]]`. Plain numbers and bare
-`#658` are never rewritten — they mean other things too often to guess — so the token is
-the only short form that links. A token whose number the bridge cannot resolve from its
-own state stays plain text and is reported as a warning (`agentctl chat reply` prints it;
-captured replies log it), so fix the number rather than leaving the owner a dead
-reference. Inside code fences and inline code the tokens stay literal, as written. The lines after the hits say how far back each channel was searched: search
+Never show the owner a bare internal id: not `(060)`, not a bare number after
+"thread"/"reply"/"per your", not a bare `#658`. Cite with the tagged forms only:
+`:thread:060` for a thread (the number exactly as the prompt and
+`agentctl chat thread 060` write it), `:email:1846` for a message (the number the
+prompt's header and `chat thread` print beside the message), and `:issue:658` for a
+tracker issue. The bridge renders each as a clickable link from its own state; the
+(The reply fence keeps its protocol form, `<CHAT_REPLY_007>`: the tag is plumbing,
+not a citation — never render or rewrite it.) A reference whose number the bridge
+cannot resolve stays tagged plain text and is reported as a warning
+(`agentctl chat reply` prints it; captured replies log it and count it in
+`chat status`), so fix the number rather than leaving the owner a dead reference.
+The bridge also guards the habit: `thread 060`, `reply 060` or `per your 0060`
+naming a retained thread is rewritten to the linked tagged form and reported, and
+`(060)` is reported without being rewritten. Inside code fences and inline code,
+references stay literal, as written. The lines after the hits say how far back each channel was searched: search
 covers only what the server's cache holds, a recent window until full-history retention
 lands, so when a channel's reach is partial, say so in the reply ("searched back to …;
 older discussion is outside the cached window") rather than presenting the hits as the
