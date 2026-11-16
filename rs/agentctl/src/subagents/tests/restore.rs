@@ -3694,3 +3694,158 @@ fn restore_revives_with_the_recorded_profile_environment() {
     assert_eq!(environments.len(), 2);
     assert_eq!(environments[1], ["RECOVERY_MODE=on"]);
 }
+
+#[test]
+fn restore_refuses_a_busy_lock_without_waiting_or_touching_runtime() {
+    use fs2::FileExt;
+    let fixture = Fixture::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(registry.join(".restore.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    for dry_run in [true, false] {
+        let host = ScriptedHost::new();
+        let result = restore(
+            &fixture.client,
+            &registry,
+            &host,
+            &config,
+            &RestoreOptions {
+                dry_run,
+                ..options(None)
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("restore lock is busy"));
+        assert!(host.commands().is_empty());
+    }
+}
+
+#[test]
+fn watch_reconciles_dead_desired_agents_once_and_check_only_never_launches() {
+    let fixture = Fixture::new();
+    let old = dead_agent(&fixture);
+    let mut config = config(&fixture, Some("lane"));
+    config.units.clear();
+    config.duties.agent_repair = true;
+    config.duties.queue_drain = false;
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let run = |check_only| {
+        watch_once(
+            &fixture.client,
+            &registry,
+            &host,
+            &config,
+            &WatchOptions {
+                check_only,
+                ..repair_watch_options()
+            },
+            &mut Default::default(),
+            &mut Default::default(),
+        )
+        .into_iter()
+        .find(|row| row["check"] == "agent_repair")
+        .unwrap()
+    };
+    let plan = run(true);
+    assert_eq!(plan["ok"], false, "{plan}");
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+    let repaired = run(false);
+    assert_eq!(repaired["ok"], true, "{repaired}");
+    let new_token = fixture.manager().load("lane").unwrap().token;
+    assert_ne!(new_token, old.token);
+    let repeated = run(false);
+    assert_eq!(repeated["ok"], true, "{repeated}");
+    assert_eq!(fixture.manager().load("lane").unwrap().token, new_token);
+}
+
+#[test]
+fn restore_dry_run_reports_unavailable_herdr_without_waiting() {
+    let fixture = Fixture::new();
+    let config = config(&fixture, None);
+    fixture.client.fail_panes.store(true, Ordering::Relaxed);
+    let host = ScriptedHost::new();
+    let started = host.now();
+    let report = restore(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        &host,
+        &config,
+        &RestoreOptions {
+            dry_run: true,
+            ..options(None)
+        },
+    )
+    .unwrap();
+    assert_eq!(report["herdr"]["ready"], false);
+    assert_eq!(host.now(), started, "dry-run must not sleep for Herdr");
+    assert!(!host
+        .commands()
+        .iter()
+        .any(|command| command.contains(" start ")));
+}
+
+#[test]
+fn watch_agent_repair_is_opt_in_and_never_revives_stopped_lanes() {
+    let fixture = Fixture::new();
+    let mut old = dead_agent(&fixture);
+    let config = config(&fixture, Some("lane"));
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let findings = watch_once(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &repair_watch_options(),
+        &mut Default::default(),
+        &mut Default::default(),
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|row| row["check"] == "agent_repair" && row["skipped"] == true)
+            || findings.iter().any(|row| row["subject"] == "agent_repair")
+    );
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+    // A manually stopped worker is excluded by the same desired-state
+    // derivation restore uses. The coordinator is deliberately distinct.
+    old.lifecycle = "stopped".to_owned();
+    fixture.manager().save(&old).unwrap();
+    let mut config = config.clone();
+    config.coordinator = None;
+    config.units.clear();
+    let plan = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &RestoreOptions {
+            dry_run: true,
+            ..options(None)
+        },
+    )
+    .unwrap();
+    assert_eq!(plan["agents"][0]["action"], "skipped", "{plan}");
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+}
+
+fn repair_watch_options() -> WatchOptions {
+    WatchOptions {
+        interval: Duration::from_secs(60),
+        once: true,
+        check_only: false,
+        wrkslots: None,
+        state_dir: None,
+        queue_stale: Duration::from_secs(600),
+    }
+}

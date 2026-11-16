@@ -4,7 +4,7 @@
 //! named for the boot:
 //!
 //! 1. Hold `<registry>/.restore.lock`, so a boot unit and a manual run never overlap: the
-//!    second waits for the first, then finds its completed report.
+//!    second refuses promptly and can retry after the active restore finishes.
 //! 2. Replay this epoch's recorded report when it already says the restore completed. The
 //!    epoch is the kernel boot plus the user manager's identity (#1405), so a user-manager
 //!    restart in the same boot runs a real restore instead of replaying the old report.
@@ -57,7 +57,7 @@ pub const WATCH_KEYS: [&str; 5] = [
     "close_bare_shells",
 ];
 /// Per-duty switches for `agentctl watch` (#1145 Phase 1).
-pub const DUTY_NAMES: [&str; 8] = [
+pub const DUTY_NAMES: [&str; 9] = [
     "notify",
     "status_requests",
     "tab_hygiene",
@@ -65,6 +65,7 @@ pub const DUTY_NAMES: [&str; 8] = [
     "herdr",
     "slot_images",
     "restore_check",
+    "agent_repair",
     "queue_drain",
 ];
 
@@ -88,7 +89,7 @@ pub fn parse_duty_override(spec: &str) -> Result<(String, bool)> {
     }
 }
 
-/// Watch duties, each defaulting on (today's behaviour). Unknown keys refused.
+/// Watch duties default on except opt-in agent repair. Unknown keys refused.
 /// `status_requests` is accepted but owned by the notifier (`watch-agents`) in
 /// Phase 1: it gates nothing `watch` itself does yet.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -115,6 +116,9 @@ pub struct WatchDuties {
     /// This boot's restore report check.
     #[serde(default = "default_true")]
     pub restore_check: bool,
+    /// Opt-in reconciliation of desired agents through the existing restore transaction.
+    #[serde(default)]
+    pub agent_repair: bool,
     /// Typing queued prompts and stale-queue findings.
     #[serde(default = "default_true")]
     pub queue_drain: bool,
@@ -129,6 +133,7 @@ impl Default for WatchDuties {
             herdr: true,
             slot_images: true,
             restore_check: true,
+            agent_repair: false,
             queue_drain: true,
         }
     }
@@ -144,6 +149,7 @@ impl WatchDuties {
             "herdr" => self.herdr,
             "slot_images" => self.slot_images,
             "restore_check" => self.restore_check,
+            "agent_repair" => self.agent_repair,
             "queue_drain" => self.queue_drain,
             _ => false,
         }
@@ -159,6 +165,7 @@ impl WatchDuties {
             "herdr" => self.herdr = on,
             "slot_images" => self.slot_images = on,
             "restore_check" => self.restore_check = on,
+            "agent_repair" => self.agent_repair = on,
             "queue_drain" => self.queue_drain = on,
             _ => unreachable!(),
         }
@@ -298,6 +305,10 @@ pub struct RestoreConfig {
     /// The coordinator's name in this registry; revived first.
     #[serde(default)]
     pub coordinator: Option<String>,
+    /// Refuse recovery when the recorded conversation cannot resume, rather than start fresh.
+    /// Always enabled by watch agent_repair; default false for manual restore compatibility.
+    #[serde(default)]
+    pub require_recorded_session: bool,
     /// Other registries that name the coordinator.
     #[serde(default)]
     pub also_registered: Vec<AlsoRegistered>,
@@ -541,6 +552,7 @@ impl RestoreConfig {
         Self {
             schema: CONFIG_SCHEMA.to_owned(),
             coordinator: None,
+            require_recorded_session: false,
             also_registered: Vec::new(),
             units: Vec::new(),
             exclude: Vec::new(),
@@ -1929,6 +1941,7 @@ fn recover_agent<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
     name: &str,
     options: &RestoreOptions,
+    require_recorded_session: bool,
 ) -> Value {
     let status = manager.status(name).ok();
     let lifecycle = status
@@ -1960,6 +1973,10 @@ fn recover_agent<A: ManagedApi + ?Sized>(
     } else {
         None
     };
+    if require_recorded_session && unresumable.is_some() {
+        return json!({"name": name, "action": "refused", "reason": format!(
+            "recorded session required: {}", unresumable.unwrap_or_default())});
+    }
     match plan["action"].as_str().unwrap_or_default() {
         "revive" if options.dry_run && unresumable.is_some() => json!({
             "name": name, "action": "revive-fresh", "dry_run": true, "reason": unresumable,
@@ -2993,9 +3010,14 @@ pub fn restore<A: ManagedApi + ?Sized>(
         .mode(0o600)
         .open(registry.join(".restore.lock"))
         .map_err(|error| fail(format!("cannot open the restore lock: {error}")))?;
-    // A second restore waits for the first, then replays its completed report.
-    lock.lock_exclusive()
-        .map_err(|error| fail(format!("cannot take the restore lock: {error}")))?;
+    // Never park a diagnostic or watchdog behind a hung recovery process.
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            fail("restore already running: restore lock is busy; retry after the active restore finishes")
+        } else {
+            fail(format!("cannot take the restore lock: {error}"))
+        }
+    })?;
     let boot_id = host.boot_id()?;
     let epoch = RestoreEpoch {
         boot_id: boot_id.clone(),
@@ -3154,7 +3176,15 @@ pub fn restore<A: ManagedApi + ?Sized>(
             }
         }
     }
-    report["herdr"] = wait_for_herdr(client, host, Duration::from_secs(config.herdr_wait_seconds));
+    report["herdr"] = wait_for_herdr(
+        client,
+        host,
+        if options.dry_run {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(config.herdr_wait_seconds)
+        },
+    );
     // Desired state includes Herdr up (#742): start its unit and wait again.
     if report["herdr"]["ready"] != true {
         if let Some(unit) = config.herdr_unit.as_deref() {
@@ -3193,7 +3223,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
             } else if let Some(Err(reason)) = &bind {
                 json!({"name": name, "action": "refused", "reason": reason, "slot_bind": {"action": "refused"}})
             } else {
-                recover_agent(&manager, name, options)
+                recover_agent(&manager, name, options, config.require_recorded_session)
             };
             if let Some(Ok(verified)) = &bind {
                 row["slot_bind"] = verified.clone();
@@ -3290,7 +3320,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 continue;
             }
             eprintln!("agentctl restore: restoring {name}");
-            let mut row = recover_agent(&manager, name, options);
+            let mut row = recover_agent(&manager, name, options, config.require_recorded_session);
             if let Some(Ok(verified)) = &bind {
                 row["slot_bind"] = verified.clone();
             }
@@ -4345,6 +4375,12 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
         }
     }
 
+    if duties.agent_repair {
+        findings.push(reconcile_agents(client, registry, host, config, options));
+    } else {
+        findings.push(skipped("agent_repair"));
+    }
+
     if let (Some(name), true) = (config.coordinator.as_deref(), herdr_up) {
         if let Ok(manager) = ManagedAgents::new(client, registry) {
             let plan = manager.revive(name, true, None, Duration::from_secs(30));
@@ -4384,6 +4420,82 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             "repair": Value::Null}));
     }
     findings
+}
+
+// The watcher is only a caller of restore: its lock, identity proofs, journal,
+// desired-set rules and session verification remain the single repair authority.
+fn reconcile_agents<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    host: &dyn Host,
+    config: &RestoreConfig,
+    options: &WatchOptions,
+) -> Value {
+    if config.coordinator.is_none() {
+        return finding(
+            "agent_repair",
+            "team",
+            false,
+            "configure a registered coordinator before enabling agent repair",
+            Value::Null,
+        );
+    }
+    let mut config = config.clone();
+    config.require_recorded_session = true;
+    // Infrastructure is reconciled by the earlier watch duties. A planning
+    // pass must not wait for an unavailable server or credential.
+    config.herdr_wait_seconds = 0;
+    config.certificate_wait_seconds = Some(0);
+    let mut restore_options = RestoreOptions {
+        dry_run: true,
+        force: true,
+        startup_timeout: Duration::from_secs(30),
+        wrkslots: options.wrkslots.clone(),
+        ..RestoreOptions::default()
+    };
+    let plan = match restore(client, registry, host, &config, &restore_options) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return finding(
+                "agent_repair",
+                "team",
+                false,
+                error.to_string(),
+                Value::Null,
+            )
+        }
+    };
+    let needs_repair = std::iter::once(&plan["coordinator"])
+        .chain(plan["agents"].as_array().into_iter().flatten())
+        .any(|row| matches!(row["action"].as_str(), Some("revive" | "promote")));
+    if needs_repair && !options.check_only {
+        restore_options.dry_run = false;
+        match restore(client, registry, host, &config, &restore_options) {
+            Ok(report) => finding(
+                "agent_repair",
+                "team",
+                restore_exit_code(&report, false) == 0,
+                "reconciled desired agents through restore; see repair report for each outcome",
+                report,
+            ),
+            Err(error) => finding("agent_repair", "team", false, error.to_string(), plan),
+        }
+    } else {
+        let ready = !needs_repair && plan["would_complete"] == true;
+        finding(
+            "agent_repair",
+            "team",
+            ready,
+            if needs_repair {
+                "desired agents need repair (check only)"
+            } else if ready {
+                "desired agents already running"
+            } else {
+                "desired agents could not be verified; see repair plan for refusals"
+            },
+            plan,
+        )
+    }
 }
 
 fn health_path(options: &WatchOptions) -> Option<PathBuf> {

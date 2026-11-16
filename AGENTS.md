@@ -1,5 +1,11 @@
 # Agent Instructions
 
+## Recovery lane exception — November 16, 2026 ET
+
+For the assigned recovery automation work, publish fixes as pull requests as
+explicitly requested by the owner. This supersedes direct-to-main publication
+for this lane only; validation and linear history requirements still apply.
+
 ## Publication Policy
 
 Routine changes to this repository go directly to `rrnewton/agent-utils:main`.

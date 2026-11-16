@@ -13,6 +13,32 @@ brings back every agent whose record says it was running at shutdown, then the u
 The installed command is the authority for flags and exit codes: `agentctl restore --help`.
 This skill is the protocol around it.
 
+## Continuous recovery (November 16, 2026 ET)
+
+Use the existing `install-units` generated `agent-watch.service` outside the
+terminal server's cgroup. Give it absolute executable paths and an explicit
+PATH for harness launches; never depend on a login shell. Inspect the unit's
+actual `ControlGroup` after starting it. Retire an obsolete boot healer only
+after the replacement writes a fresh `health.json`.
+
+`watch.json` can opt into `"duties": {"agent_repair": true}`. Each pass plans
+against the registry-derived desired agents, then calls the same `restore`
+transaction when repair is needed. It does not replay an earlier success from
+this boot. The duty defaults off. It requires a registered coordinator and
+refuses a fresh conversation when the recorded session cannot resume. Set
+`"require_recorded_session": true` in `restore.json` to apply that policy to
+manual and boot restores too. Stopped lanes and explicit exclusions remain down.
+Use `watch --once --check-only` first; inspect all refusal reasons in health.json.
+A busy restore lock now refuses promptly, including dry runs; retry after the
+active restorer finishes. Do not kill another restorer or bypass the lock.
+
+A proven dead native harness may leave its matching session metadata in an idle
+shell. Revival accepts that metadata only with independent process-death and
+descendant-free shell proofs, stable pane/cwd/workspace observations and no
+competing owner. A different session still refuses: do not clear it or guess a
+replacement conversation. This supersedes the blanket stop/start workaround
+below for matching stale metadata only.
+
 ## 0. One restorer per team
 
 Before you touch anything, find out whether someone is already restoring the team:
