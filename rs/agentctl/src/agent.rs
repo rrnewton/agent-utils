@@ -870,6 +870,20 @@ pub trait AgentRuntime {
     fn typed_anything(&self) -> Option<bool> {
         None
     }
+    /// Whether the second-Enter backstop (#1691 agentctl-second-enter) runs after a typing
+    /// attempt. The default is `false` so embedders and tests opt in explicitly;
+    /// [`SystemRuntime`] enables it unless `AGENTCTL_SECOND_ENTER=0`.
+    fn second_enter_enabled(&self) -> bool {
+        false
+    }
+    /// Note that the second Enter was pressed at Unix time `at`.
+    fn note_second_enter(&self, at: f64) {
+        let _ = at;
+    }
+    /// Note that the second Enter was skipped, with `reason`.
+    fn note_second_enter_skipped(&self, reason: &str) {
+        let _ = reason;
+    }
 }
 
 /// A runtime that behaves as `inner` and names the queue a drain delivers from: see
@@ -888,6 +902,15 @@ impl AgentRuntime for QueueRuntime<'_> {
     }
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
+    }
+    fn second_enter_enabled(&self) -> bool {
+        self.inner.second_enter_enabled()
+    }
+    fn note_second_enter(&self, at: f64) {
+        self.inner.note_second_enter(at);
+    }
+    fn note_second_enter_skipped(&self, reason: &str) {
+        self.inner.note_second_enter_skipped(reason);
     }
     fn monotonic(&self) -> Duration {
         self.inner.monotonic()
@@ -949,6 +972,15 @@ impl AgentRuntime for WithdrawUnacceptedRuntime<'_> {
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
     }
+    fn second_enter_enabled(&self) -> bool {
+        self.inner.second_enter_enabled()
+    }
+    fn note_second_enter(&self, at: f64) {
+        self.inner.note_second_enter(at);
+    }
+    fn note_second_enter_skipped(&self, reason: &str) {
+        self.inner.note_second_enter_skipped(reason);
+    }
     fn typed_prompts_queue(&self) -> Option<PathBuf> {
         self.inner.typed_prompts_queue()
     }
@@ -1001,6 +1033,15 @@ impl AgentRuntime for WithdrawingRuntime<'_> {
     }
     fn paste_drawn_as(&self, label: &str) {
         self.inner.paste_drawn_as(label);
+    }
+    fn second_enter_enabled(&self) -> bool {
+        self.inner.second_enter_enabled()
+    }
+    fn note_second_enter(&self, at: f64) {
+        self.inner.note_second_enter(at);
+    }
+    fn note_second_enter_skipped(&self, reason: &str) {
+        self.inner.note_second_enter_skipped(reason);
     }
     fn typed_prompts_queue(&self) -> Option<PathBuf> {
         self.inner.typed_prompts_queue()
@@ -1136,6 +1177,21 @@ impl AgentRuntime for PasteTrackingRuntime<'_> {
         self.inner.withdraws_unaccepted(message_id)
     }
 
+    fn second_enter_enabled(&self) -> bool {
+        self.inner.second_enter_enabled()
+    }
+    fn note_second_enter(&self, at: f64) {
+        let mut document = self.document.borrow_mut();
+        document.insert("second_enter_at".to_owned(), json!(at));
+        let _ = atomic_json(&self.inflight_path, &Value::Object(document.clone()));
+        self.inner.note_second_enter(at);
+    }
+    fn note_second_enter_skipped(&self, reason: &str) {
+        let mut document = self.document.borrow_mut();
+        document.insert("second_enter_skipped".to_owned(), json!(reason));
+        let _ = atomic_json(&self.inflight_path, &Value::Object(document.clone()));
+        self.inner.note_second_enter_skipped(reason);
+    }
     fn input_started(&self) {
         let mut document = self.document.borrow_mut();
         if document.contains_key("paste_started_at") {
@@ -1500,6 +1556,12 @@ pub(crate) fn sender_or(runtime: &dyn AgentRuntime, fallback: &str) -> String {
 }
 
 impl AgentRuntime for SystemRuntime {
+    fn second_enter_enabled(&self) -> bool {
+        !matches!(
+            std::env::var("AGENTCTL_SECOND_ENTER").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    }
     fn monotonic(&self) -> Duration {
         self.origin.elapsed()
     }

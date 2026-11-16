@@ -253,6 +253,21 @@
         "null"
       ]
     },
+    "second_enter_at": {
+      "description": "Unix seconds when the second Enter was pressed (#1691).",
+      "format": "double",
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "second_enter_skipped": {
+      "description": "Why the second Enter was skipped, when it was.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "sent_at": {
       "description": "Original send time recorded by a sender, in its own units."
     },

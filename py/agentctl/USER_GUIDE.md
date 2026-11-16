@@ -2302,6 +2302,13 @@ alone, with these rules:
   text left there (`typed_as`), the drain logs it (a notice the first time),
   and every later drain presses Enter only, never typing it again, until it
   leaves the bottom. Prompts behind it wait rather than being typed on top of it.
+- **Second Enter (#1691)**: about 1 s after every typing attempt, on every
+  outcome and before the pane lock is released, one extra Enter is pressed
+  when the re-read composer is empty (harmless) or holds our own staged text
+  or post-type placeholder; it is skipped on approval/permission/picker
+  dialogs and foreign drafts. A flush is receipted `submitted by
+  second_enter`; the queue record gains `second_enter_at` or
+  `second_enter_skipped`. Opt out with `AGENTCTL_SECOND_ENTER=0`.
 - **agentterm**: a pane showing agentterm's view of a remote session is read by
   agentterm's input frame at the bottom of the screen, not by stillness:
   `╭ idle ─…` is `idle`, and a spinner with `working M:SS` is `working`. Any

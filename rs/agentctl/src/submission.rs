@@ -1505,6 +1505,90 @@ fn submit_key(harness: &str, view: &ComposerView, runtime: &dyn AgentRuntime) ->
     crate::harness::adapter(harness).map_or("Enter", |adapter| adapter.submit_key(view))
 }
 
+/// Delay before the second Enter (#1691 agentctl-second-enter).
+pub const SECOND_ENTER_DELAY: Duration = Duration::from_secs(1);
+
+/// The second Enter: about 1 s after a typing attempt, under the caller's pane lock,
+/// press one extra Enter when it can only submit our own paste or land on an empty
+/// composer. Returns a verified receipt when the press flushed our staged paste.
+fn second_enter(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    text: &str,
+    placeholders_before: usize,
+    runtime: &dyn AgentRuntime,
+) -> Option<Submission> {
+    runtime.sleep(SECOND_ENTER_DELAY);
+    if runtime.cancelled() {
+        runtime.note_second_enter_skipped("cancelled");
+        return None;
+    }
+    let Ok(screen) = terminal.read_screen(pane_id) else {
+        runtime.note_second_enter_skipped("composer read failed");
+        return None;
+    };
+    if blocked(harness, &screen)
+        || crate::agent_watch::approval_prompt_line(&screen).is_some()
+        || crate::agent_watch::blocked_finding_for(&screen, Some(harness)).is_some()
+    {
+        runtime.note_second_enter_skipped("approval, permission, picker or dialog showing");
+        return None;
+    }
+    let Some(view) = composer_view(harness, &screen) else {
+        runtime.note_second_enter_skipped("composer not recognisable");
+        return None;
+    };
+    if composer_is_empty(&view) {
+        if terminal.send_keys(pane_id, "Enter").is_ok() {
+            runtime.note_second_enter(unix_seconds());
+        } else {
+            runtime.note_second_enter_skipped("second Enter key failed");
+        }
+        return None;
+    }
+    if staged(&view, text, placeholders_before) || composer_is_this_text(&view, text) {
+        let key = submit_key(harness, &view, runtime);
+        if terminal.send_keys(pane_id, key).is_err() {
+            runtime.note_second_enter_skipped("second Enter key failed");
+            return None;
+        }
+        runtime.note_second_enter(unix_seconds());
+        let deadline = runtime.monotonic().saturating_add(PRINT_GRACE);
+        loop {
+            runtime.sleep(POLL);
+            let Ok(screen) = terminal.read_screen(pane_id) else {
+                return None;
+            };
+            if blocked(harness, &screen) {
+                return None;
+            }
+            let Some(current) = composer_view(harness, &screen) else {
+                if runtime.monotonic() >= deadline {
+                    return None;
+                }
+                continue;
+            };
+            if composer_draft(&current).is_none() {
+                return Some(Submission::Verified(SubmissionReceipt {
+                    key: "Enter",
+                    key_presses: 1,
+                    elapsed: SECOND_ENTER_DELAY,
+                    evidence: "submitted by second_enter".to_owned(),
+                    printed: true,
+                    settled: true,
+                    queued: false,
+                }));
+            }
+            if runtime.monotonic() >= deadline || runtime.cancelled() {
+                return None;
+            }
+        }
+    }
+    runtime.note_second_enter_skipped("composer holds text that is not ours");
+    None
+}
+
 /// Stage `text` in an empty composer, submit it, and prove that it left the composer.
 ///
 /// The submission key is repeated with a doubling wait while the exact text is
@@ -1513,7 +1597,63 @@ fn submit_key(harness: &str, view: &ComposerView, runtime: &dyn AgentRuntime) ->
 ///
 /// When only a marker that was already showing proves the submission, the screen is read for
 /// up to [`PRINT_GRACE`] more for printed evidence, and the receipt says which kind it got.
+/// Then press the second Enter (#1691) on every typing outcome before the caller
+/// releases the pane lock.
 pub fn submit_verified(
+    terminal: &dyn PromptTerminal,
+    pane_id: &str,
+    harness: &str,
+    text: &str,
+    timeouts: SubmitTimeouts,
+    runtime: &dyn AgentRuntime,
+) -> Result<Submission> {
+    let placeholders_before = terminal
+        .read_screen(pane_id)
+        .ok()
+        .and_then(|screen| composer_view(harness, &screen))
+        .map_or(0, |view| paste_placeholders(&view.composer));
+    let result = submit_verified_typed(terminal, pane_id, harness, text, timeouts, runtime);
+    if !runtime.second_enter_enabled() {
+        return result;
+    }
+    let typed = match &result {
+        Ok(Submission::Verified(_)) => true,
+        Ok(Submission::NotStaged(reason)) => {
+            reason.contains("stranded")
+                || reason.contains("late_paste")
+                || reason.contains("still staged")
+                || reason.contains("not observed")
+        }
+        Ok(Submission::Unconfirmed) => true,
+        Err(error) => {
+            let detail = error.to_string();
+            detail.contains("past") || detail.contains("key press") || detail.contains("composer")
+        }
+    };
+    let holds_ours = terminal
+        .read_screen(pane_id)
+        .ok()
+        .and_then(|screen| composer_view(harness, &screen))
+        .is_some_and(|view| {
+            staged(&view, text, placeholders_before) || composer_is_this_text(&view, text)
+        });
+    if !typed && !holds_ours {
+        return result;
+    }
+    if let Some(flushed) = second_enter(
+        terminal,
+        pane_id,
+        harness,
+        text,
+        placeholders_before,
+        runtime,
+    ) {
+        return Ok(flushed);
+    }
+    result
+}
+
+fn submit_verified_typed(
     terminal: &dyn PromptTerminal,
     pane_id: &str,
     harness: &str,
@@ -2672,6 +2812,8 @@ mod tests {
         followup: Option<&'static str>,
         /// When an earlier pass left the prompt stranded, for a stranded retry (#884).
         stranded_since: Option<f64>,
+        second_enter: bool,
+        second_notes: std::sync::Mutex<Vec<String>>,
     }
 
     impl AgentRuntime for Clock {
@@ -2708,6 +2850,18 @@ mod tests {
 
         fn stranded_since(&self) -> Option<f64> {
             self.stranded_since
+        }
+        fn second_enter_enabled(&self) -> bool {
+            self.second_enter
+        }
+        fn note_second_enter(&self, at: f64) {
+            self.second_notes.lock().unwrap().push(format!("at:{at}"));
+        }
+        fn note_second_enter_skipped(&self, reason: &str) {
+            self.second_notes
+                .lock()
+                .unwrap()
+                .push(format!("skipped:{reason}"));
         }
     }
 
@@ -4526,6 +4680,78 @@ mod tests {
         );
         assert!(screen.state().keys.is_empty());
         assert_eq!(screen.state().pastes.len(), 1);
+    }
+
+    #[test]
+    fn second_enter_flushes_placeholder_paste_the_first_attempt_never_saw() {
+        // Owner case (#1691): paste typed while busy, not observed in the in-lock
+        // window (stranded, no Enter sent), then drawn as a placeholder. The second
+        // Enter submits it; nothing is typed twice.
+        let screen = FakeScreen::new("claude", true);
+        screen.state().paste_visible_after_reads = 103;
+        let clock = Clock {
+            second_enter: true,
+            ..Clock::default()
+        };
+        let text = "line one of the stranded paste\nline two\nline three\nline four";
+        let outcome = submit_verified(&screen, "w1:p1", "claude", text, in_lock_timeouts(), &clock);
+        let receipt = receipt(outcome);
+        assert_eq!(receipt.evidence, "submitted by second_enter");
+        let state = screen.state();
+        assert_eq!(state.pastes.len(), 1);
+        assert_eq!(state.keys, ["Enter"]);
+        assert_eq!(state.submitted.len() + state.queued.len(), 1);
+        assert!(
+            clock
+                .second_notes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|n| n.starts_with("at:")),
+            "{:?}",
+            clock.second_notes.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn second_enter_presses_once_on_empty_composer_after_verified_submit() {
+        let screen = FakeScreen::new("claude", false);
+        let clock = Clock {
+            second_enter: true,
+            ..Clock::default()
+        };
+        let outcome = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            "hello second enter",
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        receipt(outcome);
+        assert_eq!(screen.state().keys, ["Enter", "Enter"]);
+        assert_eq!(screen.state().submitted.len(), 1);
+    }
+
+    #[test]
+    fn second_enter_never_presses_on_a_foreign_draft() {
+        let screen = FakeScreen::new("claude", false);
+        screen.state().composer = "someone else typing".to_owned();
+        let clock = Clock {
+            second_enter: true,
+            ..Clock::default()
+        };
+        let outcome = submit_verified(
+            &screen,
+            "w1:p1",
+            "claude",
+            "our prompt text here",
+            SubmitTimeouts::default(),
+            &clock,
+        );
+        refusal(outcome);
+        assert!(screen.state().keys.is_empty());
+        assert!(screen.state().pastes.is_empty());
     }
 
     fn stranded_clock(seconds_ago: f64) -> Clock {

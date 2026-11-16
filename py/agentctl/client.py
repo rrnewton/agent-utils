@@ -2804,7 +2804,7 @@ class HerdrClient:
                 f"pane {pane_id}: harness lookup failed before typing: {exc}"
             ) from exc
         if harness in VERIFIED_HARNESSES and not text.lstrip().startswith("/"):
-            return submit_verified(terminal or self, pane_id, harness, text)
+            return submit_verified(terminal or self, pane_id, harness, text, second_enter=True)
         if terminal is None:
             self._call_ok(["agent", "prompt", pane_id, text], f"agent prompt {pane_id}")
         else:

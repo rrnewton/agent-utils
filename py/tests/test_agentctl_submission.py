@@ -210,7 +210,10 @@ def _submit(agent: FakeAgent, text: str, **kwargs: float) -> object:
     clock = Clock()
     return submit_verified(
         agent, "w1:p1", agent.harness, text,
-        sleep=clock.sleep, monotonic=clock.monotonic, **kwargs,
+        stage_timeout=kwargs.get("stage_timeout"),
+        submit_timeout=kwargs.get("submit_timeout"),
+        composer_timeout=kwargs.get("composer_timeout"),
+        sleep=clock.sleep, monotonic=clock.monotonic,
     )
 
 
@@ -1781,3 +1784,18 @@ def test_a_clean_verified_send_gets_no_recheck_key() -> None:
     assert receipt is not None
     assert agent.keys == ["Enter"]
     assert agent.pastes == ["the brief"]
+def test_second_enter_flushes_placeholder_after_unobserved_paste() -> None:
+    # Owner case (#1691): first attempt never observes the paste; the second
+    # Enter, ~1s later, submits the placeholder it finds. Nothing re-typed.
+    agent = FakeAgent("claude", busy=True)
+    agent.paste_visible_after_reads = 103
+    clock = Clock()
+    receipt = submit_verified(
+        agent, "w1:p1", "claude",
+        "line one of the stranded paste\nline two\nline three\nline four",
+        stage_timeout=10, sleep=clock.sleep, monotonic=clock.monotonic,
+        second_enter=True,
+    )
+    assert receipt.evidence == "submitted by second_enter"
+    assert len(agent.pastes) == 1
+    assert agent.keys == ["Enter"]

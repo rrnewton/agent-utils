@@ -74,6 +74,7 @@ FIRST_RETRY_SECONDS = 0.5
 MAX_RETRY_SECONDS = 4.0
 #: Screen polling interval while waiting.
 POLL_SECONDS = 0.1
+SECOND_ENTER_DELAY_SECONDS = 1.0
 
 _SGR = re.compile(r"\x1b\[([0-9;:]*)m")
 _ESCAPE = re.compile(
@@ -831,6 +832,56 @@ def _recheck_after_verify(
             return
 
 
+
+def _second_enter(terminal: PromptTerminal, pane_id: str, harness: str, text: str, placeholders_before: int, *, sleep: Callable[[float], None], monotonic: Callable[[], float], on_second_enter: Callable[[], None] | None = None, on_skipped: Callable[[str], None] | None = None) -> SubmissionReceipt | None:
+    """One extra Enter ~1s after a typing attempt (#1691 agentctl-second-enter).
+
+    Presses only on an empty composer or on our own staged text/placeholder;
+    skips blocked dialogs and foreign drafts. Returns a receipt when the press
+    flushed our paste, else None.
+    """
+    def skipped(reason: str) -> SubmissionReceipt | None:
+        if on_skipped is not None: on_skipped(reason)
+        return None
+    sleep(SECOND_ENTER_DELAY_SECONDS)
+    try:
+        screen = terminal.read_screen(pane_id)
+    except Exception:
+        return skipped("composer read failed")
+    from agentctl.harness_tui import State, harness_tui
+    adapter = harness_tui(harness)
+    if adapter is not None and adapter.classify(screen).state in (State.QUESTION, State.MENU):
+        return skipped("approval, permission, picker or dialog showing")
+    view = composer_view(harness, screen)
+    if view is None:
+        return skipped("composer not recognisable")
+    if composer_is_empty(view):
+        terminal.send_keys(pane_id, "Enter")
+        if on_second_enter is not None: on_second_enter()
+        return None
+    if _staged(view, text, placeholders_before) or _composer_is_this_text(view, text):
+        key = _submit_key(harness, view)
+        terminal.send_keys(pane_id, key)
+        if on_second_enter is not None: on_second_enter()
+        deadline = monotonic() + 2.0
+        while True:
+            sleep(POLL_SECONDS)
+            current = composer_view(harness, terminal.read_screen(pane_id))
+            if current is not None and not _staged(current, text, placeholders_before) and composer_is_empty(current):
+                return SubmissionReceipt("Enter", 1, SECOND_ENTER_DELAY_SECONDS, "submitted by second_enter")
+            if monotonic() >= deadline:
+                return None
+    return skipped("composer holds text that is not ours")
+
+
+def _composer_is_this_text(view: ComposerView, text: str) -> bool:
+    solid = "".join(view.composer_solid.split()).lower()
+    wanted = "".join(text.split()).lower()
+    if solid and (solid == wanted or (len(solid) >= 16 and solid in wanted)):
+        return True
+    return f"[Pasted Content {len(text)} chars]" in view.composer
+
+
 def hold_bound_seconds(
     *, composer_timeout: float, stage_timeout: float, submit_timeout: float
 ) -> float:
@@ -847,7 +898,54 @@ def hold_bound_seconds(
     )
 
 
+
 def submit_verified(
+    terminal: PromptTerminal,
+    pane_id: str,
+    harness: str,
+    text: str,
+    *,
+    stage_timeout: float | None = None,
+    submit_timeout: float | None = None,
+    composer_timeout: float | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    second_enter: bool = False,
+) -> SubmissionReceipt:
+    """Typed submission plus the second Enter on every typing outcome (#1691)."""
+    import os
+    if os.environ.get("AGENTCTL_SECOND_ENTER") in ("0", "false", "off"):
+        second_enter = False
+    placeholders_before = 0
+    try:
+        before_view = composer_view(harness, terminal.read_screen(pane_id))
+        if before_view is not None:
+            placeholders_before = len(_PASTE_PLACEHOLDER.findall(before_view.composer))
+    except Exception:
+        pass
+    result = None
+    error = None
+    try:
+        result = _submit_verified_typed(
+            terminal, pane_id, harness, text,
+            stage_timeout=stage_timeout, submit_timeout=submit_timeout,
+            composer_timeout=composer_timeout, sleep=sleep, monotonic=monotonic,
+        )
+    except Exception as exc:  # second Enter runs on unverified/stranded outcomes too
+        error = exc
+    if second_enter:
+        typed = result is not None or (error is not None and not isinstance(error, PromptNotStaged))
+        if typed:
+            flushed = _second_enter(terminal, pane_id, harness, text, placeholders_before, sleep=sleep, monotonic=monotonic)
+            if flushed is not None:
+                return flushed
+    if error is not None:
+        raise error
+    assert result is not None
+    return result
+
+
+def _submit_verified_typed(
     terminal: PromptTerminal,
     pane_id: str,
     harness: str,

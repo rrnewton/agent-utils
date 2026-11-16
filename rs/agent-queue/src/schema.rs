@@ -124,6 +124,12 @@ pub struct QueueItem {
     /// Drain passes that found the prompt still stranded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stranded_passes: Option<u64>,
+    /// Unix seconds when the second Enter was pressed (#1691).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_enter_at: Option<f64>,
+    /// Why the second Enter was skipped, when it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_enter_skipped: Option<String>,
     /// Unix seconds when an unsent draft was recovered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_recovered_at: Option<f64>,
@@ -191,6 +197,8 @@ impl QueueItem {
             probable_misroute: None,
             typed_as: None,
             paste_label: None,
+            second_enter_at: None,
+            second_enter_skipped: None,
             stranded_at: None,
             stranded_passes: None,
             draft_recovered_at: None,

@@ -57,6 +57,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Capability | Claude Code | Codex | Muse | Unknown TUI | Headless |
 | --- | --- | --- | --- | --- | --- |
 | Send: typing + submit | supported | supported | supported | partial | supported (Claude only) |
+| Second Enter after delivery (#1691) | supported | supported | supported (Rust editor path) | none | n/a (no composer) |
 | Send: delivery receipts | supported | supported | supported | partial | supported (Claude only) |
 | Follow-up while working | partial | supported | supported | none | n/a (queued turns) |
 | Stuck-paste / Enter backstop | supported | partial | supported | partial | n/a (no composer) |
@@ -206,6 +207,20 @@ in `rs/agentctl/src/stale_draft.rs`.
 This is the row the owner did not know diverged: the backstop grew up
 Claude-first, reached Muse in #1546, and an unrecognised TUI still gets
 a report instead of a rescue.
+
+### Second Enter after delivery
+
+One extra Enter about 1 s after every TUI typing attempt, on every outcome
+(verified, unverified, stranded, paste-not-observed), before the pane lock
+is released (#1691 agentctl-second-enter; `second_enter` in
+`rs/agentctl/src/submission.rs`, mirrored in `py/agentctl/submission.py`).
+It presses only on an empty composer or on our own staged text or
+post-type placeholder, skips approval/permission/picker/dialog screens
+and foreign drafts (`second_enter_skipped` on the queue record), and a
+flush is receipted as `submitted by second_enter` with `second_enter_at`
+stamped. Bare Enter on an empty composer was verified harmless live for
+Claude Code, Codex and Muse. Opt out: `AGENTCTL_SECOND_ENTER=0`. Unknown
+TUI gets none (no composer model); headless has no composer.
 
 ### Composer / draft detection
 
