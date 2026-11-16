@@ -56,10 +56,69 @@ struct Fixture {
     argv_file: PathBuf,
 }
 
+/// Whether `pid` is still the test process that owned a fixture server:
+/// a process (not a thread of something else — pid reuse can hand the
+/// number to either) whose command line names this test binary. A bare
+/// `/proc/<pid>` existence check is not proof after reuse.
+fn tmux_fixture_owner_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    let is_process = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Tgid:"))
+        .and_then(|tgid| tgid.trim().parse::<u32>().ok())
+        == Some(pid);
+    if !is_process {
+        return false;
+    }
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .is_ok_and(|cmdline| cmdline.windows(14).any(|part| part == b"tmux_lifecycle"))
+}
+
+/// Remove tmux servers left by earlier test processes that died without
+/// running their fixture cleanup (a killed test binary never runs `Drop`,
+/// and its watchdog shell dies with it): every `agentctl-tmux-test-*`
+/// socket whose owner pid (the middle name segment) is no longer that
+/// test process. A live owner's server — including a parallel test in
+/// this same process — is never touched.
+fn sweep_stale_tmux_servers(tmux: &PathBuf) {
+    let Some(socket) = tmux_socket_path("probe").parent().map(PathBuf::from) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&socket) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("agentctl-tmux-test-") else {
+            continue;
+        };
+        let Some(owner) = rest
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if tmux_fixture_owner_alive(owner) {
+            continue;
+        }
+        let _ = Command::new(tmux)
+            .args(["-L", &name, "kill-server"])
+            .output();
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
 impl Fixture {
     fn new() -> Option<Self> {
         let tmux = executable("tmux")?;
         executable("python3")?;
+        sweep_stale_tmux_servers(&tmux);
         let root = std::env::temp_dir().join(format!(
             "agentctl-tmux-lifecycle-{}-{}",
             std::process::id(),
