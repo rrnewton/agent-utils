@@ -879,6 +879,12 @@ def _composer_is_this_text(view: ComposerView, text: str) -> bool:
     wanted = "".join(text.split()).lower()
     if solid and (solid == wanted or (len(solid) >= 16 and solid in wanted)):
         return True
+    # Newest placeholder wins (#1691), as in the Rust edition.
+    labels = re.findall(r"\[Pasted text #\d+ \+(\d+) lines\]", view.composer)
+    if labels and int(labels[-1]) in {
+        max(0, len(text.splitlines()) - 1), text.count("\n"), len(text.splitlines())
+    }:
+        return True
     return f"[Pasted Content {len(text)} chars]" in view.composer
 
 
@@ -1025,9 +1031,8 @@ def _submit_verified_typed(
             )
         if monotonic() >= composer_deadline:
             raise PromptNotStaged(
-                f"pane {pane_id} does not show a recognisable {harness} composer "
-                f"after {composer_timeout:g}s (a dialog or menu may be open); "
-                "nothing was typed"
+                f"pane {pane_id} composer is occupied by an unattributed draft; nothing was typed" if "[Pasted " in screen else f"pane {pane_id} does not show a recognisable {harness} composer "
+                f"after {composer_timeout:g}s (a dialog or menu may be open); nothing was typed" if "[Pasted " not in screen else ""
             )
         sleep(POLL_SECONDS)
     draft = before.composer_solid.strip()

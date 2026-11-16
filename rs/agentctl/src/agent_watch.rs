@@ -4649,6 +4649,43 @@ fn stranded_prompt_id(queue: &std::path::Path) -> Option<String> {
     None
 }
 
+/// Text of the stranded prompt in `queue`, for placeholder attribution (#1691).
+fn stranded_prompt_text(queue: &std::path::Path) -> Option<String> {
+    for phase in ["inbox", "inbox.v2", "inflight"] {
+        let Ok(entries) = std::fs::read_dir(queue.join(phase)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let Ok(document) = crate::agent::read_private_json(&path) else {
+                continue;
+            };
+            if document.get("stranded_at").is_some_and(|at| !at.is_null()) {
+                if let Some(text) = document.get("text").and_then(serde_json::Value::as_str) {
+                    return Some(text.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Whether `screen`'s newest paste placeholder matches `text` by size (#1691).
+fn placeholder_matches_stranded(screen: &str, text: &str) -> bool {
+    let labels = crate::submission::placeholder_labels(screen);
+    if let Some(label) = labels.last() {
+        if let Some(m) = crate::stale_draft::pasted_line_count_pub(label) {
+            if crate::submission::expected_line_counts(text).contains(&m) {
+                return true;
+            }
+        }
+    }
+    screen.contains(&format!("[Pasted Content {} chars]", text.chars().count()))
+}
+
 /// The idle sweep over editor drafts (#731 agentctl-paste-tail-flush):
 /// a draft the agent's own queue records prove agentctl typed — a whole
 /// prompt or a paste tail fragment of one — that has sat unsent for
@@ -4679,6 +4716,26 @@ fn sweep_editor_drafts(
                     .agent_queue(&agent)
                     .and_then(|queue| stranded_prompt_id(&queue).map(|id| (queue, id)))
                 {
+                    // Placeholder attribution (#1691): a stranded paste drawn
+                    // only as a placeholder in an unparseable composer is still
+                    // ours when its size matches; flush it instead of only
+                    // reporting it unreadable.
+                    if !options.check_only {
+                        if let Some(text) = stranded_prompt_text(&queue) {
+                            if placeholder_matches_stranded(&screen, &text) {
+                                match notifier.flush_draft(&agent) {
+                                    Ok(evidence) => {
+                                        rows.push(json!({"agent": agent, "id": id, "draft": "ours-placeholder", "action": "flushed", "detail": evidence}));
+                                        continue;
+                                    }
+                                    Err(_) => {
+                                        rows.push(json!({"agent": agent, "id": id, "draft": "ours-placeholder", "action": "quarantine-possibly-submitted"}));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let _ = queue;
                     let fingerprint = format!("unreadable:{id}");
                     let entry = state

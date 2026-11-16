@@ -952,15 +952,17 @@ fn composer_is_this_text(view: &ComposerView, text: &str) -> bool {
     // 3-line notice is this text here too, not only on a fresh delivery
     // (#884 follow-up busy-evidence). Wrapped-row counts are not accepted
     // here: they would attribute a foreign chip of a similar size.
-    let region = &view.composer;
-    if let Some(start) = region.find("[Pasted text #") {
-        if let Some(end) = region[start..].find(']') {
-            let label = &region[start..=start + end];
-            if let Some(m) = crate::stale_draft::pasted_line_count_pub(label) {
-                return expected_line_counts(text).contains(&m);
+    // Newest placeholder wins (#1691): a stranded paste may sit behind an
+    // older placeholder; only the newest one's size can be this text.
+    let labels = placeholder_labels(&view.composer);
+    if let Some(label) = labels.last() {
+        if let Some(m) = crate::stale_draft::pasted_line_count_pub(label) {
+            if expected_line_counts(text).contains(&m) {
+                return true;
             }
         }
     }
+    let region = &view.composer;
     if paste_placeholders(region) > 0 {
         return region.contains(&format!("[Pasted Content {} chars]", text.chars().count()));
     }
@@ -1847,6 +1849,12 @@ fn submit_verified_typed(
                 timeouts.composer,
             ) {
                 return refuse(reason);
+            }
+            if screen.contains("[Pasted ") {
+                return refuse(format!(
+                    "pane {pane_id} composer is occupied by an unattributed draft; \
+                     nothing was typed"
+                ));
             }
             return refuse(format!(
                 "pane {pane_id} does not show a recognisable {harness} composer after {}s \
@@ -4780,6 +4788,21 @@ mod tests {
         );
         assert!(screen.state().pastes.is_empty(), "nothing typed again");
         assert!(screen.state().keys.is_empty());
+    }
+
+    #[test]
+    fn a_stranded_retry_attributes_the_newest_placeholder_by_size() {
+        // #1691 commit 2: no recorded label; the newest placeholder whose line
+        // count matches this text is ours, behind an older foreign placeholder.
+        let screen = FakeScreen::new("claude", false);
+        screen.leave_draft("foreign one\nforeign two\nforeign three\nforeign four\nforeign five");
+        let ours = "our one\nour two\nour three\nour four";
+        screen.leave_another_draft(ours);
+        let clock = stranded_clock(30.0);
+        let outcome = submit_verified(&screen, "w1:p1", "claude", ours, in_lock_timeouts(), &clock);
+        receipt(outcome);
+        assert!(screen.state().pastes.is_empty(), "never retyped");
+        assert!(!screen.state().keys.is_empty());
     }
 
     /// A prompt as long as the messages agents send each other, one line of it per item.
