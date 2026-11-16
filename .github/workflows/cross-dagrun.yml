@@ -34,6 +34,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          # Keep ancestry for selection without downloading old blobs from every archived branch.
+          filter: blob:none
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -120,6 +122,8 @@ jobs:
           # Selection compares the checked-out commit with the event's real base. A depth-one
           # checkout cannot answer that question and must not silently become a full run.
           fetch-depth: 0
+          # Keep ancestry for selection without downloading old blobs from every archived branch.
+          filter: blob:none
       - name: prepare and verify the privileged Linux test host
         env:
           AGENT_UTILS_RUNNER_ENVIRONMENT: ${{ runner.environment }}

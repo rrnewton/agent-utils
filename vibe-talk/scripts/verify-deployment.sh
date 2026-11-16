@@ -237,10 +237,16 @@ checking "the read token can list tools, and post_reply is not among them"
 rpc "$READ_TOKEN" tools/list
 [ "$STATUS" = "200" ] || fail "check 2 (read tools/list): returned $STATUS, expected 200. Is the read token exactly what the server was started with? Body was: $BODY"
 read_tools="$(tool_names)"
-for expected in recent_activity list_channels digest_channel read_page count_messages find_message read_message; do
+for expected in recent_activity list_channels read_page count_messages find_message read_message; do
     grep -qx "$expected" <<<"$read_tools" || fail "check 2 (read tools/list): '$expected' was missing from the read token's tool list. Tools offered: $(tr '\n' ' ' <<<"$read_tools")"
 done
-ok "read token sees recent_activity, list_channels, digest_channel, read_page, count_messages, find_message, read_message"
+ok "read token sees recent_activity, list_channels, read_page, count_messages, find_message, read_message"
+# The legacy digest remains callable below, but discovery intentionally directs
+# agents to read_page instead (the service's hidden-but-callable contract).
+if grep -qx digest_channel <<<"$read_tools"; then
+    fail "check 2 (read tools/list): legacy digest_channel was advertised instead of staying hidden"
+fi
+ok "legacy digest_channel stays hidden from tool discovery"
 
 if grep -qx post_reply <<<"$read_tools"; then
     fail "check 2 (read tools/list): post_reply WAS offered to the read token. A read credential must not even see the posting tool. Tools offered: $(tr '\n' ' ' <<<"$read_tools")"
