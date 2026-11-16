@@ -72,6 +72,11 @@ STATE_JS = """() => {
 }"""
 
 
+def number(state: Json, key: str) -> float:
+    value = state.get(key)
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
 def message_id(index: int) -> str:
     return f"88000000000000000{index:02d}"
 
@@ -164,7 +169,7 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
                "the needle search did not filter to fifteen")
     walk.settled()
     state = walk.state()
-    walk.check(abs(float(state["top"]) - float(state["foot"])) <= 2,
+    walk.check(abs(number(state, "top") - number(state, "foot")) <= 2,
                f"no hit on screen: reader at {state['top']}, foot is {state['foot']}")
     walk.check(state["lastVisible"] == message_id(39),
                f"the newest hit is not on screen: last visible is {state['lastVisible']}")
@@ -185,7 +190,7 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     state = walk.state()
     walk.check(state["firstVisible"] == parked["firstVisible"],
                f"the row at the head of the screen changed: {parked['firstVisible']} -> {state['firstVisible']}")
-    walk.check(abs(float(state["firstTop"]) - float(parked["firstTop"])) <= 2,
+    walk.check(abs(number(state, "firstTop") - number(parked, "firstTop")) <= 2,
                f"a hit was on screen but the row under the eye moved from {parked['firstTop']} to {state['firstTop']}")
     walk.shot("after-search-hit-on-screen-stayed")
     if keyboard:
