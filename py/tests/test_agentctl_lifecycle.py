@@ -1619,6 +1619,23 @@ def test_postclose_probe_failure_does_not_prevent_archival(tmp_path: Path, monke
     assert Path(str(result["archive"])).is_dir()
 
 
+def test_queue_binding_completes_while_this_process_holds_the_queue_locks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1723: flock belongs to the open file description, so binding a queue
+    # whose delivery+binding locks this process already holds — the state a
+    # lifecycle path that calls back into queue code creates — must complete,
+    # not wait on the process itself. On the old code this test hangs and
+    # only the test runner's timeout (a backstop) ends it.
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path))
+    queue = manager._queue("worker")
+    target = manager.get("worker").target()
+    with manager._queue_locks("worker"):
+        agent._bind_queue(queue, target)
+        agent._bind_queue(queue, target)
+    # And once the outer hold is gone, the binding still excludes others.
+    agent._bind_queue(queue, target)
+
+
 def test_explicit_send_serializes_id_reservation_against_delivery_transitions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeManagedClient()
     manager = ManagedAgents(cast(HerdrClient, fake), tmp_path / "registry")

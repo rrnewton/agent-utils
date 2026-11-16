@@ -4582,7 +4582,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     }
 }
 
-fn queue_locks_at(directory: &Path) -> Result<Vec<File>> {
+fn queue_locks_at(directory: &Path) -> Result<Vec<agent_queue::fsio::HeldLock>> {
     let queue = directory.join("queue");
     if !queue.exists() {
         return Ok(Vec::new());
@@ -4590,10 +4590,11 @@ fn queue_locks_at(directory: &Path) -> Result<Vec<File>> {
     agent::validate_private_directory(&queue, "old revive queue", false)?;
     let mut held = Vec::new();
     for name in [".delivery.lock", ".binding.lock"] {
-        let file = agent::open_private_lock(&queue.join(name), "old revive queue lock")?;
-        file.lock_exclusive()
+        let path = queue.join(name);
+        let file = agent::open_private_lock(&path, "old revive queue lock")?;
+        let guard = agent_queue::fsio::lock_exclusive_blocking(file, &path, name)
             .map_err(|error| fail(error.to_string()))?;
-        held.push(file);
+        held.push(guard);
     }
     Ok(held)
 }

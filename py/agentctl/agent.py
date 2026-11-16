@@ -15,6 +15,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
@@ -1374,12 +1375,13 @@ def _enqueue_outcome(
     filename = f"{identifier}.json"
     path = os.path.join(inbox, filename)
     descriptor = -1
+    took_delivery = False
     try:
         if serialize:
             directory_identity = _queue_directory_identity(root)
             lock_path = os.path.join(root, ".delivery.lock")
             descriptor = _open_private_lock(lock_path, "queue delivery lock")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            took_delivery = _acquire_flock(descriptor)
             _verify_queue_lock(root, directory_identity, lock_path, descriptor, "queue delivery lock")
         # A prompt the Rust edition set aside (or still holds in its second inbox) keeps its
         # identifier, so re-queueing it here can never type it a second time.
@@ -1414,6 +1416,7 @@ def _enqueue_outcome(
             )
     finally:
         if descriptor >= 0:
+            _release_flock(descriptor, took_delivery)
             os.close(descriptor)
     return identifier, superseded
 
@@ -1556,6 +1559,56 @@ class _TargetLock:
 
 def _flock_exclusive(descriptor: int, _path: str) -> None:
     fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+
+# Locks this thread holds, by (thread, device, inode) of the lock file, with
+# how many holders each has (#1723, as in the Rust edition): flock belongs to
+# the open file description, so a second flock on a file this thread already
+# holds — through a fresh descriptor, as a lifecycle path holding a queue's
+# locks and calling back into queue code does — waits on the thread itself
+# for ever. Another thread's hold still contends normally.
+_HELD_FLOCKS: dict[tuple[int, int, int], int] = {}
+_HELD_FLOCKS_GUARD = threading.Lock()
+
+
+def _acquire_flock(descriptor: int) -> bool:
+    """Flock `descriptor`, or count one more hold when this process already
+    holds that file. True when this call took the flock (and must release it).
+
+    The registry guard is never held across the flock: a wait for a contended
+    lock can re-enter queue code (a test's flock hook does exactly that), and
+    a guard held across it would wait on this same thread (#1723's shard hang).
+    """
+    key = _flock_key(descriptor)
+    with _HELD_FLOCKS_GUARD:
+        if key in _HELD_FLOCKS:
+            _HELD_FLOCKS[key] += 1
+            return False
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    with _HELD_FLOCKS_GUARD:
+        _HELD_FLOCKS[key] = _HELD_FLOCKS.get(key, 0) + 1
+    return True
+
+
+def _release_flock(descriptor: int, took: bool) -> None:
+    """Release one hold counted by :func:`_acquire_flock`; only the holder that
+    took the flock unlocks it, so a nested hold's release changes nothing."""
+    key = _flock_key(descriptor)
+    unlock = False
+    with _HELD_FLOCKS_GUARD:
+        depth = _HELD_FLOCKS.get(key, 0)
+        if depth <= 1:
+            _HELD_FLOCKS.pop(key, None)
+            unlock = took
+        else:
+            _HELD_FLOCKS[key] = depth - 1
+    if unlock:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _flock_key(descriptor: int) -> tuple[int, int, int]:
+    held = os.fstat(descriptor)
+    return threading.get_ident(), held.st_dev, held.st_ino
 
 
 def _lock_target(
@@ -1724,8 +1777,9 @@ def _bind_queue(
     binding_path = os.path.join(root, "target.json")
     descriptor = _open_private_lock(lock_path, "queue binding lock")
     expected = _binding(target)
+    took_binding = False
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        took_binding = _acquire_flock(descriptor)
         _verify_queue_lock(root, directory_identity, lock_path, descriptor, "queue binding lock")
         policy = _ACTIVE_ATOMIC_POLICY.get()
         if policy is not None:
@@ -1752,6 +1806,7 @@ def _bind_queue(
         else:
             _atomic_json(binding_path, expected, max_artifact_bytes=max_artifact_bytes)
     finally:
+        _release_flock(descriptor, took_binding)
         os.close(descriptor)
     return directory_identity
 
@@ -1773,13 +1828,14 @@ def rebind_queue(root: str, previous: Target, replacement: Target) -> None:
     binding_path = os.path.join(root, "target.json")
     delivery_descriptor = _open_private_lock(delivery_path, "queue delivery lock")
     binding_descriptor = -1
+    took_delivery = took_binding = False
     try:
-        fcntl.flock(delivery_descriptor, fcntl.LOCK_EX)
+        took_delivery = _acquire_flock(delivery_descriptor)
         _verify_queue_lock(root, directory_identity, delivery_path, delivery_descriptor, "queue delivery lock")
         binding_descriptor = _open_private_lock(
             binding_lock_path, "queue binding lock"
         )
-        fcntl.flock(binding_descriptor, fcntl.LOCK_EX)
+        took_binding = _acquire_flock(binding_descriptor)
         _verify_queue_lock(root, directory_identity, binding_lock_path, binding_descriptor, "queue binding lock")
         old = _binding(previous)
         new = _binding(replacement)
@@ -1799,7 +1855,9 @@ def rebind_queue(root: str, previous: Target, replacement: Target) -> None:
             _atomic_json(binding_path, new)
     finally:
         if binding_descriptor >= 0:
+            _release_flock(binding_descriptor, took_binding)
             os.close(binding_descriptor)
+        _release_flock(delivery_descriptor, took_delivery)
         os.close(delivery_descriptor)
 
 
@@ -1825,11 +1883,12 @@ def rebind_queue_after(
     binding_path = os.path.join(root, "target.json")
     delivery_descriptor = _open_private_lock(delivery_path, "queue delivery lock")
     binding_descriptor = -1
+    took_delivery = took_binding = False
     try:
-        fcntl.flock(delivery_descriptor, fcntl.LOCK_EX)
+        took_delivery = _acquire_flock(delivery_descriptor)
         _verify_queue_lock(root, directory_identity, delivery_path, delivery_descriptor, "queue delivery lock")
         binding_descriptor = _open_private_lock(binding_lock_path, "queue binding lock")
-        fcntl.flock(binding_descriptor, fcntl.LOCK_EX)
+        took_binding = _acquire_flock(binding_descriptor)
         _verify_queue_lock(root, directory_identity, binding_lock_path, binding_descriptor, "queue binding lock")
         old = _binding(previous)
         if os.path.lexists(binding_path):
@@ -1855,7 +1914,9 @@ def rebind_queue_after(
         return result
     finally:
         if binding_descriptor >= 0:
+            _release_flock(binding_descriptor, took_binding)
             os.close(binding_descriptor)
+        _release_flock(delivery_descriptor, took_delivery)
         os.close(delivery_descriptor)
 
 

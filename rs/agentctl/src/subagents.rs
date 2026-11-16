@@ -2013,7 +2013,7 @@ struct DeadAdoptionSnapshot {
 #[derive(Debug)]
 struct RetirementQueue {
     directory: Option<PinnedParentDirectory>,
-    locks: Vec<(&'static str, File)>,
+    locks: Vec<(&'static str, agent_queue::fsio::HeldLock)>,
 }
 
 impl ManagedRecordSnapshot {
@@ -7165,11 +7165,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     fn identity_lock(&self) -> Result<agent_queue::fsio::HeldLock> {
         agent::create_private_directory(&self.registry, "agent registry", true, true)?;
-        let file =
-            agent::open_private_lock(&self.registry.join(".identity.lock"), "agent identity lock")?;
-        file.lock_exclusive()
-            .map_err(|error| fail(error.to_string()))?;
-        Ok(agent_queue::fsio::HeldLock::new(file))
+        let path = self.registry.join(".identity.lock");
+        let file = agent::open_private_lock(&path, "agent identity lock")?;
+        agent_queue::fsio::lock_exclusive_blocking(file, &path, "agent identity lock")
+            .map_err(|error| fail(error.to_string()))
     }
 
     fn pane_lock(&self, pane_id: &str) -> Result<agent::TargetLock> {
@@ -8083,11 +8082,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent::sync_directory(&directory)
     }
 
-    /// Hold one existing queue's delivery and binding locks, in drain's order.
+    /// Hold one existing queue's delivery and binding locks, in drain's order
+    /// (delivery, then binding: see the queue crate's lock-order docs).
     ///
     /// A queue is created by the first send, under the name lock the caller holds, so a
-    /// missing queue has nothing to exclude; it is never created here.
-    fn queue_locks(&self, directory_name: &str) -> Result<Vec<File>> {
+    /// missing queue has nothing to exclude; it is never created here. A lock this
+    /// process already holds is held once more, never taken again (#1723): lifecycle
+    /// paths hold these while calling back into queue code.
+    fn queue_locks(&self, directory_name: &str) -> Result<Vec<agent_queue::fsio::HeldLock>> {
         let queue = self.directory(directory_name)?.join("queue");
         if !queue.is_dir() {
             return Ok(Vec::new());
@@ -8097,10 +8099,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             (".delivery.lock", "queue delivery lock"),
             (".binding.lock", "queue binding lock"),
         ] {
-            let lock = agent::open_private_lock(&queue.join(lock_name), purpose)?;
-            lock.lock_exclusive()
+            let path = queue.join(lock_name);
+            let lock = agent::open_private_lock(&path, purpose)?;
+            let guard = agent_queue::fsio::lock_exclusive_blocking(lock, &path, purpose)
                 .map_err(|error| fail(format!("cannot take {purpose}: {error}")))?;
-            held.push(lock);
+            held.push(guard);
         }
         Ok(held)
     }
@@ -8167,9 +8170,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         for name in [".delivery.lock", ".binding.lock"] {
             let queue = held.directory.as_ref().expect("existing queue is pinned");
             let file = Self::open_retirement_queue_lock(&queue.file, name, true)?;
-            file.lock_exclusive()
+            let path = pinned.path.join("queue").join(name);
+            let guard = agent_queue::fsio::lock_exclusive_blocking(file, &path, name)
                 .map_err(|error| fail(format!("cannot lock adoption retirement queue: {error}")))?;
-            held.locks.push((name, file));
+            held.locks.push((name, guard));
             self.verify_retirement_queue(pinned, &held)?;
         }
         Ok(held)

@@ -2424,20 +2424,21 @@ class ManagedAgents:
             location = registry_layout.locate(self.registry, name)
             held = (registry_layout.LEGACY, registry_layout.CURRENT) if location == registry_layout.LEGACY \
                 else (registry_layout.CURRENT,)
-            descriptors: list[int] = []
+            held_flocks: list[tuple[int, bool]] = []
             try:
                 for which in held:
                     path, _rank = registry_layout.lock_paths(self.registry, name, which)
                     descriptor = agent._open_private_lock(str(path), "agent lifecycle lock")
-                    descriptors.append(descriptor)
-                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    took = agent._acquire_flock(descriptor)
+                    held_flocks.append((descriptor, took))
                 first, _rank = registry_layout.lock_paths(self.registry, name, location)
-                if not registry_layout.lock_still_current(self.registry, name, location, descriptors[0], first):
+                if not registry_layout.lock_still_current(self.registry, name, location, held_flocks[0][0], first):
                     continue
                 yield
                 return
             finally:
-                for descriptor in reversed(descriptors):
+                for descriptor, took in reversed(held_flocks):
+                    agent._release_flock(descriptor, took)
                     os.close(descriptor)
         raise AgentDeliveryError(
             f"agent {name!r} kept moving between registry layouts while its lifecycle lock was taken"
@@ -2450,10 +2451,12 @@ class ManagedAgents:
         descriptor = agent._open_private_lock(
             str(self.registry / ".identity.lock"), "agent identity lock"
         )
+        took = False
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            took = agent._acquire_flock(descriptor)
             yield
         finally:
+            agent._release_flock(descriptor, took)
             os.close(descriptor)
 
     def _directory(self, name: str) -> Path:
@@ -6408,16 +6411,17 @@ class ManagedAgents:
         if not queue.is_dir():
             yield
             return
-        descriptors: list[int] = []
+        held_flocks: list[tuple[int, bool]] = []
         try:
             for lock_name, purpose in ((".delivery.lock", "queue delivery lock"),
                                        (".binding.lock", "queue binding lock")):
                 descriptor = agent._open_private_lock(str(queue / lock_name), purpose)
-                descriptors.append(descriptor)
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                took = agent._acquire_flock(descriptor)
+                held_flocks.append((descriptor, took))
             yield
         finally:
-            for descriptor in reversed(descriptors):
+            for descriptor, took in reversed(held_flocks):
+                agent._release_flock(descriptor, took)
                 os.close(descriptor)
 
     def anchor(

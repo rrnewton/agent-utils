@@ -96,6 +96,17 @@
 //! "expected_agent", "expected_workspace", "expected_cwd"}`, absent expectations being `null`.
 //! A drainer refuses a queue bound to a different target.
 //!
+//! **Lock order.** One process takes these locks in one order only: registry lifecycle
+//! lock, registry identity lock, queue delivery lock, queue binding lock, host-wide pane
+//! (target) lock. Binding is only ever taken alone (the first send's bind, which acquires
+//! nothing while holding it) or after delivery (queue lock pairs, binding moves) — never
+//! while holding the pane lock, and no path takes delivery while holding binding. A queue
+//! lock this thread already holds is held, never re-taken: flock belongs to the open file
+//! description, so re-taking through a second `open()` blocks the thread on itself
+//! (#1723); [`fsio::already_held`] and [`fsio::HeldLock::reentrant`] make queue-lock
+//! acquisition re-entrant instead. The lifecycle lock is the exception: distinct
+//! operations exclude each other through it even in one thread, and no path re-takes it.
+//!
 //! **Lanes.** `inbox.v2/`, `cancel/` and `cancelled/` exist only once something needed them, so
 //! a queue that never used them is the original four-phase format. A drainer that knows only
 //! that format never types an `inbox.v2/` item, but it does not read tombstones either: until

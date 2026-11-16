@@ -164,6 +164,56 @@ pub fn open_private_lock(path: &Path, purpose: &str) -> Result<File> {
     Ok(file)
 }
 
+/// The locks this thread holds, by (thread, device, inode) of the lock file, with
+/// how many guards hold each. A `flock` belongs to the open file description, so a
+/// second `open()` of a file this thread already holds and a fresh flock on it
+/// blocks the thread on itself — the revive self-deadlock of #1723, where a
+/// lifecycle path that already held a queue's locks called back into a path that
+/// took them again. Every flock acquisition in this library checks this registry
+/// first and treats a lock the calling thread already holds as held, never as
+/// contended; a lock another thread holds still contends normally, because its
+/// flock is a different open file description.
+type HeldKey = (std::thread::ThreadId, u64, u64);
+static HELD_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<HeldKey, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn held_locks() -> std::sync::MutexGuard<'static, std::collections::HashMap<HeldKey, usize>> {
+    HELD_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_key(file: &File) -> Option<HeldKey> {
+    file.metadata()
+        .ok()
+        .map(|metadata| (std::thread::current().id(), metadata.dev(), metadata.ino()))
+}
+
+/// Whether the calling thread already holds an exclusive flock on `lock`'s file.
+/// Callers about to flock must check this first: flocking a file the thread
+/// already holds, through a new description, waits for ever.
+pub fn already_held(lock: &File) -> bool {
+    lock_key(lock).is_some_and(|key| held_locks().contains_key(&key))
+}
+
+fn register_held(file: &File) -> Option<HeldKey> {
+    let key = lock_key(file)?;
+    *held_locks().entry(key).or_insert(0) += 1;
+    Some(key)
+}
+
+fn deregister_held(key: Option<HeldKey>) {
+    let Some(key) = key else { return };
+    let mut held = held_locks();
+    if let Some(depth) = held.get_mut(&key) {
+        *depth -= 1;
+        if *depth == 0 {
+            held.remove(&key);
+        }
+    }
+}
+
 /// A lock file this process holds a `flock` on, unlocked explicitly when dropped.
 ///
 /// A `flock` belongs to the open file description, and a child process forked by any thread
@@ -173,13 +223,35 @@ pub fn open_private_lock(path: &Path, purpose: &str) -> Result<File> {
 /// Unlocking releases it for every copy of the descriptor at once. Wrap a file in this as soon as
 /// its lock is taken.
 #[derive(Debug)]
-pub struct HeldLock(File);
+pub struct HeldLock {
+    file: File,
+    key: Option<HeldKey>,
+    release: bool,
+}
 
 impl HeldLock {
     /// Hold `file`, whose lock the caller has just taken, until this value is dropped.
     #[must_use]
     pub fn new(file: File) -> Self {
-        Self(file)
+        let key = register_held(&file);
+        Self {
+            file,
+            key,
+            release: true,
+        }
+    }
+
+    /// Hold one more guard on a lock this process already holds (#1723): `file` is a
+    /// fresh, unflocked description of the same lock file, so dropping this guard
+    /// unlocks nothing — the outer guard keeps the lock until it drops.
+    #[must_use]
+    pub fn reentrant(file: File) -> Self {
+        let key = register_held(&file);
+        Self {
+            file,
+            key,
+            release: false,
+        }
     }
 }
 
@@ -187,19 +259,26 @@ impl std::ops::Deref for HeldLock {
     type Target = File;
 
     fn deref(&self) -> &File {
-        &self.0
+        &self.file
     }
 }
 
 impl Drop for HeldLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        deregister_held(self.key);
+        if self.release {
+            let _ = FileExt::unlock(&self.file);
+        }
     }
 }
 
 /// Take an exclusive `flock` on `lock`, polling every 10 ms through `waiter` until it is free or
-/// the waiter is cancelled.
+/// the waiter is cancelled. A lock this process already holds is already taken (#1723):
+/// flocking it again through this new description would wait on the process itself.
 pub fn lock_exclusive(lock: &File, path: &Path, purpose: &str, waiter: &dyn Waiter) -> Result<()> {
+    if already_held(lock) {
+        return Ok(());
+    }
     loop {
         match FileExt::try_lock_exclusive(lock) {
             Ok(()) => return Ok(()),
@@ -223,6 +302,19 @@ pub fn lock_exclusive(lock: &File, path: &Path, purpose: &str, waiter: &dyn Wait
 /// Longest an ordinary waiter defers to priority waiters without a break before it tries the
 /// lock anyway: see [`lock_exclusive_ranked`]. Longer than a slow delivery.
 pub const PRIORITY_DEFERENCE: Duration = Duration::from_secs(300);
+
+/// Take a blocking exclusive `flock` on `lock` and hold it in a [`HeldLock`], or, when
+/// this process already holds that lock, hold one more guard on it instead of waiting
+/// on itself (#1723). This is the acquisition lifecycle paths that hold a queue's
+/// locks while calling back into queue code must use.
+pub fn lock_exclusive_blocking(lock: File, path: &Path, purpose: &str) -> Result<HeldLock> {
+    if already_held(&lock) {
+        return Ok(HeldLock::reentrant(lock));
+    }
+    lock.lock_exclusive()
+        .map_err(|error| io_error(&format!("lock {purpose}"), path, error))?;
+    Ok(HeldLock::new(lock))
+}
 
 /// [`lock_exclusive`], ranked by the companion lock `gate` (another private lock file, never
 /// held long): while any `priority` waiter is waiting, ordinary waiters do not compete for
@@ -248,6 +340,10 @@ pub fn lock_exclusive_ranked(
     gate: &File,
     priority: bool,
 ) -> Result<()> {
+    // No already-held shortcut here, unlike [`lock_exclusive`]: the ranked
+    // lifecycle lock is how distinct operations in one thread (a sender
+    // against a holder) exclude each other, and no lifecycle path re-takes
+    // it while holding it — revive drops it before draining (#1723).
     let mut registered = false;
     let mut deferring_since: Option<Instant> = None;
     loop {
@@ -663,6 +759,47 @@ mod tests {
         let other = open_private_lock(&path, "test lock").unwrap();
         FileExt::try_lock_exclusive(&other).expect("the lock is free once its holder is dropped");
         drop((forked, other));
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_lock_this_process_holds_is_never_taken_again() {
+        // #1723: flock belongs to the open file description, so a second flock on a
+        // file this process holds — through a fresh open, as a lifecycle path that
+        // already holds a queue's locks calling back into queue code does — blocks
+        // the process on itself. Every acquisition must see the held lock instead.
+        let directory = std::env::temp_dir().join(format!(
+            "agent-queue-reentrant-{}-{}",
+            std::process::id(),
+            TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_private_directory(&directory, "test directory", true, false).unwrap();
+        let path = directory.join(".binding.lock");
+        let outer = lock_exclusive_blocking(
+            open_private_lock(&path, "test lock").unwrap(),
+            &path,
+            "test lock",
+        )
+        .unwrap();
+        // The blocking acquisition and both polling acquisitions return at once.
+        let nested = lock_exclusive_blocking(
+            open_private_lock(&path, "test lock").unwrap(),
+            &path,
+            "test lock",
+        )
+        .unwrap();
+        let polled = open_private_lock(&path, "test lock").unwrap();
+        lock_exclusive(&polled, &path, "test lock", &Blocking).unwrap();
+        // Another description still cannot take it while any guard lives.
+        let contender = open_private_lock(&path, "test lock").unwrap();
+        assert!(FileExt::try_lock_exclusive(&contender).is_err());
+        drop(polled);
+        drop(nested);
+        // The nested guard's drop released nothing: the outer guard still holds.
+        assert!(FileExt::try_lock_exclusive(&contender).is_err());
+        drop(outer);
+        FileExt::try_lock_exclusive(&contender).expect("free once the outer guard drops");
+        drop(contender);
         fs::remove_dir_all(&directory).unwrap();
     }
 

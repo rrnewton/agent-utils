@@ -725,6 +725,79 @@ fn revive_preserves_entire_old_queue_and_requested_task_without_replaying_either
 }
 
 #[test]
+fn revive_completes_while_this_process_already_holds_the_queue_locks() {
+    // #1723 agentctl-revive-binding-lock-self-deadlock: revive takes the old
+    // queue's delivery and binding locks, and paths it calls back into take
+    // queue locks again. flock belongs to the open file description, so the
+    // second take blocked the process on itself for 25 minutes in the tmux
+    // lifecycle test. Drive that exact state — both locks already held by
+    // this process — and require revive to complete; on the old code this
+    // test hangs, and only the harness timeout (a backstop, not the oracle)
+    // ends it.
+    let (fixture, old) = recoverable("codex", true);
+    let queue = fixture.root.join("registry/agents/worker/queue");
+    agent::create_private_directory(&queue, "test queue", false, false).unwrap();
+    for name in [".delivery.lock", ".binding.lock"] {
+        agent::open_private_lock(&queue.join(name), "test queue lock").unwrap();
+    }
+    let held = fixture.manager().queue_locks("worker").unwrap();
+    assert_eq!(held.len(), 2);
+    let result = fixture
+        .manager()
+        .revive("worker", false, Some(&old.token), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], json!(true));
+    drop(held);
+}
+
+#[test]
+fn revive_archived_completes_while_this_process_already_holds_the_queue_locks() {
+    // #1723, the `--archived` path: revive_archived restores the archived
+    // directory (same queue inode) and then revive takes its delivery and
+    // binding locks. Holding both already — as an outer lifecycle path
+    // would — must not make the restore wait on itself.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let queue = fixture.root.join("registry/agents/worker/queue");
+    agent::create_private_directory(&queue, "test queue", false, false).unwrap();
+    for name in [".delivery.lock", ".binding.lock"] {
+        agent::open_private_lock(&queue.join(name), "test queue lock").unwrap();
+    }
+    let record = fixture.manager().load("worker").unwrap();
+    let stopped = fixture.manager().stop("worker").unwrap();
+    assert!(stopped["archive"].is_string(), "{stopped}");
+    kill_owned(&fixture, &record);
+    let archive_queue = PathBuf::from(stopped["archive"].as_str().unwrap()).join("queue");
+    let mut held = Vec::new();
+    for name in [".delivery.lock", ".binding.lock"] {
+        let path = archive_queue.join(name);
+        let file = agent::open_private_lock(&path, "test queue lock").unwrap();
+        held.push(agent_queue::fsio::lock_exclusive_blocking(file, &path, name).unwrap());
+    }
+    let revived = fixture
+        .manager()
+        .revive_archived("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(revived["revived"], json!(true), "{revived}");
+    drop(held);
+}
+
+#[test]
 fn revive_preserves_producer_decimals_in_stopped_and_resumed_generations() {
     let timestamp = 1_791_594_983.664_875_7;
     let numbers = json!({
