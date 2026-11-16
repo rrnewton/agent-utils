@@ -20186,6 +20186,169 @@ def test_single_validate_complete_remove_shares_the_batch_census_bound_and_refus
     assert [record.slot for record in state.slots] == ["slot01"]
 
 
+def _stub_subvolume_finish(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    underneath: bool = False,
+) -> tuple[dict[str, object], list[str]]:
+    """Fake the worktrees-image backing of one validate slot (#1746)."""
+
+    from wrkslots import worktreesimage
+
+    calls: list[str] = []
+    fenced = tmp_path / (".slot01.fenced.1." + "a" * 32)
+    fenced.mkdir()
+    (fenced / "checkout").mkdir()
+    (fenced / "checkout" / "file.txt").write_text("x", encoding="utf-8")
+    if underneath:
+        host = tmp_path / "underneath"
+        host.mkdir()
+    config = types.SimpleNamespace(
+        control=tmp_path / "control",
+        worktrees_image=types.SimpleNamespace(direct=False),
+    )
+    record = types.SimpleNamespace(slot_type="validate", slot="slot01")
+    checkout = types.SimpleNamespace(
+        name="main", repository="repo", path="slot01/checkout",
+        branch="validate/slot01", head="abc123",
+    )
+    repository = tmp_path / "repo"
+    repository.mkdir()
+
+    class _Vcs:
+        def initialized_submodules(self, _path: Path) -> list[str]:
+            return []
+
+        def _run(self, _repo: Path, args: list[str], *, check: bool = True) -> types.SimpleNamespace:
+            del check
+            calls.append(" ".join(args))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def listed_worktrees(self, _repo: Path) -> set[Path]:
+            return set()
+
+        def delete_branch_at(self, _repo: Path, branch: str, _head: str) -> None:
+            calls.append(f"delete-branch {branch}")
+
+        def remove_worktree(self, *_args: object, **_kwargs: object) -> None:
+            calls.append("remove-worktree")
+
+    monkeypatch.setattr(wrkslots, "_slot_image_at", lambda *_a: None)
+    monkeypatch.setattr(wrkslots, "_worktrees_bind_slot", lambda *_a: "slot01")
+    monkeypatch.setattr(wrkslots, "_refresh_owned_mounts", lambda *_a: None)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda *_a: None)
+    monkeypatch.setattr(
+        wrkslots, "_stored_repository_path", lambda *_a: ("repo", repository)
+    )
+    monkeypatch.setattr(
+        wrkslots, "_stored_path", lambda _c, raw, _label: tmp_path / raw
+    )
+    monkeypatch.setattr(
+        wrkslots, "_write_journal", lambda *_a, **_k: calls.append("journal")
+    )
+    monkeypatch.setattr(
+        wrkslots, "_remove_cache_directory",
+        lambda *_a, **_k: calls.append("cache-walk"),
+    )
+    def _root_owned_walk(*_a: object) -> list[Path]:
+        calls.append("root-owned-walk")
+        return []
+
+    monkeypatch.setattr(
+        wrkslots, "_delete_root_owned_within_slot",
+        _root_owned_walk,
+    )
+    monkeypatch.setattr(worktreesimage, "image_mount_dir", lambda *_a: tmp_path / "mnt")
+    monkeypatch.setattr(
+        worktreesimage, "load_bind_records",
+        lambda *_a: {"slot01": worktreesimage.BindRecord("slots/slot01")},
+    )
+
+    hidden = tmp_path / "hidden-subvolume-tree"
+
+    def umount(_path: Path) -> None:
+        calls.append("umount")
+        # Unmounting hides the subvolume tree; only a host original
+        # kept beneath the bind (the underneath case) stays visible.
+        (fenced / "checkout").rename(hidden)
+        if underneath:
+            (fenced / "host-original").mkdir(exist_ok=True)
+
+    monkeypatch.setattr(worktreesimage, "umount_point", umount)
+    monkeypatch.setattr(
+        worktreesimage, "bind_slot", lambda *_a: calls.append("rebind")
+    )
+    monkeypatch.setattr(
+        worktreesimage, "forget_bind", lambda *_a: calls.append("forget-bind")
+    )
+
+    def delete_subvolume(path: Path) -> None:
+        calls.append(f"delete-subvolume {path}")
+        shutil.rmtree(hidden)
+
+    monkeypatch.setattr(worktreesimage, "delete_slot_subvolume", delete_subvolume)
+    journal: dict[str, object] = {"removed": [], "removing": []}
+    state: dict[str, object] = {
+        "config": config, "record": record, "journal": journal,
+        "vcs": _Vcs(), "fenced": fenced, "checkout": checkout,
+    }
+    return state, calls
+
+
+def test_validate_subvolume_delete_first_skips_per_file_walks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, calls = _stub_subvolume_finish(monkeypatch, tmp_path)
+    removed: set[str] = set()
+    removing: set[str] = set()
+    done = wrkslots._validate_subvolume_delete_first(
+        cast(wrkslots.Config, state["config"]),
+        cast(wrkslots.ActiveRecord, state["record"]),
+        cast("dict[str, object]", state["journal"]),
+        cast(wrkslots._GitVcs, state["vcs"]),
+        fenced_slot=cast(Path, state["fenced"]),
+        moved_checkouts=[cast(wrkslots.Checkout, state["checkout"])],
+        moved_paths={"main": cast(Path, state["fenced"]) / "checkout"},
+        removed=removed, removing=removing,
+        journal_path=tmp_path / "journal.json",
+    )
+    assert done is True
+    assert removed == {"main"} and removing == set()
+    # Subvolume-first order, and no per-file walk of any kind.
+    assert calls[0] == "umount"
+    assert any(c.startswith("delete-subvolume") for c in calls)
+    assert "forget-bind" in calls
+    assert "worktree prune --expire now" in calls
+    assert "delete-branch validate/slot01" in calls
+    assert "cache-walk" not in calls
+    assert "root-owned-walk" not in calls
+    assert "remove-worktree" not in calls
+
+
+def test_validate_subvolume_delete_first_refuses_content_underneath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, calls = _stub_subvolume_finish(monkeypatch, tmp_path, underneath=True)
+    removed: set[str] = set()
+    removing: set[str] = set()
+    with pytest.raises(wrkslots.Refusal, match="content sits beneath"):
+        wrkslots._validate_subvolume_delete_first(
+            cast(wrkslots.Config, state["config"]),
+            cast(wrkslots.ActiveRecord, state["record"]),
+            cast("dict[str, object]", state["journal"]),
+            cast(wrkslots._GitVcs, state["vcs"]),
+            fenced_slot=cast(Path, state["fenced"]),
+            moved_checkouts=[cast(wrkslots.Checkout, state["checkout"])],
+            moved_paths={"main": cast(Path, state["fenced"]) / "checkout"},
+            removed=removed, removing=removing,
+            journal_path=tmp_path / "journal.json",
+        )
+    assert "rebind" in calls
+    assert not any(c.startswith("delete-subvolume") for c in calls)
+    assert removed == set()
+
+
 def test_raised_census_seconds_reaches_the_batch_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1104,6 +1104,14 @@ a value below the computed default refuses, and no value above 3600 seconds is a
 Without the flag nothing changes. A census that still exceeds the raised bound refuses with a
 message naming the rerun, such as "rerun with --census-seconds 240 to allow a slower census".
 
+A validate slot backed by the worktrees image is deleted subvolume-first: after the census and
+fence, the bind is unmounted, anything sitting underneath it refuses (the bind is restored and
+nothing is deleted), the slot's whole subvolume is deleted with `btrfs subvolume delete` — which
+itself refuses nested subvolumes, so it cannot reach outside the slot — and each checkout's Git
+registration is pruned and its branch deleted. The per-file emptying walks are skipped, so a
+large validation tree goes in one operation instead of file by file. Slots without that backing
+keep the previous path unchanged.
+
 ## Slot-state homes
 
 A slot's private state home (`slot-state/<slot_type>/<slot>` under the control

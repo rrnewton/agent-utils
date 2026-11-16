@@ -56866,6 +56866,126 @@ def _record_is_eden(record: ActiveRecord) -> bool:
     return bool(checkouts) and all(item.vcs == "eden" for item in checkouts)
 
 
+def _validate_subvolume_delete_first(
+    config: Config,
+    record: ActiveRecord,
+    journal: dict[str, object],
+    vcs: _GitVcs,
+    *,
+    fenced_slot: Path,
+    moved_checkouts: Sequence[Checkout],
+    moved_paths: Mapping[str, Path],
+    removed: set[str],
+    removing: set[str],
+    journal_path: Path,
+) -> bool:
+    """Delete a subvolume-backed validate slot subvolume-first (#1746).
+
+    Returns ``False`` when the ordinary empty-then-delete path applies
+    (non-validate slot, per-slot disk image, no worktrees-image backing,
+    or initialized submodules whose shared admin only `git worktree
+    remove` cleans up).  When it returns ``True`` the whole fenced tree
+    is gone: the bind was unmounted after checking nothing sits
+    underneath, the slot subvolume was deleted (which refuses nested
+    subvolumes, so it cannot reach outside the slot), each checkout's
+    registration was pruned, and its branch deleted, with the journal
+    updated exactly as the per-checkout loop would have done.  A
+    refusal after the bind is unmounted re-establishes the bind and
+    deletes nothing.
+    """
+
+    if record.slot_type != "validate":
+        return False
+    if _slot_image_at(config, fenced_slot) is not None:
+        return False
+    bind_slot = _worktrees_bind_slot(config, fenced_slot)
+    direct = (
+        bind_slot is None
+        and config.worktrees_image is not None
+        and config.worktrees_image.direct
+        and worktreesimage.is_subvolume(fenced_slot)
+    )
+    if bind_slot is None and not direct:
+        return False
+    for checkout in moved_checkouts:
+        if vcs.initialized_submodules(moved_paths[checkout.name]):
+            return False
+    mount_dir: Path | None = None
+    records: dict[str, worktreesimage.BindRecord] = {}
+    if bind_slot is not None:
+        mount_dir = worktreesimage.image_mount_dir(config.control)
+        try:
+            records = worktreesimage.load_bind_records(config.control)
+            worktreesimage.umount_point(fenced_slot)
+        except worktreesimage.WorktreesImageError as exc:
+            raise Refusal(
+                f"cannot unmount the worktrees-image bind at {fenced_slot}: {exc}"
+            ) from exc
+        _refresh_owned_mounts(config)
+        if next(fenced_slot.iterdir(), None) is not None:
+            worktreesimage.bind_slot(config.control, mount_dir, bind_slot, fenced_slot)
+            _refresh_owned_mounts(config)
+            raise Refusal(
+                f"content sits beneath the worktrees-image bind at {fenced_slot} "
+                "(a host original an older migrate kept); the bind was "
+                "re-established and nothing was deleted - reclaim the "
+                "original or switch layout before removing the slot"
+            )
+    for checkout in moved_checkouts:
+        removing.add(checkout.name)
+    journal["removing"] = sorted(removing)
+    _write_journal(config, journal, journal_path=journal_path)
+    try:
+        if bind_slot is not None:
+            assert mount_dir is not None
+            worktreesimage.delete_slot_subvolume(
+                mount_dir / records[bind_slot].subvolume
+            )
+            worktreesimage.forget_bind(config.control, bind_slot)
+        else:
+            worktreesimage.delete_slot_subvolume(fenced_slot)
+    except worktreesimage.WorktreesImageError as exc:
+        if bind_slot is not None:
+            assert mount_dir is not None
+            worktreesimage.bind_slot(config.control, mount_dir, bind_slot, fenced_slot)
+        raise Refusal(
+            f"btrfs subvolume delete refused for validate slot {record.slot}: "
+            f"{exc}; nothing was deleted and the slot is preserved"
+        ) from exc
+    finally:
+        _refresh_owned_mounts(config)
+    if bind_slot is not None:
+        fenced_slot.rmdir()
+    _interrupt_for_test("after-validate-subvolume-delete")
+    for checkout in moved_checkouts:
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        pruned = vcs._run(
+            repository, ["worktree", "prune", "--expire", "now"], check=False
+        )
+        if pruned.returncode != 0:
+            raise Refusal(
+                f"git worktree prune failed for {repository} after subvolume "
+                f"delete of validate slot {record.slot}: "
+                f"{(pruned.stderr or pruned.stdout).strip()}"
+            )
+        moved_path = moved_paths[checkout.name]
+        canonical = _stored_path(config, checkout.path, "checkout path")
+        listed = vcs.listed_worktrees(repository)
+        if moved_path.absolute() in listed or canonical.absolute() in listed:
+            raise Refusal(
+                f"Git still registers checkout {checkout.name} of validate slot "
+                f"{record.slot} after subvolume delete and prune; preserve the "
+                "repository registration for recovery"
+            )
+        vcs.delete_branch_at(repository, checkout.branch, checkout.head)
+        removed.add(checkout.name)
+        removing.discard(checkout.name)
+    journal["removed"] = sorted(removed)
+    journal["removing"] = sorted(removing)
+    _write_journal(config, journal, journal_path=journal_path)
+    return True
+
+
 def _finish_remove_paths(
     config: Config,
     record: ActiveRecord,
@@ -57229,6 +57349,20 @@ def _finish_remove_paths(
                     expected_head=record.checkouts[0].head,
                 )
                 _interrupt_for_test("after-validation-removal-proof-recheck")
+            subvolume_deleted = _validate_subvolume_delete_first(
+                config,
+                record,
+                journal,
+                vcs,
+                fenced_slot=fenced_slot,
+                moved_checkouts=moved_checkouts,
+                moved_paths=moved_paths,
+                removed=removed,
+                removing=removing,
+                journal_path=journal_path,
+            )
+            if subvolume_deleted:
+                remaining = ()
             disposable_git: dict[Path, tuple[int, int]] = {}
             nested_by_cache: dict[Path, tuple[_DisposableNestedRepository, ...]] = {}
             nested_evidence: dict[Path, dict[str, object]] = {}
@@ -57246,7 +57380,7 @@ def _finish_remove_paths(
                 if finish.archive_nested and record.slot_type == "agent"
                 else None
             )
-            if record.slot_type == "agent" or validation_complete:
+            if (record.slot_type == "agent" or validation_complete) and not subvolume_deleted:
                 # Every guard above has passed.  Judge each nested repository
                 # in every cache before the first deletion, so a refusal
                 # leaves all of them in place.
@@ -57329,7 +57463,7 @@ def _finish_remove_paths(
             # its budget.  Deleting runs to completion: stopping partway would
             # leave a partly deleted slot.
             _end_item_deadline()
-            for checkout in moved_checkouts:
+            for checkout in () if subvolume_deleted else moved_checkouts:
                 for cache in _cache_directories_for_checkout(config, checkout):
                     judged_here = nested_by_cache.get(cache.path, ())
                     deleting_nested[:] = [
