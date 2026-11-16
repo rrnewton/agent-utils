@@ -37,6 +37,17 @@ def test_eden_checkout_round_trip() -> None:
     assert wrkslots_cli._checkout_to_obj(checkout) == _eden_obj()
 
 
+def test_parse_proc_stat_allows_pid1_zero_start() -> None:
+    raw = (
+        b"1 (systemd) S 0 1 1 0 -1 4194560 100 200 0 0 "
+        b"10 10 0 0 20 0 1 0 0 1000 0 18446744073709551615"
+    )
+    parsed = wrkslots_cli._parse_proc_stat(raw)
+    assert parsed is not None and parsed.pid == 1 and parsed.start_ticks == 0
+    other = raw.replace(b"1 (systemd)", b"2 (kthreadd)", 1)
+    assert wrkslots_cli._parse_proc_stat(other) is not None
+
+
 def test_eden_checkout_rejects_wrong_markers() -> None:
     bad = _eden_obj()
     bad["branch"] = "main"

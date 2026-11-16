@@ -23278,7 +23278,9 @@ def _parse_proc_stat(raw: bytes) -> _ProcStatFields | None:
         state = fields[0].decode("ascii")
     except (UnicodeError, ValueError):
         return None
-    if process <= 0 or parent < 0 or flags < 0 or start_ticks <= 0:
+    if process <= 0 or parent < 0 or flags < 0 or start_ticks < 0:
+        # start_ticks 0 is legitimate: PID 1 and the kernel threads
+        # start at boot, before the tick counter advances.
         return None
     return _ProcStatFields(process, state, parent, flags, start_ticks)
 
@@ -78494,7 +78496,8 @@ _FIND_MISSING_RE = re.compile(
     r"^/usr/bin/find: '/proc/(?P<pid>[0-9]+)(?:/[^']*)?': " r"No such file or directory$"
 )
 _GREP_MISSING_RE = re.compile(
-    r"^/usr/bin/grep: /proc/(?P<pid>[0-9]+)/maps: No such file or directory$"
+    r"^/usr/bin/grep: /proc/(?P<pid>[0-9]+)/maps: "
+    r"(?:No such file or directory|No such process)$"
 )
 _FIND_MISSING_DESCRIPTOR_RE = re.compile(
     r"^/usr/bin/find: '/proc/[0-9]+/fd/[0-9]+': No such file or directory$"
@@ -79258,7 +79261,13 @@ def _absent_validate_maps_matches(
     targets: Mapping[Path, str],
     budget: _ReadOnlyCommandBudget | None = None,
 ) -> tuple[tuple[int, str, str, str], ...]:
-    files = [str(Path("/proc") / str(process.pid) / "maps") for process in processes]
+    # Kernel threads have no userspace maps; grep on their maps
+    # reports ESRCH for every one of them and drowns the census.
+    files = [
+        str(Path("/proc") / str(process.pid) / "maps")
+        for process in processes
+        if not process.kernel_thread
+    ]
     if not files:
         return ()
     patterns: list[str] = []
