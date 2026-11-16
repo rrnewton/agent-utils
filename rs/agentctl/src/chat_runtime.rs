@@ -12551,14 +12551,34 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
     /// notices. Resolution reads only local state; the send proceeds either
     /// way.
     fn render_outbound_links(&self, body: &str) -> (String, Vec<String>, Vec<String>) {
+        self.render_outbound_links_as(body, false)
+    }
+
+    /// [`Self::render_outbound_links`], in Markdown link form when
+    /// `markdown` — the converted path's converter expands references
+    /// itself, exactly once (#1709).
+    fn render_outbound_links_as(
+        &self,
+        body: &str,
+        markdown: bool,
+    ) -> (String, Vec<String>, Vec<String>) {
         let threads = self.thread_link_map();
         let messages = self.message_link_map();
-        let rendered = crate::chat_links::render_reply_links(
-            body,
-            &|alias| threads.get(&alias).cloned(),
-            &|number| messages.get(&number).cloned(),
-            self.config.issue_url_template.as_deref(),
-        );
+        let rendered = if markdown {
+            crate::chat_links::render_reply_links_markdown(
+                body,
+                &|alias| threads.get(&alias).cloned(),
+                &|number| messages.get(&number).cloned(),
+                self.config.issue_url_template.as_deref(),
+            )
+        } else {
+            crate::chat_links::render_reply_links(
+                body,
+                &|alias| threads.get(&alias).cloned(),
+                &|number| messages.get(&number).cloned(),
+                self.config.issue_url_template.as_deref(),
+            )
+        };
         (rendered.text, rendered.warnings, rendered.notices)
     }
 
@@ -14747,7 +14767,18 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         // and `chat sent` shows what the agent wrote. Unresolvable references
         // stay tagged and plain; warnings and guard notices reach the service
         // log (and `chat status`), never the owner.
-        let (linked_body, link_warnings, guard_notices) = self.render_outbound_links(&reply.body);
+        // The converted path's helper converts Markdown itself, so on that
+        // path references render as Markdown links and expand exactly once
+        // there; every other path takes Slack link markup directly (#1709).
+        let effective_format = self
+            .config
+            .effective_slack_format(&request_snapshot.message.channel_id)
+            .ok()
+            .flatten();
+        let (linked_body, link_warnings, guard_notices) = self.render_outbound_links_as(
+            &reply.body,
+            matches!(effective_format, Some(SlackFormat::Converted)),
+        );
         for warning in &link_warnings {
             eprintln!("agentctl: chat reply link: {warning}");
         }
@@ -14759,11 +14790,6 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         // link title can hold markup of its own that the vendor mangles
         // (#658 Q2): drop titles before the handoff. The converted path's own
         // converter already discards them.
-        let effective_format = self
-            .config
-            .effective_slack_format(&request_snapshot.message.channel_id)
-            .ok()
-            .flatten();
         let linked_body = match effective_format {
             Some(SlackFormat::Converted) => linked_body,
             _ => crate::chat_links::strip_link_titles(&linked_body),
@@ -21890,7 +21916,7 @@ pub(crate) mod tests {
             "{posted}"
         );
         assert!(
-            posted.contains("<https://github.com/OWNER/REPO/issues/658|:issue:658>"),
+            posted.contains("<https://github.com/OWNER/REPO/issues/658|#658>"),
             "{posted}"
         );
         // The guard rewrote `per your 0001`; unknown and plain forms stay.
@@ -22038,6 +22064,81 @@ pub(crate) mod tests {
         for request in status["requests"].as_array().expect("requests") {
             assert_eq!(request["thread_permalink"], json!(permalink));
         }
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// #1709: on the converted path a captured reply hands the helper
+    /// Markdown links, never Slack `<url|label>` text for its converter's
+    /// autolink pass to read as one raw address.
+    #[test]
+    fn a_converted_reply_hands_the_helper_markdown_links() {
+        let root = temporary("converted-links");
+        let mut configuration = config_without_reaction();
+        configuration.channel_ids = vec!["C0CC755QYSK".to_owned()];
+        configuration.slack_workspace_url = Some("https://acme.slack.com".to_owned());
+        configuration.issue_url_template =
+            Some("https://github.com/OWNER/REPO/issues/{n}".to_owned());
+        configuration.slack_format = Some(SlackFormat::Converted);
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let message = InboundMessage::new(
+            ChannelId::new("C0CC755QYSK").expect("channel"),
+            MessageId::new("C0CC755QYSK/messages/1794772223.198289").expect("message"),
+            ThreadId::new("C0CC755QYSK/threads/1794772223.198289").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "please look",
+            "2026-11-16T09:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("delivery-1").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery");
+        let key = state
+            .admit_batch(&batch)
+            .expect("admission")
+            .new_request_keys
+            .into_iter()
+            .next()
+            .expect("key");
+        // The prompt assigns the reply alias the citation names.
+        let _prompt = state.prompt(&key, "").expect("prompt");
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(
+                &key,
+                &format!(
+                    "<CHAT_REPLY_{0}>\nSee :thread:001 and :issue:658.\n</CHAT_REPLY_{0}>",
+                    route.identifier
+                ),
+            )
+            .expect("capture reply");
+        let mut transport = FakeReplyTransport::default();
+        assert!(state
+            .publish_one(&key, &mut transport)
+            .expect("sent")
+            .is_some());
+        let posted = &transport.submissions[0].2;
+        assert!(
+            posted.contains(
+                "[:thread:001](https://acme.slack.com/archives/C0CC755QYSK/p1794772223198289)"
+            ),
+            "{posted}"
+        );
+        assert!(
+            posted.contains("[#658](https://github.com/OWNER/REPO/issues/658)"),
+            "{posted}"
+        );
+        assert!(!posted.contains("<https://"), "{posted}");
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

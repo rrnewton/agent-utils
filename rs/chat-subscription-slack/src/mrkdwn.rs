@@ -669,6 +669,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn markdown_reference_links_convert_exactly_once() {
+        // #1709: bridge references arrive as Markdown links on the converted
+        // path; each becomes one Slack link with its short label, its
+        // address appearing exactly once (no autolink doubling).
+        let out = convert_markdown(
+            "See [#658](https://tracker.example.invalid/issues/658) and [:thread:060](https://acme.slack.com/archives/C0123ABCD/p1700000000000100).",
+        );
+        assert_eq!(
+            out,
+            "See <https://tracker.example.invalid/issues/658|#658> and <https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:060>."
+        );
+        assert_eq!(out.matches("issues/658").count(), 1, "{out}");
+        assert_eq!(out.matches("p1700000000000100").count(), 1, "{out}");
+    }
+
+    #[test]
     fn preserves_blank_lines_and_headings() {
         let out = convert_markdown("# Title\n\nFirst para.\n\nSecond para.\n");
         assert_eq!(out, "*Title*\n\nFirst para.\n\nSecond para.");

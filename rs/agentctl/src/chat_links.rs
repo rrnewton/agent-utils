@@ -225,10 +225,36 @@ pub fn render_reply_links(
     message_link: &dyn Fn(u64) -> Option<String>,
     issue_template: Option<&str>,
 ) -> RenderedLinks {
+    render_links(body, thread_link, message_link, issue_template, false)
+}
+
+/// [`render_reply_links`] in Markdown link form (`[label](url)`), for the
+/// converted outbound path whose helper converts Markdown itself: references
+/// must reach that converter as Markdown links so they are expanded exactly
+/// once, never as Slack `<url|label>` text the converter's autolink pass
+/// would read as one raw address (#1709).
+#[must_use]
+pub fn render_reply_links_markdown(
+    body: &str,
+    thread_link: &dyn Fn(u64) -> Option<String>,
+    message_link: &dyn Fn(u64) -> Option<String>,
+    issue_template: Option<&str>,
+) -> RenderedLinks {
+    render_links(body, thread_link, message_link, issue_template, true)
+}
+
+fn render_links(
+    body: &str,
+    thread_link: &dyn Fn(u64) -> Option<String>,
+    message_link: &dyn Fn(u64) -> Option<String>,
+    issue_template: Option<&str>,
+    markdown: bool,
+) -> RenderedLinks {
     let mut renderer = Renderer {
         thread_link,
         message_link,
         issue_template,
+        markdown,
         warnings: Vec::new(),
         notices: Vec::new(),
         suppressed: 0,
@@ -391,12 +417,22 @@ struct Renderer<'a> {
     thread_link: &'a dyn Fn(u64) -> Option<String>,
     message_link: &'a dyn Fn(u64) -> Option<String>,
     issue_template: Option<&'a str>,
+    markdown: bool,
     warnings: Vec<String>,
     notices: Vec<String>,
     suppressed: usize,
 }
 
 impl Renderer<'_> {
+    /// One resolved reference as a link, in this render's wire form.
+    fn link(&self, url: &str, label: &str) -> String {
+        if self.markdown {
+            format!("[{label}]({url})")
+        } else {
+            format!("<{url}|{label}>")
+        }
+    }
+
     fn warn(&mut self, warning: String) {
         if self.warnings.len() < MAX_WARNINGS {
             self.warnings.push(warning);
@@ -508,7 +544,7 @@ impl Renderer<'_> {
                     }
                     let label = format!(":thread:{}", thread_label(number));
                     match (self.thread_link)(number) {
-                        Some(url) => (format!("<{url}|{label}>"), consumed),
+                        Some(url) => (self.link(&url, &label), consumed),
                         None => {
                             self.warn(format!(
                                 "{label} has no local permalink; shown as plain text"
@@ -523,7 +559,7 @@ impl Renderer<'_> {
                     }
                     let label = format!(":email:{number}");
                     match (self.message_link)(number) {
-                        Some(url) => (format!("<{url}|{label}>"), consumed),
+                        Some(url) => (self.link(&url, &label), consumed),
                         None => {
                             self.warn(format!(
                                 "{label} has no local permalink; shown as plain text"
@@ -538,7 +574,10 @@ impl Renderer<'_> {
                     }
                     let label = format!(":issue:{number}");
                     match self.issue_template.and_then(|t| issue_url(t, number)) {
-                        Some(url) => (format!("<{url}|{label}>"), consumed),
+                        // The drawn label is the short `#N` every reader
+                        // shows; the citation form stays for plain text
+                        // (#1709).
+                        Some(url) => (self.link(&url, &format!("#{number}")), consumed),
                         None => {
                             self.warn(format!(
                                 "{label} cannot be linked (no usable issue_url_template); shown as plain text"
@@ -563,40 +602,49 @@ impl Renderer<'_> {
             return None;
         }
         let rest = &span[index..];
+        // Phrase matching is on bytes and every span below goes through
+        // `str::get`: `rest` may hold multi-byte characters anywhere, and no
+        // slice of it may panic (#1708).
         let phrase = ["per your ", "thread ", "reply "]
             .into_iter()
             .find(|phrase| {
-                rest.len() >= phrase.len() && rest[..phrase.len()].eq_ignore_ascii_case(phrase)
+                rest.as_bytes()
+                    .get(..phrase.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(phrase.as_bytes()))
             })?;
         let digits_start = phrase.len();
-        let digit_len = rest[digits_start..]
-            .bytes()
-            .take_while(u8::is_ascii_digit)
-            .count();
+        let digit_len = rest.as_bytes().get(digits_start..).map_or(0, |tail| {
+            tail.iter().take_while(|byte| byte.is_ascii_digit()).count()
+        });
         if !(3..=4).contains(&digit_len) {
             return None;
         }
-        let after = rest[digits_start + digit_len..].chars().next();
+        let after = rest
+            .get(digits_start + digit_len..)
+            .and_then(|tail| tail.chars().next());
         if after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
             return None;
         }
-        let digits = &rest[digits_start..digits_start + digit_len];
+        let digits = rest.get(digits_start..digits_start + digit_len)?;
         let alias: u64 = digits.parse().ok()?;
-        let prefix = &rest[..digits_start];
+        let prefix = rest.get(..digits_start)?;
         let label = format!(":thread:{}", thread_label(alias));
         match (self.thread_link)(alias) {
             Some(url) => {
                 self.notices.push(format!(
                     "bare thread reference \"{prefix}{digits}\" rewritten as {label}"
                 ));
-                Some((format!("{prefix}<{url}|{label}>"), digits_start + digit_len))
+                Some((
+                    format!("{prefix}{}", self.link(&url, &label)),
+                    digits_start + digit_len,
+                ))
             }
             None => {
                 self.notices.push(format!(
                     "possible bare thread reference \"{prefix}{digits}\" left as written; cite it as {label}"
                 ));
                 Some((
-                    rest[..digits_start + digit_len].to_owned(),
+                    rest.get(..digits_start + digit_len)?.to_owned(),
                     digits_start + digit_len,
                 ))
             }
@@ -807,10 +855,28 @@ mod tests {
         let rendered = render("See :thread:060, :email:1846 and :issue:658.");
         assert_eq!(
             rendered.text,
-            "See <https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:060>, <https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD|:email:1846> and <https://github.com/OWNER/REPO/blob/main/.minibeads/issues/project-658.md|:issue:658>."
+            "See <https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:060>, <https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD|:email:1846> and <https://github.com/OWNER/REPO/blob/main/.minibeads/issues/project-658.md|#658>."
         );
         assert!(rendered.warnings.is_empty(), "{:?}", rendered.warnings);
         assert!(rendered.notices.is_empty(), "{:?}", rendered.notices);
+    }
+
+    #[test]
+    fn markdown_form_carries_each_reference_once_with_a_short_label() {
+        // #1709: the converted path's input — one Markdown link per
+        // reference, short labels, no Slack `<url|label>` for its autolink
+        // pass to swallow whole.
+        let rendered = render_reply_links_markdown(
+            "See :thread:060, :email:1846 and :issue:658.",
+            &thread_link,
+            &message_link,
+            Some(TEMPLATE),
+        );
+        assert_eq!(
+            rendered.text,
+            "See [:thread:060](https://acme.slack.com/archives/C0123ABCD/p1700000000000100), [:email:1846](https://acme.slack.com/archives/C0123ABCD/p1700000050000300?thread_ts=1700000000.000100&cid=C0123ABCD) and [#658](https://github.com/OWNER/REPO/blob/main/.minibeads/issues/project-658.md)."
+        );
+        assert!(rendered.warnings.is_empty(), "{:?}", rendered.warnings);
     }
 
     #[test]
@@ -854,6 +920,91 @@ mod tests {
         );
         assert!(rendered.warnings.is_empty(), "{:?}", rendered.warnings);
         assert!(rendered.notices.is_empty(), "{:?}", rendered.notices);
+    }
+
+    #[test]
+    fn the_reported_unicode_text_renders_without_panicking() {
+        // #1708: this exact live reply panicked the guard's phrase slice.
+        let rendered = render("(:issue:1234, parts 2b–3)");
+        assert!(
+            rendered.text.contains("|#1234>, parts 2b–3)"),
+            "{}",
+            rendered.text
+        );
+        assert!(rendered.warnings.is_empty(), "{:?}", rendered.warnings);
+    }
+
+    #[test]
+    fn unicode_around_references_and_guard_phrases_never_panics() {
+        // #1708: multi-byte text right after and around every reference form
+        // and guard phrase; known references still link, nothing panics.
+        for body in [
+            "See :thread:060–done and :email:1846—done and :issue:658’s",
+            "🧵 thread 060 and 🎉thread 060; per your 0060…",
+            "スレッド thread 060、reply 060。:thread:060",
+            "thread 060–3 and per your 0060—“quoted”",
+            "café :issue:658 — naïve 🧵060",
+        ] {
+            let rendered = render(body);
+            assert!(!rendered.text.is_empty(), "{body}");
+        }
+        let rendered = render("dash after :thread:060–x");
+        assert!(
+            rendered.text.contains(
+                "<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:060>"
+            ),
+            "{}",
+            rendered.text
+        );
+        // A rendered issue reference carries the short `#N` label (#1709).
+        let rendered = render("See :issue:658.");
+        assert!(rendered.text.contains("|#658>"), "{}", rendered.text);
+    }
+
+    #[test]
+    fn generated_unicode_bodies_never_panic() {
+        // #1708 property-style: deterministic pseudo-random bodies mixing
+        // reference fragments, guard phrases and multi-byte characters.
+        const POOL: &[&str] = &[
+            ":thread:060",
+            ":email:1846",
+            ":issue:658",
+            "thread ",
+            "reply ",
+            "per your ",
+            "060",
+            "1846",
+            "–",
+            "—",
+            "“",
+            "”",
+            "’",
+            "🧵",
+            "🎉",
+            "スレッド",
+            "café",
+            " ",
+            "(",
+            ")",
+            "`",
+            "a",
+            "9",
+        ];
+        let mut state: u64 = 0x1708;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..512 {
+            let mut body = String::new();
+            for _ in 0..24 {
+                body.push_str(POOL[next() % POOL.len()]);
+            }
+            let _ = render(&body);
+            let _ = strip_link_titles(&body);
+        }
     }
 
     #[test]
