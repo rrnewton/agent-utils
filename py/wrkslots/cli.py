@@ -37821,6 +37821,183 @@ def _run_post_provision_hooks(
     return total
 
 
+@dataclasses.dataclass(frozen=True)
+class _WorktreeConfigState:
+    """One repository's worktree-config state, read from its common directory (#1435).
+
+    ``shared_core_worktree`` is a ``core.worktree`` value still in the common
+    ``config``; ``held_core_worktree`` is one already moved into the main
+    worktree's ``config.worktree``. The broken state is the extension on
+    while a shared value remains: Git then resolves every linked worktree
+    through that one shared value, so ``git status`` and ``git diff`` in a
+    linked worktree can be phantom.
+    """
+
+    common: Path
+    extension_enabled: bool
+    shared_core_worktree: str | None
+    held_core_worktree: str | None
+    core_bare_true: bool
+
+    @property
+    def broken(self) -> bool:
+        return self.extension_enabled and self.shared_core_worktree is not None
+
+
+def _inspect_worktree_config(
+    vcs: _GitVcs, probe: Path, common: Path
+) -> _WorktreeConfigState:
+    """Read the worktree-config state of the repository at ``probe`` (#1435).
+
+    This is the one reader both the identity path and the shared-submodule
+    preparation use, so their view of when enabling
+    ``extensions.worktreeConfig`` is safe cannot drift apart.
+    """
+
+    def shared_get(key: str) -> str | None:
+        result = vcs._run(
+            probe, ["config", "--file", str(common / "config"), "--get", key],
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    held: str | None = None
+    worktree_config = common / "config.worktree"
+    if worktree_config.is_file() and not worktree_config.is_symlink():
+        result = vcs._run(
+            probe,
+            ["config", "--file", str(worktree_config), "--get", "core.worktree"],
+            check=False,
+        )
+        held = result.stdout.strip() if result.returncode == 0 else None
+    bare = shared_get("core.bare")
+    return _WorktreeConfigState(
+        common=common,
+        extension_enabled=shared_get("extensions.worktreeConfig") == "true",
+        shared_core_worktree=shared_get("core.worktree"),
+        held_core_worktree=held,
+        core_bare_true=bare is not None and bare.lower() == "true",
+    )
+
+
+def _resolve_config_worktree(common: Path, value: str) -> Path:
+    resolved = Path(value)
+    if not resolved.is_absolute():
+        resolved = common / resolved
+    return resolved.resolve()
+
+
+def _ensure_worktree_config_enabled(
+    vcs: _GitVcs,
+    probe: Path,
+    common: Path,
+    *,
+    main_worktree: Path | None,
+    move_core_worktree: bool,
+    make_refusal: Callable[[_WorktreeConfigState], str],
+) -> bool:
+    """Enable ``extensions.worktreeConfig`` without silently breaking worktrees (#1435).
+
+    Never flips the extension while the common config still holds
+    ``core.worktree``. With ``move_core_worktree`` the value is moved into
+    the main worktree's ``config.worktree`` (verified by re-reading the
+    state); otherwise the caller refuses with ``make_refusal``. Returns
+    True when this call changed the repository config.
+    """
+
+    state = _inspect_worktree_config(vcs, probe, common)
+    if state.shared_core_worktree is not None:
+        if not move_core_worktree or main_worktree is None:
+            raise Refusal(make_refusal(state))
+        if _resolve_config_worktree(common, state.shared_core_worktree) != (
+            main_worktree.resolve()
+        ):
+            raise Refusal(make_refusal(state))
+        if state.held_core_worktree is not None and _resolve_config_worktree(
+            common, state.held_core_worktree
+        ) != main_worktree.resolve():
+            raise Refusal(make_refusal(state))
+        vcs._run(
+            probe,
+            [
+                "config", "--file", str(common / "config.worktree"),
+                "core.worktree", str(main_worktree.resolve()),
+            ],
+        )
+        vcs._run(
+            probe,
+            ["config", "--file", str(common / "config"), "--unset", "core.worktree"],
+        )
+        vcs._run(
+            probe,
+            ["config", "--file", str(common / "config"), "extensions.worktreeConfig", "true"],
+        )
+        after = _inspect_worktree_config(vcs, probe, common)
+        if (
+            after.shared_core_worktree is not None
+            or not after.extension_enabled
+            or after.held_core_worktree is None
+            or _resolve_config_worktree(common, after.held_core_worktree)
+            != main_worktree.resolve()
+        ):
+            raise Refusal(
+                f"moving core.worktree for {common} did not verify: "
+                f"shared={after.shared_core_worktree!r} held={after.held_core_worktree!r} "
+                f"extension={after.extension_enabled}; preserve the repository "
+                "and inspect it before rerunning"
+            )
+        return True
+    if state.core_bare_true:
+        raise Refusal(make_refusal(state))
+    if move_core_worktree and main_worktree is not None:
+        if state.held_core_worktree is not None and _resolve_config_worktree(
+            common, state.held_core_worktree
+        ) != main_worktree.resolve():
+            raise Refusal(make_refusal(state))
+        if state.held_core_worktree is None:
+            vcs._run(
+                probe,
+                [
+                    "config", "--file", str(common / "config.worktree"),
+                    "core.worktree", str(main_worktree.resolve()),
+                ],
+            )
+            if not state.extension_enabled:
+                vcs._run(
+                    probe,
+                    [
+                        "config", "--file", str(common / "config"),
+                        "extensions.worktreeConfig", "true",
+                    ],
+                )
+            return True
+    if state.extension_enabled:
+        return False
+    vcs._run(
+        probe,
+        ["config", "--file", str(common / "config"), "extensions.worktreeConfig", "true"],
+    )
+    return True
+
+
+def _identity_worktree_refusal(shared: Path, state: _WorktreeConfigState) -> str:
+    found = [
+        setting
+        for setting, present in (
+            ("core.bare=true", state.core_bare_true),
+            ("core.worktree", state.shared_core_worktree is not None),
+        )
+        if present
+    ]
+    return (
+        f"configuration.identity needs extensions.worktreeConfig in {shared}, "
+        f"which also sets {' and '.join(found)}; with the extension on, Git "
+        "applies that to every linked worktree. Move it into the main "
+        "worktree's config.worktree (see git-worktree(1), CONFIGURATION FILE) "
+        "or remove identity from the configuration"
+    )
+
+
 def _assert_git_identity_supported(
     config: Config, repositories: Iterable[Path], vcs: _GitVcs
 ) -> None:
@@ -37832,38 +38009,19 @@ def _assert_git_identity_supported(
     linked worktree, so each one stops being a work tree. Git's own remedy
     is to move those settings into the main worktree's ``config.worktree``;
     wrkslots will not rewrite shared settings, so it refuses instead.
+    The identity caller refuses rather than moving the value: identity is
+    a slot-local convenience, and rewriting the primary checkout's
+    worktree location is the explicit shared-submodule preparation's job
+    (#1435, see _prepare_shared_submodule_repo).
     """
 
     if config.identity is None:
         return
     for repository in dict.fromkeys(repositories):
-        shared = vcs.common_directory(repository) / "config"
-        bare = vcs._run(
-            repository,
-            ["config", "--file", str(shared), "--type=bool", "--get", "core.bare"],
-            check=False,
-        )
-        worktree = vcs._run(
-            repository,
-            ["config", "--file", str(shared), "--get", "core.worktree"],
-            check=False,
-        )
-        found = [
-            setting
-            for setting, present in (
-                ("core.bare=true", bare.returncode == 0 and bare.stdout.strip() == "true"),
-                ("core.worktree", worktree.returncode == 0),
-            )
-            if present
-        ]
-        if found:
-            raise Refusal(
-                f"configuration.identity needs extensions.worktreeConfig in {shared}, "
-                f"which also sets {' and '.join(found)}; with the extension on, Git "
-                "applies that to every linked worktree. Move it into the main "
-                "worktree's config.worktree (see git-worktree(1), CONFIGURATION FILE) "
-                "or remove identity from the configuration"
-            )
+        common = vcs.common_directory(repository)
+        state = _inspect_worktree_config(vcs, repository, common)
+        if state.core_bare_true or state.shared_core_worktree is not None:
+            raise Refusal(_identity_worktree_refusal(common / "config", state))
 
 
 def _apply_slot_git_identity(
@@ -37872,9 +38030,12 @@ def _apply_slot_git_identity(
     """Set the configured Git identity privately in every new checkout (#1096).
 
     The slot's own checkout gets ``git config --worktree``, which needs
-    ``extensions.worktreeConfig`` in the shared config: an inert switch that
-    gives every worktree its own ``config.worktree`` and changes nothing
-    else. ``user.name`` and ``user.email`` themselves are never written to
+    ``extensions.worktreeConfig`` in the shared config. That switch is not
+    inert: with it on, Git applies a ``core.worktree`` left in the shared
+    config to every linked worktree, so enabling it goes through
+    _ensure_worktree_config_enabled, which refuses while such a value
+    remains instead of flipping the switch silently (#1435).
+    ``user.name`` and ``user.email`` themselves are never written to
     the shared config, so the main checkout and sibling slots keep theirs.
     A populated submodule whose repository is private to this slot gets a
     plain ``git config``; one shared with the primary and sibling slots
@@ -37902,17 +38063,15 @@ def _apply_slot_git_identity(
     for checkout in created:
         path = _stored_path(config, checkout.path, "identity checkout path")
         try:
-            enabled = vcs._run(
-                path,
-                ["config", "--type=bool", "--get", "extensions.worktreeConfig"],
-                check=False,
+            common = vcs.common_directory(path)
+            _ensure_worktree_config_enabled(
+                vcs, path, common,
+                main_worktree=None,
+                move_core_worktree=False,
+                make_refusal=lambda state: _identity_worktree_refusal(
+                    common / "config", state
+                ),
             )
-            if enabled.returncode != 0 or enabled.stdout.strip() != "true":
-                shared = vcs.common_directory(path) / "config"
-                vcs._run(
-                    path,
-                    ["config", "--file", str(shared), "extensions.worktreeConfig", "true"],
-                )
             for key, value in settings:
                 vcs._run(path, ["config", "--worktree", key, value])
             private = vcs._run(path, ["rev-parse", "--absolute-git-dir"])
@@ -38009,12 +38168,9 @@ def _set_submodule_git_identity(
                 # #1206: a shared submodule's repository is common to every
                 # slot, so a plain `git config` would leak this slot's
                 # identity to all peers. Scope it per worktree instead.
-                ext = vcs._run(
-                    nested,
-                    ["config", "--get", "extensions.worktreeConfig"],
-                    check=False,
-                )
-                if ext.returncode != 0 or ext.stdout.strip() != "true":
+                if not _inspect_worktree_config(
+                    vcs, nested, common_dir
+                ).extension_enabled:
                     outcomes.append(
                         (
                             display,
@@ -38135,39 +38291,22 @@ def _shared_module_prep_state(
             common,
         )
 
-    def shared_get(key: str) -> str | None:
-        result = vcs._run(
-            source_submodule, ["config", "--file", str(common / "config"), "--get", key],
-            check=False,
-        )
-        return result.stdout.strip() if result.returncode == 0 else None
-
-    bare = shared_get("core.bare")
-    if bare is not None and bare.lower() == "true":
+    inspected = _inspect_worktree_config(vcs, source_submodule, common)
+    if inspected.core_bare_true:
         return "unexpected", f"{common} sets core.bare=true; a bare module repository has no main worktree to share from", common
     source = source_submodule.resolve()
     worktree_config = common / "config.worktree"
-    held: str | None = None
-    if worktree_config.is_file() and not worktree_config.is_symlink():
-        result = vcs._run(
-            source_submodule,
-            ["config", "--file", str(worktree_config), "--get", "core.worktree"],
-            check=False,
-        )
-        held = result.stdout.strip() if result.returncode == 0 else None
-    if held is not None and Path(held).resolve() != source:
+    held = inspected.held_core_worktree
+    if held is not None and _resolve_config_worktree(common, held) != source:
         return (
             "unexpected",
             f"{worktree_config} already holds core.worktree={held}, which is "
             f"not this submodule checkout ({source}); refusing to rewrite it",
             common,
         )
-    shared_worktree = shared_get("core.worktree")
+    shared_worktree = inspected.shared_core_worktree
     if shared_worktree is not None:
-        resolved = Path(shared_worktree)
-        if not resolved.is_absolute():
-            resolved = common / resolved
-        if resolved.resolve() != source:
+        if _resolve_config_worktree(common, shared_worktree) != source:
             return (
                 "unexpected",
                 f"{common}/config holds core.worktree={shared_worktree}, which "
@@ -38176,7 +38315,7 @@ def _shared_module_prep_state(
                 common,
             )
         return "unprepared", "core.worktree is still in the shared config", common
-    if shared_get("extensions.worktreeConfig") == "true" and held is not None:
+    if inspected.extension_enabled and held is not None:
         return "prepared", "core.worktree is held per-worktree", common
     return "unprepared", "extensions.worktreeConfig is not enabled yet", common
 
@@ -38213,24 +38352,27 @@ def _prepare_shared_submodule_repo(vcs: _GitVcs, source_submodule: Path) -> bool
         )
     head_before = vcs.head(source_submodule)
     source = source_submodule.resolve()
-    vcs._run(
-        source_submodule,
-        ["config", "--file", str(common / "config"), "extensions.worktreeConfig", "true"],
-    )
-    vcs._run(
-        source_submodule,
-        ["config", "--file", str(common / "config.worktree"), "core.worktree", str(source)],
-    )
-    shared = vcs._run(
-        source_submodule,
-        ["config", "--file", str(common / "config"), "--get", "core.worktree"],
-        check=False,
-    )
-    if shared.returncode == 0:
-        vcs._run(
-            source_submodule,
-            ["config", "--file", str(common / "config"), "--unset", "core.worktree"],
+
+    def prepare_refusal(state: _WorktreeConfigState) -> str:
+        return (
+            f"cannot share the submodule at {source_submodule}: "
+            f"{common}/config holds core.worktree={state.shared_core_worktree}, "
+            "which does not name this submodule checkout, or "
+            f"{common}/config.worktree already holds a different "
+            "core.worktree. remedy: inspect that repository, restore it to "
+            "a populated primary submodule checkout whose core.worktree "
+            "names it, then rerun"
         )
+
+    # The shared-submodule caller moves the value instead of refusing:
+    # sharing is the explicit request, and the move is verified and
+    # logged here, and reversible by moving the value back (#1435).
+    _ensure_worktree_config_enabled(
+        vcs, source_submodule, common,
+        main_worktree=source,
+        move_core_worktree=True,
+        make_refusal=prepare_refusal,
+    )
     if vcs.head(source_submodule) != head_before:
         raise Refusal(
             f"preparing {common} for sharing changed the HEAD of {source_submodule}; "
@@ -38562,6 +38704,92 @@ def _shared_submodule_doctor_findings(
                             repository / relative,
                             f"{checkout.name}/{raw}",
                         )
+    return findings
+
+
+def _worktree_config_doctor_findings(
+    config: Config, states: Sequence[ActiveState]
+) -> list[dict[str, object]]:
+    """Doctor check for the broken worktree-config state (#1435), read-only.
+
+    A repository with ``extensions.worktreeConfig=true`` while
+    ``core.worktree`` is still in the common config resolves every linked
+    worktree through that shared value, so plain ``git status`` and
+    ``git diff`` in a linked worktree can be phantom. Reports each such
+    repository once, with the remedy; changes nothing.
+    """
+
+    findings: list[dict[str, object]] = []
+    vcs = _GitVcs()
+    seen: set[Path] = set()
+
+    def check(record: ActiveRecord, machine: str, probe: Path, label: str) -> None:
+        try:
+            common = vcs.common_directory(probe)
+            if common in seen:
+                return
+            seen.add(common)
+            state = _inspect_worktree_config(vcs, probe, common)
+        except Exception:
+            return
+        if not state.broken:
+            return
+        findings.append(
+            _operational_finding(
+                "worktree-config-core-worktree-in-common",
+                record.slot,
+                machine,
+                f"repository {common} ({label}) has "
+                f"extensions.worktreeConfig=true while core.worktree="
+                f"{state.shared_core_worktree} is still in the common "
+                f"config {common / 'config'}; every linked worktree "
+                "resolves its top level through that shared value, so "
+                "git status and git diff there can be phantom. remedy: "
+                f"move core.worktree into the main worktree's "
+                f"config.worktree (git config --file "
+                f"{common / 'config.worktree'} core.worktree "
+                f"<main-worktree-path> and git config --file "
+                f"{common / 'config'} --unset core.worktree), then check "
+                "git rev-parse --show-toplevel in the main worktree and "
+                "in a linked worktree, or unset "
+                "extensions.worktreeConfig in the common config if "
+                "per-worktree config is not needed; doctor changed "
+                "nothing",
+            )
+        )
+
+    def visit_submodules(
+        record: ActiveRecord, machine: str, tree: Path, label: str, depth: int
+    ) -> None:
+        if depth > 8:
+            return
+        for _name, raw in _declared_submodules(vcs, tree):
+            relative = Path(raw)
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            nested = tree / relative
+            if _submodule_worktree_populated(nested):
+                check(record, machine, nested, f"{label}/{raw}")
+                visit_submodules(record, machine, nested, f"{label}/{raw}", depth + 1)
+
+    for state in states:
+        for record in state.slots:
+            for checkout in record.checkouts:
+                try:
+                    _relative, repository = _stored_repository_path(
+                        config, checkout.repository
+                    )
+                    path = _stored_path(config, checkout.path, "doctor checkout path")
+                except Exception:
+                    continue
+                if path.is_dir():
+                    check(record, state.machine, path, checkout.name)
+                    visit_submodules(record, state.machine, path, checkout.name, 0)
+                if repository.is_dir():
+                    check(record, state.machine, repository, checkout.name)
+                    visit_submodules(
+                        record, state.machine, repository, checkout.name, 0
+                    )
     return findings
 
 
@@ -52926,6 +53154,7 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         # would need to prepare, and slot submodules still privately cloned.
         findings.extend(_proof_mirror_doctor_findings(config))
         findings.extend(_shared_submodule_doctor_findings(config, states))
+        findings.extend(_worktree_config_doctor_findings(config, states))
         findings.extend(_harness_checkout_doctor_findings(config, states))
         findings.extend(_eden_discovery_doctor_findings(config, states))
         findings.extend(_eden_backing_doctor_findings(config, states))

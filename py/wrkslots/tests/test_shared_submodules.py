@@ -270,3 +270,155 @@ def test_doctor_reports_private_submodule(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     kinds = {finding["kind"] for finding in json.loads(result.stdout)["findings"]}
     assert "shared-submodule-private" in kinds
+
+
+# --- Worktree-config safety (#1435 wrkslots-worktreeconfig-core-worktree) ---
+#
+# Enabling ``extensions.worktreeConfig`` while ``core.worktree`` is still
+# in a repository's common config makes every linked worktree resolve its
+# top level through that shared value. The identity path refuses in that
+# state, the shared-submodule preparation moves the value, and doctor
+# reports the broken state without changing anything.
+
+_WORKTREE_CONFIG_KIND = "worktree-config-core-worktree-in-common"
+
+
+def _toplevel_and_status(tree: Path) -> tuple[str, str]:
+    toplevel = git(tree, "rev-parse", "--show-toplevel").stdout.strip()
+    status = git(tree, "status", "--porcelain").stdout
+    return toplevel, status
+
+
+def _common_config(repo: Path) -> Path:
+    common = git(
+        repo, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    ).stdout.strip()
+    return Path(common) / "config"
+
+
+def _doctor_kinds(project: Path) -> set[str]:
+    result = command(project, "doctor", "--format", "json")
+    assert result.returncode == 0, result.stderr
+    return {str(f["kind"]) for f in json.loads(result.stdout)["findings"]}
+
+
+def test_identity_refuses_submodule_style_core_worktree_and_leaves_toplevels(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    # Submodule-style: the common config carries core.worktree, as a
+    # submodule's module repository does (there with a relative value,
+    # covered by the preparation test below).
+    sibling = tmp_path / "sibling"
+    git(repository, "worktree", "add", "-b", "codex/sibling", str(sibling), "main")
+    git(repository, "config", "core.worktree", str(repository))
+    before_main = _toplevel_and_status(repository)
+    before_sibling = _toplevel_and_status(sibling)
+    shared_before = _common_config(repository).read_bytes()
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+
+    refused = create(project)
+
+    assert refused.returncode == 3, refused.stderr
+    assert "core.worktree" in refused.stderr
+    assert _toplevel_and_status(repository) == before_main
+    assert _toplevel_and_status(sibling) == before_sibling
+    assert _common_config(repository).read_bytes() == shared_before
+    assert not checkout(project).exists()
+
+
+def test_identity_refusal_names_the_remedy(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    git(repository, "config", "core.worktree", str(repository))
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+    config = wrkslots._load_config(str(project), "testhost")
+
+    with pytest.raises(wrkslots.Refusal) as caught:
+        wrkslots._assert_git_identity_supported(
+            config, [repository], wrkslots._GitVcs()
+        )
+
+    message = str(caught.value)
+    assert "Move it into the main worktree's config.worktree" in message
+    assert "remove identity from the configuration" in message
+    assert "core.worktree" in message
+
+
+def test_prepare_moves_core_worktree_and_leaves_toplevels(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    component = repository / "component"
+    sibling = tmp_path / "component-sibling"
+    git(component, "worktree", "add", "-b", "codex/comp-sibling", str(sibling), "HEAD")
+    before_main = _toplevel_and_status(component)
+    before_sibling = _toplevel_and_status(sibling)
+
+    changed = wrkslots._prepare_shared_submodule_repo(
+        wrkslots._GitVcs(), component
+    )
+
+    assert changed is True
+    assert _toplevel_and_status(component) == before_main
+    assert _toplevel_and_status(sibling) == before_sibling
+    shared = _common_config(component).read_text(encoding="utf-8")
+    assert "core.worktree" not in shared
+    assert "worktreeConfig = true" in shared
+    held = _common_config(component).with_name("config.worktree").read_text(
+        encoding="utf-8"
+    )
+    assert str(component.resolve()) in held
+
+
+def test_doctor_reports_broken_state_and_stays_silent_when_healthy(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    assert _WORKTREE_CONFIG_KIND not in _doctor_kinds(project)
+
+    # Break it the way a hand flip does: extension on, value unmoved.
+    git(repository, "config", "extensions.worktreeConfig", "true")
+    git(repository, "config", "core.worktree", str(repository))
+    before = _common_config(repository).read_bytes()
+
+    result = command(project, "doctor", "--format", "json")
+
+    assert result.returncode == 0, result.stderr
+    findings = [
+        f for f in json.loads(result.stdout)["findings"]
+        if f["kind"] == _WORKTREE_CONFIG_KIND
+    ]
+    assert len(findings) == 1
+    assert "core.worktree" in str(findings[0]["detail"])
+    assert "config.worktree" in str(findings[0]["detail"])
+    assert _common_config(repository).read_bytes() == before, "doctor repaired"
+
+
+def test_doctor_silent_on_prepared_shared_submodule(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    update_configuration(
+        project, identity=dict(_SLOT_IDENTITY), share_submodules=True
+    )
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    assert _WORKTREE_CONFIG_KIND not in _doctor_kinds(project)
+
+
+def test_plain_repo_identity_keeps_working(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    update_configuration(project, identity=dict(_SLOT_IDENTITY))
+
+    made = create(project)
+
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project)
+    assert (
+        git(tree, "config", "--worktree", "user.name").stdout.strip()
+        == _SLOT_IDENTITY["name"]
+    )
+    shared = _common_config(repository).read_text(encoding="utf-8")
+    assert "worktreeConfig = true" in shared
+    assert "core.worktree" not in shared

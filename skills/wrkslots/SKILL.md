@@ -83,6 +83,14 @@ The selected source worktree may contain the configured managed root, as in `--r
 above. That exact source root is not a target collision; any other Git-registered ancestor, the
 requested slot root itself, or a descendant is refused.
 
+When a slot needs a per-worktree Git identity, use the configured `identity` instead of running
+`git config --worktree user.name ...` by hand in a linked worktree or a submodule worktree.
+Enabling `extensions.worktreeConfig` is safe only while the repository's common configuration
+holds no `core.worktree`; check `git config --file <git-common-dir>/config --get core.worktree`
+first. wrkslots refuses to enable the switch while such a value remains, the shared-submodule
+preparation moves the value into the main worktree's `config.worktree`, and `wrkslots doctor`
+reports the enabled-but-unmoved state as `worktree-config-core-worktree-in-common`.
+
 Provisioning always starts with an empty per-checkout build cache; it never copies a donor cache.
 The first dependency build may therefore take many minutes instead of roughly one or two minutes,
 and per-slot cache storage is not shared by reflinks.

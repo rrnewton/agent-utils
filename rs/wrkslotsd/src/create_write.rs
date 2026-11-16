@@ -121,10 +121,49 @@ fn shared_config(repo: &Path) -> Result<String> {
         .into_owned())
 }
 
+/// One repository's worktree-config state (#1435): whether the
+/// extension is on, a `core.worktree` is still in the common config,
+/// and `core.bare=true` is set there. The one reader both the identity
+/// refusal and the identity apply step use, mirroring
+/// `_inspect_worktree_config`, so the two cannot drift apart.
+fn worktree_config_state(repo: &Path) -> Result<(String, bool, bool, bool)> {
+    let shared = shared_config(repo)?;
+    let get = |key: &str| {
+        let (ok, value, _) = git_output(repo, &["config", "--file", &shared, "--get", key]);
+        if ok {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    };
+    let extension = get("extensions.worktreeConfig").as_deref() == Some("true");
+    let has_core_worktree = get("core.worktree").is_some();
+    let bare_true = get("core.bare")
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    Ok((shared, extension, has_core_worktree, bare_true))
+}
+
+fn author_refusal(shared: &str, has_core_worktree: bool, bare_true: bool) -> String {
+    let mut found = Vec::new();
+    if bare_true {
+        found.push("core.bare=true");
+    }
+    if has_core_worktree {
+        found.push("core.worktree");
+    }
+    format!(
+        "configuration.identity needs extensions.worktreeConfig in {shared}, which also sets {}; with the extension on, Git applies that to every linked worktree. Move it into the main worktree's config.worktree (see git-worktree(1), CONFIGURATION FILE) or remove identity from the configuration",
+        found.join(" and ")
+    )
+}
+
 /// Refuse, before create writes anything, a repository whose shared
 /// config holds `core.bare=true` or `core.worktree`: once
 /// `extensions.worktreeConfig` is on, Git applies those to every
 /// linked worktree (#1096). Mirrors `_assert_git_identity_supported`.
+/// The identity caller refuses rather than moving the value; moving it
+/// is the explicit shared-submodule preparation's job (#1435).
 fn assert_author_supported(repositories: &[PathBuf]) -> Result<()> {
     let mut seen: Vec<&PathBuf> = Vec::new();
     for repository in repositories {
@@ -132,35 +171,33 @@ fn assert_author_supported(repositories: &[PathBuf]) -> Result<()> {
             continue;
         }
         seen.push(repository);
-        let shared = shared_config(repository)?;
-        let (bare_ok, bare, _) = git_output(
-            repository,
+        let (shared, _extension, has_core_worktree, bare_true) = worktree_config_state(repository)?;
+        if bare_true || has_core_worktree {
+            return Err(author_refusal(&shared, has_core_worktree, bare_true));
+        }
+    }
+    Ok(())
+}
+
+/// Enable `extensions.worktreeConfig` for the identity, refusing while
+/// the common config still holds `core.worktree` (#1435). Mirrors
+/// `_ensure_worktree_config_enabled` with moving disabled.
+fn ensure_worktree_config(repo: &Path) -> Result<()> {
+    let (shared, extension, has_core_worktree, bare_true) = worktree_config_state(repo)?;
+    if has_core_worktree || bare_true {
+        return Err(author_refusal(&shared, has_core_worktree, bare_true));
+    }
+    if !extension {
+        git(
+            repo,
             &[
                 "config",
                 "--file",
                 &shared,
-                "--type=bool",
-                "--get",
-                "core.bare",
+                "extensions.worktreeConfig",
+                "true",
             ],
-        );
-        let (worktree_ok, _, _) = git_output(
-            repository,
-            &["config", "--file", &shared, "--get", "core.worktree"],
-        );
-        let mut found = Vec::new();
-        if bare_ok && bare.trim() == "true" {
-            found.push("core.bare=true");
-        }
-        if worktree_ok {
-            found.push("core.worktree");
-        }
-        if !found.is_empty() {
-            return Err(format!(
-                "configuration.identity needs extensions.worktreeConfig in {shared}, which also sets {}; with the extension on, Git applies that to every linked worktree. Move it into the main worktree's config.worktree (see git-worktree(1), CONFIGURATION FILE) or remove identity from the configuration",
-                found.join(" and ")
-            ));
-        }
+        )?;
     }
     Ok(())
 }
@@ -189,17 +226,7 @@ fn apply_author(
                 .unwrap_or_default(),
         );
         let private = (|| -> Result<String> {
-            let (enabled_ok, enabled, _) = git_output(
-                &path,
-                &["config", "--type=bool", "--get", "extensions.worktreeConfig"],
-            );
-            if !(enabled_ok && enabled.trim() == "true") {
-                let shared = shared_config(&path)?;
-                git(
-                    &path,
-                    &["config", "--file", &shared, "extensions.worktreeConfig", "true"],
-                )?;
-            }
+            ensure_worktree_config(&path)?;
             for (key, value) in settings {
                 git(&path, &["config", "--worktree", key, value])?;
             }

@@ -505,9 +505,14 @@ registered:
 
 - the slot's own checkout gets `git config --worktree user.name` and `user.email`, which land in
   that worktree's private `config.worktree`. Per-worktree configuration needs
-  `extensions.worktreeConfig=true` in the repository's shared configuration; that switch is the
-  one shared write, and it changes nothing for the primary checkout or other slots. `user.name`
-  and `user.email` are never written to the shared configuration;
+  `extensions.worktreeConfig=true` in the repository's shared configuration. That switch is the
+  one shared write, and it is safe only while the shared configuration holds no `core.worktree`:
+  check first with `git config --file <common-dir>/config --get core.worktree`, where
+  `<common-dir>` is what `git rev-parse --git-common-dir` prints. When a value is there, as in a
+  submodule's module repository (`core.worktree=../../../<submodule>`), enabling the extension
+  without moving the value makes every linked worktree resolve its top level through that one
+  shared value. wrkslots refuses in that case (see below) rather than enabling the switch.
+  `user.name` and `user.email` are never written to the shared configuration;
 - each populated submodule below the checkout, recursively, gets plain `git config user.name` and
   `user.email`. Such a submodule's Git directory lives under the slot's own Git directory, so that
   configuration is private to the slot.
@@ -527,10 +532,19 @@ leaves the slot for inspection with its create journal, like a failed post-provi
 cause and run `wrkslots recover`, which repeats the step (every write is idempotent).
 
 With `extensions.worktreeConfig` on, Git applies a `core.bare=true` or `core.worktree` left in the
-shared configuration to every linked worktree, which then stops being a work tree. So when any
-repository in the plan has either setting in its shared configuration, `create` refuses before
-writing anything. Git's remedy is to move the setting into the primary worktree's
-`config.worktree` (git-worktree(1), "CONFIGURATION FILE"); otherwise remove `identity`.
+shared configuration to every linked worktree: a linked worktree then resolves its top level
+through the shared `core.worktree` value, so `git status` and `git diff` there can show phantom
+changes. So when any repository in the plan has either setting in its shared configuration,
+`create` refuses before writing anything, and the refusal names the remedy: move the setting
+into the primary worktree's `config.worktree` (git-worktree(1), "CONFIGURATION FILE"), or remove
+`identity`. The shared-submodule preparation performs that move itself, for submodule module
+repositories, and logs it. `wrkslots doctor` reports the broken state itself — the extension on
+while `core.worktree` is still in a common configuration — as a
+`worktree-config-core-worktree-in-common` finding with the same remedy; doctor is read-only and
+changes nothing. Anyone setting an identity by hand in a linked worktree or a submodule
+worktree follows the same rule: read the common configuration first, and only run
+`git config --worktree user.name ...` once the extension is on and no `core.worktree` remains
+in the common configuration.
 
 Slots created before the key was set keep the identity they had; `create` does not revisit them.
 

@@ -31280,7 +31280,7 @@ def test_create_sets_configured_identity_slot_privately(
         assert "identity: checkout=product submodule=component/leaf: set" in made.stderr
         assert _commit_identity(tree / "component", "component-work") == expected
         assert _commit_identity(tree / "component" / "leaf", "leaf-work") == expected
-    # Only the inert extension switch reached the shared config.
+    # Only the extension switch reached the shared config.
     after_shared = git(repository, "config", "--file", str(shared_config), "--list").stdout
     assert sorted(after_shared.splitlines()) == sorted(
         [*before_shared.splitlines(), "extensions.worktreeconfig=true"]
