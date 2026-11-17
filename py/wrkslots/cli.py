@@ -25912,6 +25912,15 @@ def _process_state_legacy(identity: ProcessIdentity | None) -> tuple[str, str]:
             return "dead", message
         return "indeterminate", message
     if current == identity:
+        # A zombie has exited: its generation is dead even though the
+        # unreaped /proc entry still matches (#1736 review). A pidfd on
+        # it is already readable, so calling it live would spin waiters.
+        try:
+            stat = _read_process_stat(Path("/proc") / str(identity.pid))
+        except Refusal:
+            stat = None
+        if stat is not None and stat.state in {"Z", "X"}:
+            return "dead", f"PID {identity.pid} exited and awaits reaping"
         return "live", f"PID {identity.pid} generation is live"
     return "dead", f"PID {identity.pid} was reused; the recorded generation exited"
 
@@ -37730,17 +37739,20 @@ def _seal_actor_crossed_boot(raw: Mapping[str, object]) -> bool:
 
 
 def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str]:
-    """Whether the seal journal at ``path`` was left by a process proven dead.
+    """Whether the seal journal at ``path`` was left by a batch proven gone.
 
-    True only when the seal's actor ran on this machine identity, it is
-    proven dead -- an actor from an earlier boot on this host is dead
-    regardless of any pid check (#1764), otherwise its pid must be absent
-    or now name another process generation (``_process_state``) -- and no
-    finish journal is paired with the seal. A live or indeterminate
-    actor, an actor from another machine, an unreadable journal, or a
-    paired finish all keep the seal binding. Such an orphan is what a
-    validate-batch removal leaves when its process is killed before its
-    ``finally`` retires the seal: nothing can still be using it
+    The batch process recorded in the seal's extension slot governs
+    (#1736): the seal is orphaned when that operator is proven dead
+    or ran in an earlier boot on this host (#1764: dead regardless of
+    any pid check), whatever the authorizing coordinator -- routinely
+    a long-lived harness -- is still doing. Coordinator liveness alone
+    never keeps a seal alive. A seal recording no operator (written
+    before the slot existed) is judged by its actor the old way. A
+    live or indeterminate operator, an operator from another machine,
+    an unreadable journal, or a paired finish all keep the seal
+    binding. Such an orphan is what a validate-batch removal leaves
+    when its process is killed before its ``finally`` retires the
+    seal: nothing can still be using it
     (https://github.com/rrnewton/agent-utils/issues/236).
     """
     try:
@@ -37754,20 +37766,23 @@ def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str
             return False, "the seal records no actor"
         host_id = _host_id()
         boot_id = _boot_id(Path("/proc"))
-        if identity.host_id != host_id:
-            return False, "the seal's actor belongs to another machine identity"
-        if identity.boot_id != boot_id:
-            # An earlier boot on this host: dead regardless of the pid.
-            reason = "the seal's actor ran in an earlier boot"
+        operator = _seal_operator(_raw)
+        judged = operator if operator is not None else identity
+        if judged.host_id != host_id:
+            return False, "the seal's batch belongs to another machine identity"
+        if judged.boot_id != boot_id:
+            reason = "the seal's batch ran in an earlier boot"
+        elif judged.pid == os.getpid():
+            reason = "the seal's batch is this process"
         else:
-            state, reason = _process_state(identity)
+            state, reason = _process_state(judged)
             if state != "dead":
-                return False, f"the seal's actor is {state}: {reason}"
+                return False, f"the seal's batch is {state}: {reason}"
         if _validate_batch_seal_paired_finish(config, targets) is not None:
             return False, "a finish journal is paired with the seal"
     except (Refusal, StateError) as exc:
         return False, f"the seal cannot be judged: {exc}"
-    return True, f"its actor PID {identity.pid} is dead: {reason}"
+    return True, f"its batch PID {judged.pid} is dead: {reason}"
 
 
 def _validate_batch_seal_owner_liveness(
@@ -38446,7 +38461,11 @@ def _recover_dead_actor_journals(config: Config) -> None:
 
 
 def _wait_for_control_change(
-    config: Config, timeout_seconds: float, *, pid: int | None = None
+    config: Config,
+    timeout_seconds: float,
+    *,
+    pid: int | None = None,
+    recheck: Callable[[], bool] | None = None,
 ) -> None:
     """Block until the control directory changes or the timeout passes (#1755).
 
@@ -38474,11 +38493,15 @@ def _wait_for_control_change(
             libc.inotify_add_watch(
                 fd,
                 os.fsencode(config.control),
-                0x00000FFF,  # IN_ALL_EVENTS
+                0x100 | 0x200 | 0x40 | 0x80,  # CREATE|DELETE|MOVED_FROM|MOVED_TO
             )
         )
         if watch < 0:
             raise OSError(ctypes.get_errno(), "inotify_add_watch failed")
+        # Close the missed-wakeup window: the caller's condition may
+        # have cleared between its last check and this watch.
+        if recheck is not None and not recheck():
+            return
         if pid is not None:
             try:
                 pidfd = os.pidfd_open(pid)
@@ -38491,7 +38514,10 @@ def _wait_for_control_change(
                 selector.register(pidfd, selectors.EVENT_READ)
             selector.select(wait)
     except (OSError, AttributeError, ValueError):
-        time.sleep(timeout_seconds)
+        # Capped like the pidfd-missing branch (#1736 review): the
+        # caller re-judges after about a second instead of sleeping
+        # out the whole budget on a setup failure (EMFILE is common).
+        time.sleep(min(timeout_seconds, 1.0))
     finally:
         if pidfd is not None and pidfd >= 0:
             os.close(pidfd)
@@ -38585,7 +38611,12 @@ def _assert_no_journal(
         if classification == "live":
             assert actor is not None
             if wait_seconds > 0.0 and time.monotonic() < deadline:
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                _wait_for_control_change(
+                    config,
+                    max(0.0, deadline - time.monotonic()),
+                    pid=actor.pid,
+                    recheck=lambda: blocked_path.exists(),
+                )
                 continue
             raise _JournalBusy(
                 kind=blocked_raw.get("kind"),
@@ -88541,6 +88572,20 @@ def _cmd_recover(
                         f"since {_seal_since}) recorded in {_seal_path}; "
                         "recover refuses a seal whose owner is still "
                         "running; wait for the batch to finish"
+                    )
+                if _seal_state != "dead" and not bool(
+                    getattr(args, "coordinator_authorized", False)
+                ):
+                    # Fail closed on a seal nobody can judge (#1736
+                    # review); the explicit override is the
+                    # coordinator's own authorization, given only after
+                    # confirming no batch is running.
+                    raise Refusal(
+                        f"validation-batch seal recorded in {_seal_path}; "
+                        f"its owner cannot be proven dead here "
+                        f"({_seal_detail}), so recover refuses it; if no "
+                        "batch is running, rerun with "
+                        "--coordinator-authorized to override"
                     )
                 # #885: an exact-slot create journal that overlaps no seal
                 # target is recovered before the seal, whose pairing would

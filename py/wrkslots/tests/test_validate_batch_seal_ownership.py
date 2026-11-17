@@ -1250,7 +1250,7 @@ def test_adopt_wait_stops_when_the_batch_dies_mid_wait(
                 "--project-root",
                 str(project),
                 "--wait-lock",
-                "30",
+                "3600",
                 "adopt",
                 "target",
                 "--agent",
@@ -1268,6 +1268,8 @@ def test_adopt_wait_stops_when_the_batch_dies_mid_wait(
     assert worker.is_alive(), "adopt did not wait on the live seal"
     operator.kill()
     operator.wait()
+    # The join bound is deliberately far smaller than the 3600s
+    # budget: a broken pidfd wake hangs here and fails, never passes.
     worker.join(timeout=30)
     assert not worker.is_alive(), "adopt slept out its budget on a dead batch"
     assert outcome["rc"] == 3
@@ -1275,6 +1277,106 @@ def test_adopt_wait_stops_when_the_batch_dies_mid_wait(
     assert "interrupted validation-batch seal recorded" in err
     assert "wrkslots recover" in err
     assert seal.read_bytes() == sealed
+
+
+def test_zombie_and_reused_pid_operators_are_dead_not_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A zombie operator, and a reused pid, are both dead (#1736)."""
+
+    import time as _time
+
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    sleeper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"]
+    )
+    try:
+        _rewrite_operator(seal, sleeper.pid)
+        # Reused pid: same live pid, another generation.
+        raw = json.loads(seal.read_text())
+        raw["x"]["operator"]["start_ticks"] += 999_999
+        seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+        assert _adopt_target(project) == 3
+        assert "interrupted validation-batch seal recorded" in (
+            capsys.readouterr().err
+        )
+
+        # Zombie: the recorded generation exited and awaits reaping.
+        zombie = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"]
+        )
+        try:
+            _rewrite_operator(seal, zombie.pid)
+            zombie.kill()
+            deadline = _time.monotonic() + 30
+            state = ""
+            while _time.monotonic() < deadline:
+                text = Path(f"/proc/{zombie.pid}/stat").read_text()
+                state = text.rsplit(")", 1)[1].split()[0]
+                if state == "Z":
+                    break
+                _time.sleep(0.01)
+            assert state == "Z", "child never became a zombie"
+            assert _adopt_target(project) == 3
+            err = capsys.readouterr().err
+            assert "interrupted validation-batch seal recorded" in err
+            assert "in progress" not in err
+        finally:
+            zombie.wait()
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+def test_recover_fails_closed_on_an_unknowable_seal_without_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recover refuses an unknowable seal unless authorized (#1736)."""
+
+    project, target, seal, original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(seal, host_id="0" * 32)
+
+    refused = raw_command_with_census_authority_stub(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+    assert refused.returncode == 3, refused.stderr
+    assert "--coordinator-authorized" in refused.stderr
+    assert seal.exists()
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
+
+
+def test_an_old_format_seal_without_x_is_recovered_as_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A seal with no extension slot recovers exactly as before."""
+
+    project, target, seal, original = _crashed_seal(tmp_path, monkeypatch)
+    raw = json.loads(seal.read_text())
+    del raw["x"]
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+    recovered = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
 
 
 def test_recover_refuses_a_seal_whose_batch_is_still_running(

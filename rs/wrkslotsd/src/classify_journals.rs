@@ -953,6 +953,19 @@ fn seal_orphaned(cfg: &Cfg, path: &Path) -> bool {
     if crate::status_state::process_state(Some(&identity)).0 != "dead" {
         return false;
     }
+    // The batch process itself must also be gone (#1736 review).
+    if let Some(operator_value) = value
+        .get("x")
+        .and_then(|extension| extension.get("operator"))
+    {
+        if let Some(operator) = crate::status_state::identity_from_value(operator_value) {
+            if operator.pid != i64::from(std::process::id())
+                && crate::status_state::process_state(Some(&operator)).0 == "live"
+            {
+                return false;
+            }
+        }
+    }
     // A paired finish keeps the seal binding; any outstanding finish
     // journal is treated as potentially paired (conservative).
     let machines = BTreeSet::from([cfg.machine.clone()]);

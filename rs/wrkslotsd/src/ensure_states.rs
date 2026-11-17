@@ -647,6 +647,13 @@ pub(crate) fn seal_owner_liveness(
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
         return unknown("the seal cannot be judged: invalid JSON".to_string());
     };
+    // Minimal shape validation mirroring `_validate_batch_seal_journal`
+    // (#1736 review): an invalid seal is unknown, never judged.
+    if value.get("kind").and_then(Value::as_str) != Some("validate-batch-seal")
+        || value.get("schema").and_then(Value::as_i64) != Some(1)
+    {
+        return unknown("the seal cannot be judged: wrong kind or schema".to_string());
+    }
     let Some(actor) = value.get("actor") else {
         return unknown("the seal records no actor".to_string());
     };

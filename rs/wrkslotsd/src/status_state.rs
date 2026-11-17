@@ -292,10 +292,26 @@ pub(crate) fn process_state(identity: Option<&Identity>) -> (String, String) {
                 && current.host_id == identity.host_id
                 && current.cgroup_path == identity.cgroup_path;
             if same_generation {
-                (
-                    "live".to_string(),
-                    format!("PID {} generation is live", identity.pid),
-                )
+                // A zombie has exited (#1736 review): dead even
+                // though the unreaped /proc entry still matches.
+                let zombie = std::fs::read_to_string(format!("/proc/{}/stat", identity.pid))
+                    .ok()
+                    .and_then(|text| {
+                        text.rsplit_once(')')
+                            .map(|(_, rest)| rest.trim_start().starts_with(['Z', 'X']))
+                    })
+                    .unwrap_or(false);
+                if zombie {
+                    (
+                        "dead".to_string(),
+                        format!("PID {} exited and awaits reaping", identity.pid),
+                    )
+                } else {
+                    (
+                        "live".to_string(),
+                        format!("PID {} generation is live", identity.pid),
+                    )
+                }
             } else {
                 (
                     "dead".to_string(),
