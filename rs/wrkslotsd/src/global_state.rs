@@ -80,6 +80,18 @@ pub(crate) fn validate_event_chain(directory: &Path, machine: &str) -> Result<()
 
 /// Like `validate_event_chain`, but also return the event documents.
 pub(crate) fn load_event_chain(directory: &Path, machine: &str) -> Result<Vec<Value>> {
+    load_event_chain_filtered(directory, machine, &[])
+}
+
+/// Validate one chain exactly as `load_event_chain` does, returning
+/// only the events whose kind is in `retain` (every kind when it is
+/// empty), so a reader that folds a long log holds only what it can
+/// still consult (#1794).
+pub(crate) fn load_event_chain_filtered(
+    directory: &Path,
+    machine: &str,
+    retain: &[&str],
+) -> Result<Vec<Value>> {
     use crate::active_state::{as_int, as_mapping, as_str, parse_timestamp};
 
     let mut names: Vec<String> = Vec::new();
@@ -192,7 +204,7 @@ pub(crate) fn load_event_chain(directory: &Path, machine: &str) -> Result<Vec<Va
             as_str(&raw["recorded_at"], "append-only event.recorded_at")?,
             "append-only event.recorded_at",
         )?;
-        as_str(&raw["kind"], "append-only event.kind")?;
+        let kind = as_str(&raw["kind"], "append-only event.kind")?;
         as_mapping(&raw["payload"], "append-only event.payload")?;
         let recorded = as_str(&raw["sha256"], "append-only event.sha256")?;
         let mut core = raw.clone();
@@ -206,7 +218,9 @@ pub(crate) fn load_event_chain(directory: &Path, machine: &str) -> Result<Vec<Va
             ));
         }
         previous = recorded.to_owned();
-        events.push(value);
+        if retain.is_empty() || retain.contains(&kind) {
+            events.push(value);
+        }
     }
     Ok(events)
 }

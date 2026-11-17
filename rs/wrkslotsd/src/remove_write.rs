@@ -3454,64 +3454,6 @@ fn submodule_private_history(
             unresolvable.len()
         ));
     }
-    // Every commit object, excluding salvage's own commits.
-    let all_commits = git(
-        sub_path,
-        &[
-            "cat-file",
-            "--batch-all-objects",
-            "--unordered",
-            "--batch-check=%(objectname)",
-            "--filter=object:type=commit",
-        ],
-    )?;
-    let commit_list: Vec<&str> = all_commits
-        .lines()
-        .filter(|line| is_sha(line.trim()))
-        .collect();
-    if !commit_list.is_empty() {
-        let mut command = Command::new("git");
-        command
-            .args([
-                "--no-replace-objects",
-                "-c",
-                "core.useReplaceRefs=false",
-                "-C",
-            ])
-            .arg(sub_path)
-            .args(["log", "--no-walk=unsorted", "--stdin", "--format=%H %ce"])
-            .env_clear();
-        for (key, value) in std::env::vars() {
-            if !key.starts_with("GIT_") {
-                command.env(key, value);
-            }
-        }
-        command
-            .env("LC_ALL", "C")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped());
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("cannot execute Git: {error}"))?;
-        {
-            use std::io::Write as _;
-            let mut stdin = child.stdin.take().expect("stdin");
-            let _ = stdin.write_all(commit_list.join("\n").as_bytes());
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("cannot execute Git: {error}"))?;
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let (commit, committer) = line.split_once(' ').unwrap_or((line, ""));
-            if committer != "wrkslots@localhost" && is_sha(commit) {
-                positives.insert(commit.to_string());
-            }
-        }
-    }
     // Durable repositories: the checkout's recorded source when
     // it lives outside what removal deletes, and the submodule's
     // own local-path remote outside the slot.
@@ -3663,6 +3605,171 @@ fn submodule_private_history(
             .collect();
         Ok((tips, commits.len()))
     };
+    // Every commit object, excluding salvage's own commits.
+    let all_commits = git(
+        sub_path,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--unordered",
+            "--batch-check=%(objectname)",
+            "--filter=object:type=commit",
+        ],
+    )?;
+    let commit_list: Vec<&str> = all_commits
+        .lines()
+        .filter(|line| is_sha(line.trim()))
+        .collect();
+    // Decisive early exit (#1794): the full scan's positives are the
+    // ref/reflog roots above plus every commit object, and its remote
+    // answer can only shrink the tips, so when neither root set
+    // reaches past the negatives there is nothing private to judge
+    // and the committer filter, classification and remote ask below
+    // are all skipped.
+    {
+        let (ref_tips, _) = compute(&positives, &negatives)?;
+        if ref_tips.is_empty() {
+            if commit_list.is_empty() {
+                return Ok(None);
+            }
+            let mut all_positives = positives.clone();
+            for commit in &commit_list {
+                all_positives.insert(commit.trim().to_string());
+            }
+            let (all_tips, _) = compute(&all_positives, &negatives)?;
+            if all_tips.is_empty() {
+                return Ok(None);
+            }
+        }
+    }
+    if !commit_list.is_empty() {
+        let mut command = Command::new("git");
+        command
+            .args([
+                "--no-replace-objects",
+                "-c",
+                "core.useReplaceRefs=false",
+                "-C",
+            ])
+            .arg(sub_path)
+            .args(["log", "--no-walk=unsorted", "--stdin", "--format=%H %ce"])
+            .env_clear();
+        for (key, value) in std::env::vars() {
+            if !key.starts_with("GIT_") {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("stdin");
+            let _ = stdin.write_all(commit_list.join("\n").as_bytes());
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let (commit, committer) = line.split_once(' ').unwrap_or((line, ""));
+            if committer != "wrkslots@localhost" && is_sha(commit) {
+                positives.insert(commit.to_string());
+            }
+        }
+    }
+    // Every commit object, excluding salvage's own commits.
+    let all_commits = git(
+        sub_path,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--unordered",
+            "--batch-check=%(objectname)",
+            "--filter=object:type=commit",
+        ],
+    )?;
+    let commit_list: Vec<&str> = all_commits
+        .lines()
+        .filter(|line| is_sha(line.trim()))
+        .collect();
+    // Decisive early exit (#1794): the full scan's positives are the
+    // ref/reflog roots above plus every commit object, and its remote
+    // answer can only shrink the tips, so when neither root set
+    // reaches past the negatives there is nothing private to judge
+    // and the committer filter, classification and remote ask below
+    // are all skipped. A root the full scan never walks can name a
+    // missing object and make rev-list refuse; that error falls
+    // through to the full scan's own refusal, never an early exit.
+    {
+        let ref_empty = match compute(&positives, &negatives) {
+            Ok((ref_tips, _)) => ref_tips.is_empty(),
+            Err(_) => false,
+        };
+        if ref_empty {
+            if commit_list.is_empty() {
+                return Ok(None);
+            }
+            let mut all_positives = positives.clone();
+            for commit in &commit_list {
+                all_positives.insert(commit.trim().to_string());
+            }
+            if let Ok((all_tips, _)) = compute(&all_positives, &negatives) {
+                if all_tips.is_empty() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    if !commit_list.is_empty() {
+        let mut command = Command::new("git");
+        command
+            .args([
+                "--no-replace-objects",
+                "-c",
+                "core.useReplaceRefs=false",
+                "-C",
+            ])
+            .arg(sub_path)
+            .args(["log", "--no-walk=unsorted", "--stdin", "--format=%H %ce"])
+            .env_clear();
+        for (key, value) in std::env::vars() {
+            if !key.starts_with("GIT_") {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+        {
+            use std::io::Write as _;
+            let mut stdin = child.stdin.take().expect("stdin");
+            let _ = stdin.write_all(commit_list.join("\n").as_bytes());
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("cannot execute Git: {error}"))?;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let (commit, committer) = line.split_once(' ').unwrap_or((line, ""));
+            if committer != "wrkslots@localhost" && is_sha(commit) {
+                positives.insert(commit.to_string());
+            }
+        }
+    }
     let (mut tips, mut total) = compute(&positives, &negatives)?;
     let mut remote_unchecked: Option<(String, String)> = None;
     if !tips.is_empty() {

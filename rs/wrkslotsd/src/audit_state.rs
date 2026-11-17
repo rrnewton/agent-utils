@@ -32,7 +32,9 @@ use crate::finish_write::{
     assert_cache_policy_untracked, assert_record_paths, cache_globs_for, fnmatch_component,
     glob_parts, stored_path, stored_repository_path, verify_existing_worktree,
 };
-use crate::global_state::{discover_machines, event_log_status, load_event_chain, EventLogStatus};
+use crate::global_state::{
+    discover_machines, event_log_status, load_event_chain_filtered, EventLogStatus,
+};
 use crate::handoff_state::{
     load_sidecar_artifact, read_regular_file_identity, sidecar_path, strict_json_object,
 };
@@ -78,7 +80,7 @@ pub(crate) fn release_state(
             latest = Some(event.clone());
         }
     }
-    release_state_with_latest(cfg, record, events, latest.as_ref())
+    release_state_with_latest(cfg, record, events, latest.as_ref(), None)
 }
 
 /// The latest `owner-released` event of each (slot, generation) in one
@@ -103,6 +105,102 @@ pub(crate) fn latest_release_events(events: &[Value]) -> BTreeMap<(String, i64),
     latest
 }
 
+/// Event kinds an audit row can still consult after the registry
+/// fold, plus the operation kinds journal validation reads (#1794):
+/// every other payload is dropped at load, so audit memory follows
+/// the retained kinds, not the whole log.
+pub(crate) const AUDIT_RETAINED_EVENT_KINDS: &[&str] = &[
+    "state-imported",
+    "active-state-recorded",
+    "slot-held",
+    "slot-hold-released",
+    "handoff-read",
+    "handoff-write-intended",
+    "handoff-write-completed",
+    "owner-released",
+    "operation-progress-recorded",
+    "operation-completed",
+    "operation-quarantined",
+];
+
+/// Every generation's handoff write publication from one pass,
+/// mirroring `publication` per record without rescanning per row.
+pub(crate) fn handoff_publications(
+    events: &[Value],
+) -> BTreeMap<(String, i64), (i64, Value, bool)> {
+    let mut latest: BTreeMap<(String, i64), (i64, Value)> = BTreeMap::new();
+    let mut completed: BTreeMap<(String, i64), Vec<i64>> = BTreeMap::new();
+    for event in events {
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        let (Some(slot), Some(generation)) = (
+            payload.get("slot").and_then(Value::as_str),
+            payload.get("generation").and_then(Value::as_i64),
+        ) else {
+            continue;
+        };
+        let key = (slot.to_string(), generation);
+        match event.get("kind").and_then(Value::as_str) {
+            Some("handoff-write-intended") => {
+                if let Some(sequence) = event.get("sequence").and_then(Value::as_i64) {
+                    let replace = latest
+                        .get(&key)
+                        .map(|(current, _)| sequence >= *current)
+                        .unwrap_or(true);
+                    if replace {
+                        latest.insert(
+                            key,
+                            (
+                                sequence,
+                                payload.get("artifact").cloned().unwrap_or(Value::Null),
+                            ),
+                        );
+                    }
+                }
+            }
+            Some("handoff-write-completed") => {
+                if let Some(sequence) = payload.get("intent_sequence").and_then(Value::as_i64) {
+                    completed.entry(key).or_default().push(sequence);
+                }
+            }
+            _ => {}
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(key, (sequence, artifact))| {
+            let done = completed
+                .get(&key)
+                .map(|list| list.contains(&sequence))
+                .unwrap_or(false);
+            (key, (sequence, artifact, done))
+        })
+        .collect()
+}
+
+/// Every generation's latest handoff-read payload from one pass,
+/// mirroring `latest_handoff_read` per record.
+pub(crate) fn latest_handoff_reads(events: &[Value]) -> BTreeMap<(String, i64), Value> {
+    let mut latest: BTreeMap<(String, i64), Value> = BTreeMap::new();
+    for event in events {
+        if event.get("kind").and_then(Value::as_str) != Some("handoff-read") {
+            continue;
+        }
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        let (Some(slot), Some(generation)) = (
+            payload.get("slot").and_then(Value::as_str),
+            payload.get("generation").and_then(Value::as_i64),
+        ) else {
+            continue;
+        };
+        latest.insert((slot.to_string(), generation), payload.clone());
+    }
+    latest
+}
+
 /// `release_state` for a row whose latest release event an audit
 /// already folded from the machine's chain (#1284).
 pub(crate) fn release_state_with_latest(
@@ -110,6 +208,7 @@ pub(crate) fn release_state_with_latest(
     record: &Value,
     events: &[Value],
     latest: Option<&Value>,
+    precomputed_publication: Option<Option<(i64, Value, bool)>>,
 ) -> Result<(Option<Value>, Option<String>)> {
     if record.get("slot_type").and_then(Value::as_str) != Some("agent") {
         return Ok((None, None));
@@ -129,7 +228,14 @@ pub(crate) fn release_state_with_latest(
         "sha256": handoff.get("sha256").cloned().unwrap_or(Value::Null),
         "intent_sequence": handoff.get("intent_sequence").cloned().unwrap_or(Value::Null),
     });
-    let void = release_void_reason(cfg, record, events, &payload, &handoff)?;
+    let void = release_void_reason(
+        cfg,
+        record,
+        events,
+        &payload,
+        &handoff,
+        precomputed_publication,
+    )?;
     Ok((Some(release), void))
 }
 
@@ -139,6 +245,7 @@ fn release_void_reason(
     events: &[Value],
     payload: &Value,
     handoff: &Value,
+    precomputed_publication: Option<Option<(i64, Value, bool)>>,
 ) -> Result<Option<String>> {
     let record_agent = record
         .get("agent")
@@ -180,7 +287,10 @@ fn release_void_reason(
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let intent_sequence = handoff.get("intent_sequence").and_then(Value::as_i64);
-    let published = publication(events, slot, generation);
+    let published = match precomputed_publication {
+        Some(publication) => publication,
+        None => publication(events, slot, generation),
+    };
     let publication_ok = match &published {
         Some((sequence, _artifact, completed)) => Some(*sequence) == intent_sequence && *completed,
         None => false,
@@ -277,6 +387,7 @@ fn handoff_read_reason(
     record: &Value,
     events: &[Value],
     slot_path: &Path,
+    precomputed_read: Option<Option<Value>>,
 ) -> Option<String> {
     let slot = record
         .get("slot")
@@ -295,7 +406,10 @@ fn handoff_read_reason(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let sidecar = load_sidecar_artifact(cfg, machine, slot, slot_type, generation);
-    let latest = latest_handoff_read(events, record);
+    let latest = match precomputed_read {
+        Some(read) => read,
+        None => latest_handoff_read(events, record),
+    };
     match sidecar {
         Err(error) => Some(error),
         Ok(None) => {
@@ -6068,6 +6182,8 @@ fn audit_record(
     census_targets: &[PathBuf],
     audit_hold: &Value,
     release_latest: Option<&Value>,
+    precomputed_publication: Option<Option<(i64, Value, bool)>>,
+    precomputed_read: Option<Option<Value>>,
 ) -> Result<(Value, bool)> {
     let slot = record
         .get("slot")
@@ -6099,7 +6215,13 @@ fn audit_record(
     let (heartbeat_age, heartbeat_expired) = heartbeat_diagnosis(record)?;
     let mut agent_running = !(liveness.state == "dead" && owner_state == "dead");
     let hold = audit_hold.clone();
-    let (release, void_reason) = release_state_with_latest(cfg, record, events, release_latest)?;
+    let (release, void_reason) = release_state_with_latest(
+        cfg,
+        record,
+        events,
+        release_latest,
+        precomputed_publication,
+    )?;
     let release_honoured = release.is_some()
         && void_reason.is_none()
         && matches!(owner_state.as_str(), "live" | "dead")
@@ -6196,7 +6318,13 @@ fn audit_record(
         if let Err(error) = crate::finish_write::assert_slot_contents(cfg, record) {
             reasons.push(error);
         } else {
-            if let Some(reason) = handoff_read_reason(cfg, record, events, &slot_path) {
+            if let Some(reason) = handoff_read_reason(
+                cfg,
+                record,
+                events,
+                &slot_path,
+                precomputed_read.clone(),
+            ) {
                 reasons.push(reason);
             }
             let checkouts = record
@@ -6770,7 +6898,7 @@ pub(crate) fn parse_audit(
         }
         let directory = cfg.control.join(format!("EVENTS.{machine}"));
         let events = if directory.is_dir() {
-            load_event_chain(&directory, machine)?
+            load_event_chain_filtered(&directory, machine, AUDIT_RETAINED_EVENT_KINDS)?
         } else {
             Vec::new()
         };
@@ -7198,6 +7326,21 @@ pub(crate) fn parse_audit(
             }
         }
     }
+    // Handoff publications and reads likewise: one pass per machine
+    // for every generation, not one log rescan per row (#1794).
+    let mut audit_publications: BTreeMap<
+        (String, String, i64),
+        (i64, Value, bool),
+    > = BTreeMap::new();
+    let mut audit_reads: BTreeMap<(String, String, i64), Value> = BTreeMap::new();
+    for (machine, machine_events) in &events_by_machine {
+        for ((slot, generation), publication) in handoff_publications(machine_events) {
+            audit_publications.insert((machine.clone(), slot, generation), publication);
+        }
+        for ((slot, generation), read) in latest_handoff_reads(machine_events) {
+            audit_reads.insert((machine.clone(), slot, generation), read);
+        }
+    }
     let judge = |index: usize| -> Result<(Value, bool)> {
         let record = &records[index];
         let machine = record
@@ -7238,6 +7381,16 @@ pub(crate) fn parse_audit(
             &census_targets,
             &hold,
             release_latest,
+            Some(
+                audit_publications
+                    .get(&(machine.to_string(), slot.to_string(), generation))
+                    .cloned(),
+            ),
+            Some(
+                audit_reads
+                    .get(&(machine.to_string(), slot.to_string(), generation))
+                    .cloned(),
+            ),
         )
     };
     let judged = judge_in_pool(records.len(), jobs, judge);

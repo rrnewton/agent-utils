@@ -9010,6 +9010,8 @@ def _resolve_handoff_artifact(
     slot_path: Path,
     *,
     events: Sequence[Mapping[str, object]] | None = None,
+    publication: tuple[int, Mapping[str, object], bool] | None = None,
+    publication_computed: bool = False,
 ) -> _HandoffArtifact | None:
     selected_events = (
         _load_events(config, record.machine) if events is None else events
@@ -9021,7 +9023,8 @@ def _resolve_handoff_artifact(
             "provenance and is permanently manual-only; preserve it for inspection "
             "rather than replacing or using it as removal authority"
         )
-    publication = _handoff_write_publication(record, selected_events)
+    if not publication_computed:
+        publication = _handoff_write_publication(record, selected_events)
     if sidecar is None and publication is not None:
         state = "completed" if publication[2] else "outstanding"
         remedy = (
@@ -9041,7 +9044,12 @@ def _resolve_handoff_artifact(
                 "a legacy projection cannot supersede it"
             )
         _assert_handoff_sidecar_publication(
-            config, record, sidecar, events=selected_events
+            config,
+            record,
+            sidecar,
+            events=selected_events,
+            publication=publication,
+            publication_computed=True,
         )
     legacy = _legacy_handoff_artifact(config, record, slot_path)
     if sidecar is not None and legacy is not None:
@@ -11865,6 +11873,114 @@ def _handoff_write_publication(
     return sequence, intents[sequence], sequence in completed
 
 
+def _handoff_write_publications(
+    records: Sequence[ActiveRecord],
+    events: Iterable[Mapping[str, object]],
+) -> dict[tuple[str, int], tuple[int, Mapping[str, object], bool] | None]:
+    """Every record's publication from one pass over the log (#1794).
+
+    ``_handoff_write_publication`` per record rescans the whole log per
+    row; an audit judging dozens of rows pays that per row. This keeps
+    the same per-record state (intents, completions, the running owner
+    each intent must match) for every wanted generation at once and
+    raises the same refusals in the same order.
+    """
+
+    wanted: dict[tuple[str, int], ActiveRecord] = {
+        (record.slot, record.generation): record for record in records
+    }
+    intents: dict[tuple[str, int], dict[int, Mapping[str, object]]] = {
+        key: {} for key in wanted
+    }
+    completed: dict[tuple[str, int], set[int]] = {key: set() for key in wanted}
+    owners: dict[tuple[str, int], ProcessIdentity | None] = {
+        key: None for key in wanted
+    }
+    for event in events:
+        kind = event.get("kind")
+        payload = _as_mapping(event["payload"], f"{kind} event payload")
+        if kind in ("state-imported", "active-state-recorded"):
+            for key, record in wanted.items():
+                owners[key] = _handoff_owner_step(owners[key], record, kind, payload)
+        if kind == "handoff-write-intended":
+            slot_value = payload.get("slot")
+            if not isinstance(slot_value, str):
+                continue
+            key = cast(
+                "tuple[str, int]", (slot_value, payload.get("generation"))
+            )
+            try:
+                matched = key in wanted
+            except TypeError:
+                continue
+            if not matched:
+                continue
+            record = wanted[key]
+            artifact = _as_mapping(payload.get("artifact"), "handoff write intent artifact")
+            if (
+                artifact.get("schema") != HANDOFF_SIDECAR_SCHEMA
+                or artifact.get("machine") != record.machine
+                or artifact.get("slot") != record.slot
+                or artifact.get("generation") != record.generation
+                or artifact.get("source") != "write-handoff"
+            ):
+                raise StateError("handoff write intent has an invalid artifact identity")
+            writer = _identity_from_obj(
+                payload.get("writer"), "handoff write intent writer"
+            )
+            if writer is None:
+                raise StateError("handoff write intent lacks an owner identity")
+            intent_sequence = _as_int(
+                event["sequence"], "handoff write intent sequence", minimum=1
+            )
+            if owners[key] is None or writer != owners[key]:
+                raise StateError(
+                    "handoff write intent writer does not match the recorded slot owner"
+                )
+            intents[key][intent_sequence] = artifact
+        elif kind == "handoff-write-completed":
+            slot_value = payload.get("slot")
+            if not isinstance(slot_value, str):
+                continue
+            key = cast(
+                "tuple[str, int]", (slot_value, payload.get("generation"))
+            )
+            try:
+                matched = key in wanted
+            except TypeError:
+                continue
+            if not matched:
+                continue
+            sequence = _as_int(
+                payload.get("intent_sequence"),
+                "handoff write completion intent_sequence",
+                minimum=1,
+            )
+            intended_artifact = intents[key].get(sequence)
+            if intended_artifact is None:
+                raise StateError("handoff write completion references an unknown intent")
+            digest = _as_str(
+                payload.get("artifact_sha256"),
+                "handoff write completion artifact_sha256",
+            )
+            if digest != _event_digest(intended_artifact):
+                raise StateError("handoff write completion digest does not match its intent")
+            completed[key].add(sequence)
+    results: dict[tuple[str, int], tuple[int, Mapping[str, object], bool] | None] = {}
+    for key in wanted:
+        record_intents = intents[key]
+        if not record_intents:
+            results[key] = None
+            continue
+        sequence = max(record_intents)
+        results[key] = (
+            sequence,
+            record_intents[sequence],
+            sequence in completed[key],
+        )
+    return results
+
+
 def _legacy_projection_read(
     record: ActiveRecord,
     events: Sequence[Mapping[str, object]],
@@ -11902,6 +12018,8 @@ def _assert_handoff_sidecar_publication(
     *,
     allow_outstanding_write: bool = False,
     events: Sequence[Mapping[str, object]] | None = None,
+    publication: tuple[int, Mapping[str, object], bool] | None = None,
+    publication_computed: bool = False,
 ) -> tuple[str, int | None, Mapping[str, object] | None]:
     if not artifact.provenance_complete:
         raise Refusal("handoff sidecar lacks complete source provenance")
@@ -11909,8 +12027,9 @@ def _assert_handoff_sidecar_publication(
         _load_events(config, record.machine) if events is None else events
     )
     artifact_obj = _handoff_artifact_to_obj(artifact)
-    if artifact.source == "write-handoff":
+    if not publication_computed:
         publication = _handoff_write_publication(record, selected_events)
+    if artifact.source == "write-handoff":
         if publication is None or not _json_equal(publication[1], artifact_obj):
             raise Refusal(
                 f"slot {record.slot} handoff sidecar has no matching owner-authenticated "
@@ -11922,7 +12041,6 @@ def _assert_handoff_sidecar_publication(
                 "sidecar and have its exact owner retry write-handoff"
             )
         return "write-handoff", publication[0], None
-    publication = _handoff_write_publication(record, selected_events)
     if publication is not None:
         state = "completed" if publication[2] else "outstanding"
         raise Refusal(
@@ -20291,6 +20409,38 @@ class _GitVcs:
             raise Refusal(f"Git reported an unsafe common directory: {common}")
         return common
 
+    def absolute_git_directory(self, path: Path) -> Path:
+        return Path(self._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
+
+    def durable_ref_tips(self, repository: Path) -> frozenset[str]:
+        """Every ref tip of ``repository``, in one Git process (#1794)."""
+
+        return frozenset(
+            line.strip()
+            for line in self._run(
+                repository, ["for-each-ref", "--format=%(objectname)"]
+            ).stdout.splitlines()
+            if line.strip()
+        )
+
+    def commit_object_ids(self, path: Path) -> tuple[str, ...]:
+        """Every commit object in ``path``'s store, in one Git process (#1794)."""
+
+        return tuple(
+            line.strip()
+            for line in self._run(
+                path,
+                [
+                    "cat-file",
+                    "--batch-all-objects",
+                    "--unordered",
+                    "--batch-check=%(objectname)",
+                    "--filter=object:type=commit",
+                ],
+            ).stdout.splitlines()
+            if line.strip()
+        )
+
     def linked_worktree_git_directory(self, checkout: Path) -> tuple[Path, Path]:
         """Return the exact common and per-worktree Git directories."""
 
@@ -24734,6 +24884,14 @@ class _AuditGitVcs(_GitVcs):
         ] = {}
         self._submodule_paths: dict[Path, tuple[str, ...]] = {}
         self._indexed_gitlinks: dict[Path, tuple[str, ...]] = {}
+        self._heads: dict[Path, str] = {}
+        self._branches: dict[Path, str] = {}
+        self._absolute_git_directories: dict[Path, Path] = {}
+        self._remote_authorities: dict[
+            tuple[Path, str], _RemoteAuthority
+        ] = {}
+        self._durable_ref_tips: dict[Path, frozenset[str]] = {}
+        self._commit_object_ids: dict[Path, tuple[str, ...]] = {}
 
     def common_directory(self, repository: Path) -> Path:
         key = repository.absolute()
@@ -24800,6 +24958,58 @@ class _AuditGitVcs(_GitVcs):
                 repository
             )
         return self._indexed_gitlinks[key]
+
+    # Per-repository facts an audit sweep asks once per repository, not
+    # once per row or submodule that uses it (#1794): rows are judged
+    # from one registry snapshot, so a HEAD, branch, remote authority,
+    # ref listing or object enumeration read for one row is the answer
+    # for every row sharing that repository.
+
+    def head(self, checkout: Path) -> str:
+        key = checkout.absolute()
+        if key not in self._heads:
+            self._heads[key] = super().head(checkout)
+        return self._heads[key]
+
+    def branch(self, checkout: Path) -> str:
+        key = checkout.absolute()
+        if key not in self._branches:
+            self._branches[key] = super().branch(checkout)
+        return self._branches[key]
+
+    def absolute_git_directory(self, path: Path) -> Path:
+        key = path.absolute()
+        if key not in self._absolute_git_directories:
+            self._absolute_git_directories[key] = super().absolute_git_directory(path)
+        return self._absolute_git_directories[key]
+
+    def remote_authority(
+        self,
+        checkout: Path,
+        remote: str,
+        *,
+        env_overrides: Mapping[str, str] | None = None,
+    ) -> _RemoteAuthority:
+        if env_overrides is not None:
+            return super().remote_authority(
+                checkout, remote, env_overrides=env_overrides
+            )
+        key = (checkout.absolute(), remote)
+        if key not in self._remote_authorities:
+            self._remote_authorities[key] = super().remote_authority(checkout, remote)
+        return self._remote_authorities[key]
+
+    def durable_ref_tips(self, repository: Path) -> frozenset[str]:
+        common = self.common_directory(repository)
+        if common not in self._durable_ref_tips:
+            self._durable_ref_tips[common] = super().durable_ref_tips(repository)
+        return self._durable_ref_tips[common]
+
+    def commit_object_ids(self, path: Path) -> tuple[str, ...]:
+        common = self.common_directory(path)
+        if common not in self._commit_object_ids:
+            self._commit_object_ids[common] = super().commit_object_ids(path)
+        return self._commit_object_ids[common]
 
 
 def _resolved_repository_path(
@@ -39140,6 +39350,8 @@ def _assert_handoff_read(
     slot_path: Path,
     *,
     events: Sequence[Mapping[str, object]] | None = None,
+    publication: tuple[int, Mapping[str, object], bool] | None = None,
+    publication_computed: bool = False,
 ) -> _HandoffRead | None:
     if record.slot_type != "agent":
         return None
@@ -39148,7 +39360,12 @@ def _assert_handoff_read(
     )
     latest = _latest_handoff_read(record, selected_events)
     artifact = _resolve_handoff_artifact(
-        config, record, slot_path, events=selected_events
+        config,
+        record,
+        slot_path,
+        events=selected_events,
+        publication=publication,
+        publication_computed=publication_computed,
     )
     if artifact is None:
         if latest is not None and _slot_legacy_handoff_is_committed_project_file(slot_path):
@@ -40306,6 +40523,9 @@ def _owner_release_void_reason(
     record: ActiveRecord,
     release: _OwnerRelease,
     events: Sequence[Mapping[str, object]],
+    *,
+    publication: tuple[int, Mapping[str, object], bool] | None = None,
+    publication_computed: bool = False,
 ) -> str | None:
     """Why a recorded release no longer describes this slot, or ``None`` if it does.
 
@@ -40324,7 +40544,8 @@ def _owner_release_void_reason(
             f"the heartbeat was renewed after the release (released at heartbeat "
             f"{release.heartbeat_at}, now {record.heartbeat_at})"
         )
-    publication = _handoff_write_publication(record, events)
+    if not publication_computed:
+        publication = _handoff_write_publication(record, events)
     if publication is None or publication[0] != release.intent_sequence or not publication[2]:
         return "the handoff publication changed after the release"
     try:
@@ -40348,6 +40569,9 @@ def _owner_release_state(
     record: ActiveRecord,
     events: Sequence[Mapping[str, object]],
     releases: Mapping[tuple[str, int], _OwnerRelease] | None = None,
+    *,
+    publication: tuple[int, Mapping[str, object], bool] | None = None,
+    publication_computed: bool = False,
 ) -> tuple[_OwnerRelease | None, str | None]:
     """This generation's latest release and, if it no longer applies, why not."""
 
@@ -40361,7 +40585,14 @@ def _owner_release_state(
     release = selected.get((record.slot, record.generation))
     if release is None:
         return None, None
-    return release, _owner_release_void_reason(config, record, release, events)
+    return release, _owner_release_void_reason(
+        config,
+        record,
+        release,
+        events,
+        publication=publication,
+        publication_computed=publication_computed,
+    )
 
 
 def _owner_release_in_effect(
@@ -56007,6 +56238,92 @@ def _absent_slot_recovery_reason(
     )
 
 
+def _audit_private_history_absent(
+    vcs: _GitVcs, path: Path, kept: str, durable: Sequence[Path]
+) -> bool:
+    """Whether no kept private tip can exist, without the full scan (#1794).
+
+    Decisive, not heuristic: the roots tested are a superset of the full
+    scan's roots (every ref tip, every reflog endpoint, every pseudoref,
+    HEAD, and -- for a non-shared store -- every commit object), and the
+    durable repositories' ref tips are the scan's negatives. A remote
+    answer and the scan's classification can only shrink that tip set,
+    never grow it, so an empty tip set here is exactly the full scan's
+    "nothing kept". Any doubt (a tip survives, a reflog endpoint is not
+    a full object name) returns False and the full scan decides, with
+    its own refusals, exactly as before.
+    """
+
+    _assert_files_ref_storage(vcs, path)
+    common = vcs.common_directory(path)
+    git_directory = vcs.absolute_git_directory(path)
+    negatives: set[str] = {kept}
+    alternates: list[str] = []
+    for repository in durable:
+        negatives |= vcs.durable_ref_tips(repository)
+        objects = vcs.common_directory(repository) / "objects"
+        if ":" in str(objects):
+            raise Refusal(
+                f"repository object directory path contains ':': {objects}"
+            )
+        alternates.append(str(objects))
+    environment = (
+        {"GIT_ALTERNATE_OBJECT_DIRECTORIES": ":".join(alternates)}
+        if alternates
+        else None
+    )
+    if _is_shared_submodule_gitdir(git_directory, common):
+        positives = _reflog_endpoints(
+            _reflog_files_under(git_directory / "logs")
+        )
+        positives |= _private_pseudoref_commits(vcs, path)
+        head = vcs._run(path, ["rev-parse", "--verify", "HEAD"], check=False)
+        if head.returncode == 0 and head.stdout.strip():
+            positives.add(head.stdout.strip())
+        for line in vcs._run(
+            path,
+            ["for-each-ref", "--format=%(objectname) %(refname)", "refs/worktree/"],
+        ).stdout.splitlines():
+            sha, _sp, _refname = line.partition(" ")
+            if sha:
+                positives.add(sha)
+        return not _commit_tips(
+            vcs, path, positives, negatives, env_overrides=environment
+        )
+    reflog_by_ref = _reflog_entries_by_ref((common, git_directory))
+    endpoints: set[str] = set()
+    for entries in reflog_by_ref.values():
+        for entry in entries:
+            endpoints.update(
+                value
+                for value in (entry.old, entry.new)
+                if set(value) != {"0"}
+            )
+    if any(not SHA_RE.fullmatch(value) for value in endpoints):
+        return False
+    positives = set(endpoints)
+    positives |= _private_pseudoref_commits(vcs, path)
+    for line in vcs._run(
+        path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
+    ).stdout.splitlines():
+        fields = line.split(" ", 2)
+        if len(fields) == 3 and fields[0]:
+            positives.add(fields[0])
+    positives.add(kept)
+    if _commit_tips(vcs, path, positives, negatives, env_overrides=environment):
+        return False
+    every_commit = vcs.commit_object_ids(path)
+    if not every_commit:
+        return True
+    return not _commit_tips(
+        vcs,
+        path,
+        set(every_commit) | positives,
+        negatives,
+        env_overrides=environment,
+    )
+
+
 def _audit_submodule_private_history(
     config: Config,
     record: ActiveRecord,
@@ -56023,6 +56340,12 @@ def _audit_submodule_private_history(
     """
 
     authority = vcs.remote_authority(path, submodule.remote)
+    durable = _durable_submodule_repositories(
+        vcs, config, record, submodule, path, authority
+    )
+    kept = vcs.head(path)
+    if _audit_private_history_absent(vcs, path, kept, durable):
+        return None
 
     def cover(tips: tuple[str, ...]) -> _RemoteCoverage:
         try:
@@ -56036,8 +56359,8 @@ def _audit_submodule_private_history(
     return _submodule_private_history(
         vcs,
         path,
-        vcs.head(path),
-        _durable_submodule_repositories(vcs, config, record, submodule, path, authority),
+        kept,
+        durable,
         remote_cover=cover,
     )
 
@@ -56054,6 +56377,8 @@ def _audit_record(
     cache_measurement: _AuditCacheMeasurement | None = None,
     holds: Mapping[tuple[str, str], dict[str, object] | None] | None = None,
     owner_releases: Mapping[tuple[str, int], _OwnerRelease] | None = None,
+    publication: tuple[int, Mapping[str, object], bool] | None = None,
+    publication_computed: bool = False,
 ) -> tuple[dict[str, object], bool]:
     selected_vcs = vcs or _GitVcs()
     owner_state, owner_detail = _process_state(record.owner)
@@ -56075,7 +56400,12 @@ def _audit_record(
         else _load_hold(config, record.slot, record.machine, events=events)
     )
     release, release_void = _owner_release_state(
-        config, record, events, releases=owner_releases
+        config,
+        record,
+        events,
+        releases=owner_releases,
+        publication=publication,
+        publication_computed=publication_computed,
     )
     # Remove honours a release exactly when this is true; audit must agree
     # with it so that DELETABLE never names a slot remove would refuse and a
@@ -56179,7 +56509,14 @@ def _audit_record(
         except _SlotDirectoryAbsent:
             slot_absent = True
         # Recovery refuses an unread handoff exactly as removal does.
-        _assert_handoff_read(config, record, slot_path, events=events)
+        _assert_handoff_read(
+            config,
+            record,
+            slot_path,
+            events=events,
+            publication=publication,
+            publication_computed=publication_computed,
+        )
         for checkout in () if slot_absent else record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
             repository = _stored_repository_path(config, checkout.repository)[1]
@@ -56777,6 +57114,24 @@ def _cmd_share_submodules(args: argparse.Namespace) -> int:
     return run()
 
 
+#: Event kinds an audit row can still consult after the registry fold
+#: (#1794): holds, owner releases, handoff reads and write publications.
+#: Every other kind's payload is dropped after one streaming pass, so
+#: audit memory follows the retained kinds, not the whole log.
+_AUDIT_EVENT_KINDS = frozenset(
+    {
+        "state-imported",
+        "active-state-recorded",
+        "slot-held",
+        "slot-hold-released",
+        "handoff-read",
+        "handoff-write-intended",
+        "handoff-write-completed",
+        OWNER_RELEASE_EVENT,
+    }
+)
+
+
 def _cmd_audit(args: argparse.Namespace) -> int:
     restore_memory_limit = _apply_scan_memory_limit(args)
     _bound_event_retention()
@@ -56884,9 +57239,22 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
         )
         snapshot_revision = _audit_registry_revision(all_states)
         records = [record for state in states for record in state.slots]
-        event_logs = {
-            state.machine: _load_events(config, state.machine) for state in states
-        }
+        # Stream each log once, retaining only the kinds an audit row
+        # can still consult (#1794): the registry state itself was
+        # already derived by _validate_global_state above, so the full
+        # parsed history (tens of thousands of events, a few of them
+        # tens of megabytes) is never held for the rest of the audit.
+        event_logs: dict[str, tuple[dict[str, object], ...]] = {}
+        event_counts: dict[str, int] = {}
+        for state in states:
+            retained: list[dict[str, object]] = []
+            total = 0
+            for event in _iter_events(config, state.machine):
+                total += 1
+                if event.get("kind") in _AUDIT_EVENT_KINDS:
+                    retained.append(event)
+            event_logs[state.machine] = tuple(retained)
+            event_counts[state.machine] = total
         seal_targets, seal_errors = _audit_validate_batch_seal_evidence(config)
         if not all_machines:
             seal_targets = tuple(
@@ -56945,7 +57313,7 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
             registry_started,
             {
                 "active_rows": len(records),
-                "event_records": sum(len(events) for events in event_logs.values()),
+                "event_records": sum(event_counts.values()),
                 "machine_shards": len(states),
                 "recovery_journals": len(journal_slots),
                 "validation_seals": len(seal_targets),
@@ -56965,7 +57333,7 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
             machine_events,
             {(record.slot, record.generation) for record in machine_records},
         )
-        if machine_events:
+        if event_counts[machine]:
             machine_holds = _holds_from_events(
                 machine_events,
                 machine,
@@ -56980,6 +57348,23 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
                 audit_holds[(machine, record.slot)] = _load_hold_snapshot(
                     config, record.slot, machine
                 )
+    # Handoff write publications likewise: one pass per machine for
+    # every agent generation, not one log rescan per row (#1794).
+    audit_publications: dict[
+        tuple[str, str, int], tuple[int, Mapping[str, object], bool] | None
+    ] = {}
+    for machine, machine_events in event_logs.items():
+        agent_records = [
+            record
+            for record in records
+            if record.machine == machine and record.slot_type == "agent"
+        ]
+        if not agent_records:
+            continue
+        for (slot, generation), publication in _handoff_write_publications(
+            agent_records, machine_events
+        ).items():
+            audit_publications[(machine, slot, generation)] = publication
     _check_scan_deadline(scan_deadline)
     liveness_started = metrics.start()
     # Validation rows are answered by their runs, agent rows by the
@@ -57027,6 +57412,10 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
             record,
             event_logs[record.machine],
             releases=audit_releases[record.machine],
+            publication=audit_publications.get(
+                (record.machine, record.slot, record.generation)
+            ),
+            publication_computed=True,
         )
         release_honoured = (
             release is not None
@@ -57214,6 +57603,10 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
             ],
             holds=audit_holds,
             owner_releases=audit_releases[record.machine],
+            publication=audit_publications.get(
+                (record.machine, record.slot, record.generation)
+            ),
+            publication_computed=True,
         )
 
     # Rows are judged independently from the same snapshot, census and cache measurements, so
