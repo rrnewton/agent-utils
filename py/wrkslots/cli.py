@@ -56823,6 +56823,11 @@ def _seal_cleanup_path_private(
                 )
             original_mode = stat.S_IMODE(metadata.st_mode)
             identity = _fd_private_cleanup_identity(descriptor, str(fenced_slot))
+            if identity[0] == 0:
+                raise Refusal(
+                    f"cleanup fence is a deleted subvolume under a stale bind "
+                    f"(device 0) and is absent storage, not a seal target: {fenced_slot}"
+                )
             if before_seal is not None:
                 before_seal(original_mode, identity)
             os.fchmod(descriptor, 0o700)
@@ -61332,6 +61337,51 @@ def _prefetch_remote_containment(
             continue
 
 
+def _reconcile_deleted_bind_validate_row(
+    config: Config, args: argparse.Namespace
+) -> bool:
+    """Reconcile one deleted-subvolume validate row as absent storage.
+
+    Returns False when the named row is not a deleted-subvolume bind,
+    leaving the ordinary validation removal to judge it. Otherwise the
+    row is planned and recovered exactly as recover-absent-validate-rows
+    does, which unmounts the stale binds wrkslots owns first (#1771).
+    """
+
+    try:
+        state = _load_active_snapshot(config, require_repository=False)
+    except (Refusal, StateError):
+        return False
+    record = next((item for item in state.slots if item.slot == args.slot), None)
+    if (
+        record is None
+        or record.slot_type != "validate"
+        or record.generation != args.expected_generation
+        or not _deleted_bind_mount_points(config, record)
+    ):
+        return False
+    coordinator = _capture_remove_processes(args.coordinator_pid)[0]
+    item = AbsentValidateRow(
+        record.machine, record.slot, record.generation, _record_sha256(record)
+    )
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        planned = _plan_absent_validate_rows(config, (item,))
+        if planned:
+            journal = _absent_validate_batch_journal(
+                config, item.record_sha256, planned, coordinator
+            )
+            _write_journal(config, journal)
+            _recover_absent_validate_rows(
+                config,
+                _journal_path(config),
+                journal,
+                coordinator,
+                safety_prechecked=True,
+            )
+    return True
+
+
 def _cmd_remove_in_scope(
     args: argparse.Namespace,
     *,
@@ -61489,6 +61539,18 @@ def _cmd_remove_in_scope(
             "--validation-proof-manifest and --completed-record must be supplied "
             "together for registered validation removal"
         )
+    if (
+        private_cleanup is None
+        and proof_manifest is None
+        and bool(args.validate_complete)
+        and _reconcile_deleted_bind_validate_row(config, args)
+    ):
+        if emit:
+            print(
+                f"removed and archived slot={args.slot} "
+                f"generation={args.expected_generation}"
+            )
+        return 0
     if (
         private_cleanup is None
         and (proof_manifest is not None or bool(args.validate_complete))
@@ -62534,6 +62596,13 @@ def _seal_validate_batch_targets(
                             f"{prefix} a proven-dead recorded owner; owner is "
                             f"{owner_state}: {owner_detail}"
                         )
+                if _deleted_bind_mount_points(config, record):
+                    raise Refusal(
+                        f"validation row {slot} storage is a deleted subvolume "
+                        "under a stale bind and is absent storage; reconcile it "
+                        "with recover-absent-validate-rows, which unmounts the "
+                        "stale binds it owns"
+                    )
                 slot_path = _assert_slot_contents(config, record)
                 proof_manifest = proof_manifests.get(slot)
                 if proof_manifest is not None:
@@ -80394,6 +80463,82 @@ def _absent_validate_row_paths(config: Config, record: ActiveRecord) -> tuple[Pa
     return tuple(dict.fromkeys(path.absolute() for path in paths))
 
 
+def _stat_device(path: Path) -> int | None:
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
+def _deleted_bind_mount_points(
+    config: Config, record: ActiveRecord
+) -> tuple[Path, ...]:
+    """Stale bind mounts of one validate row's deleted subvolume (#1771).
+
+    A bind whose mountinfo root ends in ``//deleted`` shows a subvolume
+    that no longer exists; stat of its mount point reports device 0.
+    Returns every mount point showing that same deleted subvolume --
+    the row's own paths plus mirror views with the identical device
+    and root -- deepest first, and nothing else. A live bind (no
+    ``//deleted`` root and a nonzero device) returns empty.
+    """
+
+    paths = _absent_validate_row_paths(config, record)
+    try:
+        table = slotimage.mount_table()
+    except Exception:
+        table = []
+    keys: set[tuple[str, str]] = set()
+    direct: set[Path] = set()
+    for path in paths:
+        tops = [entry for entry in table if entry.mount_point == path]
+        for entry in tops:
+            if entry.root.endswith("//deleted"):
+                keys.add((entry.device, entry.root))
+        if _stat_device(path) == 0:
+            if tops:
+                keys.add((tops[-1].device, tops[-1].root))
+            else:
+                direct.add(path)
+    mounts = {
+        entry.mount_point
+        for entry in table
+        if (entry.device, entry.root) in keys
+    } | direct
+    return tuple(sorted(mounts, key=lambda point: len(point.parts), reverse=True))
+
+
+def _unmount_deleted_bind(path: Path) -> None:
+    try:
+        worktreesimage.unmount_bind(path)
+    except worktreesimage.WorktreesImageError as exc:
+        raise Refusal(f"cannot unmount stale deleted-subvolume bind at {path}: {exc}") from exc
+
+
+def _retire_deleted_subvolume_binds(
+    config: Config, records: Sequence[ActiveRecord]
+) -> None:
+    """Unmount stale deleted-subvolume binds, then drop empty mount points.
+
+    The existing absent-row census runs first, so a live process with
+    its cwd or open files under the bind refuses before anything is
+    unmounted. Only the row's own paths lose their (by then empty)
+    mount-point directories; mirror directories are left alone.
+    """
+
+    for record in records:
+        mounts = _deleted_bind_mount_points(config, record)
+        if not mounts:
+            continue
+        paths = _absent_validate_row_paths(config, record)
+        _assert_absent_validate_processes_unrelated(((record, paths),))
+        for mount in mounts:
+            _unmount_deleted_bind(mount)
+        for path in sorted(paths, key=lambda point: len(point.parts), reverse=True):
+            with contextlib.suppress(OSError):
+                path.rmdir()
+
+
 def _eden_backing_repository(raw: str) -> Path:
     """Validate an Eden backing repository path on its own terms (#1554).
 
@@ -80418,8 +80563,17 @@ def _assert_absent_validate_rows_storage(
     for record in records:
         _assert_record_paths(config, record)
         paths = _absent_validate_row_paths(config, record)
+        deleted_mounts = _deleted_bind_mount_points(config, record)
         for path in paths:
             if path.exists() or path.is_symlink():
+                # A deleted subvolume under a stale bind is absent
+                # storage (#1771): the bind is unmounted on apply by
+                # _retire_deleted_subvolume_binds, never storage.
+                if any(
+                    path == mount or mount in path.parents or path in mount.parents
+                    for mount in deleted_mounts
+                ):
+                    continue
                 raise Refusal(
                     f"validation row {record.slot} still has physical storage at {path}"
                 )
@@ -88111,6 +88265,7 @@ def _recover_absent_validate_rows(
     )
     if any(not present for present in presence[first_present:]):
         raise StateError("absent-validation-row ACTIVE removals do not form a durable prefix")
+    _retire_deleted_subvolume_binds(config, current_records)
     if not safety_prechecked and archived_prefix < len(items):
         _assert_absent_validate_rows_safe(config, current_records)
     before_states, before_archives = states, archives

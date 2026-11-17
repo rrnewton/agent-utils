@@ -195,6 +195,35 @@ fn recovery_matches(
     })
 }
 
+/// Whether `path` is covered by a deleted-subvolume bind (#1771):
+/// its device is 0, or a mountinfo root ending in `//deleted` mounts
+/// at or above it (or it is the slot directory holding such a mount).
+/// Such a bind is absent storage, never physical storage; the census
+/// and unmount stay with the Python edition, as for every active row.
+fn deleted_bind_covers(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.dev() == 0 {
+            return true;
+        }
+    }
+    let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 || !fields[3].ends_with("//deleted") {
+            continue;
+        }
+        let decoded = fields[4].replace("\\040", " ");
+        let mount_point = Path::new(&decoded);
+        if path == mount_point || path.starts_with(mount_point) || mount_point.starts_with(path) {
+            return true;
+        }
+    }
+    false
+}
+
 fn refusal_payload(
     root: Option<&Path>,
     machine_override: Option<&str>,
@@ -422,7 +451,7 @@ pub(crate) fn recover_absent_validate_rows(
             }
             paths.dedup();
             for path in &paths {
-                if path.exists() || path.is_symlink() {
+                if (path.exists() || path.is_symlink()) && !deleted_bind_covers(path) {
                     return Err(format!(
                         "validation row {} still has physical storage at {}",
                         row.slot,

@@ -50142,6 +50142,187 @@ def test_recover_absent_validate_rows_handles_terminal_and_recordless_rows(
     ]
 
 
+def _make_deleted_bind_validate_row(
+    project: Path, repository: Path, slot: str = "deadbind"
+) -> tuple[wrkslots.ActiveRecord, Path, Path]:
+    """A validate row whose subvolume is gone under a live bind (#1771).
+
+    The checkout is unregistered and emptied, then recreated as the
+    empty mount-point directory stat shows for a deleted subvolume
+    (dev 0, ino 256); the fake mount table supplies the //deleted
+    source the kernel reports for it.
+    """
+    made = create(project, slot=slot, agent="validate-a", branch=None, slot_type="validate")
+    assert made.returncode == 0, made.stderr
+    record = mark_recorded_owner_dead(project, slot)
+    config = wrkslots._load_config(str(project), "testhost")
+    checkout_path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    git(repository, "worktree", "remove", "--force", "--", str(checkout_path))
+    checkout_path.mkdir(parents=True, exist_ok=True)
+    slot_path = wrkslots._slot_directory(config, slot, "validate")
+    return record, slot_path, checkout_path
+
+
+def _fake_deleted_bind_table(
+    monkeypatch: pytest.MonkeyPatch,
+    checkout_path: Path,
+    mirror: Path,
+    foreign: Path,
+) -> list[Path]:
+    """Fake mountinfo: a //deleted bind, its mirror, and a foreign bind."""
+    root = "/deadbind//deleted"
+    table = [
+        slotimage.MountEntry(
+            mount_point=checkout_path, fstype="btrfs", source="/dev/loop1",
+            device="0:41", root=root,
+        ),
+        slotimage.MountEntry(
+            mount_point=mirror, fstype="btrfs", source="/dev/loop1",
+            device="0:41", root=root,
+        ),
+        slotimage.MountEntry(
+            mount_point=foreign, fstype="btrfs", source="/dev/loop1",
+            device="0:41", root="/other//deleted",
+        ),
+    ]
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: table)
+    unmounted: list[Path] = []
+    monkeypatch.setattr(
+        wrkslots, "_unmount_deleted_bind", lambda path: unmounted.append(path)
+    )
+    return unmounted
+
+
+def test_recover_absent_validate_rows_retires_a_deleted_subvolume_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record, slot_path, checkout_path = _make_deleted_bind_validate_row(
+        project, repository
+    )
+    mirror = tmp_path / "mirror" / "deadbind"
+    foreign = tmp_path / "mirror" / "other"
+    unmounted = _fake_deleted_bind_table(monkeypatch, checkout_path, mirror, foreign)
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    assert run_absent_validate_recovery(project, input_path, apply=False, output_format="json") == 0
+    planned = json.loads(capsys.readouterr().out)
+    assert [row["outcome"] for row in planned["rows"]] == ["planned"]
+    assert unmounted == []
+
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    recovered = json.loads(capsys.readouterr().out)
+    assert [row["outcome"] for row in recovered["rows"]] == ["recovered"]
+    assert set(unmounted) == {checkout_path, mirror}
+    assert foreign not in unmounted
+    config = wrkslots._load_config(str(project), "testhost")
+    assert list(wrkslots._load_active(config).slots) == []
+    assert [str(row["slot"]) for row in wrkslots._load_archive(config).records] == ["deadbind"]
+    assert not slot_path.exists()
+
+
+def test_deleted_subvolume_bind_refuses_while_a_process_uses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record, _slot_path, checkout_path = _make_deleted_bind_validate_row(
+        project, repository
+    )
+    mirror = tmp_path / "mirror" / "deadbind"
+    foreign = tmp_path / "mirror" / "other"
+    unmounted = _fake_deleted_bind_table(monkeypatch, checkout_path, mirror, foreign)
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    def live_census(_rows: object) -> object:
+        raise wrkslots.Refusal("live process 4242 may still use validation row deadbind")
+
+    monkeypatch.setattr(wrkslots, "_assert_absent_validate_processes_unrelated", live_census)
+    assert run_absent_validate_recovery(project, input_path, apply=True) != 0
+    assert unmounted == []
+    config = wrkslots._load_config(str(project), "testhost")
+    assert [row.slot for row in wrkslots._load_active(config).slots] == ["deadbind"]
+
+
+def test_remove_validate_complete_reconciles_a_deleted_subvolume_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    record, slot_path, checkout_path = _make_deleted_bind_validate_row(
+        project, repository
+    )
+    mirror = tmp_path / "mirror" / "deadbind"
+    foreign = tmp_path / "mirror" / "other"
+    unmounted = _fake_deleted_bind_table(monkeypatch, checkout_path, mirror, foreign)
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+
+    removed = wrkslots.main(
+        [
+            "--project-root", str(project), "remove", "deadbind",
+            "--validate-complete", "--coordinator-authorized",
+            "--coordinator-pid", str(os.getpid()),
+            "--expected-generation", str(record.generation),
+        ]
+    )
+    assert removed == 0, capsys.readouterr().err
+    assert set(unmounted) == {checkout_path, mirror}
+    assert foreign not in unmounted
+    assert active_slots(project) == []
+    assert not slot_path.exists()
+    seal = control_directory(project) / "VALIDATE-BATCH-SEAL.testhost.journal"
+    assert not seal.exists()
+
+
+def test_deleted_bind_detection_accepts_a_zero_device_without_a_deleted_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """st_dev 0 alone also names a deleted subvolume (#1771)."""
+    project, repository, _remote = make_project(tmp_path)
+    record, _slot_path, checkout_path = _make_deleted_bind_validate_row(
+        project, repository
+    )
+    mirror = tmp_path / "mirror" / "deadbind"
+    table = [
+        slotimage.MountEntry(
+            mount_point=checkout_path, fstype="btrfs", source="/dev/loop1",
+            device="0:41", root="/deadbind",
+        ),
+        slotimage.MountEntry(
+            mount_point=mirror, fstype="btrfs", source="/dev/loop1",
+            device="0:41", root="/deadbind",
+        ),
+    ]
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: table)
+    monkeypatch.setattr(
+        wrkslots, "_stat_device", lambda path: 0 if path == checkout_path else 1
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    assert set(wrkslots._deleted_bind_mount_points(config, record)) == {
+        checkout_path,
+        mirror,
+    }
+
+
+def test_recover_absent_validate_rows_handles_a_missing_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Defect 6: a validate row whose checkout directory is already gone."""
+    project, repository, _remote = make_project(tmp_path)
+    record = prepare_absent_validate_row(
+        project, repository, slot="gone-dir", agent="validate-a"
+    )
+    config = wrkslots._load_config(str(project), "testhost")
+    checkout_path = wrkslots._stored_path(config, record.checkouts[0].path, "test checkout")
+    assert not checkout_path.exists()
+    input_path = write_absent_validate_input(project, [record])
+    allow_test_host_for_absent_validate_recovery(project, monkeypatch)
+    assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
+    recovered = json.loads(capsys.readouterr().out)
+    assert [row["outcome"] for row in recovered["rows"]] == ["recovered"]
+    assert list(wrkslots._load_active(config).slots) == []
+
+
 def test_recover_absent_validate_rows_replays_past_a_refusing_census(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
