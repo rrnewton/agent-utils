@@ -1,7 +1,10 @@
 # vibe-talk quickstart: from nothing to a talking agent
 
 Six steps, in order, with the exact commands. Nothing here asks you to read source or invent a
-value. `README.md` is the reference; this is the path through it.
+value. `README.md` is the reference; this is the path through it. If you first want the map —
+install, then the six ways a browser or phone can reach the server (localhost, LAN, SSH,
+Cloudflare Tunnel, Tailscale, or a work web proxy), then installing and pairing the phone app —
+read [`SETUP.md`](SETUP.md) and run `vibe-talk doctor` before the first start.
 
 **It assumes you have nothing.** No cloud account, no domain, no reverse proxy, no orchestrator —
 one machine that can run a process and reach `discord.com` outbound is the whole requirement.

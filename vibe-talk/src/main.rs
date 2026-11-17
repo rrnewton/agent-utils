@@ -37,6 +37,7 @@ vibe-talk — a chat bridge for a voice agent
 USAGE:
     vibe-talk [--config PATH] [--config-overlay PATH]... [--fake-discord] [--skip-startup-probe]
               [--startup-probe-wait SECONDS]
+    vibe-talk doctor [--config PATH] [--config-overlay PATH]...
     vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
     vibe-talk recap [--config PATH] [--hours N | --since WHEN] [--channel NAME] [--json]
     vibe-talk prompts [--hours N | --since WHEN] [--channel NAME] [--json]
@@ -50,6 +51,11 @@ USAGE:
 
 COMMANDS:
     (none)                run the server
+    doctor                check the configuration before the first start: durable storage, a
+                          public address for pairing, plain-HTTP exposure, writable channels,
+                          live updates and voice. Prints one line per check with its fix and
+                          exits 1 while any FAIL remains. Makes no network call. See
+                          `vibe-talk doctor --help`
     pair-link             print a one-time link, good for five minutes, that signs a phone in to
                           the server running on this host. Never prints the token. See
                           `vibe-talk pair-link --help`
@@ -376,6 +382,7 @@ fn log_in_colour(stream: &impl std::io::IsTerminal) -> bool {
 async fn main() -> anyhow::Result<()> {
     let mut argv = std::env::args().skip(1);
     match argv.next().as_deref() {
+        Some("doctor") => return doctor(argv),
         Some("pair-link") => return pair_link(argv).await,
         Some("recap") => return recap(argv).await,
         Some("prompts") => return prompts(argv),
@@ -1281,6 +1288,41 @@ fn cache_stats(mut args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     };
     let stats = vibe_talk::cache::stats::measure(&path).map_err(anyhow::Error::msg)?;
     println!("{}", serde_json::to_string_pretty(&stats)?);
+    Ok(())
+}
+
+/// `vibe-talk doctor`. `#1780 vibe-talk-setup-routes-and-pairing-ux`.
+fn doctor(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let mut config_path: Option<PathBuf> = None;
+    let mut overlays: Vec<PathBuf> = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                println!(
+                    "vibe-talk doctor — check the configuration before the first start\n\n\
+                     USAGE:\n    vibe-talk doctor [--config PATH] [--config-overlay PATH]...\n\n\
+                     Loads the configuration exactly as the server does and prints one line per\n\
+                     check (OK, WARN or FAIL) with the fix for each finding. Exits 1 while any\n\
+                     FAIL remains, 0 otherwise. Makes no network call and never prints a token."
+                );
+                return Ok(());
+            }
+            "--config" => {
+                config_path = Some(args.next().context("--config needs a path")?.into());
+            }
+            "--config-overlay" => {
+                overlays.push(args.next().context("--config-overlay needs a path")?.into());
+            }
+            other => anyhow::bail!("unrecognized argument {other:?}; try vibe-talk doctor --help"),
+        }
+    }
+    let config = Config::discover(config_path, overlays)?;
+    let findings = vibe_talk::doctor::check(&config);
+    print!("{}", vibe_talk::doctor::render(&findings));
+    if vibe_talk::doctor::failed(&findings) {
+        anyhow::bail!("setup is not ready: fix the FAIL lines above, then run vibe-talk doctor again");
+    }
     Ok(())
 }
 

@@ -955,7 +955,10 @@ audible. So where the page plays through Web Audio, its playback report also car
 
 ## Setting it up
 
-**If you are setting this up for the first time, use [`QUICKSTART.md`](QUICKSTART.md).** It runs
+**If you are setting this up for the first time, start with [`SETUP.md`](SETUP.md)** for the
+install, the connection routes (localhost, LAN, SSH, Cloudflare Tunnel, Tailscale, or a work
+web proxy), phone installation, and pairing, and run `vibe-talk doctor` before the first start.
+Then use [`QUICKSTART.md`](QUICKSTART.md) for the vendor steps. It runs
 the six steps — Discord bot, tokens, run it, expose it (optional), ElevenLabs agent, first
 conversation — in order, with the exact commands and no gaps to fill in from here. This file is
 the reference behind it: what every route does, what the security model is, and where it stops.

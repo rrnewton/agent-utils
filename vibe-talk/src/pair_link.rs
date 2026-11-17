@@ -163,7 +163,8 @@ pub async fn run(options: Options) -> anyhow::Result<PairLink> {
         .with_context(|| {
             format!(
                 "could not reach the vibe-talk server at {server} (the configuration's bind \
-                 address); is it running?"
+                 address); is it running? Run vibe-talk doctor to check the configuration it \
+                 should have started with"
             )
         })?;
     let status = response.status();

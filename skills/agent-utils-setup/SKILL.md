@@ -521,8 +521,10 @@ link to `.agents/skills/` if it has one, and commit the harness. For each tool, 
   `mb init` in the primary checkout if it has no `.minibeads/` yet. Record in the harness
   `AGENTS.md` that dispatched tasks are filed and claimed there and closed by the worker that
   lands them.
-- **vibe-talk**: a separately deployed web service; `agent-utils/vibe-talk/QUICKSTART.md` and
-  its README are the reference. What a first run needs, in order:
+- **vibe-talk**: a separately deployed web service; `agent-utils/vibe-talk/SETUP.md` is the
+  first-run guide (install, the connection routes, phone installation and pairing, checked by
+  `vibe-talk doctor`), and its QUICKSTART and README are the reference behind it. What a first
+  run needs, in order:
   - a native build (`cargo build --release --locked` in `vibe-talk/`), installed to a versioned
     path rather than run from `target/`, unless the container image works on the host;
   - configuration and tokens outside any directory the owner syncs between machines;

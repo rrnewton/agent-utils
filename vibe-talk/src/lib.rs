@@ -64,6 +64,7 @@ pub mod conversation;
 pub mod diagnostics;
 pub mod directory;
 pub mod discord;
+pub mod doctor;
 pub mod documents;
 pub mod egress;
 pub mod elevenlabs;
