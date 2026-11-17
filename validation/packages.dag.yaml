@@ -123,17 +123,12 @@ steps:
       preferred_inner_jobs: 1
       rss_baseline_bytes: 536870912
 
-  # DISABLED UNTIL ROBUST under `disabled-optin` (#1765 wrkslots-load-sensitive-gate-tests;
-  # owner rule 346): the scenario's removal raced a 60-second wall budget under host load
-  # (113 s loaded, 73 s solo), so its verdict depended on load. It stays runnable by hand
-  # (`python3 scripts/check_standalone.py --subset wrkslots`, or validate
-  # --include-disabled) and returns only on the re-enable bar in #1765.
   - group: standalone
     job: wrkslots
     desc: install only wrkslots in a clean environment and run a whole slot lifecycle
     cmd: python3 scripts/check_standalone.py --subset wrkslots
     jobs_flag: ""
-    labels: [validation-packages, validation-python-packages, component-wrkslots, disabled-optin]
+    labels: [validation-packages, validation-python-packages, component-wrkslots]
     timeout: 2400
     cpu_timeout: 300
     hint:
