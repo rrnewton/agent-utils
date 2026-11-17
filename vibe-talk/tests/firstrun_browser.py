@@ -275,8 +275,10 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
         profile = tempfile.mkdtemp(prefix="vibe-talk-firstrun-")
         context = playwright.chromium.launch_persistent_context(
             profile, headless=True, executable_path=args.browser_executable,
-            viewport=viewport, is_mobile=mobile, has_touch=mobile,
-            device_scale_factor=2.6 if mobile else 1, color_scheme=scheme)
+            viewport={"width": viewport["width"], "height": viewport["height"]},
+            is_mobile=mobile, has_touch=mobile,
+            device_scale_factor=2.6 if mobile else 1,
+            color_scheme="dark" if scheme == "dark" else "light")
         context.pages[0].on("pageerror", lambda error: page_errors.append(str(error)))
         return context
 
@@ -284,12 +286,12 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
         api = FirstRunApi(listed=[dict(CHANNEL)])
         server, thread, url = serve(api, served)
         try:
-            context = fresh_context(DESK, scheme)  # type: ignore[arg-type]
+            context = fresh_context(DESK, scheme)
             try:
                 walk_fresh(context, url, args.screenshots, "desk", scheme)
             finally:
                 context.close()
-            context = fresh_context(PHONE, scheme, mobile=True)  # type: ignore[arg-type]
+            context = fresh_context(PHONE, scheme, mobile=True)
             try:
                 walk_phone(context, url, args.screenshots, scheme)
             finally:
@@ -304,7 +306,7 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
     api = FirstRunApi(listed=[dict(CHANNEL)])
     server, thread, url = serve(api, served)
     try:
-        context = fresh_context(DESK, "light")  # type: ignore[arg-type]
+        context = fresh_context(DESK, "light")
         try:
             walk_saved_voice(context, url, args.screenshots)
         finally:
@@ -319,17 +321,17 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
     api = FirstRunApi(listed=[])
     server, thread, url = serve(api, served)
     try:
-        context = fresh_context(PHONE, "light", mobile=True)  # type: ignore[arg-type]
+        context = fresh_context(PHONE, "light", mobile=True)
         try:
             walk_no_channel(context, api, url, args.screenshots)
         finally:
             context.close()
-        context = fresh_context(DESK, "light")  # type: ignore[arg-type]
+        context = fresh_context(DESK, "light")
         try:
             walk_deep_link(context, url)
         finally:
             context.close()
-        context = fresh_context(PHONE, "light", mobile=True)  # type: ignore[arg-type]
+        context = fresh_context(PHONE, "light", mobile=True)
         try:
             walk_pairing(context, url, args.screenshots)
         finally:
