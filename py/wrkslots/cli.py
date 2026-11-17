@@ -1112,16 +1112,15 @@ _RECLAIMABLE_OUTPUT_WALK_SECONDS = 20.0
 # removal keeps 64 KiB; each further sealed slot adds 64 KiB (512 KiB for
 # eight).
 _VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES = 64 * 1024
-# remove-agent-batch takes a new shared lsof scan before an item whose scan is
-# older than this.  That evidence serves only the early refusals an item makes
-# before its path fence, and nothing is deleted before the fence: the scan after
-# the fence compares every process with the fenced tree by path and by device
-# and inode, so it finds inode-alias use too, and a use refuses there and rolls
-# the fence back (#1108).  An older scan only refuses less early, which is why a
-# single removal whose registry-lock wait outlasts this age goes on rather than
-# refusing (#956).  On a 4,200-process host at load average 95, with small test
-# slots, one shared scan of three slots took 39 seconds; a batch pays for a new
-# scan roughly once per six items.
+# Since #1367 each remove-agent-batch item takes its own lsof scan at its
+# turn (one scan per slot, not one per batch); a scan older than this is
+# retaken before an item relies on it.  That evidence serves only the early
+# refusals an item makes before its path fence, and nothing is deleted
+# before the fence: the scan after the fence compares every process with
+# the fenced tree by path and by device and inode, so it finds inode-alias
+# use too, and a use refuses there and rolls the fence back (#1108).  An
+# older scan only refuses less early, which is why a single removal whose
+# registry-lock wait outlasts this age goes on rather than refusing (#956).
 _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS = 300.0
 _AGENT_REMOVE_BATCH_LSOF_SECONDS = 600.0
 _AGENT_REMOVE_BATCH_YIELD_SECONDS = 0.25
@@ -91028,14 +91027,15 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "the exact owner that still applies, or the owner-consented handoff exception) "
             "and the same per-slot checks: registered liveness, handoff read, Git "
             "salvage to the recorded remote with read-back, path fence, and archive. "
-            "Only the process-use checks before the path fence are shared: one lsof scan "
-            "and, right after it, one reading of /proc cover every requested slot, run "
-            "before any registry lock is taken, and are repeated when they are older than "
-            f"{_AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS:.0f} seconds. At each process-use "
+            "The process-use checks before the path fence run once per slot at that "
+            "slot's turn (#1367): one lsof scan of the slot's own directory and, right "
+            "after it, one reading of /proc for that slot, both before that slot's "
+            "registry lock is taken, so each slot is judged on evidence taken when it "
+            "is reached. At each process-use "
             "check before the fence, the batch confirms the slot directory is the one that "
             "scan covered, refuses on any use that scan saw or any lsof warning that may "
             "concern the slot, and looks up path, mapping, mount, and owner-cgroup use in "
-            "the shared /proc reading. Nothing is deleted before the fence. Each process-use check "
+            "that /proc reading. Nothing is deleted before the fence. Each process-use check "
             "after it scans /proc once, comparing every process's working directory, root, "
             "executable, open files, and mappings with the fenced tree by path and by "
             "device and inode; when that scan cannot decide (for example, the tree spans "

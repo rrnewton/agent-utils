@@ -1472,27 +1472,29 @@ and the archive. The lock is released between slots, followed by a 0.25-second p
 waiting heartbeat can take it. Each slot waits up to 30 seconds for the lock, or for `--wait-lock`
 seconds when that is given.
 
-Only the process-use checks made before the path fence are shared. Before taking any lock, the batch
-runs one `lsof +D` over every requested slot directory and attributes each open file to the slot
-that contains it; a file it cannot attribute counts against every slot. Right after it, the batch
-reads `/proc` once for all of those slots. Where `remove --no-lock-budget` would run `lsof` before the
-fence, the batch instead:
+The process-use checks made before the path fence run once per slot at that slot's turn (#1367),
+not once for the whole batch. Before taking that slot's lock, the batch runs one `lsof +D` over
+the slot's own directory and attributes each open file to the slot that contains it; a file it
+cannot attribute counts against every slot. Right after it, the batch reads `/proc` once for
+that slot. Where `remove --no-lock-budget` would run `lsof` before the fence, the batch instead:
 
-1. confirms that the slot directory is still the directory the shared scan covered, by device and
+1. confirms that the slot directory is still the directory that scan covered, by device and
    inode;
-2. refuses the slot if the shared scan saw any process using it, or if `lsof` printed a warning
+2. refuses the slot if that scan saw any process using it, or if `lsof` printed a warning
    that may concern the slot, exactly as `remove` would refuse on that warning;
-3. looks up, in that shared `/proc` reading, a process whose working directory, root, executable,
+3. looks up, in that `/proc` reading, a process whose working directory, root, executable,
    open descriptor, memory mapping, or mount table names the slot, and a live process in the
    recorded owner's cgroup when that cgroup is evidence. The answer is the one a scan of `/proc`
    for that slot alone would give.
 
 The `/proc` reading catches use that `lsof` does not report, such as a root or a mount table, and use
-that began while `lsof` ran. The shared scan catches a descriptor opened through a hard link outside
-the slot, which no `/proc` path names. Both are repeated together when they are older than 300
-seconds. A slot checked a second time before that, after waiting for a holder to exit, has `/proc`
-scanned afresh for it alone, and so does every slot when the shared reading could not be taken. Nothing is deleted before the fence. A slot that the shared scan saw in use
-is refused even if that process has since exited; run another batch or `remove` for it.
+that began while `lsof` ran. The `lsof` scan catches a descriptor opened through a hard link outside
+the slot, which no `/proc` path names. Because each slot's evidence is taken at its turn, a process
+that began using a later slot after the batch started is seen by that slot's own scan. A slot
+checked a second time, after waiting for a holder to exit, has `/proc` scanned afresh for it
+alone, and so does every slot when the reading could not be taken. Nothing is deleted before
+the fence. A slot that its scan saw in use is refused even if that process has since exited;
+run another batch or `remove` for it.
 
 The process-use checks after the fence guard deletion. `remove --no-lock-budget` runs `lsof +D` on
 the fenced path for each of them. The batch first scans `/proc` once instead. It records the device and inode of
