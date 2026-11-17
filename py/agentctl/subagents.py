@@ -2655,6 +2655,25 @@ class ManagedAgents:
             f"alias with `agentctl alias rm {name}`"
         )
 
+    def _repoint_aliases(self, token: str, source: str, target: str) -> None:
+        """Point every alias for generation ``token`` naming ``source`` at ``target``.
+
+        A chained rename (A renamed to B, then B to C) keeps A's alias
+        reaching the agent (#1777).
+        """
+        directory = registry_layout.aliases_directory(self.registry)
+        if not directory.exists():
+            return
+        for entry in sorted(os.listdir(directory)):
+            if not entry.endswith(".json"):
+                continue
+            alias = self._read_alias(entry[: -len(".json")])
+            if alias is not None and alias["token"] == token and alias["new"] == source:
+                alias["new"] = target
+                agent._atomic_json(
+                    str(registry_layout.alias_path(self.registry, str(alias["old"]))), alias
+                )
+
     def alias_list(self) -> list[dict[str, object]]:
         """Every live alias, sorted by old name; expired ones are pruned."""
         directory = registry_layout.aliases_directory(self.registry)
@@ -7228,6 +7247,7 @@ class ManagedAgents:
             agent._atomic_json(
                 str(registry_layout.alias_path(self.registry, old)), alias
             )
+        self._repoint_aliases(str(journal["token"]), old, new)
         self._remove_rename_journal(journal)
         result: dict[str, object] = {
             "name": new, "previous_name": old, "token": record.token, "pane_id": pane_id,

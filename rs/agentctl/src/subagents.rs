@@ -7055,6 +7055,55 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             })
     }
 
+    /// The current name `agent_name` resolves to: through a live alias, or
+    /// itself. For callers that hold a possibly-old name in a config file
+    /// (restore's coordinator) and must compare it with the designation.
+    pub(crate) fn canonical_name(&self, agent_name: &str) -> Result<String> {
+        Ok(match self.resolve_alias(agent_name)? {
+            Some((resolved, _)) => resolved,
+            None => agent_name.to_owned(),
+        })
+    }
+
+    /// Point every alias for generation `token` that names `from` at `to`:
+    /// a chained rename (A renamed to B, then B to C) keeps A's alias
+    /// reaching the agent (#1777).
+    fn repoint_aliases(&self, token: &str, from: &str, to: &str) -> Result<()> {
+        let directory = agent_queue::registry::aliases_directory(&self.registry);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot list aliases {}: {error}",
+                    directory.display()
+                )))
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| fail(error.to_string()))?;
+            let Some(old) = entry
+                .file_name()
+                .to_str()
+                .and_then(|file| file.strip_suffix(".json"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Some(mut alias) = self.read_alias(&old)? else {
+                continue;
+            };
+            if alias.token == token && alias.new == from {
+                alias.new = to.to_owned();
+                agent::atomic_json(
+                    &agent_queue::registry::alias_path(&self.registry, &old),
+                    &alias.document(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Refuse to register a new agent under a name a live alias still owns.
     fn refuse_live_alias(&self, agent_name: &str) -> Result<()> {
         let Some(alias) = self.read_alias(agent_name)? else {
@@ -9733,6 +9782,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             created: journal.started_at,
             expires: until,
         });
+        // A chained rename re-points the aliases this generation already
+        // has, so the first old name follows it to the newest one.
+        self.repoint_aliases(&journal.token, old, new)?;
         if let Some(alias) = &alias {
             self.prepare_layout()?;
             agent::atomic_json(

@@ -293,6 +293,20 @@ def test_rename_with_alias_keeps_the_old_name_reaching_the_agent(
     assert manager.alias_list()[0]["new"] == "new"
 
 
+def test_a_chained_rename_repoints_the_first_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch, "old")
+    manager.rename("old", "new", keep_alias="14d")
+    manager.rename("new", "lead", keep_alias="14d")
+    aliases = manager.registry / "aliases"
+    assert json.loads((aliases / "old.json").read_text())["new"] == "lead"
+    assert json.loads((aliases / "new.json").read_text())["new"] == "lead"
+    assert manager.status("old")["name"] == "lead"
+    manager.send("old", "via both renames")
+    assert fake.submitted[-1] == "via both renames"
+
+
 def test_an_alias_whose_agent_was_replaced_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

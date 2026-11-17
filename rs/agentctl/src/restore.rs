@@ -515,6 +515,24 @@ impl RestoreConfig {
         paths
     }
 
+    /// Resolve a configured coordinator that is a live rename alias of the
+    /// designated agent to the agent's current name (#1777), so a renamed
+    /// coordinator does not make restore refuse its own configuration.
+    /// Anything else is left for [`Self::follow_designation`] to judge.
+    pub fn resolve_coordinator_alias<A: ManagedApi + ?Sized>(
+        &mut self,
+        manager: &ManagedAgents<'_, A>,
+        designated: Option<&str>,
+    ) {
+        if let (Some(named), Some(current)) = (&self.coordinator, designated) {
+            if let Ok(resolved) = manager.canonical_name(named) {
+                if resolved == current {
+                    self.coordinator = Some(resolved);
+                }
+            }
+        }
+    }
+
     /// Take the registry's designated coordinator (`agentctl coordinator set`) when
     /// `restore.json` names none. A `restore.json` coordinator that disagrees with it, or a
     /// designated coordinator that `exclude` lists, is an error, and the configuration keeps its
@@ -2854,9 +2872,14 @@ pub fn spec_write_agents<A: ManagedApi + ?Sized>(
     let config = RestoreConfig::load(registry)?;
     // The designation follows the agent by token, so resolve it the way the
     // restore itself does rather than reading the file's (possibly old) name.
+    // A configured coordinator kept as a rename alias resolves the same way.
+    let manager = crate::subagents::ManagedAgents::new(client, registry);
     let coordinator = match config.coordinator.clone() {
-        Some(name) => Some(name),
-        None => crate::subagents::ManagedAgents::new(client, registry)
+        Some(name) => match &manager {
+            Ok(manager) => manager.canonical_name(&name).ok().or(Some(name)),
+            Err(_) => Some(name),
+        },
+        None => manager
             .and_then(|manager| manager.designated_coordinator())
             .unwrap_or_default(),
     };

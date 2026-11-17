@@ -3149,7 +3149,7 @@ def test_layout_migration_moves_idle_agents_once_and_keeps_fixed_items(tmp_path:
     assert (first["layout_before"], first["layout"]) == ("1", "2")
     assert first["moved"] == ["alpha", "beta"] and first["removed_lock_files"] == 5
     assert sorted(path.name for path in registry.iterdir()) == [
-        ".coordinator.lock", ".identity.lock", ".renames", "agents", "locks", "profiles.json",
+        ".coordinator.lock", ".identity.lock", ".renames", "agents", "aliases", "locks", "profiles.json",
     ]
     assert [path.name for path in (registry / ".renames").iterdir()] == [registry_layout.RENAMES_TRIPWIRE]
     assert registry_layout.is_tripwire(registry / "agents/agent.json")
@@ -3226,7 +3226,7 @@ def test_a_build_older_than_layout_two_fails_closed_on_the_tripwire(tmp_path: Pa
     registry_layout.migrate(registry, apply=True, wait=0)
     names = [path.name for path in registry.iterdir() if subagents_module._NAME.fullmatch(path.name)
              and path.name != "archive"]
-    assert sorted(names) == ["agents", "locks"]
+    assert sorted(names) == ["agents", "aliases", "locks"]
     document = json.loads((registry / "agents/agent.json").read_text(encoding="utf-8"))
     assert not isinstance(document, dict)
 

@@ -400,6 +400,31 @@ fn the_tree_hangs_every_agent_under_its_manager_and_the_rest_under_the_coordinat
 }
 
 #[test]
+fn restore_accepts_a_coordinator_named_by_a_live_alias() {
+    use crate::restore::RestoreConfig;
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let manager = fixture.manager();
+    manager.coordinator_set("worker").unwrap();
+    manager
+        .rename_keep_alias("worker", "reviewer", Some("14d"))
+        .unwrap();
+    // The designation followed the rename by token; restore.json still
+    // names the old name, kept as an alias of the same agent.
+    assert_eq!(
+        manager.designated_coordinator().unwrap().as_deref(),
+        Some("reviewer")
+    );
+    let mut config = RestoreConfig::load(&registry(&fixture)).unwrap();
+    config.coordinator = Some("worker".to_owned());
+    config.resolve_coordinator_alias(&manager, Some("reviewer"));
+    assert_eq!(config.coordinator.as_deref(), Some("reviewer"));
+    config
+        .follow_designation(Some("reviewer".to_owned()))
+        .unwrap();
+}
+
+#[test]
 fn restore_follows_the_designation_and_keeps_its_own_coordinator_on_a_conflict() {
     use crate::restore::RestoreConfig;
     let fixture = Fixture::new();

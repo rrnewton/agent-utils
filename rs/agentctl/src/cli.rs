@@ -6125,9 +6125,15 @@ fn designation_problem(
     registry: &Path,
     config: &mut crate::restore::RestoreConfig,
 ) -> Option<String> {
-    let designated = match ManagedAgents::new(client, registry)
-        .and_then(|manager| manager.designated_coordinator())
-    {
+    let manager = match ManagedAgents::new(client, registry) {
+        Ok(manager) => manager,
+        Err(error) => {
+            return Some(format!(
+                "the coordinator designation is unreadable: {error}"
+            ))
+        }
+    };
+    let designated = match manager.designated_coordinator() {
         Ok(designated) => designated,
         Err(error) => {
             return Some(format!(
@@ -6135,6 +6141,7 @@ fn designation_problem(
             ))
         }
     };
+    config.resolve_coordinator_alias(&manager, designated.as_deref());
     config
         .follow_designation(designated)
         .err()

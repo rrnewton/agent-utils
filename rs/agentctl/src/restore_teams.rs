@@ -380,13 +380,19 @@ pub(crate) fn restore_one_with_client<A: ManagedApi + ?Sized>(
     options: &RestoreOptions,
     boot: bool,
 ) -> Result<Value> {
-    let designation_problem = match ManagedAgents::new(client, registry)
-        .and_then(|manager| manager.designated_coordinator())
-    {
-        Ok(designated) => config
-            .follow_designation(designated)
-            .err()
-            .map(|error| error.to_string()),
+    let designation_problem = match ManagedAgents::new(client, registry) {
+        Ok(manager) => match manager.designated_coordinator() {
+            Ok(designated) => {
+                config.resolve_coordinator_alias(&manager, designated.as_deref());
+                config
+                    .follow_designation(designated)
+                    .err()
+                    .map(|error| error.to_string())
+            }
+            Err(error) => Some(format!(
+                "the coordinator designation is unreadable: {error}"
+            )),
+        },
         Err(error) => Some(format!(
             "the coordinator designation is unreadable: {error}"
         )),

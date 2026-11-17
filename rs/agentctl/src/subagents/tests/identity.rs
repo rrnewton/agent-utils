@@ -833,6 +833,31 @@ fn a_crash_mid_rename_with_alias_leaves_no_alias_or_a_complete_one() {
 }
 
 #[test]
+fn a_chained_rename_repoints_the_first_alias() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .manager()
+        .rename_keep_alias("worker", "reviewer", Some("14d"))
+        .unwrap();
+    fixture
+        .manager()
+        .rename_keep_alias("reviewer", "lead", Some("14d"))
+        .unwrap();
+    // The first old name followed the agent to its newest name, and the
+    // second rename kept its own old name too.
+    assert_eq!(alias_document(&fixture, "worker")["new"], "lead");
+    assert_eq!(alias_document(&fixture, "reviewer")["new"], "lead");
+    let status = fixture.manager().status("worker").unwrap();
+    assert_eq!(status["name"], "lead");
+    send(&fixture, "worker", "via both renames").unwrap();
+    assert_eq!(
+        runs(&fixture).last().map(String::as_str),
+        Some("via both renames")
+    );
+}
+
+#[test]
 fn rename_without_keep_alias_keeps_the_old_behaviour() {
     let fixture = Fixture::new();
     fixture.start(None);
