@@ -4646,7 +4646,7 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
         &BTreeMap::new(),
         0.0,
         config.bare_shell_grace_seconds as f64,
-        workspaces.first().map(|workspace| *workspace),
+        workspaces.first().copied(),
     );
     Ok(json!({
         "tabs": rows.iter().map(|row| json!({
