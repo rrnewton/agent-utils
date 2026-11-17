@@ -240,6 +240,12 @@ pub(crate) enum Writers {
         /// Delete gitignored files outside the caches, listing them in the receipt
         #[arg(long)]
         discard_ignored: bool,
+        /// Proceed past a private-history tip whose object no local store holds, naming it in the receipt
+        #[arg(long)]
+        archive_unresolvable_private_history: bool,
+        /// Allow the age rule to drop rescue/salvage-named commits (this edition keeps every tip it finds, so it is accepted for parity)
+        #[arg(long)]
+        discard_rescue_ref_history: bool,
     },
     /// Strictly replay an event log and atomically replace the derived index
     Rebuild {
@@ -2583,6 +2589,8 @@ pub fn run() -> u8 {
                 machine,
                 archive_ignored,
                 discard_ignored,
+                archive_unresolvable_private_history,
+                discard_rescue_ref_history: _,
             } => {
                 let ignored_mode = if archive_ignored {
                     crate::remove_write::IgnoredMode::Archive
@@ -2598,6 +2606,7 @@ pub fn run() -> u8 {
                     coordinator_pid,
                     expected_generation,
                     ignored_mode,
+                    archive_unresolvable_private_history,
                 ) {
                     Ok(value) => {
                         println!(

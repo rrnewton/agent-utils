@@ -17415,9 +17415,17 @@ def _advertised_fingerprint(inventory: Mapping[str, str]) -> str:
 
 
 @contextlib.contextmanager
-def _remote_containment_scope(mirror_root: Path | None = None) -> Iterator[None]:
+def _remote_containment_scope(
+    mirror_root: Path | None = None,
+    *,
+    allow_unresolvable_private_history: bool = False,
+    discard_rescue_ref_history: bool = False,
+) -> Iterator[None]:
     """Keep remote containment answers, salvage facts and bundle verifications for one removal."""
 
+    policy = _PRIVATE_HISTORY_SCAN_POLICY.set(
+        (allow_unresolvable_private_history, discard_rescue_ref_history)
+    )
     token = _REMOTE_CONTAINMENT_MEMO.set({})
     tips_token = _REMOTE_ADVERTISED_TIPS_MEMO.set({})
     mirror_token = _PROOF_MIRROR_ROOT.set(mirror_root)
@@ -17432,6 +17440,7 @@ def _remote_containment_scope(mirror_root: Path | None = None) -> Iterator[None]
     try:
         yield
     finally:
+        _PRIVATE_HISTORY_SCAN_POLICY.reset(policy)
         _PRIVATE_HISTORY_MEMO.reset(history)
         _PREGATHERED_SALVAGE_RECEIPTS.reset(receipts)
         _SUBMODULE_INVENTORY_MEMO.reset(inventories)
@@ -28918,6 +28927,9 @@ def _execute_ttl_rescue(
         bundle_path.parent.mkdir(parents=True, exist_ok=True)
         git(checkout_dir, "bundle", "create", str(bundle_path), "--all")
         git(checkout_dir, "bundle", "verify", str(bundle_path))
+        _assert_bundle_verifies_against_surviving_stores(
+            _GitVcs(), checkout_dir, bundle_path
+        )
         operations += 2
         bundle = str(bundle_path)
     return {
@@ -30221,6 +30233,250 @@ def _excluded_incomplete_history_entries(
     ]
 
 
+#: Dropped-commit entries kept inline in a salvage receipt (#1785);
+#: longer lists are a bounded summary plus a manifest sidecar file in
+#: the salvage archive, in the style of #1772.
+_DROPPED_HISTORY_INLINE_LIMIT = 64
+_DROPPED_HISTORY_SCHEMA = 1
+
+
+def _dropped_history_entries(
+    history: _PrivateHistory | None,
+    facts: _SalvageCandidate | None = None,
+) -> list[dict[str, object]]:
+    """Every commit a removal drops, by SHA and naming ref (#1785).
+
+    That is the scan's not-kept tips (age, held-by-source and stale
+    categories), its unresolvable tips when the operator proceeded
+    past them, and a candidate's excluded incomplete-history commits:
+    each with the ref that named it (or "" when nothing did) and the
+    reason it was dropped. Sorted by commit, then ref, then reason,
+    duplicates removed.
+    """
+
+    entries: set[tuple[str, str, str]] = set()
+    if history is not None:
+        for category, commit, ref in history.not_kept:
+            entries.add((commit, ref, category))
+        for name, commit, reason in history.unresolvable:
+            entries.add((commit, name, f"unresolvable: {reason}"))
+    if facts is not None:
+        for category, commit, ref in facts.dropped_private_history:
+            entries.add((commit, ref, category))
+        for commit, missing, reason in facts.excluded_incomplete_history:
+            entries.add((commit, "", reason))
+    return [
+        {"commit": commit, "ref": ref, "reason": reason}
+        for commit, ref, reason in sorted(entries)
+    ]
+
+
+def _dropped_history_digest(
+    entries: Sequence[Mapping[str, object]],
+) -> str:
+    """Sha256 of the canonical dropped-commit lines, sorted."""
+
+    digest = hashlib.sha256()
+    for entry in sorted(
+        entries,
+        key=lambda item: (
+            str(item.get("commit", "")),
+            str(item.get("ref", "")),
+            str(item.get("reason", "")),
+        ),
+    ):
+        digest.update(
+            f"{entry.get('commit', '')} {entry.get('ref', '')} "
+            f"{entry.get('reason', '')}\n".encode("utf-8")
+        )
+    return digest.hexdigest()
+
+
+def _dropped_history_admitted(config: Config) -> bool:
+    """Whether receipts may carry dropped_private_history (#1788).
+
+    That key is a level-3 record field: readers that deny unknown
+    fields (the pinned 096a8d74 readers among them) refuse any record
+    carrying it, so below the ceiling it is not written at all, and
+    the same commits are captured by the dropped-history manifest
+    sidecar, a separate file no record reader parses.
+    """
+
+    return _writer_ceiling(config) >= 3
+
+
+def _dropped_history_obj(
+    entries: Sequence[Mapping[str, object]],
+    *,
+    file: str | None = None,
+) -> dict[str, object]:
+    """Bounded receipt value for dropped commits (#1785).
+
+    Up to the inline limit every entry is listed; a longer list is
+    the bounded summary (count, canonical digest, first entries) plus
+    ``file``, the manifest sidecar the caller wrote holding all of
+    them. An empty list is count 0 with no entries and no file.
+    """
+
+    ordered = sorted(
+        (dict(entry) for entry in entries),
+        key=lambda item: (
+            str(item.get("commit", "")),
+            str(item.get("ref", "")),
+            str(item.get("reason", "")),
+        ),
+    )
+    result: dict[str, object] = {
+        "count": len(ordered),
+        "sha256": _dropped_history_digest(ordered),
+        "entries": ordered[:_DROPPED_HISTORY_INLINE_LIMIT],
+    }
+    if file is not None:
+        result["file"] = file
+    return result
+
+
+def _dropped_history_receipt(
+    entries: Sequence[Mapping[str, object]],
+    archive_root: Path,
+    machine: str,
+    slot: str,
+    generation: int | None,
+    checkout_name: str,
+    *,
+    emit_key: bool = True,
+) -> dict[str, object] | None:
+    """The receipt value for ``entries``, writing a manifest when long.
+
+    With ``emit_key`` false (writer ceiling below level 3, #1788) the
+    manifest is written whenever anything was dropped and None is
+    returned, so the caller writes no receipt key at all; the drop is
+    still recorded, by SHA, in the sidecar.
+    """
+
+    if not entries and not emit_key:
+        return None
+    if emit_key and len(entries) <= _DROPPED_HISTORY_INLINE_LIMIT:
+        return _dropped_history_obj(entries)
+    digest = _dropped_history_digest(entries)
+    root = archive_root
+    epoch = "ownerless" if generation is None else str(generation)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", checkout_name).strip("-.") or "checkout"
+    name_digest = hashlib.sha256(checkout_name.encode("utf-8")).hexdigest()[:12]
+    directory = (
+        root
+        / _LOCAL_SALVAGE_DIRECTORY
+        / machine
+        / slot
+        / epoch
+        / "dropped-history"
+    )
+    _prepare_local_salvage_directory(root, directory)
+    sidecar = directory / f"{safe_name}-{name_digest}-{digest[:12]}.json"
+    payload = {
+        "schema": _DROPPED_HISTORY_SCHEMA,
+        "kind": "wrkslots-dropped-private-history",
+        "machine": machine,
+        "slot": slot,
+        "generation": generation,
+        "checkout": checkout_name,
+        "count": len(entries),
+        "sha256": digest,
+        "entries": [
+            dict(entry)
+            for entry in sorted(
+                entries,
+                key=lambda item: (
+                    str(item.get("commit", "")),
+                    str(item.get("ref", "")),
+                    str(item.get("reason", "")),
+                ),
+            )
+        ],
+    }
+    _atomic_write_json(sidecar, payload)
+    written = _strict_json_object(
+        _read_bounded_regular_file(sidecar, "dropped-history manifest", _JOURNAL_BYTES_LIMIT),
+        "dropped-history manifest",
+    )
+    if not _json_equal(written, payload):
+        raise Refusal(f"dropped-history manifest readback failed: {sidecar}")
+    if not emit_key:
+        return None
+    return _dropped_history_obj(entries, file=str(sidecar))
+
+
+def _recorded_dropped_reasons(
+    config: Config,
+    record: ActiveRecord,
+    receipt: Mapping[str, object],
+    checkout_name: str,
+) -> dict[str, tuple[str, str]]:
+    """Dropped commits recorded for one checkout, receipt or sidecar.
+
+    At writer ceiling 3 the salvage receipt carries them; below it
+    only the dropped-history manifest sidecars do (#1788), so both
+    are read here.
+    """
+
+    reasons: dict[str, tuple[str, str]] = {}
+
+    def add_entries(entries: object) -> None:
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if isinstance(entry, Mapping):
+                reasons[str(entry.get("commit", ""))] = (
+                    str(entry.get("ref", "")),
+                    str(entry.get("reason", "")),
+                )
+
+    dropped_obj = receipt.get("dropped_private_history")
+    manifests: list[Path] = []
+    if isinstance(dropped_obj, Mapping):
+        add_entries(dropped_obj.get("entries"))
+        named_file = dropped_obj.get("file")
+        if isinstance(named_file, str):
+            manifests.append(Path(named_file))
+    roots: list[Path] = []
+    try:
+        roots.append(_default_salvage_archive_root(config))
+    except Refusal:
+        pass
+    for key in ("archive_bundle", "destination"):
+        value = receipt.get(key)
+        if isinstance(value, str) and _LOCAL_SALVAGE_DIRECTORY in Path(value).parts:
+            parts = Path(value).parts
+            index = parts.index(_LOCAL_SALVAGE_DIRECTORY)
+            roots.append(Path(*parts[:index]))
+    for root in dict.fromkeys(roots):
+        base = (
+            root
+            / _LOCAL_SALVAGE_DIRECTORY
+            / record.machine
+            / record.slot
+        )
+        if not base.is_dir():
+            continue
+        for candidate in sorted(base.rglob("dropped-history/*.json")):
+            manifests.append(candidate)
+    for manifest in dict.fromkeys(manifests):
+        if not manifest.is_file():
+            continue
+        try:
+            payload = _strict_json_object(
+                _read_bounded_regular_file(
+                    manifest, "dropped-history manifest", _JOURNAL_BYTES_LIMIT
+                ),
+                "dropped-history manifest",
+            )
+        except Refusal:
+            continue
+        if payload.get("checkout") == checkout_name:
+            add_entries(payload.get("entries"))
+    return reasons
+
+
 def _salvage_bundle_object_env(
     vcs: _GitVcs, path: Path
 ) -> tuple[tuple[Path, ...], dict[str, str]]:
@@ -30280,6 +30536,58 @@ def _salvage_bundle_object_env(
             str(store) for store in stores[1:]
         )
     return tuple(stores), env
+
+
+def _surviving_bundle_object_stores(
+    vcs: _GitVcs, path: Path
+) -> tuple[Path, ...]:
+    """Bundle object stores that remain after this checkout is removed.
+
+    A thin bundle may only name prerequisites in these stores (#1785):
+    for a linked worktree the common store stays (removal deletes only
+    the worktree's administrative Git directory), while a standalone
+    repository candidate's own store goes with the candidate, so only
+    stores outside it (its alternates and the parent module store a
+    bundle may read) count. Stores under the directory removal
+    deletes are excluded, never merely trusted.
+    """
+
+    stores, _env = _salvage_bundle_object_env(vcs, path)
+    common = Path(os.path.realpath(vcs.common_directory(path)))
+    git_directory = Path(
+        vcs._run(
+            path, ["rev-parse", "--path-format=absolute", "--absolute-git-dir"]
+        ).stdout.strip()
+    )
+    git_directory = Path(os.path.realpath(git_directory))
+    # The slot's administrative directory (#1785): for a linked
+    # worktree `.git/worktrees/<slot>` (a submodule's per-worktree
+    # store lives under it), removal deletes everything beneath it,
+    # so no alternate or parent store resolving there can count, even
+    # when it sits outside this repository's own common directory.
+    # The admin directory is recognised by its own files (gitdir /
+    # commondir), not by a path component that a project directory
+    # could also carry.
+    admin_root = git_directory
+    for ancestor in (git_directory, *git_directory.parents):
+        if ancestor.parent.name != "worktrees":
+            continue
+        if (ancestor / "gitdir").exists() or (ancestor / "commondir").exists():
+            admin_root = ancestor
+            break
+    if common != git_directory:
+        return tuple(
+            store
+            for store in stores
+            if not store.is_relative_to(git_directory)
+            and not store.is_relative_to(admin_root)
+        )
+    return tuple(
+        store
+        for store in stores
+        if not store.is_relative_to(common)
+        and not store.is_relative_to(admin_root)
+    )
 
 
 def _missing_objects(
@@ -30348,6 +30656,7 @@ def _partition_kept_commits(
     tips: Sequence[str],
     *,
     protected: AbstractSet[str] = frozenset(),
+    named: AbstractSet[str] = frozenset(),
 ) -> tuple[tuple[str, ...], tuple[tuple[str, str, str], ...]]:
     """Split kept private-history ``tips`` into bundleable and excluded commits.
 
@@ -30360,8 +30669,15 @@ def _partition_kept_commits(
     locally for any other reason is excluded the same way when nothing
     the slot would lose reaches it (#1481: a dangling commit whose tree
     no store holds is unrecoverable, and refusing parks the slot); a
-    ``protected`` tip (reachable from a ref or a reflog) refuses instead,
+    ``named`` tip (itself named by a ref or a reflog) refuses instead,
     naming the kept commit, the object, and every store searched (#1278).
+
+    An unnamed incomplete tip that reaches ``protected`` commits
+    re-roots at every maximal complete one of them (#1785), so a
+    rescue/salvage-named commit is never dropped with a descendant it
+    merely happens to sit under; a maximal protected commit that is
+    itself incomplete (outside promisor gaps) refuses the same way a
+    protected tip does.
     """
 
     if not tips:
@@ -30387,6 +30703,126 @@ def _partition_kept_commits(
             "(promisor gap or missing locally); recorded in the salvage receipt",
         )
         return tuple(tips), ()
+    def complete_protected_roots(
+        tip: str,
+    ) -> tuple[list[str], list[tuple[str, str, str]]]:
+        """Maximal complete protected commits ``tip`` reaches, and drops.
+
+        When a tip cannot be bundled but rescue/salvage-named (or
+        otherwise protected) commits beneath it can, keeping every
+        maximal one is what keeps the named history (#1785). One
+        parent walk of the tip builds the whole ancestry graph; no
+        per-candidate history walks, however many refs name commits.
+        A maximal protected commit whose only gaps are promisor gaps
+        is recorded dropped by SHA, and the search recurses to ITS
+        maximal complete protected ancestors, so a complete rescue
+        commit is never hidden under a promisor-gapped one. Any other
+        incomplete protected commit refuses, naming it, its missing
+        object, and every store searched.
+        """
+
+        roots = [commit for commit in protected if commit != tip]
+        if not roots:
+            return [], []
+        parents: dict[str, list[str]] = {}
+        for line in vcs._run(
+            path,
+            ["rev-list", "--parents", tip],
+            check=False,
+            env_overrides=env,
+        ).stdout.splitlines():
+            fields = line.split()
+            if fields:
+                parents[fields[0]] = fields[1:]
+        if tip not in parents:
+            return [], []
+
+        def ancestors_of(commit: str) -> set[str]:
+            seen: set[str] = set()
+            pending = list(parents.get(commit, ()))
+            while pending:
+                current = pending.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                pending.extend(parents.get(current, ()))
+            return seen
+
+        def maximal_of(candidates: list[str]) -> list[str]:
+            return [
+                commit
+                for commit in candidates
+                if not any(
+                    commit in ancestors_of(other)
+                    for other in candidates
+                    if other != commit
+                )
+            ]
+
+        kept_roots: list[str] = []
+        dropped: list[tuple[str, str, str]] = []
+        seen_roots: set[str] = set()
+
+        def resolve(candidates: list[str]) -> None:
+            for root in maximal_of(candidates):
+                if root in seen_roots:
+                    continue
+                seen_roots.add(root)
+                listed = vcs._run(
+                    path,
+                    ["rev-list", "--objects", "--missing=print", root],
+                    check=False,
+                    env_overrides=env,
+                )
+                root_missing = [
+                    line[1:].split(" ", 1)[0]
+                    for line in listed.stdout.splitlines()
+                    if line.startswith("?")
+                    and SHA_RE.fullmatch(line[1:].split(" ", 1)[0])
+                ]
+                if listed.returncode == 0 and not root_missing:
+                    kept_roots.append(root)
+                    continue
+                tolerated = vcs._run(
+                    path,
+                    [
+                        "rev-list",
+                        "--objects",
+                        "--missing=allow-promisor",
+                        root,
+                    ],
+                    check=False,
+                    env_overrides=env,
+                )
+                if tolerated.returncode == 0:
+                    # A promisor gap: this protected commit is dropped
+                    # and listed by SHA; what it reaches is judged next.
+                    dropped.append(
+                        (
+                            root,
+                            root_missing[0] if root_missing else root,
+                            _PROMISOR_GAP_REASON,
+                        )
+                    )
+                    below = [
+                        commit
+                        for commit in roots
+                        if commit != root and commit in ancestors_of(root)
+                    ]
+                    resolve(below)
+                    continue
+                searched = ", ".join(str(store) for store in stores)
+                first = root_missing[0] if root_missing else root
+                raise Refusal(
+                    f"salvage of checkout {checkout_name} cannot bundle "
+                    f"kept commit {root}: object {first} is missing from "
+                    f"every object store searched: {searched}; nothing "
+                    "was removed"
+                )
+
+        resolve([commit for commit in roots if commit in parents])
+        return kept_roots, dropped
+
     kept: list[str] = []
     excluded: list[tuple[str, str, str]] = []
     verified: list[str] = []
@@ -30418,28 +30854,47 @@ def _partition_kept_commits(
                 env_overrides=env,
             )
             if tolerated.returncode == 0:
+                roots_kept, roots_dropped = complete_protected_roots(tip)
+                for root in roots_kept:
+                    if root not in kept:
+                        kept.append(root)
+                        verified.append(root)
+                excluded.extend(roots_dropped)
                 excluded.append((tip, missing[0], _PROMISOR_GAP_REASON))
                 continue
-            if tip not in protected:
-                excluded.append((tip, missing[0], _MISSING_LOCALLY_REASON))
-                continue
-            searched = ", ".join(str(store) for store in stores)
-            raise Refusal(
-                f"salvage of checkout {checkout_name} cannot bundle kept commit "
-                f"{tip}: object {missing[0]} is missing from every object "
-                f"store searched: {searched}; nothing was removed"
-            )
+            if tip in named:
+                searched = ", ".join(str(store) for store in stores)
+                raise Refusal(
+                    f"salvage of checkout {checkout_name} cannot bundle kept "
+                    f"commit {tip}: object {missing[0]} is missing from "
+                    f"every object store searched: {searched}; nothing was "
+                    "removed"
+                )
+            roots_kept, roots_dropped = complete_protected_roots(tip)
+            for root in roots_kept:
+                if root not in kept:
+                    kept.append(root)
+                    verified.append(root)
+            excluded.extend(roots_dropped)
+            excluded.append((tip, missing[0], _MISSING_LOCALLY_REASON))
+            continue
         # The tip's own commit object is unreadable; the bundle stage would
         # refuse it, so name it here instead of keeping it blindly.
-        if tip not in protected:
-            excluded.append((tip, tip, _MISSING_LOCALLY_REASON))
-            continue
-        searched = ", ".join(str(store) for store in stores)
-        raise Refusal(
-            f"salvage of checkout {checkout_name} cannot bundle kept commit "
-            f"{tip}: object {tip} is missing from every object store "
-            f"searched: {searched}; nothing was removed"
-        )
+        if tip in named:
+            searched = ", ".join(str(store) for store in stores)
+            raise Refusal(
+                f"salvage of checkout {checkout_name} cannot bundle kept "
+                f"commit {tip}: object {tip} is missing from every object "
+                f"store searched: {searched}; nothing was removed"
+            )
+        roots_kept, roots_dropped = complete_protected_roots(tip)
+        for root in roots_kept:
+            if root not in kept:
+                kept.append(root)
+                verified.append(root)
+        excluded.extend(roots_dropped)
+        excluded.append((tip, tip, _MISSING_LOCALLY_REASON))
+        continue
     _print_count_line_once(
         checkout_name,
         f"keeping {len(kept)}/{len(excluded)}",
@@ -30535,21 +30990,97 @@ def _thin_bundle_prerequisites(
     if not tips:
         return ()
     _stores, env = _salvage_bundle_object_env(vcs, path)
-    proof: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for ref, tip in sorted(tips.items()):
-        if not SHA_RE.fullmatch(tip) or tip in seen:
-            continue
-        result = vcs._run(
+    # A thin prerequisite must live in a store that survives removal
+    # (#1785): a tip only the slot's own store holds cannot thin the
+    # bundle, however the remote advertises it. Both questions are
+    # asked in one batch each, never one Git process per tip.
+    surviving = _surviving_bundle_object_stores(vcs, path)
+    if not surviving:
+        return ()
+    ancestors = set(
+        vcs._run(
             path,
-            ["merge-base", "--is-ancestor", tip, facts.commit],
+            ["rev-list", facts.commit],
             check=False,
             env_overrides=env,
+        ).stdout.split()
+    )
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for ref, tip in sorted(tips.items()):
+        if not SHA_RE.fullmatch(tip) or tip in seen or tip not in ancestors:
+            continue
+        seen.add(tip)
+        candidates.append((ref, tip))
+    if not candidates:
+        return ()
+    surviving_env: dict[str, str] = {
+        "GIT_OBJECT_DIRECTORY": str(surviving[0]),
+        "GIT_NO_LAZY_FETCH": "1",
+    }
+    if len(surviving) > 1:
+        surviving_env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = ":".join(
+            str(store) for store in surviving[1:]
         )
-        if result.returncode == 0:
-            seen.add(tip)
+    checked_result = vcs._run(
+        path,
+        ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input_text="".join(
+            f"{tip}\n{tip}^{{tree}}\n" for _ref, tip in candidates
+        ),
+        check=False,
+        env_overrides=surviving_env,
+    )
+    checked_lines = checked_result.stdout.splitlines()
+    if checked_result.returncode != 0 or len(checked_lines) != 2 * len(candidates):
+        # A failed batch proves nothing either way: fall back to the
+        # complete bundle, never a thinner one (#1785).
+        return ()
+    proof: list[tuple[str, str]] = []
+    for position, (ref, tip) in enumerate(candidates):
+        pair = checked_lines[2 * position : 2 * position + 2]
+        if len(pair) == 2 and all(
+            not line.endswith(" missing") for line in pair
+        ):
             proof.append((ref, tip))
     return tuple(proof)
+
+
+def _assert_bundle_verifies_against_surviving_stores(
+    vcs: _GitVcs, path: Path, bundle: Path
+) -> None:
+    """Verify ``bundle`` against only the stores that survive ``path``.
+
+    A bundle verified in the checkout's own store proves nothing once
+    removal deletes that store (#1785): run Git's own bundle check in
+    a bare scratch repository whose alternates are exactly the
+    surviving stores. A complete bundle passes there too; a bundle
+    whose prerequisites only the deleted store holds refuses here,
+    before anything is deleted.
+    """
+
+    surviving = _surviving_bundle_object_stores(vcs, path)
+    with tempfile.TemporaryDirectory(
+        prefix=".wrkslots-surviving-verify-", dir=str(bundle.parent)
+    ) as temporary:
+        restored = Path(temporary) / "restored.git"
+        vcs._run(Path(temporary), ["init", "--bare", "--", str(restored)])
+        if surviving:
+            alternates = restored / "objects" / "info" / "alternates"
+            alternates.write_text(
+                "".join(f"{store}\n" for store in surviving),
+                encoding="utf-8",
+            )
+        result = vcs._run(
+            restored, ["bundle", "verify", str(bundle)], check=False
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise Refusal(
+                f"salvage bundle {bundle} does not verify against the object "
+                f"stores that survive removal of checkout at {path}: {detail}; "
+                "nothing was removed"
+            )
 
 
 def _verify_local_salvage_bundle(
@@ -30579,14 +31110,19 @@ def _verify_local_salvage_bundle(
         root = Path(temporary)
         restored = root / "restored.git"
         if prerequisites:
-            # A thin bundle (#1367) verifies in a scratch repository whose
-            # alternates are the stores a bundle may read, which hold the
-            # prerequisites the remote proved; the bundle must verify
-            # against them and fetch to the exact salvage commit. (A clone
-            # of one store would hardlink its dangling objects and let the
-            # fetch negotiation skip objects only another store holds.)
+            # A thin bundle (#1367, #1785) verifies in a scratch
+            # repository whose alternates are only the stores that
+            # survive removal, which hold the prerequisites the remote
+            # proved; the bundle must verify against them and fetch to
+            # the exact salvage commit. Verification in a store removal
+            # deletes would prove nothing. (A clone of one store would
+            # hardlink its dangling objects and let the fetch
+            # negotiation skip objects only another store holds.)
             if not prerequisite_stores:
-                raise StateError("a thin salvage bundle has no prerequisite stores")
+                raise Refusal(
+                    "thin salvage bundle has no surviving prerequisite store; "
+                    "write a complete bundle instead"
+                )
             vcs._run(root, ["init", "--bare", "--", str(restored)])
             alternates = restored / "objects" / "info" / "alternates"
             alternates.write_text(
@@ -30683,6 +31219,12 @@ def _local_salvage_receipt_payload(
         extra["excluded_incomplete_history"] = excluded_entries
     if any(count for _key, count in facts.history_counts):
         extra["private_history_counts"] = _facts_history_counts_obj(facts)
+    # dropped_private_history deliberately stays out of this payload
+    # (#1785): this file is re-derived and compared byte-for-byte by
+    # salvage readers, including older pinned ones, and an unknown key
+    # would make them refuse a bundle they can otherwise verify. The
+    # dropped list lives in the archive record's salvage receipt (and
+    # its manifest sidecar), which readers only mapping-check.
     return {
         **extra,
         "schema": _LOCAL_SALVAGE_RECEIPT_SCHEMA,
@@ -30794,7 +31336,7 @@ def _ensure_local_salvage_bundle(
                     facts.commit,
                     vcs,
                     prerequisites=tuple(commit for _ref, commit in thin_proof),
-                    prerequisite_stores=stores,
+                    prerequisite_stores=_surviving_bundle_object_stores(vcs, path),
                 )
                 try:
                     os.link(temp_bundle, bundle, follow_symlinks=False)
@@ -30998,7 +31540,7 @@ def _ensure_shared_salvage_bundle(
             commit,
             vcs,
             prerequisites=tuple(tip for _ref, tip in thin_proof),
-            prerequisite_stores=_salvage_bundle_object_env(vcs, path)[0],
+            prerequisite_stores=_surviving_bundle_object_stores(vcs, path),
         )
         _interrupt_for_test("after-shared-salvage-bundle-before-metadata")
         _atomic_write_json(
@@ -31104,7 +31646,7 @@ def _archive_salvage_locally(
         facts.commit,
         vcs,
         prerequisites=tuple(commit for _ref, commit in thin_proof),
-        prerequisite_stores=_salvage_bundle_object_env(vcs, path)[0],
+        prerequisite_stores=_surviving_bundle_object_stores(vcs, path),
     )
     expected_receipt = _local_salvage_receipt_payload(
         checked_root,
@@ -31162,9 +31704,9 @@ def _archive_salvage_locally(
                         prerequisites=tuple(
                             commit for _ref, commit in thin_proof
                         ),
-                        prerequisite_stores=_salvage_bundle_object_env(
+                        prerequisite_stores=_surviving_bundle_object_stores(
                             vcs, path
-                        )[0],
+                        ),
                     )
                 except Refusal:
                     intact = False
@@ -31235,7 +31777,7 @@ def _archive_salvage_locally(
                     facts.commit,
                     vcs,
                     prerequisites=tuple(commit for _ref, commit in thin_proof),
-                    prerequisite_stores=_salvage_bundle_object_env(vcs, path)[0],
+                    prerequisite_stores=_surviving_bundle_object_stores(vcs, path),
                 )
             expected_receipt = _local_salvage_receipt_payload(
                 checked_root,
@@ -31351,6 +31893,22 @@ def _archive_salvage_locally(
         ),
         "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
         "private_history_counts": _facts_history_counts_obj(facts),
+        **(
+            {}
+            if (
+                dropped_value := _dropped_history_receipt(
+                    _dropped_history_entries(facts.private_history, facts),
+                    checked_root,
+                    machine,
+                    slot,
+                    generation,
+                    checkout.name,
+                    emit_key=_dropped_history_admitted(config),
+                )
+            )
+            is None
+            else {"dropped_private_history": dropped_value}
+        ),
         "remote_failure": None if remote_failure is None else str(remote_failure),
         "archive_reason": archive_reason,
         "destination": str(bundle),
@@ -31485,7 +32043,7 @@ def _assert_local_salvage_receipt(
         vcs,
         prerequisites=tuple(commit for _ref, commit in thin_proof),
         prerequisite_stores=(
-            () if path is None else _salvage_bundle_object_env(vcs, path)[0]
+            () if path is None else _surviving_bundle_object_stores(vcs, path)
         ),
     )
 
@@ -31525,6 +32083,12 @@ class _SalvageCandidate:
     # produced this candidate (#1280), kept and reported-not-kept, as
     # (category, count) in _PRIVATE_HISTORY_COUNT_KEYS order.
     history_counts: tuple[tuple[str, int], ...] = ()
+    # Dropped commits from the private-history scan (#1785), as
+    # (category, commit, first ref naming it) like
+    # _PrivateHistory.not_kept, with unresolvable tips under an
+    # "unresolvable: ..." category. Carried even when no tip was kept,
+    # so the salvage receipt can list every drop by SHA.
+    dropped_private_history: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def aliased(self) -> bool:
@@ -31573,6 +32137,15 @@ class _PrivateHistory:
     # naming it or ""), so the report can name the object each count is
     # about instead of leaving a bare category total.
     not_kept: tuple[tuple[str, str, str], ...] = ()
+    # Ref, reflog or pseudoref tips whose object no local store holds
+    # (#1785): (name naming it, commit, why it cannot be resolved). Empty
+    # unless the scan was allowed to proceed past them
+    # (--archive-unresolvable-private-history); otherwise they refuse.
+    unresolvable: tuple[tuple[str, str, str], ...] = ()
+    # Kept tips that reach a rescue/salvage-named commit (#1785): the
+    # bundle partition must treat them as protected, so an incomplete
+    # descendant can re-root at the named commit instead of dropping it.
+    protected_tips: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32027,7 +32600,11 @@ def _assert_no_info_attributes(info_attributes: Path, label: str) -> None:
         )
 
 
-def _private_pseudoref_commits(vcs: _GitVcs, path: Path) -> set[str]:
+def _private_pseudoref_commits(
+    vcs: _GitVcs,
+    path: Path,
+    unresolvable: list[tuple[str, str, str]] | None = None,
+) -> set[str]:
     """Return the commits that pseudorefs in ``path``'s own Git directory name.
 
     Removal deletes that directory (a linked worktree's administrative
@@ -32035,12 +32612,15 @@ def _private_pseudoref_commits(vcs: _GitVcs, path: Path) -> set[str]:
     named like a pseudoref (ORIG_HEAD, a custom MY_HEAD, FETCH_HEAD's lines)
     is a root: each object name in it that is, or peels to, a commit is
     returned.  A symbolic pseudoref names a ref, which is judged on its own;
-    an object that is missing, or is a tree or blob (AUTO_MERGE), has no
-    commit to keep.  Unfinished-operation files refuse elsewhere.
+    an object that is a tree or blob (AUTO_MERGE) has no commit to keep. An
+    object that is missing locally is reported through ``unresolvable``
+    when the caller collects it (#1785); other callers keep the skip.
+    Unfinished-operation files refuse elsewhere.
     """
 
     git_directory = Path(vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
     candidates: set[str] = set()
+    named: dict[str, str] = {}
     try:
         names = sorted(os.listdir(git_directory))
     except OSError as exc:
@@ -32059,14 +32639,46 @@ def _private_pseudoref_commits(vcs: _GitVcs, path: Path) -> set[str]:
             token = line.split("\t", 1)[0].split(" ", 1)[0].strip()
             if SHA_RE.fullmatch(token):
                 candidates.add(token)
-    commits: set[str] = set()
-    for candidate in sorted(candidates):
-        peeled = vcs._run(
-            path, ["rev-parse", "-q", "--verify", f"{candidate}^{{commit}}"], check=False
-        )
-        value = peeled.stdout.strip()
-        if peeled.returncode == 0 and SHA_RE.fullmatch(value):
-            commits.add(value)
+                named.setdefault(token, name)
+    # One batch peel for every candidate (#1785), not one Git
+    # process per pseudoref.
+    peeled_map = _peel_to_commits(vcs, path, candidates)
+    commits: set[str] = {
+        commit for commit in peeled_map.values() if commit is not None
+    }
+    if unresolvable is not None:
+        missing_candidates = [
+            candidate
+            for candidate in sorted(candidates)
+            if peeled_map.get(candidate) is None
+        ]
+        if missing_candidates:
+            # One batch presence check distinguishes a missing object
+            # (unresolvable) from a present tree/blob (AUTO_MERGE).
+            checked_result = vcs._run(
+                path,
+                ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                input_text="".join(f"{item}\n" for item in missing_candidates),
+                check=False,
+                env_overrides={"GIT_NO_LAZY_FETCH": "1"},
+            )
+            checked = checked_result.stdout.splitlines()
+            if checked_result.returncode != 0 or len(checked) != len(
+                missing_candidates
+            ):
+                raise Refusal(
+                    f"cannot batch-check objects at {path}: "
+                    f"{(checked_result.stderr or checked_result.stdout).strip()}"
+                )
+            for candidate, line in zip(missing_candidates, checked):
+                if line.endswith(" missing"):
+                    unresolvable.append(
+                        (
+                            named.get(candidate, candidate),
+                            candidate,
+                            "object missing locally",
+                        )
+                    )
     return commits
 
 
@@ -32217,12 +32829,18 @@ def _commit_tips(
         raise Refusal(f"checkout {path} lists a reflog entry or ref that is not a full object")
     if not positives:
         return ()
+    # A scan walk never lazy-fetches (#1785): a missing object is judged
+    # locally, never silently fetched from a promisor remote.
+    scan_env: Mapping[str, str] = {
+        **(env_overrides or {}),
+        "GIT_NO_LAZY_FETCH": "1",
+    }
     orphans = vcs._run(
         path,
         ["rev-list", "--stdin"],
         input_text="".join(f"{item}\n" for item in sorted(positives))
         + "".join(f"^{item}\n" for item in sorted(negatives)),
-        env_overrides=env_overrides,
+        env_overrides=scan_env,
     ).stdout.split()
     if not orphans:
         return ()
@@ -32231,13 +32849,18 @@ def _commit_tips(
         path,
         ["rev-list", "--no-walk=unsorted", "--parents", "--stdin"],
         input_text="".join(f"{item}\n" for item in orphans),
-        env_overrides=env_overrides,
+        env_overrides=scan_env,
     ).stdout.splitlines():
         parents.update(line.split()[1:])
     return tuple(sorted(set(orphans) - parents))
 
 
-def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[str, ...]:
+def _worktree_private_orphan_tips(
+    vcs: _GitVcs,
+    path: Path,
+    kept: str,
+    unresolvable: list[tuple[str, str, str]] | None = None,
+) -> tuple[str, ...]:
     """Return the tips of commits that only ``path``'s private Git state reaches.
 
     Removing a linked worktree deletes its private administrative directory:
@@ -32255,7 +32878,7 @@ def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[
     for prefix in _WORKTREE_PRIVATE_REF_PREFIXES:
         files.extend(_reflog_files_under(_git_path(vcs, path, f"logs/{prefix.rstrip('/')}")))
     positives = _reflog_endpoints(files)
-    positives |= _private_pseudoref_commits(vcs, path)
+    positives |= _private_pseudoref_commits(vcs, path, unresolvable)
     negatives = {kept}
     for line in vcs._run(
         path, ["for-each-ref", "--format=%(objectname) %(refname)"]
@@ -32393,8 +33016,18 @@ class _ReflogEntry:
 
 def _reflog_entries_by_ref(
     directories: Sequence[Path],
+    unresolvable: list[tuple[str, str, str]] | None = None,
 ) -> dict[str, tuple[_ReflogEntry, ...]]:
-    """Every reflog entry by the ref its log file names, oldest file order kept."""
+    """Every reflog entry by the ref its log file names, oldest file order kept.
+
+    A file that cannot be read, or a line that does not parse, is never
+    silently skipped (#1785): it is recorded in ``unresolvable`` (or
+    refuses here when the caller collects none), because the commit
+    such a line names would otherwise lose its reflog-named status
+    and be age-dropped. A line whose endpoint names parse keeps its
+    entry with a zero timestamp, so a present commit stays named
+    while the caller judges the recorded problem.
+    """
 
     by_ref: dict[str, list[_ReflogEntry]] = {}
     for directory in dict.fromkeys(directories):
@@ -32404,16 +33037,52 @@ def _reflog_entries_by_ref(
             entries = by_ref.setdefault(ref, [])
             try:
                 contents = file.read_bytes()
-            except OSError:
+            except OSError as exc:
+                problem = (ref, "", f"cannot read reflog file {file}: {exc}")
+                if unresolvable is None:
+                    raise Refusal(
+                        f"cannot read reflog file {file}: {exc}"
+                    ) from exc
+                unresolvable.append(problem)
                 continue
             for line in contents.decode("utf-8", "replace").splitlines():
                 head, _tab, message = line.partition("\t")
                 fields = head.split(" ")
-                if len(fields) < 4 or not SHA_RE.fullmatch(fields[0]):
+                endpoints_ok = (
+                    len(fields) >= 2
+                    and SHA_RE.fullmatch(fields[0]) is not None
+                    and SHA_RE.fullmatch(fields[1]) is not None
+                )
+                if len(fields) < 4 or not endpoints_ok:
+                    problem = (
+                        ref,
+                        fields[1]
+                        if len(fields) >= 2 and SHA_RE.fullmatch(fields[1])
+                        else "",
+                        f"malformed reflog line in {file}: {line[:80]!r}",
+                    )
+                    if unresolvable is None:
+                        raise Refusal(problem[2])
+                    unresolvable.append(problem)
+                    if endpoints_ok:
+                        entries.append(
+                            _ReflogEntry(fields[0], fields[1], 0.0, message)
+                        )
                     continue
                 try:
                     timestamp = float(fields[-2])
                 except ValueError:
+                    problem = (
+                        ref,
+                        fields[1],
+                        f"malformed reflog line in {file}: {line[:80]!r}",
+                    )
+                    if unresolvable is None:
+                        raise Refusal(problem[2])
+                    unresolvable.append(problem)
+                    entries.append(
+                        _ReflogEntry(fields[0], fields[1], 0.0, message)
+                    )
                     continue
                 entries.append(
                     _ReflogEntry(fields[0], fields[1], timestamp, message)
@@ -32559,6 +33228,215 @@ _PRIVATE_HISTORY_MEMO: contextvars.ContextVar[
     dict[tuple[object, ...], _PrivateHistory | None] | None
 ] = contextvars.ContextVar("wrkslots_private_history_memo", default=None)
 
+#: How the private-history scan treats rescue/salvage refs and
+#: unresolvable tips in this removal (#1785), as
+#: (allow_unresolvable, discard_rescue_refs). The default refuses an
+#: unresolvable tip and never age-drops a rescue/salvage-named commit;
+#: _cmd_remove sets the operator's explicit choices for its scope, and
+#: callers outside a removal keep the default. Explicit keyword
+#: arguments on _submodule_private_history override this for one scan.
+_PRIVATE_HISTORY_SCAN_POLICY: contextvars.ContextVar[tuple[bool, bool]] = (
+    contextvars.ContextVar("wrkslots_private_history_policy", default=(False, False))
+)
+
+#: Ref prefixes whose named commits removal never age-drops (#1785).
+_RESCUE_REF_PREFIXES: tuple[str, str] = ("refs/rescue/", "refs/salvage/")
+
+
+def _peel_to_commits(
+    vcs: _GitVcs,
+    path: Path,
+    shas: AbstractSet[str],
+    env_overrides: Mapping[str, str] | None = None,
+) -> dict[str, str | None]:
+    """Peel each object name in ``shas`` to its commit, or None when missing.
+
+    One batch check with lazy fetching off (#1785): the peeled
+    ``for-each-ref`` format crashes Git on a missing object, and a
+    promisor must not silently fetch the object a scan is judging.
+    A present object that is not a commit or tag also peels to None's
+    neighbour: its commit line is missing while the object line is not,
+    so callers distinguish "missing" from "not a commit" through the
+    first answer line, which this returns alongside by keying the result
+    only on the commit question — callers that must distinguish run
+    their own presence check, as _private_pseudoref_commits does.
+    """
+
+    if not shas:
+        return {}
+    env: dict[str, str] = {**(env_overrides or {}), "GIT_NO_LAZY_FETCH": "1"}
+    ordered = sorted(shas)
+    listed = vcs._run(
+        path,
+        ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input_text="".join(f"{sha}\n{sha}^{{commit}}\n" for sha in ordered),
+        check=False,
+        env_overrides=env,
+    )
+    lines = listed.stdout.splitlines()
+    if listed.returncode != 0 or len(lines) != 2 * len(ordered):
+        # A failed or short batch must never read as "every object is
+        # missing" (#1785): that would strip rescue protection under
+        # the archive flag instead of refusing.
+        raise Refusal(
+            f"cannot batch-check objects at {path}: "
+            f"{(listed.stderr or listed.stdout).strip() or 'short batch output'}"
+        )
+    peeled: dict[str, str | None] = {}
+    for position, sha in enumerate(ordered):
+        commit_line = lines[2 * position + 1] if 2 * position + 1 < len(lines) else ""
+        commit = commit_line.split(" ", 1)[0]
+        peeled[sha] = commit if SHA_RE.fullmatch(commit) else None
+    return peeled
+
+
+def _ref_commits_safely(
+    vcs: _GitVcs,
+    path: Path,
+    env_overrides: Mapping[str, str] | None,
+    unresolvable: list[tuple[str, str, str]],
+    ref_roots: Sequence[Path] = (),
+) -> dict[str, str]:
+    """Every ref of ``path`` mapped to the commit it names, missing named.
+
+    Lists refs without the peeled format (which crashes Git on a
+    missing object), then peels each distinct object in one batch. A
+    ref whose object is missing locally, or is not a commit, is
+    appended to ``unresolvable`` as (ref, object, reason) and omitted
+    from the result; the caller decides whether that refuses (#1785).
+
+    ``ref_roots`` are the ref directories (common and per-worktree
+    Git directories) to cross-check against Git's listing: Git skips
+    a broken loose ref with only a warning on stderr, and never
+    lists a loose ref planted in a per-worktree Git directory, so a
+    truncated or invisible refs/rescue/* file would otherwise lose
+    its commit silently. Such a file is judged here instead: broken
+    contents are unresolvable, a valid name becomes a ref here.
+    """
+
+    directs: dict[str, str] = {}
+    listed = vcs._run(
+        path,
+        ["for-each-ref", "--format=%(objectname) %(refname)"],
+        check=False,
+        env_overrides={"GIT_NO_LAZY_FETCH": "1"},
+    )
+    if listed.returncode != 0:
+        raise Refusal(
+            f"cannot list refs at {path}: "
+            f"{(listed.stderr or listed.stdout).strip()}"
+        )
+    for line in listed.stdout.splitlines():
+        direct, separator, refname = line.partition(" ")
+        if not separator or not SHA_RE.fullmatch(direct) or not refname:
+            if line.strip():
+                unresolvable.append((line.strip(), "", "malformed ref listing"))
+            continue
+        directs[refname] = direct
+    extra_tokens: dict[str, str] = {}
+    for root in dict.fromkeys(ref_roots):
+        refs_directory = root / "refs"
+        if not refs_directory.is_dir():
+            continue
+        for current, _directories, files in os.walk(
+            refs_directory, followlinks=False
+        ):
+            for name in sorted(files):
+                if name.endswith(".lock"):
+                    # A stale lock from a crashed ref update names no
+                    # ref at all (#1785); Git ignores it too.
+                    continue
+                ref_file = Path(current) / name
+                refname = ref_file.relative_to(root).as_posix()
+                try:
+                    _validate_git_ref_name(refname, "loose ref")
+                except Refusal:
+                    continue
+                try:
+                    contents = ref_file.read_bytes().decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+                except OSError as exc:
+                    unresolvable.append(
+                        (refname, "", f"cannot read loose ref {ref_file}: {exc}")
+                    )
+                    continue
+                if contents.startswith("ref:"):
+                    # A symbolic ref is judged through its target.
+                    continue
+                token = contents.split(maxsplit=1)[0] if contents else ""
+                if not SHA_RE.fullmatch(token):
+                    unresolvable.append(
+                        (
+                            refname,
+                            token,
+                            f"broken loose ref file {ref_file} does not name "
+                            "a full object",
+                        )
+                    )
+                    continue
+                if refname not in directs:
+                    directs[refname] = token
+                elif token != directs[refname]:
+                    # A loose ref in another Git directory with the
+                    # same name as a listed ref: Git's listing stands,
+                    # but this file is judged too (#1785).
+                    extra_tokens.setdefault(refname, token)
+        packed = root / "packed-refs"
+        if packed.is_file():
+            try:
+                packed_lines = packed.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+            except OSError as exc:
+                unresolvable.append(
+                    ("packed-refs", "", f"cannot read {packed}: {exc}")
+                )
+                packed_lines = []
+            for line in packed_lines:
+                if not line or line.startswith(("#", "^")):
+                    continue
+                token, _space, refname = line.partition(" ")
+                if not refname:
+                    continue
+                if not SHA_RE.fullmatch(token):
+                    unresolvable.append(
+                        (
+                            refname,
+                            token,
+                            f"broken packed ref in {packed} does not "
+                            "name a full object",
+                        )
+                    )
+                elif refname not in directs:
+                    directs[refname] = token
+                elif token != directs[refname]:
+                    extra_tokens.setdefault(refname, token)
+    peeled = _peel_to_commits(vcs, path, set(directs.values()), env_overrides)
+    if extra_tokens:
+        extra_peeled = _peel_to_commits(
+            vcs, path, set(extra_tokens.values()), env_overrides
+        )
+        for refname, token in extra_tokens.items():
+            if extra_peeled.get(token) is None:
+                unresolvable.append(
+                    (
+                        refname,
+                        token,
+                        "object missing locally or not a commit",
+                    )
+                )
+    commits: dict[str, str] = {}
+    for refname, direct in directs.items():
+        commit = peeled.get(direct)
+        if commit is None:
+            unresolvable.append(
+                (refname, direct, "object missing locally or not a commit")
+            )
+            continue
+        commits[refname] = commit
+    return commits
+
 
 def _private_history_fingerprint(
     vcs: _GitVcs,
@@ -32621,7 +33499,7 @@ def _private_history_fingerprint(
         kept,
         tuple(str(repository) for repository in durable),
         vcs._run(
-            path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
+            path, ["for-each-ref", "--format=%(objectname) %(refname)"]
         ).stdout,
         _repository_config_sha256(vcs, path),
         tuple(reflog_state),
@@ -32645,6 +33523,8 @@ def _submodule_private_history(
     *,
     remote_cover: Callable[[tuple[str, ...]], _RemoteCoverage] | None = None,
     now: float | None = None,
+    allow_unresolvable: bool | None = None,
+    discard_rescue_refs: bool | None = None,
 ) -> _PrivateHistory | None:
     """See _submodule_private_history_uncached.
 
@@ -32653,10 +33533,20 @@ def _submodule_private_history(
     checkout unchanged (#1437).
     """
 
+    policy = _PRIVATE_HISTORY_SCAN_POLICY.get()
+    allow_unresolvable = policy[0] if allow_unresolvable is None else allow_unresolvable
+    discard_rescue_refs = policy[1] if discard_rescue_refs is None else discard_rescue_refs
     memo = _PRIVATE_HISTORY_MEMO.get()
     if memo is None:
         return _submodule_private_history_uncached(
-            vcs, path, kept, durable, remote_cover=remote_cover, now=now
+            vcs,
+            path,
+            kept,
+            durable,
+            remote_cover=remote_cover,
+            now=now,
+            allow_unresolvable=allow_unresolvable,
+            discard_rescue_refs=discard_rescue_refs,
         )
     # The key names whether a remote was asked: without remote_cover a
     # tracking tip classifies as named, with it as stale pushed or
@@ -32669,9 +33559,16 @@ def _submodule_private_history(
         before = _private_history_fingerprint(vcs, path, kept, durable)
     except Refusal:
         return _submodule_private_history_uncached(
-            vcs, path, kept, durable, remote_cover=remote_cover, now=now
+            vcs,
+            path,
+            kept,
+            durable,
+            remote_cover=remote_cover,
+            now=now,
+            allow_unresolvable=allow_unresolvable,
+            discard_rescue_refs=discard_rescue_refs,
         )
-    key = (before, remote_cover is not None)
+    key = (before, remote_cover is not None, allow_unresolvable, discard_rescue_refs)
     cached = memo.get(key)
     if cached is not None or key in memo:
         # A "held by source store" answer proves the durable store held
@@ -32691,7 +33588,14 @@ def _submodule_private_history(
             return cached
         del memo[key]
     result = _submodule_private_history_uncached(
-        vcs, path, kept, durable, remote_cover=remote_cover, now=now
+        vcs,
+        path,
+        kept,
+        durable,
+        remote_cover=remote_cover,
+        now=now,
+        allow_unresolvable=allow_unresolvable,
+        discard_rescue_refs=discard_rescue_refs,
     )
     try:
         after = _private_history_fingerprint(vcs, path, kept, durable)
@@ -32710,6 +33614,8 @@ def _submodule_private_history_uncached(
     *,
     remote_cover: Callable[[tuple[str, ...]], _RemoteCoverage] | None = None,
     now: float | None = None,
+    allow_unresolvable: bool = False,
+    discard_rescue_refs: bool = False,
 ) -> _PrivateHistory | None:
     """Return the commits that only a slot submodule's own repository holds, if any.
 
@@ -32737,6 +33643,25 @@ def _submodule_private_history_uncached(
     git_directory = Path(
         vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
     )
+    unresolvable: list[tuple[str, str, str]] = []
+    # Durable negatives and the alternate stores every scan walk may
+    # read, with lazy fetching off in every walk (#1785).
+    negatives = {kept}
+    alternates: list[str] = []
+    for repository in durable:
+        negatives.update(
+            line.strip()
+            for line in vcs._run(repository, ["for-each-ref", "--format=%(objectname)"])
+            .stdout.splitlines()
+            if line.strip()
+        )
+        objects = vcs.common_directory(repository) / "objects"
+        if ":" in str(objects):
+            raise Refusal(f"repository object directory path contains ':': {objects}")
+        alternates.append(str(objects))
+    environment: dict[str, str] = {"GIT_NO_LAZY_FETCH": "1"}
+    if alternates:
+        environment["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = ":".join(alternates)
     shared_submodule = _is_shared_submodule_gitdir(git_directory, common)
     if shared_submodule:
         # #1206: removal deletes only this worktree's administration (its
@@ -32747,24 +33672,34 @@ def _submodule_private_history_uncached(
         all_reflog_endpoints = _reflog_endpoints(
             _reflog_files_under(git_directory / "logs")
         )
-        pseudorefs = _private_pseudoref_commits(vcs, path)
+        pseudorefs = _private_pseudoref_commits(vcs, path, unresolvable)
         positives: set[str] = set(all_reflog_endpoints) | pseudorefs
-        ref_commits: dict[str, str] = {}
+        # Every ref is enumerated for naming only (#1785): a rescue or
+        # salvage ref in the shared store still names its commit, even
+        # though only per-worktree state is a positive here.
+        ref_commits = _ref_commits_safely(
+            vcs, path, environment, unresolvable, (common, git_directory)
+        )
+        reflog_by_ref: dict[str, tuple[_ReflogEntry, ...]] = {}
+        cutoff = None
         head = vcs._run(path, ["rev-parse", "--verify", "HEAD"], check=False)
         if head.returncode == 0 and head.stdout.strip():
             positives.add(head.stdout.strip())
-        for line in vcs._run(
-            path,
-            ["for-each-ref", "--format=%(objectname) %(refname)", "refs/worktree/"],
-        ).stdout.splitlines():
-            sha, _sp, refname = line.partition(" ")
-            if sha and refname:
-                ref_commits[refname] = sha
+        for refname, sha in ref_commits.items():
+            if refname.startswith("refs/worktree/"):
                 positives.add(sha)
+        for endpoint, commit in _peel_to_commits(
+            vcs, path, all_reflog_endpoints, environment
+        ).items():
+            if commit is None:
+                unresolvable.append(
+                    ("reflog", endpoint, "object missing locally or not a commit")
+                )
+                positives.discard(endpoint)
     else:
         now_ts = time.time() if now is None else now
         cutoff = _prune_expire_cutoff(vcs, path, now_ts)
-        reflog_by_ref = _reflog_entries_by_ref((common, git_directory))
+        reflog_by_ref = _reflog_entries_by_ref((common, git_directory), unresolvable)
         all_reflog_endpoints = set()
         for entries in reflog_by_ref.values():
             for entry in entries:
@@ -32790,19 +33725,32 @@ def _submodule_private_history_uncached(
                     positives.update(
                         value for value in (entry.old, entry.new) if set(value) != {"0"}
                     )
-        pseudorefs = _private_pseudoref_commits(vcs, path)
+        pseudorefs = _private_pseudoref_commits(vcs, path, unresolvable)
         positives |= pseudorefs
-        ref_commits = {}
-        for line in vcs._run(
-            path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
-        ).stdout.splitlines():
-            fields = line.split(" ", 2)
-            if len(fields) != 3:
+        ref_commits = _ref_commits_safely(
+            vcs, path, environment, unresolvable, (common, git_directory)
+        )
+        positives.update(ref_commits.values())
+        # Reflog endpoints whose object no local store holds are
+        # unresolvable tips too (#1785), never rev-list failures.
+        peeled_endpoints = _peel_to_commits(
+            vcs, path, all_reflog_endpoints, environment
+        )
+        for endpoint, commit in peeled_endpoints.items():
+            if commit is not None:
                 continue
-            direct, peeled, refname = fields
-            positives.add(direct)
-            if SHA_RE.fullmatch(peeled or direct):
-                ref_commits[refname] = peeled or direct
+            source = next(
+                (
+                    ref
+                    for ref, entries in reflog_by_ref.items()
+                    if any(endpoint in (entry.old, entry.new) for entry in entries)
+                ),
+                "reflog",
+            )
+            unresolvable.append(
+                (source, endpoint, "object missing locally or not a commit")
+            )
+            positives.discard(endpoint)
     # Every commit object, named or not (a dropped stash, for one): the whole
     # repository is deleted, so an unreferenced commit is kept too.  The
     # commits salvage itself writes here (committer wrkslots@localhost) are
@@ -32827,27 +33775,51 @@ def _submodule_private_history_uncached(
             path,
             ["log", "--no-walk=unsorted", "--stdin", "--format=%H %ce"],
             input_text="".join(f"{commit}\n" for commit in every_commit),
+            env_overrides=environment,
         ).stdout.splitlines():
             commit, _space, committer = line.partition(" ")
             if committer != "wrkslots@localhost":
                 positives.add(commit)
-    negatives = {kept}
-    alternates: list[str] = []
-    for repository in durable:
-        negatives.update(
-            line.strip()
-            for line in vcs._run(repository, ["for-each-ref", "--format=%(objectname)"])
-            .stdout.splitlines()
-            if line.strip()
-        )
-        objects = vcs.common_directory(repository) / "objects"
-        if ":" in str(objects):
-            raise Refusal(f"repository object directory path contains ':': {objects}")
-        alternates.append(str(objects))
-    # With no durable repository there is no alternate to name.
-    environment = (
-        {"GIT_ALTERNATE_OBJECT_DIRECTORIES": ":".join(alternates)} if alternates else None
-    )
+    # An unresolvable tip is never silently skipped (#1785): by
+    # default it refuses, naming every ref and SHA and the flag that
+    # proceeds; with that flag it is excluded here and named in the
+    # receipt and on stderr through the returned history.
+    unresolvable = sorted(set(unresolvable))
+    # Malformed-reflog problems are deferred (#1785): a commit they
+    # name that is kept, or kept by reachability from a kept tip, is
+    # not a problem at all; only one that would be dropped is judged
+    # after classification below.
+    deferred_problems = [
+        entry
+        for entry in unresolvable
+        if entry[2].startswith("malformed reflog")
+    ]
+    if deferred_problems:
+        unresolvable = [
+            entry for entry in unresolvable if entry not in deferred_problems
+        ]
+    if unresolvable:
+        if not allow_unresolvable:
+            named = "; ".join(
+                f"{name} {commit} ({reason})" if commit else f"{name} ({reason})"
+                for name, commit, reason in unresolvable
+            )
+            raise Refusal(
+                f"private history at {path} has {len(unresolvable)} unresolvable "
+                f"tip(s): {named}. Removal would delete the store that names "
+                "them without knowing what they hold, so nothing was removed. "
+                "remedy: restore the missing objects, or rerun remove with "
+                "--archive-unresolvable-private-history to bundle what can be "
+                "kept and name every unresolvable tip in the salvage receipt"
+            )
+        for name, commit, reason in unresolvable:
+            _print_count_line_once(
+                f"unresolvable:{path}:{name}:{commit}",
+                f"{name}:{commit}",
+                f"wrkslots: private history at {path}: unresolvable tip "
+                f"{commit or name} named by {name} ({reason}); if it is "
+                "not kept it is listed by SHA in the salvage archive",
+            )
     tips = _commit_tips(vcs, path, positives, negatives, env_overrides=environment)
     coverage: _RemoteCoverage | None = None
     if tips and remote_cover is not None:
@@ -32856,13 +33828,86 @@ def _submodule_private_history_uncached(
             negatives |= coverage.covering
             tips = _commit_tips(vcs, path, positives, negatives, env_overrides=environment)
     if not tips:
-        return None
+        # Nothing is kept, so no deferred reflog problem is cleared by
+        # reachability: judge it here, before the early return (#1785).
+        if deferred_problems:
+            if not allow_unresolvable:
+                named = "; ".join(
+                    f"{name} {commit} ({reason})"
+                    for name, commit, reason in deferred_problems
+                )
+                raise Refusal(
+                    f"private history at {path} has malformed reflog "
+                    f"line(s): {named}. Removal would delete the store "
+                    "that names them without knowing what they hold, so "
+                    "nothing was removed. remedy: repair the reflog, or "
+                    "rerun remove with "
+                    "--archive-unresolvable-private-history to bundle "
+                    "what can be kept and name every unresolvable tip in "
+                    "the salvage receipt"
+                )
+            unresolvable = sorted(set(unresolvable) | set(deferred_problems))
+        if not unresolvable:
+            return None
+        return _PrivateHistory(
+            tips=(),
+            commits=0,
+            refs=(),
+            unreferenced=0,
+            remote_unchecked=None if coverage is None else coverage.unchecked,
+            counts=tuple((key, 0) for key in _PRIVATE_HISTORY_COUNT_KEYS),
+            not_kept=(),
+            unresolvable=tuple(unresolvable),
+        )
     # Classify every tip by root type (#1280). Only the kept categories
     # stay tips; the rest are counted and reported, never silently dropped.
     objects = common / "objects"
     naming: dict[str, list[str]] = {}
     for refname, commit in ref_commits.items():
         naming.setdefault(commit, []).append(refname)
+    # A commit named by a rescue or salvage ref is never age-dropped
+    # (#1785), including when _commit_tips collapsed it into an
+    # unnamed maximal tip that reaches it: keeping that tip is what
+    # keeps the named commit. --discard-rescue-ref-history opts out.
+    protected_tips: set[str] = set()
+    if not discard_rescue_refs:
+        rescue_named = {
+            commit
+            for refname, commit in ref_commits.items()
+            if refname.startswith(_RESCUE_REF_PREFIXES)
+        }
+        if rescue_named:
+            # One parent walk for every tip (#1785): per-tip walks made
+            # a large rescue inventory cost one Git process per tip.
+            parents: dict[str, list[str]] = {}
+            for line in vcs._run(
+                path,
+                ["rev-list", "--parents", "--stdin"],
+                input_text="".join(f"{tip}\n" for tip in sorted(tips))
+                + "".join(f"^{item}\n" for item in sorted(negatives)),
+                env_overrides=environment,
+            ).stdout.splitlines():
+                fields = line.split()
+                if fields:
+                    parents[fields[0]] = fields[1:]
+            private_rescue = rescue_named & set(parents)
+            if private_rescue:
+                children: dict[str, list[str]] = {}
+                for commit, commit_parents in parents.items():
+                    for parent in commit_parents:
+                        children.setdefault(parent, []).append(commit)
+                tip_set = set(tips)
+                for rescue_commit in private_rescue:
+                    seen = {rescue_commit}
+                    pending = [rescue_commit]
+                    while pending:
+                        current = pending.pop()
+                        if current in tip_set:
+                            protected_tips.add(current)
+                        for child in children.get(current, ()):
+                            if child not in seen:
+                                seen.add(child)
+                                pending.append(child)
     dangling = [
         tip
         for tip in tips
@@ -32881,6 +33926,8 @@ def _submodule_private_history_uncached(
 
     def classify(tip: str) -> tuple[str, bool]:
         names = naming.get(tip, [])
+        if tip in protected_tips:
+            return "named refs", True
         if any(
             name.startswith(("refs/heads/", "refs/tags/")) or name == "refs/stash"
             for name in names
@@ -32908,7 +33955,16 @@ def _submodule_private_history_uncached(
             if cutoff is None or (age_at is not None and age_at >= cutoff):
                 return "stale fetched recent", True
             return "stale fetched past prune expiry", False
-        if names or tip in all_reflog_endpoints or tip in pseudorefs:
+        effective_names = (
+            [
+                name
+                for name in names
+                if not name.startswith(_RESCUE_REF_PREFIXES)
+            ]
+            if discard_rescue_refs
+            else names
+        )
+        if effective_names or tip in all_reflog_endpoints or tip in pseudorefs:
             return "named refs", True
         if tip in held:
             return "dangling, held by source store", False
@@ -32926,6 +33982,49 @@ def _submodule_private_history_uncached(
             kept_tips.append(tip)
         else:
             not_kept_tips.append((category, tip, naming.get(tip, [""])[0]))
+    # A malformed-reflog problem whose commit was kept, or is kept by
+    # reachability from a kept tip, is not a problem (#1785); one that
+    # would be dropped is judged now, by the same policy as any other
+    # unresolvable tip.
+    if deferred_problems:
+        kept_reach: set[str] = set(kept_tips)
+        if kept_tips:
+            kept_reach.update(
+                vcs._run(
+                    path,
+                    ["rev-list", *kept_tips],
+                    check=False,
+                    env_overrides=environment,
+                ).stdout.split()
+            )
+        remaining_problems = [
+            entry for entry in deferred_problems if entry[1] not in kept_reach
+        ]
+        if remaining_problems:
+            if not allow_unresolvable:
+                named = "; ".join(
+                    f"{name} {commit} ({reason})"
+                    for name, commit, reason in remaining_problems
+                )
+                raise Refusal(
+                    f"private history at {path} has malformed reflog "
+                    f"line(s): {named}. Removal would delete the store "
+                    "that names them without knowing what they hold, so "
+                    "nothing was removed. remedy: repair the reflog, or "
+                    "rerun remove with "
+                    "--archive-unresolvable-private-history to bundle "
+                    "what can be kept and name every unresolvable tip in "
+                    "the salvage receipt"
+                )
+            for name, commit, reason in remaining_problems:
+                _print_count_line_once(
+                    f"unresolvable:{path}:{name}:{commit}",
+                    f"{name}:{commit}",
+                    f"wrkslots: private history at {path}: unresolvable "
+                    f"tip {commit or name} named by {name} ({reason}); "
+                    "if it is not kept it is listed by SHA in the salvage archive",
+                )
+            unresolvable = sorted(set(unresolvable) | set(remaining_problems))
     counts = tuple((key, counts_by_key[key]) for key in _PRIVATE_HISTORY_COUNT_KEYS)
     not_kept = tuple(not_kept_tips)
     if not_kept:
@@ -32935,13 +34034,13 @@ def _submodule_private_history_uncached(
         # (before and after the fence, and the final pass); print each
         # distinct result once, so identical scans do not repeat it.
         shown = ", ".join(
-            f"{commit[:12]} ({ref + ', ' if ref else ''}{category})"
+            f"{commit} ({ref + ', ' if ref else ''}{category})"
             for category, commit, ref in not_kept[:3]
         )
         rest = (
-            f"; and {len(not_kept) - 3} more, counted in the salvage receipt"
+            f"; and {len(not_kept) - 3} more, listed by SHA in the salvage archive"
             if len(not_kept) > 3
-            else "; counted in the salvage receipt"
+            else "; listed by SHA in the salvage archive"
         )
         line = (
             f"wrkslots: private history at {path}: not keeping "
@@ -32957,7 +34056,12 @@ def _submodule_private_history_uncached(
             vcs, path, tuple(kept_tips), negatives, environment, coverage
         )
         return dataclasses.replace(
-            summary, tips=tuple(kept_tips), counts=counts, not_kept=not_kept
+            summary,
+            tips=tuple(kept_tips),
+            counts=counts,
+            not_kept=not_kept,
+            unresolvable=tuple(unresolvable),
+            protected_tips=tuple(sorted(protected_tips)),
         )
     return _PrivateHistory(
         tips=(),
@@ -32967,6 +34071,8 @@ def _submodule_private_history_uncached(
         remote_unchecked=None if coverage is None else coverage.unchecked,
         counts=counts,
         not_kept=not_kept,
+        unresolvable=tuple(unresolvable),
+        protected_tips=tuple(sorted(protected_tips)),
     )
 
 
@@ -32987,20 +34093,15 @@ def _private_history_summary(
                 ["rev-list", "--stdin"],
                 input_text="".join(f"{item}\n" for item in sorted(starts))
                 + "".join(f"^{item}\n" for item in sorted(negatives)),
-                env_overrides=environment,
+                env_overrides={**(environment or {}), "GIT_NO_LAZY_FETCH": "1"},
             ).stdout.split()
         )
 
     private = walk(tips)
     refs: list[tuple[str, str]] = []
-    for line in vcs._run(
-        path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
-    ).stdout.splitlines():
-        fields = line.split(" ", 2)
-        if len(fields) != 3:
-            continue
-        direct, peeled, refname = fields
-        commit = peeled or direct
+    for refname, commit in _ref_commits_safely(
+        vcs, path, environment, []
+    ).items():
         if commit in private:
             refs.append((refname, commit))
     named = walk({commit for _refname, commit in refs}) if refs else set()
@@ -33339,26 +34440,66 @@ def _salvage_candidate_uncached(
         )
         tips = () if history is None else history.tips
     else:
-        tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
+        orphan_unresolvable: list[tuple[str, str, str]] = []
+        tips = _worktree_private_orphan_tips(
+            vcs, path, facts.commit, orphan_unresolvable
+        )
+        if orphan_unresolvable:
+            allow_unresolvable, _discard = _PRIVATE_HISTORY_SCAN_POLICY.get()
+            if not allow_unresolvable:
+                named = "; ".join(
+                    f"{name} {commit} ({reason})"
+                    for name, commit, reason in sorted(set(orphan_unresolvable))
+                )
+                raise Refusal(
+                    f"private history at {path} has unresolvable tip(s): "
+                    f"{named}. Removal would delete the store that names "
+                    "them without knowing what they hold, so nothing was "
+                    "removed. remedy: restore the missing objects, or "
+                    "rerun remove with "
+                    "--archive-unresolvable-private-history to bundle what "
+                    "can be kept and name every unresolvable tip in the "
+                    "salvage receipt"
+                )
     if history is not None:
         protected: set[str] = {commit for _ref, commit in history.refs}
-        protected.update(_reflog_reached_tips(vcs, path, set(tips) - protected))
+        named_tips: set[str] = set(protected)
+        reflog_tips = _reflog_reached_tips(vcs, path, set(tips) - protected)
+        protected.update(reflog_tips)
+        named_tips.update(reflog_tips)
+        # Tips the scan protected because they reach a rescue/salvage
+        # commit (#1785): the partition re-roots or refuses for them,
+        # never silently excludes the named commit beneath them.
+        protected.update(history.protected_tips)
     else:
         protected = set(tips)
+        named_tips = set(tips)
     kept_tips, excluded = _partition_kept_commits(
-        vcs, path, checkout.name, tips, protected=protected
+        vcs, path, checkout.name, tips, protected=protected, named=named_tips
     )
     extra.extend(tip for tip in kept_tips if tip not in extra)
     history_counts = () if history is None else history.counts
     kept_history = history if history is not None and history.tips else None
+    dropped_history: tuple[tuple[str, str, str], ...] = ()
+    if history is not None:
+        dropped_history = history.not_kept + tuple(
+            (f"unresolvable: {reason}", commit, name)
+            for name, commit, reason in history.unresolvable
+        )
+    elif not allow_detached:
+        dropped_history = tuple(
+            (f"unresolvable: {reason}", commit, name)
+            for name, commit, reason in sorted(set(orphan_unresolvable))
+        )
     if not extra:
-        if not excluded and not history_counts:
+        if not excluded and not history_counts and not dropped_history:
             return facts
         return dataclasses.replace(
             facts,
             private_history=kept_history,
             excluded_incomplete_history=excluded,
             history_counts=history_counts,
+            dropped_private_history=dropped_history,
         )
     if facts.shallow is not None:
         raise Refusal(
@@ -33380,6 +34521,7 @@ def _salvage_candidate_uncached(
         private_history=kept_history,
         excluded_incomplete_history=excluded,
         history_counts=history_counts,
+        dropped_private_history=dropped_history,
     )
 
 
@@ -34142,7 +35284,12 @@ def _unlisted_submodule_checkouts(
 
 
 def _nested_module_repository_checkouts(
-    config: Config, checkout: Checkout, vcs: _GitVcs, checkout_path: Path
+    config: Config,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    checkout_path: Path,
+    known_candidates: AbstractSet[tuple[str, Path]] = frozenset(),
+    known_candidate_names: AbstractSet[str] = frozenset(),
 ) -> tuple[tuple[Checkout, Path], ...]:
     """Return module repositories at any nesting depth with no populated worktree (#864).
 
@@ -34151,6 +35298,8 @@ def _nested_module_repository_checkouts(
     whose worktree is populated is already a listed or unlisted candidate;
     one without a worktree would otherwise be deleted unseen, so it becomes
     a salvage candidate in its own right, recorded by its nesting path.
+    ``known_candidates`` are the candidates the caller already
+    collected for this checkout, as (name, worktree path) pairs.
     """
 
     git_directory = Path(
@@ -34184,8 +35333,64 @@ def _nested_module_repository_checkouts(
             head = vcs.head(current)
             authority = vcs.remote_authority(current, remote)
             repository = current.relative_to(config.root).as_posix()
-        except (Refusal, ValueError):
-            continue
+        except (Refusal, ValueError) as exc:
+            # Skip only the fenced recheck case (#1785): the repository
+            # is an already-collected candidate whose recorded worktree
+            # the fence renamed, so Git cannot chdir there, and it is
+            # judged through its candidate path instead. Any other
+            # unreadable module repository refuses, or its history,
+            # refs/rescue/* included, would be deleted unseen.
+            nested_name = f"{checkout.name}/{relative.as_posix()}"
+            same_name = [
+                candidate_path
+                for name, candidate_path in known_candidates
+                if name == nested_name
+            ]
+            if not same_name and nested_name in known_candidate_names:
+                # Collected before the fence and recorded in a receipt;
+                # its worktree no longer answers, so the name is the
+                # evidence it is judged elsewhere (#864).
+                print(
+                    f"wrkslots: skipping nested module repository {current} "
+                    f"of checkout {checkout.name}: cannot be read here "
+                    f"({exc}); it is judged as a listed candidate instead",
+                    file=sys.stderr,
+                )
+                continue
+            if same_name:
+                # Name match is necessary but not sufficient (#1785):
+                # when a candidate worktree still answers, its Git
+                # directory must be this repository. When none can
+                # answer (the fenced case), the name is the evidence.
+                answered = []
+                for candidate_path in same_name:
+                    candidate_gitdir = vcs._run(
+                        candidate_path,
+                        ["rev-parse", "--absolute-git-dir"],
+                        check=False,
+                    )
+                    if candidate_gitdir.returncode == 0:
+                        answered.append(
+                            Path(candidate_gitdir.stdout.strip()).resolve()
+                        )
+                if answered and current.resolve() not in answered:
+                    raise Refusal(
+                        f"nested module repository {current} of checkout "
+                        f"{checkout.name} cannot be read: {exc}; the "
+                        f"candidate of the same name is a different "
+                        f"repository ({answered[0]}); preserve it"
+                    ) from exc
+                print(
+                    f"wrkslots: skipping nested module repository {current} "
+                    f"of checkout {checkout.name}: cannot be read here "
+                    f"({exc}); it is judged as a listed candidate instead",
+                    file=sys.stderr,
+                )
+                continue
+            raise Refusal(
+                f"nested module repository {current} of checkout "
+                f"{checkout.name} cannot be read: {exc}; preserve it"
+            ) from exc
         result.append(
             (
                 Checkout(
@@ -34745,6 +35950,22 @@ def _salvage_one_checkout(
             "containing_remote_refs": list(containing),
             "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
             "private_history_counts": _facts_history_counts_obj(facts),
+            **(
+                {}
+                if (
+                    dropped_value := _dropped_history_receipt(
+                        _dropped_history_entries(facts.private_history, facts),
+                        archive_root or _default_salvage_archive_root(config),
+                        record.machine,
+                        record.slot,
+                        record.generation,
+                        checkout.name,
+                        emit_key=_dropped_history_admitted(config),
+                    )
+                )
+                is None
+                else {"dropped_private_history": dropped_value}
+            ),
             **(_proof_mirror_receipt(checkout.remote_url_sha256) or {}),
             **proof,
         }
@@ -34817,6 +36038,22 @@ def _salvage_one_checkout(
         "containing_remote_refs": [],
         "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
         "private_history_counts": _facts_history_counts_obj(facts),
+        **(
+            {}
+            if (
+                dropped_value := _dropped_history_receipt(
+                    _dropped_history_entries(facts.private_history, facts),
+                    archive_root or _default_salvage_archive_root(config),
+                    record.machine,
+                    record.slot,
+                    record.generation,
+                    checkout.name,
+                    emit_key=_dropped_history_admitted(config),
+                )
+            )
+            is None
+            else {"dropped_private_history": dropped_value}
+        ),
         "destination": f"{checkout.remote}:{salvage_ref}",
     }
 
@@ -35998,6 +37235,11 @@ def _salvage_agent_slot(
         if checkout.vcs == "eden":
             # Eden salvage runs in the Eden remove sequence
             # (_finish_remove_paths), never through Git (#1204).
+            print(
+                f"wrkslots: checkout {checkout.name}: skipping Git salvage: "
+                "Eden checkout, salvaged in the Eden remove sequence",
+                file=sys.stderr,
+            )
             continue
         path = _stored_path(config, checkout.path, "checkout path")
         drift = _observe_checkout_drift(vcs, checkout, path) if archive_drifted else None
@@ -36045,7 +37287,11 @@ def _salvage_agent_slot(
             ):
                 candidates.append((unlisted, unlisted_path, True, None, True))
             for nested_repo, nested_repo_path in _nested_module_repository_checkouts(
-                config, checkout, vcs, path
+                config,
+                checkout,
+                vcs,
+                path,
+                known_candidates={(item[0].name, item[1]) for item in candidates},
             ):
                 if nested_repo.name not in {item[0].name for item in candidates}:
                     candidates.append(
@@ -36151,6 +37397,9 @@ def _salvage_agent_slot(
     # Declared submodules whose scan found only reported, not-kept commits
     # (#1280): their counts still belong in the salvage receipt.
     reported_history_counts: dict[str, tuple[tuple[str, int], ...]] = {}
+    # The same scans themselves (#1785), so their dropped and
+    # unresolvable commits can be listed in the receipt by SHA.
+    reported_history: dict[str, _PrivateHistory] = {}
     for checkout, path, detached, drift, never_push in candidates:
 
         def derive(keep_private_state: bool) -> _SalvageCandidate:
@@ -36169,6 +37418,7 @@ def _salvage_agent_slot(
             )
 
         facts = derive(never_push)
+        declared_history: _PrivateHistory | None = None
         if checkout.name in self_sourced_names and facts.private_history is not None:
             private_history_kept.add(checkout.name)
         if detached and not never_push:
@@ -36179,6 +37429,7 @@ def _salvage_agent_slot(
             history = _declared_submodule_private_history(
                 config, record, checkout, path, vcs, facts
             )
+            declared_history = history
             if history is not None and history.tips:
                 if not archive_private_history:
                     raise _private_history_refusal(
@@ -36189,6 +37440,27 @@ def _salvage_agent_slot(
                 private_history_kept.add(checkout.name)
             elif history is not None:
                 reported_history_counts[checkout.name] = history.counts
+                reported_history[checkout.name] = history
+        # Every checkout scanned gets a keep/drop line (#1785),
+        # including one with nothing private.
+        scan_history = facts.private_history or declared_history
+        kept_count = len(scan_history.tips) if scan_history is not None else 0
+        dropped_entries = _dropped_history_entries(scan_history, facts)
+        unresolvable_count = (
+            len(scan_history.unresolvable) if scan_history is not None else 0
+        )
+        _print_count_line_once(
+            checkout.name,
+            f"scan:{kept_count}:{len(dropped_entries)}:{unresolvable_count}",
+            f"wrkslots: checkout {checkout.name}: private-history scan: "
+            f"kept {kept_count} commit(s), dropped {len(dropped_entries)} "
+            f"commit(s), unresolvable {unresolvable_count} commit(s)"
+            + (
+                "; nothing private"
+                if kept_count == 0 and not dropped_entries
+                else "; dropped commits are listed by SHA in the salvage archive"
+            ),
+        )
         prepared.append((checkout, path, detached, drift, never_push, facts))
     receipts: list[dict[str, object]] = []
     # Every initialized submodule of this removal, for the proof that a
@@ -36321,10 +37593,32 @@ def _salvage_agent_slot(
                     receipt["ignored_files"] = entries
                 if name in ignored_archives:
                     receipt["ignored_archive"] = ignored_archives[name]
+    prepared_facts = {
+        checkout.name: facts for checkout, _p, _d, _dr, _n, facts in prepared
+    }
     for receipt in receipts:
         inventoried, inventoried_path = candidates_by_name[
             _as_str(receipt.get("checkout"), "salvage receipt.checkout")
         ]
+        receipts_facts = prepared_facts.get(inventoried.name)
+        entries = _dropped_history_entries(
+            reported_history.get(inventoried.name)
+            or (receipts_facts.private_history if receipts_facts else None),
+            receipts_facts,
+        )
+        dropped_value = _dropped_history_receipt(
+            entries,
+            archive_root or _default_salvage_archive_root(config),
+            record.machine,
+            record.slot,
+            record.generation,
+            inventoried.name,
+            emit_key=_dropped_history_admitted(config),
+        )
+        if dropped_value is not None:
+            receipt["dropped_private_history"] = dropped_value
+        else:
+            receipt.pop("dropped_private_history", None)
         receipt["ref_inventory"] = _ref_inventory(
             config, record, inventoried, inventoried_path, vcs, archive_root
         )
@@ -36486,6 +37780,22 @@ def _salvage_ownerless_checkout(
             "containing_remote_refs": list(containing),
             "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
             "private_history_counts": _facts_history_counts_obj(facts),
+            **(
+                {}
+                if (
+                    dropped_value := _dropped_history_receipt(
+                        _dropped_history_entries(facts.private_history, facts),
+                        _default_salvage_archive_root(config),
+                        config.machine,
+                        slot,
+                        None,
+                        checkout.name,
+                        emit_key=_dropped_history_admitted(config),
+                    )
+                )
+                is None
+                else {"dropped_private_history": dropped_value}
+            ),
         }
     if facts.aliased or not _salvage_push_allowed(config, facts.remote_authority):
         return _archive_salvage_locally(
@@ -36519,6 +37829,22 @@ def _salvage_ownerless_checkout(
         "containing_remote_refs": [],
         "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
         "private_history_counts": _facts_history_counts_obj(facts),
+        **(
+            {}
+            if (
+                dropped_value := _dropped_history_receipt(
+                    _dropped_history_entries(facts.private_history, facts),
+                    _default_salvage_archive_root(config),
+                    config.machine,
+                    slot,
+                    None,
+                    checkout.name,
+                    emit_key=_dropped_history_admitted(config),
+                )
+            )
+            is None
+            else {"dropped_private_history": dropped_value}
+        ),
         "destination": f"{checkout.remote}:{ref}",
     }
 
@@ -36562,6 +37888,27 @@ def _salvage_ownerless_worktree(
         )
         for candidate, candidate_path, detached in candidates
     ]
+    # Every checkout scanned gets a keep/drop line (#1785), as in the
+    # agent-slot path.
+    for candidate, _candidate_path, _detached, facts in prepared:
+        scan_history = facts.private_history
+        kept_count = len(scan_history.tips) if scan_history is not None else 0
+        dropped_entries = _dropped_history_entries(scan_history, facts)
+        unresolvable_count = (
+            len(scan_history.unresolvable) if scan_history is not None else 0
+        )
+        _print_count_line_once(
+            candidate.name,
+            f"scan:{kept_count}:{len(dropped_entries)}:{unresolvable_count}",
+            f"wrkslots: checkout {candidate.name}: private-history scan: "
+            f"kept {kept_count} commit(s), dropped {len(dropped_entries)} "
+            f"commit(s), unresolvable {unresolvable_count} commit(s)"
+            + (
+                "; nothing private"
+                if kept_count == 0 and not dropped_entries
+                else "; dropped commits are listed by SHA in the salvage archive"
+            ),
+        )
     return tuple(
         _salvage_ownerless_checkout(
             config,
@@ -36640,7 +37987,12 @@ def _assert_salvage_still_matches(
                 unlisted_names.add(unlisted.name)
                 targets.append((unlisted, unlisted_path, True, drift is not None))
         for nested_repo, nested_repo_path in _nested_module_repository_checkouts(
-            config, checkout, vcs, path
+            config,
+            checkout,
+            vcs,
+            path,
+            known_candidates={(target[0].name, target[1]) for target in targets},
+            known_candidate_names=set(by_name),
         ):
             if nested_repo.name in by_name and nested_repo.name not in {
                 target[0].name for target in targets
@@ -36709,17 +38061,95 @@ def _assert_salvage_still_matches(
         fall_back(checkout, path, facts, receipt)
         return True
 
+    _policy_hint = (
+        "; this mismatch can come from a different "
+        "private-history policy: the interrupted run may "
+        "have used --archive-unresolvable-private-history "
+        "or --discard-rescue-ref-history, so re-run "
+        "recover with the same flags the interrupted run used"
+    )
     for checkout, path, _allow_detached, facts in prepared:
         receipt = by_name[checkout.name]
+        if (
+            _allow_detached
+            and receipt.get("archive_reason")
+            not in (
+                _PRIVATE_HISTORY_ARCHIVE_REASON,
+                _CHECKOUT_DRIFT_ARCHIVE_REASON,
+            )
+            and _CHECKOUT_DRIFT_RECEIPT_KEY not in receipt
+            and not _checkout_is_self_sourced(config, checkout, path, vcs)
+        ):
+            # A declared submodule whose private history the current
+            # policy keeps, but whose receipt kept none of it, was
+            # salvaged under a different policy (#1785): resuming
+            # under this one would silently delete what it now keeps.
+            # A tip the receipt already explains as incomplete (the
+            # bundle partition excluded it under any policy) is not
+            # such a difference.
+            declared_history = _declared_submodule_private_history(
+                config, record, checkout, path, vcs, facts
+            )
+            if declared_history is not None and declared_history.tips:
+                dropped_reasons = _recorded_dropped_reasons(
+                    config, record, receipt, checkout.name
+                )
+                salvage_commit = str(receipt.get("salvage_commit", ""))
+                unexplained = []
+                for tip in declared_history.tips:
+                    if dropped_reasons.get(tip, ("", ""))[1] in (
+                        _MISSING_LOCALLY_REASON,
+                        _PROMISOR_GAP_REASON,
+                    ):
+                        continue
+                    if (
+                        salvage_commit
+                        and vcs._run(
+                            path,
+                            [
+                                "merge-base",
+                                "--is-ancestor",
+                                tip,
+                                salvage_commit,
+                            ],
+                            check=False,
+                            env_overrides={"GIT_NO_LAZY_FETCH": "1"},
+                        ).returncode
+                        == 0
+                    ):
+                        continue
+                    unexplained.append(tip)
+                if unexplained:
+                    raise Refusal(
+                        f"checkout {checkout.name} changed after salvage; "
+                        "preserve it and rerun remove so the changed state is "
+                        "published before deletion" + _policy_hint
+                    )
         expected = (
             _as_str(receipt.get("source_head"), "salvage receipt.source_head"),
             _as_str(receipt.get("status_sha256"), "salvage receipt.status_sha256"),
             _as_str(receipt.get("salvage_commit"), "salvage receipt.salvage_commit"),
         )
         if (facts.head, facts.status_digest, facts.commit) != expected:
+            recorded = _recorded_dropped_reasons(
+                config, record, receipt, checkout.name
+            )
+            policy_hint = ""
+            if any(
+                ref.startswith(_RESCUE_REF_PREFIXES)
+                or reason.startswith("unresolvable")
+                for ref, reason in recorded.values()
+            ):
+                    policy_hint = (
+                        "; this mismatch can come from a different "
+                        "private-history policy: the interrupted run may "
+                        "have used --archive-unresolvable-private-history "
+                        "or --discard-rescue-ref-history, so re-run "
+                        "recover with the same flags the interrupted run used"
+                    )
             raise Refusal(
                 f"checkout {checkout.name} changed after salvage; preserve it and rerun remove "
-                "so the changed state is published before deletion"
+                "so the changed state is published before deletion" + policy_hint
             )
         _assert_receipt_ignored_files(config, checkout, path, receipt, vcs)
         disposition = _as_str(
@@ -47618,6 +49048,10 @@ def _cmd_finisher(args: argparse.Namespace) -> int:
         retire_argv.append("--coordinator-authorized")
     if args.archive_private_history:
         retire_argv.append("--archive-private-history")
+    if getattr(args, "archive_unresolvable_private_history", False):
+        retire_argv.append("--archive-unresolvable-private-history")
+    if getattr(args, "discard_rescue_ref_history", False):
+        retire_argv.append("--discard-rescue-ref-history")
     if args.archive_drifted_checkouts:
         retire_argv.append("--archive-drifted-checkouts")
     code, retire_payload = _finisher_run_captured(retire_argv)
@@ -47812,6 +49246,7 @@ def _salvage_state_home_repo(
             raise Refusal(
                 f"salvage bundle for state home {repo} did not verify for {head}"
             )
+        _assert_bundle_verifies_against_surviving_stores(vcs, repo, temp_bundle)
         temp_bundle.replace(bundle)
     return bundle
 
@@ -62112,6 +63547,9 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                     ],
                 )
                 vcs._run(path, ["bundle", "verify", str(bundle)])
+                # Before anything relies on it (#1785): the bundle must
+                # also verify against stores that survive this checkout.
+                _assert_bundle_verifies_against_surviving_stores(vcs, path, bundle)
                 bundle_paths.append(str(bundle))
         ignored_entries: list[HandoffIgnoredFile] = []
         ignored_archive_entries: list[HandoffIgnoredArchive] = []
@@ -63221,7 +64659,15 @@ def _cmd_remove(
             )
         except Exception:
             mirror_root = None
-    with _remote_containment_scope(mirror_root):
+    with _remote_containment_scope(
+        mirror_root,
+        allow_unresolvable_private_history=bool(
+            getattr(args, "archive_unresolvable_private_history", False)
+        ),
+        discard_rescue_ref_history=bool(
+            getattr(args, "discard_rescue_ref_history", False)
+        ),
+    ):
         return _cmd_remove_in_scope(
             args,
             private_cleanup=private_cleanup,
@@ -63342,7 +64788,11 @@ def _prefetch_remote_containment(
             candidates.extend(
                 (nested_repo, nested_repo_path, True, False, True)
                 for nested_repo, nested_repo_path in _nested_module_repository_checkouts(
-                    config, checkout, vcs, path
+                    config,
+                    checkout,
+                    vcs,
+                    path,
+                    known_candidates={(item[0].name, item[1]) for item in candidates},
                 )
                 if nested_repo.name not in {item[0].name for item in candidates}
             )
@@ -91655,6 +93105,32 @@ def _cmd_classify_ownerless_validate_batch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_recover_with_policy(
+    args: argparse.Namespace,
+    *,
+    ownerless_batch_cleanup: _OwnerlessValidationBatchContext | None = None,
+    emit: bool = True,
+) -> int:
+    """`recover` under the operator's private-history policy (#1785).
+
+    Nothing is journaled: the interrupted run's policy is re-supplied
+    here, exactly as for remove, and a resume without it fails closed.
+    """
+
+    token = _PRIVATE_HISTORY_SCAN_POLICY.set(
+        (
+            bool(getattr(args, "archive_unresolvable_private_history", False)),
+            bool(getattr(args, "discard_rescue_ref_history", False)),
+        )
+    )
+    try:
+        return _cmd_recover(
+            args, ownerless_batch_cleanup=ownerless_batch_cleanup, emit=emit
+        )
+    finally:
+        _PRIVATE_HISTORY_SCAN_POLICY.reset(token)
+
+
 def _cmd_recover(
     args: argparse.Namespace,
     *,
@@ -92759,6 +94235,27 @@ _ARCHIVE_IGNORED_HELP = (
     "bytes of ignored files in total. Gitignored content inside the caches is deleted "
     "with the checkout as before and is not listed (default: off, ignored files "
     "outside the caches refuse removal)"
+)
+_ARCHIVE_UNRESOLVABLE_PRIVATE_HISTORY_HELP = (
+    "for an agent slot, do not refuse removal when a private-history tip "
+    "(a ref, reflog endpoint or pseudoref in a submodule's own repository) "
+    "names an object no local store holds: bundle what can be kept as with "
+    "--archive-private-history, and name every unresolvable tip by ref and "
+    "full SHA in the salvage receipt's dropped_private_history and on "
+    "stderr. Without this option such a tip refuses removal, naming every "
+    "unresolvable ref and SHA and this flag. A reflog in a promisor or "
+    "filtered clone can name a commit the store never held, so this is the "
+    "explicit way past that common case instead of a dead end (default: "
+    "off, unresolvable tips refuse)"
+)
+_DISCARD_RESCUE_REF_HISTORY_HELP = (
+    "for an agent slot, allow the private-history age/prune-expiry rule to "
+    "drop a commit named by a refs/rescue/* or refs/salvage/* ref, as it "
+    "may drop any other dangling commit. Without this option such a commit "
+    "is kept (bundled) like any other private commit, including when it is "
+    "only an ancestor of a dropped tip. Every dropped commit is listed by "
+    "full SHA and naming ref in the salvage receipt either way (default: "
+    "off, rescue/salvage-named commits are never age-dropped)"
 )
 _DISCARD_IGNORED_HELP = (
     "for an agent slot, delete gitignored files outside the known regenerable caches "
@@ -94586,6 +96083,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="as for remove, for every target: " + _ARCHIVE_PRIVATE_HISTORY_HELP,
     )
     retire_pending.add_argument(
+        "--archive-unresolvable-private-history",
+        action="store_true",
+        help="as for remove, for every target: " + _ARCHIVE_UNRESOLVABLE_PRIVATE_HISTORY_HELP,
+    )
+    retire_pending.add_argument(
+        "--discard-rescue-ref-history",
+        action="store_true",
+        help="as for remove, for every target: " + _DISCARD_RESCUE_REF_HISTORY_HELP,
+    )
+    retire_pending.add_argument(
         "--format",
         choices=("human", "json"),
         default="human",
@@ -94640,6 +96147,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--archive-private-history",
         action="store_true",
         help="as for retire-pending: " + _ARCHIVE_PRIVATE_HISTORY_HELP,
+    )
+    finisher.add_argument(
+        "--archive-unresolvable-private-history",
+        action="store_true",
+        help="as for retire-pending: " + _ARCHIVE_UNRESOLVABLE_PRIVATE_HISTORY_HELP,
+    )
+    finisher.add_argument(
+        "--discard-rescue-ref-history",
+        action="store_true",
+        help="as for retire-pending: " + _DISCARD_RESCUE_REF_HISTORY_HELP,
     )
     finisher.add_argument(
         "--archive-drifted-checkouts",
@@ -95148,6 +96665,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=_ARCHIVE_PRIVATE_HISTORY_HELP,
     )
     remove.add_argument(
+        "--archive-unresolvable-private-history",
+        action="store_true",
+        help=_ARCHIVE_UNRESOLVABLE_PRIVATE_HISTORY_HELP,
+    )
+    remove.add_argument(
+        "--discard-rescue-ref-history",
+        action="store_true",
+        help=_DISCARD_RESCUE_REF_HISTORY_HELP,
+    )
+    remove.add_argument(
         "--archive-ignored",
         action="store_true",
         help=_ARCHIVE_IGNORED_HELP,
@@ -95347,6 +96874,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--archive-private-history",
         action="store_true",
         help="as for remove, for every slot of the batch: " + _ARCHIVE_PRIVATE_HISTORY_HELP,
+    )
+    remove_agent_batch.add_argument(
+        "--archive-unresolvable-private-history",
+        action="store_true",
+        help="as for remove, for every slot of the batch: " + _ARCHIVE_UNRESOLVABLE_PRIVATE_HISTORY_HELP,
+    )
+    remove_agent_batch.add_argument(
+        "--discard-rescue-ref-history",
+        action="store_true",
+        help="as for remove, for every slot of the batch: " + _DISCARD_RESCUE_REF_HISTORY_HELP,
     )
     remove_agent_batch.add_argument(
         "--archive-ignored",
@@ -95971,6 +97508,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="discard an incomplete temp write only when its prior durable file is valid",
     )
     recover.add_argument(
+        "--archive-unresolvable-private-history",
+        action="store_true",
+        help="as for remove: resume a removal whose interrupted run used it, with the same private-history policy",
+    )
+    recover.add_argument(
+        "--discard-rescue-ref-history",
+        action="store_true",
+        help="as for remove: resume a removal whose interrupted run used it, with the same private-history policy",
+    )
+    recover.add_argument(
         "--override-unjudgeable-seal",
         action="store_true",
         help=(
@@ -96076,7 +97623,7 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "published; no files are changed"
         ),
     )
-    recover.set_defaults(handler=_cmd_recover)
+    recover.set_defaults(handler=_cmd_recover_with_policy)
     config_parser = subparsers.add_parser(
         "config",
         help=f"convert or regenerate {CONFIG_NAME}",

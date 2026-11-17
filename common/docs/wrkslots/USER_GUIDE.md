@@ -1775,10 +1775,15 @@ tries the recorded remote first. Only after a salvage push refuses, for any reas
 initial fetch fails in the transport, does it write one Git bundle per affected
 repository under the supplied root. The bundle is thin when the remote proves a
 prerequisite at that moment (a ref it advertises under refs/heads/*, refs/tags/*,
-refs/salvage/* or refs/rescue/* whose commit is an ancestor of the salvage commit):
+refs/salvage/* or refs/rescue/* whose commit is an ancestor of the salvage commit
+and is held, with its tree, by an object store that survives this removal — the
+shared/source store, not merely a store inside the slot being deleted):
 it then holds only the commits the prerequisites do not reach, the receipt records
 the proof under `thin_bundle`, and verification unbundles it against those
-prerequisites. With no such proof the bundle is self-contained, as before. Commits
+prerequisites in surviving stores only. A prerequisite only the slot's own store
+holds never thins a bundle, and every salvage bundle is verified against the
+surviving stores before anything is deleted, refusing when that fails. With no
+such proof the bundle is self-contained, as before. Commits
 reachable only from the remote's refs/rescue/* or refs/salvage/* count as published
 wherever wrkslots asks whether history is already on a remote. A fetch failure counts as a transport failure only when Git's
 combined output reports a proxy `CONNECT` refusal, an unresolved host, or a refused, timed-out, or
@@ -2042,6 +2047,22 @@ by committer date. Every salvage receipt counts the tips in
 `stale fetched past prune expiry`, `dangling, held by source store`, `dangling, slot-only,
 kept`, `dangling, slot-only, past prune expiry`), and removal prints how many it is not
 keeping before anything is deleted.
+
+A commit named by a `refs/rescue/*` or `refs/salvage/*` ref is an exception to that age rule:
+it is never dropped for age, including when it is only an ancestor of a dropped tip, unless
+`--discard-rescue-ref-history` is given. Every commit removal drops, for any reason, is listed
+by full SHA and naming ref in the salvage receipt's `dropped_private_history` — up to 64
+entries inline, beyond that as a bounded summary (count and canonical digest) plus a manifest
+sidecar at `file` in the salvage archive holding the full list. That receipt key is a level-3
+record field: it is written only when the project's `writer_ceiling` configuration is at
+least 3; below that ceiling the same list is recorded in the `dropped-history/` manifest
+sidecar alone, a file no record reader parses. And every checkout scanned
+prints a `private-history scan:` keep/drop line, with `nothing private` when there is nothing.
+A tip (a ref, reflog endpoint or pseudoref) whose object no local store holds refuses removal
+by default, naming every such ref and full SHA; passing
+`--archive-unresolvable-private-history` bundles what can be kept instead and names every
+unresolvable tip in `dropped_private_history` and on stderr, which is the way past reflog
+names in a promisor or filtered clone that name commits the store never held.
 
 To restore the kept history, fetch the archive ref that the receipt (`archive_bundle`,
 `archive_ref`) names from the bundle into any clone of the submodule's repository. The salvage

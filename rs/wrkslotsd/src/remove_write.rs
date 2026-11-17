@@ -284,6 +284,7 @@ fn git_unchecked(repo: &Path, args: &[&str]) -> Result<(Option<i32>, String, Str
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_NO_REPLACE_OBJECTS", "1");
     let output = command
         .output()
@@ -3168,13 +3169,16 @@ pub(crate) fn audit_private_history_reason(
     checkout_path: &Path,
 ) -> Option<String> {
     for (relative, sub_path) in declared_submodules_recursive(checkout_path) {
-        let kept = git(&sub_path, &["rev-parse", "--verify", "HEAD"])
-            .map(|out| out.trim().to_string())
-            .unwrap_or_default();
-        if kept.is_empty() {
-            continue;
-        }
-        match submodule_private_history(cfg, checkout_path, &sub_path, &kept) {
+        let kept = match git(&sub_path, &["rev-parse", "--verify", "HEAD"]) {
+            Ok(out) if !out.trim().is_empty() => out.trim().to_string(),
+            Ok(_) => continue,
+            Err(error) => {
+                return Some(format!(
+                    "submodule {checkout_name}/{relative} cannot be read: {error}; preserve it"
+                ))
+            }
+        };
+        match submodule_private_history(cfg, checkout_path, &sub_path, &kept, false) {
             Ok(Some(history)) => {
                 let label = format!("{checkout_name}/{relative}");
                 return Some(private_history_refusal(slot, &label, &history));
@@ -3218,11 +3222,93 @@ fn reflog_endpoints(logs: &Path) -> std::collections::BTreeSet<String> {
     endpoints
 }
 
+/// Peel each object to its commit in one batch check (#1785), with
+/// lazy fetching off; a missing or non-commit object maps to None.
+/// One Git process for every candidate, not one per ref.
+fn peel_to_commits_batch(
+    repo: &Path,
+    shas: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeMap<String, Option<String>>> {
+    let mut peeled = std::collections::BTreeMap::new();
+    if shas.is_empty() {
+        return Ok(peeled);
+    }
+    let mut command = Command::new("git");
+    command
+        .args([
+            "--no-replace-objects",
+            "-c",
+            "core.useReplaceRefs=false",
+            "-C",
+        ])
+        .arg(repo)
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+        .env_clear();
+    for (key, value) in std::env::vars() {
+        if !key.starts_with("GIT_") {
+            command.env(key, value);
+        }
+    }
+    command
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot execute Git: {error}"))?;
+    // Write stdin on its own thread (#1785): past roughly a pipe
+    // buffer of candidates, writing everything before reading would
+    // deadlock against the child's batch output.
+    let mut input = String::new();
+    for sha in shas {
+        input.push_str(sha);
+        input.push('\n');
+        input.push_str(sha);
+        input.push_str("^{commit}\n");
+    }
+    let mut stdin = child.stdin.take().expect("stdin");
+    let writer = std::thread::spawn(move || {
+        use std::io::Write as _;
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("cannot execute Git: {error}"))?;
+    let _ = writer.join();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    if output.status.code() != Some(0) || lines.len() != 2 * shas.len() {
+        // A failed or short batch must never read as "every object
+        // is missing" (#1785).
+        return Err(format!(
+            "cannot batch-check objects at {}: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    for (position, sha) in shas.iter().enumerate() {
+        let commit_line = lines.get(2 * position + 1).copied().unwrap_or("");
+        let commit = commit_line.split(' ').next().unwrap_or("");
+        peeled.insert(sha.clone(), is_sha(commit).then(|| commit.to_string()));
+    }
+    Ok(peeled)
+}
+
 struct PrivateHistory {
     commits: usize,
     refs: Vec<String>,
     unreferenced: usize,
     remote_unchecked: Option<(String, String)>,
+    /// (name, commit, reason) tips no local store can resolve (#1785);
+    /// empty unless the scan proceeded past them with the explicit
+    /// --archive-unresolvable-private-history flag.
+    unresolvable: Vec<(String, String, String)>,
 }
 
 /// The commits only a declared submodule's own repository holds
@@ -3237,6 +3323,7 @@ fn submodule_private_history(
     _checkout_path: &Path,
     sub_path: &Path,
     kept_head: &str,
+    allow_unresolvable: bool,
 ) -> Result<Option<PrivateHistory>> {
     let common = {
         let out = git(sub_path, &["rev-parse", "--git-common-dir"])?;
@@ -3265,29 +3352,68 @@ fn submodule_private_history(
             }
         }
     }
-    let mut ref_commits: Vec<(String, String)> = Vec::new();
+    // Refs are listed without the peeled format, which crashes Git
+    // on a missing object (#1785); each object is peeled explicitly
+    // with lazy fetching off (git_unchecked sets GIT_NO_LAZY_FETCH).
+    let mut unresolvable: Vec<(String, String, String)> = Vec::new();
+    // One batch peel for every reflog endpoint and ref object (#1785).
+    let mut directs: Vec<(String, String)> = Vec::new();
     for line in git(
         sub_path,
-        &[
-            "for-each-ref",
-            "--format=%(objectname) %(*objectname) %(refname)",
-        ],
+        &["for-each-ref", "--format=%(objectname) %(refname)"],
     )?
     .lines()
     {
-        let mut fields = line.splitn(3, ' ');
-        let (Some(direct), peeled, Some(refname)) =
-            (fields.next(), fields.next().unwrap_or(""), fields.next())
-        else {
+        let Some((direct, refname)) = line.split_once(' ') else {
             continue;
         };
-        if is_sha(direct) {
-            positives.insert(direct.to_string());
+        if is_sha(direct) && !refname.is_empty() {
+            directs.push((direct.to_string(), refname.to_string()));
         }
-        let tip = if is_sha(peeled) { peeled } else { direct };
-        if is_sha(tip) {
-            ref_commits.push((refname.to_string(), tip.to_string()));
+    }
+    let mut candidates: std::collections::BTreeSet<String> = positives.clone();
+    candidates.extend(directs.iter().map(|(direct, _)| direct.clone()));
+    let peeled = peel_to_commits_batch(sub_path, &candidates)?;
+    for endpoint in &candidates {
+        if !positives.contains(endpoint) {
+            continue;
         }
+        if peeled.get(endpoint).cloned().flatten().is_none() {
+            unresolvable.push((
+                "reflog".to_string(),
+                endpoint.clone(),
+                "object missing locally or not a commit".to_string(),
+            ));
+            positives.remove(endpoint);
+        }
+    }
+    let mut ref_commits: Vec<(String, String)> = Vec::new();
+    for (direct, refname) in &directs {
+        match peeled.get(direct).cloned().flatten() {
+            Some(tip) => {
+                positives.insert(tip.clone());
+                ref_commits.push((refname.clone(), tip));
+            }
+            None => {
+                unresolvable.push((
+                    refname.clone(),
+                    direct.clone(),
+                    "object missing locally or not a commit".to_string(),
+                ));
+            }
+        }
+    }
+    if !unresolvable.is_empty() && !allow_unresolvable {
+        let named = unresolvable
+            .iter()
+            .map(|(name, commit, reason)| format!("{name} {commit} ({reason})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "private history at {} has {} unresolvable tip(s): {named}. Removal would delete the store that names them without knowing what they hold, so nothing was removed. remedy: restore the missing objects, or rerun remove with --archive-unresolvable-private-history to bundle what can be kept and name every unresolvable tip in the salvage receipt",
+            sub_path.display(),
+            unresolvable.len()
+        ));
     }
     // Every commit object, excluding salvage's own commits.
     let all_commits = git(
@@ -3326,6 +3452,7 @@ fn submodule_private_history(
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
         let mut child = command
@@ -3423,6 +3550,7 @@ fn submodule_private_history(
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_NO_REPLACE_OBJECTS", "1");
         for (key, value) in &env {
             command.env(key, value);
@@ -3571,7 +3699,16 @@ fn submodule_private_history(
         }
     }
     if tips.is_empty() {
-        return Ok(None);
+        if unresolvable.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(PrivateHistory {
+            commits: 0,
+            refs: Vec::new(),
+            unreferenced: 0,
+            remote_unchecked,
+            unresolvable,
+        }));
     }
     let _reflog = reflog_endpoints(&common.join("logs"));
     let mut refs: Vec<String> = Vec::new();
@@ -3582,9 +3719,16 @@ fn submodule_private_history(
             .filter(|(_, commit)| commit == tip)
             .map(|(name, _)| name)
             .collect();
-        let named = naming
-            .iter()
-            .any(|name| name.starts_with("refs/heads/") || name.starts_with("refs/tags/"));
+        // A rescue/salvage ref names its commit like a branch or tag
+        // (#1785): this edition never age-drops a tip, and a named
+        // rescue tip must not fall into the unreferenced count.
+        let named = naming.iter().any(|name| {
+            name.starts_with("refs/heads/")
+                || name.starts_with("refs/tags/")
+                || name.starts_with("refs/rescue/")
+                || name.starts_with("refs/salvage/")
+                || *name == "refs/stash"
+        });
         if named {
             for name in naming {
                 if !refs.contains(name) {
@@ -3601,7 +3745,32 @@ fn submodule_private_history(
         refs,
         unreferenced,
         remote_unchecked,
+        unresolvable,
     }))
+}
+
+/// The receipt value for dropped private-history commits (#1785),
+/// Python `_dropped_history_obj`'s shape: count, canonical digest
+/// and inline entries ((commit, ref, reason) triples). Computed
+/// from the scans this gate actually ran, never a bare count alone.
+fn dropped_history_value(entries: &[(String, String, String)]) -> Value {
+    let mut ordered: Vec<&(String, String, String)> = entries.iter().collect();
+    ordered.sort();
+    let mut lines = String::new();
+    for (commit, reference, reason) in &ordered {
+        lines.push_str(&format!("{commit} {reference} {reason}\n"));
+    }
+    json!({
+        "count": ordered.len(),
+        "sha256": format!("{:x}", Sha256::digest(lines.as_bytes())),
+        "entries": ordered
+            .iter()
+            .take(64)
+            .map(|(commit, reference, reason)| {
+                json!({"commit": commit, "ref": reference, "reason": reason})
+            })
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// Python `_private_history_refusal`'s exact wording (#1255).
@@ -3635,6 +3804,15 @@ fn private_history_refusal(slot: &str, sub_name: &str, history: &PrivateHistory)
                 history.unreferenced
             ));
         }
+        if !history.unresolvable.is_empty() {
+            let named = history
+                .unresolvable
+                .iter()
+                .map(|(name, commit, _reason)| format!("{name} {commit}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            text.push_str(&format!("; unresolvable tips: {named}"));
+        }
         text
     };
     let unchecked = match &history.remote_unchecked {
@@ -3658,6 +3836,7 @@ fn salvage_gate(
     ignored_context: &IgnoredContext<'_>,
     handoff: &Value,
     slot: &str,
+    allow_unresolvable: bool,
 ) -> Result<Value> {
     let name = checkout
         .get("name")
@@ -3800,14 +3979,26 @@ fn salvage_gate(
             .and_then(|parent| parent.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        for (sub_name, sub_path) in declared_submodules(&path) {
-            let kept = git(&sub_path, &["rev-parse", "--verify", "HEAD"])
-                .map(|out| out.trim().to_string())
-                .unwrap_or_default();
-            if kept.is_empty() {
-                continue;
-            }
-            if let Some(history) = submodule_private_history(cfg, &path, &sub_path, &kept)? {
+        // Recursive (#1785): a nested submodule's private history
+        // must not pass this gate unchecked, as audit judges it.
+        for (sub_name, sub_path) in declared_submodules_recursive(&path) {
+            let kept = match git(&sub_path, &["rev-parse", "--verify", "HEAD"]) {
+                Ok(out) if !out.trim().is_empty() => out.trim().to_string(),
+                Ok(_) => {
+                    eprintln!(
+                        "wrkslots: checkout {name}/{sub_name}: skipping private-history scan: no HEAD is checked out"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "submodule {name}/{sub_name} cannot be read: {error}; preserve it"
+                    ));
+                }
+            };
+            if let Some(history) =
+                submodule_private_history(cfg, &path, &sub_path, &kept, allow_unresolvable)?
+            {
                 let relative = sub_path
                     .strip_prefix(&path)
                     .map(|rel| rel.to_string_lossy().into_owned())
@@ -3838,6 +4029,9 @@ fn salvage_gate(
         "disposition": "already-published",
         "remote_ref": Value::Null,
         "excluded_incomplete_history": [],
+        // This edition keeps every private-history tip it finds (no
+        // age drop); the gate above refused any submodule history, so
+        // a receipt emitted here scanned and dropped nothing (#1785).
         "private_history_counts": {
             "named refs": 0,
             "stale pushed": 0,
@@ -3853,6 +4047,15 @@ fn salvage_gate(
             .unwrap_or(json!([])),
         "ref_inventory": ref_inventory(&path, &name)?,
     });
+    // Level 3 (#1788): only at the writer ceiling that admits it.
+    if writer_ceiling(config) >= 3 {
+        if let Some(object) = receipt.as_object_mut() {
+            object.insert(
+                "dropped_private_history".to_string(),
+                dropped_history_value(&[]),
+            );
+        }
+    }
     if !ignored_files.is_empty() {
         let disposition = match effective_mode {
             IgnoredMode::Archive => "archived",
@@ -4430,6 +4633,7 @@ fn prepare_remove(
     expected_generation: i64,
     coordinator_pid: i64,
     ignored_mode: IgnoredMode,
+    allow_unresolvable: bool,
 ) -> Result<PreparedRemove> {
     validate_global(root, cfg)?;
     let active = active_document(root, cfg, selected)?;
@@ -4611,6 +4815,7 @@ fn prepare_remove(
             &ignored_context,
             &handoff_value,
             slot,
+            allow_unresolvable,
         )?);
     }
     assert_slot_unused(&slot_path, coordinator_pid)?;
@@ -4640,6 +4845,7 @@ pub(crate) fn remove_slot(
     coordinator_pid: i64,
     expected_generation: i64,
     ignored_mode: IgnoredMode,
+    allow_unresolvable: bool,
 ) -> Result<Value> {
     require_fixture()?;
     let host_context = [
@@ -4677,6 +4883,7 @@ pub(crate) fn remove_slot(
         expected_generation,
         coordinator_pid,
         ignored_mode,
+        allow_unresolvable,
     )?;
     // --wait-lock also covers a live finish journal (#1755): wait for
     // it here, holding no registry lock, bounded by the same budget,
@@ -5544,12 +5751,124 @@ mod private_history_tests {
             eden_mount_root: None,
             validation_exclusion_roots: Vec::new(),
         };
-        let history = submodule_private_history(&cfg, &repo, &repo, &kept)
+        let history = submodule_private_history(&cfg, &repo, &repo, &kept, false)
             .unwrap()
             .expect("dangling commits are private history");
         assert_eq!(history.commits, 2);
         assert_eq!(history.unreferenced, 1);
         assert!(history.refs.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn fixture(name: &str) -> (std::path::PathBuf, std::path::PathBuf, String, super::Cfg) {
+        let base = std::env::temp_dir().join(format!(
+            "wrkslots-history-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"], None);
+        std::fs::write(repo.join("f.txt"), "x\n").unwrap();
+        git(&repo, &["add", "f.txt"], None);
+        git(&repo, &["commit", "-q", "-m", "base"], None);
+        let kept = git(&repo, &["rev-parse", "HEAD"], None);
+        let cfg = super::Cfg {
+            root: base.clone(),
+            worktrees: base.clone(),
+            control: base.clone(),
+            layout: "flat".to_string(),
+            default_remote: "origin".to_string(),
+            default_landed_ref: "refs/heads/main".to_string(),
+            machine: "testhost".to_string(),
+            harness_repo: None,
+            eden_mount_root: None,
+            validation_exclusion_roots: Vec::new(),
+        };
+        (base, repo, kept, cfg)
+    }
+
+    #[test]
+    fn writer_ceiling_uses_the_schema_level_default() {
+        // #1788: absent means this build's level; a project may pin a
+        // lower ceiling, and only then is the level-3
+        // dropped_private_history receipt key withheld.
+        assert_eq!(
+            super::writer_ceiling(&serde_json::json!({})),
+            super::SCHEMA_LEVEL
+        );
+        assert_eq!(
+            super::writer_ceiling(&serde_json::json!({"writer_ceiling": 3})),
+            3
+        );
+        assert_eq!(
+            super::writer_ceiling(&serde_json::json!({"writer_ceiling": 2})),
+            2
+        );
+    }
+
+    #[test]
+    fn private_history_names_rescue_refs() {
+        let (base, repo, kept, cfg) = fixture("rescue");
+        let tree = git(&repo, &["rev-parse", "HEAD^{tree}"], None);
+        let dangling = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &kept],
+            Some("rescued\n"),
+        );
+        git(
+            &repo,
+            &["update-ref", "refs/rescue/inventory/dangling-1", &dangling],
+            None,
+        );
+        let history = submodule_private_history(&cfg, &repo, &repo, &kept, false)
+            .unwrap()
+            .expect("rescue-named commits are private history");
+        assert_eq!(
+            history.refs,
+            vec!["refs/rescue/inventory/dangling-1".to_string()]
+        );
+        assert_eq!(history.unreferenced, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn private_history_refuses_a_missing_rescue_tip_and_proceeds_with_flag() {
+        let (base, repo, kept, cfg) = fixture("missing");
+        // A commit object is created here, so a loose rescue ref can be
+        // planted in the scan repository pointing at an object it does
+        // not hold (only writes through Git would refuse) — write the ref
+        // file directly, as an inventory written elsewhere would.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        git(&elsewhere, &["init", "-q", "-b", "main"], None);
+        std::fs::write(elsewhere.join("e.txt"), "e\n").unwrap();
+        git(&elsewhere, &["add", "e.txt"], None);
+        git(&elsewhere, &["commit", "-q", "-m", "elsewhere"], None);
+        let missing = git(&elsewhere, &["rev-parse", "HEAD"], None);
+        let refs_dir = repo.join(".git/refs/rescue");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(refs_dir.join("missing-1"), format!("{missing}\n")).unwrap();
+        let error = match submodule_private_history(&cfg, &repo, &repo, &kept, false) {
+            Ok(_) => panic!("a missing tip refuses by default"),
+            Err(error) => error,
+        };
+        assert!(error.contains("refs/rescue/missing-1"), "{error}");
+        assert!(error.contains(&missing), "{error}");
+        assert!(
+            error.contains("--archive-unresolvable-private-history"),
+            "{error}"
+        );
+        let history = submodule_private_history(&cfg, &repo, &repo, &kept, true)
+            .unwrap()
+            .expect("flagged scan proceeds past the missing tip");
+        assert_eq!(history.unresolvable.len(), 1);
+        assert_eq!(history.unresolvable[0].0, "refs/rescue/missing-1");
+        assert_eq!(history.unresolvable[0].1, missing);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

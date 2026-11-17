@@ -150,6 +150,82 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(output.stdout)
 }
 
+/// Verify a salvage bundle against only the stores that survive
+/// removal of `path` (#1785): a bundle checked in the checkout's own
+/// store proves nothing once that store is deleted. The scratch
+/// repository's alternates are exactly the surviving stores.
+fn verify_bundle_against_surviving(
+    cfg: &Cfg,
+    checkout: &Value,
+    path: &Path,
+    bundle: &Path,
+) -> Result<()> {
+    let git_dir_raw = git(path, &["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = PathBuf::from(git_dir_raw.trim());
+    let common_raw = git(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common_named = PathBuf::from(common_raw.trim());
+    let common = if common_named.is_absolute() {
+        common_named
+    } else {
+        path.join(common_named)
+    };
+    let mut surviving: Vec<PathBuf> = Vec::new();
+    if common != git_dir {
+        surviving.push(common.join("objects"));
+    } else if let Some(repository_raw) = checkout.get("repository").and_then(Value::as_str) {
+        if let Ok((_stored, repository)) = stored_repository_path(cfg, repository_raw) {
+            let repo_common_raw = git(
+                &repository,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )?;
+            let repo_named = PathBuf::from(repo_common_raw.trim());
+            let repo_common = if repo_named.is_absolute() {
+                repo_named
+            } else {
+                repository.join(repo_named)
+            };
+            let objects = repo_common.join("objects");
+            if objects != common.join("objects") {
+                surviving.push(objects);
+            }
+        }
+    }
+    let scratch = bundle.with_extension(format!("surviving-verify-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let result = (|| -> Result<()> {
+        std::fs::create_dir_all(&scratch)
+            .map_err(|error| format!("cannot create bundle verify scratch: {error}"))?;
+        let restored = scratch.join("restored.git");
+        git(
+            &scratch,
+            &["init", "--bare", "--", &restored.to_string_lossy()],
+        )?;
+        if !surviving.is_empty() {
+            let alternates = restored.join("objects/info/alternates");
+            let text = surviving
+                .iter()
+                .map(|store| format!("{}\n", store.display()))
+                .collect::<String>();
+            std::fs::write(&alternates, text)
+                .map_err(|error| format!("cannot write bundle verify alternates: {error}"))?;
+        }
+        git(&restored, &["bundle", "verify", &bundle.to_string_lossy()])
+            .map_err(|error| {
+                format!(
+                    "salvage bundle {} does not verify against the object stores that survive removal of checkout at {}: {error}; nothing was removed",
+                    bundle.display(),
+                    path.display()
+                )
+            })?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
 fn is_sha(value: &str) -> bool {
     value.len() == 40
         && value
@@ -2754,6 +2830,9 @@ pub(crate) fn finish_slot(
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             git(path, &arg_refs)?;
             git(path, &["bundle", "verify", &bundle.to_string_lossy()])?;
+            // Before anything relies on it (#1785): it must also
+            // verify against stores that survive this checkout.
+            verify_bundle_against_surviving(&cfg, checkout, path, &bundle)?;
             bundle_paths.push(bundle.to_string_lossy().into_owned());
         }
     }

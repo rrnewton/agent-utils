@@ -511,6 +511,7 @@
         "py/wrkslots/tests/test_remove_write_rust.py",
         "py/wrkslots/tests/test_retire_freeze.py",
         "py/wrkslots/tests/test_retire_lock_scope.py",
+        "py/wrkslots/tests/test_review1785_regressions.py",
         "py/wrkslots/tests/test_sandbox_cpu_quotas.py",
         "py/wrkslots/tests/test_sandbox_gate_deny.py",
         "py/wrkslots/tests/test_sandbox_root_spec.py",

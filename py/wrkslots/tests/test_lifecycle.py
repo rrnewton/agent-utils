@@ -65167,6 +65167,46 @@ def test_archive_drifted_checkouts_recovery_refuses_new_submodule_history(
     assert git(component, "rev-parse", "late-work").stdout.strip() == late
 
 
+def test_recover_without_discard_flag_refuses_after_interrupted_discard_remove(
+    tmp_path: Path,
+) -> None:
+    """#1785: an interrupted remove run with --discard-rescue-ref-history,
+    resumed without the flag, refuses naming both policy flags and the
+    same-flags remedy, and deletes nothing. Nothing is journaled about
+    the policy; the operator re-supplies it."""
+
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    base = git(component, "rev-parse", "HEAD").stdout.strip()
+    git(component, "checkout", "-q", "-b", "tmp-rescue-drop")
+    rescued = commit_local(component, "rescued.txt", "rescued\n", "rescued work")
+    git(component, "checkout", "-q", "--detach", base)
+    git(component, "branch", "-q", "-D", "tmp-rescue-drop")
+    git(component, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    _set_loose_mtime(component, rescued, _KEPT_SET_OLD)
+    git(component, "update-ref", "refs/rescue/inventory/dropped-tip", rescued)
+
+    interrupted = _remove_archiving(
+        project,
+        "--archive-ignored",
+        "--archive-private-history",
+        "--discard-rescue-ref-history",
+        "--no-lock-budget",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-finish-journal"},
+    )
+    assert interrupted.returncode == 86, interrupted.stdout + interrupted.stderr
+    assert tree.is_dir()
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode != 0, recovered.stdout + recovered.stderr
+    assert "changed after salvage" in recovered.stderr
+    assert "--archive-unresolvable-private-history" in recovered.stderr
+    assert "--discard-rescue-ref-history" in recovered.stderr
+    assert "same flags" in recovered.stderr
+    assert tree.is_dir()
+    assert git(component, "rev-parse", "refs/rescue/inventory/dropped-tip").stdout.strip() == rescued
+
+
 @pytest.mark.parametrize("state", ("staged-then-deleted", "force-added-then-edited"))
 def test_archive_drifted_checkouts_keeps_the_checkouts_own_index(
     tmp_path: Path, state: str
@@ -65659,6 +65699,53 @@ def test_archive_private_history_writes_a_thin_bundle_when_proven(tmp_path: Path
     assert git(restored, "merge-base", "--is-ancestor", branch_commit, salvage, check=False).returncode == 0
 
 
+def test_archive_private_history_never_thins_against_a_slot_only_prerequisite(
+    tmp_path: Path,
+) -> None:
+    """#1785: a remote-advertised prerequisite that only the slot's own
+    store (and the bare remote) holds, not the surviving source store,
+    must not thin the bundle: it thins only against the surviving tip,
+    so the bundle itself carries the rescue commit."""
+
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    branch_commit, _tag_commit = _leaf_private_branch_and_tag(leaf)
+    base = git(leaf, "rev-parse", "HEAD").stdout.strip()
+    git(leaf, "push", "-q", "origin", f"{branch_commit}:refs/rescue/slot-only-tip")
+    # The surviving source store (the primary's own leaf clone) does
+    # not hold the rescue commit; only the slot store and the remote do.
+    parent_leaf = project / "repo" / "component" / "leaf"
+    assert (
+        git(parent_leaf, "cat-file", "-e", branch_commit, check=False).returncode != 0
+    )
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    thin = receipt.get("thin_bundle")
+    if isinstance(thin, dict):
+        assert thin["prerequisites"] == [base]
+    # Either a complete bundle, or one thinned only against `base`:
+    # restoring from the surviving source store alone (which never
+    # held the rescue commit) must still reach it through the bundle.
+    restored = tmp_path / "restored-slot-only-prereq.git"
+    parent_store = (
+        project / "repo" / ".git" / "modules" / "component" / "modules" / "leaf"
+    )
+    git(tmp_path, "clone", "-q", "--bare", str(parent_store), str(restored))
+    git(
+        restored,
+        "fetch",
+        str(receipt["archive_bundle"]),
+        f"{receipt['archive_ref']}:{receipt['archive_ref']}",
+    )
+    salvage = str(receipt["salvage_commit"])
+    # The fetch itself is the check: thinned against the slot-only
+    # commit, it would fail here for lack of that prerequisite.
+    assert git(restored, "cat-file", "-e", salvage, check=False).returncode == 0
+
+
 def test_archive_private_history_falls_back_to_a_complete_bundle(tmp_path: Path) -> None:
     """#1367: with no proven prerequisite the bundle stays self-contained."""
     project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
@@ -65870,6 +65957,408 @@ def test_archive_private_history_bundles_a_declared_submodule(tmp_path: Path) ->
     salvage = str(receipt["salvage_commit"])
     parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[2:]
     assert sorted(parents) == sorted((branch_commit, tag_commit))
+
+
+def test_private_history_keeps_a_rescue_named_ancestor_of_an_old_tip(
+    tmp_path: Path,
+) -> None:
+    """#1785: a rescue-named commit is never age-dropped, even when it is
+    only an ancestor of the unnamed maximal tip that reaches it; the
+    explicitly named discard flag is what lets the age rule drop it."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    git(slot, "checkout", "-q", "-b", "tmp-rescue-chain")
+    ancestor = commit_local(slot, "ancestor.txt", "ancestor\n", "rescue ancestor")
+    tip = commit_local(slot, "tip.txt", "tip\n", "rescue tip")
+    git(slot, "checkout", "-q", "--detach", base)
+    git(slot, "branch", "-q", "-D", "tmp-rescue-chain")
+    git(slot, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    for commit in (ancestor, tip):
+        _set_loose_mtime(slot, commit, _KEPT_SET_OLD)
+    git(slot, "update-ref", "refs/rescue/inventory/reflog-ancestor", ancestor)
+
+    history = _private_history(slot, base, parent)
+
+    assert history is not None
+    assert history.tips == (tip,)
+    assert history.refs == (("refs/rescue/inventory/reflog-ancestor", ancestor),)
+    assert dict(history.counts)["dangling, slot-only, past prune expiry"] == 0
+    assert history.not_kept == ()
+
+    discarded = wrkslots._submodule_private_history(
+        wrkslots._GitVcs(),
+        slot,
+        base,
+        (parent,),
+        remote_cover=lambda tips: wrkslots._RemoteCoverage(
+            "origin", frozenset(), frozenset({"refs/heads/main"})
+        ),
+        now=_KEPT_SET_FIXED_NOW,
+        discard_rescue_refs=True,
+    )
+
+    assert discarded is not None
+    assert discarded.tips == ()
+    assert discarded.not_kept == (
+        ("dangling, slot-only, past prune expiry", tip, ""),
+    )
+    dropped = wrkslots._dropped_history_entries(discarded)
+    assert {entry["commit"] for entry in dropped} == {tip}
+
+
+def test_private_history_missing_rescue_ref_refuses_and_flag_records_it(
+    tmp_path: Path,
+) -> None:
+    """#1785: a rescue ref whose object no local store holds refuses by
+    default, naming the ref, the full SHA and the flag that proceeds;
+    with the flag the scan records it as unresolvable instead."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    elsewhere = tmp_path / "elsewhere-rescue"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(elsewhere)],
+        check=True, capture_output=True, text=True,
+    )
+    git(elsewhere, "config", "user.name", "Wrkslots Test")
+    git(elsewhere, "config", "user.email", "wrkslots@example.invalid")
+    missing = commit_local(elsewhere, "else.txt", "else\n", "elsewhere commit")
+    assert git(slot, "cat-file", "-e", missing, check=False).returncode != 0
+    gitdir = Path(git(slot, "rev-parse", "--absolute-git-dir").stdout.strip())
+    planted = gitdir / "refs" / "rescue" / "missing-1"
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text(missing + "\n", encoding="utf-8")
+
+    with pytest.raises(wrkslots.Refusal) as refused:
+        _private_history(slot, base, parent)
+    message = str(refused.value)
+    assert "refs/rescue/missing-1" in message
+    assert missing in message
+    assert "--archive-unresolvable-private-history" in message
+
+    allowed = wrkslots._submodule_private_history(
+        wrkslots._GitVcs(),
+        slot,
+        base,
+        (parent,),
+        remote_cover=lambda tips: wrkslots._RemoteCoverage(
+            "origin", frozenset(), frozenset({"refs/heads/main"})
+        ),
+        now=_KEPT_SET_FIXED_NOW,
+        allow_unresolvable=True,
+    )
+    assert allowed is not None
+    assert allowed.unresolvable == (
+        ("refs/rescue/missing-1", missing, "object missing locally or not a commit"),
+    )
+    dropped = wrkslots._dropped_history_entries(allowed)
+    assert dropped == [
+        {
+            "commit": missing,
+            "ref": "refs/rescue/missing-1",
+            "reason": "unresolvable: object missing locally or not a commit",
+        }
+    ]
+
+
+def test_private_history_scan_batches_git_processes_for_many_rescue_refs(
+    tmp_path: Path,
+) -> None:
+    """#1785: one for-each-ref and batch peels for the whole scan, not
+    one Git process per rescue tip, however many refs name commits."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    commits: list[str] = []
+    git(slot, "checkout", "-q", "-b", "tmp-many-rescue")
+    for index in range(60):
+        commit = commit_local(slot, "many.txt", f"{index}\n", f"many {index}")
+        commits.append(commit)
+        git(slot, "update-ref", f"refs/rescue/inventory/many-{index}", commit)
+    git(slot, "checkout", "-q", "--detach", base)
+    git(slot, "branch", "-q", "-D", "tmp-many-rescue")
+    counter = [0]
+    token = wrkslots._SCAN_SUBPROCESSES.set(counter)
+    try:
+        history = _private_history(slot, base, parent)
+    finally:
+        wrkslots._SCAN_SUBPROCESSES.reset(token)
+    assert history is not None
+    assert len(history.tips) == 1
+    # Per-tip processes would be well over 60; the batched scan is a
+    # small constant number of Git invocations.
+    assert counter[0] < 40, counter
+    # The bundle partition's protected-root search is one parent walk
+    # of the tip, not one history walk per protected candidate (#1785).
+    tip = history.tips[0]
+    blob = git(slot, "rev-parse", f"{tip}:many.txt").stdout.strip()
+    gitdir = Path(git(slot, "rev-parse", "--absolute-git-dir").stdout.strip())
+    (gitdir / "objects" / blob[:2] / blob[2:]).unlink()
+    protected = {commit for _ref, commit in history.refs}
+    protected.update(history.protected_tips)
+    partition_counter = [0]
+    token = wrkslots._SCAN_SUBPROCESSES.set(partition_counter)
+    try:
+        kept, _excluded = wrkslots._partition_kept_commits(
+            wrkslots._GitVcs(), slot, "product", history.tips, protected=protected
+        )
+    finally:
+        wrkslots._SCAN_SUBPROCESSES.reset(token)
+    assert commits[-2] in kept
+    assert partition_counter[0] < 40, partition_counter
+
+
+def test_thin_prerequisites_must_live_in_a_surviving_store(tmp_path: Path) -> None:
+    """#1785: a prerequisite only the slot's own store holds cannot
+    thin a bundle; one the surviving (common/source) store holds can."""
+
+    origin, parent, slot, base = _kept_set_repos(tmp_path)
+    vcs = wrkslots._GitVcs()
+    # A commit the remote advertises under a rescue ref, made only in
+    # the slot clone (its standalone store is removed with it).
+    git(slot, "checkout", "-q", "-b", "thin-src")
+    slot_only = commit_local(slot, "slot-only.txt", "slot only\n", "slot only")
+    child = commit_local(slot, "child.txt", "child\n", "child of slot only")
+    git(slot, "push", "-q", "origin", f"{slot_only}:refs/rescue/thin-slot-only")
+    git(slot, "checkout", "-q", "--detach", base)
+    checkout = wrkslots.Checkout(
+        name="product",
+        path="product",
+        repository=".",
+        branch="",
+        start_point=base,
+        remote="origin",
+        remote_url_sha256=vcs.remote_authority(slot, "origin").sha256,
+        landed_ref="refs/remotes/origin/main",
+        head=base,
+    )
+    facts = wrkslots._SalvageCandidate(
+        head=base,
+        status_digest=wrkslots._EMPTY_STATUS_SHA256,
+        commit=child,
+        dirty=False,
+        remote_authority=vcs.remote_authority(slot, "origin"),
+    )
+    assert wrkslots._thin_bundle_prerequisites(vcs, slot, checkout, facts) == ()
+
+    # The same shape in a linked worktree, whose common store survives
+    # removal of the worktree's administrative directory.
+    linked = tmp_path / "linked-thin"
+    git(parent, "worktree", "add", "-q", str(linked), "-b", "thin-linked")
+    git(linked, "config", "user.name", "Wrkslots Test")
+    git(linked, "config", "user.email", "wrkslots@example.invalid")
+    git(linked, "checkout", "-q", "-b", "thin-linked-src")
+    surviving_tip = commit_local(linked, "surviving.txt", "surviving\n", "surviving tip")
+    linked_child = commit_local(linked, "linked-child.txt", "child\n", "linked child")
+    git(linked, "push", "-q", "origin", f"{surviving_tip}:refs/rescue/thin-surviving")
+    linked_facts = wrkslots._SalvageCandidate(
+        head=base,
+        status_digest=wrkslots._EMPTY_STATUS_SHA256,
+        commit=linked_child,
+        dirty=False,
+        remote_authority=vcs.remote_authority(linked, "origin"),
+    )
+    linked_checkout = wrkslots.Checkout(
+        name="product",
+        path="product",
+        repository=".",
+        branch="",
+        start_point=base,
+        remote="origin",
+        remote_url_sha256=vcs.remote_authority(linked, "origin").sha256,
+        landed_ref="refs/remotes/origin/main",
+        head=base,
+    )
+    proof = wrkslots._thin_bundle_prerequisites(
+        vcs, linked, linked_checkout, linked_facts
+    )
+    assert ("refs/rescue/thin-surviving", surviving_tip) in proof
+
+
+def test_dropped_history_receipt_uses_a_manifest_beyond_the_inline_limit(
+    tmp_path: Path,
+) -> None:
+    """#1785/#1772: a long dropped list is a bounded summary plus a
+    manifest sidecar holding every SHA, never a bare count."""
+
+    entries = [
+        {
+            "commit": f"{index:040x}",
+            "ref": "refs/rescue/inventory/dangling-1",
+            "reason": "dangling, slot-only, past prune expiry",
+        }
+        for index in range(70)
+    ]
+    root = tmp_path / "archive"
+    root.mkdir()
+    receipt = wrkslots._dropped_history_receipt(
+        entries, root, "testhost", "slot01", 1, "product/component"
+    )
+    assert receipt is not None
+    assert receipt["count"] == 70
+    assert len(cast(list[object], receipt["entries"])) == 64
+    sidecar = Path(str(receipt["file"]))
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert payload["count"] == 70
+    assert [entry["commit"] for entry in payload["entries"]] == [
+        entry["commit"] for entry in entries
+    ]
+    assert receipt["sha256"] == payload["sha256"]
+
+
+def _set_writer_ceiling(project: Path, level: int) -> None:
+    path = project / ".wrkslots.yml"
+    text = path.read_text(encoding="utf-8")
+    if text.lstrip().startswith("{"):
+        payload = json.loads(text)
+        payload["writer_ceiling"] = level
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("schema:"):
+            lines.insert(index + 1, f"writer_ceiling: {level}")
+            break
+    else:  # pragma: no cover - fixture configs always name a schema
+        lines.insert(0, f"writer_ceiling: {level}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_remove_every_checkout_prints_a_scan_line_and_rescue_ancestor_is_bundled(
+    tmp_path: Path,
+) -> None:
+    """#1785 (2)+(a): every scanned checkout prints a keep/drop line,
+    including nothing-private ones, and a rescue-named ancestor in a
+    nested submodule is bundled, not age-dropped."""
+
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    _set_writer_ceiling(project, 2)
+    leaf = component / "leaf"
+    base = git(leaf, "rev-parse", "HEAD").stdout.strip()
+    git(leaf, "checkout", "-q", "-b", "tmp-rescue-chain")
+    ancestor = commit_local(leaf, "ancestor.txt", "ancestor\n", "rescue ancestor")
+    tip = commit_local(leaf, "tip.txt", "tip\n", "rescue tip")
+    git(leaf, "checkout", "-q", "--detach", base)
+    git(leaf, "branch", "-q", "-D", "tmp-rescue-chain")
+    git(leaf, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    for commit in (ancestor, tip):
+        _set_loose_mtime(leaf, commit, _KEPT_SET_OLD)
+    git(leaf, "update-ref", "refs/rescue/inventory/reflog-ancestor", ancestor)
+
+    removed = _remove_archiving(
+        project,
+        "--archive-ignored",
+        "--archive-private-history",
+        "--no-lock-budget",
+    )
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    for name in ("product", "product/component", "product/component/leaf"):
+        line = f"checkout {name}: private-history scan:"
+        assert line in removed.stderr, removed.stderr
+    assert "nothing private" in removed.stderr
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert _bundle_reaches(tmp_path, receipt, ancestor, "restored-rescue-ancestor.git")
+    # Default writer ceiling 2 (#1788): the level-3 key is not written.
+    assert "dropped_private_history" not in receipt
+
+
+def test_remove_missing_rescue_ref_refuses_then_archives_with_flag(
+    tmp_path: Path,
+) -> None:
+    """#1785 (1): a nested submodule rescue tip in no store refuses by
+    default; with --archive-unresolvable-private-history removal
+    bundles what it can and names the tip in receipt and stdout."""
+
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    _set_writer_ceiling(project, 3)
+    elsewhere = tmp_path / "elsewhere-missing"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(elsewhere)],
+        check=True, capture_output=True, text=True,
+    )
+    git(elsewhere, "config", "user.name", "Wrkslots Test")
+    git(elsewhere, "config", "user.email", "wrkslots@example.invalid")
+    missing = commit_local(elsewhere, "else.txt", "else\n", "elsewhere commit")
+    gitdir = Path(git(leaf, "rev-parse", "--absolute-git-dir").stdout.strip())
+    planted = gitdir / "refs" / "rescue" / "missing-1"
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text(missing + "\n", encoding="utf-8")
+
+    refused = _remove_archiving(
+        project,
+        "--archive-ignored",
+        "--archive-private-history",
+        "--no-lock-budget",
+    )
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    assert "refs/rescue/missing-1" in refused.stderr
+    assert missing in refused.stderr
+    assert "--archive-unresolvable-private-history" in refused.stderr
+    assert tree.is_dir()
+
+    removed = _remove_archiving(
+        project,
+        "--archive-ignored",
+        "--archive-private-history",
+        "--archive-unresolvable-private-history",
+        "--no-lock-budget",
+    )
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    assert missing in removed.stderr
+    assert "refs/rescue/missing-1" in removed.stderr
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    dropped = cast(Mapping[str, object], receipt["dropped_private_history"])
+    assert dropped["count"] == 1
+    entries = cast(list[Mapping[str, object]], dropped["entries"])
+    assert entries[0]["commit"] == missing
+    assert entries[0]["ref"] == "refs/rescue/missing-1"
+
+
+def test_dropped_history_at_ceiling_2_lives_only_in_the_sidecar(
+    tmp_path: Path,
+) -> None:
+    """#1788: at the default writer ceiling 2 no salvage receipt carries
+    dropped_private_history (a level-3 key older strict readers refuse),
+    and the drop is still recorded by SHA in the manifest sidecar."""
+
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    _set_writer_ceiling(project, 2)
+    elsewhere = tmp_path / "elsewhere-ceiling2"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(elsewhere)],
+        check=True, capture_output=True, text=True,
+    )
+    git(elsewhere, "config", "user.name", "Wrkslots Test")
+    git(elsewhere, "config", "user.email", "wrkslots@example.invalid")
+    missing = commit_local(elsewhere, "else.txt", "else\n", "elsewhere commit")
+    gitdir = Path(git(leaf, "rev-parse", "--absolute-git-dir").stdout.strip())
+    planted = gitdir / "refs" / "rescue" / "missing-2"
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text(missing + "\n", encoding="utf-8")
+
+    removed = _remove_archiving(
+        project,
+        "--archive-ignored",
+        "--archive-private-history",
+        "--archive-unresolvable-private-history",
+        "--no-lock-budget",
+    )
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert "dropped_private_history" not in receipt
+    sidecars = sorted(project.rglob("dropped-history/*.json"))
+    assert sidecars, list(project.rglob("dropped-history/*"))
+    recorded = [
+        entry
+        for sidecar in sidecars
+        for entry in json.loads(sidecar.read_text(encoding="utf-8"))["entries"]
+    ]
+    assert any(
+        entry["commit"] == missing and entry["ref"] == "refs/rescue/missing-2"
+        for entry in recorded
+    ), recorded
 
 
 def _kept_component_commit_with_missing_blob(
