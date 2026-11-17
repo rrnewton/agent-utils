@@ -3597,6 +3597,11 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            # `#1781`: sign-in lands on the Channel; the dock this walk measures is the call
+            # view's, two presses away through Documents.
+            page.click("#view-switch")
+            page.click("#view-switch")
+            until("() => !document.getElementById('pane-voice').hidden", "the call view did not appear")
             until("() => !document.getElementById('control-pane').hidden", "the call view's pane did not appear")
 
             # The call view, idle: the bar's four and the switch, and Sound, Clear and Talk beside them.
@@ -5027,7 +5032,9 @@ def windows_walk(chromium: BrowserType, args: argparse.Namespace) -> None:
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             first.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            read_for(lambda: first.click("#view-switch"), first, listed_first, "the first window's channel")
+            # `#1781`: sign-in landed on the channel and read the first listed already; a
+            # reload is the act that reads it again here.
+            read_for(lambda: first.reload(wait_until="load"), first, listed_first, "the first window's channel")
             choose(first, listed_second, "the first window's choice")
             # A second window opens on that, the last choice, and is put on the first listed.
             second = opened()
