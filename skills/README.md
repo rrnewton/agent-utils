@@ -51,6 +51,17 @@ copying its manual.
 - `herdr-agent` — durably deliver and inspect prompts for an interactive agent in a Herdr pane
   (the older interface; start new integrations with `agentctl`).
 
+## Shared practice skills
+
+- `testing-principles` — tool-agnostic testing rules that follow from running at high load:
+  CPU-primary budgets, memory headroom, counted FLAKY results, named skips, no weakened
+  assertions. `testing-with-dagrun` and `testing-with-buck` apply them per test runner. A product
+  repository imports generated copies of these three, never edits them by hand, checks them for
+  drift, and keeps its own addendum outside the copy.
+- `landing-modes` — the coordinator-level landing-mode protocol (gated, optimistic, composed,
+  emergency repair, review-gated). Inactive unless a project's owner enables it; a project that
+  has not says only that its main is gated.
+
 ## Install in a harness
 
 `agent-utils-setup` links the skills a project uses into its harness, once for every agent
