@@ -815,6 +815,47 @@ def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
         _assert_home_untouched_and_layered(box_base, home, box_base / "control" / "slot-state" / "agent" / "s1")
 
 
+def test_root_box_reports_no_new_privs(box_base: Path) -> None:
+    """I4: the seal is exercised through the real root entry, not a raw prctl.
+
+    Live only: skips without the installed, version-matched root
+    helper. The harness guarantee is the slice stop in the finally:
+    a killed run leaves no boxed child (I3).
+    """
+
+    _sandbox_host_or_skip("root")
+    for directory in ("slot", "control", "project"):
+        (box_base / directory).mkdir(parents=True, exist_ok=True)
+    slot = f"pytest-root-seal-{os.getpid()}"
+    (box_base / "control" / "ACTIVE.test.json").write_text(
+        json.dumps({"slots": [{"slot": slot, "agent": "worker", "checkouts": [{"path": "slot"}]}]}),
+        encoding="utf-8",
+    )
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from wrkslots import sandbox\n"
+        "base = Path(sys.argv[1])\n"
+        f"view = sandbox.SlotView({slot!r}, 'agent', base / 'slot', base / 'control' / 'slot-state' / 'agent' / 's1', (), base / 'control', 'worktree', base / 'project')\n"
+        "settings = sandbox.SandboxSettings(isolation='root', home_shared=(), tmp_size='64M', limits=sandbox.SandboxLimits(tasks_max=256))\n"
+        "sandbox.run(view, settings, ['grep', '^NoNewPrivs', '/proc/self/status'])\n"
+    )
+    environment = {
+        **os.environ,
+        "HOME": str(Path.home()),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+    }
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(box_base)],
+            capture_output=True, text=True, timeout=120, env=environment, check=False,
+        )
+    finally:
+        subprocess.run(["systemctl", "--user", "stop", sandbox.slice_name("agent", slot)], capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "NoNewPrivs:\t1" in result.stdout, result.stdout
+
+
 def test_wrkslots_run_boxes_a_plain_worktree_slot(box_base: Path) -> None:
     """The box does not depend on the representation: a plain-worktree slot gets the same view."""
 

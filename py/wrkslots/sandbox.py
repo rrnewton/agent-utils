@@ -1524,7 +1524,14 @@ def _remount_read_only(point: str, flags: int | None = None) -> None:
     _mount_at_fd(None, point, None, _MS_BIND | _MS_REMOUNT | _MS_RDONLY | flags)
 
 
-def _remount_tree_read_only(base: str, keep: Sequence[str] = (), keep_exact: Sequence[str] = ()) -> list[str]:
+def _remount_tree_read_only(
+    base: str,
+    keep: Sequence[str] = (),
+    keep_exact: Sequence[str] = (),
+    *,
+    strict_fd: bool = False,
+    strict_roots: Sequence[str] = (),
+) -> list[str]:
     """Remount ``base`` and every mount below it read-only; return real failures.
 
     Mounts at or below a ``keep`` path, and mounts exactly at a ``keep_exact``
@@ -1544,7 +1551,10 @@ def _remount_tree_read_only(base: str, keep: Sequence[str] = (), keep_exact: Seq
         if not os.path.lexists(point):
             continue  # covered by a tmpfs: unreachable, nothing to protect
         try:
-            _remount_read_only(point, flags)
+            if strict_fd:
+                _remount_read_only_strict(point, flags, strict_roots)
+            else:
+                _remount_read_only(point, flags)
         except MountError as exc:
             # EINVAL: the path no longer names that mount's root because a
             # layer above shadows it; unreachable. Other failures (another
@@ -1645,7 +1655,7 @@ def _mask_eden_backing(path: str) -> None:
         pass
 
 
-def _mask_git_config(path: str) -> str:
+def _mask_git_config(path: str, *, strict_fd: bool = False, strict_roots: Sequence[str] = ()) -> str:
     """Mask one isolated-policy Git configuration path; return its outcome.
 
     Unlike :func:`_mask`, nothing is resolved: a symbolic link (valid or
@@ -1682,17 +1692,19 @@ def _mask_git_config(path: str) -> str:
         )
     try:
         if stat.S_ISDIR(info.st_mode):
-            _mount_at_fd(
+            _mount_at_dispatch(
                 "tmpfs",
                 path,
                 "tmpfs",
                 _MS_NOSUID | _MS_NODEV | _MS_NOEXEC | _MS_RDONLY,
                 f"mode=0700,uid={os.getuid()},gid={os.getgid()},size=4k",
+                strict_fd,
+                strict_roots,
             )
             return "directory"
         if stat.S_ISREG(info.st_mode):
-            _mount_at_fd("/dev/null", path, None, _MS_BIND)
-            _remount_read_only(path)
+            _mount_at_dispatch("/dev/null", path, None, _MS_BIND, None, strict_fd, strict_roots)
+            _remount_read_only_dispatch(path, strict_fd, strict_roots)
             return "file"
     except MountError as exc:
         raise SandboxError(f"git-config-policy isolated: cannot mask {path}: {exc}") from exc
@@ -1780,6 +1792,355 @@ def _open_tree_clone(root_fd: int, name: str, *, recursive: bool) -> int:
 
 def _move_mount_clone(descriptor: int, target: str) -> None:
     _syscall(_SYS_MOVE_MOUNT, descriptor, b"", _AT_FDCWD, target.encode(), _MOVE_MOUNT_F_EMPTY_PATH)
+
+
+# --- fd-based mounts for the root entry (#1792): resolve once, keep the
+# fd, mount onto it. No path-string mount is ever a fallback in this mode.
+_SYS_OPENAT2 = 437
+_SYS_FSOPEN = 430
+_SYS_FSCONFIG = 431
+_SYS_FSMOUNT = 432
+_SYS_MOUNT_SETATTR = 442
+_AT_EMPTY_PATH = 0x1000
+_MOVE_MOUNT_T_EMPTY_PATH = 0x40
+_RESOLVE_BENEATH = 0x08
+_RESOLVE_NO_MAGICLINKS = 0x02
+_RESOLVE_NO_SYMLINKS = 0x04
+_ATTR_RDONLY = 1
+_ATTR_NOSUID = 2
+_ATTR_NODEV = 4
+_ATTR_NOEXEC = 8
+_ATTR_NOATIME = 0x10
+_ATTR_STRICTATIME = 0x20
+_ATTR_NODIRATIME = 0x80
+
+
+def _fd_syscall(number: int, *args: object) -> int:
+    """A mount-API syscall for the strict root build; failures refuse."""
+
+    return _syscall(number, *args)
+
+
+def _syscall_errno(number: int, *args: object) -> int:
+    """Run a syscall for a presence probe; return 0 or the errno."""
+
+    libc = _libc()
+    libc.syscall.restype = ctypes.c_long
+    if libc.syscall(number, *args) < 0:
+        return ctypes.get_errno()
+    return 0
+
+
+def _require_fd_mount_syscalls() -> None:
+    """Fail closed unless the fd mount APIs exist on this kernel (#1792).
+
+    Presence is probed with calls that cannot mount anything (an
+    invalid-argument answer proves the syscall is wired up; ENOSYS
+    refuses). During the build itself every strict call refuses on
+    any failure, so a mid-build ENOSYS/EINVAL is never a fallback.
+    """
+
+    root_fd = os.open("/", os.O_PATH | os.O_CLOEXEC)
+    try:
+        try:
+            tree = _open_tree_fd(root_fd)
+        except MountError as exc:
+            raise SandboxError(
+                "root view needs open_tree for fd-based mounts (unavailable); refusing"
+            ) from exc
+        os.close(tree)
+        fs_fd: int | None = None
+        try:
+            fs_fd = _fd_syscall(_SYS_FSOPEN, b"tmpfs", 1)
+        except MountError as exc:
+            raise SandboxError(
+                "root view needs fsopen for fd-based mounts (unavailable); refusing"
+            ) from exc
+        finally:
+            if fs_fd is not None:
+                os.close(fs_fd)
+        for number, name in ((_SYS_MOVE_MOUNT, "move_mount"), (_SYS_MOUNT_SETATTR, "mount_setattr")):
+            if _syscall_errno(number, -1, b"", -1, b"", 0x80000000) == 38:  # ENOSYS
+                raise SandboxError(f"root view needs {name} for fd-based mounts (unavailable); refusing")
+    finally:
+        os.close(root_fd)
+
+
+def _openat2_fd(dfd: int, relative: str) -> int:
+    """openat2 `relative` beneath `dfd`, symlink-free; fail closed."""
+
+    import struct
+
+    libc = _libc()
+    if not hasattr(libc, "syscall"):
+        raise SandboxError("root view needs openat2 (unavailable); refusing")
+    how = ctypes.create_string_buffer(
+        struct.pack(
+            "QQQ",
+            os.O_PATH | os.O_CLOEXEC,
+            0,
+            _RESOLVE_BENEATH | _RESOLVE_NO_SYMLINKS | _RESOLVE_NO_MAGICLINKS,
+        ),
+        24,
+    )
+    result = libc.syscall(_SYS_OPENAT2, dfd, relative.encode(), ctypes.byref(how), 24)
+    if result < 0:
+        error = ctypes.get_errno()
+        if error == 38:  # ENOSYS
+            raise SandboxError("root view needs openat2 (unavailable); refusing")
+        raise SandboxError(
+            f"root view path component {relative!r} does not resolve without symlinks "
+            f"({os.strerror(error)}); refusing"
+        )
+    return int(result)
+
+
+#: Root fds opened before the strict build covers /tmp (#1792): a
+#: scratch root under /tmp is unreachable by name afterwards, but
+#: lookups through its kept fd still cross the mounts built on it.
+#: Filled by `build_view` in strict mode; every fd is O_CLOEXEC, so
+#: leftovers close at exec or process exit.
+_STRICT_ROOT_FDS: dict[str, int] = {}
+
+
+def _resolve_fd(path: str, roots: Sequence[str] = (), *, create: str | None = None) -> int:
+    """Resolve `path` once to an O_PATH fd beneath its trusted root.
+
+    The root is the longest of `roots` containing the path (else `/`
+    itself), opened symlink-free and kept only for this resolution;
+    the returned fd is the caller's. A missing leaf is created through
+    its resolved parent fd when `create` is "dir" or "file" (#1792).
+    """
+
+    if not os.path.isabs(path):
+        raise SandboxError(f"root view path {path!r} is not absolute; refusing")
+    base = "/"
+    for root in sorted((os.path.realpath(item) for item in roots), key=len, reverse=True):
+        if path == root or path.startswith(root + "/"):
+            base = root
+            break
+    cached = _STRICT_ROOT_FDS.get(base)
+    root_fd = os.dup(cached) if cached is not None else _openat2_strict(base)
+    try:
+        relative = os.path.relpath(path, base)
+        if relative == ".":
+            owned, root_fd = root_fd, -1
+            return owned
+        try:
+            return _openat2_fd(root_fd, relative)
+        except SandboxError:
+            if create is None:
+                raise
+        parent_relative, leaf = os.path.split(relative)
+        parent_fd = root_fd if parent_relative in ("", ".") else _openat2_fd(root_fd, parent_relative)
+        try:
+            if create == "dir":
+                os.mkdir(leaf, 0o755, dir_fd=parent_fd)
+            elif create == "file":
+                created = os.open(leaf, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=parent_fd)
+                os.close(created)
+            else:
+                raise SandboxError(f"unknown mount-point creation {create!r}; refusing")
+            return _openat2_fd(parent_fd, leaf)
+        finally:
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
+def _open_tree_fd(descriptor: int, *, recursive: bool = True) -> int:
+    flags = _OPEN_TREE_CLONE | _OPEN_TREE_CLOEXEC | _AT_EMPTY_PATH | (_AT_RECURSIVE if recursive else 0)
+    return _fd_syscall(_SYS_OPEN_TREE, descriptor, b"", flags)
+
+
+def _move_mount_fd(tree_fd: int, target_fd: int) -> None:
+    _fd_syscall(_SYS_MOVE_MOUNT, tree_fd, b"", target_fd, b"", _MOVE_MOUNT_F_EMPTY_PATH | _MOVE_MOUNT_T_EMPTY_PATH)
+
+
+def _attr_set_from_flags(flags: int) -> int:
+    """Translate preserved MS_* mount flags to mount_setattr attributes."""
+
+    attributes = flags & (_ATTR_RDONLY | _ATTR_NOSUID | _ATTR_NODEV | _ATTR_NOEXEC)
+    if flags & _MS_STRICTATIME:
+        attributes |= _ATTR_STRICTATIME
+    elif flags & _MS_NOATIME:
+        attributes |= _ATTR_NOATIME
+    if flags & _MS_NODIRATIME:
+        attributes |= _ATTR_NODIRATIME
+    return attributes
+
+
+def _mount_setattr_fd(descriptor: int, *, attr_set: int = 0, propagation: int = 0, recursive: bool = False) -> None:
+    import struct
+
+    buffer = ctypes.create_string_buffer(struct.pack("QQQQ", attr_set, 0, propagation, 0), 32)
+    flags = _AT_EMPTY_PATH | (_AT_RECURSIVE if recursive else 0)
+    _fd_syscall(_SYS_MOUNT_SETATTR, descriptor, b"", flags, ctypes.byref(buffer), 32)
+
+
+def _bind_resolved_fd(source_fd: int, target_fd: int, *, recursive: bool = True) -> None:
+    """Bind the pinned source fd onto the resolved target fd (#1792)."""
+
+    tree = _open_tree_fd(source_fd, recursive=recursive)
+    try:
+        _move_mount_fd(tree, target_fd)
+    finally:
+        os.close(tree)
+
+
+def _mount_ids_by_point() -> dict[str, list[int]]:
+    """Mount-table ids per point; a fresh id proves a mount landed."""
+
+    out: dict[str, list[int]] = {}
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) >= 5:
+            try:
+                out.setdefault(_unescape(fields[4]), []).append(int(fields[0]))
+            except ValueError:
+                continue
+    return out
+
+
+def _bind_fd_strict(source_fd: int, target: str, roots: Sequence[str] = ()) -> None:
+    is_directory = stat.S_ISDIR(os.fstat(source_fd).st_mode)
+    before = _mount_ids_by_point().get(target, [])
+    target_fd = _resolve_fd(target, roots, create="dir" if is_directory else "file")
+    try:
+        _bind_resolved_fd(source_fd, target_fd)
+    finally:
+        os.close(target_fd)
+    # The tree we moved was cloned from the pinned source fd, so a
+    # fresh mount id at the point proves the bind landed there; the
+    # name may already be covered (a scratch root under /tmp), which
+    # is why this reads the mount table, not the path.
+    if not any(identifier not in before for identifier in _mount_ids_by_point().get(target, [])):
+        raise SandboxError(f"built view mounts do not match: bind {target} did not land; refusing")
+
+
+def _mount_tmpfs_fd(target_fd: int, data: str | None, flags: int) -> None:
+    fs_fd = _fd_syscall(_SYS_FSOPEN, b"tmpfs", 1)
+    try:
+        for pair in (data or "").split(","):
+            key, separator, value = pair.partition("=")
+            if separator:
+                _fd_syscall(_SYS_FSCONFIG, fs_fd, 1, key.strip().encode(), value.strip().encode(), 0)
+        _fd_syscall(_SYS_FSCONFIG, fs_fd, 6, 0, 0, 0)  # FSCONFIG_CMD_CREATE
+        attributes = flags & (_ATTR_RDONLY | _ATTR_NOSUID | _ATTR_NODEV | _ATTR_NOEXEC)
+        mount_fd = _fd_syscall(_SYS_FSMOUNT, fs_fd, 1, attributes)
+        try:
+            _move_mount_fd(mount_fd, target_fd)
+        finally:
+            os.close(mount_fd)
+    finally:
+        os.close(fs_fd)
+
+
+def _mount_tmpfs_strict(target: str, data: str | None, flags: int, roots: Sequence[str] = ()) -> None:
+    """A fresh tmpfs on `target`, created and mounted only through fds."""
+
+    target_fd = _resolve_fd(target, roots)
+    try:
+        _mount_tmpfs_fd(target_fd, data, flags)
+    finally:
+        os.close(target_fd)
+
+
+def _remount_read_only_strict(point: str, flags: int | None, roots: Sequence[str] = ()) -> None:
+    if flags is None:
+        flags = next((value for mount_point, value in reversed(_mounts()) if mount_point == point), 0)
+    try:
+        descriptor = _resolve_fd(point, roots)
+    except SandboxError as exc:
+        raise MountError(str(exc), _errno.EINVAL) from exc
+    try:
+        _mount_setattr_fd(descriptor, attr_set=_attr_set_from_flags(flags) | _ATTR_RDONLY)
+    finally:
+        os.close(descriptor)
+
+
+def _mount_at_fd_strict(
+    source: str | None, target: str, fstype: str | None, flags: int, data: str | None, roots: Sequence[str] = ()
+) -> None:
+    if fstype == "tmpfs":
+        _mount_tmpfs_strict(target, data, flags, roots)
+        return
+    if fstype is not None or source is None:
+        raise SandboxError(f"root view cannot fd-mount {fstype or source} on {target}; refusing")
+    source_fd = _resolve_fd(source, roots)
+    target_fd = _resolve_fd(target, roots)
+    try:
+        _bind_resolved_fd(source_fd, target_fd, recursive=False)
+    finally:
+        os.close(source_fd)
+        os.close(target_fd)
+
+
+def _mask_strict(path: str, roots: Sequence[str] = ()) -> None:
+    """Mask by resolved fd in root mode: no realpath, no name mount."""
+
+    if not os.path.lexists(path):
+        return
+    descriptor = _resolve_fd(path, roots)
+    try:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            _mount_tmpfs_fd(
+                descriptor,
+                f"mode=0700,uid={os.getuid()},gid={os.getgid()},size=4k",
+                _MS_NOSUID | _MS_NODEV | _MS_NOEXEC | _MS_RDONLY,
+            )
+        else:
+            source_fd = _resolve_fd("/dev/null", roots)
+            try:
+                _bind_resolved_fd(source_fd, descriptor, recursive=False)
+            finally:
+                os.close(source_fd)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISDIR(os.stat(path).st_mode):
+        _remount_read_only_strict(path, None, roots)
+
+
+def _bind_dispatch(descriptor: int, target: str, strict_fd: bool, roots: Sequence[str]) -> None:
+    if strict_fd:
+        _bind_fd_strict(descriptor, target, roots)
+    else:
+        _bind_fd(descriptor, target)
+
+
+def _mount_at_dispatch(
+    source: str | None,
+    target: str,
+    fstype: str | None,
+    flags: int,
+    data: str | None,
+    strict_fd: bool,
+    roots: Sequence[str],
+) -> None:
+    if strict_fd:
+        _mount_at_fd_strict(source, target, fstype, flags, data, roots)
+    else:
+        _mount_at_fd(source, target, fstype, flags, data)
+
+
+def _mask_dispatch(path: str, strict_fd: bool, roots: Sequence[str]) -> None:
+    if strict_fd:
+        _mask_strict(path, roots)
+    else:
+        _mask(path)
+
+
+def _remount_read_only_dispatch(point: str, strict_fd: bool, roots: Sequence[str]) -> None:
+    if strict_fd:
+        _remount_read_only_strict(point, None, roots)
+    else:
+        _remount_read_only(point)
 
 
 def _pivot_user_root() -> None:
@@ -1917,7 +2278,7 @@ def _cover_shared_ancestors(spec: Mapping[str, object]) -> None:
     _cover_unowned_ancestors(targets)
 
 
-def build_view(spec: Mapping[str, object]) -> None:
+def build_view(spec: Mapping[str, object], *, strict_fd: bool = False, strict_roots: Sequence[str] = ()) -> None:
     """Build the view described by ``spec`` in the CURRENT (new) mount namespace.
 
     Shared by both isolation modes. The caller has entered a mount namespace in
@@ -1925,6 +2286,13 @@ def build_view(spec: Mapping[str, object]) -> None:
     mode: uid, gid, and groups already dropped, CAP_SYS_ADMIN kept), so every
     path lookup and access check is the user's own and every file created is
     the user's.
+
+    With ``strict_fd`` (the root entry only, #1792) every content mount
+    is made through an fd resolved once beneath a trusted root: no
+    path-string mount and no fallback when the fd mount APIs are
+    missing. The one exception is propagation on `/` itself in the
+    non-strict spelling below; strict mode changes it with
+    mount_setattr on the resolved root fd instead.
     """
 
     def strings(key: str) -> list[str]:
@@ -1936,7 +2304,23 @@ def build_view(spec: Mapping[str, object]) -> None:
     # Slave propagation keeps host mount events flowing in (a coordinator box
     # sees image slots mounted after it started) while nothing mounted in the
     # box ever reaches the host. Without roots to propagate, everything is private.
-    _mount(None, "/", None, _MS_REC | (_MS_SLAVE if propagate else _MS_PRIVATE))
+    if strict_fd:
+        _require_fd_mount_syscalls()
+        for root in strict_roots:
+            real = os.path.realpath(root)
+            if (real == "/tmp" or real.startswith("/tmp/")) and real not in _STRICT_ROOT_FDS and os.path.isdir(real):
+                _STRICT_ROOT_FDS[real] = _openat2_strict(real)
+        slash_fd = _resolve_fd("/", strict_roots)
+        try:
+            _mount_setattr_fd(
+                slash_fd,
+                propagation=_MS_SLAVE if propagate else _MS_PRIVATE,
+                recursive=True,
+            )
+        finally:
+            os.close(slash_fd)
+    else:
+        _mount(None, "/", None, _MS_REC | (_MS_SLAVE if propagate else _MS_PRIVATE))
     home = str(spec["home"])
     layer = str(spec["home_layer"])
     mode = str(spec.get("home_mode", "ro"))
@@ -1966,10 +2350,15 @@ def build_view(spec: Mapping[str, object]) -> None:
         *(src for src, _ in binds),
     ]:
         if path not in pinned:
-            pinned[path] = os.open(path, _O_PATH)
+            pinned[path] = _resolve_fd(path, strict_roots) if strict_fd else os.open(path, _O_PATH)
 
     # 1. A fresh /tmp for this launch.
-    _mount("tmpfs", "/tmp", "tmpfs", _MS_NOSUID | _MS_NODEV, f"mode=1777,size={spec.get('tmp_size', DEFAULT_TMP_SIZE)}")
+    if strict_fd:
+        _mount_tmpfs_strict(
+            "/tmp", f"mode=1777,size={spec.get('tmp_size', DEFAULT_TMP_SIZE)}", _MS_NOSUID | _MS_NODEV, strict_roots
+        )
+    else:
+        _mount("tmpfs", "/tmp", "tmpfs", _MS_NOSUID | _MS_NODEV, f"mode=1777,size={spec.get('tmp_size', DEFAULT_TMP_SIZE)}")
     if spec.get("eden_root_cover"):
         # 1a. An Eden view is re-rooted on a user-owned tmpfs so Sapling's
         # shared-directory ownership walk reaches a root it accepts.
@@ -1978,37 +2367,39 @@ def build_view(spec: Mapping[str, object]) -> None:
     # 2. $HOME: the slot's private layer, with the real entries bound read-only
     #    on their placeholders. The layer itself stays writable, so a harness
     #    can create and rename top-level files; they land in the layer.
-    _bind_fd(pinned[layer], home)
+    _bind_dispatch(pinned[layer], home, strict_fd, strict_roots)
     for relative in home_binds:
         target = os.path.join(home, relative)
-        _bind_fd(pinned[target], target)
-        failures = _remount_tree_read_only(target)
+        _bind_dispatch(pinned[target], target, strict_fd, strict_roots)
+        failures = _remount_tree_read_only(target, strict_fd=strict_fd, strict_roots=strict_roots)
         if failures:
             raise SandboxError(f"could not make {target} read-only: " + "; ".join(failures[:3]))
     # Other paths to the same files: read-only ("ro") or empty ("hidden").
     for alias in aliases:
         if mode == "ro":
-            _bind_fd(pinned[alias], alias)
-            failures = _remount_tree_read_only(alias)
+            _bind_dispatch(pinned[alias], alias, strict_fd, strict_roots)
+            failures = _remount_tree_read_only(alias, strict_fd=strict_fd, strict_roots=strict_roots)
             if failures:
                 raise SandboxError(f"could not make {alias} read-only: " + "; ".join(failures[:3]))
         else:
-            _mount_at_fd("tmpfs", alias, "tmpfs", _MS_NOSUID | _MS_NODEV, "mode=0755,size=16m")
+            _mount_at_dispatch(
+                "tmpfs", alias, "tmpfs", _MS_NOSUID | _MS_NODEV, "mode=0755,size=16m", strict_fd, strict_roots
+            )
 
     # 3. Trees that stay read-only whatever protect_system says: the wrkslots
     # control directory (registry, other slots and their mounts) and the root
     # launcher's spec directory. A slot below the control directory is bound
     # writable again next.
     for path in read_only:
-        _bind_fd(pinned[path], path)
-        failures = _remount_tree_read_only(path)
+        _bind_dispatch(pinned[path], path, strict_fd, strict_roots)
+        failures = _remount_tree_read_only(path, strict_fd=strict_fd, strict_roots=strict_roots)
         if failures:
             raise SandboxError(f"could not make {path} read-only: " + "; ".join(failures[:3]))
 
     # 4. Writable binds, in order: shared $HOME state, nested private
     # directories, the slot, Git directories, outputs, extra paths.
     for source, target in binds:
-        _bind_fd(pinned[source], target)
+        _bind_dispatch(pinned[source], target, strict_fd, strict_roots)
 
     # 5. Masks last, so they win over anything bound above. The isolated Git
     # configuration policy's paths are masked strictly (no link followed,
@@ -2017,16 +2408,20 @@ def build_view(spec: Mapping[str, object]) -> None:
     git_config_outcomes: list[tuple[str, str]] = []
     for path in strings("masks"):
         if path in git_config_masks:
-            git_config_outcomes.append((path, _mask_git_config(path)))
+            if strict_fd:
+                outcome = _mask_git_config(path, strict_fd=True, strict_roots=strict_roots)
+            else:
+                outcome = _mask_git_config(path)
+            git_config_outcomes.append((path, outcome))
         elif path == spec.get("eden_backing"):
             _mask_eden_backing(path)
         else:
-            _mask(path)
+            _mask_dispatch(path, strict_fd, strict_roots)
     if sorted(path for path, _outcome in git_config_outcomes) != sorted(git_config_masks):
         raise SandboxError("git-config-policy isolated: a policy path is missing from the view's masks")
     if mode == "hidden":
         for alias in aliases:
-            _remount_read_only(alias)
+            _remount_read_only_dispatch(alias, strict_fd, strict_roots)
 
     if spec.get("eden_root_cover"):
         # The old root stayed attached only so the pinned binds above could
@@ -2041,14 +2436,14 @@ def build_view(spec: Mapping[str, object]) -> None:
             # The backing skeleton stays writable for Sapling's shared-dir
             # write check; it is a per-launch tmpfs, never the host store.
             keep.append(str(spec["eden_backing"]))
-        failures = _remount_tree_read_only("/", keep, keep_exact=[home])
+        failures = _remount_tree_read_only("/", keep, keep_exact=[home], strict_fd=strict_fd, strict_roots=strict_roots)
         if failures:
             raise SandboxError(
                 "could not make every mount read-only (refusing to run unprotected): "
                 + "; ".join(failures[:3])
             )
     if propagate:
-        _limit_propagation(propagate)
+        _limit_propagation(propagate, strict_fd=strict_fd, strict_roots=strict_roots)
     if git_config_masks:
         _confirm_git_config_masks(git_config_outcomes)
     for descriptor in pinned.values():
@@ -2056,7 +2451,7 @@ def build_view(spec: Mapping[str, object]) -> None:
     os.chdir(str(spec.get("cwd", "/")))
 
 
-def _limit_propagation(roots: Sequence[str]) -> None:
+def _limit_propagation(roots: Sequence[str], *, strict_fd: bool = False, strict_roots: Sequence[str] = ()) -> None:
     """Keep host mount events only where ``roots`` are visible; make every other mount private.
 
     The mount each root resolves through in the view (the topmost mount whose
@@ -2076,8 +2471,15 @@ def _limit_propagation(roots: Sequence[str]) -> None:
         if point in keep or _under(point, roots) or not os.path.lexists(point):
             continue
         try:
-            _mount(None, point, None, _MS_PRIVATE)
-        except MountError:
+            if strict_fd:
+                descriptor = _resolve_fd(point, strict_roots)
+                try:
+                    _mount_setattr_fd(descriptor, propagation=_MS_PRIVATE)
+                finally:
+                    os.close(descriptor)
+            else:
+                _mount(None, point, None, _MS_PRIVATE)
+        except (MountError, SandboxError):
             continue  # shadowed by a mount above it: unreachable
 
 
@@ -2119,11 +2521,16 @@ _PR_SET_PDEATHSIG = 1
 
 
 def _maybe_pdeathsig() -> None:
-    """Die with the launcher ONLY when explicitly opted in (tests).
+    """Die with the launcher ONLY when explicitly opted in (userns entry).
 
     A boxed lane must normally survive its launcher shell exiting, so
-    this is never unconditional: WRKSLOTS_PDEATHSIG=1 is set by test
-    harnesses that kill their launcher and need no boxed child left.
+    this is never unconditional: WRKSLOTS_PDEATHSIG=1 may be set by
+    test harnesses that kill their launcher and need no boxed child
+    left. The root entry does not call this (#1792): the kernel
+    clears the death signal when the helper drops uid, so it could
+    never deliver that promise there; root-mode test cleanup is the
+    harness's job (the live root tests stop their systemd slice in a
+    finally block).
     """
 
     if os.environ.get("WRKSLOTS_PDEATHSIG") == "1":
@@ -2180,28 +2587,46 @@ def _set_capabilities_split(
 
 
 def _verify_mount_points(view: Mapping[str, object]) -> None:
-    """The built view's mounts are where they should be, from what (#1583).
+    """The built view's mounts are where they should be (#1792).
 
-    Topmost mount per point wins. Every expected bind point must be a
-    mount whose device is its source's device, so a mount that landed
-    somewhere else (or onto something else) refuses before exec.
+    Topmost mount per point wins. Every bind point (unless a mask
+    covers it, since masks win by design) must show its source itself
+    (device+inode, since mount-table device strings and a file's
+    ``st_dev`` disagree on btrfs), so a bind that landed somewhere
+    else refuses before exec. The home point and ``/tmp`` need only
+    be mounts: layered covers legitimately change what they show.
     """
 
     topmost: dict[str, str] = {}
     for device, _root, point in _mount_rows():
         topmost[str(point)] = device
-    # Existence per expected point only: layered covers (the home
-    # layer, system covers) legitimately change a bind's device, so
-    # device equality would refuse every real view.
     expected = {"/tmp", str(view["home"])}
+    masks = view.get("masks", [])
+    masked = {str(item) for item in masks} if isinstance(masks, list) else set()
     raw_binds = view.get("binds", [])
+    wrong: list[str] = []
     if isinstance(raw_binds, list):
         for pair in raw_binds:
             if isinstance(pair, list) and len(pair) == 2:
-                expected.add(str(pair[1]))
+                source, target = str(pair[0]), str(pair[1])
+                expected.add(target)
+                if target in masked or target in ("/tmp", str(view["home"])):
+                    continue
+                if target not in topmost:
+                    continue  # reported as missing below
+                try:
+                    landed = os.stat(target)
+                    origin = os.stat(source)
+                except OSError:
+                    # Covered by a later mount (a scratch root under
+                    # /tmp): its landing was proven at bind time.
+                    continue
+                if (landed.st_dev, landed.st_ino) != (origin.st_dev, origin.st_ino):
+                    wrong.append(f"{target} does not show its source")
     missing = sorted(point for point in expected if point not in topmost)
-    if missing:
-        raise SandboxError(f"built view mounts do not match: missing {missing}; refusing")
+    if missing or wrong:
+        details = "; ".join([*(f"missing {missing}" if missing else []), *wrong])
+        raise SandboxError(f"built view mounts do not match: {details}; refusing")
 
 
 def _prctl(option: int, value: int) -> None:
@@ -2300,8 +2725,30 @@ _ROOT_VIEW_KEYS = frozenset(
 _TMP_SIZE = re.compile(r"([0-9]+)([KMGT%]?)\Z")
 
 
-def _check_root_schema(document: Mapping[str, object]) -> dict[str, object]:
-    """Validate the stdin spec against the closed schema; return its view."""
+def _host_memory_bytes() -> int:
+    """Total host memory for the percent tmp_size cap; 0 when unknown."""
+
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError):
+        return 0
+
+
+def _check_root_schema(
+    document: Mapping[str, object], *, host_memory_bytes: int | None = None
+) -> dict[str, object]:
+    """Validate the stdin spec against the closed schema; return its view.
+
+    Every view value is type-checked here (#1792), so a wrongly typed
+    value refuses at the boundary instead of tripping a late assert
+    inside `build_view` while capabilities are held.
+    """
 
     unknown = set(document) - _ROOT_DOCUMENT_KEYS
     if unknown:
@@ -2312,15 +2759,40 @@ def _check_root_schema(document: Mapping[str, object]) -> dict[str, object]:
     unknown_view = set(view) - _ROOT_VIEW_KEYS
     if unknown_view:
         raise SandboxError(f"root view has unknown keys {sorted(unknown_view)}; refusing")
+    for key in ("home", "home_layer", "home_mode", "cwd"):
+        if key in view and not isinstance(view[key], str):
+            raise SandboxError(f"root view {key} must be a string; refusing")
+    for key in ("home_aliases", "home_binds", "read_only", "masks", "propagate", "git_config_masks"):
+        if key in view and (
+            not isinstance(view[key], list) or not all(isinstance(item, str) for item in view[key])
+        ):
+            raise SandboxError(f"root view {key} must be a list of strings; refusing")
+    if "binds" in view and (
+        not isinstance(view["binds"], list)
+        or not all(
+            isinstance(pair, list) and len(pair) == 2 and all(isinstance(item, str) for item in pair)
+            for pair in view["binds"]
+        )
+    ):
+        raise SandboxError("root view binds must be a list of [source, target] string pairs; refusing")
+    for key in ("protect_system", "eden_root_cover"):
+        if key in view and not isinstance(view[key], bool):
+            raise SandboxError(f"root view {key} must be a boolean; refusing")
+    for key in ("eden_checkout", "eden_backing", "git_config_policy"):
+        if key in view and view[key] is not None and not isinstance(view[key], str):
+            raise SandboxError(f"root view {key} must be a string or null; refusing")
     tmp_size = view.get("tmp_size", DEFAULT_TMP_SIZE)
     match = _TMP_SIZE.fullmatch(str(tmp_size)) if isinstance(tmp_size, (str, int)) else None
     # Same grammar as the settings model: an absolute size with an
-    # optional K/M/G/T suffix, or "N%" (1-100) of host memory.
+    # optional K/M/G/T suffix, or "N%" (1-100) of host memory. Both
+    # forms are capped at 64 GiB (#1792): the percent form is computed
+    # against host memory, so "100%" of a large host cannot bypass it.
     valid = False
     if match is not None:
         value, suffix = int(match.group(1)), match.group(2)
         if suffix == "%":
-            valid = 1 <= value <= 100
+            memory = _host_memory_bytes() if host_memory_bytes is None else host_memory_bytes
+            valid = 1 <= value <= 100 and 0 < value * memory // 100 <= 64 * (1 << 30)
         else:
             multiplier = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
             valid = 0 < value * multiplier[suffix] <= 64 * (1 << 30)
@@ -2673,7 +3145,7 @@ def _caller_groups(uid: int) -> list[int] | None:
     return None
 
 
-def _remount_nosuid_nodev(target: str) -> None:
+def _remount_nosuid_nodev(target: str, *, strict_fd: bool = False, strict_roots: Sequence[str] = ()) -> None:
     """Remount the TOPMOST bind at `target` NOSUID|NODEV, preserving flags."""
 
     flags = _MS_BIND | _MS_REMOUNT | _MS_NOSUID | _MS_NODEV
@@ -2689,14 +3161,25 @@ def _remount_nosuid_nodev(target: str) -> None:
         flags |= _MS_RDONLY
     if "noexec" in options:
         flags |= _MS_NOEXEC
-    _mount_at_fd(None, target, None, flags)
+    if strict_fd:
+        descriptor = _resolve_fd(target, strict_roots)
+        try:
+            _mount_setattr_fd(descriptor, attr_set=_attr_set_from_flags(flags))
+        finally:
+            os.close(descriptor)
+    else:
+        _mount_at_fd(None, target, None, flags)
 
 
 def enter_root() -> None:
     """``sudo -n`` side of ``isolation: root``: build the view, drop to the user, run the command.
 
     The spec arrives on stdin (no path argument, so no root-side lookup or
-    unlink of a user path ever happens). Privilege is shed FIRST, keeping
+    unlink of a user path ever happens). The view is built mount-by-fd
+    (#1792): targets resolve once with openat2 beneath their trusted
+    root and mounts move onto the kept fd, so a swapped name cannot
+    redirect a bind, and the build refuses if the fd mount APIs are
+    unavailable. Privilege is shed FIRST, keeping
     CAP_SYS_ADMIN only in the permitted set (raised effective only for
     the mount phase, after the namespace is unshared and the spec is
     parsed), and every check on the spec then runs as the invoking user:
@@ -2721,7 +3204,8 @@ def enter_root() -> None:
 
     if os.geteuid() != 0:
         raise SandboxError("enter-root must run as root (through sudo -n)")
-    _maybe_pdeathsig()
+    # No PDEATHSIG promise in root mode: the uid drop below clears it
+    # (#1792, item I3). Test cleanup is the harness's slice stop.
     _prctl(_PR_SET_DUMPABLE, 0)
     uid, gid, db_groups, name = _sudo_identity()
     caller = _caller_groups(uid)
@@ -2772,16 +3256,22 @@ def enter_root() -> None:
         raise SandboxError("the root launcher spec groups are not the caller's own; refusing")
     os.umask(int(str(document.get("umask", 0o022))))
     _set_capabilities([_CAP_SYS_ADMIN])
-    build_view(view)
-    _check_root_paths(view, trusted, uid, built=True, roots_override=checked_roots)
-    _verify_mount_points(view)
-    raw_binds = view.get("binds", [])
-    if isinstance(raw_binds, list):
-        for pair in raw_binds:
-            if isinstance(pair, list) and len(pair) == 2:
-                _remount_nosuid_nodev(str(pair[1]))
-    command = _traced(view, command, environment)
+    try:
+        build_view(view, strict_fd=True, strict_roots=checked_roots)
+        _verify_mount_points(view)
+        raw_binds = view.get("binds", [])
+        if isinstance(raw_binds, list):
+            for pair in raw_binds:
+                if isinstance(pair, list) and len(pair) == 2:
+                    _remount_nosuid_nodev(str(pair[1]), strict_fd=True, strict_roots=checked_roots)
+    except BaseException:
+        # No post-bind code may run with the capability held (#1792):
+        # drop it before the failure propagates to error handling.
+        _set_capabilities([])
+        raise
     _set_capabilities([])
+    _check_root_paths(view, trusted, uid, built=True, roots_override=checked_roots)
+    command = _traced(view, command, environment)
     if os.getuid() != uid or os.geteuid() != uid or os.getgid() != gid:
         raise SandboxError("privilege drop did not take effect")
     _prctl(_PR_SET_NO_NEW_PRIVS, 1)

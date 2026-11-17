@@ -1,13 +1,14 @@
 ---
 title: 'boxed-muse-lane-identity: boxed Muse lanes die at harness start and cannot retire'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
 - agentctl
 - wrkslots
 created_at: 2026-11-15T20:00:00+00:00
-updated_at: 2026-11-15T20:00:00+00:00
+updated_at: 2026-11-17T18:35:00+00:00
+closed_at: 2026-11-17T18:35:00+00:00
 ---
 
 # Description
@@ -73,7 +74,21 @@ independently reproduced): userns start failures rc75/rc69 with the
 EINVAL pane line for all three harnesses; cgroup (limits-only) muse
 lane completes the full cycle; the working mount-sandboxed set is
 the runtime-beside-launcher launch above. Full matrix in the #1569
-boxed-lanes report. Resolution: (fill in at landing)
+boxed-lanes report.
+
+## Resolution
+
+Landed on github/main: aaa67b93 (boxed Muse lanes on the runtime
+beside the launcher), 1f3649c7 (retire launch_failed records whose
+pinned process is dead), 2fbe7e6d (Muse behind the root slot
+relay), and the sealed root-helper stack as tip 0f6905c9
+(216e7fc2, 840ea917, 5e3a1bae, 5431086a, 0f6905c9; gated
+dde3669d, gate verdict PARTIAL with no failed steps, 7 cross
+checks skipped-unverified). Reviews 3/4/5 are closed; review 5
+cleared the landing after L1+L2 and left the install-readiness
+items I1-I5, which are filed as #1792 boxed-root-helper-fd-mounts.
+No sudoers line exists; install remains an owner decision after
+#1792 lands and passes its independent install review.
 
 ## Security review: the root-launcher spec parser (threat model)
 
