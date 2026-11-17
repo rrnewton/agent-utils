@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod restart_slot;
+
 const SCHEMA: &str = "agentctl-revive/v1";
 
 #[cfg(test)]
@@ -2291,6 +2293,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     fn candidate_policy_matches(&self, record: &AgentRecord, old: &AgentRecord) -> Result<bool> {
         let native = revive_conversation(old)?;
         let expected_arguments = expected_arguments(old)?;
+        let target = self.enrolled_target(old)?;
         Ok(record.name == old.name
             && record.token != old.token
             && record.harness == old.harness
@@ -2307,9 +2310,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             && record.reasoning_effort == old.reasoning_effort
             && record.arguments == expected_arguments
             && record.environment_names == old.environment_names
-            && record.slot == old.slot
-            && self.slot_project_matches(record, old)
-            && record.slot_isolation == old.slot_isolation
+            && record.slot == target.slot
+            && self.slot_project_matches(record, &target)
+            && record.slot_isolation == target.slot_isolation
             && record.extra.get("project_box") == old.extra.get("project_box")
             && record.resume.as_deref() == Some(&native.value)
             && record.native_session.as_ref().is_some_and(|session| {
@@ -2564,7 +2567,14 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             && record.environment_names.is_empty()
             && matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay"))
         .then(|| proof.pane_id.clone());
-        let plan = self.revive_launch_plan(record, timeout, reuse_pane)?;
+        let target = self.enrolled_target(record)?;
+        // Enrollment always gets a fresh presentation under the slot manager.
+        let reuse_pane = if target.slot != record.slot {
+            None
+        } else {
+            reuse_pane
+        };
+        let plan = self.revive_launch_plan(&target, timeout, reuse_pane)?;
         Ok((plan, proof))
     }
 
@@ -2940,7 +2950,52 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         stop_background_tasks: bool,
         refresh_profile: bool,
     ) -> Result<Value> {
+        self.restart_enrolling(
+            agent_name,
+            when_idle,
+            wait_timeout,
+            startup_timeout,
+            stop_background_tasks,
+            refresh_profile,
+            None,
+        )
+    }
+
+    /// Restart with a durable cgroup enrollment intent; the live record is never rewritten.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restart_enrolling(
+        &self,
+        agent_name: &str,
+        when_idle: bool,
+        wait_timeout: Duration,
+        startup_timeout: Duration,
+        stop_background_tasks: bool,
+        refresh_profile: bool,
+        slot: Option<SlotLaunch>,
+    ) -> Result<Value> {
         let record = self.load(agent_name)?;
+        let existing_enrollment = self.restart_enrollment(&record)?;
+        if refresh_profile && (slot.is_some() || existing_enrollment.is_some()) {
+            return Err(fail(
+                "slot enrollment cannot be combined with profile refresh",
+            ));
+        }
+        let requested = slot
+            .as_ref()
+            .map(|slot| self.prepare_enrollment(&record, slot))
+            .transpose()?;
+        if requested
+            .as_ref()
+            .zip(existing_enrollment.as_ref())
+            .is_some_and(|(a, b)| a != b)
+        {
+            return Err(fail("restart already journals a different slot enrollment"));
+        }
+        let enrollment = existing_enrollment.or(requested);
+        let target = match &enrollment {
+            Some(value) => value.target(&record)?,
+            None => record.clone(),
+        };
         if record.agentcloud.is_some() {
             return self.restart_cloud(agent_name);
         }
@@ -2999,7 +3054,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             self.revive_launch_plan(&refreshed, startup_timeout, Some(pane.clone()))?;
             Some(changed)
         } else {
-            self.revive_launch_plan(&record, startup_timeout, Some(pane.clone()))?;
+            self.revive_launch_plan(&target, startup_timeout, Some(pane.clone()))?;
             None
         };
         let identity = if record.anchors_with_harness_identity() {
@@ -3054,12 +3109,18 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 false,
                 false,
             )?;
+            // Persist the journal directory entry before the enrollment can exit its harness.
+            // Fsyncing the journal itself does not make a newly created parent durable.
+            if enrollment.is_some() {
+                agent::sync_directory(&self.registry)?;
+            }
             let root = pin_directory(&self.registry.join(".restarts"), agent_name)?;
             let doc = json!({
                 "schema": "agentctl-restart/v1",
                 "name": agent_name,
                 "old_token": record.token,
                 "session": session,
+                "slot_enrollment": enrollment,
                 "phase": phase,
                 "started_at": SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3071,6 +3132,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 .map_err(|error| *error.error)?;
             Ok(())
         };
+        if enrollment.is_some() && !alive && !resumed_exited {
+            write_journal("exited")?;
+        }
         if alive && !resumed_exited {
             write_journal("planned")?;
             self.exit_to_shell_stopping(
@@ -3694,7 +3758,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             .map_err(|error| fail(error.to_string()))?
             .as_secs_f64();
         let new_token = new_journal_id()?;
-        let mut candidate = record.clone();
+        let mut candidate = self.enrolled_target(&record)?;
         candidate.adapter = revived_adapter(&record).to_owned();
         // The new generation is a flat schema-1 record whatever form the old one had.
         candidate.nested = None;
@@ -4305,8 +4369,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 self.save(&candidate)?;
                 staged_bytes = artifact_bytes(&staged, "agent.json")?;
             }
-            self.verify_candidate(&candidate, old, &journal.proof).map_err(|_| fail(format!(
-                "interrupted revive candidate is not independently verified; refusing another launch; no automatic relaunch; journal and diagnostics retained at {}; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",
+            self.verify_candidate(&candidate, old, &journal.proof).map_err(|error| fail(format!(
+                "interrupted revive candidate is not independently verified ({error}); refusing another launch; no automatic relaunch; journal and diagnostics retained at {}; use `agentctl revive {} --dry-run` and `agentctl revive {}`; if the candidate never started, `agentctl revive {} --abandon-candidate` marks it failed and launches again (refused while a harness runs for it)",
                 stage_path.join("agent.json").display(), journal.name, journal.name, journal.name
             )))?;
             if candidate.lifecycle != "running" {
@@ -4334,6 +4398,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             if journal.ready_record_sha256.as_deref() != Some(&digest(&staged_bytes)) {
                 return Err(fail("verified revive candidate record changed"));
             }
+            self.bind_enrolled_candidate(&candidate, old)?;
             if let Some((pinned, record, bytes)) = active {
                 if record.token != journal.old_token
                     || !same_journal_directory(pinned.inode, journal.old_directory_inode)
@@ -4380,6 +4445,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     || (!reused && self.revive_proof(old)? != journal.proof)
                 {
                     return Err(fail("revive source changed immediately before retirement"));
+                }
+                // Enrollment's owner transfer may wait on the slot registry lock. Prove the
+                // candidate again after that wait and before retiring the old registration.
+                if self.restart_enrollment(old)?.is_some() {
+                    self.verify_candidate(&candidate, old, &journal.proof)?;
                 }
                 atomic_replace_bytes(&pinned, "agent.json", &stopped)
                     .map_err(|error| *error.error)?;

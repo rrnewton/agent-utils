@@ -3794,3 +3794,246 @@ fn revive_native_idle_shell_refuses_foreign_or_unproved_session_metadata() {
         assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
     }
 }
+
+fn enrollment_fixture() -> (Fixture, AgentRecord, PathBuf, PathBuf) {
+    let (fixture, mut old) = recoverable("muse", false);
+    old.session_agent = Some("muse".to_owned());
+    old.session_value = Some("sess-1".to_owned());
+    fixture.manager().save(&old).unwrap();
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    fixture.client.exit_to_shell.store(true, Ordering::Relaxed);
+    let (bin, calls) = revive_fake_wrkslots(&fixture, pinned_pid(&old), false);
+    let script = fs::read_to_string(&bin)
+        .unwrap()
+        .replace("userns", "cgroup");
+    fs::write(&bin, script).unwrap();
+    (fixture, old, bin, calls)
+}
+
+fn enrollment_slot(fixture: &Fixture) -> SlotLaunch {
+    SlotLaunch {
+        slot: "existing_slot".to_owned(),
+        project: Some(fixture.root.clone()),
+        isolation: Some("cgroup".to_owned()),
+        ..SlotLaunch::default()
+    }
+}
+
+#[test]
+fn restart_slot_enrollment_preserves_session_and_archives_only_after_ready() {
+    let (fixture, old, bin, calls) = enrollment_fixture();
+    let mut manager = fixture.manager();
+    manager.revive_wrkslots_executable = Some(bin);
+    let result = manager
+        .restart_enrolling(
+            "worker",
+            false,
+            TIMEOUT,
+            TIMEOUT,
+            false,
+            false,
+            Some(enrollment_slot(&fixture)),
+        )
+        .unwrap();
+    assert_eq!(result["action"], "restarted");
+    let current = manager.read_record("worker").unwrap();
+    assert_ne!(current.token, old.token);
+    assert_eq!(current.cwd, old.cwd);
+    assert_eq!(current.resume.as_deref(), Some("sess-1"));
+    assert_eq!(current.slot.as_deref(), Some("existing_slot"));
+    assert_eq!(current.slot_isolation.as_deref(), Some("cgroup"));
+    assert_eq!(
+        current.launch_spec.as_ref().unwrap()["slot_isolation"],
+        "cgroup"
+    );
+    assert!(fixture
+        .root
+        .join("registry/archive")
+        .join(format!("worker-{}", old.token))
+        .exists());
+    assert!(fs::read_to_string(calls)
+        .unwrap()
+        .contains("transfer-owner"));
+}
+
+#[test]
+fn restart_slot_enrollment_refuses_wrong_checkout_or_isolation_before_exit() {
+    for change in ["cwd", "isolation"] {
+        let (fixture, old, bin, calls) = enrollment_fixture();
+        let script = fs::read_to_string(&bin).unwrap();
+        let script = if change == "cwd" {
+            let elsewhere = fixture.root.join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            script.replace(
+                &format!("\"slot_path\":\"{}\"", fixture.root.display()),
+                &format!("\"slot_path\":\"{}\"", elsewhere.display()),
+            )
+        } else {
+            script.replace("cgroup", "userns")
+        };
+        fs::write(&bin, script).unwrap();
+        let mut manager = fixture.manager();
+        manager.revive_wrkslots_executable = Some(bin);
+        let before = files(&fixture.root.join("registry"));
+        assert!(manager
+            .restart_enrolling(
+                "worker",
+                false,
+                TIMEOUT,
+                TIMEOUT,
+                false,
+                false,
+                Some(enrollment_slot(&fixture))
+            )
+            .is_err());
+        assert_eq!(manager.read_record("worker").unwrap().token, old.token);
+        assert_eq!(files(&fixture.root.join("registry")), before);
+        assert!(!fixture
+            .client
+            .runs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|run| run.contains("/exit")));
+        assert!(!fs::read_to_string(calls)
+            .unwrap()
+            .contains("transfer-owner"));
+    }
+}
+
+#[test]
+fn restart_slot_enrollment_recovers_each_publication_boundary_without_another_launch() {
+    for boundary in ["launched", "ready", "stopped", "archived", "published"] {
+        let (fixture, old, bin, _) = enrollment_fixture();
+        let mut manager = fixture.manager();
+        manager.revive_wrkslots_executable = Some(bin);
+        crate::subagents::revive::fail_once(boundary);
+        let error = manager
+            .restart_enrolling(
+                "worker",
+                false,
+                TIMEOUT,
+                TIMEOUT,
+                false,
+                false,
+                Some(enrollment_slot(&fixture)),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("could not relaunch"),
+            "{boundary}: {error}"
+        );
+        if matches!(boundary, "launched" | "ready") {
+            assert_eq!(manager.read_record("worker").unwrap().token, old.token);
+            assert!(!fixture
+                .root
+                .join("registry/archive")
+                .join(format!("worker-{}", old.token))
+                .exists());
+        }
+        let launches = fixture.client.runs.lock().unwrap().clone();
+        let result = manager
+            .revive("worker", false, Some(&old.token), TIMEOUT)
+            .unwrap();
+        assert_eq!(result["revived"], true, "{boundary}: {result}");
+        let current = manager.read_record("worker").unwrap();
+        assert_eq!(current.slot_isolation.as_deref(), Some("cgroup"));
+        assert_eq!(current.resume.as_deref(), Some("sess-1"));
+        assert_eq!(
+            *fixture.client.runs.lock().unwrap(),
+            launches,
+            "{boundary}: duplicate launch"
+        );
+    }
+}
+
+#[test]
+fn restart_slot_enrollment_owner_refusal_keeps_old_registration_and_retries_bind() {
+    let (fixture, old, bin, _) = enrollment_fixture();
+    fs::write(fixture.root.join("owner-refuse"), b"").unwrap();
+    let mut manager = fixture.manager();
+    manager.revive_wrkslots_executable = Some(bin);
+    let error = manager
+        .restart_enrolling(
+            "worker",
+            false,
+            TIMEOUT,
+            TIMEOUT,
+            false,
+            false,
+            Some(enrollment_slot(&fixture)),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("owner bind refused before retirement"),
+        "{error}"
+    );
+    assert_eq!(manager.read_record("worker").unwrap().token, old.token);
+    assert!(!fixture
+        .root
+        .join("registry/archive")
+        .join(format!("worker-{}", old.token))
+        .exists());
+    let launches = fixture.client.runs.lock().unwrap().clone();
+    fs::remove_file(fixture.root.join("owner-refuse")).unwrap();
+    manager.revive("worker", false, None, TIMEOUT).unwrap();
+    assert_eq!(
+        manager
+            .read_record("worker")
+            .unwrap()
+            .slot_isolation
+            .as_deref(),
+        Some("cgroup")
+    );
+    assert_eq!(*fixture.client.runs.lock().unwrap(), launches);
+}
+
+#[test]
+fn restart_slot_enrollment_rejects_changed_source_or_journal_identity() {
+    for change in ["record", "token", "permissions"] {
+        let (fixture, old, bin, _) = enrollment_fixture();
+        let mut manager = fixture.manager();
+        manager.revive_wrkslots_executable = Some(bin);
+        crate::subagents::revive::fail_once("launched");
+        manager
+            .restart_enrolling(
+                "worker",
+                false,
+                TIMEOUT,
+                TIMEOUT,
+                false,
+                false,
+                Some(enrollment_slot(&fixture)),
+            )
+            .unwrap_err();
+        let journal = fixture
+            .root
+            .join("registry/.restarts")
+            .join(format!("{}.json", old.token));
+        match change {
+            "record" => {
+                let mut changed = manager.read_record("worker").unwrap();
+                changed.model = Some("different-model".to_owned());
+                manager.save(&changed).unwrap();
+            }
+            "token" => {
+                let mut doc: Value = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+                doc["old_token"] = json!("another-generation");
+                agent::atomic_json(&journal, &doc).unwrap();
+            }
+            _ => fs::set_permissions(&journal, fs::Permissions::from_mode(0o666)).unwrap(),
+        }
+        let launches = fixture.client.runs.lock().unwrap().clone();
+        assert!(
+            manager.revive("worker", false, None, TIMEOUT).is_err(),
+            "{change}"
+        );
+        assert_eq!(manager.read_record("worker").unwrap().token, old.token);
+        assert_eq!(*fixture.client.runs.lock().unwrap(), launches);
+    }
+}

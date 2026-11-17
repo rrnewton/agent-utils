@@ -21,6 +21,14 @@ same exact-SHA lease protection for this lane's own branch. It incorporates
 the extracted fixes from main and the upstream process-pin regression repair;
 focused tests remain a publication checkpoint, not complete validation evidence.
 
+## Restart slot enrollment — coordinator November 16, 2026, 9:36pm ET
+
+Implement journaled enrollment of a running unboxed lane into a capped slot
+through agentctl restart as its own PR, stacked on recovery-reconciler when
+needed. Include focused tests and publish checkpoints with normal hooks.
+This supersedes the direct-to-main and one-PR rules for this assigned change.
+No self-restart, live pilot, or rollout without the coordinator's explicit GO.
+
 ## Publication Policy
 
 Routine changes to this repository go directly to `rrnewton/agent-utils:main`.
