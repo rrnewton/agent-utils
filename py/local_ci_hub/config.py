@@ -54,6 +54,7 @@ class Config:
     producers: list[str] = field(default_factory=lambda: ["local-ci-hub"])
     admission_kinds: list[str] = field(default_factory=lambda: ["host-limits-live"])
     known_gaps: list[str] = field(default_factory=list)
+    schema_cutover: str = "2026-11-17T00:00:00Z"
 
     @property
     def ledger_file(self) -> Path:
@@ -125,6 +126,7 @@ def load(path: Path | None, root: Path | None = None) -> Config:
         producers=[str(v) for v in led.get("producers", ["local-ci-hub"])],
         admission_kinds=[str(v) for v in data.get("receipt", {}).get("admission_kinds", ["host-limits-live"])] if isinstance(data.get("receipt", {}).get("admission_kinds"), list) else ["host-limits-live"],
         known_gaps=[str(v) for v in rec.get("known_gaps", [])],
+        schema_cutover=str(rec.get("schema_version_cutover", "2026-11-17T00:00:00Z")),
     )
     unknown = set(cfg.qualifying) - {"local-ledger-pass", "remote-pass"}
     if unknown:

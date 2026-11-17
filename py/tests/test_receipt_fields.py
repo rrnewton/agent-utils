@@ -68,6 +68,7 @@ def test_schema6_requires_full_profile_and_result_set(tmp_path: Path) -> None:
 def test_schema_versions_gate_and_coverage_thresholds(tmp_path: Path) -> None:
     legacy = {k: v for k, v in _good_v6().items()
               if k not in ("schema_version", "repo", "gates_run", "gates_expected", "coverage")}
+    legacy["finished_at"] = "2026-11-16T00:00:00Z"  # era evidence predates the cutover
     assert _verdict(tmp_path / "a", legacy) == "qualified"  # era rules, not vacuous clauses
     v5 = dict(legacy, schema_version=5, repo="repo-a")
     assert _verdict(tmp_path / "b", v5) != "qualified"  # schema 5 requires gates+coverage
@@ -122,6 +123,24 @@ def test_schema4_era_and_gap_names(tmp_path: Path) -> None:
     assert _verdict(tmp_path / "b", gap) == "qualified"  # named, ledgered gaps
     skip = dict(_good_v6(), gates_run=1, gates_expected=2, intentional_skipped_nodes=["n"])
     assert _verdict(tmp_path / "c", skip) == "qualified"  # legitimate intentional skip
+
+
+def test_era_cutover_both_sides(tmp_path: Path) -> None:
+    legacy = {k: v for k, v in _good_v6().items()
+              if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
+                           "admission", "admission_floor_evidence", "tooling_sha",
+                           "producer", "record_id", "log_identity", "cell_results")}
+    before = dict(legacy, finished_at="2026-11-16T23:59:59Z")
+    assert _verdict(tmp_path / "a", before) == "qualified"  # predates the cutover
+    after = dict(legacy, finished_at="2026-11-17T00:00:01Z")
+    assert _verdict(tmp_path / "b", after) != "qualified"  # new runs may not omit fields
+    absent = {k: v for k, v in before.items() if k != "finished_at"}
+    assert _verdict(tmp_path / "c", absent) != "qualified"
+    junk = dict(before, finished_at="not-a-time")
+    assert _verdict(tmp_path / "d", junk) != "qualified"
+    v4_after = dict(before, schema_version=4, finished_at="2026-11-17T00:00:01Z")
+    v4_after.pop("repo", None)
+    assert _verdict(tmp_path / "e", v4_after) != "qualified"  # missing repo, after cutover
 
 
 def test_adapter_maps_and_drops(tmp_path: Path) -> None:

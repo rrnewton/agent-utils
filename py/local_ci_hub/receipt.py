@@ -113,6 +113,23 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
                     out[key] = totals[key]
         return out
 
+    def _era_ok(r: dict[str, object]) -> bool:
+        # Era evidence only before the schema-version cutover: a
+        # new run can never qualify by omitting fields. Absent or
+        # unparseable finish times refuse.
+        import datetime as _dt
+        raw = r.get("finished_at")
+        if not isinstance(raw, str) or not raw:
+            return False
+        try:
+            when = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            cut = _dt.datetime.fromisoformat(cfg.schema_cutover.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if when.tzinfo is None or cut.tzinfo is None:
+            return False
+        return when < cut
+
     def _repo_allowed(r: dict[str, object], version: int) -> bool:
         # A foreign repository never qualifies at any version. A
         # missing repository refuses schema 5+ records and any
@@ -125,7 +142,7 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             return isinstance(repo, str) and repo in allowed
         if version >= 5:
             return False  # schema 5+ must name its repository
-        return True  # unversioned and schema <=4: era rules
+        return _era_ok(r)  # below schema 5: era evidence only
 
     def _strict_pass(r: dict[str, object]) -> bool:
         r = _with_totals(r)
@@ -134,6 +151,8 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
         version = _version_of(r)
         if version is None:
             return False  # malformed or future schema version: refused
+        if version == 0 and not _era_ok(r):
+            return False  # unversioned: era evidence only
         if not _repo_allowed(r, version):
             return False
         if r.get("commit_anchored") is False:
