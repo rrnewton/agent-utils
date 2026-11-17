@@ -140,34 +140,34 @@ class ServerApi(FakeApi):
 
 
 def serve_hits(api: ServerApi, web_root: Path) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
-    base = handler_for(api, web_root)  # type: ignore[arg-type]
+    base = handler_for(api, web_root)
 
     class Handler(base):  # type: ignore[valid-type, misc]
         def do_GET(self) -> None:  # noqa: N802
             parts = urlsplit(self.path)
             path = unquote(parts.path)
             if path.endswith("/search") and self.headers.get("Authorization") == f"Bearer {TOKEN}":
-                self.json(200, api.search(parse_qs(parts.query)))  # type: ignore[attr-defined]
+                self.json(200, api.search(parse_qs(parts.query)))
                 return
             if path.endswith("/history") and self.headers.get("Authorization") == f"Bearer {TOKEN}":
                 self.json(200, {"channel_id": CHANNEL["id"], "complete": True, "cycle_pages": 1,
                                 "walking": False, "queue_position": None,
                                 "oldest_ms": stamp_ms(0), "reached_ms": stamp_ms(0),
-                                "eta_s": None, "held_reason": None})  # type: ignore[attr-defined]
+                                "eta_s": None, "held_reason": None})
                 return
             super().do_GET()
 
         def do_POST(self) -> None:  # noqa: N802
             path = unquote(urlsplit(self.path).path)
             if path.endswith("/history/prioritize"):
-                if not self.authorized():  # type: ignore[attr-defined]
+                if not self.authorized():
                     return
                 with api.lock:
                     api.prioritized.append(path)
                 self.json(200, {"channel_id": CHANNEL["id"], "complete": True, "cycle_pages": 1,
                                 "walking": False, "queue_position": None,
                                 "oldest_ms": stamp_ms(0), "reached_ms": stamp_ms(0),
-                                "eta_s": None, "held_reason": None})  # type: ignore[attr-defined]
+                                "eta_s": None, "held_reason": None})
                 return
             super().do_POST()
 
