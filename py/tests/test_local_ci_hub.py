@@ -74,8 +74,9 @@ def test_receipt_qualified_and_no_result(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     assert run_cli(repo, "receipt", "show", "deadbeef").returncode == 1  # no-result, not qualified
     assert run_cli(repo, "run", "start").returncode == 0
+    # An in-place run writes commit_anchored false and can never qualify.
     out = run_cli(repo, "--json", "receipt", "show", "HEAD")
-    assert out.returncode == 0 and json.loads(out.stdout)["verdict"] == "qualified"
+    assert out.returncode == 1 and json.loads(out.stdout)["verdict"] == "not-qualified"
 
 
 def test_run_start_honours_commit_and_cell(tmp_path: Path) -> None:

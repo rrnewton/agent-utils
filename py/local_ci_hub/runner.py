@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import fcntl
+import socket
 from collections.abc import Callable, Mapping
 import json
 import os
@@ -13,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import host_limits
+from . import host_limits, result_adapter
 from .config import Config
 from .ledger import Ledger
 
@@ -31,6 +32,48 @@ def _handles(cfg: Config, environ: Mapping[str, str] | None = None) -> Path:
     except OSError:
         pass
     return d
+
+
+def _git(root: Path, *args: str) -> str:
+    try:
+        return subprocess.run(["git", *args], cwd=root, capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _record_fields(cfg: Config, *, commit: str, run_id: str,
+                     started_at: str, decision: object, inputs: object) -> dict[str, object]:
+    """Terminal-record fields the runner itself computes.
+
+    Anchoring is honest about this runner: it executes in place,
+    so commit_anchored is false until the checkout lifecycle
+    materializes a slot. Tooling identity is the tool tree HEAD.
+    """
+    tree = _git(cfg.root, "rev-parse", f"{commit}^{{tree}}") or ""
+    base_sha = _git(cfg.root, "rev-parse", f"{commit}^") or commit
+    base_tree = _git(cfg.root, "rev-parse", f"{base_sha}^{{tree}}") or tree
+    tool_root = Path(__file__).resolve().parents[2]
+    tooling = _git(tool_root, "rev-parse", "HEAD") or "unknown"
+    dirty = bool(_git(cfg.root, "status", "--porcelain"))
+    adapted = result_adapter.from_result_file(cfg.state_dir / f"{run_id}.result.json")
+    fields: dict[str, object] = {
+        "schema_version": 6, "producer": cfg.producer, "repo": cfg.repo,
+        "record_id": f"rec-{run_id}", "tree": tree, "base_sha": base_sha,
+        "base_tree": base_tree, "commit_anchored": False, "tree_dirty": dirty,
+        "admission": "host-limits-live",
+        "admission_floor_evidence": {
+            "floor_kind": "current-main", "floor_sha": commit,
+            "observed_main_sha": _commit(cfg.root), "floor_tree": tree},
+        "tooling_sha": tooling, "cwd": str(cfg.root),
+        "host": socket.gethostname().split(".")[0],
+        "started_at": started_at,
+        "concurrent_validates": int(getattr(inputs, "v", 0)) + 1,
+        "concurrency_proof": {"decision": decision.as_dict() if hasattr(decision, "as_dict") else {},
+                              "inputs": inputs.as_dict() if hasattr(inputs, "as_dict") else {}},
+    }
+    fields.update(adapted)
+    return fields
 
 
 def _commit(root: Path) -> str:
@@ -222,7 +265,10 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "",
     ledger_result = {"pass": "PASS", "fail": "FAIL", "timeout": "TIMEOUT",
                      "no_result": "NO_RESULT"}[outcome]
     Ledger(cfg).append_result(commit=commit, result=ledger_result, run_id=run_id, cell=cell,
-                              command=" ".join(cfg.validate_command))
+                              command=" ".join(cfg.validate_command),
+                              extra=_record_fields(cfg, commit=commit, run_id=run_id,
+                                                   started_at=str(handle.get("started_at", "")),
+                                                   decision=decision, inputs=inputs))
     Ledger(cfg).publish()
     handle.update(state="finished", result=ledger_result, outcome=outcome, exit_code=exit_code,
                 box_breach=breach)

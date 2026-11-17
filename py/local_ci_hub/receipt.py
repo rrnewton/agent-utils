@@ -61,9 +61,65 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
         except Exception:
             pass
     rows = Ledger(cfg).for_commit(commit)
+    _RESULTS = {"pass", "fail", "timeout", "incomplete", "killed", "no_result"}
+
+    def _result_of(r: dict[str, object]) -> str:
+        value = str(r.get("result", "")).strip().lower()
+        return "fail" if value == "failed" else value  # reader leniency only
+
+    def _version_of(r: dict[str, object]) -> int:
+        value = r.get("schema_version")
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    def _count_of(value: object) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, list):
+            return len(value)
+        return None
+
+    def _with_totals(r: dict[str, object]) -> dict[str, object]:
+        # Test totals may arrive nested under test_results.totals.
+        out = dict(r)
+        holder = r.get("test_results")
+        totals = holder.get("totals") if isinstance(holder, dict) else None
+        if isinstance(totals, dict):
+            for key in ("executed_tests", "passed_tests", "filtered_tests",
+                        "failures", "known_gaps"):
+                if out.get(key) is None and totals.get(key) is not None:
+                    out[key] = totals[key]
+        return out
+
     def _strict_pass(r: dict[str, object]) -> bool:
-        if r.get("result") != "PASS" or r.get("_digest_ok") is False or r.get("_evidence_ok") is False:
+        r = _with_totals(r)
+        if _result_of(r) != "pass" or r.get("_digest_ok") is False or r.get("_evidence_ok") is False:
             return False
+        version = _version_of(r)
+        if version >= 6 and cfg.require_full_evidence:
+            # Schema-6 records: repository required, full selection required.
+            repo = r.get("repo")
+            if not isinstance(repo, str) or not repo:
+                return False
+            if cfg.repo and repo != cfg.repo:
+                return False  # the same SHA never qualifies across repositories
+            if r.get("profile") != "full" or r.get("selection_mode") != "full":
+                return False
+        if version >= 5 and cfg.require_full_evidence:
+            # Schema-5+: gate accounting must close and coverage is required.
+            ran = _count_of(r.get("gates_run"))
+            expected = _count_of(r.get("gates_expected"))
+            skipped = _count_of(r.get("intentional_skipped_nodes")) or 0
+            if ran is None or expected is None or ran + skipped != expected:
+                return False
+            cov = r.get("coverage")
+            if not isinstance(cov, dict):
+                return False
+            planned = cov.get("planned_test_nodes")
+            planned_n = len(planned) if isinstance(planned, list) else planned
+            if not planned_n or cov.get("zero_executed_nodes") not in ([],) or cov.get("absent_nodes") not in ([],):
+                return False
         if r.get("commit_anchored") is False:
             return False
         if not _release_identity_ok(cfg, r):
@@ -80,7 +136,14 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             if r.get("tree_dirty") not in (None, False) or (r.get("failures") or 0) != 0:
                 return False
             if r.get("passed_tests") is not None and r.get("passed_tests") != r.get("executed_tests"):
-                return False
+                # Owner-approved known-gap exception: a shortfall qualifies
+                # only when every missing test is ledgered as a known gap.
+                executed = r.get("executed_tests")
+                passed = r.get("passed_tests")
+                gaps = _count_of(r.get("known_gaps"))
+                if not (isinstance(executed, int) and isinstance(passed, int)
+                        and gaps is not None and executed - passed <= gaps):
+                    return False
             if cfg.release_payload is not None and r.get("release_builder") is not None and r.get("e2e_payload") != cfg.release_payload:
                 return False  # only the configured current release identity qualifies; superseded payloads are supplemental
             cov = r.get("coverage")
@@ -101,7 +164,7 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
         # FAIL (e.g. only-portable) is a withheld non-verdict and must not veto
         # a qualifying PASS.
         return (
-            r.get("result") == "FAIL"
+            _result_of(r) == "fail"
             and r.get("_evidence_ok") is not False
             and r.get("_digest_ok") is not False
             and r.get("commit_anchored") is True

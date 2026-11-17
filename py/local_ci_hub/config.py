@@ -48,6 +48,8 @@ class Config:
     digest_command: list[str] | None = None
     repos: list[dict[str, object]] = field(default_factory=list)
     counted_repos: list[str] = field(default_factory=list)
+    repo: str = "example"
+    producer: str = "local-ci-hub"
 
     @property
     def ledger_file(self) -> Path:
@@ -113,6 +115,8 @@ def load(path: Path | None, root: Path | None = None) -> Config:
         release_payload=dict(rec["release_payload"]) if rec.get("release_payload") else None,
         digest_command=list(rec["digest_command"]) if rec.get("digest_command") else None,
         counted_repos=[str(v) for v in led.get("counted_repos", [])],
+        repo=str(proj.get("repo", proj.get("name", "example"))),
+        producer=str(led.get("producer", "local-ci-hub")),
     )
     unknown = set(cfg.qualifying) - {"local-ledger-pass", "remote-pass"}
     if unknown:

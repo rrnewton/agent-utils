@@ -26,7 +26,7 @@ _ROW_REF_FIELDS = frozenset({"codec", "sha256", "bytes", "locator", "compressed_
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def canonical_bytes(event: dict[str, object]) -> bytes:
@@ -118,7 +118,7 @@ class Ledger:
                 merged["_digest_ok"] = (expect == ev["digest"])
             merged["_evidence_ok"] = bool(evidence_ok and rows[rid].get("_evidence_ok", True))  # once refused, always refused
             rows[rid] = merged
-        counted = set(self.cfg.counted_repos)
+        counted = set(self.cfg.counted_repos) | {self.cfg.repo}
         return [rows[r] for r in order if rows[r].get("repo") is None or rows[r].get("repo") in counted]
 
     def _resolve_ref(self, codec: dict[str, object], host: str | None = None) -> tuple[dict[str, object], bool]:
@@ -183,7 +183,8 @@ class Ledger:
         return proc.stdout.decode().strip().split()[-1] if proc.stdout.strip() else None
 
     def append_result(self, *, commit: str, result: str, run_id: str | None = None,
-                      cell: str = "", command: str = "", host: str | None = None) -> dict[str, object]:
+                      cell: str = "", command: str = "", host: str | None = None,
+                      extra: dict[str, object] | None = None) -> dict[str, object]:
         """Append one run result to the spool for later publication."""
         run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
         ev: dict[str, object] = {
@@ -192,6 +193,9 @@ class Ledger:
             "cell": cell, "command": command, "host": host or short_host(),
             "team": self.cfg.team, "finished_at": _now(),
         }
+        if extra:
+            for key, value in extra.items():
+                ev.setdefault(key, value)
         ev["digest"] = digest({k: v for k, v in ev.items() if k != "digest"})
         self.cfg.spool_dir.mkdir(parents=True, exist_ok=True)
         spool = self.cfg.spool_dir / f"{ev['event_id']}.jsonl"
