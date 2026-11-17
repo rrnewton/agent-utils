@@ -958,9 +958,7 @@ fn seal_orphaned(cfg: &Cfg, path: &Path) -> bool {
         .and_then(|extension| extension.get("operator"))
         .and_then(crate::status_state::identity_from_value);
     let judged = operator.as_ref().unwrap_or(&identity);
-    if judged.pid != i64::from(std::process::id())
-        && crate::status_state::process_state(Some(judged)).0 != "dead"
-    {
+    if crate::status_state::process_state(Some(judged)).0 != "dead" {
         return false;
     }
     // A paired finish keeps the seal binding; any outstanding finish
