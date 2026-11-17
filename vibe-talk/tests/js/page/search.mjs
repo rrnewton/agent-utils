@@ -2746,6 +2746,8 @@ test("`#1786 vibe-talk-search-scope-server-hits`: in a thread, this thread's ser
   const cards = page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"));
   assert.deepStrictEqual(cards.map((li) => li.getAttribute("data-id")), ["150"]);
   assert.equal(cards[0].getAttribute("data-server-hit"), "card");
+  assert.ok(cards[0].descendants().some((node) => node.tagName === "mark" || node.tagName === "MARK"),
+    "the placed card's hit is not highlighted like the loaded cards'");
   assert.deepStrictEqual(page.el("server-hits").children, [], "a snippet was drawn at the foot");
   // The other thread's hit waits behind the chip, named for this thread.
   const chip = page.el("search-outside-chip");

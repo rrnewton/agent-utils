@@ -911,6 +911,9 @@ function placeServerHits(): void {
   for (const hit of serverInScopeHits()) {
     const node = deps.serverCardNode ? deps.serverCardNode(hit) : serverHitNode(hit);
     node.setAttribute(SERVER_HIT_MARK, "card");
+    // Marked like every other hit on the page (the quoted hits are at their
+    // build in `serverHitNode`); later filter passes re-mark it as a row.
+    if (deps.serverCardNode) markSearchHits(node, searchParsed(searchField.query()).terms);
     placed.push({ at: Date.parse(hit.timestamp) || 0, node });
   }
   if (outsideShown) {
