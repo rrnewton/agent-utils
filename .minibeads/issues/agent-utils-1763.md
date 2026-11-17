@@ -1,13 +1,14 @@
 ---
 title: 'dagrun-learned-step-memory-cap-too-tight: learned caps OOM light cargo steps under gate contention'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - dagrun
 - validation
 created_at: 2026-11-17T07:20:02.000000000+00:00
-updated_at: 2026-11-17T07:20:02.000000000+00:00
+updated_at: 2026-11-17T14:35:00.000000000+00:00
+closed_at: 2026-11-17T14:35:00.000000000+00:00
 ---
 
 # Description
@@ -56,7 +57,7 @@ fails the run.
 
 ## Resolution
 
-Implemented on `mu-dagcap/1763`:
+Landed on github/main as `c71e282db561c6aa3b941744300f7cafd9cac4a4` (replayed from gated `a1a2fc1d`). Implemented on `mu-dagcap/1763`:
 
 - `dagrun.sizing.learned_mem_cap_bytes` (both editions):
   `peak + max(25% of peak, 512 MiB)`; the ordinary profile path floors every
