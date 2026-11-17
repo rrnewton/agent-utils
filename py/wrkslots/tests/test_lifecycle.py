@@ -60624,6 +60624,155 @@ def test_remove_agent_batch_archive_ignored_removes_slots(tmp_path: Path) -> Non
             )
 
 
+def _dangling_third_party_copy(tree: Path) -> Path:
+    """A copy of a submodule worktree whose gitdir is gone (#1774)."""
+
+    dangling = tree / "ignored" / "reverie-third-party-a32b6494" / "dynamorio"
+    dangling.mkdir(parents=True)
+    (dangling / ".git").write_text(
+        "gitdir: ../../../../../../.git/worktrees/revastra1-20261103/modules/"
+        "reverie/modules/third-party/dynamorio\n",
+        encoding="utf-8",
+    )
+    (dangling / "file.txt").write_text("copied work\n", encoding="utf-8")
+    return dangling
+
+
+def _project_with_ignored_directory(tmp_path: Path) -> tuple[Path, Path]:
+    project, repository, _remote = make_project(tmp_path)
+    (repository / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    git(repository, "add", ".gitignore")
+    git(repository, "commit", "-q", "-m", "ignore the copies directory")
+    git(repository, "push", "-q", "origin", "main")
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    commit_task(repository, tree, "codex/task")
+    _prepare_removable_agent_slot(project)
+    return project, tree
+
+
+@pytest.mark.parametrize("flag", ("--archive-ignored", "--discard-ignored"))
+def test_remove_dangling_gitfile_under_ignored_proceeds(tmp_path: Path, flag: str) -> None:
+    """#1774: a dangling gitlink is plain ignored files, never probed."""
+
+    project, tree = _project_with_ignored_directory(tmp_path)
+    dangling = _dangling_third_party_copy(tree)
+
+    removed = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        flag,
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    assert active_slots(project) == []
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipt = archive["records"][0]["salvage"][0]
+    paths = [entry["path"] for entry in receipt["ignored_files"]]
+    assert "ignored/reverie-third-party-a32b6494/dynamorio/.git" in paths
+    assert "ignored/reverie-third-party-a32b6494/dynamorio/file.txt" in paths
+    if flag == "--archive-ignored":
+        tars = list(project.rglob("ignored-*.tar"))
+        assert len(tars) == 1
+        with tarfile.open(tars[0], "r:") as bundle:
+            names = bundle.getnames()
+        assert any(name.endswith("dynamorio/.git") for name in names)
+        assert any(name.endswith("dynamorio/file.txt") for name in names)
+    assert not dangling.exists()
+
+
+def test_remove_resolvable_nested_repo_with_unpushed_commit_refuses(
+    tmp_path: Path,
+) -> None:
+    """#1774: a real nested repository keeps its unpushed-work refusal.
+
+    The nested clone sits in a configured cache, where removal judges
+    nested repositories; a local-only commit there refuses, exactly as
+    before this change.
+    """
+
+    project, _remote, tree, _head = _slot_with_clean_nested_clone(tmp_path)
+    nested = tree / "target" / "deps" / "clean"
+    commit_local(nested, "local.txt", "local only\n", "local only")
+    _prepare_removable_agent_slot(project)
+
+    removed = remove(project)
+
+    assert removed.returncode != 0, removed.stdout
+    assert "not provably disposable" in removed.stderr
+    assert tree.is_dir()
+    assert (nested / "local.txt").is_file()
+    assert active_slots(project)
+
+
+def test_remove_nested_git_directory_under_ignored_is_unchanged(tmp_path: Path) -> None:
+    """#1774: a nested `.git` directory is judged as a repository, as before."""
+
+    project, tree = _project_with_ignored_directory(tmp_path)
+    upstream = _bare_upstream(tmp_path, "dependency", {"seed.txt": "seed\n"})
+    nested = tree / "ignored" / "nested"
+    _nested_clone(upstream, nested)
+    (nested / "scratch.log").write_text("scratch\n", encoding="utf-8")
+    (nested / ".gitignore").write_text("scratch.log\n", encoding="utf-8")
+    git(nested, "add", ".gitignore")
+    git(nested, "commit", "-q", "-m", "ignore scratch")
+    git(nested, "push", "-q", "origin", "main")
+
+    removed = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--discard-ignored",
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    receipt = archive["records"][0]["salvage"][0]
+    paths = [entry["path"] for entry in receipt.get("ignored_files", [])]
+    # The nested repository's own ignored files, under its prefix, exactly
+    # as before; its `.git` directory is never an ignored file.
+    assert "ignored/nested//scratch.log" in paths
+    assert not any(path.endswith("nested/.git") for path in paths)
+
+
+def test_dangling_gitlink_classification(tmp_path: Path) -> None:
+    """#1774: only a gitfile whose gitdir is gone is a dangling gitlink."""
+
+    dangling = tmp_path / "dangling"
+    dangling.mkdir()
+    (dangling / ".git").write_text("gitdir: ../gone/modules/copy\n", encoding="utf-8")
+    assert wrkslots._is_dangling_gitlink(dangling)
+
+    upstream = _bare_upstream(tmp_path, "dependency", {"seed.txt": "seed\n"})
+    clone = tmp_path / "clone"
+    _nested_clone(upstream, clone)
+    assert not wrkslots._is_dangling_gitlink(clone)
+
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / ".git").write_text(f"gitdir: {clone / '.git'}\n", encoding="utf-8")
+    assert not wrkslots._is_dangling_gitlink(linked)
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert not wrkslots._is_dangling_gitlink(plain)
+
+
 def referenced_ignored_batch_project(
     tmp_path: Path,
 ) -> tuple[Path, list[str], Path]:

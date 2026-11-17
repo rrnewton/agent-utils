@@ -1944,8 +1944,17 @@ fn collect_ignored_directory(
     {
         return Ok(());
     }
-    let git_marker = directory.join(".git");
-    if git_marker.exists() || git_marker.is_symlink() {
+    if crate::finish_write::is_dangling_gitlink(&directory) {
+        // Not a repository (#1774): the gitfile itself is one more ignored
+        // file, named in the evidence by its path, and the files beside it
+        // are collected below like any other ignored files.
+        record_ignored_file(
+            checkout_name,
+            checkout_path,
+            &format!("{relative}/.git"),
+            found,
+        )?;
+    } else if directory.join(".git").exists() || directory.join(".git").is_symlink() {
         return collect_ignored_files(
             config,
             checkout_name,
@@ -2018,6 +2027,7 @@ fn collect_ignored_files(
             ".",
         ],
     )?;
+    let mut dangling_seen = std::collections::HashSet::new();
     for name in raw.split('\0') {
         if name.is_empty() {
             continue;
@@ -2076,6 +2086,21 @@ fn collect_ignored_files(
             )?;
         } else {
             record_ignored_file(checkout_name, checkout_path, &relative, found)?;
+            // Git lists the files below a dangling gitlink (#1774) one by
+            // one and never lists the gitfile itself; name it here, once,
+            // as the ignored file it is.
+            let parts: Vec<&str> = relative.split('/').collect();
+            for end in 1..parts.len() {
+                let ancestor = parts[..end].join("/");
+                let gitfile = format!("{ancestor}/.git");
+                if dangling_seen.contains(&ancestor) || found.contains_key(&gitfile) {
+                    continue;
+                }
+                dangling_seen.insert(ancestor.clone());
+                if crate::finish_write::is_dangling_gitlink(&checkout_path.join(&ancestor)) {
+                    record_ignored_file(checkout_name, checkout_path, &gitfile, found)?;
+                }
+            }
         }
     }
     Ok(())
@@ -2713,7 +2738,7 @@ fn declared_submodules(checkout_path: &Path) -> Vec<(String, PathBuf)> {
             continue;
         };
         let sub_path = checkout_path.join(value.trim());
-        if sub_path.join(".git").exists() {
+        if crate::finish_write::submodule_worktree_populated(&sub_path) {
             found.push((name.to_string(), sub_path));
         }
     }

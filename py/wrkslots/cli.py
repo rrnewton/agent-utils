@@ -33258,17 +33258,33 @@ def _checkout_is_self_sourced(
     return repository.resolve() == git_directory.resolve()
 
 
+def _is_dangling_gitlink(directory: Path) -> bool:
+    """Whether ``directory`` holds a dangling gitlink, not a repository (#1774).
+
+    A ``.git`` file whose gitdir does not resolve names no repository: a
+    copy of a submodule worktree can keep such a file after the tree it
+    pointed into is gone. It is plain files, judged like any other file
+    beside it, and is never probed for remotes. A ``.git`` directory, or a
+    gitfile that does resolve, is a repository and is judged as one.
+    """
+
+    return (directory / ".git").is_file() and not _submodule_worktree_populated(
+        directory
+    )
+
+
 def _is_unlisted_submodule_worktree(vcs: _GitVcs, checkout_path: Path, relative: str) -> bool:
     """Whether ``relative`` under a checkout is a populated submodule worktree.
 
     Its ``.git`` file must point into the checkout's own ``modules``
     directory, which is what makes it a submodule repository the branch
     stopped listing rather than an arbitrary embedded repository (#859).
+    A dangling gitlink (#1774) is not a worktree at all.
     """
 
     worktree = checkout_path / relative
     gitfile = worktree / ".git"
-    if not gitfile.is_file():
+    if not gitfile.is_file() or _is_dangling_gitlink(worktree):
         return False
     try:
         target = gitfile.read_text(encoding="utf-8").strip()
@@ -33323,6 +33339,10 @@ def _unlisted_submodule_checkouts(
         if not module_dir.is_absolute():
             module_dir = (worktree / module_dir).resolve()
         if modules_root not in module_dir.parents and module_dir.parent != modules_root:
+            continue
+        if _is_dangling_gitlink(worktree):
+            # A copy of a submodule worktree whose gitdir is gone (#1774):
+            # plain files under ignored content, never a salvage candidate.
             continue
         relative = worktree.relative_to(checkout_path).as_posix()
         if relative in listed:
@@ -34362,7 +34382,12 @@ def _collect_ignored_directory(
         # own Git checks judge it, and its object store is not a pile of
         # ignored worktree files.
         return
-    if (directory / ".git").exists() or (directory / ".git").is_symlink():
+    if _is_dangling_gitlink(directory):
+        # Not a repository (#1774): the gitfile itself is one more ignored
+        # file, named in the evidence by its path, and the files beside it
+        # are collected below like any other ignored files.
+        _record_ignored_file(checkout, checkout_path, f"{relative}/.git", found)
+    elif (directory / ".git").exists() or (directory / ".git").is_symlink():
         _collect_ignored_files(
             config,
             checkout,
@@ -34438,6 +34463,7 @@ def _collect_ignored_files(
         ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."],
     ).stdout
     repositories: dict[str, bool] = {}
+    dangling_seen: set[str] = set()
     for name in raw.split("\x00"):
         if not name:
             continue
@@ -34472,6 +34498,19 @@ def _collect_ignored_files(
             )
         else:
             _record_ignored_file(checkout, checkout_path, relative, found)
+            # Git lists the files below a dangling gitlink (#1774) one by
+            # one and never lists the gitfile itself; name it here, once,
+            # as the ignored file it is.
+            parts = relative.split("/")
+            for end in range(1, len(parts)):
+                ancestor = "/".join(parts[:end])
+                if ancestor in dangling_seen or f"{ancestor}/.git" in found:
+                    continue
+                dangling_seen.add(ancestor)
+                if _is_dangling_gitlink(checkout_path.joinpath(*parts[:end])):
+                    _record_ignored_file(
+                        checkout, checkout_path, f"{ancestor}/.git", found
+                    )
 
 
 def _ignored_files_outside_caches(

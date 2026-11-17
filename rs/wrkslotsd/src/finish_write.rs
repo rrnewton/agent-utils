@@ -1434,6 +1434,41 @@ fn gitlink_paths(path: &Path) -> Result<Vec<String>> {
     Ok(found)
 }
 
+/// Whether a submodule worktree is populated: its `.git` directory, or a
+/// gitfile whose gitdir resolves (#1774, as the Python edition's
+/// `_submodule_worktree_populated`). A gitfile whose gitdir is gone is a
+/// dangling gitlink: plain files, never probed as a repository.
+pub(crate) fn submodule_worktree_populated(dir: &Path) -> bool {
+    let git_entry = dir.join(".git");
+    if git_entry.is_dir() {
+        return true;
+    }
+    if !git_entry.is_file() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&git_entry) else {
+        return false;
+    };
+    let Some(target) = text.trim().strip_prefix("gitdir:") else {
+        return false;
+    };
+    let target = target.trim();
+    if target.is_empty() {
+        return false;
+    }
+    let gitdir = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        dir.join(target)
+    };
+    gitdir.is_dir()
+}
+
+/// Whether `dir` holds a dangling gitlink, not a repository (#1774).
+pub(crate) fn is_dangling_gitlink(dir: &Path) -> bool {
+    dir.join(".git").is_file() && !submodule_worktree_populated(dir)
+}
+
 pub(crate) fn initialized_submodules(path: &Path) -> Result<Vec<String>> {
     let mut result: Vec<String> = Vec::new();
     let mut queue: Vec<String> = gitlink_paths(path)?;
@@ -1442,7 +1477,7 @@ pub(crate) fn initialized_submodules(path: &Path) -> Result<Vec<String>> {
         let relative = queue[index].clone();
         index += 1;
         let nested = path.join(&relative);
-        if !nested.join(".git").exists() {
+        if !submodule_worktree_populated(&nested) {
             continue;
         }
         result.push(relative.clone());

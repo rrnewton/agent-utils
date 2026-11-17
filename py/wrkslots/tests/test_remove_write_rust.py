@@ -793,6 +793,47 @@ def test_remove_ignored_file_archives_in_both_editions(tmp_path: Path) -> None:
         assert archives[0] == archives[1]
 
 
+def _add_dangling_copy(root: Path) -> None:
+    """A submodule-worktree copy whose gitdir is gone, under ignored/ (#1774)."""
+
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / ".gitignore").write_text("ignored/\n")
+    _git(checkout, "add", ".gitignore")
+    _git(checkout, "commit", "-q", "-m", "ignore copies")
+    _git(checkout, "push", "-q", "origin", "HEAD:suite/work")
+    dangling = checkout / "ignored" / "reverie-third-party-a32b6494" / "dynamorio"
+    dangling.mkdir(parents=True)
+    (dangling / ".git").write_text(
+        "gitdir: ../../../../../../.git/worktrees/slot-a/modules/"
+        "reverie/modules/third-party/dynamorio\n"
+    )
+    (dangling / "file.txt").write_text("copied work\n")
+
+
+def test_remove_dangling_gitfile_discards_in_both_editions(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        for root in (rust_root, oracle_root):
+            _add_dangling_copy(root)
+        assert _python_remove(oracle_root, discard_ignored=True) == 0
+        result = _rust_remove(rust_root, discard_ignored=True)
+        assert result.returncode == 0, result.stderr
+        assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
+            oracle_root, "ARCHIVED.node-a.json"
+        )
+        for root in (rust_root, oracle_root):
+            assert not (root / "worktrees" / "slot-a").exists()
+            archived = _doc(root, "ARCHIVED.node-a.json")
+            records = cast(list[dict[str, object]], archived["records"])
+            salvage = cast(list[dict[str, object]], records[0]["salvage"])
+            paths = [
+                entry["path"]
+                for entry in cast(list[dict[str, object]], salvage[0]["ignored_files"])
+            ]
+            assert "ignored/reverie-third-party-a32b6494/dynamorio/.git" in paths
+            assert "ignored/reverie-third-party-a32b6494/dynamorio/file.txt" in paths
+
+
 def test_remove_ignored_cache_target_still_removes_in_both_editions(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         rust_root, oracle_root = _pair(base)
