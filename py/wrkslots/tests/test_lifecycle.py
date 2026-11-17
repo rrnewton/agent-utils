@@ -66966,6 +66966,32 @@ def test_containing_refs_sidecar_round_trip(tmp_path: Path) -> None:
     assert "containing_remote_refs_sidecar" not in holder
 
 
+def test_remove_with_many_containing_refs_writes_small_finish_journal(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    for index in range(200):
+        git(repository, "branch", f"bulk-{index}")
+    git(repository, "push", "origin", "refs/heads/bulk-*:refs/heads/bulk-*")
+    created = create(project)
+    assert created.returncode == 0, created.stderr
+    journal = prepare_removal_journal(project)
+    raw = json.loads(journal.read_text(encoding="utf-8"))
+    salvage = raw["salvage"][0]
+    reference = salvage["containing_remote_refs_sidecar"]
+    assert reference["count"] >= 200
+    assert len(salvage["containing_remote_refs"]) == 64
+    config = wrkslots._load_config(str(project), "testhost")
+    assert (config.control / str(reference["path"])).is_file()
+    # Two hundred refs inline twice would exceed 16 KiB on their own.
+    assert journal.stat().st_size < 32768
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid())
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert not journal.exists()
+
+
 def test_containing_refs_sidecar_missing_refuses_naming_digest(
     tmp_path: Path,
 ) -> None:
