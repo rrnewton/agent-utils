@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { ALICE, CHANNEL, CODER, CSS, FakeElement, HOLD_MS, HTML, HTML_CODE, LINK_ATTRS, PAGE_CODE,
   RECORD_EPOCH, UNPACK_STORAGE, allLeavingOut, assertMarkupContains, assistantSays,
   authorChannel, authorState, backlog, beforeOf, boxesOf, builtSince, cardRow, channelSummaryText,
-  chooseAuthor, chooseReadMode, collapsedRows, cssBlock, cssRules, deliver, excerptOf, foldButton,
+  chooseAuthor, chooseReadMode, collapsedRows, cssBlock, cssRules, deliver, enterVoice, excerptOf, foldButton,
   gate, headOf, hitsIn, inTwoColumns, json, lineText, longMessage, marksPending, message,
   messageCacheStatus, messageRows, newPage, nodeWithinFixture, openerOf, pagedThreads, pickThread,
   press, reReadChannel, reloadPage, repliesPage, replyHint, rowWithId, ruledRows, said,
@@ -93,6 +93,7 @@ test("THE COUNT NAMES ITS DENOMINATOR, BECAUSE THE SCREEN IS ONLY A SUFFIX OF TH
   const page = newPage();
   recorded(page, "conv", TALKED_ABOUT);
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
   assert.equal(page.el("search-count").textContent, "", "a count stands with nothing to count");
 
@@ -234,6 +235,7 @@ test("NOTHING MATCHED IS SAID WHERE THE MESSAGES WERE, NOT ONLY IN THE CORNER", 
   const page = newPage();
   recorded(page, "conv", TALKED_ABOUT);
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
   assert.equal(page.el("search-empty").hidden, true, "it is standing with nothing to explain");
 
