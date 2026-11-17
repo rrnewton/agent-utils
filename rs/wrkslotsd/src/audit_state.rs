@@ -6002,9 +6002,12 @@ fn cleanup_target(cfg: &Cfg, value: &Value, label: &str) -> Result<(String, i64,
     exact_keys(
         raw,
         &["slot", "generation", "path", "original_mode", "identity"],
-        &[],
+        &["fs_id"],
         label,
     )?;
+    if let Some(fs_id) = raw.get("fs_id") {
+        as_int(fs_id, &format!("{label}.fs_id"), 0)?;
+    }
     let slot = validate_name(as_str(&raw["slot"], &format!("{label}.slot"))?, "slot")?;
     let generation = as_int(&raw["generation"], &format!("{label}.generation"), 1)?;
     let (_relative, path) = relative_inside(

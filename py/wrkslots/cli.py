@@ -4220,6 +4220,101 @@ def _fd_private_cleanup_identity(fd: int, label: str) -> tuple[int, int, int, st
     return before.st_dev, before.st_ino, handle_type, file_handle
 
 
+def _filesystem_id(path: Path) -> int:
+    """The stable filesystem identity of ``path`` (statfs's filesystem id).
+
+    Unlike a subvolume's anonymous ``st_dev``, which a remount renumbers,
+    this folds the filesystem UUID with the subvolume root, so it names
+    one filesystem and subvolume across a reboot (#1764). Zero means the
+    filesystem reports none and proves nothing.
+    """
+
+    try:
+        return os.statvfs(path).f_fsid
+    except OSError as exc:
+        raise Refusal(f"cannot determine the filesystem identity of {path}: {exc}") from exc
+
+
+def _same_filesystem(path: Path, anchor: Path) -> bool:
+    """Whether ``path`` and ``anchor`` live on the same filesystem now.
+
+    Judged from the current mount table (same mount source and type),
+    which a reboot renumbers together for both, never from a recorded
+    ``st_dev``; falls back to equal filesystem ids. Any doubt is False.
+    """
+
+    try:
+        table = slotimage.mount_table()
+    except Exception:
+        table = []
+    if table:
+        def top(candidate: Path) -> slotimage.MountEntry | None:
+            found: slotimage.MountEntry | None = None
+            for entry in table:
+                if candidate == entry.mount_point or entry.mount_point in candidate.parents:
+                    if found is None or len(entry.mount_point.parts) > len(found.mount_point.parts):
+                        found = entry
+            return found
+
+        here, there = top(path), top(anchor)
+        if here is not None and there is not None:
+            return here.source == there.source and here.fstype == there.fstype
+    try:
+        return _filesystem_id(path) != 0 and _filesystem_id(path) == _filesystem_id(anchor)
+    except Refusal:
+        return False
+
+
+def _cleanup_fs_anchor(config: Config) -> Path:
+    """The configured filesystem a sealed validate target must share."""
+
+    if config.worktrees_image is not None:
+        return config.worktrees_image.mount_point(config.control, config.worktrees)
+    return _validate_slots_directory(config)
+
+
+def _private_cleanup_identity_matches(
+    path: Path,
+    live: _PrivateCleanupIdentity,
+    expected: _PrivateCleanupIdentity,
+    *,
+    cross_boot: bool,
+    recorded_fs_id: int | None,
+    fs_anchor: Path | None,
+) -> bool:
+    """Whether ``live`` proves ``path`` is the directory ``expected`` sealed.
+
+    The exact tuple always matches. Across a boot (the seal actor's boot
+    ended, so nothing it sealed can still be in use) a renumbered
+    anonymous device alone also matches: the inode, handle type and
+    handle bytes must be identical, both devices must be anonymous
+    (major 0), and the filesystem must be proven the same without the
+    device number -- by the recorded stable filesystem id when the
+    journal carries one, else by sharing the configured anchor's
+    filesystem. The handle names one inode generation in one
+    filesystem, so a recreated directory reusing the inode number, a
+    bind mount of any other object, or a foreign (FUSE) filesystem
+    cannot satisfy this; any doubt is False (#1764).
+    """
+
+    if live == expected:
+        return True
+    if not cross_boot or len(live) != 4 or len(expected) != 4:
+        return False
+    if live[1:] != expected[1:]:
+        return False
+    if os.major(live[0]) != 0 or os.major(expected[0]) != 0:
+        return False
+    if recorded_fs_id is not None:
+        try:
+            return recorded_fs_id != 0 and _filesystem_id(path) == recorded_fs_id
+        except Refusal:
+            return False
+    if fs_anchor is None:
+        return False
+    return _same_filesystem(path, fs_anchor)
+
+
 def _private_cleanup_identity_from_obj(
     value: object, label: str
 ) -> _PrivateCleanupIdentity:
@@ -37420,17 +37515,37 @@ def _validate_batch_seal_journals(config: Config) -> list[Path]:
     return sorted(config.control.glob("VALIDATE-BATCH-SEAL.*.journal"))
 
 
+def _seal_actor_crossed_boot(raw: Mapping[str, object]) -> bool:
+    """Whether the seal's actor ran on this host in an earlier boot (#1764).
+
+    No process survives a reboot, so such an actor is dead regardless of
+    any pid check; only the host identity and boot are compared here.
+    """
+
+    identity = _identity_from_obj(raw["actor"], "validation-batch seal journal.actor")
+    if identity is None:
+        return False
+    try:
+        return identity.host_id == _host_id() and identity.boot_id != _boot_id(
+            Path("/proc")
+        )
+    except Refusal:
+        return False
+
+
 def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str]:
     """Whether the seal journal at ``path`` was left by a process proven dead.
 
-    True only when the seal's actor ran on this machine identity and this
-    boot, its pid is absent or now names another process generation
-    (``_process_state``), and no finish journal is paired with the seal. A
-    live or indeterminate actor, an actor from another machine or an earlier
-    boot, an unreadable journal, or a paired finish all keep the seal binding.
-    Such an orphan is what a validate-batch removal leaves when its process is
-    killed before its ``finally`` retires the seal: nothing can still be using
-    it (https://github.com/rrnewton/agent-utils/issues/236).
+    True only when the seal's actor ran on this machine identity, it is
+    proven dead -- an actor from an earlier boot on this host is dead
+    regardless of any pid check (#1764), otherwise its pid must be absent
+    or now name another process generation (``_process_state``) -- and no
+    finish journal is paired with the seal. A live or indeterminate
+    actor, an actor from another machine, an unreadable journal, or a
+    paired finish all keep the seal binding. Such an orphan is what a
+    validate-batch removal leaves when its process is killed before its
+    ``finally`` retires the seal: nothing can still be using it
+    (https://github.com/rrnewton/agent-utils/issues/236).
     """
     try:
         _raw, targets = _validate_batch_seal_journal(
@@ -37446,10 +37561,12 @@ def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str
         if identity.host_id != host_id:
             return False, "the seal's actor belongs to another machine identity"
         if identity.boot_id != boot_id:
-            return False, "the seal's actor ran in an earlier boot"
-        state, reason = _process_state(identity)
-        if state != "dead":
-            return False, f"the seal's actor is {state}: {reason}"
+            # An earlier boot on this host: dead regardless of the pid.
+            reason = "the seal's actor ran in an earlier boot"
+        else:
+            state, reason = _process_state(identity)
+            if state != "dead":
+                return False, f"the seal's actor is {state}: {reason}"
         if _validate_batch_seal_paired_finish(config, targets) is not None:
             return False, "a finish journal is paired with the seal"
     except (Refusal, StateError) as exc:
@@ -55963,6 +56080,9 @@ def _restore_private_cleanup_path(
     expected_identity: _PrivateCleanupIdentity,
     *,
     allow_missing: bool = True,
+    cross_boot: bool = False,
+    recorded_fs_id: int | None = None,
+    fs_anchor: Path | None = None,
 ) -> None:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
@@ -55975,7 +56095,14 @@ def _restore_private_cleanup_path(
         raise Refusal(f"cannot open private cleanup path {path}: {exc}") from exc
     try:
         identity = _fd_private_cleanup_identity(descriptor, str(path))
-        if identity != expected_identity:
+        if not _private_cleanup_identity_matches(
+            path,
+            identity,
+            expected_identity,
+            cross_boot=cross_boot,
+            recorded_fs_id=recorded_fs_id,
+            fs_anchor=fs_anchor,
+        ):
             raise Refusal(
                 f"private cleanup path identity changed before mode restoration: {path}"
             )
@@ -55994,6 +56121,8 @@ def _reestablish_private_cleanup_fence(
     expected_identity: _PrivateCleanupIdentity,
     *,
     managed_root: Path | None = None,
+    cross_boot: bool = False,
+    recorded_fs_id: int | None = None,
 ) -> None:
     """Verify an interrupted target and re-seal an exactly restored mode."""
 
@@ -56006,11 +56135,15 @@ def _reestablish_private_cleanup_fence(
         raise Refusal(f"interrupted cleanup fence is not a real directory: {path}")
     mode = stat.S_IMODE(metadata.st_mode)
     if mode == 0o700:
-        if (
+        if not _private_cleanup_identity_matches(
+            path,
             _private_cleanup_fence_identity(
                 config, path, managed_root=managed_root
-            )
-            != expected_identity
+            ),
+            expected_identity,
+            cross_boot=cross_boot,
+            recorded_fs_id=recorded_fs_id,
+            fs_anchor=_cleanup_fs_anchor(config),
         ):
             raise Refusal(f"interrupted cleanup fence identity changed: {path}")
         return
@@ -56023,7 +56156,14 @@ def _reestablish_private_cleanup_fence(
     def verify_before_seal(
         observed_mode: int, observed_identity: _PrivateCleanupIdentity
     ) -> None:
-        if observed_mode != original_mode or observed_identity != expected_identity:
+        if observed_mode != original_mode or not _private_cleanup_identity_matches(
+            path,
+            observed_identity,
+            expected_identity,
+            cross_boot=cross_boot,
+            recorded_fs_id=recorded_fs_id,
+            fs_anchor=_cleanup_fs_anchor(config),
+        ):
             raise Refusal(f"interrupted cleanup fence identity changed: {path}")
 
     sealed_mode, sealed_identity = _seal_cleanup_path_private(
@@ -56032,7 +56172,14 @@ def _reestablish_private_cleanup_fence(
         before_seal=verify_before_seal,
         managed_root=managed_root,
     )
-    if sealed_mode != original_mode or sealed_identity != expected_identity:
+    if sealed_mode != original_mode or not _private_cleanup_identity_matches(
+        path,
+        sealed_identity,
+        expected_identity,
+        cross_boot=cross_boot,
+        recorded_fs_id=recorded_fs_id,
+        fs_anchor=_cleanup_fs_anchor(config),
+    ):
         raise StateError(f"interrupted cleanup fence changed while resealing: {path}")
 
 
@@ -56042,13 +56189,16 @@ def _private_cleanup_target_to_obj(
     generation: int,
     target: _PrivateCleanupTarget,
 ) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "slot": slot,
         "generation": generation,
         "path": target.path.relative_to(config.root).as_posix(),
         "original_mode": target.original_mode,
         "identity": list(target.identity),
     }
+    if target.fs_id is not None:
+        result["fs_id"] = target.fs_id
+    return result
 
 
 def _private_cleanup_target_from_obj(
@@ -56058,7 +56208,7 @@ def _private_cleanup_target_from_obj(
     _exact_keys(
         raw,
         {"slot", "generation", "path", "original_mode", "identity"},
-        set(),
+        {"fs_id"},
         label,
     )
     slot = _validate_name(_as_str(raw["slot"], f"{label}.slot"), "slot")
@@ -56074,7 +56224,12 @@ def _private_cleanup_target_from_obj(
         raise StateError(f"{label}.original_mode exceeds permission bits")
     identity_values = _as_list(raw["identity"], f"{label}.identity")
     identity = _private_cleanup_identity_from_obj(identity_values, f"{label}.identity")
-    return slot, generation, _PrivateCleanupTarget(path, original_mode, identity)
+    fs_id = (
+        _as_int(raw["fs_id"], f"{label}.fs_id", minimum=0)
+        if raw.get("fs_id") is not None
+        else None
+    )
+    return slot, generation, _PrivateCleanupTarget(path, original_mode, identity, fs_id)
 
 
 def _validate_batch_seal_journal(
@@ -56757,6 +56912,9 @@ def _recover_validate_batch_seal_journal(
                 target.original_mode,
                 target.identity,
                 allow_missing=False,
+                cross_boot=_seal_actor_crossed_boot(raw),
+                recorded_fs_id=target.fs_id,
+                fs_anchor=_cleanup_fs_anchor(config),
             )
         except (Refusal, StateError) as exc:
             errors.append(str(exc))
@@ -61363,7 +61521,10 @@ def _seal_validate_batch_targets(
                     selected_path: Path = slot_path,
                 ) -> None:
                     target = _PrivateCleanupTarget(
-                        selected_path, original_mode, identity
+                        selected_path,
+                        original_mode,
+                        identity,
+                        _filesystem_id(selected_path),
                     )
                     entries = _as_list(
                         seal_journal["targets"],
@@ -61387,6 +61548,7 @@ def _seal_validate_batch_targets(
                     path=slot_path,
                     original_mode=original_mode,
                     identity=identity,
+                    fs_id=_filesystem_id(slot_path),
                 )
                 _interrupt_for_test("after-validate-batch-seal-target")
             except (Refusal, StateError) as exc:
@@ -84203,6 +84365,7 @@ class _PrivateCleanupTarget:
     path: Path
     original_mode: int
     identity: _PrivateCleanupIdentity
+    fs_id: int | None = None
 
 
 @dataclasses.dataclass

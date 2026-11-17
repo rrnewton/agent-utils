@@ -524,7 +524,7 @@ def _classify(project: Path, slot: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-@pytest.mark.parametrize("actor", ("exited", "pid-reused"))
+@pytest.mark.parametrize("actor", ("exited", "pid-reused", "earlier-boot"))
 def test_a_dead_actors_seal_is_retired_by_the_next_create(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actor: str
 ) -> None:
@@ -533,10 +533,13 @@ def test_a_dead_actors_seal_is_retired_by_the_next_create(
     The seal records the process that authorized the removal, which in
     production is the killed publisher itself. "exited" records a process that
     has since exited; "pid-reused" names a live PID with another start time,
-    so the recorded generation exited.
+    so the recorded generation exited. "earlier-boot" ran on this host in
+    an earlier boot, which no process survives (#1764).
     """
     project, target, seal, original = _crashed_seal(tmp_path, monkeypatch)
-    if actor == "exited":
+    if actor == "earlier-boot":
+        _rewrite_actor(seal, boot_id="00000000-0000-4000-8000-000000000000")
+    elif actor == "exited":
         child = subprocess.Popen(["sleep", "60"])
         try:
             exited = wrkslots._read_process_identity(child.pid)
@@ -558,11 +561,16 @@ def test_a_dead_actors_seal_is_retired_by_the_next_create(
     assert target.stat().st_mode & 0o777 == original
 
 
-@pytest.mark.parametrize("actor", ("live", "other-boot", "other-host"))
+@pytest.mark.parametrize("actor", ("live", "other-host"))
 def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actor: str
 ) -> None:
-    """A live actor, or one from another boot or machine, still needs recover."""
+    """A live actor, or one from another machine, still needs recover.
+
+    An actor from an earlier boot on this host is proven dead instead
+    (#1764): no process survives a reboot, so the next create retires
+    its seal like any dead actor's.
+    """
     project, target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
     if actor == "live":
         _rewrite_actor(
@@ -701,3 +709,190 @@ def test_only_wrkslots_processes_of_this_project_can_hold_a_seal_open(tmp_path: 
     process(18, ["python3", "-m", "wrkslots", "--project-root", str(project), "remove", "sealed-slot"], tmp_path)
     assert wrkslots._other_live_wrkslots_processes(project, proc, targets=("sealed-slot",)) == [18]
     assert wrkslots._other_live_wrkslots_processes(project, proc, targets=("never-mentioned",)) == []
+
+
+_EARLIER_BOOT = "earlier-boot-before-reboot"
+_RENUMBERED_DEV = 1048744  # an anonymous (major 0) device, unlike any live one
+
+
+def _crash_sealed(project: Path, seal: Path) -> dict:
+    crashed = raw_command_with_census_authority_stub(
+        project,
+        *_remove_command(),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
+    )
+    assert crashed.returncode == 86, crashed.stderr
+    return json.loads(seal.read_text(encoding="utf-8"))
+
+
+def _rewrite_seal(seal: Path, payload: dict) -> None:
+    seal.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _recover(project: Path) -> subprocess.CompletedProcess[str]:
+    return raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+
+def test_cross_boot_seal_with_renumbered_device_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reported shape (#1764): earlier boot, only the device changed.
+
+    The journal is rewritten to a pre-change one (no recorded filesystem
+    id) whose actor ran in an earlier boot and whose target device was
+    renumbered by the reboot; recover must restore the sealed mode.
+    """
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    original = target.stat().st_mode & 0o777
+    payload = _crash_sealed(project, seal)
+    assert target.stat().st_mode & 0o777 == 0o700
+    payload["actor"]["boot_id"] = _EARLIER_BOOT
+    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
+    payload["targets"][0].pop("fs_id", None)
+    _rewrite_seal(seal, payload)
+
+    assert remove_completed_validation(project) == 3
+    assert "interrupted validation-batch seal recorded" in capsys.readouterr().err
+
+    recovered = _recover(project)
+    assert recovered.returncode == 0, recovered.stderr
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
+
+    assert remove_completed_validation(project) == 0, capsys.readouterr().err
+    assert active_slots(project) == []
+
+
+def test_cross_boot_seal_with_recorded_fs_id_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A new journal's recorded filesystem id proves the same filesystem."""
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    original = target.stat().st_mode & 0o777
+    payload = _crash_sealed(project, seal)
+    assert payload["targets"][0].get("fs_id")
+    payload["actor"]["boot_id"] = _EARLIER_BOOT
+    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
+    _rewrite_seal(seal, payload)
+
+    recovered = _recover(project)
+    assert recovered.returncode == 0, recovered.stderr
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
+    assert remove_completed_validation(project) == 0, capsys.readouterr().err
+
+
+def test_same_boot_seal_with_renumbered_device_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No reboot: a changed device is a changed directory, seal binding."""
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    payload = _crash_sealed(project, seal)
+    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
+    payload["targets"][0].pop("fs_id", None)
+    _rewrite_seal(seal, payload)
+
+    recovered = _recover(project)
+    assert recovered.returncode != 0
+    assert seal.exists()
+    assert target.stat().st_mode & 0o777 == 0o700
+
+
+def test_cross_boot_seal_with_different_handle_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recreated directory reusing the inode has different handle bytes."""
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    payload = _crash_sealed(project, seal)
+    payload["actor"]["boot_id"] = _EARLIER_BOOT
+    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
+    handle = payload["targets"][0]["identity"][3]
+    payload["targets"][0]["identity"][3] = ("0" if handle[0] != "0" else "1") + handle[1:]
+    payload["targets"][0].pop("fs_id", None)
+    _rewrite_seal(seal, payload)
+
+    recovered = _recover(project)
+    assert recovered.returncode != 0
+    assert seal.exists()
+    assert target.stat().st_mode & 0o777 == 0o700
+
+
+def test_cross_boot_seal_with_different_filesystem_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recorded filesystem id that is not the live one proves nothing."""
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    payload = _crash_sealed(project, seal)
+    payload["actor"]["boot_id"] = _EARLIER_BOOT
+    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
+    payload["targets"][0]["fs_id"] = int(payload["targets"][0]["fs_id"]) + 1
+    _rewrite_seal(seal, payload)
+
+    recovered = _recover(project)
+    assert recovered.returncode != 0
+    assert seal.exists()
+    assert target.stat().st_mode & 0o777 == 0o700
+
+
+def test_earlier_boot_actor_is_orphaned_regardless_of_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier boot on this host is dead even if its pid looks live."""
+    project, _target, seal = _prepare(tmp_path, monkeypatch)
+    _crash_sealed(project, seal)
+    config = wrkslots._load_config(str(project), "testhost")
+    monkeypatch.setattr(
+        wrkslots, "_process_state", lambda _identity: ("live", "pid reused live")
+    )
+    monkeypatch.setattr(
+        wrkslots, "_validate_batch_seal_paired_finish", lambda *_a: None
+    )
+
+    orphaned, _reason = wrkslots._validate_batch_seal_orphaned(config, seal)
+    assert orphaned is False  # journal actor boot is the real (later) boot here
+
+    payload = json.loads(seal.read_text(encoding="utf-8"))
+    payload["actor"]["boot_id"] = "boot-before-this-one"
+    _rewrite_seal(seal, payload)
+    orphaned, reason = wrkslots._validate_batch_seal_orphaned(config, seal)
+    assert orphaned is True
+    assert "earlier boot" in reason
+
+
+def test_private_cleanup_identity_matches_cross_boot_rules(tmp_path: Path) -> None:
+    """The relaxed match needs inode, handle and filesystem, never device."""
+    target = tmp_path / "slot"
+    target.mkdir()
+    live = wrkslots._stable_directory_identity(target, "slot")
+    recorded = (_RENUMBERED_DEV, live[1], live[2], live[3])
+    assert wrkslots._private_cleanup_identity_matches(
+        target, live, recorded,
+        cross_boot=True, recorded_fs_id=wrkslots._filesystem_id(target),
+        fs_anchor=None,
+    )
+    assert not wrkslots._private_cleanup_identity_matches(
+        target, live, recorded,
+        cross_boot=False, recorded_fs_id=wrkslots._filesystem_id(target),
+        fs_anchor=None,
+    )
+    different_inode = (_RENUMBERED_DEV, live[1] + 1, live[2], live[3])
+    assert not wrkslots._private_cleanup_identity_matches(
+        target, live, different_inode,
+        cross_boot=True, recorded_fs_id=wrkslots._filesystem_id(target),
+        fs_anchor=None,
+    )
+    assert not wrkslots._private_cleanup_identity_matches(
+        target, live, recorded,
+        cross_boot=True, recorded_fs_id=wrkslots._filesystem_id(target) + 1,
+        fs_anchor=None,
+    )
+    assert wrkslots._private_cleanup_identity_matches(
+        target, live, recorded,
+        cross_boot=True, recorded_fs_id=None, fs_anchor=tmp_path,
+    )
