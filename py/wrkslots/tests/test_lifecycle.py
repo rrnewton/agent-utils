@@ -22456,6 +22456,7 @@ def test_validate_batch_seal_recovery_refuses_path_disappearing_before_open(
         identity: wrkslots._PrivateCleanupIdentity,
         *,
         allow_missing: bool = True,
+        **kwargs: object,
     ) -> None:
         shutil.rmtree(path)
         real_restore(
@@ -22463,6 +22464,7 @@ def test_validate_batch_seal_recovery_refuses_path_disappearing_before_open(
             original_mode,
             identity,
             allow_missing=allow_missing,
+            **kwargs,  # type: ignore[arg-type]
         )
 
     monkeypatch.setattr(
