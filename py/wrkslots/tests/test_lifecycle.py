@@ -21246,6 +21246,7 @@ def test_validate_subvolume_delete_first_skips_per_file_walks(
         moved_paths={"main": cast(Path, state["fenced"]) / "checkout"},
         removed=removed, removing=removing,
         journal_path=tmp_path / "journal.json",
+        registration_probe=False,
     )
     assert done is True
     assert removed == {"main"} and removing == set()
@@ -21277,6 +21278,7 @@ def test_validate_subvolume_delete_first_refuses_content_underneath(
             moved_paths={"main": cast(Path, state["fenced"]) / "checkout"},
             removed=removed, removing=removing,
             journal_path=tmp_path / "journal.json",
+            registration_probe=False,
         )
     assert "rebind" in calls
     assert not any(c.startswith("delete-subvolume") for c in calls)
@@ -21315,9 +21317,15 @@ class _TwoRepoVcs:
         del check
         self.calls.append(" ".join(args))
         if args[:1] == ["rev-parse"]:
+            recognised = repository not in self.non_git
+            output = ""
+            if recognised and args[1:2] == ["--is-bare-repository"]:
+                output = "false\n"
+            elif recognised:
+                output = f"{repository}\n"
             return types.SimpleNamespace(
-                returncode=1 if repository in self.non_git else 0,
-                stdout="",
+                returncode=0 if recognised else 1,
+                stdout=output,
                 stderr="",
             )
         if args[:2] == ["worktree", "prune"]:
@@ -21386,6 +21394,7 @@ def _run_subvolume_delete_first(
         moved_paths={"main": cast(Path, state["fenced"]) / "checkout"},
         removed=removed, removing=removing,
         journal_path=tmp_path / "journal.json",
+        registration_probe=False,
     )
 
 
@@ -21724,6 +21733,102 @@ def test_subvolume_delete_first_skips_eden_and_non_git_siblings(
     assert eden_repo.absolute() not in repositories
     assert notgit_repo.absolute() not in repositories
     assert _run_subvolume_delete_first(state, tmp_path) is True
+
+
+def test_registration_repositories_rejects_non_git_dir_inside_git_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1776: `git rev-parse --git-dir` inside a non-git directory
+    # that sits inside another git tree succeeds by walking upward;
+    # that directory is not a repository, and its parent tree must
+    # not be pruned or listed for it.  Recognition compares the
+    # reported top-level against the candidate itself.
+    parent = tmp_path / "parent-tree"
+    parent.mkdir()
+    git(parent, "init", "-q")
+    git(parent, "commit", "-q", "--allow-empty", "-m", "parent")
+    inside = parent / "not-a-repo"
+    inside.mkdir()
+    real_repo = tmp_path / "real-repo"
+    real_repo.mkdir()
+    git(real_repo, "init", "-q")
+    git(real_repo, "commit", "-q", "--allow-empty", "-m", "real")
+    config = types.SimpleNamespace(control=tmp_path / "control")
+    checkout = types.SimpleNamespace(
+        name="main", repository="real-repo", path="slot01/checkout",
+        branch="b", head="h",
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_stored_repository_path",
+        lambda _c, raw: (raw, tmp_path / raw),
+    )
+    others = types.SimpleNamespace(
+        slots=[
+            types.SimpleNamespace(
+                slot_type="validate",
+                slot="inside-slot",
+                checkouts=[
+                    types.SimpleNamespace(
+                        name="main", repository="parent-tree/not-a-repo",
+                        path="inside-slot/checkout", branch="b", head="h",
+                    )
+                ],
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        wrkslots, "_validate_global_state", lambda *_a, **_k: ([others], [])
+    )
+    repositories = wrkslots._registration_repositories(
+        cast(wrkslots.Config, config),
+        cast(wrkslots.Checkout, checkout),
+    )
+    assert repositories == [real_repo.absolute()]
+
+
+def test_registration_repositories_recognises_bare_and_rejects_dirs_inside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1776: a bare repository has no top level, yet it is a real
+    # registering repository (bare mirrors are common recorded
+    # repositories); a plain directory inside it is not.
+    bare = tmp_path / "mirror.git"
+    git(tmp_path, "init", "-q", "--bare", "mirror.git")
+    inside_bare = bare / "not-a-repo"
+    inside_bare.mkdir()
+    config = types.SimpleNamespace(control=tmp_path / "control")
+    checkout = types.SimpleNamespace(
+        name="main", repository="mirror.git", path="slot01/checkout",
+        branch="b", head="h",
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_stored_repository_path",
+        lambda _c, raw: (raw, tmp_path / raw),
+    )
+    others = types.SimpleNamespace(
+        slots=[
+            types.SimpleNamespace(
+                slot_type="validate",
+                slot="inside-slot",
+                checkouts=[
+                    types.SimpleNamespace(
+                        name="main", repository="mirror.git/not-a-repo",
+                        path="inside-slot/checkout", branch="b", head="h",
+                    )
+                ],
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        wrkslots, "_validate_global_state", lambda *_a, **_k: ([others], [])
+    )
+    repositories = wrkslots._registration_repositories(
+        cast(wrkslots.Config, config),
+        cast(wrkslots.Checkout, checkout),
+    )
+    assert repositories == [bare.absolute()]
 
 
 def test_subvolume_precheck_refuses_foreign_before_dropping_own_lock(

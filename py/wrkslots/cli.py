@@ -58476,8 +58476,39 @@ def _record_is_eden(record: ActiveRecord) -> bool:
     return bool(checkouts) and all(item.vcs == "eden" for item in checkouts)
 
 
+def _is_own_git_repository(probe: _GitVcs, repository: Path) -> bool:
+    """Whether ``repository`` is itself a git repository (#1776).
+
+    A bare repository has no work tree, so ``--show-toplevel``
+    fails there; it is recognised when Git reports it bare and its
+    absolute git dir resolves to the candidate itself.  Any other
+    repository is recognised when its reported top level resolves
+    to the candidate, so a non-git directory inside a work tree or
+    a bare repository is never mistaken for its parent.
+    """
+
+    bare = probe._run(
+        repository, ["rev-parse", "--is-bare-repository"], check=False
+    )
+    if bare.returncode == 0 and bare.stdout.strip() == "true":
+        git_dir = probe._run(
+            repository, ["rev-parse", "--absolute-git-dir"], check=False
+        )
+        return git_dir.returncode == 0 and Path(
+            git_dir.stdout.strip()
+        ).resolve() == repository.resolve()
+    top = probe._run(repository, ["rev-parse", "--show-toplevel"], check=False)
+    return top.returncode == 0 and Path(top.stdout.strip()).resolve() == (
+        repository.resolve()
+    )
+
+
 def _registration_repositories(
-    config: Config, checkout: Checkout, vcs: _GitVcs | None = None
+    config: Config,
+    checkout: Checkout,
+    vcs: _GitVcs | None = None,
+    *,
+    probe_git: bool = True,
 ) -> list[Path]:
     """Every git repository that may register ``checkout`` (#1766).
 
@@ -58486,9 +58517,13 @@ def _registration_repositories(
     registration inspection ``status`` performs.  Eden checkouts and
     directories Git does not recognise as repositories are skipped:
     pruning or listing them would refuse after the irreversible
-    delete.  An unreadable registry falls back to the recorded
-    repository alone; the removal's own state validation refuses
-    separately in that case.
+    delete.  Recognition compares ``rev-parse --show-toplevel``
+    against the candidate itself, so a non-git directory inside
+    another git tree is not mistaken for that tree's repository
+    (#1776).  ``probe_git=False`` skips the probe entirely; test
+    doubles pass it explicitly.  An unreadable registry falls back
+    to the recorded repository alone; the removal's own state
+    validation refuses separately in that case.
     """
 
     probe = vcs if vcs is not None else _GitVcs()
@@ -58497,20 +58532,11 @@ def _registration_repositories(
     def add(repository: Path) -> None:
         if not repository.is_dir() or repository.absolute() in repositories:
             return
-        if getattr(probe, "worktree_lock_state", None) is None:
-            # A test double without the lock API cannot be probed;
-            # treat its repositories as recognised, as before.
+        if not probe_git:
             repositories.append(repository.absolute())
             return
         try:
-            recognised = (
-                probe._run(
-                    repository,
-                    ["rev-parse", "--git-dir"],
-                    check=False,
-                ).returncode
-                == 0
-            )
+            recognised = _is_own_git_repository(probe, repository)
         except Exception:  # noqa: BLE001 -- unrecognised, skipped below
             recognised = False
         if recognised:
@@ -58652,6 +58678,7 @@ def _validate_subvolume_delete_first(
     removed: set[str],
     removing: set[str],
     journal_path: Path,
+    registration_probe: bool = True,
 ) -> bool:
     """Delete a subvolume-backed validate slot subvolume-first (#1746).
 
@@ -58691,7 +58718,9 @@ def _validate_subvolume_delete_first(
     # any other lock refuses with nothing changed.
     registration_repositories: dict[str, list[Path]] = {}
     for checkout in moved_checkouts:
-        repositories = _registration_repositories(config, checkout, vcs)
+        repositories = _registration_repositories(
+            config, checkout, vcs, probe_git=registration_probe
+        )
         registration_repositories[checkout.name] = repositories
         _unlock_own_registration_locks(
             config,
