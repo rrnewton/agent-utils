@@ -198,6 +198,14 @@ def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
     _delay_checkout_opens(monkeypatch, fixture, 0.1, log)
     original_identity = cli._audit_cache_root_identity
     calls: list[tuple[float, float]] = []
+    # A fake monotonic clock (#1765): time stands still except that each
+    # binding start advances it 0.1 s, so the shared 0.5 s deadline below is
+    # reached after exactly five binding starts however a loaded host
+    # schedules the real work (the delayed opens still sleep in real time,
+    # which no longer moves the clock). A forked binding child inherits the
+    # fake time of its start, so its own pre-work deadline check judges the
+    # same fake instant its parent admitted it at.
+    now = 0.0
 
     def observed_identity(
         config: cli.Config,
@@ -205,12 +213,16 @@ def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
         *,
         deadline: float | None = None,
     ) -> tuple[int, int, int, int, int] | None:
+        nonlocal now
         assert deadline is not None
-        calls.append((time.monotonic(), deadline))
-        return original_identity(config, cache, deadline=deadline)
+        calls.append((now, deadline))
+        try:
+            return original_identity(config, cache, deadline=deadline)
+        finally:
+            now += 0.1
 
     monkeypatch.setattr(cli, "_audit_cache_root_identity", observed_identity)
-    _StartGatedClock(monkeypatch, log)
+    monkeypatch.setattr(time, "monotonic", lambda: now)
 
     # The default is asserted above; a short explicit allowance proves the
     # same shared-deadline and no-late-start behavior without waiting five
@@ -220,16 +232,14 @@ def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
     )
 
     elapsed = _seconds_since_open_started(log)
-    # From the first open's start: the short work allowance, at most the
-    # existing one-second reap allowance, plus scheduling on a loaded host.
-    assert elapsed <= 0.5 + cli._READ_ONLY_COMMAND_REAP_SECONDS + 2.0, elapsed
-    assert 0 < len(calls) < 12
+    assert len(calls) == 5, calls
+    assert [round(began, 6) for began, _deadline in calls] == [0.0, 0.1, 0.2, 0.3, 0.4]
     assert all(began < deadline for began, deadline in calls)
     deadlines = {deadline for _began, deadline in calls}
     assert len(deadlines) == 1
     deadline = next(iter(deadlines))
     observed = [json.loads(line) for line in log.read_text().splitlines()]
-    assert 0 < len(observed) < 12
+    assert len(observed) == 5, observed
     assert all(entry["started"] < deadline for entry in observed)
     assert counters["work_consumed"] == 0
     assert counters["directories_visited"] == 0
