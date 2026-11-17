@@ -11999,7 +11999,10 @@ def _validate_global_state_for_finish_recovery(
     config: Config, journal: Mapping[str, object]
 ) -> tuple[list[ActiveState], list[ArchiveState]]:
     journals: list[Mapping[str, object]] = [journal]
-    loaded = _load_validate_batch_seal_journal(config)
+    try:
+        loaded = _load_validate_batch_seal_journal(config)
+    except (Refusal, StateError, KeyError, TypeError, ValueError):
+        loaded = None
     if loaded is not None:
         _seal_path, _seal_raw, targets = loaded
         for other_path in _outstanding_journals(config):
@@ -12016,7 +12019,11 @@ def _validate_global_state_for_finish_recovery(
                 )
             except (Refusal, StateError):
                 continue
-            if _finish_seal_matches(config, targets, other, other_record):
+            try:
+                _matched = _finish_seal_matches(config, targets, other, other_record)
+            except (Refusal, StateError, KeyError, TypeError, ValueError):
+                continue
+            if _matched:
                 journals.append(other)
     return _validate_global_state_for_finish_recoveries(config, tuple(journals))
 
@@ -62810,15 +62817,24 @@ def _remove_validate_batch_grouped(
             # A user who entered a later fence after the grouped census
             # is caught by a fresh per-slot census right before its
             # deletion; the first completion still relies on the grouped
-            # census it immediately follows.
+            # census it immediately follows.  A refusal here retains this
+            # slot (still fenced, journal kept) and later slots continue.
             _fenced_path = _finish_fenced_slot(
                 config, prepared.record, prepared.journal
             )
-            private_cleanup.fresh_census = _capture_same_uid_process_path_census(
-                (_fenced_path,), budget=census_budget
-            )
-            census_count += 1
-            census_budget.remaining_seconds()
+            try:
+                private_cleanup.fresh_census = (
+                    _capture_same_uid_process_path_census(
+                        (_fenced_path,), budget=census_budget
+                    )
+                )
+                census_count += 1
+                census_budget.remaining_seconds()
+            except Refusal as exc:
+                retained.append(
+                    {"slot": slot, "generation": generation, "reason": str(exc)}
+                )
+                continue
         finish = _FinishContext(
             mode="remove",
             actor="coordinator",
@@ -89669,9 +89685,14 @@ def _cmd_recover(
                     config,
                     recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
                 )
-        after_states, after_archives = _validate_global_state(
-            config, require_repository=kind != "finish"
-        )
+        if kind == "finish" and seal_journals:
+            after_states, after_archives = (
+                _validate_global_state_for_finish_recovery(config, raw)
+            )
+        else:
+            after_states, after_archives = _validate_global_state(
+                config, require_repository=kind != "finish"
+            )
         after = _global_rows(after_states, after_archives)
         if kind == "recover-absent-validate-rows":
             pass

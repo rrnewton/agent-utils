@@ -20322,6 +20322,23 @@ def test_grouped_batch_crash_after_archive_before_active_recovers(
         wrkslots.main(arguments)
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
 
+    # Recovering the slot that was NOT archived first must also succeed
+    # (its removal previously reported the other slot's overlap after
+    # completing), then plain recover finishes the rest.
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--slot",
+                order[1],
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
     assert (
         wrkslots.main(
             [
@@ -20491,6 +20508,80 @@ def test_grouped_batch_rechecks_later_slot_after_grouped_census(
     assert report["removed"] == [{"generation": 1, "slot": "slot01"}]
     assert {row["slot"] for row in report["retained"]} == {"slot02"}
     assert "live process" in report["retained"][0]["reason"]
+
+
+def test_grouped_batch_later_census_failure_reports_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A census refusal on a later slot retains that slot (fenced, journal
+    # kept) and the batch still reports and completes the others.
+    project, _repository, _remote = make_project(tmp_path)
+    slots = ("slot01", "slot02", "slot03")
+    slot_paths = prepare_dead_validate_slots(project, slots)
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
+    calls = 0
+
+    def same_uid(
+        paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
+    ) -> wrkslots._ProcessPathCensus:
+        nonlocal calls
+        del budget
+        calls += 1
+        if calls > 1 and any("slot02" in path.name for path in paths):
+            raise wrkslots.Refusal("stub recheck census refused")
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", same_uid
+    )
+    arguments = [
+        "--project-root",
+        str(project),
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    for slot in slots:
+        arguments.extend(("--slot", f"{slot}=1"))
+    arguments.extend(("--format", "json"))
+
+    assert wrkslots.main(arguments) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert {row["slot"] for row in report["removed"]} == {"slot01", "slot03"}
+    assert {row["slot"] for row in report["retained"]} == {"slot02"}
+    assert "stub recheck census refused" in report["retained"][0]["reason"]
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._finish_journal_path(config, "slot02").is_file()
+    assert list(slot_paths["slot02"].parent.glob(".slot02.fenced.*"))
+    assert not slot_paths["slot01"].exists()
+    assert not slot_paths["slot03"].exists()
+
+    # A second recover retires the retained slot and the seal.
+    monkeypatch.setattr(
+        wrkslots,
+        "_capture_same_uid_process_path_census",
+        lambda _paths, **_kwargs: wrkslots._ProcessPathCensus((), ()),
+    )
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert active_slots(project) == []
 
 
 def test_validate_batch_that_retains_every_item_exits_nonzero(
