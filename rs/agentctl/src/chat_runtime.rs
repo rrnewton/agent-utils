@@ -12644,8 +12644,9 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
     /// as a reply's are (#658/#1709) — from this state's local records
     /// alone. The post's own text is never changed: the caller posts this
     /// text and keeps the post as written, so a retry renders the same.
-    /// Guard notices are recorded as a reply's are; warnings are the
-    /// caller's to log.
+    /// Guard notices are NOT recorded as a reply's are: `chat status`'s
+    /// bare-reference count reads replies, and trace narration would flood
+    /// it; the caller logs the notices instead. Warnings likewise.
     pub(crate) fn render_trace_links(
         &self,
         channel_id: &str,
@@ -12660,7 +12661,6 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
             body,
             matches!(effective_format, Some(SlackFormat::Converted)),
         );
-        self.record_bare_ref_notices(&guard_notices);
         let linked_body = match effective_format {
             Some(SlackFormat::Converted) => linked_body,
             _ => crate::chat_links::strip_link_titles(&linked_body),
@@ -22159,6 +22159,139 @@ pub(crate) mod tests {
             "{wire}"
         );
         assert!(!wire.contains("<https"), "{wire}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// A state holding one admitted request (reply alias 001, message
+    /// number 1) on the test channel, as the #1801 tests expand against.
+    fn trace_link_state(root: &std::path::Path, converted: bool) -> BridgeState {
+        let mut configuration = config_without_reaction();
+        configuration.channel_ids = vec!["C0123ABCD".to_owned()];
+        configuration.slack_workspace_url = Some("https://acme.slack.com".to_owned());
+        if converted {
+            configuration.slack_format = Some(crate::chat_runtime::SlackFormat::Converted);
+        }
+        let state = BridgeState::initialize(root, configuration).expect("initialize state");
+        let message = InboundMessage::new(
+            ChannelId::new("C0123ABCD").expect("channel"),
+            MessageId::new("1700000000.000100").expect("message"),
+            ThreadId::new("1700000000.000100").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "please look",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("delivery-1").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery");
+        let key = state
+            .admit_batch(&batch)
+            .expect("admission")
+            .new_request_keys
+            .into_iter()
+            .next()
+            .expect("key");
+        // Building the prompt assigns the request its reply alias, as in
+        // `a_captured_reply_with_link_tokens_posts_link_markup`.
+        state.prompt(&key, "").expect("prompt");
+        state
+    }
+
+    /// #1801 (coordb): the collector split the post to 3,500 bytes before
+    /// expansion; the expanded wire text is re-split by the same rule, so
+    /// no posted part exceeds the budget and no link is cut.
+    #[test]
+    fn a_trace_posts_expanded_wire_stays_within_the_post_budget() {
+        let root = temporary("trace-links-budget");
+        let state = trace_link_state(&root, false);
+        let mut body = String::new();
+        while body.len() < 3_400 {
+            body.push_str("see :thread:001 and :email:1 again. ");
+            body.push('\n');
+        }
+        assert!(
+            body.len() <= crate::chat_trace::MAX_POST_BYTES,
+            "{}",
+            body.len()
+        );
+        let (wire, _warnings, _notices) = state.render_trace_links("C0123ABCD", &body);
+        assert!(
+            wire.len() > crate::chat_trace::MAX_POST_BYTES,
+            "{}",
+            wire.len()
+        );
+        let parts = crate::chat_trace::split_wire(&wire);
+        assert!(parts.len() >= 2, "{parts:?}");
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.len() <= crate::chat_trace::MAX_POST_BYTES),
+            "{:?}",
+            parts.iter().map(String::len).collect::<Vec<_>>()
+        );
+        // Every expanded link survives whole in exactly one part.
+        let in_parts = |needle: &str| {
+            parts
+                .iter()
+                .map(|part| part.matches(needle).count())
+                .sum::<usize>()
+        };
+        assert!(in_parts("|:thread:001>") >= 10, "{wire}");
+        assert_eq!(
+            in_parts("|:thread:001>"),
+            wire.matches("|:thread:001>").count()
+        );
+        assert_eq!(in_parts("|:email:1>"), wire.matches("|:email:1>").count());
+        for part in &parts {
+            assert_eq!(
+                part.matches("<https").count(),
+                part.matches("|:thread:001>").count() + part.matches("|:email:1>").count(),
+                "{part}"
+            );
+        }
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// #1801 (coordb): guard notices on the trace path are the caller's to
+    /// log, never recorded: `bare-ref-warnings.json` counts reply guard
+    /// hits, and trace narration would flood it.
+    #[test]
+    fn a_trace_render_records_no_bare_ref_notices() {
+        let root = temporary("trace-links-notices");
+        let state = trace_link_state(&root, false);
+        let (wire, _warnings, notices) = state.render_trace_links("C0123ABCD", "per your 0001");
+        assert!(!notices.is_empty(), "the guard did not notice");
+        assert!(wire.contains("|:thread:001>"), "{wire}");
+        assert!(
+            !root.join("bare-ref-warnings.json").exists(),
+            "a trace render recorded bare-reference notices"
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// #1801 (coordb): text the collector escaped (#832) expands its
+    /// reference at send, and the escapes come out byte-identical.
+    #[test]
+    fn escaped_trace_text_expands_its_reference_and_keeps_its_escapes() {
+        let root = temporary("trace-links-escaped");
+        let state = trace_link_state(&root, false);
+        let escaped = crate::chat_trace::escape_for_chat(
+            "Fixed preemptions.rs; see [the note](ai_docs/x.md) and :thread:001.",
+        );
+        let (wire, _warnings, _notices) = state.render_trace_links("C0123ABCD", &escaped);
+        assert!(wire.contains("`preemptions.rs`"), "{wire}");
+        assert!(wire.contains("the note (`ai_docs/x.md`)"), "{wire}");
+        assert!(
+            wire.contains(
+                "<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:001>"
+            ),
+            "{wire}"
+        );
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

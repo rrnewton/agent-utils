@@ -263,6 +263,20 @@ fn describe_prompt(text: &str) -> String {
     }
 }
 
+/// The most bytes in one trace post, as the collector splits and as the
+/// send path re-splits the expanded wire text (`#1801`).
+pub const MAX_POST_BYTES: usize = 3_500;
+
+/// Split the EXPANDED wire text of one post to [`MAX_POST_BYTES`] each, by
+/// the same rule the collector splits the text it collected: a post just
+/// under the budget whose references expanded past it still goes out as
+/// whole posts, no link's markup cut (link markup holds no space to split
+/// at) and no fence left open across a part the splitter made.
+#[must_use]
+pub fn split_wire(text: &str) -> Vec<String> {
+    split_long(text, MAX_POST_BYTES)
+}
+
 /// Split over-long text at paragraph breaks outside code fences,
 /// hard-splitting at char boundaries as a last resort. Fence state is
 /// tracked per line, so a compact code block cannot stick it on.
@@ -454,7 +468,7 @@ impl Collector {
     pub fn new(window: std::time::Duration) -> Self {
         Self {
             window_secs: window.as_secs_f64(),
-            max_bytes: 3_500,
+            max_bytes: MAX_POST_BYTES,
             max_pending_bytes: 14_000,
             labels: Vec::new(),
             turn_started: None,

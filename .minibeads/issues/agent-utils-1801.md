@@ -26,16 +26,22 @@ should too.
 At the trace send path, and only there: run the same expansion the reply
 path uses (`chat_links::render_reply_links`, or
 `render_reply_links_markdown` on the converted format, exactly as
-`chat_runtime::render_outbound_links_as` chooses for replies, #1709).
-The stored trace text stays exactly as the agent wrote it; links are
-rendered on the wire only, as for replies (#658), so retries render the
-same. Link warnings and bare-number guard notices from the expansion go
-where trace diagnostics already go (the service log), never into the
-trace thread. The #832 escaping still applies (file names and relative
-links protected); expansion runs on the escaped text it posts, in the
-order the send path dictates, and code spans/fences stay unexpanded, as
-`render_reply_links` already guarantees. No change to collection,
-splitting, rate limiting, metadata, or the reply path.
+`chat_runtime::render_outbound_links_as` chooses for replies, #1709),
+through one `BridgeState::render_trace_links` the driver calls with the
+bridge state read once per pass. The stored trace text stays exactly as
+the agent wrote it; links are rendered on the wire only, as for replies
+(#658), so retries render the same. Link warnings and bare-number guard
+notices from the expansion go to the service log, never into the trace
+thread, and guard notices are NOT recorded in `bare-ref-warnings.json`
+(that count reads replies; trace narration would flood it). The #832
+escaping still applies (file names and relative links protected);
+expansion runs on the escaped text it posts, and code spans/fences stay
+unexpanded, as `render_reply_links` already guarantees. Because expansion
+can carry a post past the collector's 3,500-byte split, the wire text is
+re-split by the same splitter (`chat_trace::split_wire`) and each part
+posts under its own derived request id, so retries re-derive the same
+parts and the publish ledger answers for the ones that landed. No change
+to collection, rate limiting, metadata, or the reply path.
 
 # Acceptance Criteria
 
@@ -45,6 +51,12 @@ splitting, rate limiting, metadata, or the reply path.
   form on the converted path); unresolvable references stay plain;
   references inside code spans/fences stay as written; the stored post
   text is byte-identical to the agent's text.
+- A post just under 3,500 bytes with 10+ resolvable references yields
+  wire parts each at most 3,500 bytes with every link intact; a trace
+  render with guard notices leaves `bare-ref-warnings.json` unchanged;
+  escaped trace text (`escape_for_chat`: a file name, a relative link, a
+  `:thread:001`) expands its reference and keeps its escapes
+  byte-identical.
 - Existing trace and reply tests stay green (full agentctl Rust test
   module for the touched files).
 

@@ -1231,6 +1231,10 @@ fn spawn_trace_driver(
                 }
             }
             if thread.is_some() && now >= next_post_try {
+                // #1801: the bridge state is read once per pass for link
+                // expansion, never per post; a pass that cannot read it
+                // posts the texts as written.
+                let link_state = crate::chat_runtime::BridgeState::inspect(&root_dir).ok();
                 let pending = std::mem::take(&mut held);
                 let mut rest = Vec::new();
                 let mut failed = false;
@@ -1246,21 +1250,16 @@ fn spawn_trace_driver(
                         crate::chat_runtime::random_operation_uuid()
                             .unwrap_or_else(|_| "trace-post".to_owned())
                     });
-                    let metadata = crate::chat_trace::trace_metadata(
-                        "entry",
-                        &agent,
-                        team.as_deref(),
-                        session.as_deref(),
-                        &thread_date,
-                        seq + 1,
-                        Some(&post.trigger),
-                    );
                     // #1801: references expand on the wire exactly as a
                     // reply's do; the post itself stays as the agent wrote
-                    // it, so a retry renders the same. A state that cannot
-                    // be read posts the text as written, never holds it.
-                    let wire = match crate::chat_runtime::BridgeState::inspect(&root_dir) {
-                        Ok(state) => {
+                    // it, so a retry renders the same. Expansion can carry
+                    // a post that fit the collector's budget past it, so
+                    // the wire text is re-split by the same rule and each
+                    // part posts under its own derived request id; a retry
+                    // re-derives the same parts and the publish ledger
+                    // answers for the ones that already landed.
+                    let wire = match &link_state {
+                        Some(state) => {
                             let (text, warnings, notices) =
                                 state.render_trace_links(&channel, &post.text);
                             for warning in &warnings {
@@ -1271,76 +1270,101 @@ fn spawn_trace_driver(
                             }
                             text
                         }
-                        Err(_) => post.text.clone(),
+                        None => post.text.clone(),
                     };
-                    match publish_trace(
-                        &root_dir,
-                        &channel,
-                        thread.as_deref(),
-                        &uuid,
-                        &wire,
-                        metadata,
-                        &mut metadata_ok,
-                    ) {
-                        Ok(_) => {
-                            seq += 1;
-                            if let Some(tid) = thread.as_deref() {
-                                let _ =
-                                    write_state(&dir, &thread_date.clone(), tid, high_water, seq);
+                    let parts = crate::chat_trace::split_wire(&wire);
+                    for (index, part) in parts.iter().enumerate() {
+                        let part_uuid = if index == 0 {
+                            uuid.clone()
+                        } else {
+                            format!("{uuid}-{index}")
+                        };
+                        let metadata = crate::chat_trace::trace_metadata(
+                            "entry",
+                            &agent,
+                            team.as_deref(),
+                            session.as_deref(),
+                            &thread_date,
+                            seq + 1,
+                            Some(&post.trigger),
+                        );
+                        match publish_trace(
+                            &root_dir,
+                            &channel,
+                            thread.as_deref(),
+                            &part_uuid,
+                            part,
+                            metadata,
+                            &mut metadata_ok,
+                        ) {
+                            Ok(_) => {
+                                seq += 1;
+                                if let Some(tid) = thread.as_deref() {
+                                    let _ = write_state(
+                                        &dir,
+                                        &thread_date.clone(),
+                                        tid,
+                                        high_water,
+                                        seq,
+                                    );
+                                }
                             }
-                        }
-                        Err(e) => {
-                            let action = match &e {
-                                ChatServiceError::Outbound(f) => {
-                                    crate::chat_trace::classify_failure(
-                                        &f.code,
-                                        &f.detail,
-                                        f.outcome
-                                            == crate::chat_runtime::OutboundOutcome::NotApplied,
-                                        f.retryable,
-                                    )
-                                }
-                                _ => crate::chat_trace::PostFailure::Retry,
-                            };
-                            match action {
-                                crate::chat_trace::PostFailure::Drop => {
-                                    service_log(format!(
-                                        "agentctl: trace post dropped (cannot succeed): {e}"
-                                    ));
-                                }
-                                crate::chat_trace::PostFailure::ThreadGone => {
-                                    service_log(format!(
+                            Err(e) => {
+                                let action = match &e {
+                                    ChatServiceError::Outbound(f) => {
+                                        crate::chat_trace::classify_failure(
+                                            &f.code,
+                                            &f.detail,
+                                            f.outcome
+                                                == crate::chat_runtime::OutboundOutcome::NotApplied,
+                                            f.retryable,
+                                        )
+                                    }
+                                    _ => crate::chat_trace::PostFailure::Retry,
+                                };
+                                match action {
+                                    crate::chat_trace::PostFailure::Drop => {
+                                        service_log(format!(
+                                            "agentctl: trace post dropped (cannot succeed): {e}"
+                                        ));
+                                    }
+                                    crate::chat_trace::PostFailure::ThreadGone => {
+                                        service_log(format!(
                                         "agentctl: trace thread is gone ({e}); clearing it for a fresh root"
                                     ));
-                                    let _ = std::fs::remove_file(dir.join("trace-thread.json"));
-                                    thread = None;
-                                    thread_date = String::new();
-                                    next_root_try = 0.0;
-                                    replacement_root = true;
-                                    // thread_not_found is provably not
-                                    // applied, and the old UUID is tied to
-                                    // the old thread in the helper ledger,
-                                    // so this post gets a fresh UUID.
-                                    rest.push((post, None));
-                                    failed = true;
-                                }
-                                crate::chat_trace::PostFailure::Retry => {
-                                    if let ChatServiceError::Outbound(f) = &e {
-                                        if logged_kinds.insert(f.code.clone()) {
-                                            service_log(format!(
+                                        let _ = std::fs::remove_file(dir.join("trace-thread.json"));
+                                        thread = None;
+                                        thread_date = String::new();
+                                        next_root_try = 0.0;
+                                        replacement_root = true;
+                                        // thread_not_found is provably not
+                                        // applied, and the old UUID is tied to
+                                        // the old thread in the helper ledger,
+                                        // so this post gets a fresh UUID.
+                                        rest.push((post, None));
+                                        failed = true;
+                                    }
+                                    crate::chat_trace::PostFailure::Retry => {
+                                        if let ChatServiceError::Outbound(f) = &e {
+                                            if logged_kinds.insert(f.code.clone()) {
+                                                service_log(format!(
                                                 "agentctl: trace posts failing with {} (holding, retrying): {e}",
                                                 f.code
                                             ));
+                                            }
+                                        } else {
+                                            service_log(format!(
+                                                "agentctl: trace post failed (holding rest): {e}"
+                                            ));
                                         }
-                                    } else {
-                                        service_log(format!(
-                                            "agentctl: trace post failed (holding rest): {e}"
-                                        ));
+                                        rest.push((post, Some(uuid)));
+                                        failed = true;
+                                        next_post_try = now + 10.0;
                                     }
-                                    rest.push((post, Some(uuid)));
-                                    failed = true;
-                                    next_post_try = now + 10.0;
                                 }
+                                // The post is settled or held; no later part
+                                // of it posts in this pass.
+                                break;
                             }
                         }
                     }
