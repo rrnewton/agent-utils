@@ -8,6 +8,7 @@ repeated here because the shared test host cannot guarantee loop devices.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import socket
@@ -1715,7 +1716,15 @@ def test_migrate_refuses_a_slot_used_only_through_an_open_fd(
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             fds = list(Path(f"/proc/{child.pid}/fd").glob("*"))
-            if any(os.readlink(fd) == str(held_file) for fd in fds):
+
+            def _held(fd: Path) -> bool:
+                # The child may close a startup descriptor between the
+                # listing and the read; that fd is simply not the held one.
+                with contextlib.suppress(OSError):
+                    return os.readlink(fd) == str(held_file)
+                return False
+
+            if any(_held(fd) for fd in fds):
                 break
             time.sleep(0.05)
         with pytest.raises(cli.Refusal, match="in use"):
