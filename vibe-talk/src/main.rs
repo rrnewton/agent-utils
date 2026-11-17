@@ -1321,7 +1321,9 @@ fn doctor(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let findings = vibe_talk::doctor::check(&config);
     print!("{}", vibe_talk::doctor::render(&findings));
     if vibe_talk::doctor::failed(&findings) {
-        anyhow::bail!("setup is not ready: fix the FAIL lines above, then run vibe-talk doctor again");
+        anyhow::bail!(
+            "setup is not ready: fix the FAIL lines above, then run vibe-talk doctor again"
+        );
     }
     Ok(())
 }

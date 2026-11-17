@@ -72,7 +72,8 @@ pub fn check(config: &Config) -> Vec<Finding> {
         findings.push(Finding {
             level: Level::Fail,
             check: "provider-token",
-            detail: "a chat provider token is still the placeholder from the example configuration".to_owned(),
+            detail: "a chat provider token is still the placeholder from the example configuration"
+                .to_owned(),
             fix: "replace it with the real provider credential; see SETUP.md step 1".to_owned(),
         });
     } else {
@@ -227,7 +228,9 @@ writable = true
         let findings = check(&config(BASE));
         assert!(!failed(&findings), "findings: {}", render(&findings));
         assert!(
-            findings.iter().any(|f| f.check == "storage" && f.level == Level::Ok),
+            findings
+                .iter()
+                .any(|f| f.check == "storage" && f.level == Level::Ok),
             "findings: {}",
             render(&findings)
         );
@@ -235,7 +238,10 @@ writable = true
 
     #[test]
     fn missing_storage_is_a_failure_with_a_fix() {
-        let text = BASE.replace("[storage]\npath = \"/var/lib/vibe-talk/vibe-talk.sqlite3\"\n", "");
+        let text = BASE.replace(
+            "[storage]\npath = \"/var/lib/vibe-talk/vibe-talk.sqlite3\"\n",
+            "",
+        );
         let findings = check(&config(&text));
         let finding = findings
             .iter()
@@ -250,7 +256,9 @@ writable = true
         let text = BASE.replace("a-real-discord-bot-token-value", "REPLACE-ME");
         let findings = check(&config(&text));
         assert!(
-            findings.iter().any(|f| f.check == "provider-token" && f.level == Level::Fail),
+            findings
+                .iter()
+                .any(|f| f.check == "provider-token" && f.level == Level::Fail),
             "findings: {}",
             render(&findings)
         );
@@ -263,12 +271,16 @@ writable = true
             .replace("127.0.0.1:8080", "0.0.0.0:8080");
         let findings = check(&config(&text));
         assert!(
-            findings.iter().any(|f| f.check == "public-address" && f.level == Level::Warn),
+            findings
+                .iter()
+                .any(|f| f.check == "public-address" && f.level == Level::Warn),
             "findings: {}",
             render(&findings)
         );
         assert!(
-            findings.iter().any(|f| f.check == "bind-exposure" && f.level == Level::Warn),
+            findings
+                .iter()
+                .any(|f| f.check == "bind-exposure" && f.level == Level::Warn),
             "findings: {}",
             render(&findings)
         );
@@ -279,13 +291,17 @@ writable = true
         let text = BASE.replace("writable = true", "writable = false");
         let findings = check(&config(&text));
         assert!(
-            findings.iter().any(|f| f.check == "channels-writable" && f.level == Level::Warn),
+            findings
+                .iter()
+                .any(|f| f.check == "channels-writable" && f.level == Level::Warn),
             "findings: {}",
             render(&findings)
         );
         // BASE configures no ElevenLabs credentials and keeps the default read-aloud backend.
         assert!(
-            findings.iter().any(|f| f.check == "voice" && f.level == Level::Warn),
+            findings
+                .iter()
+                .any(|f| f.check == "voice" && f.level == Level::Warn),
             "findings: {}",
             render(&findings)
         );
@@ -296,7 +312,9 @@ writable = true
         let text = format!("{BASE}\n[read_aloud]\nbackend = \"browser\"\n");
         let findings = check(&config(&text));
         assert!(
-            !findings.iter().any(|f| f.check == "voice" && f.level == Level::Warn),
+            !findings
+                .iter()
+                .any(|f| f.check == "voice" && f.level == Level::Warn),
             "findings: {}",
             render(&findings)
         );
