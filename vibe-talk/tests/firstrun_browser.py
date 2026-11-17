@@ -7,7 +7,7 @@ The owner's asks, as the browser lives them:
     dismissing it lands on the Channel view — the app opens on the Channel, not the call;
   * the Welcome never comes back unasked: a reload after dismissing stays on the Channel,
     and a saved Voice choice still opens on Voice with no Welcome at all;
-  * the Welcome re-opens from Settings (`#open-welcome`) and from Help (`#help-open-welcome`);
+  * the Welcome re-opens from Settings (`#open-welcome`) and from Help (`#welcome-from-help`);
   * with no channel configured the Welcome is the guided setup — the config steps and a
     copyable snippet — and Check again, once the (fake) server has a channel, lands on it;
   * a deep link (`?v=docs`) still wins over the default.
@@ -173,8 +173,8 @@ def walk_fresh(context: BrowserContext, url: str, shots: Path | None, where: str
     page.click("#open-settings")
     page.wait_for_selector("#open-help", state="visible", timeout=10_000)
     page.click("#open-help")
-    page.wait_for_selector("#help-open-welcome", state="visible", timeout=10_000)
-    page.click("#help-open-welcome")
+    page.wait_for_selector("#welcome-from-help", state="visible", timeout=10_000)
+    page.click("#welcome-from-help")
     expect_welcome(page, f"{where} from Help")
     page.click("#welcome-start")
     expect_channel(page, f"{where} back from Help's Welcome")

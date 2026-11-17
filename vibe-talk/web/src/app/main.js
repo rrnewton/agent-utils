@@ -7927,7 +7927,7 @@ el("welcome-start").addEventListener("click", () => welcome.dismiss());
 el("welcome-copy-config").addEventListener("click", () => void welcome.copyConfig());
 el("welcome-check-again").addEventListener("click", () => void welcome.recheck());
 el("open-welcome").addEventListener("click", () => welcome.showWelcome());
-el("help-open-welcome").addEventListener("click", () => welcome.showWelcome());
+el("welcome-from-help").addEventListener("click", () => welcome.showWelcome());
 
 const { signIn, saveToken, forgetToken, setTokenState, noTokenSentence } = createSignIn({
   el: (id) => el(id),

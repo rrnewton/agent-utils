@@ -5062,6 +5062,13 @@ async function startTalking(page) {
   page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
   await page.el("save-token").click();
   await page.settle();
+  // `#1781 vibe-talk-first-run-welcome-channel-default`. The page opens on the Channel, where
+  // Read stands in Talk's place: a call starts from the call's view, reached through the switch.
+  for (let presses = 0; page.tab() !== "voice" && presses < 3; presses += 1) {
+    await page.el("view-switch").click();
+    await page.settle();
+  }
+  assert.equal(page.tab(), "voice", "startTalking did not reach the call's view");
   page.setFetch(MINTED);
 
   await page.el("talk").click();
@@ -6496,6 +6503,36 @@ const textOfRow = (li) => li.children.find((node) => node.hasClass("body"));
 
 // --- the raw Discord view --------------------------------------------------------------------------
 
+/**
+ * Enter the channel as a reader arriving at it does, with the read that entry owes (`#1781
+ * vibe-talk-first-run-welcome-channel-default`: the page opens on the Channel already, so
+ * entering presses away and back — a page standing there has read it with other messages).
+ */
+async function enterChannel(page) {
+  for (let presses = 0; page.tab() === "discord" && presses < 3; presses += 1) {
+    await page.el("view-switch").click();
+    await page.settle();
+  }
+  for (let presses = 0; page.tab() !== "discord" && presses < 3; presses += 1) {
+    await page.el("view-switch").click();
+    await page.settle();
+  }
+  assert.equal(page.tab(), "discord", "the switch did not reach the channel view");
+}
+
+/**
+ * Press the view switch until the call's view shows (`#1781
+ * vibe-talk-first-run-welcome-channel-default`: the page now opens on the Channel, so a test
+ * that needs the call view goes there explicitly rather than assuming it).
+ */
+async function enterVoice(page) {
+  for (let presses = 0; page.tab() !== "voice" && presses < 3; presses += 1) {
+    await page.el("view-switch").click();
+    await page.settle();
+  }
+  assert.equal(page.tab(), "voice", "the switch did not reach the call's view");
+}
+
 /** Load the Discord tab with a given set of channel messages. */
 async function showDiscord(page, messages) {
   page.messages = messages;
@@ -7693,8 +7730,7 @@ const sseDelete = (eventId, channelId, messageId, extra) =>
 async function withLiveChannel(page, messages) {
   page.messages = messages || [];
   await signIn(page);
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
   assert.equal(page.streamOpens.length, 1, "signing in did not attach a live stream");
   return page.stream();
 }
@@ -10503,7 +10539,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   sentCards, sentOk, sentWithoutKey, serveByChannel, serveScoped, servedBookmarkPage, serverFloor,
   serviceOf, servicesPage, session_lines, setReadNew, settingsChannel, settingsFoldState,
   settingsGroup, settingsHeading, settingsHeadings, settingsOptions, settingsSection,
-  settleRedraftWait, settleSend, settleSpokenYes, showDiscord, showLinks, showPinned, shownIds,
+  enterChannel, enterVoice, settleRedraftWait, settleSend, settleSpokenYes, showDiscord, showLinks, showPinned, shownIds,
   sideAtFoot, sideIds, sideRow, signIn, sourceCalls, sourceConstant, sourceString, sourceStringTable, speakRelay,
   discordSplitPost, speech, splitPost, spokenDraft, sseDelete, sseMessage, sseUpdate, stackPlaces, startChatting,
   startNeutralCall, startOf, startTalking, startTalkingNamed, startV1Call, state, statusText,

@@ -299,7 +299,6 @@ export interface ElementById {
   "help-message-cache": HTMLDetailsElement;
   "help-message-links": HTMLDetailsElement;
   "help-microphone": HTMLDetailsElement;
-  "help-open-welcome": HTMLButtonElement;
   "help-reading-width": HTMLDetailsElement;
   "help-resuming": HTMLDetailsElement;
   "help-rich-headers": HTMLDetailsElement;
@@ -737,6 +736,7 @@ export interface ElementById {
   "voice-system-prompt-state": HTMLParagraphElement;
   "welcome-check-again": HTMLButtonElement;
   "welcome-copy-config": HTMLButtonElement;
+  "welcome-from-help": HTMLButtonElement;
   "welcome-guide": HTMLDivElement;
   "welcome-guide-state": HTMLParagraphElement;
   "welcome-snippet": HTMLPreElement;

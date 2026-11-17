@@ -12,7 +12,7 @@ import { ALICE, BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, COUNTS_ALL_READ_MS, CS
   arrowStyle, assertCurrent, assertMarkupContains, atBottomOf, atTheHead, backlog, bodyOf,
   bridgeReply, brokenModule, brokenScript, brokenScriptEach, browsingPage, builtSince, channelReads,
   channelRow, chooseReadMode, clampedAsShownLikeChromium, clickRow, countingChannel, cssBlock,
-  delayedReply, deliver, distinctReplies, doneButton, errorResponse, fillTranscript,
+  delayedReply, deliver, distinctReplies, doneButton, enterChannel, errorResponse, fillTranscript,
   firstCardInView, focusName, focused, forwardPage, forwardReadKinds, forwardTimeline,
   freshMessagePage, freshness, gate, groupsIn, helpEntry, inPlaceRows, inTwoColumns, json,
   jumpSaysArrived, jumpShown, keptAt, keyedChannel, longMessage, manyThreads, mdBoxes, message,
@@ -45,8 +45,7 @@ test("returning to the channel RE-READS it, instead of showing what was true the
   await signIn(page);
   countingChannel(page, [message({ id: "1", content: "old" })]);
 
-  await page.el("view-switch").click(); // into the channel
-  await page.settle();
+  await enterChannel(page); // into the channel (the page opens there since #1781)
   assert.equal(page.reads, 1);
 
   await page.el("view-switch").click(); // back toward voice, through Documents
@@ -69,8 +68,7 @@ test("the channel keeps pulling for as long as you are looking at it", async () 
   await signIn(page);
   countingChannel(page, [message({ id: "1", content: "one" })]);
 
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
   assert.equal(page.reads, 1);
 
   page.messages = [message({ id: "1", content: "one" }), message({ id: "2", content: "two" })];
@@ -89,9 +87,8 @@ test("polling stops when the channel is no longer the view you are on", async ()
   await signIn(page);
   countingChannel(page, [message({ id: "1", content: "one" })]);
 
-  await page.el("view-switch").click();
-  await page.settle();
-  await page.el("view-switch").click(); // back to voice
+  await enterChannel(page);
+  await page.el("view-switch").click(); // away from the channel
   await page.settle();
 
   const before = page.reads;
@@ -104,8 +101,7 @@ test("a background refresh does NOT drag a reader who has scrolled up", async ()
   const page = newPage();
   await signIn(page);
   countingChannel(page, tallChannel());
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
 
   const area = page.el("scroll-area");
   // Reading older messages: parked well above the bottom of a channel that really overflows.
@@ -124,8 +120,7 @@ test("a background refresh DOES follow the newest line for a reader already at t
   const page = newPage();
   await signIn(page);
   countingChannel(page, tallChannel());
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
 
   const area = page.el("scroll-area");
   area.scrollTop = area.scrollHeight - area.clientHeight; // pinned to the bottom
@@ -742,8 +737,13 @@ test("changing the token clears every saved and shown message before the new one
   page.el("save-token").click();
   assert.equal(page.storage.has(MESSAGE_CACHE_KEY), false, "another credential inherited the saved rows");
   assert.deepStrictEqual(shownIds(page), [], "another credential inherited the rows on screen");
+  // `#1781 vibe-talk-first-run-welcome-channel-default`. Sign-in now lands on the Channel and
+  // reads it for the new token at once: what comes back is the new credential's own read, so
+  // the server answers it with the second token's words, never the first one's rows kept.
+  page.messages = [message({ id: "1002", content: "readable by the second token" })];
   await page.settle();
   assert.doesNotMatch(page.renderedText(), /readable by the first token/);
+  assert.match(page.renderedText(), /readable by the second token/);
 });
 
 test("signing out removes the saved messages and the rows on screen", async () => {
@@ -1726,8 +1726,10 @@ test("a background refresh the chat service is too slow for says so in the pill,
 test("a failed background refresh with nothing on screen is still reported, in words", async () => {
   const page = newPage();
   page.chatProviderName = "Example Chat";
-  await signIn(page);
+  // `#1781 vibe-talk-first-run-welcome-channel-default`. Sign-in lands on the Channel and
+  // reads it: this test's premise is a channel no read has ever reached, so that read fails too.
   page.channelPage = errorResponse(504, "error", "(no detail)");
+  await signIn(page);
   await showDiscord(page, []);
   assert.equal(page.el("error").hidden, false, "entering a channel that could not be read said nothing");
   await page.el("dismiss-error").click();
@@ -3387,8 +3389,7 @@ test("`#308 live-reply-in-main`: THE OWNER'S CASE — reads failing as the reply
     page.messages = data.messages;
     const server = forwardTimeline(page, {});
     await signIn(page);
-    await page.el("view-switch").click();
-    await page.settle();
+    await enterChannel(page);
     await page.settle();
     // Opened in All, as a threaded channel does; the reader goes to Main.
     await pickThread(page, "main");
@@ -3484,8 +3485,7 @@ async function tallThreadedMain(script = SCRIPT) {
     updated_at: answer.timestamp }];
   const server = forwardTimeline(page, {});
   await signIn(page);
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
   await page.settle();
   await pickThread(page, "main");
   await pollOnce(page);
@@ -3866,8 +3866,7 @@ async function heldAllReads(script = SCRIPT) {
   page.messages = data.messages;
   const server = forwardTimeline(page, {});
   await signIn(page);
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
   await page.settle();
   await pickThread(page, "main");
   const serve = page.timeline;
