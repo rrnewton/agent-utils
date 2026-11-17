@@ -178,9 +178,9 @@ def test_free_bytes_is_btrfs_minimum() -> None:
                                         statvfs_fn=lambda _p: (5000, 10000),
                                         backing_free=3000, qgroup_room=4000)
     assert free == 3000 and parts["slot_fs_free_bytes"] == 5000
-    preferred, _ = hl.measure_free_bytes(Path("/unused"), wrkslots_free=2500,
+    preferred, _ = hl.measure_free_bytes(Path("/unused"), manager_free=2500,
                                          statvfs_fn=lambda _p: (5000, 10000))
-    assert preferred == 2500  # wrkslots-reported value preferred
+    assert preferred == 2500  # slot-manager value preferred
 
 
 def test_gate_unknown_when_unset(tmp_path: Path) -> None:

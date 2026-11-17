@@ -139,6 +139,7 @@ class EffectiveLimits:
     unknown_keys: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
+        """Effective values with sources, for doctor and handles."""
         return {
             "path": str(self.path), "file_present": self.file_present,
             "version": self.version,
@@ -439,6 +440,7 @@ class Headroom:
     mem_available_bytes: int
 
     def as_dict(self) -> dict[str, object]:
+        """This headroom reading as a record."""
         return {"n": self.n, "idle_fraction": round(self.idle_fraction, 6),
                 "h": self.h, "signal": self.signal,
                 "mem_available_bytes": self.mem_available_bytes}
@@ -532,7 +534,7 @@ def statvfs_free(path: Path) -> tuple[int, int] | None:
 def measure_free_bytes(
     slot_root: Path,
     *,
-    wrkslots_free: int | None = None,
+    manager_free: int | None = None,
     backing_free: int | None = None,
     qgroup_room: int | None = None,
     statvfs_fn: Callable[[Path], tuple[int, int] | None] | None = None,
@@ -541,16 +543,16 @@ def measure_free_bytes(
 
     The measured path is the existing directory under which a slot
     will be created, never the not-yet-created slot itself. A
-    wrkslots-reported value is preferred for the slot filesystem.
+    slot-manager-reported value is preferred for the slot filesystem.
     On image-backed storage a single statvfs reading can overstate
     room, so F is the minimum of every known component: the slot
     filesystem, the backing filesystem, and qgroup room.
     """
     components: dict[str, object] = {"measured_path": str(slot_root)}
     values: list[int] = []
-    if wrkslots_free is not None:
-        components["wrkslots_free_bytes"] = wrkslots_free
-        values.append(wrkslots_free)
+    if manager_free is not None:
+        components["manager_free_bytes"] = manager_free
+        values.append(manager_free)
     else:
         measured = None
         if statvfs_fn is not None:
@@ -571,6 +573,7 @@ def measure_free_bytes(
 
 
 def slot_total_bytes(slot_root: Path) -> int | None:
+    """Total bytes of the slot filesystem, or None when unmeasurable."""
     measured = statvfs_free(slot_root)
     return measured[1] if measured is not None else None
 
@@ -578,6 +581,7 @@ def slot_total_bytes(slot_root: Path) -> int | None:
 # ------------------------------------------------------------- gate count
 
 def gate_slots_path(environ: Mapping[str, str] | None = None) -> Path:
+    """The gate-slots file path, honouring its environment hook."""
     env = os.environ if environ is None else environ
     raw = env.get("GATE_SLOTS_CONFIG")
     return Path(raw).expanduser() if raw else Path(
@@ -626,6 +630,7 @@ class AdmissionInputs:
     headroom: Headroom
 
     def as_dict(self) -> dict[str, object]:
+        """These admission inputs as a record."""
         return {"v": self.v, "y": self.y, "p": self.p, "f": self.f,
                 "headroom": self.headroom.as_dict()}
 
@@ -640,6 +645,7 @@ class Decision:
     mem_adj: int
 
     def as_dict(self) -> dict[str, object]:
+        """This admission decision as a record."""
         return {"admit": self.admit, "binding": self.binding,
                 "h_adj": self.h_adj, "mem_adj": self.mem_adj}
 
@@ -679,6 +685,7 @@ def clamp_request(requested: int | None, ceiling: int) -> tuple[int, str]:
 # deployment points the generic keys at its own surface.
 
 def defer_config_path(environ: Mapping[str, str] | None = None) -> Path:
+    """The gate-defer file path, honouring its environment hook."""
     env = os.environ if environ is None else environ
     raw = env.get("GATE_DEFER_CONFIG")
     return Path(raw).expanduser() if raw else Path(
