@@ -151,6 +151,105 @@ def test_ignored_only_discard_finishes_and_remove_deletes(tmp_path: Path) -> Non
     assert not tree.exists()
 
 
+def test_many_ignored_files_finish_bounded_and_remove_enforces(
+    tmp_path: Path,
+) -> None:
+    """#1772: finish records a summary plus manifest, remove enforces it."""
+
+    project, repository, _remote = make_project(tmp_path)
+    _ignore(repository, "ignored/")
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    bulk = tree / "ignored" / "bulk"
+    bulk.mkdir(parents=True)
+    for index in range(70):
+        (bulk / f"file-{index:03d}.bin").write_text(f"bulk-{index}\n")
+    finished = _finish_with(project, "--discard-ignored")
+    assert finished.returncode == 0, finished.stderr
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    handoff = row["handoff"]
+    assert isinstance(handoff, dict)
+    recorded = handoff["ignored_files"]
+    assert isinstance(recorded, list)
+    assert len(recorded) == 64
+    summary = handoff["ignored_summary"]
+    assert isinstance(summary, dict)
+    assert summary["count"] == 70
+    assert summary["dispositions"] == {"discarded": 70}
+    # A changed file after finish still refuses removal, judged through
+    # the manifest the summary names. The batch item budget is host-load
+    # timing, not what this test proves, so remove runs unbudgeted.
+    (bulk / "file-000.bin").write_text("changed\n")
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    def unbudgeted_remove() -> subprocess.CompletedProcess[str]:
+        return command(
+            project,
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            "--no-lock-budget",
+        )
+
+    refused = unbudgeted_remove()
+    assert refused.returncode != 0
+    assert "changed after finish" in (refused.stdout + refused.stderr)
+    (bulk / "file-000.bin").write_text("bulk-0\n")
+    removed = unbudgeted_remove()
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+
+
+def test_many_ignored_files_below_writer_ceiling_stay_legacy(
+    tmp_path: Path,
+) -> None:
+    """#1772 at writer_ceiling 2: the full list stays inline (#1788).
+
+    ignored_summary is record schema level 3; below the ceiling the
+    writer emits the equally checked older form (every file inline, no
+    summary, no manifest) so a pinned older reader keeps working.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    _ignore(repository, "ignored/")
+    update_configuration(project, writer_ceiling=2)
+    assert create(project).returncode == 0
+    tree = checkout(project)
+    bulk = tree / "ignored" / "bulk"
+    bulk.mkdir(parents=True)
+    for index in range(70):
+        (bulk / f"file-{index:03d}.bin").write_text(f"bulk-{index}\n")
+    finished = _finish_with(project, "--discard-ignored")
+    assert finished.returncode == 0, finished.stderr
+    row = active_slots(project)[0]
+    assert isinstance(row, dict)
+    handoff = row["handoff"]
+    assert isinstance(handoff, dict)
+    assert "ignored_summary" not in handoff
+    recorded = handoff["ignored_files"]
+    assert isinstance(recorded, list)
+    assert len(recorded) == 70
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    removed = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--no-lock-budget",
+    )
+    assert removed.returncode == 0, removed.stderr
+    assert not tree.exists()
+
+
 def test_ignored_only_archive_finishes_with_verified_tar(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     _ignore(repository, "stray.log")

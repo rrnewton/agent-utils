@@ -21,7 +21,12 @@ const ZERO_DIGEST: &str = "00000000000000000000000000000000000000000000000000000
 // State-import events contain full snapshots, so the bound leaves substantial
 // room above ordinary events while guaranteeing one corrupt file cannot force
 // unbounded allocation. Event rows themselves are streamed into SQLite.
-pub(crate) const MAX_EVENT_BYTES: u64 = 16 * 1024 * 1024;
+// The bound is 128 MiB (#1772): pre-fix histories hold active-state,
+// progress and archive events of about 45 MB that repeat a 151k-entry
+// ignored-file list, and immutable hash-chained history must stay
+// replayable. New writers emit bounded summaries, so the cap only ever
+// guards corrupt files; it is finite, never unlimited.
+pub(crate) const MAX_EVENT_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_JSON_CONTAINER_DEPTH: usize = 127;
 
 const NON_STATE_EVENT_KINDS: &[&str] = &[

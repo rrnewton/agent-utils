@@ -2312,6 +2312,34 @@ fn event_size_limit_accepts_the_exact_boundary_and_rejects_one_byte_more() {
 }
 
 #[test]
+fn oversized_legacy_event_still_replays() {
+    // #1772: a synthetic 20 MiB event (above the old 16 MiB limit, below
+    // the documented 128 MiB bound) must replay: pre-fix histories hold
+    // about 45 MB events and are immutable.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    let path = events.join("00000000000000000001.json");
+    one_event_log(&events);
+    let mut event: Value =
+        serde_json::from_slice(&fs::read(&path).expect("read event")).expect("parse event");
+    event["payload"]["active"]["slots"][0]["purpose"] = Value::String(String::new());
+    let empty = serde_json::to_vec_pretty(&event).expect("encode empty-padding event");
+    let target = 20 * 1024 * 1024usize;
+    let padding = target
+        .checked_sub(empty.len())
+        .expect("fixture envelope fits");
+    event["payload"]["active"]["slots"][0]["purpose"] = Value::String("x".repeat(padding));
+    let mut core = event.as_object().expect("event object").clone();
+    core.remove("sha256");
+    event["sha256"] =
+        Value::String(canonical_sha256(&Value::Object(core)).expect("hash oversized event"));
+    let encoded = serde_json::to_vec_pretty(&event).expect("encode oversized event");
+    assert_eq!(encoded.len(), target);
+    fs::write(&path, encoded).expect("write oversized event");
+    replay(&events).expect("20 MiB legacy event must replay under the raised bound");
+}
+
+#[test]
 fn python_and_rust_agree_on_valid_records_and_adversarial_schema() {
     let valid = Scratch::new();
     let events = valid.events();

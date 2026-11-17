@@ -2827,6 +2827,23 @@ pub(crate) fn finish_slot(
             }
         }
     }
+    // Bounded evidence (#1772, level 3): the manifest receipt is
+    // written and fsynced before the event below may reference its
+    // summary. Below the writer ceiling the full list stays inline,
+    // the equally checked older form, as with the level-2 sidecar.
+    let bounded = crate::remove_write::writer_ceiling(&config) >= 3;
+    let ignored_summary = if ignored_entries.is_empty() || !bounded {
+        Value::Null
+    } else {
+        crate::remove_write::write_ignored_manifest(
+            &cfg.control,
+            &selected,
+            slot,
+            Some(generation),
+            "handoff",
+            &ignored_entries,
+        )?
+    };
     let continuation = format!(
         "wrkslots remove {slot} --coordinator-pid <current-coordinator-pid> --expected-generation {generation}"
     );
@@ -2843,7 +2860,18 @@ pub(crate) fn finish_slot(
             handoff["discarded_unaccounted"] = json!(discarded);
         }
         if !ignored_entries.is_empty() {
-            handoff["ignored_files"] = json!(ignored_entries.clone());
+            handoff["ignored_files"] = json!(if bounded {
+                ignored_entries
+                    .iter()
+                    .take(crate::remove_write::IGNORED_EVIDENCE_INLINE_LIMIT)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                ignored_entries.clone()
+            });
+            if bounded {
+                handoff["ignored_summary"] = ignored_summary.clone();
+            }
         }
         if !ignored_archive_entries.is_empty() {
             handoff["ignored_archives"] = json!(ignored_archive_entries.clone());
@@ -2876,6 +2904,20 @@ pub(crate) fn finish_slot(
         ));
     }
     let previous_digest = canonical_sha256(&record).map_err(|error| error.to_string())?;
+    let mut accounting = json!({
+        "landed": landed_count,
+        "open": open_count,
+        "unaccounted": unaccounted.len(),
+        "discarded_unaccounted": discarded,
+        "discard_bundles": bundle_paths,
+        "ignored_files": if bounded { ignored_entries.iter().take(crate::remove_write::IGNORED_EVIDENCE_INLINE_LIMIT).cloned().collect::<Vec<_>>() } else { ignored_entries.clone() },
+        "ignored_archives": ignored_archive_entries,
+    });
+    if !ignored_summary.is_null() {
+        if let Some(object) = accounting.as_object_mut() {
+            object.insert("ignored_summary".to_string(), ignored_summary.clone());
+        }
+    }
     append_event(
         &cfg,
         &selected,
@@ -2889,15 +2931,7 @@ pub(crate) fn finish_slot(
             "record": updated,
             "evidence": {
                 "validation": validation,
-                "accounting": {
-                    "landed": landed_count,
-                    "open": open_count,
-                    "unaccounted": unaccounted.len(),
-                    "discarded_unaccounted": discarded,
-                    "discard_bundles": bundle_paths,
-                    "ignored_files": ignored_entries,
-                    "ignored_archives": ignored_archive_entries,
-                },
+                "accounting": accounting,
             },
         }),
     )?;

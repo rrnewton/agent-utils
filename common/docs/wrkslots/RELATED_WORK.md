@@ -40,7 +40,7 @@ daemon or socket behavior and performs no lease management, cleanup, rescue, del
 repository mutation. It also has no repository-discovery inventory beyond its supplied event and
 evidence inputs. The reconciliation daemon and lifecycle actions discussed below are roadmap,
 not behavior shipped in the current Rust component. Its fail-closed
-input boundary accepts at most 16 MiB per event and 127 nested JSON containers, Unicode scalar
+input boundary accepts at most 128 MiB per event and 127 nested JSON containers, Unicode scalar
 strings, exact signed/unsigned 64-bit integers, and finite binary64 floats; Python remains
 authoritative for its broader JSON input domain. Rust also rejects unknown event kinds, malformed
 or generation-mismatched hold transitions, and non-object state evidence even where the current

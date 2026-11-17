@@ -62,8 +62,12 @@ pub(crate) const IDENTITY_REQUIRED: &[&str] =
 pub(crate) const IDENTITY_OPTIONAL: &[&str] = &["namespace_pid", "pidns_inode"];
 pub(crate) const HANDOFF_REQUIRED: &[&str] =
     &["recorded_at", "validation", "limitations", "continuation"];
-pub(crate) const HANDOFF_OPTIONAL: &[&str] =
-    &["discarded_unaccounted", "ignored_files", "ignored_archives"];
+pub(crate) const HANDOFF_OPTIONAL: &[&str] = &[
+    "discarded_unaccounted",
+    "ignored_files",
+    "ignored_archives",
+    "ignored_summary",
+];
 pub(crate) const CHECKOUT_REQUIRED: &[&str] = &[
     "name",
     "path",
@@ -497,6 +501,11 @@ fn validate_handoff(value: &Value, label: &str) -> Result<(), ObserverError> {
         return Err(invalid(format!(
             "{label} ignored archives do not match its ignored files"
         )));
+    }
+    // A summary this build cannot parse is tolerated at load as
+    // permanent history (#1788); acting on the slot refuses instead.
+    if let Some(summary) = handoff.get("ignored_summary") {
+        let _ = crate::active_state::validate_ignored_summary(summary, label);
     }
     parse_timestamp(
         string(&handoff["recorded_at"], &format!("{label}.recorded_at"))?,
@@ -1441,18 +1450,20 @@ mod tests {
 
     #[test]
     fn active_record_tolerates_newer_handoff_summary_at_load() {
-        // A summary field in the active record is permanent history:
-        // load keeps it, remove of that slot refuses (#1788).
+        // An unknown summary field in the active record is permanent
+        // history: load keeps it, remove of that slot refuses (#1788).
+        // (ignored_summary itself is a known level-3 field since #1772,
+        // so this uses a still-future key.)
         let value = record_with_handoff(json!({
             "recorded_at": "2026-11-07T00:00:00Z",
             "validation": ["checked"],
             "limitations": [],
             "continuation": "continue",
-            "ignored_summary": {"count": 1, "bytes": 3},
+            "future_summary": {"count": 1, "bytes": 3},
         }));
         assert!(validate_active_record(&value, "node-a", "record").is_ok());
         let parsed = crate::active_state::record_from_obj(&value, "record").expect("load keeps");
-        assert!(parsed.unknown_fields.iter().any(|k| k == "ignored_summary"));
+        assert!(parsed.unknown_fields.iter().any(|k| k == "future_summary"));
         let err = crate::active_state::assert_record_actable(&parsed, "remove")
             .expect_err("acting refuses");
         assert!(err.contains("NEWER WRITER"), "{err}");

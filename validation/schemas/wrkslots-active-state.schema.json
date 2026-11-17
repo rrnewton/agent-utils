@@ -311,6 +311,17 @@
           },
           "type": "array"
         },
+        "ignored_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IgnoredEvidenceSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bounded summary of every recorded ignored file (#1772)."
+        },
         "limitations": {
           "description": "Known limitations.",
           "items": {
@@ -335,6 +346,84 @@
         "validation",
         "limitations",
         "continuation"
+      ],
+      "type": "object"
+    },
+    "IgnoredEvidenceSummary": {
+      "additionalProperties": false,
+      "description": "Bounded ignored-file evidence (#1772): counts plus a manifest receipt.",
+      "properties": {
+        "count": {
+          "description": "Total recorded ignored files.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispositions": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "File count per disposition (archived or discarded).",
+          "type": "object"
+        },
+        "manifest": {
+          "$ref": "#/$defs/IgnoredManifestRef",
+          "description": "The manifest receipt file beside the salvage receipt."
+        },
+        "manifest_sha256": {
+          "description": "SHA-256 of the canonical sorted per-file manifest lines.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "total_bytes": {
+          "description": "Total recorded ignored bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count",
+        "total_bytes",
+        "dispositions",
+        "manifest_sha256",
+        "manifest"
+      ],
+      "type": "object"
+    },
+    "IgnoredManifestRef": {
+      "additionalProperties": false,
+      "description": "The manifest receipt holding the full per-file ignored list (#1772).",
+      "properties": {
+        "archive_root": {
+          "description": "Salvage archive root holding the manifest.",
+          "type": "string"
+        },
+        "bytes": {
+          "description": "Manifest size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "Manifest path relative to the archive root.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "SHA-256 of the manifest bytes.",
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        }
+      },
+      "required": [
+        "archive_root",
+        "path",
+        "bytes",
+        "sha256"
       ],
       "type": "object"
     },

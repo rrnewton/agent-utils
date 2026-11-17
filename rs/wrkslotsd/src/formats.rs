@@ -118,6 +118,41 @@ pub struct HandoffIgnoredFile {
     pub disposition: String,
 }
 
+/// The manifest receipt holding the full per-file ignored list (#1772).
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoredManifestRef {
+    /// Salvage archive root holding the manifest.
+    pub archive_root: String,
+    /// Manifest path relative to the archive root.
+    pub path: String,
+    /// Manifest size in bytes.
+    #[schemars(range(min = 0))]
+    pub bytes: u64,
+    /// SHA-256 of the manifest bytes.
+    #[schemars(length(equal = 64))]
+    pub sha256: String,
+}
+
+/// Bounded ignored-file evidence (#1772): counts plus a manifest receipt.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoredEvidenceSummary {
+    /// Total recorded ignored files.
+    #[schemars(range(min = 0))]
+    pub count: u64,
+    /// Total recorded ignored bytes.
+    #[schemars(range(min = 0))]
+    pub total_bytes: u64,
+    /// File count per disposition (archived or discarded).
+    pub dispositions: std::collections::BTreeMap<String, u64>,
+    /// SHA-256 of the canonical sorted per-file manifest lines.
+    #[schemars(length(equal = 64))]
+    pub manifest_sha256: String,
+    /// The manifest receipt file beside the salvage receipt.
+    pub manifest: IgnoredManifestRef,
+}
+
 /// The verified tar one checkout's archived ignored files were kept in (#1686).
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -157,6 +192,9 @@ pub struct HandoffSummary {
     /// Verified tars for the archived ignored files (#1686).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_archives: Vec<HandoffIgnoredArchive>,
+    /// Bounded summary of every recorded ignored file (#1772).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_summary: Option<IgnoredEvidenceSummary>,
 }
 
 /// Where an imported record came from.

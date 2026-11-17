@@ -40,8 +40,11 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    salvage archive and records the SHAs in the handoff. Gitignored files outside the
    regenerable caches (Git checkouts only) refuse finish unless `--archive-ignored` keeps
    them in a verified tar in the salvage archive or `--discard-ignored` records them as
-   discarded; either way the handoff lists every such file with its size and SHA-256, and
-   `remove` later enforces that exact record (a changed file refuses removal). Tracked or
+   discarded; either way the handoff records a bounded summary of every such file
+   (count, total bytes, disposition counts and a manifest digest, with at most 64
+   files listed inline; the full per-file list, each with its size and SHA-256,
+   lives in a manifest receipt beside the salvage archive), and `remove` later
+   enforces that exact record through the manifest (a changed file refuses removal). Tracked or
    untracked non-ignored work always refuses finish. Untracked or ignored output the
    create hooks made is not dirty work: create records it (paths in submodule checkouts
    included; large trees by fingerprint, not per-file hashes), finish tolerates it while

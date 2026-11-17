@@ -390,7 +390,7 @@ fn doctor_quick(
             "active": envelope.get("active").cloned().unwrap_or(json!([])),
             "max_active_slots": envelope.get("max_active_slots").cloned().unwrap_or(Value::Null),
             "reader_floor": config.get("reader_floor").cloned().unwrap_or(json!(1)),
-            "writer_ceiling": config.get("writer_ceiling").cloned().unwrap_or(json!(2)),
+            "writer_ceiling": config.get("writer_ceiling").cloned().unwrap_or(json!(3)),
             "findings": findings,
             "counts_by_kind": counts,
             "interrupted_journals": reports,

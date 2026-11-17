@@ -313,12 +313,89 @@ pub(crate) fn identity_from_obj(value: &Value, label: &str) -> Result<Option<Ide
     Ok(Some(identity))
 }
 
+pub(crate) fn validate_ignored_summary(summary_value: &Value, label: &str) -> Result<()> {
+    let summary_label = format!("{label}.ignored_summary");
+    let summary = as_mapping(summary_value, &summary_label)?;
+    exact_keys(
+        summary,
+        &[
+            "count",
+            "total_bytes",
+            "dispositions",
+            "manifest_sha256",
+            "manifest",
+        ],
+        &[],
+        &summary_label,
+    )?;
+    let count = as_int(&summary["count"], &format!("{summary_label}.count"), 0)?;
+    as_int(
+        &summary["total_bytes"],
+        &format!("{summary_label}.total_bytes"),
+        0,
+    )?;
+    let manifest_digest = as_str(
+        &summary["manifest_sha256"],
+        &format!("{summary_label}.manifest_sha256"),
+    )?;
+    if !is_digest(manifest_digest) {
+        return Err(format!(
+            "{summary_label}.manifest_sha256 holds an invalid sha256"
+        ));
+    }
+    let dispositions = as_mapping(
+        &summary["dispositions"],
+        &format!("{summary_label}.dispositions"),
+    )?;
+    let mut total = 0i64;
+    for (name, value) in dispositions {
+        if name != "archived" && name != "discarded" {
+            return Err(format!(
+                "{summary_label}.dispositions holds an unknown disposition: {name:?}"
+            ));
+        }
+        total += as_int(value, &format!("{summary_label}.dispositions.{name}"), 0)?;
+    }
+    if total != count {
+        return Err(format!(
+            "{summary_label}.dispositions do not add up to its count"
+        ));
+    }
+    let manifest = as_mapping(&summary["manifest"], &format!("{summary_label}.manifest"))?;
+    exact_keys(
+        manifest,
+        &["archive_root", "path", "bytes", "sha256"],
+        &[],
+        &format!("{summary_label}.manifest"),
+    )?;
+    as_str(
+        &manifest["archive_root"],
+        &format!("{summary_label}.manifest.archive_root"),
+    )?;
+    as_str(&manifest["path"], &format!("{summary_label}.manifest.path"))?;
+    as_int(
+        &manifest["bytes"],
+        &format!("{summary_label}.manifest.bytes"),
+        0,
+    )?;
+    let file_digest = as_str(
+        &manifest["sha256"],
+        &format!("{summary_label}.manifest.sha256"),
+    )?;
+    if !is_digest(file_digest) {
+        return Err(format!(
+            "{summary_label}.manifest.sha256 holds an invalid sha256"
+        ));
+    }
+    Ok(())
+}
+
 fn handoff_from_obj(value: &Value, label: &str) -> Result<Vec<String>> {
     if value.is_null() {
         return Ok(Vec::new());
     }
     let raw = as_mapping(value, label)?;
-    let unknown = tolerant_keys(raw, HANDOFF_REQUIRED, HANDOFF_OPTIONAL, label)?;
+    let mut unknown = tolerant_keys(raw, HANDOFF_REQUIRED, HANDOFF_OPTIONAL, label)?;
     if let Some(discarded) = raw.get("discarded_unaccounted") {
         for (index, item) in as_list(discarded, &format!("{label}.discarded_unaccounted"))?
             .iter()
@@ -404,6 +481,14 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<Vec<String>> {
         return Err(format!(
             "{label} ignored archives do not match its ignored files"
         ));
+    }
+    // A summary this build cannot parse (a newer writer's shape,
+    // #1788 permanent history) is kept as an unknown field: load
+    // tolerates it and acting on the slot refuses.
+    if let Some(summary_value) = raw.get("ignored_summary") {
+        if validate_ignored_summary(summary_value, label).is_err() {
+            unknown.push("ignored_summary".to_string());
+        }
     }
     let recorded_at = as_str(&raw["recorded_at"], &format!("{label}.recorded_at"))?;
     parse_timestamp(recorded_at, &format!("{label}.recorded_at"))?;

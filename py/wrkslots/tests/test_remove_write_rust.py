@@ -274,6 +274,11 @@ def _scrub_doc(doc: dict[str, object]) -> dict[str, object]:
             archive = item.get("ignored_archive")
             if isinstance(archive, dict):
                 archive["archive_root"] = "ARCHIVE_ROOT"
+            summary = item.get("ignored_summary")
+            if isinstance(summary, dict):
+                manifest = cast(dict[str, object], summary).get("manifest")
+                if isinstance(manifest, dict):
+                    cast(dict[str, object], manifest)["archive_root"] = "ARCHIVE_ROOT"
     return doc
 
 
@@ -1152,6 +1157,59 @@ def test_remove_discards_ignored_evidence_when_asked(tmp_path: Path) -> None:
     ]
     assert "ignored_archive" not in salvage[0]
     assert not list(root.rglob("ignored-*.tar"))
+
+
+def test_remove_discards_many_ignored_files_with_bounded_evidence(
+    tmp_path: Path,
+) -> None:
+    """#1772: 70 ignored files leave a summary, not a 70-entry event list.
+
+    The receipt keeps at most 64 inline entries; the full per-file list
+    lives in a manifest receipt beside the salvage archive, written
+    before the event that references it, and the archived record's
+    salvage evidence stays small enough to replay.
+    """
+
+    root = _fixture(tmp_path / "case")
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / ".gitignore").write_text("ignored/\n")
+    _git(checkout, "add", ".gitignore")
+    _git(checkout, "commit", "-q", "-m", "ignore many")
+    _git(checkout, "push", "-q", "origin", "HEAD:suite/work")
+    bulk = checkout / "ignored" / "bulk"
+    bulk.mkdir(parents=True)
+    for index in range(70):
+        (bulk / f"file-{index:03d}.bin").write_bytes(f"bulk-{index}\n".encode())
+    assert _python_remove(root, discard_ignored=True) == 0
+    assert not (root / "worktrees" / "slot-a").exists()
+
+    salvage = _archived_salvage(root)
+    assert len(salvage) == 1
+    inline = salvage[0]["ignored_files"]
+    assert isinstance(inline, list)
+    assert len(inline) == 64
+    summary = salvage[0]["ignored_summary"]
+    assert isinstance(summary, dict)
+    assert summary["count"] == 70
+    assert summary["dispositions"] == {"discarded": 70}
+    assert summary["total_bytes"] == sum(
+        len(f"bulk-{index}\n".encode()) for index in range(70)
+    )
+    manifest = summary["manifest"]
+    assert isinstance(manifest, dict)
+    manifest_path = Path(str(manifest["archive_root"])) / str(manifest["path"])
+    assert manifest_path.is_file()
+    contents = manifest_path.read_bytes()
+    assert len(contents) == manifest["bytes"]
+    assert hashlib.sha256(contents).hexdigest() == manifest["sha256"]
+    document = json.loads(contents)
+    assert len(document["files"]) == 70
+    assert document["files"][0]["path"] == "ignored/bulk/file-000.bin"
+    # No event in the log carries the unbounded list any more.
+    events_dir = root / "worktrees" / "EVENTS.node-a"
+    for event_path in events_dir.glob("*.json"):
+        assert len(json.loads(event_path.read_text())["payload"]) >= 0
+        assert event_path.stat().st_size < 1024 * 1024, event_path
 
 
 def test_remove_never_blocks_on_cache_only_ignored_content(tmp_path: Path) -> None:

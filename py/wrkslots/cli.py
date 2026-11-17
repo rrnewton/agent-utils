@@ -90,6 +90,14 @@ _SHARED_SALVAGE_METADATA_SCHEMA = 1
 #: directory stays a deliberate, visible decision rather than a silent
 #: multi-gigabyte copy in the salvage archive.
 _IGNORED_ARCHIVE_LIMIT_BYTES = 512 * 1024 * 1024
+#: Inline entries kept beside an ignored-evidence summary (#1772). At most
+#: this many per-file entries travel in an event, a handoff or an active
+#: record; the full list lives in the manifest receipt the summary names.
+_IGNORED_EVIDENCE_INLINE_LIMIT = 64
+_IGNORED_MANIFEST_SCHEMA = 1
+#: A manifest lists about 300 bytes per file; this bound still covers the
+#: 512 MiB archive limit's worth of tiny files without being unlimited.
+_IGNORED_MANIFEST_BYTES_LIMIT = 512 * 1024 * 1024
 # Remote salvage and rescue refs are published outside refs/heads/. A branch
 # namespace would make every reclaim create a visible branch on the recorded
 # remote, which a main-only repository must not accumulate. Custom refs are
@@ -1284,10 +1292,11 @@ class StateError(Refusal):
 
 #: Highest record schema level this build writes (#1788). Level 1 is every
 #: shape written before handoff ignored-file accounting and seal fs_id;
-#: level 2 is those additions. A reader that meets unknown keys at load
-#: preserves them raw and warns once; only a command acting on the
-#: affected slot refuses, with SchemaSkewRefusal.
-SCHEMA_LEVEL = 2
+#: level 2 is those additions; level 3 is the bounded ignored-evidence
+#: summary with its manifest receipt (#1772). A reader that meets unknown
+#: keys at load preserves them raw and warns once; only a command acting
+#: on the affected slot refuses, with SchemaSkewRefusal.
+SCHEMA_LEVEL = 3
 _WARNED_SKEW_KEYS: set[tuple[str, str]] = set()
 
 
@@ -1655,6 +1664,25 @@ class HandoffIgnoredFile:
 
 
 @dataclasses.dataclass(frozen=True)
+class IgnoredEvidenceSummary:
+    """Bounded ignored-file evidence (#1772): counts plus a manifest receipt.
+
+    ``manifest_sha256`` digests the canonical sorted per-file lines; the
+    manifest file itself (JSON, beside the salvage receipt) is bound by
+    its own path, byte count and sha256.
+    """
+
+    count: int
+    total_bytes: int
+    dispositions: tuple[tuple[str, int], ...]
+    manifest_sha256: str
+    manifest_root: str
+    manifest_path: str
+    manifest_bytes: int
+    manifest_file_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
 class HandoffIgnoredArchive:
     """The verified tar one checkout's archived ignored files were kept in (#1686)."""
 
@@ -1676,10 +1704,13 @@ class Handoff:
     #: Commits finish discarded under --discard-unaccounted (#1364), full SHAs.
     discarded_unaccounted: tuple[str, ...] = ()
     #: Gitignored files finish archived or discarded (#1686), by checkout.
+    #: At most _IGNORED_EVIDENCE_INLINE_LIMIT entries; the rest are in the
+    #: manifest ``ignored_summary`` names (#1772).
     ignored_files: tuple[HandoffIgnoredFile, ...] = ()
     ignored_archives: tuple[HandoffIgnoredArchive, ...] = ()
     #: Keys a newer writer added, preserved raw at load (#1788).
     unknown_fields: tuple[tuple[str, str], ...] = ()
+    ignored_summary: IgnoredEvidenceSummary | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7945,8 +7976,14 @@ def _handoff_to_obj(handoff: Handoff | None) -> object:
                 "sha256": item.sha256,
                 "disposition": item.disposition,
             }
-            for item in handoff.ignored_files
+            for item in handoff.ignored_files[
+                : _IGNORED_EVIDENCE_INLINE_LIMIT
+                if handoff.ignored_summary is not None
+                else len(handoff.ignored_files)
+            ]
         ]
+    if handoff.ignored_summary is not None:
+        value["ignored_summary"] = _ignored_summary_obj(handoff.ignored_summary)
     if handoff.ignored_archives:
         value["ignored_archives"] = [
             {
@@ -7970,7 +8007,7 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
     unknown_fields = _skew_unknown_fields(
         raw,
         {"recorded_at", "validation", "limitations", "continuation"},
-        {"discarded_unaccounted", "ignored_files", "ignored_archives"},
+        {"discarded_unaccounted", "ignored_files", "ignored_archives", "ignored_summary"},
         label,
     )
     recorded_at = _as_str(raw["recorded_at"], f"{label}.recorded_at")
@@ -8065,6 +8102,32 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
     archived = bool(ignored_files) and ignored_files[0].disposition == "archived"
     if archived != bool(ignored_archives):
         raise StateError(f"{label} ignored archives do not match its ignored files")
+    ignored_summary: IgnoredEvidenceSummary | None = None
+    if "ignored_summary" in raw:
+        try:
+            candidate = _ignored_summary_from_obj(
+                raw["ignored_summary"], f"{label}.ignored_summary"
+            )
+            if candidate.count < len(ignored_files):
+                raise StateError(
+                    f"{label}.ignored_summary counts fewer files than it lists inline"
+                )
+            ignored_summary = candidate
+        except StateError:
+            # A summary this build cannot parse (a newer writer's shape,
+            # #1788 permanent history): keep it raw as an unknown field;
+            # load tolerates it and acting on the slot refuses.
+            unknown_fields = (
+                *unknown_fields,
+                (
+                    "ignored_summary",
+                    json.dumps(
+                        raw["ignored_summary"], sort_keys=True, separators=(",", ":")
+                    ),
+                ),
+            )
+    # A pre-#1772 handoff may list more than the inline limit; history
+    # stays readable, only new writers cap the list.
     return Handoff(
         recorded_at,
         validation,
@@ -8074,6 +8137,7 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
         tuple(ignored_files),
         tuple(ignored_archives),
         unknown_fields,
+        ignored_summary,
     )
 
 
@@ -34917,11 +34981,21 @@ def _ignored_triples(
 
 
 def _handoff_ignored_by_checkout(
+    config: Config,
     handoff: Handoff,
 ) -> dict[str, tuple[_IgnoredFile, ...]]:
-    """A handoff's recorded ignored files as collected-file triples (#1686)."""
+    """A handoff's recorded ignored files as collected-file triples (#1686).
+
+    With a summary (#1772) the full set comes from the manifest receipt,
+    verified through its sha256; without one the inline list is complete.
+    """
+    recorded = (
+        _read_ignored_manifest(config, handoff.ignored_summary, "handoff ignored manifest")
+        if handoff.ignored_summary is not None
+        else handoff.ignored_files
+    )
     grouped: dict[str, list[_IgnoredFile]] = {}
-    for item in handoff.ignored_files:
+    for item in recorded:
         grouped.setdefault(item.checkout, []).append(
             _IgnoredFile(item.path, item.size, item.sha256)
         )
@@ -35212,6 +35286,219 @@ def _archive_ignored_files(
     }
 
 
+def _ignored_manifest_digest(entries: Sequence[Mapping[str, object]]) -> str:
+    """Sha256 of the canonical sorted per-file manifest lines (#1772)."""
+
+    digest = hashlib.sha256()
+    for entry in sorted(
+        entries,
+        key=lambda item: (
+            _as_str(item["checkout"], "ignored manifest.checkout"),
+            _as_str(item["path"], "ignored manifest.path"),
+        ),
+    ):
+        digest.update(_as_str(entry["checkout"], "ignored manifest.checkout").encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(_as_str(entry["path"], "ignored manifest.path").encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(str(_as_int(entry["bytes"], "ignored manifest.bytes")).encode("ascii"))
+        digest.update(b"\x00")
+        digest.update(_as_str(entry["sha256"], "ignored manifest.sha256").encode("ascii"))
+        digest.update(b"\x00")
+        digest.update(
+            _as_str(entry["disposition"], "ignored manifest.disposition").encode("ascii")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _ignored_summary_obj(summary: IgnoredEvidenceSummary) -> dict[str, object]:
+    return {
+        "count": summary.count,
+        "total_bytes": summary.total_bytes,
+        "dispositions": dict(summary.dispositions),
+        "manifest_sha256": summary.manifest_sha256,
+        "manifest": {
+            "archive_root": summary.manifest_root,
+            "path": summary.manifest_path,
+            "bytes": summary.manifest_bytes,
+            "sha256": summary.manifest_file_sha256,
+        },
+    }
+
+
+def _ignored_summary_from_obj(value: object, label: str) -> IgnoredEvidenceSummary:
+    raw = _as_mapping(value, label)
+    _exact_keys(
+        raw, {"count", "total_bytes", "dispositions", "manifest_sha256", "manifest"}, set(), label
+    )
+    count = _as_int(raw["count"], f"{label}.count", minimum=0)
+    total = _as_int(raw["total_bytes"], f"{label}.total_bytes", minimum=0)
+    dispositions_raw = _as_mapping(raw["dispositions"], f"{label}.dispositions")
+    dispositions: list[tuple[str, int]] = []
+    for name in sorted(dispositions_raw):
+        if name not in ("archived", "discarded"):
+            raise StateError(f"{label}.dispositions holds an unknown disposition: {name!r}")
+        dispositions.append(
+            (name, _as_int(dispositions_raw[name], f"{label}.dispositions.{name}", minimum=0))
+        )
+    if sum(number for _name, number in dispositions) != count:
+        raise StateError(f"{label}.dispositions do not add up to its count")
+    manifest_digest = _as_str(raw["manifest_sha256"], f"{label}.manifest_sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest_digest):
+        raise StateError(f"{label}.manifest_sha256 holds an invalid sha256")
+    manifest = _as_mapping(raw["manifest"], f"{label}.manifest")
+    _exact_keys(manifest, {"archive_root", "path", "bytes", "sha256"}, set(), f"{label}.manifest")
+    file_digest = _as_str(manifest["sha256"], f"{label}.manifest.sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", file_digest):
+        raise StateError(f"{label}.manifest.sha256 holds an invalid sha256")
+    return IgnoredEvidenceSummary(
+        count=count,
+        total_bytes=total,
+        dispositions=tuple(dispositions),
+        manifest_sha256=manifest_digest,
+        manifest_root=_as_str(manifest["archive_root"], f"{label}.manifest.archive_root"),
+        manifest_path=_as_str(manifest["path"], f"{label}.manifest.path"),
+        manifest_bytes=_as_int(manifest["bytes"], f"{label}.manifest.bytes", minimum=0),
+        manifest_file_sha256=file_digest,
+    )
+
+
+def _write_ignored_manifest(
+    config: Config,
+    archive_root: Path,
+    machine: str,
+    slot: str,
+    generation: int | None,
+    label: str,
+    entries: Sequence[Mapping[str, object]],
+) -> IgnoredEvidenceSummary:
+    """Write the full ignored-file manifest beside the salvage receipt (#1772).
+
+    The file sits in the same salvage directory as the ignored-files tar
+    (``_prepare_local_salvage_directory`` keeps it owner-only), is fsynced
+    by ``_atomic_write_json`` and read back before any event may name it.
+    """
+
+    checked_root = _local_salvage_archive_root(config, str(archive_root))
+    if checked_root is None:
+        raise Refusal(f"no salvage archive root for the ignored manifest: {archive_root}")
+    ordered = sorted(
+        (dict(entry) for entry in entries),
+        key=lambda item: (
+            _as_str(item["checkout"], "ignored manifest.checkout"),
+            _as_str(item["path"], "ignored manifest.path"),
+        ),
+    )
+    canonical = _ignored_manifest_digest(ordered)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-.") or "checkout"
+    name_digest = hashlib.sha256(label.encode("utf-8")).hexdigest()[:12]
+    epoch = "ownerless" if generation is None else str(generation)
+    directory = (
+        checked_root / _LOCAL_SALVAGE_DIRECTORY / machine / slot / epoch
+    )
+    _prepare_local_salvage_directory(checked_root, directory)
+    _ensure_no_symlink_components(checked_root, directory, "local salvage archive")
+    path = directory / f"ignored-manifest-{safe_name}-{name_digest}-{canonical[:12]}.json"
+    payload: dict[str, object] = {
+        "schema": _IGNORED_MANIFEST_SCHEMA,
+        "kind": "wrkslots-ignored-manifest",
+        "machine": machine,
+        "slot": slot,
+        "generation": generation,
+        "checkout": label,
+        "files": ordered,
+    }
+    if path.exists() or path.is_symlink():
+        _read_ignored_manifest(
+            config,
+            IgnoredEvidenceSummary(
+                count=len(ordered),
+                total_bytes=sum(
+                    _as_int(item["bytes"], "ignored manifest.bytes") for item in ordered
+                ),
+                dispositions=(),
+                manifest_sha256=canonical,
+                manifest_root=str(checked_root),
+                manifest_path=path.relative_to(checked_root).as_posix(),
+                manifest_bytes=0,
+                manifest_file_sha256="0" * 64,
+            ),
+            "ignored manifest",
+            check_file_digest=False,
+        )
+    else:
+        _atomic_write_json(path, payload)
+    digest, size = _sha256_regular_file(path, "ignored-files manifest")
+    counts: dict[str, int] = {}
+    for item in ordered:
+        disposition = _as_str(item["disposition"], "ignored manifest.disposition")
+        counts[disposition] = counts.get(disposition, 0) + 1
+    summary = IgnoredEvidenceSummary(
+        count=len(ordered),
+        total_bytes=sum(_as_int(item["bytes"], "ignored manifest.bytes") for item in ordered),
+        dispositions=tuple(sorted(counts.items())),
+        manifest_sha256=canonical,
+        manifest_root=str(checked_root),
+        manifest_path=path.relative_to(checked_root).as_posix(),
+        manifest_bytes=size,
+        manifest_file_sha256=digest,
+    )
+    _read_ignored_manifest(config, summary, "ignored manifest")
+    return summary
+
+
+def _read_ignored_manifest(
+    config: Config,
+    summary: IgnoredEvidenceSummary,
+    label: str,
+    *,
+    check_file_digest: bool = True,
+) -> tuple[HandoffIgnoredFile, ...]:
+    """Read a manifest receipt back and verify it against its summary (#1772)."""
+
+    root = _local_salvage_archive_root(config, summary.manifest_root)
+    if root is None:
+        raise Refusal(f"{label} names no salvage archive root: {summary.manifest_root}")
+    _relative, path = _relative_inside(root, summary.manifest_path, label)
+    contents = _read_bounded_regular_file(path, label, _IGNORED_MANIFEST_BYTES_LIMIT)
+    if check_file_digest:
+        if len(contents) != summary.manifest_bytes or (
+            hashlib.sha256(contents).hexdigest() != summary.manifest_file_sha256
+        ):
+            raise Refusal(f"{label} changed after it was recorded: {path}")
+    document = _strict_json_object(contents, label)
+    if _as_int(document.get("schema"), f"{label}.schema") != _IGNORED_MANIFEST_SCHEMA:
+        raise Refusal(f"{label} holds an unsupported schema: {path}")
+    if _as_str(document.get("kind"), f"{label}.kind") != "wrkslots-ignored-manifest":
+        raise Refusal(f"{label} is not an ignored-files manifest: {path}")
+    entries: list[HandoffIgnoredFile] = []
+    raw_files: list[Mapping[str, object]] = []
+    for index, item in enumerate(_as_list(document.get("files"), f"{label}.files")):
+        entry = _as_mapping(item, f"{label}.files[{index}]")
+        _exact_keys(
+            entry, {"checkout", "path", "bytes", "sha256", "disposition"}, set(),
+            f"{label}.files[{index}]",
+        )
+        raw_files.append(entry)
+        entries.append(
+            HandoffIgnoredFile(
+                checkout=_as_str(entry["checkout"], f"{label}.files[{index}].checkout"),
+                path=_as_str(entry["path"], f"{label}.files[{index}].path"),
+                size=_as_int(entry["bytes"], f"{label}.files[{index}].bytes", minimum=0),
+                sha256=_as_str(entry["sha256"], f"{label}.files[{index}].sha256"),
+                disposition=_as_str(
+                    entry["disposition"], f"{label}.files[{index}].disposition"
+                ),
+            )
+        )
+    if _ignored_manifest_digest(raw_files) != summary.manifest_sha256:
+        raise Refusal(f"{label} does not match its recorded manifest sha256: {path}")
+    if len(entries) != summary.count:
+        raise Refusal(f"{label} does not hold its recorded file count: {path}")
+    return tuple(entries)
+
+
 def _assert_receipt_ignored_files(
     config: Config,
     checkout: Checkout,
@@ -35224,27 +35511,47 @@ def _assert_receipt_ignored_files(
     recorded = receipt.get("ignored_files")
     if recorded is None:
         return
-    expected_entries = _as_list(recorded, "salvage receipt.ignored_files")
     current = _ignored_files_outside_caches(config, checkout, path, vcs)
     observed: list[dict[str, object]] = []
     archive = receipt.get("ignored_archive")
-    for entry in expected_entries:
-        item = _as_mapping(entry, "salvage receipt.ignored_files entry")
-        observed.append(
-            {
-                "path": _as_str(item.get("path"), "salvage receipt.ignored_files.path"),
-                "bytes": _as_int(
-                    item.get("bytes"), "salvage receipt.ignored_files.bytes"
-                ),
-                "sha256": _as_str(
-                    item.get("sha256"), "salvage receipt.ignored_files.sha256"
-                ),
-                "disposition": _as_str(
-                    item.get("disposition"),
-                    "salvage receipt.ignored_files.disposition",
-                ),
-            }
-        )
+    summary_raw = receipt.get("ignored_summary")
+    if summary_raw is not None:
+        # Bounded evidence (#1772): the expected set is the manifest
+        # receipt, verified through its sha256, not the inline sample.
+        summary = _ignored_summary_from_obj(summary_raw, "salvage receipt.ignored_summary")
+        for item in _read_ignored_manifest(config, summary, "salvage ignored manifest"):
+            if item.checkout != checkout.name:
+                raise Refusal(
+                    f"salvage ignored manifest names checkout {item.checkout}, "
+                    f"not {checkout.name}"
+                )
+            observed.append(
+                {
+                    "path": item.path,
+                    "bytes": item.size,
+                    "sha256": item.sha256,
+                    "disposition": item.disposition,
+                }
+            )
+    else:
+        expected_entries = _as_list(recorded, "salvage receipt.ignored_files")
+        for entry in expected_entries:
+            raw_entry = _as_mapping(entry, "salvage receipt.ignored_files entry")
+            observed.append(
+                {
+                    "path": _as_str(raw_entry.get("path"), "salvage receipt.ignored_files.path"),
+                    "bytes": _as_int(
+                        raw_entry.get("bytes"), "salvage receipt.ignored_files.bytes"
+                    ),
+                    "sha256": _as_str(
+                        raw_entry.get("sha256"), "salvage receipt.ignored_files.sha256"
+                    ),
+                    "disposition": _as_str(
+                        raw_entry.get("disposition"),
+                        "salvage receipt.ignored_files.disposition",
+                    ),
+                }
+            )
     disposition = observed[0]["disposition"] if observed else None
     current_entries = [
         item.receipt_entry(_as_str(disposition, "salvage receipt disposition"))
@@ -35394,7 +35701,7 @@ def _salvage_agent_slot(
         # A finish-recorded ignored decision (#1686) is enforced here:
         # the files must still match it exactly, and a remove flag that
         # disagrees with it refuses.
-        recorded_ignored = _handoff_ignored_by_checkout(record.handoff)
+        recorded_ignored = _handoff_ignored_by_checkout(config, record.handoff)
         recorded_mode: _IgnoredMode = (
             "archive"
             if record.handoff.ignored_files[0].disposition == "archived"
@@ -35620,13 +35927,38 @@ def _salvage_agent_slot(
     }
     if ignored_by_checkout:
         disposition = "archived" if ignored_mode == "archive" else "discarded"
+        # Level 3 (#1772): bounded summary plus manifest receipt. Below
+        # the writer ceiling the full list stays inline, the equally
+        # checked older form, as with the level-2 sidecar.
+        bounded = _writer_ceiling(config) >= 3
+        manifest_root = (
+            archive_root or _default_salvage_archive_root(config) if bounded else None
+        )
         for receipt in receipts:
             name = _as_str(receipt.get("checkout"), "salvage receipt.checkout")
             ignored_files = ignored_by_checkout.get(name)
             if ignored_files:
-                receipt["ignored_files"] = [
-                    item.receipt_entry(disposition) for item in ignored_files
-                ]
+                entries = [item.receipt_entry(disposition) for item in ignored_files]
+                if bounded:
+                    assert manifest_root is not None
+                    for entry in entries:
+                        entry["checkout"] = name
+                    summary = _write_ignored_manifest(
+                        config,
+                        manifest_root,
+                        record.machine,
+                        record.slot,
+                        record.generation,
+                        name,
+                        entries,
+                    )
+                    inline_entries = entries[:_IGNORED_EVIDENCE_INLINE_LIMIT]
+                    for inline_entry in inline_entries:
+                        inline_entry.pop("checkout", None)
+                    receipt["ignored_files"] = inline_entries
+                    receipt["ignored_summary"] = _ignored_summary_obj(summary)
+                else:
+                    receipt["ignored_files"] = entries
                 if name in ignored_archives:
                     receipt["ignored_archive"] = ignored_archives[name]
     for receipt in receipts:
@@ -37883,7 +38215,7 @@ def _remove_preconditions(
     # checkout heads, not the recorded containment.
     accounting_sink: list[dict[str, object]] = []
     expected_ignored = (
-        _handoff_ignored_by_checkout(record.handoff)
+        _handoff_ignored_by_checkout(config, record.handoff)
         if record.handoff.ignored_files
         else None
     )
@@ -61121,11 +61453,40 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                             sha256=_as_str(archive["sha256"], "ignored archive sha256"),
                         )
                     )
+        ignored_summary: IgnoredEvidenceSummary | None = None
         if ignored_entries:
             # Level-2 accounting remove enforces exactly (#1788): below
             # the ceiling this refuses rather than dropping accounting
             # or writing the older, less-checked handoff form.
             _assert_writer_level(config, 2, "handoff ignored-file accounting")
+            if _writer_ceiling(config) >= 3:
+                # Level 3 (#1772): bounded summary plus manifest receipt.
+                # Below the ceiling the full list stays inline, the
+                # equally checked older form, as with the level-2
+                # containing-refs sidecar.
+                manifest_root = (
+                    resolved_root
+                    if ignored_mode == "archive"
+                    else _default_salvage_archive_root(config)
+                )
+                ignored_summary = _write_ignored_manifest(
+                    config,
+                    manifest_root,
+                    record.machine,
+                    record.slot,
+                    record.generation,
+                    "handoff",
+                    [
+                        {
+                            "checkout": item.checkout,
+                            "path": item.path,
+                            "bytes": item.size,
+                            "sha256": item.sha256,
+                            "disposition": item.disposition,
+                        }
+                        for item in ignored_entries
+                    ],
+                )
         continuation = (
             f"wrkslots remove {record.slot} --coordinator-pid "
             f"<current-coordinator-pid> --expected-generation {record.generation}"
@@ -61141,6 +61502,7 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                 discarded_unaccounted=discarded,
                 ignored_files=tuple(ignored_entries),
                 ignored_archives=tuple(ignored_archive_entries),
+                ignored_summary=ignored_summary,
             ),
         )
         _write_active_state(
@@ -61164,8 +61526,17 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                             "sha256": item.sha256,
                             "disposition": item.disposition,
                         }
-                        for item in ignored_entries
+                        for item in ignored_entries[
+                            : _IGNORED_EVIDENCE_INLINE_LIMIT
+                            if ignored_summary is not None
+                            else len(ignored_entries)
+                        ]
                     ],
+                    **(
+                        {"ignored_summary": _ignored_summary_obj(ignored_summary)}
+                        if ignored_summary is not None
+                        else {}
+                    ),
                     "ignored_archives": [
                         {
                             "checkout": item.checkout,
@@ -61194,10 +61565,20 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         print(f"unaccounted {sha} {subject}")
     for bundle_path in bundle_paths:
         print(f"discard_bundle={bundle_path}")
-    for ignored_entry in ignored_entries:
+    for ignored_entry in ignored_entries[
+        : _IGNORED_EVIDENCE_INLINE_LIMIT
+        if ignored_summary is not None
+        else len(ignored_entries)
+    ]:
         print(
             f"ignored checkout={ignored_entry.checkout} path={ignored_entry.path} "
             f"bytes={ignored_entry.size} sha256={ignored_entry.sha256} disposition={ignored_entry.disposition}"
+        )
+    if ignored_summary is not None:
+        print(
+            f"ignored_summary count={ignored_summary.count} "
+            f"total_bytes={ignored_summary.total_bytes} "
+            f"manifest_sha256={ignored_summary.manifest_sha256}"
         )
     for ignored_archive in ignored_archive_entries:
         print(f"ignored_archive checkout={ignored_archive.checkout} path={ignored_archive.path}")

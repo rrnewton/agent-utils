@@ -2704,6 +2704,297 @@ pub(crate) fn archive_ignored_files(
     }))
 }
 
+/// Highest record schema level this build writes (#1772, #1788).
+pub(crate) const SCHEMA_LEVEL: u64 = 3;
+
+/// The project's writer ceiling from its configuration (#1788):
+/// absent means this build's level.
+pub(crate) fn writer_ceiling(config: &Value) -> u64 {
+    config
+        .get("writer_ceiling")
+        .and_then(Value::as_u64)
+        .unwrap_or(SCHEMA_LEVEL)
+}
+
+/// Inline entries kept beside an ignored-evidence summary (#1772).
+pub(crate) const IGNORED_EVIDENCE_INLINE_LIMIT: usize = 64;
+pub(crate) const IGNORED_MANIFEST_BYTES_LIMIT: u64 = 512 * 1024 * 1024;
+
+/// Sha256 of the canonical sorted per-file manifest lines (#1772),
+/// mirroring the Python edition's `_ignored_manifest_digest`.
+pub(crate) fn ignored_manifest_digest(entries: &[Value]) -> String {
+    let mut ordered: Vec<&Value> = entries.iter().collect();
+    ordered.sort_by(|left, right| {
+        let key = |item: &Value| {
+            (
+                item.get("checkout")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                item.get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+        key(left).cmp(&key(right))
+    });
+    let mut digest = Sha256::new();
+    for entry in ordered {
+        digest.update(
+            entry
+                .get("checkout")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        digest.update(b"\x00");
+        digest.update(
+            entry
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        digest.update(b"\x00");
+        digest.update(
+            entry
+                .get("bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                .to_string()
+                .as_bytes(),
+        );
+        digest.update(b"\x00");
+        digest.update(
+            entry
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        digest.update(b"\x00");
+        digest.update(
+            entry
+                .get("disposition")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        digest.update(b"\n");
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// Write the full ignored-file manifest beside the salvage receipt and
+/// return its summary (#1772), mirroring `_write_ignored_manifest`.
+pub(crate) fn write_ignored_manifest(
+    archive_root: &Path,
+    machine: &str,
+    slot: &str,
+    generation: Option<i64>,
+    label: &str,
+    entries: &[Value],
+) -> Result<Value> {
+    let mut ordered: Vec<Value> = entries.to_vec();
+    ordered.sort_by(|left, right| {
+        let key = |item: &Value| {
+            (
+                item.get("checkout")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                item.get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+        key(left).cmp(&key(right))
+    });
+    let canonical = ignored_manifest_digest(&ordered);
+    let name_digest = format!("{:x}", Sha256::digest(label.as_bytes()));
+    let epoch = generation
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "ownerless".to_string());
+    let directory = archive_root
+        .join("wrkslots-salvage")
+        .join(machine)
+        .join(slot)
+        .join(epoch);
+    prepare_local_salvage_directory(archive_root, &directory)?;
+    assert_no_symlink_components(archive_root, &directory)?;
+    let path = directory.join(format!(
+        "ignored-manifest-{}-{}-{}.json",
+        sanitize_archive_name(label),
+        &name_digest[..12],
+        &canonical[..12]
+    ));
+    let payload = json!({
+        "schema": 1,
+        "kind": "wrkslots-ignored-manifest",
+        "machine": machine,
+        "slot": slot,
+        "generation": generation,
+        "checkout": label,
+        "files": ordered,
+    });
+    if path.exists() || path.is_symlink() {
+        let summary = json!({
+            "count": ordered.len(),
+            "total_bytes": ordered.iter().map(|item| item.get("bytes").and_then(Value::as_u64).unwrap_or_default()).sum::<u64>(),
+            "dispositions": {},
+            "manifest_sha256": canonical,
+            "manifest": {"archive_root": archive_root.display().to_string(), "path": "", "bytes": 0, "sha256": "0".repeat(64)},
+        });
+        read_ignored_manifest(&summary, false)?;
+    } else {
+        crate::ensure_states::atomic_write_json(&path, &payload)?;
+    }
+    let (file_sha256, size) = hash_regular_file(&path, &path.display().to_string(), label)?;
+    let relative = path
+        .strip_prefix(archive_root)
+        .map_err(|_| format!("ignored manifest escapes its root: {}", path.display()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for item in &ordered {
+        *counts
+            .entry(
+                item.get("disposition")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+            .or_default() += 1;
+    }
+    let summary = json!({
+        "count": ordered.len(),
+        "total_bytes": ordered.iter().map(|item| item.get("bytes").and_then(Value::as_u64).unwrap_or_default()).sum::<u64>(),
+        "dispositions": counts,
+        "manifest_sha256": canonical,
+        "manifest": {"archive_root": archive_root.display().to_string(), "path": relative, "bytes": size, "sha256": file_sha256},
+    });
+    read_ignored_manifest(&summary, true)?;
+    Ok(summary)
+}
+
+/// Read a manifest receipt back and verify it against its summary
+/// (#1772), mirroring `_read_ignored_manifest`; returns its entries.
+pub(crate) fn read_ignored_manifest(
+    summary: &Value,
+    check_file_digest: bool,
+) -> Result<Vec<Value>> {
+    let manifest = summary
+        .get("manifest")
+        .ok_or_else(|| "ignored summary holds no manifest".to_string())?;
+    let root = PathBuf::from(
+        manifest
+            .get("archive_root")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let relative = manifest
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "ignored manifest path escapes its root: {relative}"
+        ));
+    }
+    let path = root.join(relative_path);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot read ignored manifest {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "ignored manifest is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > IGNORED_MANIFEST_BYTES_LIMIT {
+        return Err(format!(
+            "ignored manifest exceeds the {IGNORED_MANIFEST_BYTES_LIMIT}-byte safety bound: {}",
+            path.display()
+        ));
+    }
+    let contents = std::fs::read(&path)
+        .map_err(|error| format!("cannot read ignored manifest {}: {error}", path.display()))?;
+    if check_file_digest {
+        let expected_bytes = manifest
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let expected_sha = manifest
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if contents.len() as u64 != expected_bytes
+            || format!("{:x}", Sha256::digest(&contents)) != expected_sha
+        {
+            return Err(format!(
+                "ignored manifest changed after it was recorded: {}",
+                path.display()
+            ));
+        }
+    }
+    let document: Value = serde_json::from_slice(&contents)
+        .map_err(|error| format!("ignored manifest is malformed JSON: {error}"))?;
+    if document.get("schema").and_then(Value::as_u64) != Some(1)
+        || document.get("kind").and_then(Value::as_str) != Some("wrkslots-ignored-manifest")
+    {
+        return Err(format!(
+            "ignored manifest holds an unsupported schema: {}",
+            path.display()
+        ));
+    }
+    let files = document
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if ignored_manifest_digest(&files)
+        != summary
+            .get("manifest_sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    {
+        return Err(format!(
+            "ignored manifest does not match its recorded manifest sha256: {}",
+            path.display()
+        ));
+    }
+    if files.len() as u64
+        != summary
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX)
+    {
+        return Err(format!(
+            "ignored manifest does not hold its recorded file count: {}",
+            path.display()
+        ));
+    }
+    Ok(files)
+}
+
+/// The full recorded ignored entries for one handoff: the manifest
+/// receipt when a summary is present (#1772), else the inline list.
+pub(crate) fn recorded_ignored_entries(handoff: &Value) -> Result<Vec<Value>> {
+    if let Some(summary) = handoff.get("ignored_summary") {
+        return read_ignored_manifest(summary, true);
+    }
+    Ok(handoff
+        .get("ignored_files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
 fn is_sha(text: &str) -> bool {
     text.len() == 40
         && text
@@ -3283,16 +3574,13 @@ fn salvage_gate(
     // files must still match it exactly, and a remove flag that
     // disagrees with it refuses.
     let mut effective_mode = ignored_mode;
-    let recorded_entries: Vec<&Value> = handoff
-        .get("ignored_files")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| item.get("checkout").and_then(Value::as_str) == Some(name.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // With a summary (#1772) the recorded set is the manifest receipt,
+    // verified through its sha256; without one the inline list is whole.
+    let recorded_all = recorded_ignored_entries(handoff)?;
+    let recorded_entries: Vec<&Value> = recorded_all
+        .iter()
+        .filter(|item| item.get("checkout").and_then(Value::as_str) == Some(name.as_str()))
+        .collect();
     if !recorded_entries.is_empty() {
         let disposition = recorded_entries[0]
             .get("disposition")
@@ -3469,19 +3757,58 @@ fn salvage_gate(
             IgnoredMode::Discard => "discarded",
             IgnoredMode::Refuse => unreachable!(),
         };
+        // Level 3 (#1772): bounded summary plus manifest receipt.
+        // Below the writer ceiling the full list stays inline, the
+        // equally checked older form, as with the level-2 sidecar.
+        let bounded = writer_ceiling(config) >= 3;
+        let entries: Vec<Value> = ignored_files
+            .iter()
+            .map(|item| {
+                json!({
+                    "checkout": name,
+                    "path": item.path,
+                    "bytes": item.size,
+                    "sha256": item.sha256,
+                    "disposition": disposition,
+                })
+            })
+            .collect();
         if let Some(object) = receipt.as_object_mut() {
-            object.insert(
-                "ignored_files".to_string(),
-                json!(ignored_files
+            if bounded {
+                let summary = write_ignored_manifest(
+                    ignored_context.archive_root,
+                    ignored_context.machine,
+                    ignored_context.slot,
+                    Some(ignored_context.generation),
+                    &name,
+                    &entries,
+                )?;
+                let inline: Vec<Value> = entries
                     .iter()
-                    .map(|item| json!({
-                        "path": item.path,
-                        "bytes": item.size,
-                        "sha256": item.sha256,
-                        "disposition": disposition,
-                    }))
-                    .collect::<Vec<_>>()),
-            );
+                    .take(IGNORED_EVIDENCE_INLINE_LIMIT)
+                    .map(|entry| {
+                        let mut trimmed = entry.clone();
+                        if let Some(object) = trimmed.as_object_mut() {
+                            object.remove("checkout");
+                        }
+                        trimmed
+                    })
+                    .collect();
+                object.insert("ignored_files".to_string(), json!(inline));
+                object.insert("ignored_summary".to_string(), summary);
+            } else {
+                let legacy: Vec<Value> = entries
+                    .iter()
+                    .map(|entry| {
+                        let mut trimmed = entry.clone();
+                        if let Some(object) = trimmed.as_object_mut() {
+                            object.remove("checkout");
+                        }
+                        trimmed
+                    })
+                    .collect();
+                object.insert("ignored_files".to_string(), json!(legacy));
+            }
             if effective_mode == IgnoredMode::Archive {
                 object.insert("ignored_archive".to_string(), ignored_archive);
             }

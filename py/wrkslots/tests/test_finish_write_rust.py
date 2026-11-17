@@ -216,6 +216,11 @@ def _normalize_handoff(handoff: dict[str, object]) -> None:
     if isinstance(archives, list):
         for archive in cast(list[dict[str, object]], archives):
             archive["archive_root"] = "ARCHIVEROOT"
+    summary = handoff.get("ignored_summary")
+    if isinstance(summary, dict):
+        manifest = cast(dict[str, object], summary).get("manifest")
+        if isinstance(manifest, dict):
+            cast(dict[str, object], manifest)["archive_root"] = "ARCHIVEROOT"
 
 
 def _active_doc(root: Path) -> dict[str, object]:
@@ -263,6 +268,11 @@ def _events(root: Path) -> list[dict[str, object]]:
                 if isinstance(archives, list):
                     for archive in cast(list[dict[str, object]], archives):
                         archive["archive_root"] = "ARCHIVEROOT"
+                summary = accounting.get("ignored_summary")
+                if isinstance(summary, dict):
+                    manifest = cast(dict[str, object], summary).get("manifest")
+                    if isinstance(manifest, dict):
+                        cast(dict[str, object], manifest)["archive_root"] = "ARCHIVEROOT"
         events.append(event)
     return events
 

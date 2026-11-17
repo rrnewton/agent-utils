@@ -6,7 +6,7 @@
 //! representation or decode to a finite `f64`; within that domain hashes use
 //! the Python authority's canonical spelling. Wider integers and non-finite
 //! values are refused instead of being rounded into a different hash. Event
-//! documents are limited to 16 MiB and 127 nested JSON containers, and strings
+//! documents are limited to 128 MiB and 127 nested JSON containers, and strings
 //! must decode to Unicode scalar values (so lone surrogate escapes are
 //! refused). Replay also refuses unknown event kinds, non-array imported holds,
 //! and non-object state evidence even where the current Python reader does not
