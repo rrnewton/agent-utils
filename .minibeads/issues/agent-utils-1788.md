@@ -27,3 +27,5 @@ Approved design (coordinator review): decision-relevance is decided per command 
 - The deterministic regression tests use condition-based waits only; broad validation runs the full local validate plus the gate on the exact final tree.
 
 # Notes
+
+Coordinator confirmations (on c4e83d0c): (1) When `reader_floor`/`writer_ceiling` are unset, defaults are floor 1 and ceiling this build's schema level (2), so every field written today is at or below the ceiling: nothing is refused, omitted, or changed for any existing project; the gate only bites after a project deliberately sets a lower ceiling or a future field exceeds it. (2) The summary-plus-manifest replacement for the per-file ignored list is in the per-field writer table at the same level as the accounting it replaces: under a ceiling below that level the finish refuses rather than falling back to the unbounded per-file list, and any writer of the summary must assert the level first. Unknown-key presence stands in for a stamped level integer, because stamping a new top-level key would itself brick already-deployed readers.
