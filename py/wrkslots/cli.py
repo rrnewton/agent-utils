@@ -37806,6 +37806,11 @@ def _validate_batch_seal_owner_liveness(
         if raw.get("operator") is not None
         else None
     )
+    if operator is not None and operator.pid == os.getpid():
+        # This process is the batch itself (or its in-process
+        # continuation): it never blocks itself, exactly as the
+        # process scan below excludes the caller's own pid.
+        operator = None
     if operator is not None:
         # The recorded batch process is the proven identity (#1736):
         # judge it alone, with no pid-reuse risk from a cmdline scan.
