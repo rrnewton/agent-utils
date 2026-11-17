@@ -316,7 +316,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel, open in All; no press opens it.
             wait_rows(api.ids("flat"), "the channel did not open in All")
             settled()
             check(reads == ["flat"], f"{label}: opening the channel read {reads}")

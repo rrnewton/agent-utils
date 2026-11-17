@@ -239,6 +239,9 @@ def main() -> int:
                             check(len(api.redemptions) == 2, "invalid input reached redemption")
                         page.fill("#pair-input", link)
                         page.tap("#pair-submit")
+                        # `#1781`: a first run in this profile too — the Welcome, then in.
+                        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=SHOWN_MS)
+                        page.click("#welcome-start")
                         page.wait_for_selector("#view-switch", state="visible", timeout=SHOWN_MS)
                         check(page.evaluate(f"() => localStorage.getItem({json.dumps(TOKEN_KEY)})") == TOKEN,
                               "pasting a pairing link did not sign the installed app's storage in")
@@ -260,6 +263,10 @@ def main() -> int:
                           "Safari did not offer the unspent pairing link for transfer")
                     page.tap("#pair-confirm")
                     if attempt == "first":
+                        # `#1781`: a paired device is a first run, so the Welcome meets it;
+                        # dismiss it onto the Channel, as a first-run reader does.
+                        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=SHOWN_MS)
+                        page.click("#welcome-start")
                         page.wait_for_selector("#view-switch", state="visible", timeout=SHOWN_MS)
                         stored = page.evaluate(f"() => localStorage.getItem({json.dumps(TOKEN_KEY)})")
                         check(stored == TOKEN, f"the redeemed token was not stored under {TOKEN_KEY}: {stored!r}")
