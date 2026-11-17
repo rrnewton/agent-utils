@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-setup-routes-and-pairing-ux: clear setup routes, pairing guide and first-run streamlining'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -23,3 +23,7 @@ Add a user-facing setup guide covering install (prerequisites, build or containe
 A new user can pick a route from the guide and reach a signed-in phone without reading the reference README end to end. `vibe-talk doctor` exits non-zero on a configuration that cannot serve the app and names the fix for every finding. The site page links the guide. No internal host names, account ids, workspace names or local paths appear in any added file.
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 36d7179d (gate pass on e8ad8230). Added vibe-talk/SETUP.md (install, six connection routes, Android/iOS install, pairing), vibe-talk doctor with six regression tests, site and setup-skill links, and the UX review at ai_docs/reports/research/2026-11-17-vibe-talk-setup-ux/REPORT.md with five follow-up proposals for the coordinator. Reusable first-channel and pairing copy was sent to the mu-firstrun lane for #1781 and both routes to the same channel list are named together in the guide.
