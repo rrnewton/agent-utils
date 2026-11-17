@@ -28,12 +28,13 @@ here under a count that is not exact) among five messages of the channel itself.
   it was. No horizontal overflow and no page error at any step.
 
 `#605`-`#608 server-side-search` add a fifth stage over the same channel, on a server that keeps a
-copy and answers its search: in All, "lantern" -> one collapsed line at the foot of the list
-("1 more hit on the server", `#1762`), tapped -> the line saying what was searched ("No upstream
-search · this page: back to … · server: back to … (still expanding) · … messages searched") and the
-server's one older hit drawn alone with its Show in channel button, a thumb tall, nothing wider than
-the window -> All channels ticked: the server asked over every channel, its hit from another channel
-named by it -> back to one channel, Main, "bright": the lantern root, which stands for its thread,
+copy and answers its search: in All, "lantern" -> the server's one older hit stands in the timeline
+as a card (`#1786 vibe-talk-search-scope-server-hits`; the foot line only opens the details), tapped
+-> the line saying what was searched ("No upstream
+search · this page: back to … · server: back to … (still expanding) · … messages searched"), nothing
+wider than the window -> All channels ticked: the server asked over every channel, its hit from
+another channel waits behind the chip under the search bar, and a tap interleaves it in quoted
+style with its Show in channel button, a thumb tall -> back to one channel, Main, "bright": the lantern root, which stands for its thread,
 alone -> the Threads view unpacked, "bright": the lantern card alone, its block showing only the
 reply that says it, a line below the card for the two before it -> a real press on that line: the
 two stand where they were -> Search further back pressed: the server asked to gather the channel
@@ -118,6 +119,17 @@ class GapApi(FakeApi):
         self.older = {**message(-90, "An old lantern note from the spring."), "id": "150"}
         self.elsewhere = {**message(-80, "A lantern on the other channel."), "id": "990",
                           "channel_id": "2220000000000000002"}
+        # `#1786 vibe-talk-search-scope-server-hits`: an older reply in the lantern
+        # thread itself, and one in the harbor thread (slugged, for its header).
+        self.older_in = {**message(-100, "An older lantern reply, deep in the thread."),
+                         "id": "151", "thread": {"id": LANTERN, "root_message_id": "201",
+                                                 "is_root": False, "reply_count": REPLIES[LANTERN],
+                                                 "reply_count_exact": True}}
+        self.older_harbor = {**message(-95, "An older harbor lantern note."),
+                             "id": "152", "thread": {"id": HARBOR, "root_message_id": "202",
+                                                     "is_root": False, "reply_count": REPLIES[HARBOR],
+                                                     "reply_count_exact": True,
+                                                     "display_name": "harbor-thread"}}
         self.history_asked: list[str] = []
 
     def client_config(self, scope: str) -> Json:
@@ -129,7 +141,8 @@ class GapApi(FakeApi):
         """The server's copy searched: the older note for "lantern", in one channel or all."""
         words = query.get("q", [""])[0].lower()
         everywhere = path == "/api/v1/search"
-        hits = [one for one in ([self.elsewhere, self.older] if everywhere else [self.older])
+        hits = [one for one in ([self.older_in, self.older_harbor, self.older, self.elsewhere]
+                                if everywhere else [self.older_in, self.older_harbor, self.older])
                 if "lantern" in words]
         scope = {"channel": CHANNEL, "state": "searched", "examined": 900,
                  "searched_back_to_ms": 1_750_000_000_000, "held_from_ms": 1_750_000_000_000,
@@ -435,7 +448,7 @@ def walk_through(walk: Walk) -> None:
 
 
 SCOPE_JS = "() => document.getElementById('search-scope').textContent"
-HITS_JS = """() => [...document.querySelectorAll('#server-hits > li')]
+HITS_JS = """() => [...document.querySelectorAll('#discord-log > li[data-server-hit]')]
   .filter((li) => li.getClientRects().length).map((li) => li.getAttribute('data-id'))"""
 BOX_JS = """(selector) => {
   const node = document.querySelector(selector);
@@ -465,24 +478,19 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     page.evaluate(PICK_JS, "flat")
     walk.until("() => document.getElementById('discord-log').children.length > 0", "All did not come back")
     page.fill("#search-field", "lantern")
-    # `#1762`: nothing of the server's is drawn while typing or on its answer;
-    # one line at the foot of the list, tapped to draw the hit.
-    walk.until("() => document.getElementById('server-line').textContent.includes('more hit')",
-               "the collapsed line did not show the server's hit")
+    # `#1786`: on the answer the in-channel hit stands in the timeline as a
+    # card at once; the foot line only opens the search's details.
+    walk.until("() => document.querySelector('#discord-log > li[data-server-hit=\"card\"][data-id=\"150\"]') !== null",
+               "the server's older hit did not stand as a card in the timeline")
     walk.check(page.evaluate("() => document.querySelectorAll('#server-hits > li').length") == 0,
-               "the server's hit was drawn before the line was tapped")
+               "a snippet was drawn at the foot")
     walk.press("#server-line")
-    walk.until("() => document.querySelectorAll('#server-hits > li').length === 1",
-               "the server's older hit was not drawn")
     walk.server_settled()
     scope = str(page.evaluate(SCOPE_JS))
     walk.check(scope.startswith("No upstream search · this page: back to ") and
                " · server: back to " in scope and "(still expanding)" in scope and
                scope.endswith("messages searched"), f"the line says {scope!r}")
-    walk.check(page.evaluate(HITS_JS) == ["150"], f"the hits are {page.evaluate(HITS_JS)}")
-    show = page.evaluate(BOX_JS, "#server-hits > li[data-id='150'] .server-hit-show")
-    walk.check(isinstance(show, dict) and float(show["height"]) >= 30,
-               f"Show in channel is not a thumb tall: {show}")
+    walk.check(page.evaluate(HITS_JS) == ["151", "152", "150"], f"the hits are {page.evaluate(HITS_JS)}")
     line = page.evaluate(BOX_JS, "#search-scope")
     width = float(page.evaluate("() => window.innerWidth"))
     walk.check(isinstance(line, dict) and float(line["right"]) <= width + 1, f"the line runs off the screen: {line}")
@@ -490,17 +498,45 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     walk.shot("6-server")
     walk.notes.append(f"server: {scope}")
 
-    # All channels: every channel searched, the hit elsewhere named by its channel.
+    # All channels: every channel searched; its hit from another channel
+    # waits behind the chip under the search bar, then interleaves quoted.
     press_all_channels(walk)
-    walk.until("() => document.querySelectorAll('#server-hits > li').length === 2",
-               "All channels did not bring the other channel's hit")
+    walk.until("() => !document.getElementById('search-outside-chip').hidden",
+               "the outside chip did not appear for the other channel's hit")
     walk.check(any("GET /api/v1/search?" in one for one in api.requests), "All channels did not ask every channel")
     walk.check(" · server: 2 of 2 channels" in str(page.evaluate(SCOPE_JS)),
                f"the line says {page.evaluate(SCOPE_JS)!r}")
+    walk.press("#search-outside-chip")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 4",
+               "the chip did not interleave the other channel's hit")
+    walk.check(page.evaluate(HITS_JS) == ["151", "152", "150", "990"], f"the hits are {page.evaluate(HITS_JS)}")
+    show = page.evaluate(BOX_JS, "#discord-log > li[data-id='990'] .server-hit-show")
+    walk.check(isinstance(show, dict) and float(show["height"]) >= 30,
+               f"Show in channel is not a thumb tall: {show}")
     walk.no_overflow()
     walk.shot("7-all-channels")
     press_all_channels(walk)
-    walk.until("() => document.querySelectorAll('#server-hits > li').length === 1", "one channel did not come back")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3", "one channel did not come back")
+
+    # `#1786` in the lantern thread itself: this thread's older hit is a card
+    # at once; the harbor hit and the channel note wait behind the chip.
+    page.evaluate(PICK_JS, f"thread:{LANTERN}")
+    walk.until("() => document.querySelector('#discord-log > li[data-server-hit=\"card\"][data-id=\"151\"]') !== null",
+               "in the thread, its own older hit did not stand as a card")
+    chip = (page.text_content("#search-outside-chip") or "").strip()
+    walk.check(chip in ("Show 2 hits outside this thread", "Hide 2 hits outside this thread"),
+               f"the chip says {chip!r}")
+    if chip.startswith("Show"):
+        walk.press("#search-outside-chip")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3",
+               "the chip did not interleave the outside hits in the thread")
+    walk.check(page.evaluate(HITS_JS) == ["151", "152", "150"],
+               f"in the thread the hits are {page.evaluate(HITS_JS)}")
+    harbor = page.text_content("#discord-log > li[data-id='152'] .server-hit-meta") or ""
+    walk.check("in thread harbor-thread" in harbor, f"the quoted hit's header says {harbor!r}")
+    walk.no_overflow()
+    walk.shot("7b-thread-scope")
+    walk.notes.append("thread scope: own hit a card, 2 outside behind the chip, harbor slug in its header")
 
     # Main: a thread stands for its children, so the reply's word keeps the lantern root.
     page.evaluate(PICK_JS, "main")
@@ -543,7 +579,7 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     # Search further back: the server asked to gather this channel next, and the line says so.
     page.evaluate(PICK_JS, "flat")
     page.fill("#search-field", "lantern")
-    walk.until("() => document.getElementById('server-line').textContent.includes('more hit') && "
+    walk.until("() => document.getElementById('server-line').textContent.includes('Server search details') && "
                "!document.getElementById('server-search').hidden && "
                "document.getElementById('server-line').getClientRects().length > 0",
                "the collapsed line did not show the server's hit")

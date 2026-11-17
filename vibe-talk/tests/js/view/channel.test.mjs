@@ -1591,6 +1591,7 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
     searchInAll: () => { log.push("search in All"); return "in All asked"; },
     serverMore: () => { log.push("server more"); return "more asked"; },
     toggleServerHits: () => { log.push("server line"); },
+    toggleOutsideHits: () => { log.push("outside chip"); },
     searchAllChannels: (on) => log.push(`all channels ${on}`),
     searchFurther: () => { log.push("further"); return "further asked"; },
     loadOlderTurns: () => { log.push("older turns"); return "turns asked"; },
@@ -1608,7 +1609,7 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
     closeActionMenu: () => log.push("menu closed"),
     jumpToNewest: () => log.push("newest"),
   });
-  assert.deepStrictEqual(log, ["listen load-older click", "listen left search-in-all click", "listen server-line click", "listen server-more click",
+  assert.deepStrictEqual(log, ["listen load-older click", "listen left search-in-all click", "listen server-line click", "listen search-outside-chip click", "listen server-more click",
     "listen search-all-channels change", "listen search-further click", "listen load-older-turns click", "listen collapse-all click",
     "listen expand-all click", "listen todo-filter click", "listen clear-backlog click", "listen undo-dismiss click", "listen summarise click",
     "listen reader-toggle click", "listen autoplay-toggle click", "listen expand-all click", "listen collapse-all click", "listen summarise click",
@@ -1618,13 +1619,14 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
   // Each control answers what its act started, which the page suite waits for.
   assert.deepStrictEqual([press("left search-in-all"), press("server-more")], [["in All asked"], ["more asked"]]);
   press("server-line");
+  press("search-outside-chip");
   nodes["search-all-channels"].checked = true;
   press("search-all-channels", "change");
   assert.deepStrictEqual([press("search-further"), press("load-older-turns")], [["further asked"], ["turns asked"]]);
   press("todo-filter");
   assert.deepStrictEqual([press("clear-backlog"), press("undo-dismiss")], [["cleared"], ["undone"]]);
   press("jump-newest");
-  assert.deepStrictEqual(log, ["older", "search in All", "server more", "server line", "all channels true", "further", "older turns", "read mode 0",
+  assert.deepStrictEqual(log, ["older", "search in All", "server more", "server line", "outside chip", "all channels true", "further", "older turns", "read mode 0",
     "menu closed", "focus action-menu-open true", "clear backlog", "undo", "newest"]);
   log.length = 0;
   // The menu's items: each one's act, then the menu closed and the keys back on the hamburger where they were in it.

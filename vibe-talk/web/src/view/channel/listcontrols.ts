@@ -19,6 +19,8 @@ export interface ListControlsDependencies {
   serverMore(): unknown;
   /** `#1762`. The server's one line tapped: show its snippets, or put them away. */
   toggleServerHits(): void;
+  /** `#1786`. The chip under the search bar tapped: interleave the outside hits, or put them away. */
+  toggleOutsideHits(): void;
   searchAllChannels(on: boolean): void;
   /** The search's walk further back. */
   searchFurther(): unknown;
@@ -64,6 +66,8 @@ export function mountListControls(deps: ListControlsDependencies): ListControls 
   listen(leftEl("search-in-all"), "click", () => deps.searchInAll());
   // `#605`-`#608 server-side-search`; the collapsed line itself since `#1762`.
   listen(el("server-line"), "click", () => deps.toggleServerHits());
+  // `#1786`: the outside hits' chip under the search bar.
+  listen(el("search-outside-chip"), "click", () => deps.toggleOutsideHits());
   listen(el("server-more"), "click", () => deps.serverMore());
   listen(el("search-all-channels"), "change", () => deps.searchAllChannels((el("search-all-channels") as HTMLInputElement).checked));
   listen(el("search-further"), "click", () => deps.searchFurther());

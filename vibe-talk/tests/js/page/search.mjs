@@ -2650,15 +2650,16 @@ test("`#605 server-side-search`: a pause in the typing searches the server's cop
   assert.ok(Number(asked.searchParams.get("below")) > 0, "not only what lies below the loaded messages");
   assert.equal(page.el("server-search").hidden, false);
   // `#1762`: the answer alone draws nothing but the one line at the foot.
-  assert.equal(page.el("server-line").textContent, "1 more hit on the server");
+  // `#1786`: the hit stands in the timeline as a card; the foot only opens details.
+  assert.equal(page.el("server-line").textContent, "Server search details");
   assert.equal(page.el("server-detail").hidden, true);
-  assert.deepStrictEqual(page.el("server-hits").children, [], "a snippet was drawn before the tap");
+  assert.deepStrictEqual(page.el("server-hits").children, [], "a snippet was drawn at the foot");
+  const placed = page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"));
+  assert.deepStrictEqual(placed.map((li) => li.getAttribute("data-id")), ["150"], "the in-scope hit is not a card in the timeline");
+  assert.equal(placed[0].getAttribute("data-server-hit"), "card");
   await expandServer(page);
   assert.match(page.el("search-scope").textContent,
     /^No upstream search · this page: back to .+ · server: back to .+ \(still expanding\) · 125 messages searched$/);
-  const hits = page.el("server-hits").children;
-  assert.deepStrictEqual(hits.map((li) => li.getAttribute("data-id")), ["150"]);
-  assert.ok(hits[0].descendants().some((n) => n.textContent === "Show in channel"), "a hit has no way to its channel");
   // The same search again asks nothing; a change of search asks again.
   await page.el("search-field").setValue("kestrel ");
   await page.settle();
@@ -2711,11 +2712,59 @@ test("`#607 server-side-search`: hits the page already holds are not repeated, a
   const asked = new URL(page.serverSearchCalls.at(-1), "http://fixture.test");
   assert.equal(asked.pathname, "/api/v1/search");
   assert.equal(asked.searchParams.get("below"), null, "every channel's newest, not below this page's floor");
-  assert.deepStrictEqual(page.el("server-hits").children.map((li) => li.getAttribute("data-id")), ["990"]);
+  // `#1786`: another channel's hit waits behind the chip under the search bar,
+  // and a tap interleaves it in the timeline in quoted style.
+  assert.deepStrictEqual(page.el("server-hits").children.map((li) => li.getAttribute("data-id")), []);
+  const chip = page.el("search-outside-chip");
+  assert.equal(chip.hidden, false, "the outside chip did not appear");
+  assert.equal(chip.textContent, "Show 1 hit in other channels");
+  await chip.click();
+  await page.settle();
+  const quoted = page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"));
+  assert.deepStrictEqual(quoted.map((li) => li.getAttribute("data-id")), ["990"]);
+  assert.equal(quoted[0].getAttribute("data-server-hit"), "quote");
+  assert.ok(quoted[0].descendants().some((n) => n.textContent === "Show in channel"), "a hit has no way to its channel");
   assert.match(page.el("search-scope").textContent, / · server: 2 of 2 channels, all back to .+, 1 whole · /);
   // Counted once: the server's search of every channel includes this one's newest.
   assert.match(page.el("search-scope").textContent, / · 240 messages searched$/);
   assert.equal(page.el("search-further").hidden, true, "Search further back is one channel's");
+});
+
+test("`#1786 vibe-talk-search-scope-server-hits`: in a thread, this thread's server hits are cards and the rest wait behind the chip under the search bar", async () => {
+  const page = await serverSearchPage("thread:spaces/A/threads/one & two");
+  const first = { id: "spaces/A/threads/one & two", root_message_id: "201", is_root: true,
+    reply_count: 1, reply_count_exact: true };
+  const second = { id: "spaces/A/threads/another", root_message_id: "203", is_root: true,
+    reply_count: 1, reply_count_exact: false, display_name: "x-y-z" };
+  const inside = message({ id: "150", content: "an old kestrel in this thread", timestamp: "2026-08-02T09:00:00Z",
+    thread: { ...first, is_root: false } });
+  const outside = message({ id: "151", content: "a kestrel in the other thread", timestamp: "2026-08-03T09:00:00Z",
+    thread: { ...second, is_root: false } });
+  page.serverSearch = async () => searchAnswer([outside, inside], [searchedScope()]);
+  await searchServer(page, "kestrel");
+  // This thread's hit stands in the timeline as a normal card, with no tap.
+  const cards = page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"));
+  assert.deepStrictEqual(cards.map((li) => li.getAttribute("data-id")), ["150"]);
+  assert.equal(cards[0].getAttribute("data-server-hit"), "card");
+  assert.deepStrictEqual(page.el("server-hits").children, [], "a snippet was drawn at the foot");
+  // The other thread's hit waits behind the chip, named for this thread.
+  const chip = page.el("search-outside-chip");
+  assert.equal(chip.hidden, false, "the outside chip did not appear");
+  assert.equal(chip.textContent, "Show 1 hit outside this thread");
+  await chip.click();
+  await page.settle();
+  const placed = page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit"));
+  assert.deepStrictEqual(placed.map((li) => li.getAttribute("data-id")), ["150", "151"],
+    "the outside hit is not interleaved chronologically with this thread's");
+  assert.equal(placed[1].getAttribute("data-server-hit"), "quote");
+  assert.ok(placed[1].descendants().some((n) => n.textContent === "in thread x-y-z"),
+    "the quoted hit does not name its thread by slug");
+  // A second tap puts the outside hit away; this thread's card stays.
+  await chip.click();
+  await page.settle();
+  assert.deepStrictEqual(
+    page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit")).map((li) => li.getAttribute("data-id")),
+    ["150"]);
 });
 
 test("`#605 server-side-search`: the line never says the server searched further back than it says it did", async () => {
@@ -2784,7 +2833,10 @@ test("`#605 server-side-search`: More from the server goes on below where its la
   assert.equal(page.el("server-more").hidden, false);
   await page.el("server-more").click();
   await page.settle();
-  assert.deepStrictEqual(page.el("server-hits").children.map((li) => li.getAttribute("data-id")), ["160", "140"]);
+  // `#1786`: both pages' hits stand in the timeline as cards, oldest first.
+  assert.deepStrictEqual(
+    page.el("discord-log").children.filter((li) => li.getAttribute("data-server-hit")).map((li) => li.getAttribute("data-id")),
+    ["140", "160"]);
   assert.equal(page.el("server-more").hidden, true);
   assert.match(page.el("search-scope").textContent, / · 245 messages searched$/);
 });

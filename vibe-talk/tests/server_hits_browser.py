@@ -9,12 +9,14 @@ holding "lantern"; the server's copy holds sixty older "lantern" hits. At a desk
 (a shrunken `visualViewport`, played the way tests/search_scroll_browser.py plays it):
 
   type "lantern" -> the loaded cards filter at once, no server request has fired, no
-  snippet is drawn, and the row under the eye has not moved;
-  typing settles -> one line at the foot of the list, "50+ more hits on the server",
-  under "On the server, not loaded here", with "On this screen" over the loaded hits;
-  tap the line -> the snippets, the scope line, All channels, More (the remaining
-  ten) and Search further back; tap again -> collapsed; tick All channels -> the
-  separator adds "including other channels".
+  server row is placed, and the row under the eye has not moved;
+  typing settles -> the first page's fifty in-channel hits stand in the timeline
+  as cards (`#1786 vibe-talk-search-scope-server-hits`), the bottom separator is
+  retired, no chip appears (no hit is outside this channel), and the foot line
+  only opens the search's details, with "On this screen" over the loaded hits;
+  tap the line -> the scope line, All channels, More (the remaining ten cards)
+  and Search further back; tap again -> collapsed; tick All channels -> the
+  server asked again, still no outside chip on this one-channel fixture.
 
 Pass --screenshots DIR to keep a PNG of each stage.
 """
@@ -239,20 +241,24 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     shown = page.evaluate("() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length")
     walk.check(shown == 10, f"typing did not filter the loaded cards at once: {shown} shown")
     walk.check(len(api.searches) == 0, f"the server was asked while typing: {api.searches}")
-    hits_drawn = page.evaluate("() => document.getElementById('server-hits').children.length")
-    walk.check(hits_drawn == 0, f"snippets were drawn while typing: {hits_drawn}")
+    hits_drawn = page.evaluate("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length")
+    walk.check(hits_drawn == 0, f"server rows were placed while typing: {hits_drawn}")
     walk.shot("after-typing-collapsed")
-    # The typing settles: one ask, and the one line at the foot of the list.
-    walk.until("() => document.getElementById('server-line') && document.getElementById('server-line').textContent.includes('more hits on the server')",
-               "the collapsed line never showed the server count")
-    line = page.text_content("#server-line") or ""
-    walk.check("50+" in line, f"the line does not say how many more hits: {line!r}")
+    # The typing settles: one ask, and the in-channel hits stand as cards in
+    # the timeline (the first page's fifty fresh hits, all below what the
+    # page loaded). No tap is needed and none is offered for them.
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit=\"card\"]').length === 50",
+               "the in-channel server hits did not stand as cards in the timeline")
+    line = (page.text_content("#server-line") or "").strip()
+    walk.check(line == "Server search details", f"the foot line is not the details line: {line!r}")
     walk.check(page.evaluate("() => document.getElementById('server-hits').children.length") == 0,
-               "snippets were drawn before the line was tapped")
+               "snippets were drawn at the foot")
+    walk.check(page.evaluate("() => document.getElementById('search-outside-chip').hidden"),
+               "the outside chip appeared with no hit outside this channel")
     sep = page.text_content("#search-screen-sep") or ""
     walk.check("On this screen" in sep, f"the loaded separator is missing: {sep!r}")
-    server_sep = page.text_content("#server-sep-label") or ""
-    walk.check("On the server, not loaded here" in server_sep, f"the server separator is wrong: {server_sep!r}")
+    walk.check(page.evaluate("() => document.getElementById('server-sep').hidden"),
+               "the retired bottom separator is showing")
     order = page.evaluate("""() => {
       const log = document.getElementById('discord-log');
       const section = document.getElementById('server-search');
@@ -260,10 +266,8 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     }""")
     walk.check(order, "the server section is not at the foot of the list")
     walk.shot("after-settled-line")
-    # Tap: the snippet view, on demand.
+    # Tap: the details view, on demand. The cards are already in the timeline.
     page.click("#server-line")
-    walk.until(f"() => document.getElementById('server-hits').children.length === 50",
-               "tapping the line did not draw the first page of snippets")
     walk.check(page.is_visible("#search-scope"), "the scope line is not shown expanded")
     scope = page.text_content("#search-scope") or ""
     walk.check("messages searched" in scope, f"the scope line lost its words: {scope!r}")
@@ -271,18 +275,20 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.check(page.is_visible("#search-further"), "Search further back is not offered expanded")
     walk.shot("after-expand")
     page.click("#server-more")
-    walk.until(f"() => document.getElementById('server-hits').children.length === {OLDER_HITS}",
-               "More did not bring the remaining hits")
-    # All channels: asked again over every channel, and the separator says so.
+    walk.until(f"() => document.querySelectorAll('#discord-log > li[data-server-hit=\"card\"]').length === {OLDER_HITS}",
+               "More did not bring the remaining hits as cards")
+    # All channels: asked again over every channel; this fixture has one
+    # channel, so still nothing stands outside it and no chip appears.
     before = len(api.searches)
     page.check("#search-all-channels")
-    walk.until(f"() => document.getElementById('server-sep-label').textContent.includes('including other channels')",
-               "the separator did not add 'including other channels'")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(api.searches) <= before:
+        page.wait_for_timeout(25)
     walk.check(len(api.searches) > before, "All channels did not ask the server again")
+    walk.check(page.evaluate("() => document.getElementById('search-outside-chip').hidden"),
+               "the outside chip appeared on a one-channel fixture")
     walk.shot("after-all-channels")
     page.uncheck("#search-all-channels")
-    walk.until("() => !document.getElementById('server-sep-label').textContent.includes('including other channels')",
-               "the separator kept 'including other channels'")
     # Search further back asks the server to gather, from inside the expanded view.
     page.click("#search-further")
     deadline = time.monotonic() + 10
@@ -338,7 +344,7 @@ def main() -> int:
                             walk_through(walk, keyboard, discuss=touch)
                             check(not errors, f"{name}: the page threw: {errors}")
                             context.close()
-                            report.append(f"{name} {width}x{height}: collapsed line, expand, More, All channels, further back all held")
+                            report.append(f"{name} {width}x{height}: in-channel cards, details line, More, All channels, further back all held")
                     finally:
                         api.stopping.set()
                         server.shutdown()

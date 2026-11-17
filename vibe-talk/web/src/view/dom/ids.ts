@@ -569,6 +569,7 @@ export interface ElementById {
   "search-further": HTMLButtonElement;
   "search-in-all": HTMLButtonElement;
   "search-older-note": HTMLParagraphElement;
+  "search-outside-chip": HTMLButtonElement;
   "search-scope": HTMLParagraphElement;
   "search-screen-sep": HTMLDivElement;
   "search-toggle": HTMLButtonElement;

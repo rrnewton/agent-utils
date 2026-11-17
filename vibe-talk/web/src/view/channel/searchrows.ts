@@ -285,6 +285,10 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
       const list = el(id);
       const counts = scope.includes(id);
       for (const row of list.children) {
+        // `#1786 vibe-talk-search-scope-server-hits`: a quoted server hit in the
+        // timeline was judged by the server's search, not this one; the filter
+        // neither hides it nor counts it among the loaded messages.
+        if (row.getAttribute("data-server-hit") === "quote") continue;
         const text = row.getAttribute("data-search");
         const shown = links && text !== null ? deps.showRowLinks(row) : deps.takeDownRowLinks(row);
         const said = !typed || (text !== null && (rowMatches(row, node, text) || (replyHits !== null &&
@@ -296,7 +300,9 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
           : inOpenedGap(row, opened));
         setClassWord(row as never, "search-hidden", !(hit || revealed));
         markSearchHits(row as SearchRow, hit && text !== null ? marking : []);
-        if (counts && text !== null && !row.hasAttribute("data-absorbed")) {
+        // `#1786`: rows the server search placed are not loaded messages, so
+        // neither the denominator nor the match count speaks for them.
+        if (counts && text !== null && !row.hasAttribute("data-absorbed") && !row.hasAttribute("data-server-hit")) {
           const weight = Math.max(1, idsOf(row).length);
           loaded += weight;
           const held = links ? deps.heldLinks(row) : [];
@@ -702,7 +708,8 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
   interface Seam { kind: string; words: string }
 
   function seamsFor(list: HTMLElement): { rows: SearchRow[]; wanted: Map<SearchRow, { above: Seam | null; below: Seam | null }>; runDays: Map<SearchRow, string>; today: number } {
-    const rows = ([...list.children] as SearchRow[]).filter((row) => isMessageRow(row) && !row.hasAttribute("data-card"));
+    // `#1786`: server-placed rows open no gaps of their own and count in none.
+    const rows = ([...list.children] as SearchRow[]).filter((row) => isMessageRow(row) && !row.hasAttribute("data-card") && !row.hasAttribute("data-server-hit"));
     const gaps = rowsChosen();
     const clock = dayClock();
     const plan = seamPlan(rows.map((row) => ({

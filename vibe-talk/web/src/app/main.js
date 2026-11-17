@@ -7023,12 +7023,13 @@ const olderWalks = mountOlderWalks({
   searchFurtherRunning, serverCopyOpen, gathering, repliesWalks, historyReadToStart,
   api, channelName, channelDirectoryChannels: () => channelDirectory.channels(),
   jumpToMessageLink, messageBody, markSearchHits, searchParsed, heldMessagesById,
+  serverCardNode: (hit) => discordNode(/** @type {any} */ ([hit])),
   keepingCardPlace, walkCursorOwed: timelineView.walkCursorOwed, loadOlder: timelineView.loadOlder,
   guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, preservingScroll, toPosition: (area, top) => scrollKeeping.toPosition(area, top), setStatus,
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
-const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
+const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleOutsideHits, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
 
 /**
  * The gaps a search opens in the cards and in an unpacked thread's block (web/src/view/channel
@@ -8988,6 +8989,7 @@ application.track(mountListControls({
   searchInAll: () => guardQuietly(searchInAll)(),
   serverMore: () => guardQuietly(() => serverSearchOwner.more())(),
   toggleServerHits: () => toggleServerHits(),
+  toggleOutsideHits: () => toggleOutsideHits(),
   searchAllChannels: (on) => chooseSearchAllChannels(on),
   searchFurther: () => guardQuietly(searchFurtherPressed)(),
   loadOlderTurns: () => guardQuietly(voiceTranscript().loadOlderTurns)(),

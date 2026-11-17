@@ -346,6 +346,15 @@
                 </svg>
               </button>
               <!--
+                `#1786 vibe-talk-search-scope-server-hits`. The server hits outside
+                the scope on screen (this thread, else this channel), counted on a
+                chip UNDER the search bar: in-scope hits stand in the timeline as
+                cards already, and a tap interleaves these in the timeline in
+                quoted style. Hidden while there are none; its words and its
+                showing are the server search's (`renderServerSearch`).
+              -->
+              <button id="search-outside-chip" class="chip search-outside-chip" type="button" aria-expanded="false" hidden>Show hits outside this thread</button>
+              <!--
                 `#212 link-filter`. Toggles that float UNDER the Links button while Links is on, and
                 only then, as the owner asked: "3 buttons to pop up under the link icon I just
                 clicked. They should be named PRs Commits Actions and be toggled on by default.
@@ -711,20 +720,19 @@
               <ol id="outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
               <!--
                 `#605`-`#608 server-side-search`, moved and collapsed by
-                `#1762 vibe-talk-server-hits-collapsed-line`. At the FOOT of the
-                list, below the newest loaded message: where the owner said it
-                would be bearable, pinned to the bottom and mostly off screen
-                (the #1734 search landing leaves it just under the fold), instead
-                of at the head where every answer reflowed the cards being read.
-                Collapsed, it is ONE tappable line — "N more hits on the server"
-                — under its separator; the scope line, All channels, the hits
-                alone with their way to the channel, More and Search further
-                back wait inside #server-detail until that tap, and the snippets
-                are fetched and drawn only then. Nothing here is drawn while
-                the reader types.
+                `#1762 vibe-talk-server-hits-collapsed-line`, scoped by
+                `#1786 vibe-talk-search-scope-server-hits`. What stands here at
+                the FOOT of the list is only the search's details line: the hits
+                themselves stand in the timeline (in-scope as cards, outside
+                behind #search-outside-chip under the search bar), so the old
+                separator over foot snippets is retired and #server-sep is kept
+                hidden. Collapsed, this is ONE tappable line; the scope line,
+                All channels, More and Search further back wait inside
+                #server-detail until that tap. Nothing here is drawn while the
+                reader types.
               -->
               <section id="server-search" class="server-search" aria-label="The server's copy, searched" hidden>
-                <div id="server-sep" class="search-sep" role="separator"><span id="server-sep-label">On the server, not loaded here</span></div>
+                <div id="server-sep" class="search-sep" role="separator" hidden><span id="server-sep-label">On the server, not loaded here</span></div>
                 <button id="server-line" class="server-line" type="button" aria-expanded="false" aria-controls="server-detail">Search the server</button>
                 <div id="server-detail" hidden>
                   <p id="search-scope" class="hint search-scope"></p>

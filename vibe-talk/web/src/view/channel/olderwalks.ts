@@ -111,6 +111,8 @@ export interface OlderWalksDependencies {
   jumpToMessageLink(ref: unknown): void;
   messageBody(message: Message): Node;
   heldMessagesById(): Map<string, Message>;
+  /** `#1786 vibe-talk-search-scope-server-hits`. Draw one in-scope server hit as a normal message card. */
+  serverCardNode?(hit: Message): HTMLElement;
   markSearchHits(row: Element, terms: unknown): void;
   searchParsed(query: string): { terms: string[] };
   gathering: { stop(): void; start(channel: string): Promise<void>; state(): { channel: string; failed: string; state: { reached_ms?: number; oldest_ms?: number; eta_s?: number; complete?: boolean; held_reason?: string } | null } };
@@ -159,6 +161,8 @@ export interface OlderWalks {
   channelViewWords(): string;
   oldestLoadedMs(): number | null;
   toggleServerHits(): void;
+  /** `#1786`. The chip under the search bar tapped: show or put away the outside hits. */
+  toggleOutsideHits(): void;
   dispose(): void;
 }
 
@@ -711,12 +715,25 @@ function serverSearchKeyNow() {
  * the search in the left column, and when All channels is ticked. Cheap when nothing changed.
  */
 
+/** The scope the placed server hits were last drawn for (`#1786`). */
+let placedScopeKey = "";
+
 function scheduleServerSearch() {
   const key = serverSearchKeyNow();
   // A gathering asked for elsewhere, or with the search closed, is no longer watched here; the
   // server's own bump clears itself once the walk reaches the channel's beginning.
   if (gathering.state().channel !== "" && (key === "" || !searchFurtherRunning())) stopSearchFurther();
   serverSearchOwner.schedule(key, serverCopyOpen());
+  // `#1786`: the same search in a new scope (another thread, another channel
+  // view) partitions the same hits differently, and the view's redraw took
+  // the placed rows away: draw them again for this scope. Scope changes are
+  // the reader's acts, never keystrokes, so this stays off the typing path.
+  const scope = key === "" ? "" : `${selection().view}:${selection().threadId || ""}:` +
+    `${String(selectedChannelId() || "")}:${serverSearchOwner.allChannels()}`;
+  if (scope !== placedScopeKey) {
+    placedScopeKey = scope;
+    if (scope !== "") renderServerSearch();
+  }
 }
 
 /** This browser's time zone, which the server resolves `before:` and `after:` in. */
@@ -795,7 +812,12 @@ function serverHitNode(hit: Message): HTMLElement {
   meta.append(when);
   if (hit.thread && hit.thread.is_root === false) {
     const reply = document.createElement("span");
-    reply.textContent = "in a thread";
+    // `#1786 vibe-talk-search-scope-server-hits`. The thread's slug when known:
+    // the filed `display_name` of its summary, else the root's own copy of it.
+    const threadId = threadOf(hit);
+    const summary = threadId ? channelStore.current().threads.find((one) => String(one.id) === threadId) : undefined;
+    const slug = String((summary && summary.display_name) || hit.thread.display_name || "").trim();
+    reply.textContent = slug ? `in thread ${slug}` : "in a thread";
     meta.append(reply);
   }
   const show = document.createElement("button");
@@ -830,6 +852,102 @@ function serverFreshHits(): Message[] {
   return serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
 }
 
+// `#1786 vibe-talk-search-scope-server-hits`. The scope on screen: this thread in
+// a thread view, else this channel. A fresh hit is in scope when it belongs to
+// it; in-scope hits draw as normal cards in the timeline (a sparse simulation
+// of loading further back: just those messages, placed by time), and the rest
+// wait behind the chip under the search bar as quoted hits.
+
+/** Whether `hit` belongs to the scope on screen (this thread, else this channel). */
+function hitInScope(hit: Message): boolean {
+  if (String(hit.channel_id) !== String(selectedChannelId() || "")) return false;
+  if (selection().view === "thread") {
+    const thread = selection().threadId;
+    return thread !== null && thread !== undefined && threadOf(hit) === String(thread);
+  }
+  return true;
+}
+
+const byHitTime = (a: Message, b: Message): number =>
+  (Date.parse(a.timestamp) || 0) - (Date.parse(b.timestamp) || 0);
+
+/** The fresh hits in this scope, oldest first: the cards the timeline gains. */
+function serverInScopeHits(): Message[] {
+  return serverFreshHits().filter(hitInScope).sort(byHitTime);
+}
+
+/** The fresh hits outside this scope, oldest first: the chip's quoted hits. */
+function serverOutScopeHits(): Message[] {
+  return serverFreshHits().filter((hit) => !hitInScope(hit)).sort(byHitTime);
+}
+
+/** The attribute marking a row the server search placed in the timeline. */
+const SERVER_HIT_MARK = "data-server-hit";
+
+/** Take every row the server search placed out of the timeline again. */
+function clearServerHits(): void {
+  const list = el("discord-log");
+  for (const node of [...list.children]) if (node.hasAttribute(SERVER_HIT_MARK)) list.removeChild(node);
+  if (el("server-hits").children.length > 0) el("server-hits").replaceChildren();
+}
+
+/** Whether the chip under the search bar shows the outside hits (`#1786`). */
+let outsideShown = false;
+/** The query identity the outside view was opened for; a new one closes it. */
+let outsideShownFor = "";
+
+/**
+ * Place the server's hits in the timeline, chronologically among the loaded
+ * rows: in-scope hits as normal cards, and — while the chip under the search
+ * bar is on — the outside hits as quoted rows between them. Rebuilt on every
+ * server render, so a hit the page has since loaded for real goes (it is no
+ * longer fresh) and its real row stands instead.
+ */
+function placeServerHits(): void {
+  clearServerHits();
+  const placed: { at: number; node: HTMLElement }[] = [];
+  for (const hit of serverInScopeHits()) {
+    const node = deps.serverCardNode ? deps.serverCardNode(hit) : serverHitNode(hit);
+    node.setAttribute(SERVER_HIT_MARK, "card");
+    placed.push({ at: Date.parse(hit.timestamp) || 0, node });
+  }
+  if (outsideShown) {
+    for (const hit of serverOutScopeHits()) {
+      const node = serverHitNode(hit);
+      node.setAttribute(SERVER_HIT_MARK, "quote");
+      placed.push({ at: Date.parse(hit.timestamp) || 0, node });
+    }
+  }
+  placed.sort((a, b) => a.at - b.at);
+  const list = el("discord-log");
+  for (const { at, node } of placed) {
+    let before: Element | null = null;
+    for (const row of list.children) {
+      if (row.hasAttribute(SERVER_HIT_MARK) || !isMessageRow(row)) continue;
+      const sent = rowSentMs(row);
+      if (Number.isFinite(sent) && sent > at) {
+        before = row;
+        break;
+      }
+    }
+    list.insertBefore(node, before);
+  }
+}
+
+/** What the chip under the search bar says, from the answer as it stands. */
+function outsideChipWords(count: number): string {
+  const scope = selection().view === "thread" ? "outside this thread" : "in other channels";
+  const hits = `${count} hit${count === 1 ? "" : "s"}`;
+  return outsideShown ? `Hide ${hits} ${scope}` : `Show ${hits} ${scope}`;
+}
+
+/** The chip tapped: interleave the outside hits in the timeline, or put them away. */
+function toggleOutsideHits(): void {
+  outsideShown = !outsideShown;
+  if (outsideShown) outsideShownFor = serverSearchNow().key;
+  renderServerSearch();
+}
+
 /** What the one tappable line says, from the answer as it stands. */
 function serverLineWords(): string {
   const serverSearch = serverSearchNow();
@@ -838,8 +956,9 @@ function serverLineWords(): string {
   if (serverSearch.scopes.length === 0) return "Search the server";
   const fresh = serverFreshHits();
   if (fresh.length === 0) return "No more hits on the server";
-  const more = serverSearch.resume !== null ? "+" : "";
-  return `${fresh.length}${more} more hit${fresh.length === 1 && !more ? "" : "s"} on the server`;
+  // `#1786`: the hits themselves stand in the timeline now (in-scope as cards,
+  // outside behind the chip), so the foot line only opens the search's details.
+  return "Server search details";
 }
 
 /** The line tapped: draw the snippets on demand, or put them away again. */
@@ -861,11 +980,13 @@ function toggleServerHits(): void {
 }
 
 /**
- * Draw the server's search as it stands (`#1762 vibe-talk-server-hits-collapsed-line`):
- * one tappable line at the foot of the list, and only once it is tapped the scope
- * line, All channels, the hits this page does not already hold, More and Search
- * further back. While it stays collapsed this touches only the line's words, so
- * an answer landing can never rebuild the snippet list under the reader.
+ * Draw the server's search as it stands (`#1762 vibe-talk-server-hits-collapsed-line`,
+ * scoped by `#1786 vibe-talk-search-scope-server-hits`): the fresh hits are placed
+ * in the timeline — in-scope as cards, outside as quoted rows while the chip under
+ * the search bar is on — the chip says how many wait outside, and the foot keeps
+ * one tappable line opening the scope line, All channels, More and Search further
+ * back. While typing nothing here runs at all (the schedule is a no-op for the
+ * same search), so an answer landing is the only moment the timeline gains rows.
  */
 
 function renderServerSearch() {
@@ -875,11 +996,15 @@ function renderServerSearch() {
   if (section.hidden === wanted) section.hidden = !wanted;
   if (!wanted) {
     serverExpanded = false;
-    if (el("server-hits").children.length > 0) el("server-hits").replaceChildren();
+    outsideShown = false;
+    clearServerHits();
+    const chipOff = el("search-outside-chip") as HTMLButtonElement;
+    if (!chipOff.hidden) chipOff.hidden = true;
     return;
   }
-  // A typed query is a new search: its snippets wait for a fresh tap. Widening
-  // to every channel (the key's first part) keeps the view the reader opened.
+  // A typed query is a new search: its details and outside hits wait for a
+  // fresh tap. Widening to every channel (the key's first part) keeps the
+  // views the reader opened.
   const identityOf = (key: string): string => {
     try {
       const parsed = JSON.parse(key) as unknown;
@@ -890,23 +1015,34 @@ function renderServerSearch() {
   };
   if (serverExpanded && serverExpandedFor !== "" &&
     identityOf(serverSearch.key) !== identityOf(serverExpandedFor)) serverExpanded = false;
+  if (outsideShown && outsideShownFor !== "" &&
+    identityOf(serverSearch.key) !== identityOf(outsideShownFor)) outsideShown = false;
   const all = serverSearchOwner.allChannels();
-  setTextIfChanged(el("server-sep-label"),
-    all ? "On the server, not loaded here — including other channels" : "On the server, not loaded here");
+  // `#1786`: the bottom separator is retired — in-scope hits stand in the
+  // timeline as cards, and outside hits behind the chip under the search bar.
+  const sep = el("server-sep");
+  if (!sep.hidden) sep.hidden = true;
   const line = el("server-line") as HTMLButtonElement;
   setTextIfChanged(line, serverLineWords());
   const expanded = serverExpanded ? "true" : "false";
   if (line.getAttribute("aria-expanded") !== expanded) line.setAttribute("aria-expanded", expanded);
   const detail = el("server-detail");
   if (detail.hidden === serverExpanded) detail.hidden = !serverExpanded;
+  // The chip under the search bar: the outside hits' count and way in.
+  const outside = serverOutScopeHits();
+  const chip = el("search-outside-chip") as HTMLButtonElement;
+  const showChip = outside.length > 0;
+  if (chip.hidden === showChip) chip.hidden = !showChip;
+  if (showChip) {
+    setTextIfChanged(chip, outsideChipWords(outside.length));
+    const chipOpen = outsideShown ? "true" : "false";
+    if (chip.getAttribute("aria-expanded") !== chipOpen) chip.setAttribute("aria-expanded", chipOpen);
+  }
+  placeServerHits();
   if (!serverExpanded) return;
   setTextIfChanged(el("search-scope"), searchScopeLine());
   const checkbox = el("search-all-channels") as HTMLInputElement;
   if (checkbox.checked !== all) checkbox.checked = all;
-  const fresh = serverFreshHits();
-  const drawn = [...el("server-hits").children].map((li) => `${li.getAttribute("data-channel")} ${li.getAttribute("data-id")}`);
-  const want = fresh.map((hit) => `${hit.channel_id} ${hit.id}`);
-  if (drawn.join("\n") !== want.join("\n")) el("server-hits").replaceChildren(...fresh.map(serverHitNode));
   const more = serverSearch.resume !== null && !serverSearch.loading && !serverSearch.failed;
   if (el("server-more").hidden === more) el("server-more").hidden = !more;
   renderSearchFurther();
@@ -1218,7 +1354,7 @@ function renderOlderControl() {
   return {
     renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField,
     searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk,
-    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
+    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleOutsideHits, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
     dispose() { disposed = true; },
   };
 }
