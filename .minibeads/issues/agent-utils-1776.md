@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-registration-repo-probe-walks-up: a non-git directory inside another git tree is not a repository'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-lockedreg
 labels:
 - wrkslots
 created_at: 2026-11-17T16:24:28.331876753+00:00
-updated_at: 2026-11-17T16:24:28.331876753+00:00
+updated_at: 2026-11-17T17:07:35.326725976+00:00
+closed_at: 2026-11-17T17:07:35.326725856+00:00
 ---
 
 # Description
@@ -21,3 +22,9 @@ Probe with git rev-parse --show-toplevel and require the resolved top-level to e
 # Acceptance Criteria
 
 A non-git directory inside a git tree is not returned as a registering repository, and the parent repository is not pruned or listed for it; real repositories (including the recorded one) still enumerate. Deterministic tests fail before and pass after.
+
+# Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as `7c3e86e2004e174aa6407affa6ae8a58f9a8016d` (gate pass on `8feb734d`). `_is_own_git_repository` recognises a bare repository when `--is-bare-repository` is true and `--absolute-git-dir` resolves to the candidate itself, and any other repository when `--show-toplevel` resolves to the candidate; a non-git directory inside a work tree or inside a bare repository is rejected, so its parent is never pruned or listed for it. The `getattr` test-double branch from #1766 is replaced with the explicit `probe_git` parameter, threaded through `_validate_subvolume_delete_first` as `registration_probe`. Tests cover the bare, inside-bare, inside-worktree, and real-repository cases.
