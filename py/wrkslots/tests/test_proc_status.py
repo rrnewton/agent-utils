@@ -94,6 +94,31 @@ def test_global_process_snapshot_accepts_opaque_comm_bytes(tmp_path: Path) -> No
     )
 
 
+_REAL_PIDFD_OPEN = os.pidfd_open
+
+
+def _close_and_await_exit(child: subprocess.Popen[bytes]) -> None:
+    """Close a waiting child's stdin and wait until it has exited.
+
+    The wait is on the child's pidfd becoming readable (the exit
+    condition), never on a wall-clock budget: under load the child
+    may take arbitrarily long to notice EOF and exit, and a test
+    that proceeds on a timer races that exit. The child is left
+    unreaped (a zombie) so the checker's own pidfd and generation
+    reads still observe the exact generation.
+    """
+
+    assert child.stdin is not None
+    child.stdin.close()
+    descriptor = _REAL_PIDFD_OPEN(child.pid)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            assert selector.select(5), "owned child did not exit after stdin closed"
+    finally:
+        os.close(descriptor)
+
+
 @contextlib.contextmanager
 def waiting_child(cwd: Path | None = None) -> Iterator[subprocess.Popen[bytes]]:
     child = subprocess.Popen(
@@ -369,9 +394,10 @@ def test_reclaim_restarts_lsof_and_proc_after_exact_lsof_generation_exits(
             if path == Path("/proc") / str(child.pid):
                 events.append("stat")
                 generation_reads += 1
-                if generation_reads == 2:
-                    assert child.stdin is not None
-                    child.stdin.close()
+                if generation_reads == 1:
+                    # Exit before the recheck budget starts, so its
+                    # own pidfd wait never races the exit (#1438).
+                    _close_and_await_exit(child)
             return observed
 
         monkeypatch.setattr(
@@ -421,9 +447,8 @@ def test_reclaim_restarts_proc_after_exact_proc_generation_exits(
             nonlocal generation_reads
             assert path == pid_dir
             generation_reads += 1
-            if generation_reads == 2:
-                assert child.stdin is not None
-                child.stdin.close()
+            if generation_reads == 1:
+                _close_and_await_exit(child)
             return real_generation
 
         def transient_use(_pid_dir: Path, _slot: Path, **_kw: object) -> list[str]:
@@ -460,6 +485,7 @@ def test_reclaim_recheck_catches_replacement_without_signaling_any_holder(
         waiting_child(cwd=slot) as replacement,
         waiting_child() as unrelated,
     ):
+        events: list[str] = []
         calls = scripted_lsof(
             monkeypatch,
             slot,
@@ -469,6 +495,7 @@ def test_reclaim_recheck_catches_replacement_without_signaling_any_holder(
                 lsof_holder(replacement.pid, slot),
                 lsof_holder(replacement.pid, slot),
             ],
+            events=events,
         )
         real_read_process_stat = cli._read_process_stat
         first_reads = 0
@@ -480,9 +507,11 @@ def test_reclaim_recheck_catches_replacement_without_signaling_any_holder(
             observed = real_read_process_stat(path)
             if path == Path("/proc") / str(first.pid):
                 first_reads += 1
-                if first_reads == 2:
-                    assert first.stdin is not None
-                    first.stdin.close()
+                if first_reads == 1:
+                    # Exit before the 0.05 s recheck budget starts,
+                    # so its pidfd wait never races the exit (#1438).
+                    _close_and_await_exit(first)
+                    events.append("first-exit")
             return observed
 
         monkeypatch.setattr(
@@ -498,7 +527,15 @@ def test_reclaim_recheck_catches_replacement_without_signaling_any_holder(
             )
 
         assert f"live process {replacement.pid} uses slot {slot}" in str(refused.value)
-        assert len(calls) == 4
+        # Order (#1438): the census saw the first holder, it exited,
+        # the recheck re-observed, and only then did the next census
+        # find the replacement. The replacement's own recheck runs
+        # only while the shared deadline lasts, so under load the
+        # fourth call may not happen; the order up to the find is
+        # exact either way.
+        assert events[:4] == ["lsof", "first-exit", "lsof", "lsof"]
+        assert events[4:] in ([], ["lsof"])
+        assert len(calls) == len(events) - 1
         assert budget.remaining_seconds == 0
         assert first.poll() == 0
         assert replacement.poll() is None
@@ -965,9 +1002,8 @@ def test_reclaim_fallback_exit_restarts_the_original_proc_census(
             observed = real_read_process_stat(path)
             if path == Path("/proc") / str(child.pid):
                 generation_reads += 1
-                if generation_reads == 2:
-                    assert child.stdin is not None
-                    child.stdin.close()
+                if generation_reads == 1:
+                    _close_and_await_exit(child)
             return observed
 
         def process_uids(_pid_dir: Path) -> tuple[int, int, int, int]:
