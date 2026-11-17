@@ -71,3 +71,23 @@ Approve (a) the per-kind table above (esp. handoff accounting = refuse, not
 ignore), (b) floor/ceiling names + `init --repair` as sole raiser, (c) typed
 skew refusal as a distinct exit/message from corruption. Then coding starts:
 writer gate first (stops the bleeding), reader tolerance second, fixtures last.
+
+## Review outcome and final writer table
+
+Approved with changes: typed skew refusal; decision-relevance decided per
+command at the point of use (load/replay keep every record raw, warn once;
+only remove/finish of the affected slot refuses); writer ceiling never
+satisfied by a less safe form. Permanent vs transient: active-record and
+event-log fields are permanent (replay revalidates them); journal-only
+fields are transient (journal copies inside progress events are not
+deep-validated).
+
+| New field (since the old pin) | Where | Under the ceiling |
+|---|---|---|
+| `handoff.ignored_files` / `ignored_archives` | active record + events (permanent) | finish refuses; accounting is never dropped |
+| `handoff.ignored_summary` (+ manifest) | active record (permanent) | finish refuses; never falls back to the unbounded per-file list |
+| `targets[].fs_id` (seal journals) | journal only (transient) | omitted; anchor fallback is equally safe |
+| `checkouts[].containing_remote_refs_sidecar` | finish journal record copy (transient) | list stays inline, the equally checked older form |
+
+Visibility: `wrkslots doctor` reports `reader_floor`, `writer_ceiling`,
+and each record carrying fields newer than the floor.

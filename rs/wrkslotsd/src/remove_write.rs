@@ -4015,6 +4015,9 @@ fn prepare_remove(
         })
         .cloned()
         .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;
+    // Point-of-use skew check (#1788): refuse before salvage work.
+    let parsed = crate::active_state::record_from_obj(&record, "active record")?;
+    crate::active_state::assert_record_actable(&parsed, "remove")?;
     let generation = record
         .get("generation")
         .and_then(Value::as_i64)

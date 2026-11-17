@@ -68,6 +68,8 @@ pub(crate) struct CheckoutRec {
     pub(crate) remote: String,
     pub(crate) landed_ref: String,
     pub(crate) vcs: String,
+    /// Keys a newer writer added, preserved via the record's raw copy (#1788).
+    pub(crate) unknown_fields: Vec<String>,
 }
 
 pub(crate) struct ImportRec {
@@ -95,6 +97,8 @@ pub(crate) struct RecordRec {
     pub(crate) checkouts: Vec<CheckoutRec>,
     import_source: Option<ImportRec>,
     pub(crate) normalized: Value,
+    /// Unknown keys at record, handoff and checkout level (#1788).
+    pub(crate) unknown_fields: Vec<String>,
 }
 
 pub(crate) fn as_mapping<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>> {
@@ -158,6 +162,50 @@ pub(crate) fn exact_keys(
     Err(format!(
         "{label} has invalid fields: {}",
         details.join("; ")
+    ))
+}
+
+/// Like `exact_keys`, but unknown keys are collected, not refused (#1788).
+/// Missing required keys still refuse as corruption. The caller keeps the
+/// raw record, so collected keys survive any rewrite verbatim.
+pub(crate) fn tolerant_keys(
+    raw: &Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<Vec<String>> {
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|key| !raw.contains_key(**key))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{label} has invalid fields: missing {}",
+            missing.join(", ")
+        ));
+    }
+    let mut unknown: Vec<String> = raw
+        .keys()
+        .filter(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    Ok(unknown)
+}
+
+/// The typed newer-writer refusal for acting on one slot (#1788).
+pub(crate) fn assert_record_actable(record: &RecordRec, action: &str) -> Result<()> {
+    if record.unknown_fields.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "NEWER WRITER: slot {} carries field(s) {} written by a newer wrkslots; \
+         this build cannot enforce them, so {action} of slot {} refuses. Upgrade \
+         wrkslots to act on this slot; read-only commands over other slots are unaffected",
+        record.slot,
+        record.unknown_fields.join(", "),
+        record.slot
     ))
 }
 
@@ -265,12 +313,12 @@ pub(crate) fn identity_from_obj(value: &Value, label: &str) -> Result<Option<Ide
     Ok(Some(identity))
 }
 
-fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
+fn handoff_from_obj(value: &Value, label: &str) -> Result<Vec<String>> {
     if value.is_null() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let raw = as_mapping(value, label)?;
-    exact_keys(raw, HANDOFF_REQUIRED, HANDOFF_OPTIONAL, label)?;
+    let unknown = tolerant_keys(raw, HANDOFF_REQUIRED, HANDOFF_OPTIONAL, label)?;
     if let Some(discarded) = raw.get("discarded_unaccounted") {
         for (index, item) in as_list(discarded, &format!("{label}.discarded_unaccounted"))?
             .iter()
@@ -375,12 +423,12 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
             "{label} requires validation evidence and an exact continuation"
         ));
     }
-    Ok(())
+    Ok(unknown)
 }
 
 pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRec> {
     let raw = as_mapping(value, label)?;
-    exact_keys(raw, CHECKOUT_REQUIRED, CHECKOUT_OPTIONAL, label)?;
+    let unknown_fields = tolerant_keys(raw, CHECKOUT_REQUIRED, CHECKOUT_OPTIONAL, label)?;
     let name = as_str(&raw["name"], &format!("{label}.name"))?.to_owned();
     let path = as_str(&raw["path"], &format!("{label}.path"))?.to_owned();
     let repository = as_str(&raw["repository"], &format!("{label}.repository"))?.to_owned();
@@ -435,6 +483,7 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
             remote,
             landed_ref,
             vcs,
+            unknown_fields,
         });
     }
     validate_remote(&remote)?;
@@ -458,6 +507,7 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
         remote,
         landed_ref,
         vcs,
+        unknown_fields,
     })
 }
 
@@ -698,7 +748,7 @@ fn assert_import_matches(record: &RecordRec, source: &ImportRec, label: &str) ->
 
 pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
     let raw = as_mapping(value, label)?;
-    exact_keys(raw, ACTIVE_RECORD_REQUIRED, ACTIVE_RECORD_OPTIONAL, label)?;
+    let mut unknown_fields = tolerant_keys(raw, ACTIVE_RECORD_REQUIRED, ACTIVE_RECORD_OPTIONAL, label)?;
     if let Some(value) = raw.get("harness_checkout_reason") {
         if !matches!(value, Value::Null) {
             let reason = as_str(value, &format!("{label}.harness_checkout_reason"))?;
@@ -748,7 +798,12 @@ pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
         Value::Null => None,
         value => Some(as_str(value, &format!("{label}.coordinator_recovery_note"))?.to_owned()),
     };
-    handoff_from_obj(&raw["handoff"], &format!("{label}.handoff"))?;
+    unknown_fields.extend(handoff_from_obj(&raw["handoff"], &format!("{label}.handoff"))?);
+    for checkout in &checkouts {
+        unknown_fields.extend(checkout.unknown_fields.iter().cloned());
+    }
+    unknown_fields.sort();
+    unknown_fields.dedup();
     let layout = match raw.get("layout") {
         None => None,
         Some(value) => Some(validate_layout(as_str(value, &format!("{label}.layout"))?)?),
@@ -826,6 +881,7 @@ pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
         checkouts,
         import_source,
         normalized: Value::Object(normalized),
+        unknown_fields,
     };
     if let Some(source) = &record.import_source {
         assert_import_matches(&record, source, label)?;
@@ -1418,9 +1474,11 @@ mod eden_mount_tests {
                 remote: "eden".to_owned(),
                 landed_ref: "refs/remotes/eden/main".to_owned(),
                 vcs: "eden".to_owned(),
+                unknown_fields: Vec::new(),
             }],
             import_source: None,
             normalized: Value::Null,
+            unknown_fields: Vec::new(),
         }
     }
 

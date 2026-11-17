@@ -165,12 +165,7 @@ pub(crate) fn validate_active_record(
     label: &str,
 ) -> Result<ValidatedActiveRecord, ObserverError> {
     let record = object(value, label)?;
-    exact_keys_optional(
-        record,
-        ACTIVE_RECORD_REQUIRED,
-        ACTIVE_RECORD_OPTIONAL,
-        label,
-    )?;
+    tolerant_keys_optional(record, ACTIVE_RECORD_REQUIRED, ACTIVE_RECORD_OPTIONAL, label)?;
     let slot = named_string(&record["slot"], &format!("{label}.slot"))?;
     let agent = named_string(&record["agent"], &format!("{label}.agent"))?;
     nonempty_string(&record["task"], &format!("{label}.task"))?;
@@ -416,7 +411,7 @@ fn validate_handoff(value: &Value, label: &str) -> Result<(), ObserverError> {
         return Ok(());
     }
     let handoff = object(value, label)?;
-    exact_keys_optional(handoff, HANDOFF_REQUIRED, HANDOFF_OPTIONAL, label)?;
+    tolerant_keys_optional(handoff, HANDOFF_REQUIRED, HANDOFF_OPTIONAL, label)?;
     if let Some(discarded) = handoff.get("discarded_unaccounted") {
         for (index, item) in array(discarded, &format!("{label}.discarded_unaccounted"))?
             .iter()
@@ -520,7 +515,7 @@ fn validate_checkouts(value: &Value, parent: &str) -> Result<Vec<Checkout>, Obse
     for (index, value) in values.iter().enumerate() {
         let label = format!("{parent}.checkouts[{index}]");
         let checkout = object(value, &label)?;
-        exact_keys_optional(checkout, CHECKOUT_REQUIRED, CHECKOUT_OPTIONAL, &label)?;
+        tolerant_keys_optional(checkout, CHECKOUT_REQUIRED, CHECKOUT_OPTIONAL, &label)?;
         let name = named_string(&checkout["name"], &format!("{label}.name"))?;
         if !names.insert(name.clone()) {
             return Err(invalid(format!("{parent} has duplicate checkout names")));
@@ -1251,6 +1246,26 @@ pub(crate) fn exact_keys_optional(
     Ok(())
 }
 
+/// Unknown keys are tolerated at load (#1788); missing keys still refuse.
+/// Acting on the record is where unknown keys refuse, per command.
+pub(crate) fn tolerant_keys_optional(
+    value: &Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<(), ObserverError> {
+    let actual = value.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let required = required.iter().copied().collect::<BTreeSet<_>>();
+    let missing = required.difference(&actual).copied().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(invalid(format!(
+            "{label} has invalid fields: missing {missing:?}"
+        )));
+    }
+    let _ = optional;
+    Ok(())
+}
+
 fn object<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>, ObserverError> {
     value
         .as_object()
@@ -1387,9 +1402,13 @@ mod tests {
     }
 
     #[test]
-    fn active_record_still_refuses_unknown_checkout_fields() {
+    fn active_record_tolerates_unknown_checkout_fields_at_load() {
+        // Unknown keys are kept at load (#1788); acting on the slot is
+        // where they refuse, not history load.
         let value = record(json!({"surprise": 1}));
-        assert!(validate_active_record(&value, "node-a", "record").is_err());
+        assert!(validate_active_record(&value, "node-a", "record").is_ok());
+        let parsed = crate::active_state::record_from_obj(&value, "record").expect("load keeps");
+        assert!(crate::active_state::assert_record_actable(&parsed, "remove").is_err());
     }
 
     fn record_with_handoff(handoff: Value) -> Value {
@@ -1413,6 +1432,25 @@ mod tests {
             "discarded_unaccounted": ["a".repeat(40)],
         }));
         validate_active_record(&value, "node-a", "record").expect("discarded accepted");
+    }
+
+    #[test]
+    fn active_record_tolerates_newer_handoff_summary_at_load() {
+        // A summary field in the active record is permanent history:
+        // load keeps it, remove of that slot refuses (#1788).
+        let value = record_with_handoff(json!({
+            "recorded_at": "2026-11-07T00:00:00Z",
+            "validation": ["checked"],
+            "limitations": [],
+            "continuation": "continue",
+            "ignored_summary": {"count": 1, "bytes": 3},
+        }));
+        assert!(validate_active_record(&value, "node-a", "record").is_ok());
+        let parsed = crate::active_state::record_from_obj(&value, "record").expect("load keeps");
+        assert!(parsed.unknown_fields.iter().any(|k| k == "ignored_summary"));
+        let err = crate::active_state::assert_record_actable(&parsed, "remove")
+            .expect_err("acting refuses");
+        assert!(err.contains("NEWER WRITER"), "{err}");
     }
 
     #[test]
@@ -1440,8 +1478,9 @@ mod tests {
         let body = &source[start..];
         let body = &body[..body.find("\ndef ").unwrap_or(body.len())];
         let call = body
-            .find("_exact_keys(")
-            .unwrap_or_else(|| panic!("{function} has no _exact_keys call"));
+            .find("_skew_unknown_fields(")
+            .or_else(|| body.find("_exact_keys("))
+            .unwrap_or_else(|| panic!("{function} has no key-set call"));
         let args = &body[call..];
         let args = &args[..args.find("\n    )").unwrap_or(args.len())];
         let mut parts: Vec<&str> = Vec::new();
@@ -1460,7 +1499,11 @@ mod tests {
         }
         parts.push(&args[part_start..]);
         let resolve = |part: &str| -> BTreeSet<String> {
-            let part = part.trim().trim_start_matches("_exact_keys(").trim();
+            let part = part
+                .trim()
+                .trim_start_matches("_skew_unknown_fields(")
+                .trim_start_matches("_exact_keys(")
+                .trim();
             if part == "set()" {
                 return BTreeSet::new();
             }
@@ -1531,8 +1574,9 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .insert("surprise".to_string(), json!(1));
-        assert!(validate_active_record(&unknown, "node-a", "record").is_err());
-        assert!(crate::active_state::record_from_obj(&unknown, "record").is_err());
+        // Load tolerates and preserves (#1788); only acting refuses.
+        assert!(validate_active_record(&unknown, "node-a", "record").is_ok());
+        assert!(crate::active_state::record_from_obj(&unknown, "record").is_ok());
         let mut missing = base.clone();
         missing.as_object_mut().expect("object").remove("task");
         assert!(validate_active_record(&missing, "node-a", "record").is_err());

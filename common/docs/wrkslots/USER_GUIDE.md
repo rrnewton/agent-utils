@@ -177,6 +177,22 @@ later. From then on, an additive key needs only an `ignorable_keys` entry, and a
 needs a `min_wrkslots_version` raised to the release that introduced it. `init --repair` keeps
 listed keys it does not know as they are.
 
+State records follow the same idea one level down. Loading or replaying history keeps every
+record, preserving keys a newer writer added (with one warning); read-only commands proceed.
+Only `remove` or `finish` of the slot whose record carries such keys refuses, with a
+`NEWER WRITER` message naming the slot and the fields — never `invalid fields`, which means
+corruption. Fields in the active record and the event log are permanent (replay revalidates
+them forever); fields only inside a journal file are transient (they matter only while that
+journal exists, and journal copies embedded in progress events are not deep-validated). Two
+project keys gate what writers may emit: `reader_floor` (oldest record schema level readers
+must keep reading, default 1) and `writer_ceiling` (highest level writers may emit). Raise
+them together, deliberately, with `init --repair`, once every reader understands the new
+level. A writer never satisfies the ceiling with a less safe older form: handoff ignored-file
+accounting above the ceiling refuses the finish, the seal filesystem id is simply omitted
+(readers fall back to the configured anchor, as older journals always did), and a finish
+journal keeps its containment list inline instead of referencing a sidecar file.
+`wrkslots doctor` reports the floor, the ceiling, and every record carrying newer fields.
+
 ### The machine name
 
 State files are sharded by machine (`ACTIVE.<machine>.json`). `init` writes the short host name

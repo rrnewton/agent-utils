@@ -622,6 +622,8 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "worktrees_image",
         "min_wrkslots_version",
         "ignorable_keys",
+        "reader_floor",
+        "writer_ceiling",
     }
 )
 #: A wrkslots version as min_wrkslots_version names it: MAJOR.MINOR.PATCH.
@@ -663,6 +665,17 @@ CONFIG_KEY_DOCS: dict[str, str] = {
         "Optional keys a wrkslots that does not know them may ignore, with a warning, instead "
         "of refusing the file. List a new key here when it only adds behaviour; a key that is "
         "not listed (a typo, for example) still refuses."
+    ),
+    "reader_floor": (
+        "Oldest record schema level (integer) this project's readers must keep reading. "
+        "Writers never emit fields above writer_ceiling, and never fall back to a less "
+        "safe older format to satisfy the ceiling: an operation that cannot be written "
+        "equally safely at the ceiling refuses instead. Absent means level 1."
+    ),
+    "writer_ceiling": (
+        "Highest record schema level (integer) writers in this project may emit. Raise "
+        "it (with reader_floor) only deliberately, via init --repair, once every reader "
+        "that must keep working understands the new level. Absent means this build's level."
     ),
     "machine": (
         "Machine shard name: state files are ACTIVE.<machine>.json and EVENTS.<machine>. "
@@ -824,7 +837,7 @@ CONFIG_HEADER = (
 # Fields `init --repair` may overwrite when the caller names a different value.
 # Everything else is refused, because a configuration says where live state
 # already is and rewriting that relocates rather than repairs.
-_CONFIG_REPAIR_UPDATABLE = frozenset({"schema", "max_active_slots"})
+_CONFIG_REPAIR_UPDATABLE = frozenset({"schema", "max_active_slots", "reader_floor", "writer_ceiling"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # The agent-name rule the session tooling (agentctl) applies to every name it registers, and
 # therefore every name its liveness probe can judge: a lowercase letter, then lowercase letters,
@@ -1269,6 +1282,76 @@ class StateError(Refusal):
     """A corrupt, partial, or incompatible state refusal."""
 
 
+#: Highest record schema level this build writes (#1788). Level 1 is every
+#: shape written before handoff ignored-file accounting and seal fs_id;
+#: level 2 is those additions. A reader that meets unknown keys at load
+#: preserves them raw and warns once; only a command acting on the
+#: affected slot refuses, with SchemaSkewRefusal.
+SCHEMA_LEVEL = 2
+_WARNED_SKEW_KEYS: set[tuple[str, str]] = set()
+
+
+class SchemaSkewRefusal(StateError):
+    """A record written by a newer wrkslots than this reader understands.
+
+    Distinct from corruption ("invalid fields"): the record is intact,
+    but acting on it here could ignore decision-relevant evidence.
+    """
+
+
+def _skew_unknown_fields(
+    raw: Mapping[str, object],
+    required: AbstractSet[str],
+    optional: AbstractSet[str],
+    label: str,
+) -> tuple[tuple[str, str], ...]:
+    """Collect keys this build does not know, preserved raw (#1788).
+
+    Missing required keys still refuse as corruption. Unknown keys are
+    returned as (key, canonical JSON) pairs for exact re-emission, and
+    warned about once per label/key per process.
+    """
+
+    keys = set(raw)
+    missing = sorted(required - keys)
+    if missing:
+        raise StateError(f"{label} has invalid fields: missing {', '.join(missing)}")
+    unknown = sorted(keys - required - optional)
+    preserved: list[tuple[str, str]] = []
+    for key in unknown:
+        encoded = json.dumps(raw[key], sort_keys=True, separators=(",", ":"))
+        preserved.append((key, encoded))
+        marker = (label, key)
+        if marker not in _WARNED_SKEW_KEYS:
+            _WARNED_SKEW_KEYS.add(marker)
+            print(
+                f"WARNING: wrkslots {VERSION} keeps {label} key {key} it does "
+                "not understand (written by a newer wrkslots); commands that "
+                "do not act on that record proceed",
+                file=sys.stderr,
+            )
+    return tuple(preserved)
+
+
+def _assert_record_actable(record: ActiveRecord, action: str) -> None:
+    """Refuse to act on a slot carrying fields this build cannot enforce."""
+
+    unknown = [key for key, _ in record.unknown_fields]
+    if record.handoff is not None:
+        unknown += [key for key, _ in record.handoff.unknown_fields]
+    for checkout in record.checkouts:
+        unknown += [key for key, _ in checkout.unknown_fields]
+    if unknown:
+        raise SchemaSkewRefusal(
+            f"NEWER WRITER: slot {record.slot} carries field(s) "
+            f"{', '.join(sorted(set(unknown)))} written by a newer wrkslots "
+            f"than {VERSION}; this build cannot enforce them, so {action} "
+            f"of slot {record.slot} refuses. Upgrade wrkslots (a reader "
+            "that writes those fields) to act on this slot; read-only "
+            "commands over other slots are unaffected"
+        )
+
+
 class _TargetStorageDrift(StateError):
     """Physical or Git drift of one target row's own storage, found by
     ``remove`` before its first change to the slot.
@@ -1477,6 +1560,11 @@ class Config:
     machine_source: str = dataclasses.field(
         default="configuration.machine", compare=False
     )
+    #: Schema-level gate (#1788): oldest level readers must keep reading,
+    #: and the highest level writers may emit. Absent means floor 1 and
+    #: ceiling this build's level.
+    reader_floor: int = 1
+    writer_ceiling: int = SCHEMA_LEVEL
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1550,6 +1638,8 @@ class Checkout:
     vcs: str = "git"
     #: Untracked/ignored paths the create hooks made (#1369).
     provisioned: tuple[ProvisionedPath, ...] = ()
+    #: Keys a newer writer added, preserved raw at load (#1788).
+    unknown_fields: tuple[tuple[str, str], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1588,6 +1678,8 @@ class Handoff:
     #: Gitignored files finish archived or discarded (#1686), by checkout.
     ignored_files: tuple[HandoffIgnoredFile, ...] = ()
     ignored_archives: tuple[HandoffIgnoredArchive, ...] = ()
+    #: Keys a newer writer added, preserved raw at load (#1788).
+    unknown_fields: tuple[tuple[str, str], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1638,6 +1730,8 @@ class ActiveRecord:
     import_source: _ImportSource | None = None
     task_scope: TaskScopeIdentity | None = None
     harness_checkout_reason: str | None = None
+    #: Keys a newer writer added, preserved raw at load (#1788).
+    unknown_fields: tuple[tuple[str, str], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4935,6 +5029,31 @@ def _eden_slot_path(config: Config, mount: Path, checkout: Checkout) -> Path:
     return mount.parent
 
 
+def _writer_ceiling(config: Config) -> int:
+    """Highest schema level this project's writers may emit (#1788)."""
+
+    return config.writer_ceiling
+
+
+def _assert_writer_level(config: Config, level: int, what: str) -> None:
+    """Refuse a write above the project ceiling; never degrade it.
+
+    Falling back to an older, less-checked form to satisfy the ceiling
+    is forbidden: the operation refuses and names the deliberate raise.
+    """
+
+    ceiling = _writer_ceiling(config)
+    if level > ceiling:
+        raise Refusal(
+            f"NEWER WRITER: {what} needs record schema level {level}, above "
+            f"this project's writer_ceiling {ceiling} (reader_floor "
+            f"{config.reader_floor}); refusing rather than writing a less "
+            "safe older form. Raise reader_floor and writer_ceiling "
+            "deliberately with `wrkslots init --repair` once every reader "
+            "that must keep working understands the new level"
+        )
+
+
 def _load_config(explicit_root: str | None, machine_override: str | None) -> Config:
     root = _discover_root(explicit_root)
     path = root / CONFIG_NAME
@@ -5200,6 +5319,16 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         worktrees_image=wt_settings,
         worktrees_image_skipped=wt_skipped,
         machine_source=machine_source,
+        reader_floor=(
+            1
+            if "reader_floor" not in raw
+            else _as_int(raw["reader_floor"], "configuration.reader_floor", minimum=1)
+        ),
+        writer_ceiling=(
+            SCHEMA_LEVEL
+            if "writer_ceiling" not in raw
+            else _as_int(raw["writer_ceiling"], "configuration.writer_ceiling", minimum=1)
+        ),
     )
     if config.worktrees_image is not None:
         # Re-establish the image mount and recorded slot binds on every
@@ -7829,6 +7958,8 @@ def _handoff_to_obj(handoff: Handoff | None) -> object:
             }
             for item in handoff.ignored_archives
         ]
+    for key, encoded in handoff.unknown_fields:
+        value[key] = json.loads(encoded)
     return value
 
 
@@ -7836,7 +7967,7 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
     if value is None:
         return None
     raw = _as_mapping(value, label)
-    _exact_keys(
+    unknown_fields = _skew_unknown_fields(
         raw,
         {"recorded_at", "validation", "limitations", "continuation"},
         {"discarded_unaccounted", "ignored_files", "ignored_archives"},
@@ -7942,6 +8073,7 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
         discarded,
         tuple(ignored_files),
         tuple(ignored_archives),
+        unknown_fields,
     )
 
 
@@ -8529,6 +8661,8 @@ def _checkout_to_obj(checkout: Checkout) -> dict[str, object]:
         value["provisioned"] = [
             _provisioned_to_obj(item) for item in checkout.provisioned
         ]
+    for key, encoded in checkout.unknown_fields:
+        value[key] = json.loads(encoded)
     return value
 
 
@@ -8547,7 +8681,7 @@ def _checkout_from_obj(value: object, label: str) -> Checkout:
         "containing_remote_refs",
         "vcs",
     }
-    _exact_keys(raw, fields, {"provisioned"}, label)
+    unknown_fields = _skew_unknown_fields(raw, fields, {"provisioned"}, label)
     checkout = Checkout(
         name=_as_str(raw["name"], f"{label}.name"),
         path=_as_str(raw["path"], f"{label}.path"),
@@ -8576,6 +8710,7 @@ def _checkout_from_obj(value: object, label: str) -> Checkout:
                 _as_list(raw.get("provisioned", []), f"{label}.provisioned")
             )
         ),
+        unknown_fields=unknown_fields,
     )
     _validate_name(checkout.name, "checkout name")
     if checkout.vcs not in ("git", "eden"):
@@ -8848,6 +8983,8 @@ def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
         value["task_scope"] = _task_scope_to_obj(record.task_scope)
     if record.harness_checkout_reason is not None:
         value["harness_checkout_reason"] = record.harness_checkout_reason
+    for key, encoded in record.unknown_fields:
+        value[key] = json.loads(encoded)
     return value
 
 
@@ -8869,7 +9006,7 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
         "handoff",
         "checkouts",
     }
-    _exact_keys(
+    unknown_fields = _skew_unknown_fields(
         raw,
         required_fields,
         {"slot_type", "layout", "import_source", "task_scope", "harness_checkout_reason"},
@@ -8929,6 +9066,7 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
                 raw["harness_checkout_reason"], f"{label}.harness_checkout_reason"
             )
         ),
+        unknown_fields=unknown_fields,
     )
     if record.harness_checkout_reason is not None and not record.harness_checkout_reason:
         raise StateError(f"{label}.harness_checkout_reason must be non-empty when present")
@@ -35176,6 +35314,7 @@ def _salvage_agent_slot(
         files = _ignored_files_outside_caches(config, checkout, path, vcs)
         if files:
             ignored_by_checkout[checkout.name] = files
+    _assert_record_actable(record, "remove")
     if record.handoff is not None and record.handoff.ignored_files:
         # A finish-recorded ignored decision (#1686) is enforced here:
         # the files must still match it exactly, and a remove flag that
@@ -55658,6 +55797,23 @@ def _doctor_quick(args: argparse.Namespace, config: Config) -> int:
                             hold_result.error,
                         )
                     )
+                _skew_keys = [k for k, _ in record.unknown_fields]
+                if record.handoff is not None:
+                    _skew_keys += [k for k, _ in record.handoff.unknown_fields]
+                for _checkout in record.checkouts:
+                    _skew_keys += [k for k, _ in _checkout.unknown_fields]
+                if _skew_keys:
+                    findings.append(
+                        _operational_finding(
+                            "newer-writer-record", record.slot, state.machine,
+                            "record carries field(s) "
+                            + ", ".join(sorted(set(_skew_keys)))
+                            + f" newer than reader_floor {config.reader_floor} "
+                            f"(writer_ceiling {config.writer_ceiling}); "
+                            "read-only commands proceed, remove/finish of "
+                            "this slot refuse until wrkslots is upgraded",
+                        )
+                    )
                 process_state, process_detail = _process_state(record.owner)
                 if process_state == "dead":
                     findings.append(
@@ -55731,6 +55887,8 @@ def _doctor_quick(args: argparse.Namespace, config: Config) -> int:
                         "machines": [state.machine for state in states],
                         "active": rows,
                         "max_active_slots": config.max_active_slots,
+                        "reader_floor": config.reader_floor,
+                        "writer_ceiling": config.writer_ceiling,
                         "findings": findings,
                         "counts_by_kind": counts,
                         "interrupted_journals": reports,
@@ -56415,6 +56573,10 @@ def _sidecar_containing_refs(config: Config, holder: dict[str, object]) -> None:
 
     refs = holder.get("containing_remote_refs")
     if not isinstance(refs, list) or len(refs) <= _CONTAINING_REFS_INLINE_LIMIT:
+        return
+    if _writer_ceiling(config) < 2:
+        # The sidecar key is level 2 (#1788): below the ceiling the full
+        # list stays inline, the equally checked older form.
         return
     canonical = json.dumps(refs, ensure_ascii=True, separators=(",", ":")).encode(
         "utf-8"
@@ -57552,7 +57714,10 @@ def _private_cleanup_target_to_obj(
         "original_mode": target.original_mode,
         "identity": list(target.identity),
     }
-    if target.fs_id is not None:
+    # fs_id is a level-2 recovery hint (#1788): below the ceiling it is
+    # omitted, which is equally safe — readers fall back to the configured
+    # filesystem anchor exactly as pre-fs_id journals always did.
+    if target.fs_id is not None and _writer_ceiling(config) >= 2:
         result["fs_id"] = target.fs_id
     return result
 
@@ -60658,6 +60823,7 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         states, archives = _validate_global_state(config)
         state = _load_active(config)
         record = _find_record(state, args.slot)
+        _assert_record_actable(record, "finish")
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         _assert_validate_batch_seals_disjoint_from_record(
             config, record, action="finish"
@@ -60858,6 +61024,11 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                             sha256=_as_str(archive["sha256"], "ignored archive sha256"),
                         )
                     )
+        if ignored_entries:
+            # Level-2 accounting remove enforces exactly (#1788): below
+            # the ceiling this refuses rather than dropping accounting
+            # or writing the older, less-checked handoff form.
+            _assert_writer_level(config, 2, "handoff ignored-file accounting")
         continuation = (
             f"wrkslots remove {record.slot} --coordinator-pid "
             f"<current-coordinator-pid> --expected-generation {record.generation}"
@@ -62148,6 +62319,14 @@ def _cmd_remove_in_scope(
     config = _load_config(args.project_root, args.machine)
     _assert_not_retire_frozen(config, "remove")
     _validate_name(args.slot, "slot")
+    # Point-of-use skew check first (#1788): acting on this slot must
+    # refuse before any liveness or salvage work judges other evidence.
+    _preflight = _load_active(config, require_repository=False)
+    _preflight_record = next(
+        (item for item in _preflight.slots if item.slot == args.slot), None
+    )
+    if _preflight_record is not None:
+        _assert_record_actable(_preflight_record, "remove")
     if agent_batch is not None and (
         private_cleanup is not None
         or validation_removal_proof is not None
@@ -62631,6 +62810,7 @@ def _cmd_remove_in_scope(
             before = _global_rows(states, archives)
             state = _load_active(config, require_repository=False)
             record = _find_record(state, args.slot)
+            _assert_record_actable(record, "remove")
             _expected_generation(record, args.expected_generation)
             if (
                 agent_batch is not None

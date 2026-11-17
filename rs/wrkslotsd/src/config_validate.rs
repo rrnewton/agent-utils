@@ -31,7 +31,7 @@ const REQUIRED: [&str; 6] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 28] = [
+const OPTIONAL: [&str; 30] = [
     "machine",
     "liveness_batch_command",
     "max_active_slots",
@@ -60,6 +60,8 @@ const OPTIONAL: [&str; 28] = [
     "worktrees_image",
     "min_wrkslots_version",
     "ignorable_keys",
+    "reader_floor",
+    "writer_ceiling",
 ];
 
 /// Unknown keys this process has already warned it ignores (#1109).
