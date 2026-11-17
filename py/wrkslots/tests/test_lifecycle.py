@@ -50214,7 +50214,9 @@ def test_recover_absent_validate_rows_retires_a_deleted_subvolume_bind(
     assert run_absent_validate_recovery(project, input_path, apply=True, output_format="json") == 0
     recovered = json.loads(capsys.readouterr().out)
     assert [row["outcome"] for row in recovered["rows"]] == ["recovered"]
-    assert set(unmounted) == {checkout_path, mirror}
+    # Only the row's own path is unmounted directly; the mirror is a
+    # peer view unmount_bind takes with it (#1733), never a second target.
+    assert set(unmounted) == {checkout_path}
     assert foreign not in unmounted
     config = wrkslots._load_config(str(project), "testhost")
     assert list(wrkslots._load_active(config).slots) == []
@@ -50266,7 +50268,7 @@ def test_remove_validate_complete_reconciles_a_deleted_subvolume_bind(
         ]
     )
     assert removed == 0, capsys.readouterr().err
-    assert set(unmounted) == {checkout_path, mirror}
+    assert set(unmounted) == {checkout_path}
     assert foreign not in unmounted
     assert active_slots(project) == []
     assert not slot_path.exists()
@@ -50298,10 +50300,7 @@ def test_deleted_bind_detection_accepts_a_zero_device_without_a_deleted_root(
         wrkslots, "_stat_device", lambda path: 0 if path == checkout_path else 1
     )
     config = wrkslots._load_config(str(project), "testhost")
-    assert set(wrkslots._deleted_bind_mount_points(config, record)) == {
-        checkout_path,
-        mirror,
-    }
+    assert set(wrkslots._deleted_bind_mount_points(config, record)) == {checkout_path}
 
 
 def test_recover_absent_validate_rows_handles_a_missing_directory(

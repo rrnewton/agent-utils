@@ -447,6 +447,43 @@ def test_bind_creates_private_on_every_peer_view(
     assert fake.calls[0] == ["mount", "--bind", str(mount_dir / "s1"), str(slot_path)]
 
 
+def test_unmount_bind_takes_deleted_peer_views_and_leaves_live_binds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1771: unmounting a deleted-subvolume bind takes its mirror peer
+    # view with it (#1733 peer matching on device+root, //deleted root
+    # included); a second, LIVE bind from the same device stays mounted.
+    target = tmp_path / "slots" / "deadbind"
+    mirror = tmp_path / "mirror" / "deadbind"
+    live = tmp_path / "slots" / "live"
+    root = "/deadbind//deleted"
+    table = [
+        slotimage.MountEntry(
+            mount_point=target, fstype="btrfs", source="/dev/loop1",
+            device="0:41", root=root,
+        ),
+        slotimage.MountEntry(
+            mount_point=mirror, fstype="btrfs", source="/dev/loop1",
+            device="0:41", root=root,
+        ),
+        slotimage.MountEntry(
+            mount_point=live, fstype="btrfs", source="/dev/loop1",
+            device="0:41", root="/live",
+        ),
+    ]
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda mountinfo=None: table)
+
+    worktreesimage.unmount_bind(target)
+
+    assert ["mount", "--make-private", str(target)] in fake.calls
+    assert ["mount", "--make-private", str(mirror)] in fake.calls
+    assert ["umount", str(target)] in fake.calls
+    assert ["umount", str(mirror)] in fake.calls
+    assert not any(str(live) in str(call) for call in fake.calls)
+
+
 def test_ensure_binds_privatizes_an_existing_shared_bind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

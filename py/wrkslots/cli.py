@@ -80473,14 +80473,17 @@ def _stat_device(path: Path) -> int | None:
 def _deleted_bind_mount_points(
     config: Config, record: ActiveRecord
 ) -> tuple[Path, ...]:
-    """Stale bind mounts of one validate row's deleted subvolume (#1771).
+    """One validate row's own stale deleted-subvolume bind paths (#1771).
 
     A bind whose mountinfo root ends in ``//deleted`` shows a subvolume
     that no longer exists; stat of its mount point reports device 0.
-    Returns every mount point showing that same deleted subvolume --
-    the row's own paths plus mirror views with the identical device
-    and root -- deepest first, and nothing else. A live bind (no
-    ``//deleted`` root and a nonzero device) returns empty.
+    Only the row's own paths are returned, deepest first: mirror views
+    of the same subvolume are peer views that
+    ``worktreesimage.unmount_bind`` already privatises and unmounts
+    with the target (#1733), so no second mirror matcher is built
+    here. Device 0 alone names deleted storage only for the row's own
+    path -- it never expands to other mounts sharing a device. A live
+    bind (no ``//deleted`` root and a nonzero device) returns empty.
     """
 
     paths = _absent_validate_row_paths(config, record)
@@ -80488,24 +80491,14 @@ def _deleted_bind_mount_points(
         table = slotimage.mount_table()
     except Exception:
         table = []
-    keys: set[tuple[str, str]] = set()
-    direct: set[Path] = set()
+    deleted: list[Path] = []
     for path in paths:
         tops = [entry for entry in table if entry.mount_point == path]
-        for entry in tops:
-            if entry.root.endswith("//deleted"):
-                keys.add((entry.device, entry.root))
-        if _stat_device(path) == 0:
-            if tops:
-                keys.add((tops[-1].device, tops[-1].root))
-            else:
-                direct.add(path)
-    mounts = {
-        entry.mount_point
-        for entry in table
-        if (entry.device, entry.root) in keys
-    } | direct
-    return tuple(sorted(mounts, key=lambda point: len(point.parts), reverse=True))
+        if any(entry.root.endswith("//deleted") for entry in tops):
+            deleted.append(path)
+        elif _stat_device(path) == 0:
+            deleted.append(path)
+    return tuple(sorted(deleted, key=lambda point: len(point.parts), reverse=True))
 
 
 def _unmount_deleted_bind(path: Path) -> None:

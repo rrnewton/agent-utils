@@ -198,8 +198,9 @@ fn recovery_matches(
 /// Whether `path` is covered by a deleted-subvolume bind (#1771):
 /// its device is 0, or a mountinfo root ending in `//deleted` mounts
 /// at or above it (or it is the slot directory holding such a mount).
-/// Such a bind is absent storage, never physical storage; the census
-/// and unmount stay with the Python edition, as for every active row.
+/// Such a bind is absent storage, never physical storage, but this
+/// edition never unmounts it: the caller refuses and names the Python
+/// edition, which unmounts the stale bind before reconciling.
 fn deleted_bind_covers(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     if let Ok(metadata) = std::fs::metadata(path) {
@@ -210,6 +211,10 @@ fn deleted_bind_covers(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return false;
     };
+    mountinfo_covers_deleted_bind(path, &text)
+}
+
+fn mountinfo_covers_deleted_bind(path: &Path, text: &str) -> bool {
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 5 || !fields[3].ends_with("//deleted") {
@@ -450,8 +455,14 @@ pub(crate) fn recover_absent_validate_rows(
                 paths.push(cfg.root.join(raw_path));
             }
             paths.dedup();
+            if paths.iter().any(|path| deleted_bind_covers(path)) {
+                return Err(format!(
+                    "validation row {} sits on a deleted-subvolume bind; reconcile it with the Python edition, which unmounts the stale bind first",
+                    row.slot
+                ));
+            }
             for path in &paths {
-                if (path.exists() || path.is_symlink()) && !deleted_bind_covers(path) {
+                if path.exists() || path.is_symlink() {
                     return Err(format!(
                         "validation row {} still has physical storage at {}",
                         row.slot,
@@ -489,4 +500,31 @@ pub(crate) fn recover_absent_validate_rows(
         }));
     }
     Ok(json!({"schema": 1, "rows": outcomes}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mountinfo_covers_deleted_bind;
+    use std::path::Path;
+
+    #[test]
+    fn deleted_root_covers_mount_slot_and_checkout_but_not_live_binds() {
+        let table = "\
+41 30 0:41 /deadbind//deleted /slots/validate/deadbind/product rw - btrfs /dev/loop1 rw\n\
+42 30 0:41 /live /slots/validate/live/product rw - btrfs /dev/loop1 rw\n";
+        let checkout = Path::new("/slots/validate/deadbind/product");
+        assert!(mountinfo_covers_deleted_bind(checkout, table));
+        assert!(mountinfo_covers_deleted_bind(
+            Path::new("/slots/validate/deadbind"),
+            table
+        ));
+        assert!(!mountinfo_covers_deleted_bind(
+            Path::new("/slots/validate/live/product"),
+            table
+        ));
+        assert!(!mountinfo_covers_deleted_bind(
+            Path::new("/slots/validate/other"),
+            table
+        ));
+    }
 }
