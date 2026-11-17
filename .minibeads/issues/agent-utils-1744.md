@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-validate-batch-seal-left-after-start-refusal: a refused batch leaves its seal behind and blocks the host'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-16T15:45:41-05:00
-updated_at: 2026-11-16T15:45:41-05:00
+updated_at: 2026-11-17T04:33:45-05:00
+closed_at: 2026-11-17T04:33:45-05:00
 ---
 
 # Description
@@ -32,3 +33,7 @@ The seal is published by `_seal_validate_batch_targets` inside `_remove_validate
 # Notes
 
 Related: #1736 wrkslots-live-seal-reported-as-interrupted (the seal the stranded journal leaves behind is at least named correctly now), #1735 wrkslots-remove-holds-state-lock-through-salvage.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 9bfdce6a: when the batch cleanup lock itself refuses and nothing was deleted, the batch restores the sealed modes and retires the exact seal it published without the lock; once anything was deleted the seal stays for recover, as designed.
