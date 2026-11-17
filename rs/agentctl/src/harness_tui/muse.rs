@@ -11,8 +11,8 @@
 //! and `agentctl answer` use.
 use super::{plain, AnswerPlan, HarnessTui, Question, State, View};
 use crate::client::{
-    muse_editor_rows_empty, muse_verified_process_editor_rows,
-    muse_verified_process_turn_in_progress,
+    muse_ansi_composer_is_empty, muse_divider_width, muse_editor_rows_empty_w,
+    muse_verified_process_editor_rows, muse_verified_process_turn_in_progress,
 };
 
 /// Rows, ending at the last row with text, searched for a Muse form or panel.
@@ -35,10 +35,17 @@ const APPROVAL_MARKERS: [&str; 2] = [
 ];
 
 impl MuseTui {
-    /// Whether the editor is empty: the screen's editor rows hold only the prompt marker.
+    /// Whether the editor is empty: the screen's editor rows hold only the prompt marker
+    /// or a placeholder hint. On an ANSI screen styling decides first (grey/faint ghost
+    /// is empty, default-intensity text is a draft even when its words match a hint),
+    /// so a hint a future Muse adds still reads empty (#1773).
     pub(crate) fn editor_empty(screen: &str) -> bool {
+        if let Some(empty) = muse_ansi_composer_is_empty(screen) {
+            return empty;
+        }
+        let width = muse_divider_width(screen);
         muse_verified_process_editor_rows(&plain(screen))
-            .is_some_and(|rows| muse_editor_rows_empty(&rows))
+            .is_some_and(|rows| muse_editor_rows_empty_w(&rows, width))
     }
 
     /// Whether Muse's peer-approval dialog stands where the editor would be (#974

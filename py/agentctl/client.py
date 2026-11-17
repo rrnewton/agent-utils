@@ -180,6 +180,103 @@ def muse_trust_prompt(screen: str) -> bool:
     )
 
 
+# Placeholder hints Muse draws dim inside an empty composer (Muse 1.4.23,
+# `crates/tui/src/state/prompt_hint.rs`); one versioned table shared with the Rust
+# reader in principle and pinned to the same strings. Only an exact whole-editor
+# match is a ghost; anything else is a draft (#1773).
+_MUSE_PROMPT_HINTS: tuple[str, ...] = (
+    "Type @ to search and insert workspace file paths",
+    "Start a message with ! to run a shell command yourself",
+    "Paste an image with Ctrl+V — file paths and URLs work too",
+    "Press Alt+V to dictate instead of typing",
+    "Tab queues or steers while a run is active",
+    "Press ? on an empty composer to see keyboard shortcuts",
+    "Press Ctrl+O to expand collapsed tool output",
+    "/side asks a quick question without touching this thread",
+    "/fork branches the conversation from the latest point",
+    "/goal pins a session objective with a progress bar",
+    "/resume reopens a past session (--last for the latest)",
+    "Ask to 'use a workflow' to fan out parallel agents on big tasks",
+    "Say 'use a workflow' to fan out agents on big tasks",
+    "Ask to monitor a running build or log and get pinged on changes",
+    "/agent opens the subagent command center",
+    "/tasks shows workflows, subagents and terminals in one place",
+    "/loop 10m <prompt> schedules a recurring prompt",
+    "Ctrl+B sends the selected task to the background queue",
+    "/skills browses ready-made skills for repeatable procedures",
+    "/plugins marketplace installs new commands and skills",
+    "/effort adjusts reasoning depth vs speed",
+    "/usage shows this session's token usage",
+    "/export saves the conversation to a text file",
+)
+
+
+def _muse_normalize(text: str) -> str:
+    """Collapse whitespace runs to single spaces, as the Rust `normalize` does."""
+    return " ".join(text.split())
+
+
+_MUSE_HINT_PREFIX_MIN = 20
+
+
+def _muse_is_hint_prefix(text: str, *, at_edge: bool) -> bool:
+    """Whether `text` is a truncated hint prefix (see the Rust reader)."""
+    joined = _muse_normalize(text)
+    core, ellipsis = joined, False
+    for suffix in ("…", "..."):
+        if joined.endswith(suffix):
+            core, ellipsis = _muse_normalize(joined[: -len(suffix)]), True
+            break
+    if len(core) < _MUSE_HINT_PREFIX_MIN or not (ellipsis or at_edge):
+        return False
+    return any(
+        len(_muse_normalize(hint)) > len(core) and _muse_normalize(hint).startswith(core)
+        for hint in _MUSE_PROMPT_HINTS
+    )
+
+
+def _muse_divider_width(screen: str) -> int | None:
+    """The frame's rule width in chars, or `None` without a ruled frame."""
+    widths = [
+        len(line.strip())
+        for line in screen.splitlines()
+        if len(line.strip()) >= 3 and set(line.strip()) <= {"─", "━", "═"}
+    ]
+    return widths[-1] if widths else None
+
+
+def _muse_editor_is_hint(editor: str, width: int | None = None) -> bool:
+    """Whether `editor` holds exactly one placeholder hint and nothing else.
+
+    The whole hint (wrapped rows joined either way), an ellipsis cut, or a
+    prefix filling its row to the pane edge (`width`) counts; else a draft.
+    """
+    segments = _muse_editor_segments(editor)
+    if not segments:
+        return False
+    spaced = _muse_normalize(" ".join(segments))
+    tight = _muse_normalize("".join(segments))
+    if any(_muse_normalize(hint) in (spaced, tight) for hint in _MUSE_PROMPT_HINTS):
+        return True
+    at_edge = width is not None and any(
+        len(line.rstrip()) + 1 >= width for line in editor.splitlines()
+    )
+    return _muse_is_hint_prefix(spaced, at_edge=at_edge) or _muse_is_hint_prefix(
+        tight, at_edge=at_edge
+    )
+
+
+def is_muse_placeholder_hint(text: str) -> bool:
+    """Whether draft `text` is exactly one placeholder hint."""
+    joined = _muse_normalize(text)
+    return bool(joined) and any(_muse_normalize(hint) == joined for hint in _MUSE_PROMPT_HINTS)
+
+
+def is_muse_hint_text(text: str) -> bool:
+    """Whether draft `text` is one hint or an ellipsis-truncated one."""
+    return is_muse_placeholder_hint(text) or _muse_is_hint_prefix(text, at_edge=False)
+
+
 # Markers of the progress row Muse 1.4 draws above its editor while a turn runs. The row
 # animates through all three, so a reader that knows only some misreads a running turn as idle.
 _MUSE_PROGRESS_MARKERS = ("◆", "◇", "◈")
@@ -207,20 +304,31 @@ def _muse_turn_running(transcript: str) -> bool:
     )
 
 
-def _muse_editor_idle(regions: tuple[str, str] | None) -> bool:
-    """An empty editor below a transcript that does not end in Muse's progress line."""
-    return (regions is not None and regions[1].strip() in ("❯", "›")
-            and not _muse_turn_running(regions[0]))
+def _muse_editor_idle(
+    regions: tuple[str, str] | None, width: int | None = None,
+) -> bool:
+    """An empty editor below a transcript that does not end in Muse's progress line.
+
+    A composer holding only a placeholder hint is empty (#1773).
+    """
+    if regions is None:
+        return False
+    composer = regions[1]
+    empty = composer.strip() in ("❯", "›") or _muse_editor_is_hint(composer, width)
+    return empty and not _muse_turn_running(regions[0])
 
 
 def muse_idle_composer(screen: str) -> bool:
     """Recognize Muse's idle composer without mistaking a choice prompt for it."""
-    return _muse_editor_idle(_muse_composer_regions(screen, require_header=True))
+    return _muse_editor_idle(
+        _muse_composer_regions(screen, require_header=True), _muse_divider_width(screen))
 
 
 def muse_auto_review_idle_composer(screen: str) -> bool:
     """Require the Auto-review footer on the active empty composer."""
-    if not _muse_editor_idle(_muse_composer_regions(screen, require_header=True)):
+    if not _muse_editor_idle(
+            _muse_composer_regions(screen, require_header=True),
+            _muse_divider_width(screen)):
         return False
     lines = screen.splitlines()
     dividers = [
@@ -254,7 +362,8 @@ def boxed_arguments(arguments: Sequence[str]) -> tuple[str, ...]:
 
 def muse_verified_process_idle_composer(screen: str) -> bool:
     """Recognize an idle editor after exact live-Muse process verification."""
-    return _muse_editor_idle(_muse_composer_regions(screen, require_header=False))
+    return _muse_editor_idle(
+        _muse_composer_regions(screen, require_header=False), _muse_divider_width(screen))
 
 
 def muse_verified_process_turn_running(screen: str) -> bool:

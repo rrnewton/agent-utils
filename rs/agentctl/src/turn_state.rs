@@ -342,8 +342,11 @@ pub fn composer_draft(screen: &str) -> Option<String> {
         text.push(line.trim().to_owned());
     }
     let text = text.join("\n").trim().to_owned();
+    // A Muse ghost hint is exactly one hint and nothing else (#1773); a longer
+    // draft that merely starts with a hint's words is still a draft.
     (!text.is_empty()
         && !crate::harness::codex::only_placeholder_and_braille(&text, &text)
+        && !crate::client::is_muse_hint_text(&text)
         && !composer_placeholders()
             .iter()
             .any(|hint| text.starts_with(hint)))
@@ -765,6 +768,29 @@ pub(crate) mod tests {
         assert_eq!(
             composer_draft("❯ fix the flake\n────\n"),
             Some("fix the flake".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_muse_placeholder_hint_is_not_a_composer_draft() {
+        // #1773: the watcher's draft read shares the Muse classifier.
+        for hint in [
+            "Ask to monitor a running build or log and get pinged on changes",
+            "Tab queues or steers while a run is active",
+        ] {
+            assert_eq!(composer_draft(&format!("❯ {hint}\n────\n")), None, "{hint}");
+        }
+        assert_eq!(
+            composer_draft(
+                "❯ Ask to monitor a running build or log and get pinged on changes please\n────\n"
+            ),
+            Some(
+                "Ask to monitor a running build or log and get pinged on changes please".to_owned()
+            )
+        );
+        assert_eq!(
+            composer_draft("❯ please review my change\n────\n"),
+            Some("please review my change".to_owned())
         );
     }
 

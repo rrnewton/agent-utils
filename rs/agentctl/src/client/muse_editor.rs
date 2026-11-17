@@ -20,6 +20,328 @@
 
 use std::collections::BTreeSet;
 
+/// Placeholder hints Muse draws dim inside an empty composer a few seconds after a turn
+/// settles (`crates/tui/src/state/prompt_hint.rs` in Muse 1.4.23, read from the installed
+/// `muse.real` strings). One table, versioned with Muse: a new Muse release that changes
+/// its hints updates this list in the same change. A capture returns a hint as plain text,
+/// so a text read cannot tell it from typed text by styling; an ANSI read can (see
+/// [`muse_ansi_composer_is_empty`]). Only an exact whole-editor match counts: anything
+/// longer, or any other text, is a draft and fails closed (#1773
+/// agentctl-muse-placeholder-hint-as-draft).
+pub(crate) const MUSE_PROMPT_HINTS: [&str; 23] = [
+    "Type @ to search and insert workspace file paths",
+    "Start a message with ! to run a shell command yourself",
+    "Paste an image with Ctrl+V — file paths and URLs work too",
+    "Press Alt+V to dictate instead of typing",
+    "Tab queues or steers while a run is active",
+    "Press ? on an empty composer to see keyboard shortcuts",
+    "Press Ctrl+O to expand collapsed tool output",
+    "/side asks a quick question without touching this thread",
+    "/fork branches the conversation from the latest point",
+    "/goal pins a session objective with a progress bar",
+    "/resume reopens a past session (--last for the latest)",
+    "Ask to 'use a workflow' to fan out parallel agents on big tasks",
+    "Say 'use a workflow' to fan out agents on big tasks",
+    "Ask to monitor a running build or log and get pinged on changes",
+    "/agent opens the subagent command center",
+    "/tasks shows workflows, subagents and terminals in one place",
+    "/loop 10m <prompt> schedules a recurring prompt",
+    "Ctrl+B sends the selected task to the background queue",
+    "/skills browses ready-made skills for repeatable procedures",
+    "/plugins marketplace installs new commands and skills",
+    "/effort adjusts reasoning depth vs speed",
+    "/usage shows this session's token usage",
+    "/export saves the conversation to a text file",
+];
+
+/// Whether `text` (draft text without its prompt marker, whitespace already collapsed by
+/// the caller or not) is exactly one placeholder hint. Used by the generic draft readers
+/// that see only draft text, not a whole Muse frame.
+pub(crate) fn is_muse_placeholder_hint(text: &str) -> bool {
+    let joined = normalize(text);
+    !joined.is_empty()
+        && MUSE_PROMPT_HINTS
+            .iter()
+            .any(|hint| normalize(hint) == joined)
+}
+
+/// Shortest truncated hint prefix that still proves a ghost: shorter prefixes
+/// could be the start of a typed draft, so they fail closed.
+const HINT_PREFIX_MIN: usize = 20;
+
+/// Whether draft `text` is a truncated hint: an ellipsis-ended prefix, or (when
+/// `at_edge` says the text fills its row to the pane edge) a plain prefix, of at
+/// least [`HINT_PREFIX_MIN`] chars of exactly the hint it prefixes. A prefix of
+/// no hint, or a short one, is a draft.
+fn is_hint_prefix(text: &str, at_edge: bool) -> bool {
+    let joined = normalize(text);
+    let (core, ellipsis) = match joined
+        .strip_suffix('…')
+        .or_else(|| joined.strip_suffix("..."))
+    {
+        Some(core) => (normalize(core), true),
+        None => (joined.clone(), false),
+    };
+    if core.chars().count() < HINT_PREFIX_MIN || !(ellipsis || at_edge) {
+        return false;
+    }
+    MUSE_PROMPT_HINTS.iter().any(|hint| {
+        let hint = normalize(hint);
+        hint.len() > core.len() && hint.starts_with(&core)
+    })
+}
+
+/// Whether generic draft `text` is exactly one hint or an ellipsis-truncated
+/// one (no pane width is known on that path, so a bare prefix never qualifies).
+pub(crate) fn is_muse_hint_text(text: &str) -> bool {
+    is_muse_placeholder_hint(text) || is_hint_prefix(text, false)
+}
+
+/// The pane width a Muse frame shows: the char count of its last rule, or
+/// `None` when the screen holds no ruled frame.
+pub(crate) fn muse_divider_width(screen: &str) -> Option<usize> {
+    splitlines(screen)
+        .into_iter()
+        .rfind(|line| is_divider(line))
+        .map(|line| strip(line).chars().count())
+}
+
+/// Whether the editor region `editor` holds exactly one placeholder hint and
+/// nothing else: the whole hint (wrapped rows join with a space or with
+/// nothing, as [`muse_editor_matches`] allows), or the hint truncated at the
+/// pane edge (`width` is the frame's rule width; a hint row filling it proves
+/// the cut), or cut with an ellipsis. Anything else is a draft.
+fn muse_editor_is_hint_w(editor: &str, width: Option<usize>) -> bool {
+    let Some(segments) = muse_editor_segments(editor) else {
+        return false;
+    };
+    if segments.is_empty() {
+        return false;
+    }
+    let spaced = normalize(&segments.join(" "));
+    let tight = normalize(&segments.join(""));
+    if MUSE_PROMPT_HINTS
+        .iter()
+        .any(|hint| normalize(hint) == spaced || normalize(hint) == tight)
+    {
+        return true;
+    }
+    // Truncation shows one partial text (joined either way can be the prefix
+    // when the cut falls mid-word across no row break, so try both joins).
+    let at_edge = width.is_some_and(|width| {
+        splitlines(editor)
+            .into_iter()
+            .any(|line| line.trim_end().chars().count() + 1 >= width)
+    });
+    is_hint_prefix(&spaced, at_edge) || is_hint_prefix(&tight, at_edge)
+}
+
+/// Whether the composer region `composer` holds nothing a person typed: no text at
+/// all, or only a placeholder hint. Styling is handled by
+/// [`muse_ansi_composer_is_empty`] where an ANSI screen is available.
+fn muse_composer_is_empty_w(composer: &str, width: Option<usize>) -> bool {
+    if PROMPT_MARKERS.contains(&strip(composer)) {
+        return true;
+    }
+    muse_editor_segments(composer).is_some_and(|segments| segments.is_empty())
+        || muse_editor_is_hint_w(composer, width)
+}
+
+/// Foreground colour of one rendered cell, for the ANSI styling proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CellFg {
+    Default,
+    Rgb(u32, u32, u32),
+    Indexed(u32),
+}
+
+/// Muse's hint grey on a live 1.4.23 seat: truecolor `38;2;103;108;116`, the same
+/// grey as the status line (the prompt glyph is `38;2;90;160;255`). Not SGR faint.
+const HINT_GREY: CellFg = CellFg::Rgb(103, 108, 116);
+
+/// Parse `screen` into rows of `(char, foreground, faint)`, tracking SGR state
+/// across rows as a terminal does. Mirrors [`crate::submission::render_screen`]'s
+/// row splitting (CR removed, rows split on LF, other controls dropped).
+fn ansi_cells(screen: &str) -> Vec<Vec<(char, CellFg, bool)>> {
+    let mut rows: Vec<Vec<(char, CellFg, bool)>> = Vec::new();
+    let mut row: Vec<(char, CellFg, bool)> = Vec::new();
+    let mut fg = CellFg::Default;
+    let mut faint = false;
+    let chars: Vec<char> = screen.replace('\r', "").chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if character == '\n' {
+            rows.push(std::mem::take(&mut row));
+            index += 1;
+            continue;
+        }
+        if character == '\u{1b}' {
+            // CSI SGR is the only sequence that changes fg/faint here; other
+            // escapes are skipped with the same bounds as `render_screen`.
+            if chars.get(index + 1) == Some(&'[') {
+                let mut end = index + 2;
+                while end < chars.len()
+                    && matches!(chars[end], '0'..='9' | ';' | ':' | '?' | '<' | '=' | '>')
+                {
+                    end += 1;
+                }
+                let params: String = chars[index + 2..end].iter().collect();
+                let mut cursor = end;
+                while cursor < chars.len() && (' '..='/').contains(&chars[cursor]) {
+                    cursor += 1;
+                }
+                if chars.get(cursor) == Some(&'m')
+                    && params
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == ';' || c == ':')
+                {
+                    let codes: Vec<&str> = if params.is_empty() {
+                        vec!["0"]
+                    } else {
+                        params
+                            .split(';')
+                            .map(|p| p.split(':').next().unwrap_or(""))
+                            .collect()
+                    };
+                    let mut at = 0;
+                    while at < codes.len() {
+                        match codes[at] {
+                            "" | "0" => {
+                                fg = CellFg::Default;
+                                faint = false;
+                            }
+                            "2" => faint = true,
+                            "22" => faint = false,
+                            "39" => fg = CellFg::Default,
+                            "38" if at + 1 < codes.len() => match codes[at + 1] {
+                                "2" if at + 4 < codes.len() => {
+                                    let num = |s: &str| s.parse::<u32>().unwrap_or(0);
+                                    fg = CellFg::Rgb(
+                                        num(codes[at + 2]),
+                                        num(codes[at + 3]),
+                                        num(codes[at + 4]),
+                                    );
+                                    at += 4;
+                                }
+                                "5" if at + 2 < codes.len() => {
+                                    fg = CellFg::Indexed(codes[at + 2].parse().unwrap_or(0));
+                                    at += 2;
+                                }
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                        at += 1;
+                    }
+                    index = cursor + 1;
+                    continue;
+                }
+            }
+            // Non-SGR escape: skip it (two chars for a simple escape, else one).
+            index += if matches!(chars.get(index + 1), Some('@'..='Z' | '\\')) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        index += 1;
+        if character < ' ' && character != '\t' {
+            continue;
+        }
+        row.push((character, fg, faint));
+    }
+    rows.push(row);
+    rows
+}
+
+/// Whether an ANSI `screen`'s Muse composer is empty by styling. Live Muse draws
+/// its ghost hint in truecolor grey ([`HINT_GREY`], the status line's grey) after a
+/// blue prompt glyph, not in SGR faint; faint or reverse-video ghosts count too.
+/// So: no composer text at all, faint-only text, or text whose every cell carries
+/// the hint grey (or the screen's own status-line foreground) is empty. Typed text
+/// is default-intensity and never qualifies, so a real draft still counts.
+/// `None` when the screen carries no styling or shows no Muse frame, so the caller
+/// falls back to the hint table (#1773, preference 1: herdr reads the pane with
+/// `--format ansi`, as `read_screen_with_cancellation` already does).
+pub(crate) fn muse_ansi_composer_is_empty(screen: &str) -> Option<bool> {
+    if !screen.contains('\u{1b}') {
+        return None;
+    }
+    let rendered = crate::submission::render_screen(screen);
+    let plain: String = rendered
+        .iter()
+        .map(|(row, _)| crate::submission::text_of(row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    muse_composer_regions(&plain, false)?;
+    let plain_lines = splitlines(&plain);
+    let dividers: Vec<usize> = plain_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| is_divider(line).then_some(index))
+        .collect();
+    if dividers.len() < 2 {
+        return None;
+    }
+    let (top, bottom) = (dividers[dividers.len() - 2], dividers[dividers.len() - 1]);
+    // Faint/reverse-only text is blank in the solid view.
+    let solid: String = rendered[top + 1..bottom]
+        .iter()
+        .map(|(_, row)| crate::submission::text_of(row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let solid = solid.trim_start_matches(['❯', '›', ' ', '\t']);
+    if strip(solid).is_empty() {
+        return Some(true);
+    }
+    let cells = ansi_cells(screen);
+    if cells.len() != rendered.len() {
+        return None;
+    }
+    // The status line's foreground: the most common non-default colour below the
+    // bottom rule. The hint shares it, so a future grey still matches its screen.
+    let mut footer_counts: Vec<(CellFg, usize)> = Vec::new();
+    for row in &cells[bottom + 1..] {
+        for (character, fg, _) in row {
+            if character.is_whitespace() || *fg == CellFg::Default {
+                continue;
+            }
+            if let Some(entry) = footer_counts.iter_mut().find(|(known, _)| known == fg) {
+                entry.1 += 1;
+            } else {
+                footer_counts.push((*fg, 1));
+            }
+        }
+    }
+    let footer_fg = footer_counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(fg, _)| *fg);
+    // Composer text cells: everything except whitespace and the leading glyph.
+    let mut text_cells: Vec<(CellFg, bool)> = Vec::new();
+    for (offset, row) in cells[top + 1..bottom].iter().enumerate() {
+        for (position, (character, fg, faint)) in row.iter().enumerate() {
+            if character.is_whitespace() {
+                continue;
+            }
+            if offset == 0 && position <= 1 && matches!(character, '❯' | '›') {
+                continue;
+            }
+            text_cells.push((*fg, *faint));
+        }
+    }
+    if text_cells.is_empty() {
+        return Some(true);
+    }
+    Some(
+        text_cells.iter().all(|(_, faint)| *faint)
+            || text_cells.iter().all(|(fg, _)| *fg == HINT_GREY)
+            || footer_fg.is_some_and(|grey| text_cells.iter().all(|(fg, _)| *fg == grey)),
+    )
+}
+
 /// Markers Muse draws in front of the editor's first line and in front of each user turn.
 const PROMPT_MARKERS: [&str; 2] = ["❯", "›"];
 /// Markers that end one rendered user turn: the answer marker, the next user turn, or the progress
@@ -245,8 +567,9 @@ fn muse_turn_running(transcript: &str) -> bool {
 }
 
 /// An empty editor below a transcript that does not end in Muse's progress line.
-fn muse_editor_idle(transcript: &str, composer: &str) -> bool {
-    PROMPT_MARKERS.contains(&strip(composer)) && !muse_turn_running(transcript)
+/// A composer holding only a placeholder hint is empty (#1773).
+fn muse_editor_idle_w(transcript: &str, composer: &str, width: Option<usize>) -> bool {
+    muse_composer_is_empty_w(composer, width) && !muse_turn_running(transcript)
 }
 
 /// Recognize Muse's progress line above the editor after live-Muse process verification.
@@ -257,8 +580,9 @@ pub(crate) fn muse_verified_process_turn_running(screen: &str) -> bool {
 
 /// Recognize Muse's idle composer without mistaking a choice prompt for it.
 pub(crate) fn muse_idle_composer(screen: &str) -> bool {
+    let width = muse_divider_width(screen);
     muse_composer_regions(screen, true)
-        .is_some_and(|(transcript, composer)| muse_editor_idle(&transcript, &composer))
+        .is_some_and(|(transcript, composer)| muse_editor_idle_w(&transcript, &composer, width))
 }
 
 /// Require the Auto-review footer on the active empty composer.
@@ -276,7 +600,7 @@ pub(crate) fn muse_auto_review_idle_composer(screen: &str) -> bool {
     let Some((transcript, composer)) = muse_composer_regions(screen, true) else {
         return false;
     };
-    if !muse_editor_idle(&transcript, &composer) {
+    if !muse_editor_idle_w(&transcript, &composer, muse_divider_width(screen)) {
         return false;
     }
     let lines = splitlines(screen);
@@ -288,8 +612,9 @@ pub(crate) fn muse_auto_review_idle_composer(screen: &str) -> bool {
 
 /// Recognize an idle editor after exact live-Muse process verification.
 pub(crate) fn muse_verified_process_idle_composer(screen: &str) -> bool {
+    let width = muse_divider_width(screen);
     muse_composer_regions(screen, false)
-        .is_some_and(|(transcript, composer)| muse_editor_idle(&transcript, &composer))
+        .is_some_and(|(transcript, composer)| muse_editor_idle_w(&transcript, &composer, width))
 }
 
 /// Recognize a possibly nonempty editor after live-Muse process verification.
@@ -596,6 +921,11 @@ pub(crate) fn muse_verified_process_paste_drawn(screen: &str, text: &str) -> Mus
     {
         return MusePasteDrawn::Whole;
     }
+    // A ghost hint is no draw of this paste (#1773): checked after `Whole` so a
+    // staged paste whose text is itself a hint still counts as drawn.
+    if muse_editor_is_hint_w(&editor, muse_divider_width(screen)) {
+        return MusePasteDrawn::Nothing;
+    }
     let wanted = normalize(text);
     let mut prefixes = BTreeSet::from([String::new()]);
     for (index, segment) in segments.iter().enumerate() {
@@ -724,11 +1054,15 @@ pub(crate) fn muse_verified_process_editor_rows(screen: &str) -> Option<String> 
 
 /// The draft Muse's editor holds, after live-Muse process verification: its rows as drawn, or
 /// the length a long paste's placeholder shows. `None` when the screen shows no recognisable
-/// editor, or an empty one (#720 agentctl-muse-stale-draft).
+/// editor, an empty one, or one holding only a placeholder hint (#720
+/// agentctl-muse-stale-draft, #1773 agentctl-muse-placeholder-hint-as-draft).
 pub(crate) fn muse_verified_process_editor_draft(
     screen: &str,
 ) -> Option<crate::stale_draft::Draft> {
     let (_, editor) = muse_composer_regions(screen, false)?;
+    if muse_editor_is_hint_w(&editor, muse_divider_width(screen)) {
+        return None;
+    }
     let segments = muse_editor_segments(&editor)?;
     if let [segment] = segments.as_slice() {
         let placeholder = segment
@@ -743,9 +1077,16 @@ pub(crate) fn muse_verified_process_editor_draft(
     (!segments.is_empty()).then(|| crate::stale_draft::Draft::Text(segments.join("\n")))
 }
 
-/// Whether `rows` from [`muse_verified_process_editor_rows`] hold nothing but the prompt marker.
+/// Whether `rows` from [`muse_verified_process_editor_rows`] hold nothing but the prompt
+/// marker, or only a placeholder hint (#1773).
 pub(crate) fn muse_editor_rows_empty(rows: &str) -> bool {
+    muse_editor_rows_empty_w(rows, None)
+}
+
+/// [`muse_editor_rows_empty`] with the frame's rule `width` for edge-truncated hints.
+pub(crate) fn muse_editor_rows_empty_w(rows: &str, width: Option<usize>) -> bool {
     muse_editor_segments(rows).is_some_and(|segments| segments.is_empty())
+        || muse_editor_is_hint_w(rows, width)
 }
 
 /// How many items of Muse's `◆ Queued input` block above its editor show `text`: its text,
@@ -1636,6 +1977,187 @@ mod tests {
             &frame("❯ /model\n  watermelon-full-preview"),
             "/model"
         ));
+    }
+
+    #[test]
+    fn a_placeholder_hint_is_an_empty_editor_idle_and_mid_run() {
+        // #1773: Muse 1.4.23 draws a dim hint inside an empty composer; a text
+        // capture returns it as plain text, where it read as a foreign draft.
+        let divider = "─".repeat(40);
+        let footer = "m · xhigh · /w · YOLO\n";
+        let idle_frame =
+            |editor: &str| format!("◆ prior answer\n{divider}\n{editor}\n{divider}\n{footer}");
+        let busy_frame = |editor: &str| {
+            format!(
+                "◇ Thinking (3s · esc to interrupt)\n◆ Backgrounded · Run build · 12s\n\
+                 {divider}\n{editor}\n{divider}\n{footer}"
+            )
+        };
+        for hint in [
+            "Ask to monitor a running build or log and get pinged on changes",
+            "Tab queues or steers while a run is active",
+        ] {
+            assert_eq!(
+                hint.chars().count(),
+                if hint.starts_with("Ask") { 63 } else { 42 }
+            );
+            let idle = idle_frame(&format!("❯ {hint}"));
+            assert!(muse_verified_process_idle_composer(&idle), "{hint}");
+            assert!(
+                muse_idle_composer(&format!("  Muse Code 1.4.23\n{idle}")),
+                "{hint}"
+            );
+            assert!(
+                muse_verified_process_editor_draft(&idle).is_none(),
+                "{hint}"
+            );
+            assert_eq!(muse_verified_pane_status("idle", &idle), "idle", "{hint}");
+            assert_eq!(
+                muse_verified_process_paste_drawn(&idle, "a real prompt"),
+                MusePasteDrawn::Nothing,
+                "{hint}"
+            );
+            // Mid-run the same ghost is a working pane, never staged.
+            let busy = busy_frame(&format!("❯ {hint}"));
+            assert!(!muse_verified_process_idle_composer(&busy), "{hint}");
+            assert!(
+                muse_verified_process_editor_draft(&busy).is_none(),
+                "{hint}"
+            );
+            assert_eq!(
+                muse_verified_pane_status("idle", &busy),
+                "working",
+                "{hint}"
+            );
+            assert!(
+                crate::harness_tui::muse::MuseTui::editor_empty(&busy),
+                "{hint}"
+            );
+        }
+        // A real human draft and an unknown long text still fail closed.
+        for draft in [
+            "❯ please review my change before you run anything",
+            "❯ Ask to monitor a running build or log and get pinged on changes please",
+            "❯ a long unknown sentence that no hint table knows about at all here",
+        ] {
+            let screen = idle_frame(draft);
+            assert!(!muse_verified_process_idle_composer(&screen), "{draft}");
+            assert!(
+                muse_verified_process_editor_draft(&screen).is_some(),
+                "{draft}"
+            );
+            assert_eq!(
+                muse_verified_pane_status("idle", &screen),
+                "staged",
+                "{draft}"
+            );
+            assert_eq!(
+                muse_verified_process_paste_drawn(&screen, "a real prompt"),
+                MusePasteDrawn::Other,
+                "{draft}"
+            );
+        }
+        // An agentctl staged paste, literal or collapsed, is still a draft.
+        let brief = "x".repeat(1700);
+        let staged = idle_frame(&format!(
+            "❯ [Pasted Content {} chars]",
+            muse_paste_length(&brief)
+        ));
+        assert!(muse_verified_process_editor_draft(&staged).is_some());
+        assert_eq!(muse_verified_pane_status("idle", &staged), "staged");
+        assert_eq!(
+            muse_verified_process_paste_drawn(&staged, &brief),
+            MusePasteDrawn::Whole
+        );
+        let literal = idle_frame("❯ [from lead via agentctl · reply: agentctl send lead] hello");
+        assert!(muse_verified_process_editor_draft(&literal).is_some());
+        // Narrow panes wrap a long hint across rows, or cut it at the edge
+        // (with or without an ellipsis): all three read empty; a short prefix
+        // or edge-full unknown text still fails closed.
+        let long_hint = "Ask to monitor a running build or log and get pinged on changes";
+        for width in [40usize, 60] {
+            let rule = "─".repeat(width);
+            let frame =
+                |editor: &str| format!("◆ prior answer\n{rule}\n{editor}\n{rule}\n{footer}");
+            // Wrapped: break the hint (after the marker) into width-full rows.
+            let mut rows: Vec<String> = Vec::new();
+            let mut rest = format!("❯ {long_hint}");
+            while rest.chars().count() > width {
+                let cut: String = rest.chars().take(width).collect();
+                rows.push(cut);
+                rest = rest.chars().skip(width).collect();
+            }
+            rows.push(rest);
+            let wrapped = frame(&rows.join("\n"));
+            assert!(
+                muse_verified_process_idle_composer(&wrapped),
+                "wrapped {width}: {wrapped}"
+            );
+            assert!(
+                muse_verified_process_editor_draft(&wrapped).is_none(),
+                "wrapped {width}"
+            );
+            // Truncated at the edge: one width-full row, no ellipsis.
+            let cut: String = format!("❯ {long_hint}").chars().take(width).collect();
+            let truncated = frame(&cut);
+            assert!(
+                muse_verified_process_idle_composer(&truncated),
+                "cut {width}: {truncated}"
+            );
+            assert!(
+                muse_verified_process_editor_draft(&truncated).is_none(),
+                "cut {width}"
+            );
+            // Unknown text filling the same edge is still a draft.
+            let unknown = frame(
+                &"❯ an unknown draft that fills this row!!"
+                    .chars()
+                    .take(width)
+                    .collect::<String>(),
+            );
+            assert!(
+                !muse_verified_process_idle_composer(&unknown),
+                "unknown {width}"
+            );
+            assert!(
+                muse_verified_process_editor_draft(&unknown).is_some(),
+                "unknown {width}"
+            );
+        }
+        // An ellipsis cut needs no edge, a short prefix is never enough.
+        let ellipsised = idle_frame("❯ Ask to monitor a running build or log and get pinged…");
+        assert!(muse_verified_process_idle_composer(&ellipsised));
+        let short = idle_frame("❯ /goal pins a ses");
+        assert!(!muse_verified_process_idle_composer(&short));
+        assert!(muse_verified_process_editor_draft(&short).is_some());
+        // Faint styling alone proves a ghost on an ANSI read, even for new text.
+        let faint = format!(
+            "◆ prior answer\n{divider}\n❯ \u{1b}[2ma future hint nobody listed\u{1b}[0m\n{divider}\n{footer}"
+        );
+        assert_eq!(muse_ansi_composer_is_empty(&faint), Some(true));
+        // Live 1.4.23 styling (coordb evidence): blue glyph, truecolor-grey hint,
+        // grey status line. The exact sequence must read empty; the same words in
+        // default intensity are typed text and must not.
+        let grey = format!(
+            "◆ prior answer\n{divider}\n\
+             \u{1b}[0m\u{1b}[38;2;90;160;255m❯ \u{1b}[0m\u{1b}[38;2;103;108;116m\
+             Type @ to search and insert workspace file paths\u{1b}[0m\n{divider}\n\
+             \u{1b}[38;2;103;108;116mm · xhigh · /w · YOLO\u{1b}[0m\n"
+        );
+        assert_eq!(muse_ansi_composer_is_empty(&grey), Some(true), "{grey:?}");
+        assert!(crate::harness_tui::muse::MuseTui::editor_empty(&grey));
+        let typed = grey.replace("\u{1b}[38;2;103;108;116mType @", "Type @");
+        assert_eq!(
+            muse_ansi_composer_is_empty(&typed),
+            Some(false),
+            "{typed:?}"
+        );
+        assert!(!crate::harness_tui::muse::MuseTui::editor_empty(&typed));
+        let solid = format!(
+            "◆ prior answer\n{divider}\n❯ a future hint nobody listed\n{divider}\n{footer}"
+        );
+        assert_eq!(muse_ansi_composer_is_empty(&solid), None);
+        assert!(muse_verified_process_editor_draft(&solid).is_some());
     }
 
     #[test]

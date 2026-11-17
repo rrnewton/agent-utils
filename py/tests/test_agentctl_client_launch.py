@@ -263,6 +263,72 @@ def test_current_muse_yolo_footer_is_an_idle_composer() -> None:
     assert not client_module.muse_idle_composer(choice)
 
 
+def test_muse_placeholder_hint_tables_agree() -> None:
+    # #1773: one versioned hint set; the Python table must equal the Rust
+    # `MUSE_PROMPT_HINTS` const, so a Muse hint change updates both.
+    import re
+
+    rust = (
+        Path(__file__).resolve().parents[2]
+        / "rs/agentctl/src/client/muse_editor.rs"
+    ).read_text(encoding="utf-8")
+    block = rust.split("MUSE_PROMPT_HINTS", 1)[1].split("];", 1)[0]
+    rust_hints = re.findall(r'"((?:[^"\\]|\\.)*)"', block)
+    assert rust_hints == list(client_module._MUSE_PROMPT_HINTS)
+    assert len(rust_hints) == 23
+
+
+def test_a_muse_placeholder_hint_is_an_empty_editor() -> None:
+    # #1773: a dim ghost hint in an empty composer is not a draft.
+    divider = "─" * 40
+    footer = "m · xhigh · /w · YOLO\n"
+
+    def frame(editor: str, transcript: str = "◆ prior answer") -> str:
+        return f"{transcript}\n{divider}\n{editor}\n{divider}\n{footer}"
+
+    for hint in (
+        "Ask to monitor a running build or log and get pinged on changes",
+        "Tab queues or steers while a run is active",
+    ):
+        screen = frame(f"❯ {hint}")
+        assert muse_verified_process_idle_composer(screen), hint
+        assert client_module._muse_editor_is_hint(f"❯ {hint}"), hint
+        busy = frame(
+            f"❯ {hint}",
+            transcript="◇ Thinking (3s · esc to interrupt)\n◆ Backgrounded · Run build · 12s",
+        )
+        assert not muse_verified_process_idle_composer(busy), hint
+    # Narrow panes wrap or cut a long hint; both read empty, unknown text does not.
+    long_hint = "Ask to monitor a running build or log and get pinged on changes"
+    for width in (40, 60):
+        rule = "─" * width
+
+        def narrow(editor: str) -> str:
+            return f"◆ prior answer\n{rule}\n{editor}\n{rule}\n{footer}"
+
+        wrapped = narrow("\n".join(
+            (f"❯ {long_hint}")[i:i + width]
+            for i in range(0, len(f"❯ {long_hint}"), width)
+        ))
+        assert muse_verified_process_idle_composer(wrapped), (width, wrapped)
+        cut = narrow((f"❯ {long_hint}")[:width])
+        assert muse_verified_process_idle_composer(cut), (width, cut)
+        assert not muse_verified_process_idle_composer(
+            narrow("❯ an unknown draft that fills this row!!"[:width])
+        )
+    assert muse_verified_process_idle_composer(
+        frame("❯ Ask to monitor a running build or log and get pinged…")
+    )
+    assert not muse_verified_process_idle_composer(frame("❯ /goal pins a ses"))
+    assert not muse_verified_process_idle_composer(frame("❯ please review my change"))
+    assert not muse_verified_process_idle_composer(
+        frame("❯ Ask to monitor a running build or log and get pinged on changes please")
+    )
+    assert not muse_verified_process_idle_composer(
+        frame("❯ [Pasted Content 1700 chars]")
+    )
+
+
 def test_a_paste_muse_wraps_inside_a_word_or_a_path_is_still_the_exact_editor() -> None:
     # Muse 1.4.14 wraps a long line at any character, inside a word or a path (#505
     # agentctl-muse-followup; rs/agentctl/testdata/muse-busy/muse-wrapped-draft.txt), so a
