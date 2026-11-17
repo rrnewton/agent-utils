@@ -428,7 +428,10 @@ pub(crate) fn append_event(cfg: &Cfg, machine: &str, kind: &str, payload: Value)
     if kind == "active-state-recorded" {
         // Defence in depth (#1807): the payload must continue the revision
         // the log currently ends at, never a stale state a lock-free
-        // preparation captured before another slot's event landed.
+        // preparation captured before another slot's event landed. This
+        // scan walks every event on each active append; that is fine for
+        // now (the chain was just loaded and verified above), and a
+        // revision-only tip index would be the optimisation if it bites.
         let mut derived_revision: Option<i64> = None;
         for event in &events {
             match event.get("kind").and_then(Value::as_str) {

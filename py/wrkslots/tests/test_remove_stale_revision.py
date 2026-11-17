@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -122,3 +123,35 @@ def test_write_active_state_refuses_a_stale_previous(
         cli._load_active_snapshot(config, "testhost", require_repository=False)
         == active_before
     )
+
+
+def test_write_active_state_refuses_a_stale_previous_without_an_event_log(
+    tmp_path: Path,
+) -> None:
+    """The defence's empty-log branch judges ``previous`` by the snapshot."""
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path, count=1)
+    config = cli._load_config(str(project), "testhost")
+    snapshot = cli._load_active_snapshot(config, "testhost", require_repository=False)
+    shutil.rmtree(cli._event_directory(config, "testhost"))
+    stale = dataclasses.replace(snapshot, revision=snapshot.revision - 1)
+    record = cli._find_record(snapshot, slots[0])
+    writer = cli._EventWriter(
+        directory=cli._event_directory(config, "testhost"),
+        machine="testhost",
+        sequence=1,
+        previous_sha256="0" * 64,
+    )
+    with pytest.raises(cli.StateError, match="stale previous revision"):
+        cli._write_active_state(
+            config,
+            cli._replace_record(
+                snapshot, dataclasses.replace(record, heartbeat_at=cli._utc_now())
+            ),
+            action="ttl-renewed",
+            slot=slots[0],
+            require_repository=False,
+            event_writer=writer,
+            previous=stale,
+        )
+    assert not cli._event_directory(config, "testhost").exists()
