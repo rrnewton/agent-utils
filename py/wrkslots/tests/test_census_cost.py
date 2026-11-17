@@ -2092,6 +2092,10 @@ def test_audit_record_with_precomputed_folds_never_refolds(
     counting half of this test fails, which the equality half cannot see.
     """
 
+    # Fixed clock (#1765 wrkslots-load-sensitive-gate-tests): the two rows
+    # must differ only in how they were folded, never in a wall-clock
+    # heartbeat age read seconds apart under load.
+    monkeypatch.setattr(cli, "_heartbeat_diagnosis", lambda record: (100.0, False))
     config = _config(tmp_path)
     (record,) = _records(1)
     events: list[dict[str, object]] = [
