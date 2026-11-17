@@ -38,7 +38,7 @@ use crate::handoff_state::{
 };
 use crate::handoff_write::publication;
 use crate::hold_write::{active_document, current_hold, holds_from_events, validate_global};
-use crate::journal_state::journal_forward_compatible;
+use crate::journal_state::{journal_forward_compatible, JOURNAL_EXTENSION_KEYS};
 use crate::remove_write::{
     assert_slot_unused_snapshot, capture_process_snapshot, liveness_answer, ProcessSnapshot,
 };
@@ -6054,8 +6054,6 @@ fn cleanup_target(cfg: &Cfg, value: &Value, label: &str) -> Result<(String, i64,
     Ok((slot, generation, path))
 }
 
-const JOURNAL_EXTENSION_KEYS_WITH_OPERATOR: [&str; 2] = ["x", "operator"];
-
 /// One seal journal, validated like `_validate_batch_seal_journal`.
 pub(crate) fn seal_journal(cfg: &Cfg, path: &Path, value: &Value) -> Result<(String, SealTargets)> {
     let label = "validation-batch seal journal";
@@ -6071,7 +6069,7 @@ pub(crate) fn seal_journal(cfg: &Cfg, path: &Path, value: &Value) -> Result<(Str
             "actor",
             "targets",
         ],
-        &JOURNAL_EXTENSION_KEYS_WITH_OPERATOR,
+        &JOURNAL_EXTENSION_KEYS,
         label,
     )?;
     if as_int(&raw["schema"], &format!("{label}.schema"), 0)? != 1 {

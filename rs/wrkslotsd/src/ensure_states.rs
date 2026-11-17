@@ -660,7 +660,10 @@ pub(crate) fn seal_owner_liveness(
     // The recorded batch process is the proven identity (#1736):
     // judge it alone when the seal carries one. This process itself
     // never blocks itself, as the scan below excludes its own pid.
-    if let Some(operator_value) = value.get("operator") {
+    let operator_value = value
+        .get("x")
+        .and_then(|extension| extension.get("operator"));
+    if let Some(operator_value) = operator_value {
         if !operator_value.is_null()
             && operator_value.get("pid").and_then(Value::as_i64)
                 != Some(i64::from(std::process::id()))

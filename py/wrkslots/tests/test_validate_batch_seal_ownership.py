@@ -535,14 +535,16 @@ def _crashed_seal(
 def _rewrite_actor(seal: Path, **fields: object) -> None:
     raw = json.loads(seal.read_text())
     raw["actor"].update(fields)
-    if isinstance(raw.get("operator"), dict):
-        raw["operator"].update(fields)
+    if isinstance(raw.get("x"), dict) and isinstance(raw["x"].get("operator"), dict):
+        raw["x"]["operator"].update(fields)
     seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
 
 
 def _rewrite_operator(seal: Path, pid: int) -> None:
     raw = json.loads(seal.read_text())
-    raw["operator"] = wrkslots._identity_to_obj(wrkslots._read_process_identity(pid))
+    raw.setdefault("x", {})["operator"] = wrkslots._identity_to_obj(
+        wrkslots._read_process_identity(pid)
+    )
     seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
 
 
@@ -1043,7 +1045,7 @@ def test_adopt_calls_a_seal_whose_batch_is_gone_interrupted_even_if_coordinator_
     )
     # The batch process itself stays the crashed (dead) one.
     raw = json.loads(seal.read_text())
-    raw["operator"]["pid"] = 2_147_483_647
+    raw["x"]["operator"]["pid"] = 2_147_483_647
     seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
     sealed = seal.read_bytes()
 
@@ -1175,6 +1177,104 @@ def test_a_real_running_batch_is_in_progress_to_adopt_and_recover(
     assert not seal.exists()
     assert not target.exists()
     assert active_slots(project) == []
+
+
+def test_a_new_seal_still_parses_with_the_old_reader_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The operator lives in "x" (#1736): old readers still retire it.
+
+    An old reader checks the schema-1 exact keys {schema, kind,
+    machine, created_at, actor, targets, x} and ignores the contents
+    of "x"; it must parse a new seal and judge it orphaned from its
+    actor alone, so an old create auto-retires it and an old recover
+    can read it.
+    """
+
+    _project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(seal, pid=2_147_483_647)
+    raw = json.loads(seal.read_text())
+    assert set(raw) <= {
+        "schema", "kind", "machine", "created_at", "actor", "targets", "x",
+    }
+    assert raw["schema"] == 1
+    assert "operator" in raw["x"]
+    # The crashed batch's actor is dead here (its coordinator was the
+    # invoking process, which has exited): the old actor-only orphan
+    # judgement retires the seal without ever reading "x".
+    config = wrkslots._load_config(str(_project), "testhost")
+    orphaned, _reason = wrkslots._validate_batch_seal_orphaned(config, seal)
+    assert orphaned
+
+
+def test_adopt_wait_stops_when_the_batch_dies_mid_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Killing the batch mid-wait ends the wait as interrupted (#1736).
+
+    Adopt waits on the seal's pidfd; when the operator process dies
+    the waiter wakes at once, re-judges, and refuses as interrupted
+    naming recover instead of sleeping out its --wait-lock budget.
+    """
+
+    import threading
+
+    project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
+    _rewrite_actor(
+        seal, **dataclasses.asdict(wrkslots._read_process_identity(os.getpid()))
+    )
+    operator = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(120)",
+            "-m",
+            "wrkslots",
+            "--project-root",
+            str(project),
+            "remove",
+            "target",
+        ]
+    )
+    _rewrite_operator(seal, operator.pid)
+    sealed = seal.read_bytes()
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "target")
+    outcome: dict[str, int] = {}
+
+    def run_adopt() -> None:
+        outcome["rc"] = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "--wait-lock",
+                "30",
+                "adopt",
+                "target",
+                "--agent",
+                record.agent,
+                "--owner-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+
+    worker = threading.Thread(target=run_adopt, daemon=True)
+    worker.start()
+    worker.join(timeout=2)
+    assert worker.is_alive(), "adopt did not wait on the live seal"
+    operator.kill()
+    operator.wait()
+    worker.join(timeout=30)
+    assert not worker.is_alive(), "adopt slept out its budget on a dead batch"
+    assert outcome["rc"] == 3
+    err = capsys.readouterr().err
+    assert "interrupted validation-batch seal recorded" in err
+    assert "wrkslots recover" in err
+    assert seal.read_bytes() == sealed
 
 
 def test_recover_refuses_a_seal_whose_batch_is_still_running(
