@@ -922,5 +922,9 @@ stay its owner's (#1524). The pane itself already ends above the
   }
 
   /* The chips' lift over the docked pane is `--channel-pane-bottom` now, consumed by
-   * `#scroll-tools`' own `bottom` (09-to-do-view.css, `#1813`), so no rule here. */
+   * `#scroll-tools`' own `bottom` (09-to-do-view.css, `#1813`), so no rule here.
+   * The same helper lifts `#status-line` (15-dock.css), which is the
+   * `#1779 vibe-talk-toast-avoids-discuss-controls` fix on this base: the pill
+   * stands by the pane's docked height (and centred on the channel pane on a
+   * desk), so it no longer covers the docked pane's controls. */
 }

@@ -211,6 +211,21 @@ class Walk:
         self.check(bool(self.page.evaluate(script)), why)
 
 
+TOAST_CLEAR_JS = """() => {
+    const drawn = (e) => Boolean(e) && e.getClientRects().length > 0;
+    const box = (e) => { const r = e.getBoundingClientRect();
+        return {left: r.left, top: r.top, right: r.right, bottom: r.bottom}; };
+    const toast = document.getElementById('status-line');
+    const panel = document.getElementById('discuss-panel');
+    if (!drawn(toast) || toast.hidden || !drawn(panel) || panel.hidden) return null;
+    const dismiss = document.getElementById('dismiss-status');
+    const r = dismiss.getBoundingClientRect();
+    const found = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return {toast: box(toast), panel: box(panel),
+            dismissHit: found === dismiss || dismiss.contains(found)};
+}"""
+
+
 def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     page, api = walk.page, walk.api
     if keyboard:
@@ -231,6 +246,30 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
             page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
             page.click("#discuss-menu-open")
         page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        walk.settled()
+        # `#1779 vibe-talk-toast-avoids-discuss-controls`: the dealt-with toast
+        # must not sit over the docked pane (its head, disclosure rows or ask bar).
+        page.evaluate("""() => {
+            document.getElementById('status').textContent =
+                '1 message marked as dealt with here — not in the source chat service.';
+            document.getElementById('status-line').hidden = false;
+        }""")
+        walk.until("() => { const t = document.getElementById('status-line');"
+                   " return !t.hidden && t.getClientRects().length > 0; }",
+                   "the dealt-with toast did not appear over the docked Discuss pane")
+        walk.settled()
+        measured = page.evaluate(TOAST_CLEAR_JS)
+        walk.check(measured is not None, f"toast or Discuss pane not drawn: {measured}")
+        if measured is not None:
+            toast, panel = measured["toast"], measured["panel"]
+            overlap = (toast["left"] < panel["right"] - 0.5 and panel["left"] < toast["right"] - 0.5
+                       and toast["top"] < panel["bottom"] - 0.5 and panel["top"] < toast["bottom"] - 0.5)
+            walk.check(not overlap,
+                       f"the toast covers the docked Discuss pane: toast={toast} panel={panel}")
+            walk.check(bool(measured["dismissHit"]),
+                       f"the toast's dismiss control is covered at its centre: {measured}")
+        walk.shot("toast-discuss-clear")
+        page.evaluate("() => { document.getElementById('status-line').hidden = true; }")
         walk.settled()
     walk.shot("before-search")
     page.click("#search-toggle")
