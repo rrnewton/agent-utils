@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-dangling-nested-gitfile-under-ignored: a dangling gitlink under ignored content is probed as a repository and blocks removal'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -28,3 +28,7 @@ updated_at: 2026-11-17T09:50:00-05:00
 # Notes
 
 Known edge, deliberately left: a gitfile whose gitdir exists but is not a repository (for example an empty directory) is still probed as a repository and refuses as before. Only a gitdir that does not resolve at all is a dangling gitlink here.
+
+## Resolution
+
+Landed on github/main as `e0c1144271965c955b0fcf94d0f54464296f5d62` (replayed from gated `e061f982`): `_is_dangling_gitlink` in `py/wrkslots/cli.py` (Rust `is_dangling_gitlink` in `rs/wrkslotsd/src/finish_write.rs`) classifies a `.git` file whose gitdir does not resolve as plain files, reusing `_submodule_worktree_populated`. Ignored-file collection records the gitfile itself once as an ignored file (named by path in the salvage receipt) and collects the files beside it; unlisted-submodule discovery skips it. A `.git` directory or a resolving gitfile is judged exactly as before. Focused lifecycle tests (dangling archived and discarded, resolvable nested still refusing, `.git` directory unchanged) and the Rust remove differential pass; the full gate passed on the gated tree.
