@@ -2241,13 +2241,21 @@ test("documents list filter: filename and title match case-insensitively, order 
     assert.deepEqual(keys(), ["doc-a", "doc-b", "doc-c"]);
     list.setNameFilter("ALPHA");
     assert.deepEqual(keys(), ["doc-a", "doc-c"], "the filter did not keep filename and title hits in list order");
+    // `#1783 vibe-talk-review-nits-1761-1762-1767` (c): the count line follows
+    // the active filter — "N of M documents", not the unfiltered total.
+    assert.ok(listEl.children[0].textContent.includes("2 of 3 documents"),
+      `the count line ignores the name filter: ${listEl.children[0].textContent}`);
     list.setNameFilter("roadmap");
     assert.deepEqual(keys(), ["doc-a"], "a title-only fragment did not narrow the list");
+    assert.ok(listEl.children[0].textContent.includes("1 of 3 documents"),
+      `the count line ignores the narrowed filter: ${listEl.children[0].textContent}`);
     list.setNameFilter("zebra");
     assert.deepEqual(keys(), [], "a no-match filter still showed cards");
     assert.ok(listEl.textContent.includes("No documents match"), `the no-match state is missing: ${listEl.textContent.slice(0, 200)}`);
     list.setNameFilter("");
     assert.deepEqual(keys(), ["doc-a", "doc-b", "doc-c"], "clearing the filter did not restore the list");
+    assert.ok(!listEl.children[0].textContent.includes(" of 3 documents"),
+      `the count line still claims a filter after clearing: ${listEl.children[0].textContent}`);
     assert.ok(!paths.some((path) => path.includes("/search")), `the local filter called the server: ${paths.join(", ")}`);
   });
 });

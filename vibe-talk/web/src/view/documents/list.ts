@@ -815,10 +815,17 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       list.replaceChildren(note);
       return;
     }
+    const shown = visibleRows();
     const head = document.createElement("p");
     head.className = "doc-list-head";
-    head.textContent = `Oldest first · ${totalNow || rowsNow.length} documents · newest at the bottom`;
-    const shown = visibleRows();
+    // `#1783 vibe-talk-review-nits-1761-1762-1767` (c): with a filter active
+    // (name/title words, a bucket, or Starred — anything that narrows the
+    // cards below every loaded document) the line says how many of the loaded
+    // documents are showing, not the unfiltered total; unfiltered it reads
+    // as before, against the server's total where one was stated.
+    head.textContent = shown.length !== rowsNow.length
+      ? `Oldest first · ${shown.length} of ${rowsNow.length} documents · newest at the bottom`
+      : `Oldest first · ${totalNow || rowsNow.length} documents · newest at the bottom`;
     const cards = shown.map(cardFor);
     const undo = undoChip();
     if (shown.length === 0) {
