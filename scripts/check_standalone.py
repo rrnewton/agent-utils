@@ -54,6 +54,10 @@ class CheckError(RuntimeError):
     """One subset failed to work on its own."""
 
 
+class NoResultError(CheckError):
+    """No verdict: a generous backstop ran out before the checked condition held (#1765)."""
+
+
 def suite_commands() -> frozenset[str]:
     """Every command name the suite installs, read from the tree so a new tool is covered."""
 
@@ -158,6 +162,13 @@ class Subset:
     withheld: tuple[str, ...] = ()
 
 
+#: Generous backstop for the standalone removal condition wait (#1765):
+#: about 15x the worst loaded observation (113 s); it bounds a hang, never
+#: decides the verdict, and running out reports no result (exit 75).
+_REMOVE_BACKSTOP_SECONDS = 1800
+_REMOVE_POLL_SECONDS = 2.0
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise CheckError(message)
@@ -251,14 +262,37 @@ def wrkslots_scenario(box: Sandbox) -> None:
     _require("Work committed on worker-a/t1." in handoff, f"handoff not returned:\n{handoff}")
     # The scenario proves the standalone lifecycle, not lock-budget
     # enforcement: its removal must not race the product's 60-second
-    # remove budget under host load (#1748). The default stays.
-    box.run(
-        ["wrkslots", "remove", "s1", "--coordinator-pid", pid, "--expected-generation", "1",
-         "--no-lock-budget"],
-        cwd=project,
-        timeout=600,
-    )
-    status = box.run(["wrkslots", "status"], cwd=project)
+    # remove budget under host load (#1748, #1765). The default stays.
+    # The verdict waits on the completion condition (no active slot and
+    # no slot directory) behind a generous backstop; only the backstop
+    # running out ends the wait, and that reports no result, not a
+    # failure (owner rule 346: condition-based waits only).
+    backstop = time.monotonic() + _REMOVE_BACKSTOP_SECONDS
+    try:
+        box.run(
+            ["wrkslots", "remove", "s1", "--coordinator-pid", pid, "--expected-generation", "1",
+             "--no-lock-budget"],
+            cwd=project,
+            timeout=_REMOVE_BACKSTOP_SECONDS,
+        )
+    except CheckError as exc:
+        if "timed out after" in str(exc):
+            raise NoResultError(
+                f"standalone wrkslots removal produced no result within the "
+                f"{_REMOVE_BACKSTOP_SECONDS}s backstop (#1765)"
+            ) from exc
+        raise
+    status = ""
+    while True:
+        status = box.run(["wrkslots", "status"], cwd=project)
+        if " active=0 " in status and not (project / "worktrees" / "slots" / "s1").exists():
+            break
+        if time.monotonic() >= backstop:
+            raise NoResultError(
+                f"standalone wrkslots removal produced no result: the slot was still "
+                f"present after the {_REMOVE_BACKSTOP_SECONDS}s backstop (#1765):\n{status}"
+            )
+        time.sleep(_REMOVE_POLL_SECONDS)
     _require(" active=0 " in status, f"slot still active after remove:\n{status}")
     _require(not (project / "worktrees" / "slots" / "s1").exists(), "slot directory remains")
     subject = box.run(["git", "log", "-1", "--format=%s", "worker-a/t1"], cwd=product)
@@ -503,6 +537,9 @@ def main(argv: list[str] | None = None) -> int:
     for subset in chosen:
         try:
             elapsed = check(subset, arguments.keep)
+        except NoResultError as exc:
+            print(f"check_standalone: NO_RESULT: {subset.name}: {exc}", file=sys.stderr)
+            return 75
         except (CheckError, OSError, subprocess.SubprocessError) as exc:
             print(f"check_standalone: FAIL: {subset.name}: {exc}", file=sys.stderr)
             return 1

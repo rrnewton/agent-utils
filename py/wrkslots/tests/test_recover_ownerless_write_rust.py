@@ -128,6 +128,7 @@ def _python(
     return wrkslots_cli._cmd_recover_ownerless_agent_worktree(args)
 
 
+@pytest.mark.load_quarantine  # #1765 wrkslots-load-sensitive-gate-tests
 def test_ownerless_worktree_plan_matches_python(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

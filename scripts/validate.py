@@ -867,7 +867,8 @@ INCLUDE_DISABLED_ENV = "AGENT_UTILS_INCLUDE_DISABLED"
 DISABLED_OPTIN_NOTE = (
     "timing-sensitive steps disabled by default (owner reply 346, "
     "2026-11-10; #1250 vibe-talk-timing-robust, "
-    "#1252 timeline-benchmark-optin); --include-disabled runs them on demand"
+    "#1252 timeline-benchmark-optin, "
+    "#1765 wrkslots-load-sensitive-gate-tests); --include-disabled runs them on demand"
 )
 
 

@@ -200,7 +200,7 @@ def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
     nodeids = getattr(terminalreporter.config, "_quarantined_nodeids", [])
     if nodeids:
         terminalreporter.write_sep(
-            "=", "load-quarantined cases excluded by default (#1267 wrkslots-load-robust)"
+            "=", "load-quarantined cases excluded by default (#1267 wrkslots-load-robust, #1765 wrkslots-load-sensitive-gate-tests)"
         )
         for nodeid in nodeids:
             terminalreporter.write_line(f"  quarantined: {nodeid}")

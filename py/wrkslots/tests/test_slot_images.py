@@ -672,6 +672,7 @@ def _assert_home_untouched_and_layered(base: Path, home: Path, state: Path) -> N
     assert not (base / "outside/no").exists() and not (base / "project/src/no").exists()
 
 
+@pytest.mark.load_quarantine  # #1765 wrkslots-load-sensitive-gate-tests
 @pytest.mark.parametrize("isolation", ["userns", "root"])
 def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
     _sandbox_host_or_skip(isolation)
@@ -811,6 +812,7 @@ report home_new_file 'echo x > ~/new-top-level'
 """
 
 
+@pytest.mark.load_quarantine  # #1765 wrkslots-load-sensitive-gate-tests
 @pytest.mark.parametrize("isolation", ["userns", "root"])
 @pytest.mark.parametrize("layout", ["nested", "flat"])
 @pytest.mark.parametrize("protect_system", [True, False])
@@ -1165,6 +1167,7 @@ report tmp_write 'echo x > /tmp/probe'
 """
 
 
+@pytest.mark.load_quarantine  # #1765 wrkslots-load-sensitive-gate-tests
 @pytest.mark.parametrize("isolation", ["userns", "root"])
 @pytest.mark.parametrize("scope", ["worktrees", "project"])
 def test_coordinator_box_confines_writes(box_base: Path, isolation: str, scope: str) -> None:
