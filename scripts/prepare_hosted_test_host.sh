@@ -87,5 +87,7 @@ lsattr "$probe"
 rm "$probe"
 # Do not override the test process umask: permission tests exercise its default.
 printf 'TMPDIR=/tmp\n' >> "$GITHUB_ENV"
+# Tests may refresh loop-device udev evidence only on this explicitly prepared VM.
+printf 'AGENT_UTILS_TEST_HOST_PREPARED=1\n' >> "$GITHUB_ENV"
 printf 'Test host ready: Ubuntu %s, canonical sudo, user namespaces, btrfs /tmp\n' \
     "$VERSION_ID"
