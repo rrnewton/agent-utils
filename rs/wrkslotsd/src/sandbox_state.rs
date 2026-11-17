@@ -510,7 +510,10 @@ fn tmp_size_within_cap(value: &str, host_memory_bytes: u128) -> bool {
     };
     let cap = 64u128 << 30;
     if suffix == "%" {
-        (1..=100).contains(&amount) && amount * host_memory_bytes / 100 > 0 && amount * host_memory_bytes / 100 <= cap
+        (1..=100).contains(&amount)
+            && amount
+                .checked_mul(host_memory_bytes)
+                .is_some_and(|bytes| bytes / 100 > 0 && bytes / 100 <= cap)
     } else {
         let multiplier = match suffix {
             "" => 1u128,
@@ -520,7 +523,7 @@ fn tmp_size_within_cap(value: &str, host_memory_bytes: u128) -> bool {
             "T" => 1 << 40,
             _ => return false,
         };
-        amount > 0 && amount * multiplier <= cap
+        amount > 0 && amount.checked_mul(multiplier).is_some_and(|bytes| bytes <= cap)
     }
 }
 
@@ -2118,6 +2121,7 @@ sys.stdout.write("0\n" + json.dumps(sandbox.settings_to_obj(settings), indent=2)
         assert!(tmp_size_within_cap("50%", host));
         assert!(!tmp_size_within_cap("100%", host));
         assert!(!tmp_size_within_cap("1T", host));
+        assert!(!tmp_size_within_cap("309485009821345068724781056T", host));
         assert!(!tmp_size_within_cap("0", host));
         assert!(settings_from_obj(&json!({"tmp_size": "1T"})).is_err());
     }

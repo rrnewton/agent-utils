@@ -568,6 +568,77 @@ else:
     assert "MASK-SYMLINK-REFUSED" in completed.stdout
 
 
+def test_strict_build_with_roots_below_a_covered_home() -> None:
+    # Review finding 1 (second round): trusted roots live below
+    # $HOME; once the layer bind covers $HOME, cached root fds must
+    # not steer later binds, sweeps or checks onto the covered tree.
+    import shutil
+    import tempfile
+
+    py = str(Path(__file__).resolve().parents[2])
+    script = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import sandbox as s
+base = sys.argv[2]
+uid, gid = os.getuid(), os.getgid()
+s._check(s._libc().unshare(s._CLONE_NEWUSER | s._CLONE_NEWNS), "unshare")
+s._write("/proc/self/setgroups", "deny")
+s._write("/proc/self/uid_map", f"{uid} {uid} 1\n")
+s._write("/proc/self/gid_map", f"{gid} {gid} 1\n")
+home = os.path.join(base, "home")
+work = os.path.join(home, "work")
+proj = os.path.join(work, "proj")
+control = os.path.join(proj, "worktrees")
+slot = os.path.join(control, "slots", "s1")
+other = os.path.join(control, "slots", "other")
+state = os.path.join(control, "slot-state", "s1")
+layer = os.path.join(state, "home")
+for directory in (home + "/.ssh", slot, other, layer + "/work", layer + "/.ssh", control + "/slot-state"):
+    os.makedirs(directory, exist_ok=True)
+open(os.path.join(slot, "file"), "w", encoding="utf-8").write("slot")
+open(os.path.join(other, "file"), "w", encoding="utf-8").write("other")
+open(os.path.join(home, ".ssh", "id"), "w", encoding="utf-8").write("secret")
+open(os.path.join(control, "slot-state", "other-secret"), "w", encoding="utf-8").write("cred")
+roots = [home, control, proj, "/tmp", slot, state]
+spec = {
+    "home": home, "home_layer": layer, "home_mode": "ro", "home_aliases": [],
+    "home_binds": ["work", ".ssh"], "read_only": [control],
+    "binds": [[slot, slot]],
+    "masks": [home + "/.ssh", control + "/slot-state"],
+    "tmp_size": "64M", "protect_system": True, "propagate": [], "cwd": "/",
+}
+s.build_view(spec, strict_fd=True, strict_roots=roots)
+s._verify_mount_points(spec, records=s._STRICT_BIND_RECORDS, roots=roots)
+s._remount_nosuid_nodev(slot, strict_fd=True, strict_roots=roots)
+
+def probe(path):
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        os.unlink(path)
+        return "WRITABLE"
+    except OSError:
+        return "ro"
+
+assert open(os.path.join(slot, "file"), encoding="utf-8").read() == "slot"
+assert probe(os.path.join(slot, "probe")) == "WRITABLE"
+assert probe(os.path.join(other, "probe")) == "ro"
+assert probe(os.path.join(proj, "probe")) == "ro"
+assert probe(os.path.join(home, "probe")) == "WRITABLE"
+assert os.listdir(os.path.join(control, "slot-state")) == []
+assert os.listdir(os.path.join(home, ".ssh")) == []
+print("NESTED-ROOTS-OK")
+'''
+    base = Path(tempfile.mkdtemp(prefix="wrkslots-nested-", dir="/var/tmp"))
+    try:
+        completed = _userns_completed(script, py, str(base))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "NESTED-ROOTS-OK" in completed.stdout
+
+
 def test_strict_mount_syscalls_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     # I1: no fd-mount syscall, no root launch; never a path fallback.
     def missing(number: int, *args: object) -> int:

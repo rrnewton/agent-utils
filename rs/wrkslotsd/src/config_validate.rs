@@ -1059,8 +1059,9 @@ fn tmp_size_within_cap(value: &str, host_memory_bytes: u128) -> bool {
     let cap = 64u128 << 30;
     if suffix == "%" {
         (1..=100).contains(&amount)
-            && amount * host_memory_bytes / 100 > 0
-            && amount * host_memory_bytes / 100 <= cap
+            && amount
+                .checked_mul(host_memory_bytes)
+                .is_some_and(|bytes| bytes / 100 > 0 && bytes / 100 <= cap)
     } else {
         let multiplier = match suffix {
             "" => 1u128,
@@ -1070,7 +1071,7 @@ fn tmp_size_within_cap(value: &str, host_memory_bytes: u128) -> bool {
             "T" => 1 << 40,
             _ => return false,
         };
-        amount > 0 && amount * multiplier <= cap
+        amount > 0 && amount.checked_mul(multiplier).is_some_and(|bytes| bytes <= cap)
     }
 }
 
