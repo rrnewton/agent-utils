@@ -229,7 +229,9 @@ def test_remove_waits_for_a_live_finish_journal_then_proceeds(
 
         cli._clear_journal(config, raw, journal_path=journal_path)
 
-        worker.join(timeout=60)
+        # Hang guard only, sized for a loaded gate: the pass condition
+        # is the completed removal below, never elapsed time.
+        worker.join(timeout=300)
         assert not worker.is_alive()
         assert outcome["returncode"] == 0
     finally:
