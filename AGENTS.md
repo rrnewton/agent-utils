@@ -16,6 +16,11 @@ lane's branch, or modifying the extraction PR. For this extraction checkpoint,
 the requested focused regression tests precede publication; complete current-head
 validation remains separately pending and must not be described as green.
 
+The follow-up refresh after #339 workspace-json-features landed retains the
+same exact-SHA lease protection for this lane's own branch. It incorporates
+the extracted fixes from main and the upstream process-pin regression repair;
+focused tests remain a publication checkpoint, not complete validation evidence.
+
 ## Publication Policy
 
 Routine changes to this repository go directly to `rrnewton/agent-utils:main`.
