@@ -8,7 +8,7 @@ import os
 import stat
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import MutableMapping, MutableSequence, Sequence
 from pathlib import Path
 
 import pytest
@@ -715,17 +715,38 @@ _EARLIER_BOOT = "earlier-boot-before-reboot"
 _RENUMBERED_DEV = 1048744  # an anonymous (major 0) device, unlike any live one
 
 
-def _crash_sealed(project: Path, seal: Path) -> dict:
+def _crash_sealed(project: Path, seal: Path) -> dict[str, object]:
     crashed = raw_command_with_census_authority_stub(
         project,
         *_remove_command(),
         env={"WRKSLOTS_TEST_INTERRUPT": "after-validate-batch-seal-target"},
     )
     assert crashed.returncode == 86, crashed.stderr
-    return json.loads(seal.read_text(encoding="utf-8"))
+    payload: dict[str, object] = json.loads(seal.read_text(encoding="utf-8"))
+    return payload
 
 
-def _rewrite_seal(seal: Path, payload: dict) -> None:
+
+def _seal_actor(payload: dict[str, object]) -> MutableMapping[str, object]:
+    actor = payload["actor"]
+    assert isinstance(actor, dict)
+    return actor
+
+
+def _seal_target(payload: dict[str, object]) -> MutableMapping[str, object]:
+    targets = payload["targets"]
+    assert isinstance(targets, list)
+    first = targets[0]
+    assert isinstance(first, dict)
+    return first
+
+
+def _seal_identity(target: MutableMapping[str, object]) -> MutableSequence[object]:
+    identity = target["identity"]
+    assert isinstance(identity, list)
+    return identity
+
+def _rewrite_seal(seal: Path, payload: dict[str, object]) -> None:
     seal.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -752,9 +773,9 @@ def test_cross_boot_seal_with_renumbered_device_recovers(
     original = target.stat().st_mode & 0o777
     payload = _crash_sealed(project, seal)
     assert target.stat().st_mode & 0o777 == 0o700
-    payload["actor"]["boot_id"] = _EARLIER_BOOT
-    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
-    payload["targets"][0].pop("fs_id", None)
+    _seal_actor(payload)["boot_id"] = _EARLIER_BOOT
+    _seal_identity(_seal_target(payload))[0] = _RENUMBERED_DEV
+    _seal_target(payload).pop("fs_id", None)
     _rewrite_seal(seal, payload)
 
     assert remove_completed_validation(project) == 3
@@ -776,9 +797,9 @@ def test_cross_boot_seal_with_recorded_fs_id_recovers(
     project, target, seal = _prepare(tmp_path, monkeypatch)
     original = target.stat().st_mode & 0o777
     payload = _crash_sealed(project, seal)
-    assert payload["targets"][0].get("fs_id")
-    payload["actor"]["boot_id"] = _EARLIER_BOOT
-    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
+    assert _seal_target(payload).get("fs_id")
+    _seal_actor(payload)["boot_id"] = _EARLIER_BOOT
+    _seal_identity(_seal_target(payload))[0] = _RENUMBERED_DEV
     _rewrite_seal(seal, payload)
 
     recovered = _recover(project)
@@ -794,8 +815,8 @@ def test_same_boot_seal_with_renumbered_device_still_refuses(
     """No reboot: a changed device is a changed directory, seal binding."""
     project, target, seal = _prepare(tmp_path, monkeypatch)
     payload = _crash_sealed(project, seal)
-    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
-    payload["targets"][0].pop("fs_id", None)
+    _seal_identity(_seal_target(payload))[0] = _RENUMBERED_DEV
+    _seal_target(payload).pop("fs_id", None)
     _rewrite_seal(seal, payload)
 
     recovered = _recover(project)
@@ -810,11 +831,11 @@ def test_cross_boot_seal_with_different_handle_still_refuses(
     """A recreated directory reusing the inode has different handle bytes."""
     project, target, seal = _prepare(tmp_path, monkeypatch)
     payload = _crash_sealed(project, seal)
-    payload["actor"]["boot_id"] = _EARLIER_BOOT
-    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
-    handle = payload["targets"][0]["identity"][3]
-    payload["targets"][0]["identity"][3] = ("0" if handle[0] != "0" else "1") + handle[1:]
-    payload["targets"][0].pop("fs_id", None)
+    _seal_actor(payload)["boot_id"] = _EARLIER_BOOT
+    _seal_identity(_seal_target(payload))[0] = _RENUMBERED_DEV
+    handle = str(_seal_identity(_seal_target(payload))[3])
+    _seal_identity(_seal_target(payload))[3] = ("0" if handle[0] != "0" else "1") + handle[1:]
+    _seal_target(payload).pop("fs_id", None)
     _rewrite_seal(seal, payload)
 
     recovered = _recover(project)
@@ -829,9 +850,9 @@ def test_cross_boot_seal_with_different_filesystem_still_refuses(
     """A recorded filesystem id that is not the live one proves nothing."""
     project, target, seal = _prepare(tmp_path, monkeypatch)
     payload = _crash_sealed(project, seal)
-    payload["actor"]["boot_id"] = _EARLIER_BOOT
-    payload["targets"][0]["identity"][0] = _RENUMBERED_DEV
-    payload["targets"][0]["fs_id"] = int(payload["targets"][0]["fs_id"]) + 1
+    _seal_actor(payload)["boot_id"] = _EARLIER_BOOT
+    _seal_identity(_seal_target(payload))[0] = _RENUMBERED_DEV
+    _seal_target(payload)["fs_id"] = int(str(_seal_target(payload)["fs_id"])) + 1
     _rewrite_seal(seal, payload)
 
     recovered = _recover(project)
@@ -858,7 +879,7 @@ def test_earlier_boot_actor_is_orphaned_regardless_of_pid(
     assert orphaned is False  # journal actor boot is the real (later) boot here
 
     payload = json.loads(seal.read_text(encoding="utf-8"))
-    payload["actor"]["boot_id"] = "boot-before-this-one"
+    _seal_actor(payload)["boot_id"] = "boot-before-this-one"
     _rewrite_seal(seal, payload)
     orphaned, reason = wrkslots._validate_batch_seal_orphaned(config, seal)
     assert orphaned is True
