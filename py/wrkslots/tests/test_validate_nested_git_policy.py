@@ -3,9 +3,11 @@
 A completed validation's caches are disposable: `remove --validate-complete`
 and `remove-validate-batch` delete a nested repository there whatever it
 holds.  They still refuse one whose deletion reaches outside its cache (a
-configured work tree elsewhere, a `.git` file or link, linked worktrees,
-submodule repositories, included configuration, or a repository Git cannot
-open).  Audit judges a validation row's caches with the same judgment, so it
+configured work tree elsewhere, a `.git` file or link pointing out, linked
+worktrees or submodule gitdirs outside, alternates pointing out, included
+configuration, or a repository Git cannot open); a self-contained
+repository whose gitdirs and worktrees all lie inside the cache disposes
+(#1790).  Audit judges a validation row's caches with the same judgment, so it
 reports `DELETABLE` exactly when that removal would delete, and otherwise the
 removal's own refusal.
 """
@@ -94,12 +96,20 @@ def _reaches_outside(kind: str, tmp_path: Path, remote: Path, repository: Path) 
 _REACHES_OUTSIDE = (
     ("core-worktree", "repository config sets core.worktree, so its worktree may lie outside this cache"),
     ("include", "repository config sets include.path, which could load configuration this check does not inspect"),
-    ("linked-worktree", "repository has registered linked worktrees: linked"),
-    ("modules", "repository has submodule repositories under .git/modules: vendored"),
-    ("git-file", ".git is a file, not a repository directory (a linked worktree or submodule pointer)"),
+    ("linked-worktree", "repository has a worktree registration outside the cache:"),
+    ("modules", "submodule repositories under .git/modules are not self-contained:"),
+    ("git-file", ".git file points to a repository directory outside the cache:"),
     ("git-link", ".git is a symbolic link, not a repository directory"),
     ("malformed", "not a well-formed Git repository: "),
 )
+
+# The agent (content) judgment keeps its historical wording for these kinds;
+# only the validation judgment gained the containment wording (#1790).
+_AGENT_CONDITIONS = {
+    "linked-worktree": "repository has registered linked worktrees: linked",
+    "modules": "repository has submodule repositories under .git/modules: vendored",
+    "git-file": ".git is a file, not a repository directory (a linked worktree or submodule pointer)",
+}
 
 
 def _audit_row(
@@ -222,7 +232,9 @@ def test_validation_judgment_refuses_as_the_agent_judgment_does(
 
     expected = f"cache directory contains nested Git metadata: {dotgit}: not provably disposable: {condition}"
     assert refusals[0].startswith(expected), refusals[0]
-    assert refusals[0] == refusals[1]
+    agent_condition = _AGENT_CONDITIONS.get(kind, condition)
+    expected_agent = f"cache directory contains nested Git metadata: {dotgit}: not provably disposable: {agent_condition}"
+    assert refusals[1].startswith(expected_agent), refusals[1]
 
 
 def _change_contents(content: str, repository: Path, remote: Path) -> None:
@@ -261,7 +273,7 @@ def _seeded_remote(tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize(
     "content",
-    ("local-commit", "untracked", "stash", "alternates", "content-filter", "url-rewrite", "bare"),
+    ("local-commit", "untracked", "stash", "content-filter", "url-rewrite", "bare"),
 )
 def test_validation_judgment_does_not_judge_contents(tmp_path: Path, content: str) -> None:
     """What only the content proof needs is not asked of a completed validation's cache."""
@@ -360,6 +372,82 @@ def test_audit_cache_root_keys_differ_by_nested_git_policy(tmp_path: Path) -> No
     assert cli._audit_cache_root_key(refuse, identity) != cli._audit_cache_root_key(
         validation, identity
     )
+
+
+def _repo_with_submodule(tmp_path: Path, cache: Path) -> Path:
+    """A repository cloned into ``cache`` with its submodule initialized inside it."""
+
+    leaf = tmp_path / "leaf-src"
+    git(tmp_path, "init", "-q", "-b", "main", str(leaf))
+    git(leaf, "config", "user.name", "Wrkslots Test")
+    git(leaf, "config", "user.email", "wrkslots@example.invalid")
+    commit_local(leaf, "leaf.txt", "leaf\n", "leaf")
+    lib = tmp_path / "lib-src"
+    git(tmp_path, "init", "-q", "-b", "main", str(lib))
+    git(lib, "config", "user.name", "Wrkslots Test")
+    git(lib, "config", "user.email", "wrkslots@example.invalid")
+    git(lib, "config", "protocol.file.allow", "always")
+    commit_local(lib, "lib.txt", "lib\n", "lib")
+    git(lib, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(leaf), "third_party")
+    git(lib, "commit", "-q", "-m", "add third_party")
+    repository = cache / "fixture"
+    git(tmp_path, "clone", "-q", str(lib), str(repository))
+    git(repository, "config", "protocol.file.allow", "always")
+    git(repository, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+    return repository
+
+
+def test_self_contained_repository_with_submodule_is_disposable(tmp_path: Path) -> None:
+    """#1790: gitdir, module gitdirs and worktrees all inside the cache dispose."""
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    repository = _repo_with_submodule(tmp_path, cache)
+    assert (repository / ".git" / "modules" / "third_party").is_dir()
+    judged = _judge(repository / ".git", validation_complete=True)
+    assert judged.contents_judged is False
+    submodule_gitfile = repository / "third_party" / ".git"
+    assert submodule_gitfile.is_file()
+    judged_file = _judge(submodule_gitfile, validation_complete=True)
+    assert judged_file.contents_judged is False
+
+
+def test_submodule_gitdir_outside_the_cache_refuses(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    repository = _repo_with_submodule(tmp_path, cache)
+    modules = repository / ".git" / "modules"
+    outside = tmp_path / "outside-gitdir"
+    shutil.move(str(modules / "third_party"), str(outside))
+    (modules / "third_party").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(cli.Refusal) as refused:
+        _judge(repository / ".git", validation_complete=True)
+    assert str(outside) in str(refused.value)
+
+
+def test_linked_worktree_outside_the_cache_refuses(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    repository = _repo_with_submodule(tmp_path, cache)
+    outside = tmp_path / "outside-worktree"
+    git(repository, "worktree", "add", "-q", "-b", "linked", str(outside))
+    with pytest.raises(cli.Refusal) as refused:
+        _judge(repository / ".git", validation_complete=True)
+    assert str(outside) in str(refused.value)
+
+
+def test_alternates_outside_the_cache_refuses(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    repository = _repo_with_submodule(tmp_path, cache)
+    outside_objects = tmp_path / "outside-objects"
+    outside_objects.mkdir()
+    (repository / ".git" / "objects" / "info" / "alternates").write_text(
+        f"{outside_objects}\n", encoding="utf-8"
+    )
+    with pytest.raises(cli.Refusal) as refused:
+        _judge(repository / ".git", validation_complete=True)
+    assert str(outside_objects) in str(refused.value)
 
 
 def test_journaled_evidence_accepts_only_a_false_contents_judgment() -> None:

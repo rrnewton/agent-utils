@@ -16488,13 +16488,13 @@ def _live_remote_digests(config: Config) -> set[str] | None:
     }
 
 
-def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[str]:
-    """Drop idle or orphaned proof mirrors; return their digests (#1692).
+def _proof_mirror_retirement_candidates(
+    config: Config, *, now: float | None = None
+) -> list[str]:
+    """Digests a retirement would drop: idle or orphaned mirrors (#1692).
 
-    A mirror is dropped when it has been idle past the retirement age
-    (7 days since its last fetch) or when no live slot names its remote.
-    A mirror whose refresh lock is held (a removal is using it) is kept,
-    and when the live set cannot be read every mirror is kept.
+    Read-only: no lock file is created and nothing is removed, so a report
+    run can name exactly what an apply run would retire (#1791).
     """
 
     root = config.control / "proof-mirrors"
@@ -16502,7 +16502,7 @@ def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[s
         return []
     moment = time.time() if now is None else now
     live = _live_remote_digests(config)
-    dropped: list[str] = []
+    candidates: list[str] = []
     for entry in sorted(root.iterdir()):
         record_path = entry / "record.json"
         try:
@@ -16513,8 +16513,24 @@ def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[s
             fetched_at = 0.0
         idle = moment - fetched_at > _PROOF_MIRROR_IDLE_SECONDS
         orphaned = live is not None and entry.name not in live
-        if not idle and not orphaned:
-            continue
+        if idle or orphaned:
+            candidates.append(entry.name)
+    return candidates
+
+
+def _retire_proof_mirrors(config: Config, *, now: float | None = None) -> list[str]:
+    """Drop idle or orphaned proof mirrors; return their digests (#1692).
+
+    A mirror is dropped when it has been idle past the retirement age
+    (7 days since its last fetch) or when no live slot names its remote.
+    A mirror whose refresh lock is held (a removal is using it) is kept,
+    and when the live set cannot be read every mirror is kept.
+    """
+
+    root = config.control / "proof-mirrors"
+    dropped: list[str] = []
+    for name in _proof_mirror_retirement_candidates(config, now=now):
+        entry = root / name
         descriptor = os.open(
             entry / ".lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
         )
@@ -50227,7 +50243,7 @@ def _assert_judged_git_metadata(
         raise Refusal(
             f"cannot inspect nested Git metadata judged disposable: {entry}: {exc}"
         ) from exc
-    if not stat.S_ISDIR(observed.st_mode) or (
+    if not (stat.S_ISDIR(observed.st_mode) or stat.S_ISREG(observed.st_mode)) or (
         observed.st_dev,
         observed.st_ino,
     ) != expected:
@@ -50464,10 +50480,14 @@ def _judge_nested_git_repository_unchecked(
     stash, index and files are not examined and no remote is consulted.  Only
     the checks that decide whether deleting it reaches outside the cache run,
     with the same refusals: ``.git`` is a real directory that Git reports as
-    both the repository and common directory (no ``.git`` file, link or
-    commondir), its config and config.worktree set no core.worktree and no
-    include, and it registers no linked worktree and holds no submodule
-    repository.  A repository Git cannot open refuses as well.
+    both the repository and common directory (no ``.git`` link or commondir
+    reaching outside), its config and config.worktree set no core.worktree
+    reaching outside and no include, and every submodule gitdir under
+    .git/modules (recursively), linked-worktree registration, worktree and
+    alternates target resolves inside the roots this removal deletes
+    (#1790); a ``.git`` file is disposable only when its gitdir does the
+    same.  Any escape refuses and names the escaping path.  A repository
+    Git cannot open refuses as well.
     """
 
     def refuse(condition: str) -> Refusal:
@@ -50491,12 +50511,30 @@ def _judge_nested_git_repository_unchecked(
         raise refuse(f"cannot inspect .git: {exc}") from exc
     if stat.S_ISLNK(metadata.st_mode):
         raise refuse(".git is a symbolic link, not a repository directory")
+    pending_gitfile: Path | None = None
     if stat.S_ISREG(metadata.st_mode):
-        raise refuse(
-            ".git is a file, not a repository directory "
-            "(a linked worktree or submodule pointer)"
-        )
-    if not stat.S_ISDIR(metadata.st_mode):
+        if validation_complete:
+            try:
+                gitfile_text = dotgit.read_text(errors="surrogateescape")
+            except OSError:
+                gitfile_text = ""
+            for gitfile_line in gitfile_text.splitlines():
+                if gitfile_line.startswith("gitdir:"):
+                    raw_target = gitfile_line[len("gitdir:") :].strip()
+                    if raw_target:
+                        target_path = Path(raw_target)
+                        pending_gitfile = (
+                            target_path
+                            if target_path.is_absolute()
+                            else dotgit.parent / target_path
+                        )
+                    break
+        if pending_gitfile is None:
+            raise refuse(
+                ".git is a file, not a repository directory "
+                "(a linked worktree or submodule pointer)"
+            )
+    if pending_gitfile is None and not stat.S_ISDIR(metadata.st_mode):
         raise refuse(".git is not a directory")
     work_tree = dotgit.parent
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
@@ -50634,6 +50672,189 @@ def _judge_nested_git_repository_unchecked(
         except OSError as exc:
             raise refuse(f"cannot inspect .git/{relative}: {exc}") from exc
 
+    # Self-containment for a completed validation's cache (#1790): a nested
+    # repository is disposable when every Git directory, submodule gitdir
+    # (recursively), linked-worktree registration, worktree and alternates
+    # target resolves inside the roots this removal deletes, and no pointer
+    # reaches outside.  Every escape refuses and names the escaping path.
+    resolved_roots = tuple(Path(root).resolve(strict=False) for root in removed_roots)
+
+    def inside(path: Path) -> bool:
+        resolved = Path(path).resolve(strict=False)
+        return any(
+            resolved == root or resolved.is_relative_to(root) for root in resolved_roots
+        )
+
+    def read_pointer(path: Path) -> Path | None:
+        try:
+            text = path.read_text(errors="surrogateescape")
+        except OSError:
+            return None
+        for line in text.splitlines():
+            value = line.strip()
+            if value.startswith("gitdir:"):
+                value = value[len("gitdir:") :].strip()
+            if value:
+                target = Path(value)
+                return target if target.is_absolute() else path.parent / target
+        return None
+
+    def check_alternates(gitdir: Path) -> None:
+        for name in ("alternates", "http-alternates"):
+            try:
+                data = (gitdir / "objects" / "info" / name).read_bytes()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise refuse(f"cannot inspect .git/objects/info/{name}: {exc}") from exc
+            for line in data.decode(errors="surrogateescape").splitlines():
+                value = line.strip()
+                if not value or value.startswith("#"):
+                    continue
+                target = Path(value)
+                if not target.is_absolute():
+                    target = gitdir / "objects" / target
+                if not inside(target):
+                    raise refuse(
+                        f"repository borrows objects through .git/objects/info/{name} "
+                        f"from outside the cache: {target.resolve(strict=False)}"
+                    )
+
+    def module_gitdirs(modules_root: Path) -> list[Path]:
+        found: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(modules_root):
+            current = Path(dirpath)
+            for dirname in list(dirnames):
+                candidate = current / dirname
+                if candidate.is_symlink() and not inside(candidate):
+                    raise refuse(
+                        "submodule repository under .git/modules reaches outside "
+                        f"the cache: {candidate.resolve(strict=False)}"
+                    )
+            if "HEAD" in filenames and (
+                "config" in filenames or "gitdir" in filenames
+            ):
+                found.append(current)
+                dirnames[:] = []
+        return found
+
+    def check_contained_gitdir(gitdir: Path, seen: set[Path]) -> None:
+        resolved = gitdir.resolve(strict=False)
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        if not inside(gitdir):
+            raise refuse(
+                f"Git directory reaches outside the cache: {resolved}"
+            )
+        config_path = gitdir / "config"
+        if config_path.exists():
+            names = output(
+                ["config", "--file", str(config_path), "--null", "--list", "--name-only"],
+                git_dir=gitdir,
+            )
+            for key in sorted({item for item in names.split("\0") if item}):
+                if key.lower().startswith(("include.", "includeif.")):
+                    raise refuse(
+                        f"repository config sets {key}, which could load "
+                        "configuration this check does not inspect"
+                    )
+            worktree = run(
+                ["config", "--file", str(config_path), "--get", "core.worktree"],
+                git_dir=gitdir,
+            )
+            if worktree.returncode == 0:
+                raw = worktree.stdout.decode(errors="surrogateescape").strip()
+                target = Path(raw)
+                if not target.is_absolute():
+                    target = gitdir / target
+                if not inside(target):
+                    raise refuse(
+                        "repository sets core.worktree outside the cache: "
+                        f"{target.resolve(strict=False)}"
+                    )
+            elif worktree.returncode not in {0, 1}:
+                raise refuse(f"cannot read core.worktree: {detail(worktree)}")
+        for pointer_name in ("gitdir", "commondir"):
+            pointer = gitdir / pointer_name
+            if not pointer.exists():
+                continue
+            target = read_pointer(pointer)
+            if target is None:
+                raise refuse(f"cannot inspect .git/{pointer_name} in {gitdir}")
+            if not inside(target):
+                raise refuse(
+                    f"repository has a worktree registration outside the cache: "
+                    f"{target.resolve(strict=False)}"
+                )
+            if pointer_name == "gitdir" and target.is_file():
+                back = read_pointer(target)
+                if back is not None and not inside(back):
+                    raise refuse(
+                        ".git file points to a repository directory outside "
+                        f"the cache: {back.resolve(strict=False)}"
+                    )
+        check_alternates(gitdir)
+        modules_root = gitdir / "modules"
+        if modules_root.is_dir():
+            try:
+                entries = sorted(os.listdir(modules_root))
+            except OSError as exc:
+                raise refuse(f"cannot inspect .git/modules: {exc}") from exc
+            if entries:
+                gitdirs = module_gitdirs(modules_root)
+                if not gitdirs:
+                    raise refuse(
+                        "submodule repositories under .git/modules are not "
+                        f"self-contained: {entries[0]} is not a well-formed "
+                        "repository directory"
+                    )
+                for sub in gitdirs:
+                    check_contained_gitdir(sub, seen)
+        worktrees_root = gitdir / "worktrees"
+        if worktrees_root.is_dir():
+            try:
+                entries = sorted(os.listdir(worktrees_root))
+            except OSError as exc:
+                raise refuse(f"cannot inspect .git/worktrees: {exc}") from exc
+            for entry in entries:
+                admin = worktrees_root / entry
+                if admin.is_dir():
+                    if not (admin / "gitdir").exists():
+                        raise refuse(
+                            f"registered linked worktree {entry} is not a "
+                            "well-formed worktree registration"
+                        )
+                    check_contained_gitdir(admin, seen)
+
+    if pending_gitfile is not None:
+        if not inside(pending_gitfile):
+            raise refuse(
+                ".git file points to a repository directory outside the cache: "
+                f"{pending_gitfile.resolve(strict=False)}"
+            )
+        if not pending_gitfile.is_dir():
+            raise refuse(
+                f".git file points at {pending_gitfile}, which is not a "
+                "repository directory"
+            )
+        check_contained_gitdir(pending_gitfile, set())
+        gitfile_head = run(
+            ["rev-parse", "-q", "--verify", "HEAD^{commit}"],
+            git_dir=pending_gitfile,
+        )
+        return _DisposableNestedRepository(
+            dotgit,
+            (metadata.st_dev, metadata.st_ino),
+            gitfile_head.stdout.decode().strip()
+            if gitfile_head.returncode == 0
+            else None,
+            None,
+            0,
+            (),
+            contents_judged=False,
+        )
+
     # (a) A well-formed repository whose Git directory is this .git itself.
     located = run(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"])
     if located.returncode != 0:
@@ -50687,6 +50908,7 @@ def _judge_nested_git_repository_unchecked(
             )
         if bare.returncode not in {0, 1}:
             raise refuse(f"cannot read core.bare: {detail(bare)}")
+    containment_checked = False
     for subdirectory, what in (
         ("worktrees", "registered linked worktrees"),
         ("modules", "submodule repositories under .git/modules"),
@@ -50704,8 +50926,17 @@ def _judge_nested_git_repository_unchecked(
         except OSError as exc:
             raise refuse(f"cannot inspect .git/{subdirectory}: {exc}") from exc
         if held:
+            if validation_complete and subdirectory in {"worktrees", "modules"}:
+                # #1790: held submodule/linked-worktree registrations dispose
+                # when every gitdir, worktree and alternates target they name
+                # resolves inside this removal; any escape refuses by path.
+                if not containment_checked:
+                    check_contained_gitdir(dotgit, set())
+                    containment_checked = True
+                continue
             raise refuse(f"repository has {what}: {', '.join(held[:5])}")
     if validation_complete:
+        check_alternates(dotgit)
         # Deleting it reaches nothing outside the cache, and a completed
         # validation's cache contents are disposable: name HEAD for the record.
         completed_head = run(["rev-parse", "-q", "--verify", "HEAD^{commit}"])
@@ -51859,11 +52090,25 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
     with contextlib.ExitStack() as locks:
         locks.enter_context(_mutation_locks(config, args.wait_lock))
         _refuse_partial_state(config)
-        for dropped_mirror in _retire_proof_mirrors(config):
-            print(
-                f"clean-caches: dropped proof mirror {dropped_mirror} (idle)",
-                file=sys.stderr,
-            )
+        # #1791: retirement is an apply-only mutation.  A report run (no
+        # --only/--yes, or --dry-run) only names what it would retire.
+        applying = bool(only or args.yes) and not bool(
+            getattr(args, "dry_run", False)
+        )
+        would_retire_mirrors: list[str] = []
+        if applying:
+            for dropped_mirror in _retire_proof_mirrors(config):
+                print(
+                    f"clean-caches: dropped proof mirror {dropped_mirror} (idle)",
+                    file=sys.stderr,
+                )
+        else:
+            would_retire_mirrors = _proof_mirror_retirement_candidates(config)
+            for mirror in would_retire_mirrors:
+                print(
+                    f"clean-caches: would retire proof mirror {mirror} (idle)",
+                    file=sys.stderr,
+                )
         # An interrupted absent-row recovery leaves its rows active and
         # archived until replayed; that split must not block cache
         # reclamation for every other slot
@@ -52139,6 +52384,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         },
         "removed_bytes": removed_bytes,
         "force_running": force_running,
+        "would_retire_proof_mirrors": would_retire_mirrors,
         "slots": rows,
         "skipped_foreign": [
             {"machine": machine, "slot": slot} for machine, slot in foreign_cache_rows

@@ -975,7 +975,7 @@ def test_audit_validate_nested_gitfile_matches_python(
     actual = _check(root, tmp_path)
     row = _rows(actual)[0]
     assert row["cache_status"] == "error"
-    assert ".git is a file" in str(row["cache_error"])
+    assert ".git file points to a repository directory outside the cache: /tmp/elsewhere" in str(row["cache_error"])
 
 
 def test_audit_validate_nested_linked_worktrees_matches_python(
@@ -987,7 +987,7 @@ def test_audit_validate_nested_linked_worktrees_matches_python(
     actual = _check(root, tmp_path)
     row = _rows(actual)[0]
     assert row["cache_status"] == "error"
-    assert "registered linked worktrees: fake" in str(row["cache_error"])
+    assert "registered linked worktree fake is not a well-formed worktree registration" in str(row["cache_error"])
 
 
 def test_audit_census_state_inside_project_refuses(tmp_path: Path) -> None:

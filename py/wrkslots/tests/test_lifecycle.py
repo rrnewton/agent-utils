@@ -35257,6 +35257,36 @@ def test_clean_caches_reports_then_cleans_only_explicit_or_all_slots(
     assert empty_rows["slot02"]["cache_bytes"] == 0
 
 
+def test_clean_caches_report_does_not_retire_proof_mirrors(tmp_path: Path) -> None:
+    """#1791: a report run names idle proof mirrors it would retire, dropping none."""
+
+    project, _repository, _remote = make_project(
+        tmp_path, cache_globs=("target",)
+    )
+    assert create(project, slot="slot01", agent="codex-1", branch="codex/one").returncode == 0
+    config = wrkslots._load_config(str(project), "testhost")
+    mirror = config.control / "proof-mirrors" / "idle-digest"
+    mirror.mkdir(parents=True)
+    (mirror / "record.json").write_text(
+        json.dumps({"fetched_at": 1_000_000.0}), encoding="utf-8"
+    )
+
+    report = command(project, "clean-caches", "--format", "json")
+    assert report.returncode == 0, report.stderr
+    assert mirror.exists(), report.stdout + report.stderr
+    assert "idle-digest" in report.stdout + report.stderr
+
+    dry = command(
+        project, "clean-caches", "--only", "slot01", "--dry-run", "--format", "json"
+    )
+    assert dry.returncode == 0, dry.stderr
+    assert mirror.exists()
+
+    applied = command(project, "clean-caches", "--only", "slot01", "--format", "json")
+    assert applied.returncode == 0, applied.stderr
+    assert not mirror.exists()
+
+
 def test_clean_caches_dry_run_reports_without_deleting(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(
         tmp_path, cache_globs=("target",)
