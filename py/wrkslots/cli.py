@@ -10741,6 +10741,29 @@ def _write_active_state(
         )
     elif previous.machine != state.machine:
         raise StateError("active state can only advance from the same machine's state")
+    if previous is not None:
+        # Defence in depth (#1807): a passed ``previous`` must be the state
+        # the log currently ends at, never a stale whole-registry snapshot
+        # taken before another slot's event landed. Refuse before anything
+        # is appended, and never write ACTIVE from the stale state.
+        derived = _states_from_events(
+            config, state.machine, require_repository=require_repository
+        )
+        current_revision = (
+            _load_active_snapshot(
+                config, state.machine, require_repository=require_repository
+            ).revision
+            if derived is None
+            else derived[0].revision
+        )
+        if previous.revision != current_revision:
+            raise StateError(
+                f"active state for slot {slot} cannot be recorded from stale "
+                f"previous revision {previous.revision}: the event log for "
+                f"{state.machine} currently ends at revision "
+                f"{current_revision}; nothing was appended, and ACTIVE was "
+                "not rewritten from the stale state"
+            )
     if state.revision != previous.revision + 1:
         raise StateError(
             "active state revision must advance exactly once before it is recorded"
@@ -61676,13 +61699,22 @@ class _PreparedRemoval:
 
 def _assert_prepared_removal_current(
     config: Config, prepared: _PreparedRemoval
-) -> None:
+) -> ActiveState:
     """Refuse a prepared removal whose slot changed since its validation (#1287).
 
     Compares only cheap identities under the lock: the registry identity
     (one lstat per registry file), the journal fingerprint, and this
     slot's lock-scope fingerprint (one rev-parse per checkout). A change
-    defers this slot by name; the batch goes on to its next candidate.
+    to this slot defers it by name; the batch goes on to its next
+    candidate.
+
+    Returns the state the commit must advance (#1807). The prepared
+    state was loaded lock-free before salvage, so another slot's event
+    may have landed since; when the log now ends at a newer revision,
+    the current log-derived state replaces the prepared one, provided
+    this slot's own record is unchanged. Advancing the stale prepared
+    state instead would fork the log's revisions and roll the other
+    slot's update back in ACTIVE.
     """
 
     slot = prepared.record.slot
@@ -61696,9 +61728,8 @@ def _assert_prepared_removal_current(
             "validation"
         )
     try:
-        current = _find_record(
-            _load_active_snapshot(config, require_repository=False), slot
-        )
+        current_state = _load_active(config, require_repository=False)
+        current = _find_record(current_state, slot)
     except Refusal as exc:
         raise _RetirementDeferred(
             f"slot {slot} changed between the lock-free validation and the "
@@ -61713,6 +61744,7 @@ def _assert_prepared_removal_current(
             "configuration lock; nothing was written for it from the stale "
             "validation"
         )
+    return current_state
 
 
 def _prepare_retirement_removal(
@@ -62695,7 +62727,10 @@ def _cmd_remove_in_scope(
             # in _prepare_retirement_removal; the deletion and its
             # deciding census run after this lock is released.
             _refuse_partial_state(config)
-            _assert_prepared_removal_current(config, prepared_removal)
+            # Advance the current log-derived state, not the stale
+            # lock-free one, when another slot's event landed during
+            # salvage (#1807); this slot's record was just re-checked.
+            state = _assert_prepared_removal_current(config, prepared_removal)
             _assert_no_journal(
                 config,
                 allowed=(
@@ -62706,7 +62741,6 @@ def _cmd_remove_in_scope(
                 target_slot=prepared_removal.record.slot,
             )
             record = prepared_removal.record
-            state = prepared_removal.state
             writer = prepared_removal.writer
             if writer is None:
                 # A batch item has no attempt append (#1367): its event
@@ -62718,6 +62752,19 @@ def _cmd_remove_in_scope(
                     sequence=sequence,
                     previous_sha256="0" * 64 if tip is None else tip,
                 )
+            else:
+                # The retirement writer was positioned at its attempt
+                # append, before salvage; another slot's event may have
+                # appended after it since (#1807). Reposition it at the
+                # chain tip this lock now ends at before appending.
+                sequence, tip = _chain_tip(config, record.machine)
+                if writer.sequence != sequence:
+                    writer = _EventWriter(
+                        directory=writer.directory,
+                        machine=record.machine,
+                        sequence=sequence,
+                        previous_sha256="0" * 64 if tip is None else tip,
+                    )
             admission = prepared_removal.admission
             basis = _removal_basis(
                 admission,

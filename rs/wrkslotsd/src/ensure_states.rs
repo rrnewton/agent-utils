@@ -426,6 +426,37 @@ pub(crate) fn append_event(cfg: &Cfg, machine: &str, kind: &str, payload: Value)
     }
     let events = load_event_chain(&directory, machine)?;
     if kind == "active-state-recorded" {
+        // Defence in depth (#1807): the payload must continue the revision
+        // the log currently ends at, never a stale state a lock-free
+        // preparation captured before another slot's event landed.
+        let mut derived_revision: Option<i64> = None;
+        for event in &events {
+            match event.get("kind").and_then(Value::as_str) {
+                Some("state-imported") => {
+                    derived_revision = event
+                        .pointer("/payload/active/revision")
+                        .and_then(Value::as_i64);
+                }
+                Some("active-state-recorded") => {
+                    derived_revision = event
+                        .pointer("/payload/revision")
+                        .and_then(Value::as_i64)
+                        .or(derived_revision);
+                }
+                _ => {}
+            }
+        }
+        if let Some(derived) = derived_revision {
+            let claimed = payload.get("previous_revision").and_then(Value::as_i64);
+            if claimed != Some(derived) {
+                return Err(format!(
+                    "refusing to append an active-state event from stale previous revision {}: the event log for {machine} currently ends at revision {derived}; nothing was appended",
+                    claimed
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "missing".to_string())
+                ));
+            }
+        }
         // Never append what the loader would reject: one such event refuses
         // every later command (#1373).
         crate::active_state::assert_appendable_active_payload(cfg, machine, &payload, &events)

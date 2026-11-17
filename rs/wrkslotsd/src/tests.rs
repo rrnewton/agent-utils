@@ -7105,3 +7105,33 @@ fn append_refuses_an_active_record_the_loader_rejects() {
     assert_eq!(event_names(&events).len(), before.len() + 1);
     replay(&events).expect("the log still replays");
 }
+
+#[test]
+fn append_refuses_an_active_record_from_a_stale_previous_revision() {
+    // #1807: a prepared writer advancing a state captured before another
+    // slot's event landed must never append, and must not fork the log.
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    import_log(&events, vec![], vec![]);
+    let cfg = flat_cfg(&scratch);
+    crate::ensure_states::append_event(
+        &cfg,
+        "node-a",
+        "active-state-recorded",
+        flat_created("slot-a", "worktrees/slots/slot-a"),
+    )
+    .expect("the first record is appended");
+    let before = event_names(&events);
+
+    let error = crate::ensure_states::append_event(
+        &cfg,
+        "node-a",
+        "active-state-recorded",
+        flat_created("slot-a", "worktrees/slots/slot-a"),
+    )
+    .expect_err("a stale previous revision is refused");
+    assert!(error.contains("stale previous revision 0"), "{error}");
+    assert!(error.contains("currently ends at revision 1"), "{error}");
+    assert_eq!(event_names(&events), before);
+    replay(&events).expect("the log still replays");
+}
