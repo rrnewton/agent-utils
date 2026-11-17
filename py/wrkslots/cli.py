@@ -13555,6 +13555,75 @@ def _live_journal_owner(raw: Mapping[str, object]) -> ProcessIdentity | None:
     return owner if _process_state(owner)[0] == "live" else None
 
 
+def _peek_journal_raw(path: Path) -> Mapping[str, object] | None:
+    """Best-effort journal parse for liveness, without the 1 MiB bound (#1757).
+
+    Reads at the general journal limit so an oversized live journal is
+    recognised before any recovery size check. Any failure returns None and
+    the caller falls back to the strict recovery read, which refuses exactly
+    as before; a peek never authorises anything by itself.
+    """
+
+    try:
+        contents = _read_bounded_regular_file(
+            path, "recovery journal", _JOURNAL_BYTES_LIMIT
+        )
+        return _strict_json_object(contents, "recovery journal")
+    except (Refusal, StateError, OSError):
+        return None
+
+
+def _journal_disjoint_from_create(
+    config: Config,
+    raw: Mapping[str, object],
+    *,
+    requested_slot: str | None,
+    requested_slot_type: str,
+) -> bool:
+    """Whether a non-create journal's slot and paths miss a create's targets.
+
+    Only a journal naming a different slot, whose slot directory and fenced
+    tree neither contain nor are contained by the requested slot directory,
+    is disjoint. Anything undecodable is not disjoint, so the caller keeps
+    its busy or refusal behaviour (#1757).
+    """
+
+    if requested_slot is None or raw.get("kind") != "finish":
+        return False
+    record = raw.get("record")
+    record_map: Mapping[str, object] = (
+        record if isinstance(record, Mapping) else {}
+    )
+    slot = raw.get("slot", record_map.get("slot"))
+    if not isinstance(slot, str) or slot == requested_slot:
+        return False
+    slot_type = record_map.get("slot_type", raw.get("slot_type", "agent"))
+    try:
+        requested_path = _slot_directory(
+            config, requested_slot, requested_slot_type
+        )
+        other_path = _slot_directory(
+            config, slot, slot_type if isinstance(slot_type, str) else "agent"
+        )
+    except (Refusal, StateError, KeyError, TypeError, ValueError):
+        return False
+    if _path_is_within(other_path, requested_path) or _path_is_within(
+        requested_path, other_path
+    ):
+        return False
+    fenced = raw.get("fenced")
+    if isinstance(fenced, str) and fenced:
+        try:
+            fenced_path = _stored_path(config, fenced, "finish journal.fenced")
+        except (Refusal, StateError, KeyError, TypeError, ValueError):
+            return False
+        if _path_is_within(fenced_path, requested_path) or _path_is_within(
+            requested_path, fenced_path
+        ):
+            return False
+    return True
+
+
 def _registry_writer_lock_holder(config: Config) -> int | None:
     """The PID holding the registry's exclusive writer lock, if any.
 
@@ -13788,6 +13857,28 @@ def _classify_create_journal(
     requested_slot_type: str = "agent",
     skipped_paths: list[Path] | None = None,
 ) -> _CreateJournalClassification | None:
+    # A live operation's journal is never a recovery journal (#1757):
+    # decide liveness before the 1 MiB recovery read, so an oversized live
+    # journal is neither size-checked nor met with recover advice. Only a
+    # dead or unknown owner falls through to the strict recovery read.
+    peeked = _peek_journal_raw(path)
+    if peeked is not None and peeked.get("kind") != "create":
+        peeked_owner = _live_journal_owner(peeked)
+        if peeked_owner is not None:
+            if _journal_disjoint_from_create(
+                config,
+                peeked,
+                requested_slot=requested_slot,
+                requested_slot_type=requested_slot_type,
+            ):
+                if skipped_paths is not None and path not in skipped_paths:
+                    skipped_paths.append(path)
+                return None
+            raise _JournalBusy(
+                kind=peeked.get("kind"),
+                pid=peeked_owner.pid,
+                journal=path.name,
+            )
     try:
         raw, identity, completed = _read_stable_physical_journal(
             config, path, states
@@ -13816,6 +13907,15 @@ def _classify_create_journal(
             return None
         live_owner = _live_journal_owner(raw)
         if live_owner is not None:
+            if _journal_disjoint_from_create(
+                config,
+                raw,
+                requested_slot=requested_slot,
+                requested_slot_type=requested_slot_type,
+            ):
+                if skipped_paths is not None and path not in skipped_paths:
+                    skipped_paths.append(path)
+                return None
             raise _JournalBusy(
                 kind=raw.get("kind"), pid=live_owner.pid, journal=path.name
             )
@@ -15016,8 +15116,25 @@ def _assert_create_journal_classifications_stable(
         for path in _outstanding_journals(config, machines)
         if path not in excluded_paths
     )
-    if tuple(row.path for row in rows) != outstanding:
-        raise Refusal("recovery journal set changed while it was classified")
+    # Journals skipped as live and disjoint (#1757) are not rows, yet the
+    # set is unchanged while their owners stay live; only a dead, unknown
+    # or create extra means the classified set really changed.
+    row_paths = tuple(row.path for row in rows)
+    if row_paths != outstanding:
+        extras = [path for path in outstanding if path not in row_paths]
+        missing = [path for path in row_paths if path not in outstanding]
+
+        def _still_live_extra(extra: Path) -> bool:
+            peeked = _peek_journal_raw(extra)
+            return (
+                peeked is not None
+                and peeked.get("kind") == "finish"
+                and _live_journal_owner(peeked) is not None
+            )
+
+        if missing or not all(_still_live_extra(extra) for extra in extras):
+            raise Refusal("recovery journal set changed while it was classified")
+        outstanding = row_paths
     for row in rows:
         contents, identity = _read_regular_file_identity(
             row.path, "recovery journal", 1024 * 1024

@@ -10409,6 +10409,116 @@ def test_classify_create_journals_refuses_the_interrupted_cargo_slot_itself(
     assert admitted.returncode == 0, admitted.stderr
 
 
+def _live_finish_journal(
+    project: Path, slot: str, *, pad_bytes: int = 0, dead: bool = False
+) -> Path:
+    config = wrkslots._load_config(str(project), "testhost")
+    live = wrkslots._read_process_identity(os.getpid())
+    owner = (
+        dataclasses.replace(live, start_ticks=live.start_ticks + 999999)
+        if dead
+        else live
+    )
+    other_dir = wrkslots._slot_directory(config, slot, "agent")
+    fenced_path = other_dir.parent / f".{slot}.fenced.1.test"
+    payload: dict[str, object] = {
+        "kind": "finish",
+        "machine": "testhost",
+        "slot": slot,
+        "owner": wrkslots._identity_to_obj(owner),
+        "record": {"slot": slot, "slot_type": "agent"},
+        "fenced": fenced_path.relative_to(config.root).as_posix(),
+    }
+    if pad_bytes:
+        payload["x"] = {"pad": "p" * pad_bytes}
+    path = wrkslots._finish_journal_path(config, slot, "testhost")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_live_finish_journal_for_other_slot_does_not_block_create(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    path = _live_finish_journal(project, "other-slot")
+    skipped: list[Path] = []
+    rows = wrkslots._classify_create_journals(
+        config,
+        (),
+        (),
+        requested_slot="newslot",
+        requested_slot_type="agent",
+        skipped_paths=skipped,
+    )
+    assert rows == ()
+    assert skipped == [path]
+
+
+def test_oversized_live_finish_journal_classified_without_recovery_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    path = _live_finish_journal(project, "other-slot", pad_bytes=4 * 1024 * 1024)
+    assert path.stat().st_size > 4 * 1024 * 1024
+
+    def _no_recovery_read(*args: object, **kwargs: object) -> object:
+        raise AssertionError("live journal must not take the recovery read")
+
+    monkeypatch.setattr(
+        wrkslots, "_read_regular_file_identity", _no_recovery_read
+    )
+    skipped: list[Path] = []
+    rows = wrkslots._classify_create_journals(
+        config,
+        (),
+        (),
+        requested_slot="newslot",
+        requested_slot_type="agent",
+        skipped_paths=skipped,
+    )
+    assert rows == ()
+    assert skipped == [path]
+
+
+def test_oversized_dead_finish_journal_still_refuses(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    _live_finish_journal(
+        project, "other-slot", pad_bytes=4 * 1024 * 1024, dead=True
+    )
+    with pytest.raises(wrkslots.Refusal) as caught:
+        wrkslots._classify_create_journals(
+            config,
+            (),
+            (),
+            requested_slot="newslot",
+            requested_slot_type="agent",
+            skipped_paths=[],
+        )
+    assert "exceeds the 1 MiB safety bound" in str(caught.value)
+
+
+def test_live_finish_journal_for_same_slot_is_busy_not_recovery(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    _live_finish_journal(project, "heldslot", pad_bytes=4 * 1024 * 1024)
+    with pytest.raises(wrkslots._JournalBusy):
+        wrkslots._classify_create_journals(
+            config,
+            (),
+            (),
+            requested_slot="heldslot",
+            requested_slot_type="agent",
+            skipped_paths=[],
+        )
+
+
 def test_ownerless_cargo_home_allows_nested_git_cache_and_records_determination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

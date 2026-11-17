@@ -564,6 +564,70 @@ fn live_journal_owner(raw: &Map<String, Value>) -> Option<crate::status_state::I
     }
 }
 
+/// Best-effort journal parse for liveness, without the 1 MiB bound
+/// (#1757, mirrors `_peek_journal_raw`): an oversized live journal is
+/// recognised before any recovery size check; any failure yields None and
+/// the strict recovery read refuses exactly as before.
+fn peek_journal_raw(path: &Path) -> Option<Map<String, Value>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    strict_obj(&bytes).ok()
+}
+
+/// Whether a non-create journal's slot and paths miss a create's targets
+/// (mirrors `_journal_disjoint_from_create`): only a different slot whose
+/// slot directory and fenced tree do not overlap the requested slot
+/// directory is disjoint; anything undecodable is not disjoint.
+fn journal_disjoint_from_create(
+    cfg: &Cfg,
+    raw: &Map<String, Value>,
+    requested_slot: &str,
+    requested_slot_type: &str,
+) -> bool {
+    if raw.get("kind").and_then(Value::as_str) != Some("finish") {
+        return false;
+    }
+    let record = raw.get("record").and_then(Value::as_object);
+    let slot = raw
+        .get("slot")
+        .and_then(Value::as_str)
+        .or_else(|| record.and_then(|r| r.get("slot")).and_then(Value::as_str));
+    let Some(slot) = slot else { return false };
+    if slot == requested_slot {
+        return false;
+    }
+    let slot_type = record
+        .and_then(|r| r.get("slot_type"))
+        .and_then(Value::as_str)
+        .or_else(|| raw.get("slot_type").and_then(Value::as_str))
+        .unwrap_or("agent");
+    let (Ok(requested), Ok(other)) = (
+        slot_directory(cfg, requested_slot, requested_slot_type),
+        slot_directory(cfg, slot, slot_type),
+    ) else {
+        return false;
+    };
+    if within(&other, &requested) || within(&requested, &other) {
+        return false;
+    }
+    if let Some(fenced) = raw.get("fenced").and_then(Value::as_str) {
+        if !fenced.is_empty() {
+            let Ok((_, fenced_path)) =
+                crate::config_validate::relative_inside(&cfg.root, fenced, "finish journal.fenced")
+            else {
+                return false;
+            };
+            if within(&fenced_path, &requested) || within(&requested, &fenced_path) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// A retryable busy result (#992), distinct from a hard refusal.
 #[derive(Debug)]
 pub(crate) enum ClassifyError {
@@ -1244,6 +1308,27 @@ fn classify_one(
             path.display()
         ));
     }
+    // A live operation's journal is never a recovery journal (#1757):
+    // liveness is decided before the 1 MiB recovery read, so an oversized
+    // live journal is neither size-checked nor met with recover advice.
+    if let Some(peeked) = peek_journal_raw(path) {
+        if peeked.get("kind").and_then(Value::as_str) != Some("create") {
+            if let Some(owner) = live_journal_owner(&peeked) {
+                if journal_disjoint_from_create(cfg, &peeked, requested_slot, requested_slot_type) {
+                    return Ok(None);
+                }
+                return Err(format!(
+                    "busy: live '{}' mutation {} by pid {}; retry",
+                    peeked
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    owner.pid
+                ));
+            }
+        }
+    }
     let (bytes, identity) = read_identity(path)?;
     let raw = strict_obj(&bytes)?;
     let (machine_s, kind, _slot_s) = validate_journal_shape(
@@ -1263,6 +1348,9 @@ fn classify_one(
             return Ok(None);
         }
         if let Some(owner) = live_journal_owner(&raw) {
+            if journal_disjoint_from_create(cfg, &raw, requested_slot, requested_slot_type) {
+                return Ok(None);
+            }
             return Err(format!(
                 "busy: live '{kind}' mutation {} by pid {}; retry",
                 path.file_name().unwrap_or_default().to_string_lossy(),
@@ -1692,6 +1780,8 @@ pub(crate) fn classify_create_journals(
                 }
                 if kind == "create"
                     || ownerless_cargo_home_journal_is_unrelated(&cfg, &raw, slot, slot_type)
+                    || journal_disjoint_from_create(&cfg, &raw, slot, slot_type)
+                        && live_journal_owner(&raw).is_some()
                 {
                     continue;
                 }

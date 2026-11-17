@@ -226,6 +226,47 @@ def test_live_non_create_journal_is_busy_in_both_editions(tmp_path: Path) -> Non
     assert payload["busy"]["pid"] == os.getpid()
 
 
+def _write_live_finish_journal(root: Path, *, pad_bytes: int = 0) -> Path:
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    other_dir = wrkslots_cli._slot_directory(config, "slot-a", "agent")
+    fenced_path = other_dir.parent / ".slot-a.fenced.1.test"
+    payload: dict[str, object] = {
+        "kind": "finish",
+        "machine": "node-a",
+        "slot": "slot-a",
+        "owner": _live_identity(os.getpid()),
+        "record": {"slot": "slot-a", "slot_type": "agent"},
+        "fenced": fenced_path.relative_to(config.root).as_posix(),
+    }
+    if pad_bytes:
+        payload["x"] = {"pad": "p" * pad_bytes}
+    path = wrkslots_cli._finish_journal_path(config, "slot-a", "node-a")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_live_finish_journal_for_other_slot_does_not_block_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    # #1757: a live, healthy finish for another slot is never a recovery
+    # journal, however large; classifying an unrelated create proceeds.
+    rust_root = _transfer_fixture(tmp_path / "rust", None)
+    oracle_root = _transfer_fixture(tmp_path / "oracle", None)
+    rust_journal = _write_live_finish_journal(
+        rust_root, pad_bytes=4 * 1024 * 1024
+    )
+    oracle_journal = _write_live_finish_journal(
+        oracle_root, pad_bytes=4 * 1024 * 1024
+    )
+    assert rust_journal.stat().st_size > 4 * 1024 * 1024
+    assert oracle_journal.stat().st_size > 4 * 1024 * 1024
+    rc, _out = _python_classify(oracle_root, fmt="json")
+    assert rc == 0
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["blocking"] is False
+
+
 def _write_scoped_import_journal(root: Path) -> Path:
     active = root / "worktrees" / "ACTIVE.node-a.json"
     document = json.loads(active.read_text(encoding="utf-8"))
