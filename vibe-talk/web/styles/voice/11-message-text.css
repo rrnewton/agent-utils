@@ -489,6 +489,20 @@
   border-left: 2px solid var(--accent);
   margin: 0 0 0.4rem;
   overflow-wrap: anywhere;
+  /* `#1783 vibe-talk-review-nits-1761-1762-1767` (b): reserve the floating
+   * chips' room under a hit brought to the foot of the list, so the Newest
+   * chip (which floats there, #scroll-tools) never covers the first expanded
+   * hit — or any hit — once it is scrolled into view. The clearance is the
+   * chips row's measured height plus its foot gap, written by the page's
+   * ResizeObserver; the 2.75rem floor covers the chip appearing only because
+   * the reader scrolled away from the foot, before that measurement lands. */
+  scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
+}
+
+/* The expanded view's own controls get the same reserved room at the foot. */
+#server-more,
+#search-further {
+  scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
 }
 
 .server-hit-meta {
