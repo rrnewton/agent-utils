@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-audit-deletable-vs-remove-private-history: audit DELETABLE disagrees with remove on nested submodule private history'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-removegaps
 labels:
 - wrkslots
 created_at: 2026-11-16T16:30:20-05:00
-updated_at: 2026-11-16T16:30:20-05:00
+updated_at: 2026-11-16T19:30:00-05:00
+closed_at: 2026-11-16T19:30:00-05:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ updated_at: 2026-11-16T16:30:20-05:00
 # Notes
 
 High priority: the owner ordered a host-wide slot cleanup today, and lingering validate checkouts motivated the census behind this report.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 140b440d on main. Audit now runs remove's private-history scan over every initialized submodule, nested clones included, in both editions: a kept private tip blocks with remove's own refusal naming --archive-private-history, so DELETABLE no longer names a slot remove would refuse. Regression tests build a slot with private history only in a nested submodule and assert audit and remove agree, in Python and in the Rust differential. Validated and gated on the exact tree, with the combined tree revalidated for the overlap landing.
