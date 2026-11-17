@@ -66955,7 +66955,7 @@ def test_containing_refs_sidecar_round_trip(tmp_path: Path) -> None:
     holder: dict[str, object] = {"containing_remote_refs": list(refs)}
     wrkslots._sidecar_containing_refs(config, holder)
     assert len(holder["containing_remote_refs"]) == 64  # type: ignore[arg-type]
-    reference = holder["containing_remote_refs_sidecar"]  # type: ignore[index]
+    reference = holder["containing_remote_refs_sidecar"]
     assert isinstance(reference, dict)
     assert reference["count"] == 5000
     sidecar = config.control / str(reference["path"])
@@ -67000,7 +67000,7 @@ def test_containing_refs_sidecar_missing_refuses_naming_digest(
     refs = [f"refs/remotes/origin/agent/branch-{index}" for index in range(5000)]
     holder: dict[str, object] = {"containing_remote_refs": list(refs)}
     wrkslots._sidecar_containing_refs(config, holder)
-    reference = holder["containing_remote_refs_sidecar"]  # type: ignore[index]
+    reference = holder["containing_remote_refs_sidecar"]
     assert isinstance(reference, dict)
     digest = str(reference["sha256"])
     (config.control / str(reference["path"])).unlink()

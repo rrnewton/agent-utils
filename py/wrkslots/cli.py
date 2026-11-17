@@ -55437,7 +55437,7 @@ def _shrink_finish_journal(
 
     if payload.get("kind") != "finish":
         return dict(payload)
-    shrunk = json.loads(json.dumps(payload))
+    shrunk: dict[str, object] = json.loads(json.dumps(payload))
     record_obj = shrunk.get("record")
     if isinstance(record_obj, dict):
         checkouts_obj = record_obj.get("checkouts")
