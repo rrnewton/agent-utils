@@ -204,7 +204,10 @@ test("a pending audio suspension honors the next read and a later stop", async (
     audio.state = "suspended";
     resolve();
   }));
+  // `#1800`: the suspension waits out the keep-alive first; firing it starts the suspension
+  // this test holds pending, and only then does the next read ask for the output.
   page.pure("readAloudOwner().quietReadAloudContext")();
+  page.expireTimers(25000);
   page.pure("readAloudOwner().readAloudAudioContext")();
   pending.shift()();
   await page.settle();
@@ -213,6 +216,7 @@ test("a pending audio suspension honors the next read and a later stop", async (
   page.pure("readAloudOwner().quietReadAloudContext")();
   page.pure("readAloudOwner().readAloudAudioContext")();
   page.pure("readAloudOwner().quietReadAloudContext")();
+  page.expireTimers(25000);
   for (const finish of pending.splice(0)) finish();
   await page.settle();
   assert.equal(audio.state, "suspended", "an old suspension resumed audio after Stop");

@@ -5171,6 +5171,16 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // boundary between a judgement and a different behaviour wearing the same name.
 
 const TUNING_BANDS = {
+  // `#1800 vibe-talk-read-aloud-chunk-start-clipping`. The silence before a cold chunk and how
+  // long the output stays alive after a read: enough to wake a sleeping Bluetooth sink and to
+  // bridge back-to-back reads, never so long that a cold chunk waits seconds or the output is
+  // held for minutes.
+  MIN_READ_PREROLL_MS: [0, 0, "the least pre-roll before a cold chunk (0 turns it off)"],
+  MAX_READ_PREROLL_MS: [500, 5000, "the most pre-roll before a cold chunk"],
+  DEFAULT_READ_PREROLL_MS: [100, 1000, "the default pre-roll before a cold chunk"],
+  MIN_READ_KEEP_ALIVE_MS: [0, 0, "the least keep-alive after a read (0 suspends at once)"],
+  MAX_READ_KEEP_ALIVE_MS: [30000, 600000, "the most keep-alive after a read"],
+  DEFAULT_READ_KEEP_ALIVE_MS: [5000, 60000, "the default keep-alive after a read"],
   // `#1470 toolbar-dynamic-promotion`. Slack between promoting and demoting a toolbar
   // action: wide enough to settle a boundary resize, narrow enough that a real
   // overflow still demotes within a drag.

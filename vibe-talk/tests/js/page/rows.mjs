@@ -3577,40 +3577,49 @@ test("a prepared read PLAYS AS IT ARRIVES, rather than after the ~225 KB an <aud
   page.setClock(tappedAt + 40);
   stream.controller.bytes(joined(header.subarray(20), samples.subarray(0, 3)));
   await page.settle();
-  assert.equal(audio.sources.length, 1, "the first samples were held back");
+  // The first samples, and the cold start's pre-roll silence before them (`#1800`): the speech
+  // source is created first, the silence second, and the silence starts first.
+  assert.equal(audio.sources.length, 2, "the first samples were held back");
   assert.deepEqual([...audio.sources[0].buffer.getChannelData(0)], [0.5]);
   // Half a second banked: a read arrives at speaking pace, so this lead is its whole cushion
-  // against a network stall.
-  assert.equal(audio.sources[0].startedAt, 0.5, "the first piece was not given its lead");
+  // against a network stall. The pre-roll opens the lead; speech follows it.
+  const hush = audio.sources[1];
+  assert.equal(hush.startedAt, 0.5, "the pre-roll was not given its lead");
+  assert.equal(audio.sources[0].startedAt, 0.8, "the first piece did not follow its pre-roll");
 
-  // `playing` is when that lead has run out, not when the piece was queued.
-  page.setClock(tappedAt + 540);
-  assert.equal(page.expireTimers(500), 1, "nothing waited for the first sample to reach the speaker");
+  // `playing` is when speech is due, not when the piece was queued.
+  page.setClock(tappedAt + 840);
+  assert.equal(page.expireTimers(800), 1, "nothing waited for the first sample to reach the speaker");
   await page.settle();
   // The very first sample is loud, so speech begins exactly when playback does. `#191
   // read-aloud-first-lag`; a read that opens with silence is the next test.
   assert.deepEqual(page.speechTimingCalls.map((call) => call.timing), [{
     tap_to_play_ms: 0,
     request_to_loaded_ms: 40,
-    loaded_to_playing_ms: 500,
-    tap_to_audible_ms: 540,
-    tap_to_speech_ms: 540,
+    loaded_to_playing_ms: 800,
+    tap_to_audible_ms: 840,
+    tap_to_speech_ms: 840,
   }]);
 
   stream.controller.bytes(samples.subarray(3));
   await page.settle();
-  assert.equal(audio.sources.length, 2);
-  assert.deepEqual([...audio.sources[1].buffer.getChannelData(0)], [-1, 0.25], "a split sample was garbled");
-  assert.equal(audio.sources[1].startedAt, 0.5 + 1 / 24000, "the next piece did not follow on without a gap");
+  assert.equal(audio.sources.length, 3);
+  assert.deepEqual([...audio.sources[2].buffer.getChannelData(0)], [-1, 0.25], "a split sample was garbled");
+  assert.equal(audio.sources[2].startedAt, 0.8 + 1 / 24000, "the next piece did not follow on without a gap");
 
   stream.controller.drop();
   await page.settle();
   audio.sources[0].onended();
+  hush.onended();
   await page.settle();
   assert.deepEqual(page.dismissCalls, [], "archived while its last samples were still to be heard");
-  audio.sources[1].onended();
+  audio.sources[2].onended();
   await page.settle();
   assert.deepEqual(page.dismissCalls, [{ messages: ["1000000000000000001"] }]);
+  // Kept alive briefly after the read (`#1800`), then let go.
+  assert.equal(audio.state, "running", "the audio output was dropped the moment the read ended");
+  page.expireTimers(25000);
+  await page.settle();
   assert.equal(audio.state, "suspended", "the audio output was held open after the read ended");
 });
 
@@ -3630,8 +3639,8 @@ test("a streamed read reports when SPEECH began, after the silence it opens with
   page.setClock(tappedAt + 40);
   stream.controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(250).fill(20))));
   await page.settle();
-  page.setClock(tappedAt + 540);
-  assert.equal(page.expireTimers(500), 1, "nothing waited for the first sample to reach the speaker");
+  page.setClock(tappedAt + 840);
+  assert.equal(page.expireTimers(800), 1, "nothing waited for the first sample to reach the speaker");
   await page.settle();
   assert.deepEqual(page.speechTimingCalls, [], "the report went before speech could be timed");
 
@@ -3642,9 +3651,10 @@ test("a streamed read reports when SPEECH began, after the silence it opens with
   await page.settle();
   assert.equal(page.speechTimingCalls.length, 1, "speech arrived and nothing was reported");
   const timing = page.speechTimingCalls[0].timing;
-  assert.equal(timing.tap_to_audible_ms, 540);
-  // 40 ms to the first frame, the 500 ms lead, 252 frames at 1 kHz: speech due at 792 ms.
-  assert.equal(timing.tap_to_speech_ms, 792, JSON.stringify(timing));
+  assert.equal(timing.tap_to_audible_ms, 840);
+  // 40 ms to the first frame, the 800 ms to speech (lead plus cold-start pre-roll, `#1800`),
+  // 252 frames at 1 kHz: speech due at 1092 ms.
+  assert.equal(timing.tap_to_speech_ms, 1092, JSON.stringify(timing));
 });
 
 test("...and a read that stays quiet still reports, without a speech time, after a bounded wait", async () => {
@@ -3656,7 +3666,7 @@ test("...and a read that stays quiet still reports, without a speech time, after
   await page.settle();
   page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(1, 2, 3)));
   await page.settle();
-  page.expireTimers(500);
+  page.expireTimers(800);
   await page.settle();
   assert.deepEqual(page.speechTimingCalls, []);
   assert.equal(page.expireTimers(5000), 1, "nothing bounded the wait for speech");
@@ -3723,8 +3733,9 @@ test("a SWITCH aborts the first read's response and silences what it had queued,
   page.audioStreams[1].controller.bytes(joined(wavHeader(24000, 1), pcm(4, 5)));
   await page.settle();
   assert.equal(page.audio, audio, "every tap built another audio context");
-  assert.equal(audio.sources.length, 2);
-  assert.equal(audio.sources[1].halted, false);
+  // Each read's speech plus its cold-start pre-roll silence (`#1800`).
+  assert.equal(audio.sources.length, 4);
+  assert.equal(audio.sources.at(-1).halted, false);
   assert.deepEqual(page.dismissCalls, [], "the interrupted read was filed away as heard");
 });
 
@@ -3759,9 +3770,10 @@ test("a streamed read CUT OFF part-way, or refused, says so and archives nothing
   // Refused outright, not lost: said at once, and not tried again.
   page.ticketStatus = 500;
   const asked = page.audioStreams.length;
+  const playedBefore = page.audio.sources.length;
   await rows[1].dispatch("click", {});
   await page.settle();
-  assert.equal(page.audio.sources.length, 1, "a refused read played something");
+  assert.equal(page.audio.sources.length, playedBefore, "a refused read played something");
   assert.match(page.el("status").textContent, /Cloud voice: it could not play this message\./);
   assert.equal(page.audioStreams.length, asked + 1, "a refused read was asked for again");
   assert.deepEqual(page.dismissCalls, [], "a read nobody heard to the end was archived");
