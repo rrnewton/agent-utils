@@ -387,8 +387,9 @@ thread_local! {
 }
 
 /// A test's own thread names, from `(channel, thread)` pairs, until the
-/// guard is dropped. The stamp is the map's length, so a test that files
-/// another name mid-draw changes it as a filing does.
+/// guard is dropped. The stamp hashes the entries, so a test that files
+/// another name mid-draw changes it as a filing does, and two tests'
+/// maps never share a stamp.
 #[cfg(test)]
 pub struct SlugsGuard(Option<Arc<dyn ThreadSlugs>>);
 
@@ -404,7 +405,24 @@ impl SlugsGuard {
                     .cloned()
             }
             fn stamp(&self) -> u64 {
-                self.0.len() as u64
+                // A hash of the entries, so two tests' different maps never
+                // share the render cache's stamp by counting alike.
+                let mut entries: Vec<String> = self
+                    .0
+                    .iter()
+                    .map(|((channel, thread), name)| format!("{channel}\0{thread}\0{name}"))
+                    .collect();
+                entries.sort();
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                for entry in entries {
+                    for byte in entry.bytes() {
+                        hash ^= u64::from(byte);
+                        hash = hash.wrapping_mul(0x0100_0000_01b3);
+                    }
+                    hash ^= 0xff;
+                    hash = hash.wrapping_mul(0x0100_0000_01b3);
+                }
+                hash
             }
         }
         let map: std::collections::HashMap<(String, String), String> = names
