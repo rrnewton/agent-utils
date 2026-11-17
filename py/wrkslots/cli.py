@@ -34219,23 +34219,15 @@ def _ignored_refusal(
     )
 
 
-def _warn_ignored_paths_referenced(
-    config: Config, ignored_by_checkout: Mapping[str, tuple[_IgnoredFile, ...]]
-) -> None:
-    """Warning only: name ignored paths the source tree's records cite.
+_IGNORED_REFERENCE_SCAN_FILES = 1000
+_IGNORED_REFERENCE_SCAN_BYTES = 32 * 1024 * 1024
+_IGNORED_REFERENCE_FILE_BYTES = 2 * 1024 * 1024
 
-    Bounded (at most 1000 files and 32 MiB scanned) and never a refusal:
-    the deterministic guard is the refusal itself; this only helps the
-    operator see which ignored files other work points at (#1302).
-    """
 
-    paths = sorted(
-        {item.path for files in ignored_by_checkout.values() for item in files}
-    )
-    if not paths:
-        return
-    scanned_files = 0
-    scanned_bytes = 0
+def _ignored_reference_files(config: Config) -> list[tuple[Path, int, int]]:
+    """(path, size, mtime_ns) the referenced-paths scan reads, in scan order."""
+
+    found: list[tuple[Path, int, int]] = []
     for base in (
         config.root / ".minibeads" / "issues",
         config.root / "ai_docs",
@@ -34244,27 +34236,95 @@ def _warn_ignored_paths_referenced(
         if not base.is_dir():
             continue
         for candidate in sorted(base.rglob("*")):
-            if scanned_files >= 1000 or scanned_bytes >= 32 * 1024 * 1024:
-                return
             try:
                 if candidate.is_symlink() or not candidate.is_file():
                     continue
                 metadata = candidate.stat(follow_symlinks=False)
-                if metadata.st_size > 2 * 1024 * 1024:
-                    continue
-                contents = candidate.read_bytes()
             except OSError:
                 continue
-            scanned_files += 1
-            scanned_bytes += len(contents)
-            text = contents.decode("utf-8", errors="ignore")
-            for relative in paths:
-                if relative in text:
-                    print(
-                        f"wrkslots: warning: gitignored path {relative} is "
-                        f"referenced by {candidate}",
-                        file=sys.stderr,
-                    )
+            if metadata.st_size > _IGNORED_REFERENCE_FILE_BYTES:
+                continue
+            found.append((candidate, metadata.st_size, metadata.st_mtime_ns))
+    return found
+
+
+def _scan_ignored_reference_corpus(
+    config: Config,
+) -> tuple[tuple[Path, str], ...]:
+    """Read the source tree's records once, within the scan bounds (#1302)."""
+
+    corpus: list[tuple[Path, str]] = []
+    scanned_bytes = 0
+    for candidate, _size, _mtime_ns in _ignored_reference_files(config):
+        if (
+            len(corpus) >= _IGNORED_REFERENCE_SCAN_FILES
+            or scanned_bytes >= _IGNORED_REFERENCE_SCAN_BYTES
+        ):
+            break
+        try:
+            contents = candidate.read_bytes()
+        except OSError:
+            continue
+        corpus.append((candidate, contents.decode("utf-8", errors="ignore")))
+        scanned_bytes += len(contents)
+    return tuple(corpus)
+
+
+# One cached corpus per repository tree (#1752): a batch whose every slot
+# warns about the same records must not re-read them per slot. The key is
+# the tree the scan reads (root plus each scanned file's size and mtime),
+# so a changed tree is scanned afresh; only the newest entry is kept.
+_ignored_reference_cache: (
+    tuple[tuple[str, tuple[tuple[str, int, int], ...]], tuple[tuple[Path, str], ...]]
+    | None
+) = None
+
+
+def _ignored_reference_corpus(
+    config: Config,
+) -> tuple[tuple[Path, str], ...]:
+    """The referenced-paths corpus for ``config``'s tree, scanned once."""
+
+    global _ignored_reference_cache
+    key = (
+        str(config.root),
+        tuple(
+            (str(path), size, mtime_ns)
+            for path, size, mtime_ns in _ignored_reference_files(config)
+        ),
+    )
+    if _ignored_reference_cache is not None and _ignored_reference_cache[0] == key:
+        return _ignored_reference_cache[1]
+    corpus = _scan_ignored_reference_corpus(config)
+    _ignored_reference_cache = (key, corpus)
+    return corpus
+
+
+def _warn_ignored_paths_referenced(
+    config: Config, ignored_by_checkout: Mapping[str, tuple[_IgnoredFile, ...]]
+) -> None:
+    """Warning only: name ignored paths the source tree's records cite.
+
+    Bounded (at most 1000 files and 32 MiB scanned) and never a refusal:
+    the deterministic guard is the refusal itself; this only helps the
+    operator see which ignored files other work points at (#1302).  The
+    scanned corpus is cached per repository tree (#1752), so a batch
+    warns from one scan; the warnings printed are unchanged.
+    """
+
+    paths = sorted(
+        {item.path for files in ignored_by_checkout.values() for item in files}
+    )
+    if not paths:
+        return
+    for candidate, text in _ignored_reference_corpus(config):
+        for relative in paths:
+            if relative in text:
+                print(
+                    f"wrkslots: warning: gitignored path {relative} is "
+                    f"referenced by {candidate}",
+                    file=sys.stderr,
+                )
 
 
 def _ignored_archive_path(

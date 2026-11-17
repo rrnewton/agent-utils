@@ -59199,6 +59199,70 @@ def test_remove_agent_batch_archive_ignored_removes_slots(tmp_path: Path) -> Non
             )
 
 
+def referenced_ignored_batch_project(
+    tmp_path: Path,
+) -> tuple[Path, list[str], Path]:
+    """Two dead-owner slots with gitignored files a project record cites."""
+
+    project, repository, _remote = make_project(tmp_path)
+    (repository / ".gitignore").write_text("provisioning/\n", encoding="utf-8")
+    git(repository, "add", ".gitignore")
+    git(repository, "commit", "-q", "-m", "ignore provisioning output")
+    git(repository, "push", "-q", "origin", "main")
+    slots = ["slot01", "slot02"]
+    for index, slot in enumerate(slots, start=1):
+        made = create(project, slot=slot, agent=f"codex-{index}", branch=f"codex/{slot}")
+        assert made.returncode == 0, made.stderr
+        commit_task(repository, checkout(project, slot), f"codex/{slot}")
+        handed_off = finish(project, slot, f"codex-{index}")
+        assert handed_off.returncode == 0, handed_off.stderr
+        tree = checkout(project, slot)
+        (tree / "provisioning").mkdir()
+        (tree / "provisioning" / "local.cfg").write_text(
+            "provisioned\n", encoding="utf-8"
+        )
+    for slot in slots:
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    reference = project / ".minibeads" / "issues" / "reference.md"
+    reference.parent.mkdir(parents=True, exist_ok=True)
+    reference.write_text("kept in provisioning/local.cfg\n", encoding="utf-8")
+    return project, slots, reference
+
+
+def test_remove_agent_batch_scans_referenced_ignored_paths_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1752: two slots in one batch share one referenced-paths scan.
+
+    The warning text is printed per slot exactly as before, but the
+    record file it cites is read once, not once per slot.
+    """
+
+    project, slots, reference = referenced_ignored_batch_project(tmp_path)
+    reads: list[Path] = []
+    original_read = Path.read_bytes
+
+    def counting_read(self: Path) -> bytes:
+        if self == reference:
+            reads.append(self)
+        return original_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read)
+
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 1, stderr
+    assert batch_slots(payload, "refused") == slots
+    warning = (
+        f"wrkslots: warning: gitignored path provisioning/local.cfg is "
+        f"referenced by {reference}"
+    )
+    assert stderr.count(warning) == len(slots)
+    assert len(reads) == 1
+
+
+
 def test_remove_agent_batch_refuses_validation_and_absent_rows_per_item(
     tmp_path: Path,
 ) -> None:
