@@ -587,7 +587,9 @@ fn journal_disjoint_from_create(
     requested_slot: &str,
     requested_slot_type: &str,
 ) -> bool {
-    if raw.get("kind").and_then(Value::as_str) != Some("finish") {
+    if raw.get("kind").and_then(Value::as_str) != Some("finish")
+        || requested_slot_type != "validate"
+    {
         return false;
     }
     let record = raw.get("record").and_then(Value::as_object);
@@ -1312,7 +1314,7 @@ fn classify_one(
     // liveness is decided before the 1 MiB recovery read, so an oversized
     // live journal is neither size-checked nor met with recover advice.
     if let Some(peeked) = peek_journal_raw(path) {
-        if peeked.get("kind").and_then(Value::as_str) != Some("create") {
+        if peeked.get("kind").and_then(Value::as_str) == Some("finish") {
             if let Some(owner) = live_journal_owner(&peeked) {
                 if journal_disjoint_from_create(cfg, &peeked, requested_slot, requested_slot_type) {
                     return Ok(None);

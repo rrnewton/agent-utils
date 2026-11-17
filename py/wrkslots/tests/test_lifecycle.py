@@ -10419,14 +10419,14 @@ def _live_finish_journal(
         if dead
         else live
     )
-    other_dir = wrkslots._slot_directory(config, slot, "agent")
+    other_dir = wrkslots._slot_directory(config, slot, "validate")
     fenced_path = other_dir.parent / f".{slot}.fenced.1.test"
     payload: dict[str, object] = {
         "kind": "finish",
         "machine": "testhost",
         "slot": slot,
         "owner": wrkslots._identity_to_obj(owner),
-        "record": {"slot": slot, "slot_type": "agent"},
+        "record": {"slot": slot, "slot_type": "validate"},
         "fenced": fenced_path.relative_to(config.root).as_posix(),
     }
     if pad_bytes:
@@ -10448,7 +10448,7 @@ def test_live_finish_journal_for_other_slot_does_not_block_create(
         (),
         (),
         requested_slot="newslot",
-        requested_slot_type="agent",
+        requested_slot_type="validate",
         skipped_paths=skipped,
     )
     assert rows == ()
@@ -10475,7 +10475,7 @@ def test_oversized_live_finish_journal_classified_without_recovery_read(
         (),
         (),
         requested_slot="newslot",
-        requested_slot_type="agent",
+        requested_slot_type="validate",
         skipped_paths=skipped,
     )
     assert rows == ()
@@ -10496,7 +10496,7 @@ def test_oversized_dead_finish_journal_still_refuses(
             (),
             (),
             requested_slot="newslot",
-            requested_slot_type="agent",
+            requested_slot_type="validate",
             skipped_paths=[],
         )
     assert "exceeds the 1 MiB safety bound" in str(caught.value)
@@ -10514,7 +10514,7 @@ def test_live_finish_journal_for_same_slot_is_busy_not_recovery(
             (),
             (),
             requested_slot="heldslot",
-            requested_slot_type="agent",
+            requested_slot_type="validate",
             skipped_paths=[],
         )
 

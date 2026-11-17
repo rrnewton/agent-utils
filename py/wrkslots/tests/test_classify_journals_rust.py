@@ -228,14 +228,14 @@ def test_live_non_create_journal_is_busy_in_both_editions(tmp_path: Path) -> Non
 
 def _write_live_finish_journal(root: Path, *, pad_bytes: int = 0) -> Path:
     config = wrkslots_cli._load_config(str(root), "node-a")
-    other_dir = wrkslots_cli._slot_directory(config, "slot-a", "agent")
+    other_dir = wrkslots_cli._slot_directory(config, "slot-a", "validate")
     fenced_path = other_dir.parent / ".slot-a.fenced.1.test"
     payload: dict[str, object] = {
         "kind": "finish",
         "machine": "node-a",
         "slot": "slot-a",
         "owner": _live_identity(os.getpid()),
-        "record": {"slot": "slot-a", "slot_type": "agent"},
+        "record": {"slot": "slot-a", "slot_type": "validate"},
         "fenced": fenced_path.relative_to(config.root).as_posix(),
     }
     if pad_bytes:
@@ -260,9 +260,23 @@ def test_live_finish_journal_for_other_slot_does_not_block_in_both_editions(
     )
     assert rust_journal.stat().st_size > 4 * 1024 * 1024
     assert oracle_journal.stat().st_size > 4 * 1024 * 1024
-    rc, _out = _python_classify(oracle_root, fmt="json")
+    args = argparse.Namespace(
+        project_root=str(oracle_root), machine="node-a", slot="slot-c",
+        slot_type="validate", agent="agent-other", format="json",
+    )
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        rc = wrkslots_cli._cmd_classify_create_journals(args)
     assert rc == 0
-    result = _rust_classify(rust_root, fmt="json")
+    result = subprocess.run(
+        [
+            str(rust_wrkslotsd()), "classify-create-journals", "slot-c",
+            "--agent", "agent-other", "--slot-type", "validate",
+            "--machine", "node-a", "--root", str(rust_root), "--format", "json",
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+        env=dict(os.environ),
+    )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["blocking"] is False
 

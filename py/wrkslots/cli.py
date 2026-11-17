@@ -13588,7 +13588,11 @@ def _journal_disjoint_from_create(
     its busy or refusal behaviour (#1757).
     """
 
-    if requested_slot is None or raw.get("kind") != "finish":
+    if (
+        requested_slot is None
+        or requested_slot_type != "validate"
+        or raw.get("kind") != "finish"
+    ):
         return False
     record = raw.get("record")
     record_map: Mapping[str, object] = (
@@ -13862,7 +13866,7 @@ def _classify_create_journal(
     # journal is neither size-checked nor met with recover advice. Only a
     # dead or unknown owner falls through to the strict recovery read.
     peeked = _peek_journal_raw(path)
-    if peeked is not None and peeked.get("kind") != "create":
+    if peeked is not None and peeked.get("kind") == "finish":
         peeked_owner = _live_journal_owner(peeked)
         if peeked_owner is not None:
             if _journal_disjoint_from_create(
