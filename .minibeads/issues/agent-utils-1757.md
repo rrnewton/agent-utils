@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-live-finish-journal-blocks-create: a live finish journal for one slot blocks create for another'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -57,3 +57,26 @@ megabytes on a repository whose HEAD is contained in many remote refs.
 
 Part (a), the liveness-first classification, unblocks validation and
 lands first. Part (b), the sidecar shrink, follows as its own change.
+
+## Resolution
+
+Part (a) landed 6e80ecfb: create-journal classification decides
+liveness (pid plus start time) before the 1 MiB recovery read; a live
+finish journal for a disjoint slot no longer blocks a validate create,
+an overlapping one stays busy naming the holder, and dead-owner
+oversized journals refuse as before, in both editions. Part (b)
+landed b0ce001f: containment inventories beyond 64 inline refs move
+to digest-named side files under control/containing-refs/, fsynced
+before the journal and event that reference them; recovery restores
+them and refuses naming the digest when a side file is missing. A
+real remove with 200 containing refs now writes a small finish
+journal and recovers cleanly. Older readers fail closed on the
+sidecar key rather than misjudging containment.
+
+Gate evidence note: the open-fd migrate test flaked once in 20 runs
+on this branch (20/20 on main in the same window):
+FileNotFoundError at test_worktrees_image.py:1718, os.readlink of
+/proc/<child>/fd/3 vanishing between the glob and the read - a race
+in the test's own fd poll, present in main's test code too. The poll
+now treats a vanishing fd as not-the-held-one; 20/20 after the fix,
+and the solo shard rerun passed.
