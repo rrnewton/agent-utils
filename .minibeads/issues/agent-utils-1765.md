@@ -60,6 +60,10 @@ The differential's Python oracle reads user-manager evidence through bounded bus
 
 `test_validation_exclusion_fixture_preserves_host_root_boundary` (a 5 s census bound) fails identically on unmodified `github/main` under load. Same rule-346 class: wait on a condition or use a fake clock. Taken after the current step-2 change lands.
 
+## Step 2 follow-up: journal actor liveness waits near a wall budget
+
+`py/wrkslots/tests/test_journal_actor_liveness.py::test_wait_lock_waits_for_a_live_journal_then_proceeds` failed in a loaded gate (line 178) and passed 5/5 solo on two trees at 24-43 s each, suggesting a wall-clock budget near its runtime. Same rule-346 treatment: condition waits or a fake clock.
+
 ## Step 2 root cause: browser checks sample on wall deadlines
 
 `thread-pin-picker-browser` polled conditions on 10 s wall deadlines (11 s exit-1 failures); its waits now keep the same conditions behind 120 s backstops. `pack-still-browser` recorded frames for 900 ms of wall time, so a starved main thread produced no slide (`460.4375 -> 460.4375`); it now records until the slide condition holds (with a frame-count backstop), assertions unchanged.
