@@ -290,8 +290,8 @@ def test_slice_limits_transient_until_the_backstop_refuses(
     monkeypatch.setattr(sandbox, "subprocess", fake)
     monkeypatch.setattr(sandbox, "_SLICE_LIMIT_BACKSTOP_SECONDS", 2.0)
     sleeps: list[float] = []
-    monkeypatch.setattr(sandbox.time, "sleep", sleeps.append)
-    monkeypatch.setattr(sandbox.random, "uniform", lambda _a, _b: 0.0)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    monkeypatch.setattr("random.uniform", lambda _a, _b: 0.0)
     with pytest.raises(sandbox.SandboxError, match=r"after \d+ tries: .*NoReply"):
         sandbox.apply_slice_limits(_view(tmp_path), sandbox.SandboxLimits(tasks_max=256))
     assert fake.set_property_calls > 1
