@@ -392,11 +392,51 @@
   text-align: center;
 }
 
-/* `#605`-`#608 server-side-search`. The server's copy, searched: the line saying what was searched, All
-   channels, and the server's hits, each alone with its way to the channel, under the step back. The
-   hits are the list's own quiet rows, so they read as messages and not as a second pane. */
+/* `#1762 vibe-talk-server-hits-collapsed-line`. The two signposts between what is
+   loaded here and what only the server holds: a hairline on each side of the
+   label, as the labelled seams draw theirs, and never a control. */
+.search-sep {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.35rem 1rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.search-sep::before,
+.search-sep::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--edge);
+}
+
+/* `#605`-`#608 server-side-search`, collapsed by `#1762`. The server's copy,
+   searched, at the foot of the list: one tappable line, and only once tapped
+   the line saying what was searched, All channels, and the server's hits, each
+   alone with its way to the channel. The hits are the list's own quiet rows,
+   so they read as messages and not as a second pane. */
 .server-search {
   margin: 0 1rem 0.6rem;
+}
+
+/* The one line: a full-width tap target, quiet until pressed. */
+.server-line {
+  display: block;
+  width: 100%;
+  min-height: 2.75rem;
+  margin: 0.2rem 0 0.4rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  background: var(--panel);
+  color: inherit;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
 }
 
 .search-scope {

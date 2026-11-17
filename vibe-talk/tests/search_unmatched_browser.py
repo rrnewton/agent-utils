@@ -28,7 +28,8 @@ here under a count that is not exact) among five messages of the channel itself.
   it was. No horizontal overflow and no page error at any step.
 
 `#605`-`#608 server-side-search` add a fifth stage over the same channel, on a server that keeps a
-copy and answers its search: in All, "lantern" -> the line saying what was searched ("No upstream
+copy and answers its search: in All, "lantern" -> one collapsed line at the foot of the list
+("1 more hit on the server", `#1762`), tapped -> the line saying what was searched ("No upstream
 search · this page: back to … · server: back to … (still expanding) · … messages searched") and the
 server's one older hit drawn alone with its Show in channel button, a thumb tall, nothing wider than
 the window -> All channels ticked: the server asked over every channel, its hit from another channel
@@ -453,21 +454,8 @@ ALL_CHANNELS_CLEAR_JS = """() => {
 
 
 def press_all_channels(walk: Walk) -> None:
-    """Tick or untick All channels with a real press, as a reader who has just been
-    taken to the newest hits does (`#1734 vibe-talk-search-view-scroll-default`): the
-    search-entry scroll leaves the bar's lower rows under the sticky field, so wheel
-    the list back to its head until the box's centre is clear, then press it."""
-    page = walk.page
-    if page.evaluate(ALL_CHANNELS_CLEAR_JS):
-        walk.press("#search-all-channels")
-        return
-    listed = page.locator("#discord-log").bounding_box()
-    walk.check(listed is not None, "the list is not on the screen to wheel back")
-    if listed is None:
-        return
-    page.mouse.move(listed["x"] + listed["width"] / 2, listed["y"] + listed["height"] / 2)
-    page.mouse.wheel(0, -10_000)
-    walk.until(ALL_CHANNELS_CLEAR_JS, "All channels did not come clear of the search field")
+    """Tick or untick All channels with a real press (`#1762`: the box lives in the
+    expanded server view at the foot of the list, so the press scrolls to it)."""
     walk.press("#search-all-channels")
 
 
@@ -477,6 +465,13 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     page.evaluate(PICK_JS, "flat")
     walk.until("() => document.getElementById('discord-log').children.length > 0", "All did not come back")
     page.fill("#search-field", "lantern")
+    # `#1762`: nothing of the server's is drawn while typing or on its answer;
+    # one line at the foot of the list, tapped to draw the hit.
+    walk.until("() => document.getElementById('server-line').textContent.includes('more hit')",
+               "the collapsed line did not show the server's hit")
+    walk.check(page.evaluate("() => document.querySelectorAll('#server-hits > li').length") == 0,
+               "the server's hit was drawn before the line was tapped")
+    walk.press("#server-line")
     walk.until("() => document.querySelectorAll('#server-hits > li').length === 1",
                "the server's older hit was not drawn")
     walk.server_settled()
@@ -548,6 +543,17 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     # Search further back: the server asked to gather this channel next, and the line says so.
     page.evaluate(PICK_JS, "flat")
     page.fill("#search-field", "lantern")
+    walk.until("() => document.getElementById('server-line').textContent.includes('more hit') && "
+               "!document.getElementById('server-search').hidden && "
+               "document.getElementById('server-line').getClientRects().length > 0",
+               "the collapsed line did not show the server's hit")
+    # Expand only where the Main and Threads stages left it collapsed (their
+    # passes run in the side column and never re-ask the server, so it may
+    # still stand open from the first tap). A plain click: the expanded detail
+    # above the line keeps the helper's scroll-into-view waiting on a moving
+    # list at this stage.
+    if page.evaluate("() => document.getElementById('server-detail').hidden"):
+        page.click("#server-line")
     walk.until("() => !document.getElementById('search-further').hidden", "Search further back was not offered")
     walk.press("#search-further")
     walk.until("() => document.getElementById('search-scope').textContent.includes('gathering older history')",

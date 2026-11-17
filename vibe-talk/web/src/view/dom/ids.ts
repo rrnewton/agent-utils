@@ -569,13 +569,18 @@ export interface ElementById {
   "search-in-all": HTMLButtonElement;
   "search-older-note": HTMLParagraphElement;
   "search-scope": HTMLParagraphElement;
+  "search-screen-sep": HTMLDivElement;
   "search-toggle": HTMLButtonElement;
   "selection-chip": HTMLButtonElement;
   "selection-chip-dismiss": HTMLButtonElement;
   "send-text": HTMLButtonElement;
+  "server-detail": HTMLDivElement;
   "server-hits": HTMLOListElement;
+  "server-line": HTMLButtonElement;
   "server-more": HTMLButtonElement;
   "server-search": HTMLElement;
+  "server-sep": HTMLDivElement;
+  "server-sep-label": HTMLSpanElement;
   "service-facts": HTMLParagraphElement;
   "settings-agent-audio": HTMLOptionElement;
   "settings-audio-source": HTMLSelectElement;

@@ -686,30 +686,18 @@
                 the search changes. A status, written once when a walk ends.
               -->
               <p id="search-older-note" class="hint search-older-note" role="status" hidden></p>
-              <!--
-                `#605`-`#608 server-side-search`. While a search is typed over a channel, what the
-                server's own copy holds that matches, older than what this page has loaded, each hit
-                alone with a way to it in the channel (owner, 2026-10-27, question 9); the line says
-                exactly what was searched: no upstream search, this page back to when, the server back
-                to when and whether it holds the whole channel or is still gathering it, and how many
-                messages in all. All channels widens the server's search to every channel (question
-                8; the current channel by default). Search further back asks the server to gather this
-                channel's older history next, and the line moves as it does.
-              -->
-              <section id="server-search" class="server-search" aria-label="The server's copy, searched" hidden>
-                <p id="search-scope" class="hint search-scope"></p>
-                <label class="search-all-channels">
-                  <input id="search-all-channels" type="checkbox" />
-                  All channels
-                </label>
-                <ol id="server-hits" class="server-hits"></ol>
-                <button id="server-more" class="chip" type="button" hidden>More from the server</button>
-                <button id="search-further" class="chip" type="button" hidden>Search further back</button>
-              </section>
+              <!-- `#605`-`#608 server-side-search` stands at the foot of the list,
+                   under the lists below (`#1762`): what the server's own copy
+                   holds that matches, older than what this page has loaded. -->
               <p id="timeline-notice" class="hint" hidden></p>
               <p id="channel-loading" class="channel-loading hint" role="status" aria-live="polite" hidden>
                 Loading messages…
               </p>
+              <!-- `#1762 vibe-talk-server-hits-collapsed-line`. The signpost over
+                   the loaded cards' matches, twin to the server's at the foot.
+                   Shown only while a search is typed; one row, set once, so the
+                   per-keystroke filter never pays for it. -->
+              <div id="search-screen-sep" class="search-sep" role="separator" hidden><span>On this screen</span></div>
               <ol id="thread-list" class="messages" hidden></ol>
               <ol id="discord-log" class="messages"></ol>
               <!--
@@ -721,6 +709,34 @@
               -->
               <ol id="pinned-log" class="messages" aria-label="Pinned messages" hidden></ol>
               <ol id="outgoing-log" class="messages" aria-label="Outgoing messages" hidden></ol>
+              <!--
+                `#605`-`#608 server-side-search`, moved and collapsed by
+                `#1762 vibe-talk-server-hits-collapsed-line`. At the FOOT of the
+                list, below the newest loaded message: where the owner said it
+                would be bearable, pinned to the bottom and mostly off screen
+                (the #1734 search landing leaves it just under the fold), instead
+                of at the head where every answer reflowed the cards being read.
+                Collapsed, it is ONE tappable line — "N more hits on the server"
+                — under its separator; the scope line, All channels, the hits
+                alone with their way to the channel, More and Search further
+                back wait inside #server-detail until that tap, and the snippets
+                are fetched and drawn only then. Nothing here is drawn while
+                the reader types.
+              -->
+              <section id="server-search" class="server-search" aria-label="The server's copy, searched" hidden>
+                <div id="server-sep" class="search-sep" role="separator"><span id="server-sep-label">On the server, not loaded here</span></div>
+                <button id="server-line" class="server-line" type="button" aria-expanded="false" aria-controls="server-detail">Search the server</button>
+                <div id="server-detail" hidden>
+                  <p id="search-scope" class="hint search-scope"></p>
+                  <label class="search-all-channels">
+                    <input id="search-all-channels" type="checkbox" />
+                    All channels
+                  </label>
+                  <ol id="server-hits" class="server-hits"></ol>
+                  <button id="server-more" class="chip" type="button" hidden>More from the server</button>
+                  <button id="search-further" class="chip" type="button" hidden>Search further back</button>
+                </div>
+              </section>
               <div id="channel-composer">
                 <!-- No heading line: it read like one more message. The box says where the message
                      goes in its placeholder, and names itself to a screen reader the same way. -->

@@ -158,7 +158,7 @@ export interface OlderWalks {
   scheduleServerSearch(): void;
   channelViewWords(): string;
   oldestLoadedMs(): number | null;
-  renderServerSearch(): void;
+  toggleServerHits(): void;
   dispose(): void;
 }
 
@@ -817,7 +817,56 @@ function serverHitNode(hit: Message): HTMLElement {
   return li;
 }
 
-/** Draw the server's search as it stands: the line, the hits this page does not already hold, More. */
+/** Whether the reader has tapped the server's line open (`#1762`). */
+let serverExpanded = false;
+/** The query identity the expanded view was opened for; a new one collapses it. */
+let serverExpandedFor = "";
+
+/** The server's hits this page does not already hold. */
+function serverFreshHits(): Message[] {
+  const serverSearch = serverSearchNow();
+  const channel = String(selectedChannelId() || "");
+  const held = heldMessagesById();
+  return serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
+}
+
+/** What the one tappable line says, from the answer as it stands. */
+function serverLineWords(): string {
+  const serverSearch = serverSearchNow();
+  if (serverSearch.failed) return "The server could not be searched — tap for details";
+  if (serverSearch.loading && serverSearch.hits.length === 0) return "Searching the server…";
+  if (serverSearch.scopes.length === 0) return "Search the server";
+  const fresh = serverFreshHits();
+  if (fresh.length === 0) return "No more hits on the server";
+  const more = serverSearch.resume !== null ? "+" : "";
+  return `${fresh.length}${more} more hit${fresh.length === 1 && !more ? "" : "s"} on the server`;
+}
+
+/** The line tapped: draw the snippets on demand, or put them away again. */
+function toggleServerHits(): void {
+  if (serverExpanded) {
+    serverExpanded = false;
+    renderServerSearch();
+    return;
+  }
+  serverExpanded = true;
+  serverExpandedFor = serverSearchNow().key;
+  const serverSearch = serverSearchNow();
+  // Nothing asked yet (the typing never settled, or the copy is closed): ask now.
+  if (!serverSearch.loading && serverSearch.hits.length === 0 && !serverSearch.failed &&
+    serverSearch.key !== "" && serverCopyOpen()) {
+    void guardQuietly(() => serverSearchOwner.run(false))();
+  }
+  renderServerSearch();
+}
+
+/**
+ * Draw the server's search as it stands (`#1762 vibe-talk-server-hits-collapsed-line`):
+ * one tappable line at the foot of the list, and only once it is tapped the scope
+ * line, All channels, the hits this page does not already hold, More and Search
+ * further back. While it stays collapsed this touches only the line's words, so
+ * an answer landing can never rebuild the snippet list under the reader.
+ */
 
 function renderServerSearch() {
   const serverSearch = serverSearchNow();
@@ -825,15 +874,36 @@ function renderServerSearch() {
   const wanted = serverSearch.key !== "";
   if (section.hidden === wanted) section.hidden = !wanted;
   if (!wanted) {
+    serverExpanded = false;
     if (el("server-hits").children.length > 0) el("server-hits").replaceChildren();
     return;
   }
+  // A typed query is a new search: its snippets wait for a fresh tap. Widening
+  // to every channel (the key's first part) keeps the view the reader opened.
+  const identityOf = (key: string): string => {
+    try {
+      const parsed = JSON.parse(key) as unknown;
+      return Array.isArray(parsed) ? String(parsed[1] ?? key) : key;
+    } catch (_error) {
+      return key;
+    }
+  };
+  if (serverExpanded && serverExpandedFor !== "" &&
+    identityOf(serverSearch.key) !== identityOf(serverExpandedFor)) serverExpanded = false;
+  const all = serverSearchOwner.allChannels();
+  setTextIfChanged(el("server-sep-label"),
+    all ? "On the server, not loaded here — including other channels" : "On the server, not loaded here");
+  const line = el("server-line") as HTMLButtonElement;
+  setTextIfChanged(line, serverLineWords());
+  const expanded = serverExpanded ? "true" : "false";
+  if (line.getAttribute("aria-expanded") !== expanded) line.setAttribute("aria-expanded", expanded);
+  const detail = el("server-detail");
+  if (detail.hidden === serverExpanded) detail.hidden = !serverExpanded;
+  if (!serverExpanded) return;
   setTextIfChanged(el("search-scope"), searchScopeLine());
   const checkbox = el("search-all-channels") as HTMLInputElement;
-  if (checkbox.checked !== serverSearchOwner.allChannels()) checkbox.checked = serverSearchOwner.allChannels();
-  const channel = String(selectedChannelId() || "");
-  const held = heldMessagesById();
-  const fresh = serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
+  if (checkbox.checked !== all) checkbox.checked = all;
+  const fresh = serverFreshHits();
   const drawn = [...el("server-hits").children].map((li) => `${li.getAttribute("data-channel")} ${li.getAttribute("data-id")}`);
   const want = fresh.map((hit) => `${hit.channel_id} ${hit.id}`);
   if (drawn.join("\n") !== want.join("\n")) el("server-hits").replaceChildren(...fresh.map(serverHitNode));
@@ -1148,7 +1218,7 @@ function renderOlderControl() {
   return {
     renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField,
     searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk,
-    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
+    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
     dispose() { disposed = true; },
   };
 }

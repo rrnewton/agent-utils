@@ -108,21 +108,27 @@ export function createServerSearch(deps: ServerSearchDependencies): ServerSearch
   return {
     state: () => serverSearch,
     schedule(key, open) {
-      // The same search: drawn again all the same, so the line follows what the page has loaded since
-      // and a hit the page now holds goes.
-      if (key === serverSearch.key) {
-        deps.render();
-        return;
-      }
+      // `#1762 vibe-talk-server-hits-collapsed-line`. The same search again: nothing
+      // happens. This runs on every pass of the on-screen filter while the reader
+      // types, and the filter must stay instant, so neither a request nor a render
+      // may leave here per keystroke; the count follows on the next answer instead.
+      if (key === serverSearch.key) return;
       if (serverSearchTimer !== null) deps.clock.clearTimeout(serverSearchTimer);
       serverSearchTimer = null;
       serverSearch = { key, ticket: serverSearch.ticket + 1, loading: key !== "" && open, failed: "",
         hits: [], scopes: [], examined: 0, resume: null };
-      deps.render();
-      if (key === "" || !open) return;
+      // Closing the search clears the server's section at once; that is the
+      // reader's act, not a keystroke of typing.
+      if (key === "") {
+        deps.render();
+        return;
+      }
+      // A new search is only drawn once the typing has rested and the ask is
+      // under way (`run` draws it loading, then answered), never while typing.
       serverSearchTimer = deps.clock.setTimeout(() => {
         serverSearchTimer = null;
-        deps.guard(() => run(false));
+        if (open) deps.guard(() => run(false));
+        else deps.render();
       }, SERVER_SEARCH_DELAY_MS);
     },
     run,

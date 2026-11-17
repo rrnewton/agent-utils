@@ -2618,6 +2618,12 @@ async function searchServer(page, query) {
   await page.settle();
 }
 
+/** Tap the server's one line open (`#1762`): the snippets are drawn only now. */
+async function expandServer(page) {
+  await page.el("server-line").click();
+  await page.settle();
+}
+
 /** One channel's part of a search answer: searched, back to `back`, with these facts. */
 const searchedScope = (fields = {}) => ({
   channel: CHANNEL, state: "searched", examined: 120, searched_back_to_ms: Date.parse("2026-08-01T12:00:00Z"),
@@ -2643,6 +2649,11 @@ test("`#605 server-side-search`: a pause in the typing searches the server's cop
   assert.equal(asked.searchParams.get("q"), "kestrel");
   assert.ok(Number(asked.searchParams.get("below")) > 0, "not only what lies below the loaded messages");
   assert.equal(page.el("server-search").hidden, false);
+  // `#1762`: the answer alone draws nothing but the one line at the foot.
+  assert.equal(page.el("server-line").textContent, "1 more hit on the server");
+  assert.equal(page.el("server-detail").hidden, true);
+  assert.deepStrictEqual(page.el("server-hits").children, [], "a snippet was drawn before the tap");
+  await expandServer(page);
   assert.match(page.el("search-scope").textContent,
     /^No upstream search · this page: back to .+ · server: back to .+ \(still expanding\) · 125 messages searched$/);
   const hits = page.el("server-hits").children;
@@ -2665,14 +2676,18 @@ test("`#605 server-side-search`: the line says why the server did not search, an
   page.serverSearch = async () => searchAnswer([], [{ ...searchedScope(), state: "not_searched", reason: "read_scope",
     examined: 0, searched_back_to_ms: undefined, held_from_ms: undefined }]);
   await searchServer(page, "kestrel");
+  await expandServer(page);
   assert.match(page.el("search-scope").textContent, / · server: not searched \(this device holds the read-only token\) · /);
   page.serverSearch = async () => json(502, { error: "chat_error", detail: "the server is restarting" });
   await searchServer(page, "heron");
+  assert.equal(page.el("server-line").textContent, "The server could not be searched — tap for details");
+  await expandServer(page);
   assert.match(page.el("search-scope").textContent, / · server: could not be searched \(the server is restarting\) · /);
   // NEGATIVE CONTROL: no copy kept, nothing asked, and the line says so.
   const bare = await serverSearchPage("flat", false);
   await searchServer(bare, "kestrel");
   assert.equal(bare.serverSearchCalls.length, 0);
+  await expandServer(bare);
   assert.match(bare.el("search-scope").textContent, / · server: keeps no copy · /);
 });
 
@@ -2685,6 +2700,8 @@ test("`#607 server-side-search`: hits the page already holds are not repeated, a
     ? searchAnswer([elsewhere, held], [searchedScope(), searchedScope({ channel: { ...CHANNEL, id: "2220000000000000002", label: "ops" }, whole: true, expanding: false })])
     : searchAnswer([held], [searchedScope()]));
   await searchServer(page, "answer");
+  assert.equal(page.el("server-line").textContent, "No more hits on the server");
+  await expandServer(page);
   assert.deepStrictEqual(page.el("server-hits").children.map((li) => li.getAttribute("data-id")), [],
     "a hit the page holds was drawn again");
   await page.el("search-all-channels").setChecked(true);
@@ -2707,15 +2724,18 @@ test("`#605 server-side-search`: the line never says the server searched further
   page.serverSearch = async () => searchAnswer([], [searchedScope({ searched_back_to_ms: undefined,
     resume_below_ms: 1_700_000_000_000 })], { resume_below_ms: 1_700_000_000_000 });
   await searchServer(page, "kestrel");
+  await expandServer(page);
   assert.match(page.el("search-scope").textContent, / · server: its newest part searched so far \(still expanding\) · /);
   // Every row held searched, none of it vouched whole.
   page.serverSearch = async () => searchAnswer([], [searchedScope({ searched_back_to_ms: undefined,
     held_from_ms: undefined, expanding: false })]);
   await searchServer(page, "heron");
+  await expandServer(page);
   assert.match(page.el("search-scope").textContent, / · server: all it holds searched, with gaps · /);
   // NEGATIVE CONTROL: a reach the server says is said.
   page.serverSearch = async () => searchAnswer([], [searchedScope({ whole: true, expanding: false })]);
   await searchServer(page, "otter");
+  await expandServer(page);
   assert.match(page.el("search-scope").textContent, / · server: back to .+ \(complete\) · /);
 });
 
@@ -2727,6 +2747,7 @@ test("`#608 server-side-search`: a look that fails keeps watching and says so, a
     now_ms: Date.now() };
   page.history.set(CHANNEL.id, state);
   await searchServer(page, "kestrel");
+  await expandServer(page);
   const further = page.el("search-further");
   await further.click();
   await page.settle();
@@ -2758,6 +2779,7 @@ test("`#605 server-side-search`: More from the server goes on below where its la
     ? searchAnswer([second], [searchedScope()])
     : searchAnswer([first], [searchedScope({ resume_below_ms: resume })], { resume_below_ms: resume }));
   await searchServer(page, "kestrel");
+  await expandServer(page);
   assert.match(page.el("search-scope").textContent, / · server: back to .+ so far \(still expanding\) · /);
   assert.equal(page.el("server-more").hidden, false);
   await page.el("server-more").click();
@@ -2777,6 +2799,7 @@ test("`#608 server-side-search`: Search further back asks the server to gather t
     now_ms: Date.now() });
   page.history.set(CHANNEL.id, state());
   await searchServer(page, "kestrel");
+  await expandServer(page);
   const further = page.el("search-further");
   assert.equal(further.hidden, false, "Search further back was not offered over a copy that is not whole");
   await further.click();

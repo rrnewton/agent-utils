@@ -17,6 +17,8 @@ export interface ListControlsDependencies {
   searchInAll(): unknown;
   /** `#605`-`#608 server-side-search`. The server's next page of hits, and searching every channel or this one. */
   serverMore(): unknown;
+  /** `#1762`. The server's one line tapped: show its snippets, or put them away. */
+  toggleServerHits(): void;
   searchAllChannels(on: boolean): void;
   /** The search's walk further back. */
   searchFurther(): unknown;
@@ -60,7 +62,8 @@ export function mountListControls(deps: ListControlsDependencies): ListControls 
   listen(el("load-older"), "click", () => deps.loadOlder());
   // `#262 search-load-older`. One column on Main, a search nothing loaded matches: All has the replies.
   listen(leftEl("search-in-all"), "click", () => deps.searchInAll());
-  // `#605`-`#608 server-side-search`.
+  // `#605`-`#608 server-side-search`; the collapsed line itself since `#1762`.
+  listen(el("server-line"), "click", () => deps.toggleServerHits());
   listen(el("server-more"), "click", () => deps.serverMore());
   listen(el("search-all-channels"), "change", () => deps.searchAllChannels((el("search-all-channels") as HTMLInputElement).checked));
   listen(el("search-further"), "click", () => deps.searchFurther());

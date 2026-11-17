@@ -315,6 +315,14 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     drawSeams(el("pinned-log"));
     deps.drawCardGaps(el("thread-list"));
     deps.renderReplyLinks();
+    // `#1762 vibe-talk-server-hits-collapsed-line`. The signpost over the loaded
+    // cards' matches: one element, shown while a search is typed and never
+    // reworded here, so this pass pays nothing for it per keystroke.
+    if (!deps.side()) {
+      const sep = el("search-screen-sep");
+      const show = typed && deps.view() === "discord";
+      if (sep.hidden === show) sep.hidden = !show;
+    }
     const pinned = deps.pinsOnly() && deps.view() === "discord";
     deps.setSearched({ matched, loaded, tally, pinned });
     renderSearchCount(typed, links, author !== "everyone");

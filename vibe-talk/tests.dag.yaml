@@ -2208,6 +2208,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1762 vibe-talk-server-hits-collapsed-line` in the browser engine: typing "lantern" over
+  # three hundred messages (sixty loaded) asks the server nothing and draws no snippet until
+  # the typing settles, when one line at the foot of the list says "50+ more hits on the
+  # server"; a tap draws the snippets with All channels, More and Search further back, in
+  # light and dark at 412x915 (Discuss half-pane open) and 1280x800, keyboard open and closed.
+  - group: check
+    job: server-hits-browser
+    desc: server hits stay one collapsed line until tapped so typing filters instantly, in current Chromium at 412x915 and 1280x800 in both schemes, keyboard open and closed
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/server_hits_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#620 link-url-chip` in the browser engine, at 393x852 and 412x915 with a finger and 1280x800 with
   # a mouse: URL first among the chips under Links, links written as their labels and then as their whole
   # addresses wrapped at their slashes, the choice kept over a reload, a search by a word only an address

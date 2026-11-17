@@ -35,14 +35,21 @@ test("`#624 voice-page-modularity`: the server search waits for the text to rest
     render: () => { renders += 1; },
     guard: (fn) => { fn(); },
   });
-  // The same (empty) search: drawn again, nothing asked.
+  // The same (empty) search: nothing drawn, nothing asked (`#1762`: scheduling
+  // runs on every pass of the on-screen filter, so it must cost typing nothing).
   owner.schedule("", true);
-  assert.equal(renders, 1);
+  assert.equal(renders, 0);
   assert.equal(clock.timers.size, 0);
-  // A new search: drawn at once as loading, asked once the text rests.
+  // A new search: loading, but not drawn until the text rests and the ask is
+  // under way; asked once the text rests.
   owner.schedule("k1", true);
   assert.equal(owner.state().loading, true);
+  assert.equal(renders, 0, "a new search was drawn while the reader was typing");
   assert.equal([...clock.timers.values()][0].ms, SERVER_SEARCH_DELAY_MS);
+  // The same search again mid-typing: no draw, and the one wait stands.
+  owner.schedule("k1", true);
+  assert.equal(renders, 0);
+  assert.equal(clock.timers.size, 1);
   // Typing on: the first wait is forgotten, and only the last search is asked.
   owner.schedule("k2", true);
   assert.equal(clock.timers.size, 1);
