@@ -52,6 +52,10 @@ The differential's Python oracle reads user-manager evidence through bounded bus
 
 `rust.merge-queue.test` `cli_intake_window::an_ejected_change_resubmitted_at_a_new_head_is_validated_in_the_same_run` failed in a loaded full validate ("queued" vs "landed" at `cli_intake_window.rs:428`) and passes solo in 3.2 s. Likely a timing assumption in the intake window; make it wait on a condition. Taken after the current step-2 change lands.
 
+## Step 2 follow-up: census binding deadline asserts on the wall clock
+
+`py/wrkslots/tests/test_census_binding_deadline.py::test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline` asserts every audit-cache open started before a wall-clock 5 s deadline; it failed in a loaded gate and passes 5/5 solo on two trees. Same rule-346 class; taken after the current step-2 change lands.
+
 ## Step 2 root cause: browser checks sample on wall deadlines
 
 `thread-pin-picker-browser` polled conditions on 10 s wall deadlines (11 s exit-1 failures); its waits now keep the same conditions behind 120 s backstops. `pack-still-browser` recorded frames for 900 ms of wall time, so a starved main thread produced no slide (`460.4375 -> 460.4375`); it now records until the slide condition holds (with a frame-count backstop), assertions unchanged.
