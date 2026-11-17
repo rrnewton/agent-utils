@@ -16349,6 +16349,8 @@ pub(crate) mod tests {
                     fail_first_wait: AtomicBool::new(false),
                     scroll: Mutex::new(None),
                     read_sources: Mutex::new(Vec::new()),
+                    read_instants: Mutex::new(Vec::new()),
+                    reads_completed: AtomicU64::new(0),
                     screens: Mutex::new(std::collections::VecDeque::new()),
                     screen: Mutex::new(None),
                     bottom_screen: Mutex::new(None),
@@ -16809,6 +16811,11 @@ pub(crate) mod tests {
         fail_first_wait: AtomicBool,
         pub(crate) scroll: Mutex<Option<crate::client::PaneScroll>>,
         pub(crate) read_sources: Mutex<Vec<String>>,
+        /// When each read in `read_sources` started, in the same order.
+        pub(crate) read_instants: Mutex<Vec<Instant>>,
+        /// Reads whose text has been chosen; a test can wait for it to
+        /// catch up with `read_sources` to know no read is in flight.
+        pub(crate) reads_completed: AtomicU64,
         /// The texts that successive reads return, first to last, before `screen` applies.
         pub(crate) screens: Mutex<std::collections::VecDeque<String>>,
         /// The text a read returns, when set; `visible output` otherwise.
@@ -16928,6 +16935,14 @@ pub(crate) mod tests {
         Herdr(crate::client::HerdrClient),
         /// For another reason than the cancellation, once the runtime is cancelled.
         Fail,
+    }
+    /// Increments its counter on drop, so a read counts as completed on
+    /// every exit path once its text has been chosen.
+    struct ReadCompletion<'a>(&'a AtomicU64);
+    impl Drop for ReadCompletion<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
     impl Fake {
         fn terminal(&self, pane: &str) -> String {
@@ -17260,7 +17275,11 @@ pub(crate) mod tests {
             Ok(())
         }
         fn read(&self, pane: &str, source: &str, _: Option<usize>) -> AdapterResult<String> {
+            // Counted on drop, so the read counts as completed on every
+            // exit path once its text has been chosen.
+            let _read_completion = ReadCompletion(&self.reads_completed);
             self.read_sources.lock().unwrap().push(source.to_owned());
+            self.read_instants.lock().unwrap().push(Instant::now());
             if self.fail_read.load(Ordering::Relaxed) {
                 return Err(AdapterError::unavailable("capture failed"));
             }

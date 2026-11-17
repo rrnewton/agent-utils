@@ -16181,9 +16181,13 @@ esac
 
     /// The owner loop of [`idle_backstop_case`]: `first answer` is on the screen and stored at
     /// startup, so every open request has a reply. Once the loop has made its first saturated
-    /// poll, its second read, and half a second has passed without another, `second answer`
-    /// appears under the same reply ID, which raises no output event; `on_show` runs then. Returns how long after it appeared it was stored, and
-    /// how many pane reads the loop made in between, counting the one that stored it.
+    /// poll, its second read, and every started read has completed -- so no read is in
+    /// flight that could still capture the old screen or the new one -- `second answer`
+    /// appears under the same reply ID, which raises no output event; `on_show` runs then.
+    /// Returns the interval between the last read before it appeared and the read that
+    /// stored it (both timestamped where the loop made them, so a starved test thread
+    /// cannot shrink or stretch it), and how many pane reads the loop made in between,
+    /// counting the one that stored it.
     fn idle_backstop_case(
         backstop: Duration,
         events: fn(&str) -> Vec<Value>,
@@ -16213,14 +16217,17 @@ esac
             };
             let read_sources = &fixture.client.read_sources;
             read_sources.lock().expect("read sources").clear();
+            let read_instants = &fixture.client.read_instants;
+            read_instants.lock().expect("read instants").clear();
+            let reads_completed = &fixture.client.reads_completed;
+            let completed_at_clear = reads_completed.load(AtomicOrdering::SeqCst);
             let herdr = owner_loop_herdr_every(
                 &fixture.root,
                 "herdr",
                 events,
                 Some(Duration::from_millis(300)),
             );
-            let mut last_reads = (0, Instant::now());
-            let mut shown: Option<(Instant, usize)> = None;
+            let mut shown: Option<(usize, Instant)> = None;
             let mut done: Option<(Instant, usize)> = None;
             run_owner_loop_until(
                 &fixture,
@@ -16230,32 +16237,38 @@ esac
                 Duration::from_secs(60),
                 || {
                     let reads = read_sources.lock().expect("read sources").len();
-                    if reads != last_reads.0 {
-                        last_reads = (reads, Instant::now());
-                    }
-                    // The startup read and the first saturated poll have both been made, and the
-                    // loop has had time to set its next poll after the second.
-                    if shown.is_none()
-                        && reads >= 2
-                        && last_reads.1.elapsed() >= Duration::from_millis(500)
-                    {
+                    let completed =
+                        reads_completed.load(AtomicOrdering::SeqCst) - completed_at_clear;
+                    // The startup read and the first saturated poll have both been made, and
+                    // every started read has completed: no read is in flight, so the next
+                    // read, whenever the loop schedules it, is the first that can capture
+                    // the second reply. The old test showed the reply after half a second
+                    // without a new read *start*, which a read descheduled between its
+                    // start and its screen capture outran on a loaded host, storing the
+                    // reply with zero reads in between (#1765).
+                    if shown.is_none() && reads >= 2 && completed == reads as u64 {
                         assert_eq!(stored(), 1, "the first reply is stored at startup");
+                        let previous = read_instants.lock().expect("read instants")[reads - 1];
                         *fixture.client.screen.lock().expect("screen") =
                             Some(screen(&["first answer", "second answer"]));
                         on_show(&fixture);
-                        shown = Some((Instant::now(), reads));
+                        shown = Some((reads, previous));
                     }
-                    if shown.is_some() && done.is_none() && stored() == 2 {
-                        done = Some((Instant::now(), reads));
+                    if let Some((reads_at_show, _)) = shown {
+                        if done.is_none() && stored() == 2 {
+                            let storing =
+                                read_instants.lock().expect("read instants")[reads_at_show];
+                            done = Some((storing, reads));
+                        }
                     }
                     done.is_some()
                 },
             );
             drop(herdr.release);
             herdr.server.join().expect("herdr stand-in");
-            let (shown_at, reads_at_show) = shown.expect("the second reply was shown");
+            let (reads_at_show, previous_at) = shown.expect("the second reply was shown");
             let (stored_at, reads_at_store) = done.expect("the second reply was stored");
-            (stored_at - shown_at, reads_at_store - reads_at_show)
+            (stored_at - previous_at, reads_at_store - reads_at_show)
         })
     }
 
@@ -16264,14 +16277,19 @@ esac
         // Herdr reports the agent idle, its screen shows no running turn, the subscription
         // works, and the request has stored its first reply: nothing but a new turn can add a
         // reply, so after its first saturated poll the loop reads the pane only on the idle
-        // backstop. The second reply appears half a second after that poll; no read comes
+        // backstop. The second reply appears once that poll has completed; no read comes
         // `SATURATED_POLL_INTERVAL` later, and the backstop read, one read in all, stores it.
+        // The interval is between the loop's own reads, so scheduling delays of the test
+        // thread can only stretch it, never shrink it below the backstop.
         let backstop = Duration::from_secs(6);
-        let (waited, reads) = idle_backstop_case(backstop, |_| Vec::new(), |_| {});
-        assert_eq!(reads, 1, "only the backstop read came: waited {waited:?}");
+        let (interval, reads) = idle_backstop_case(backstop, |_| Vec::new(), |_| {});
+        assert_eq!(
+            reads, 1,
+            "only the backstop read came: interval {interval:?}"
+        );
         assert!(
-            waited >= Duration::from_secs(3) && waited <= backstop + Duration::from_secs(2),
-            "{waited:?}"
+            interval >= backstop - Duration::from_secs(1),
+            "the storing read came {interval:?} after the previous read, before the backstop"
         );
     }
 
@@ -16301,7 +16319,7 @@ esac
         // reports the agent working, raising its status event. The loop goes back to reading
         // every `SATURATED_POLL_INTERVAL` at once rather than waiting out the backstop.
         REPORT_WORKING.store(false, AtomicOrdering::SeqCst);
-        let (waited, _) = idle_backstop_case(
+        let (interval, _) = idle_backstop_case(
             Duration::from_secs(60),
             |pane| {
                 if REPORT_WORKING.load(AtomicOrdering::SeqCst) {
@@ -16319,9 +16337,12 @@ esac
             },
         );
         REPORT_WORKING.store(false, AtomicOrdering::SeqCst);
+        // Half the minute-long backstop is a generous cut-short bound: the
+        // storing read must arrive long before the backstop would have
+        // fired, however a loaded host schedules the loop's wake.
         assert!(
-            waited <= SATURATED_POLL_INTERVAL * 3,
-            "the backstop was not cut short: {waited:?}"
+            interval <= Duration::from_secs(30),
+            "the backstop was not cut short: {interval:?}"
         );
     }
 
