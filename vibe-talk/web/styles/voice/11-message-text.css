@@ -423,22 +423,21 @@
   margin: 0 1rem 0.6rem;
 }
 
-/* `#1786 vibe-talk-search-scope-server-hits`. The outside hits' chip: its own
-   row under the search bar, in the list's flow, so it pushes the cards down
-   and never floats over them. Prominent, one tap. */
-#search-outside-chip:not([hidden]) {
-  display: block;
+/* `#1797 vibe-talk-search-bucket-toggles`. The bucket chips' row under the
+   search bar, in the list's flow, so it pushes the cards down and never
+   floats over them. Each chip is a toggle and wears it from aria-pressed
+   (the one `.chip[aria-pressed]` rule, as the Documents filters do). */
+.search-bucket-row:not([hidden]) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.35rem 1rem;
 }
 
-#search-outside-chip {
-  width: calc(100% - 2rem);
-  margin: 0.35rem 1rem;
-  min-height: 2.75rem;
-  padding: 0.5rem 0.9rem;
-  border: 1px solid var(--accent);
+.search-bucket-chip {
+  min-height: 2.5rem;
+  padding: 0.45rem 0.85rem;
   border-radius: 999px;
-  background: var(--panel);
-  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
   font-weight: 600;
   cursor: pointer;
 }

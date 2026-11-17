@@ -499,16 +499,13 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     walk.notes.append(f"server: {scope}")
 
     # All channels: every channel searched; its hit from another channel
-    # waits behind the chip under the search bar, then interleaves quoted.
+    # counts in main (on by default in All) and interleaves quoted at once.
     press_all_channels(walk)
-    walk.until("() => !document.getElementById('search-outside-chip').hidden",
-               "the outside chip did not appear for the other channel's hit")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 4",
+               "All channels did not interleave the other channel's hit")
     walk.check(any("GET /api/v1/search?" in one for one in api.requests), "All channels did not ask every channel")
     walk.check(" · server: 2 of 2 channels" in str(page.evaluate(SCOPE_JS)),
                f"the line says {page.evaluate(SCOPE_JS)!r}")
-    walk.press("#search-outside-chip")
-    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 4",
-               "the chip did not interleave the other channel's hit")
     walk.check(page.evaluate(HITS_JS) == ["151", "152", "150", "990"], f"the hits are {page.evaluate(HITS_JS)}")
     show = page.evaluate(BOX_JS, "#discord-log > li[data-id='990'] .server-hit-show")
     walk.check(isinstance(show, dict) and float(show["height"]) >= 30,
@@ -518,27 +515,58 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     press_all_channels(walk)
     walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3", "one channel did not come back")
 
-    # `#1786` in the lantern thread itself: this thread's older hit is a card
-    # at once; the harbor hit and the channel note wait behind the chip.
+    # `#1797` in the lantern thread itself: this thread's bucket starts on
+    # (its older hit a card at once); main and other threads start off, each
+    # behind its own chip. Toggle combinations are shot as they are made.
     page.evaluate(PICK_JS, f"thread:{LANTERN}")
     walk.until("() => document.querySelector('#discord-log > li[data-server-hit=\"card\"][data-id=\"151\"]') !== null",
                "in the thread, its own older hit did not stand as a card")
-    chip = (page.text_content("#search-outside-chip") or "").strip()
-    walk.check(chip in ("Show 2 hits outside this thread", "Hide 2 hits outside this thread"),
-               f"the chip says {chip!r}")
-    # A fresh tap either way, so showing them brings the first into view.
-    if chip.startswith("Hide"):
-        walk.press("#search-outside-chip")
-    walk.press("#search-outside-chip")
+    for chip_id, words, pressed in (("search-bucket-thread", "1 in this thread", "true"),
+                                    ("search-bucket-main", "1 in main", "false"),
+                                    ("search-bucket-threads", "1 in other threads", "false")):
+        text = (page.text_content(f"#{chip_id}") or "").strip()
+        state = page.evaluate(f"() => document.getElementById('{chip_id}').getAttribute('aria-pressed')")
+        walk.check(text == words and state == pressed, f"the {chip_id} chip says {text!r} pressed {state}")
+    walk.check(page.evaluate("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length") == 1,
+               "with only this thread on, the outside hits already stand in the thread")
+
+    def shot_buckets(name: str) -> None:
+        page.evaluate("() => { document.getElementById('search-bucket-row').scrollIntoView({block: 'center'});"
+                      " if (document.activeElement) document.activeElement.blur(); }")
+        walk.until("() => ![...document.querySelectorAll('.search-bucket-chip')].some((chip) => chip.matches(':active'))",
+                   "a bucket chip kept its press state")
+        if walk.touch:
+            # Clear the tap highlight the press left on the chip, so the shot
+            # shows the standing toggle state, not the tap.
+            box = page.locator("#search-screen-sep").bounding_box()
+            if box is not None:
+                page.touchscreen.tap(box["x"] + box["width"] - 4, box["y"] + box["height"] / 2)
+                walk.settled()
+        walk.settled()
+        walk.shot(name)
+
+    shot_buckets("7b1-only-thread")
+    walk.press("#search-bucket-main")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 2",
+               "the main chip did not interleave its hit in the thread")
+    shot_buckets("7b2-thread-and-main")
+    walk.press("#search-bucket-threads")
     walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3",
-               "the chip did not interleave the outside hits in the thread")
+               "the other-threads chip did not interleave its hit in the thread")
     walk.check(page.evaluate(HITS_JS) == ["151", "152", "150"],
                f"in the thread the hits are {page.evaluate(HITS_JS)}")
     harbor = page.text_content("#discord-log > li[data-id='152'] .server-hit-meta") or ""
     walk.check("in thread harbor-thread" in harbor, f"the quoted hit's header says {harbor!r}")
     walk.no_overflow()
-    walk.shot("7b-thread-scope")
-    walk.notes.append("thread scope: own hit a card, 2 outside behind the chip, harbor slug in its header")
+    shot_buckets("7b3-all-on")
+    walk.press("#search-bucket-thread")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 2",
+               "turning this thread off did not take its card away")
+    shot_buckets("7b4-thread-off")
+    walk.press("#search-bucket-thread")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3",
+               "turning this thread back on did not restore its card")
+    walk.notes.append("thread buckets: own card on, main/other behind chips, slug in harbor header, combinations shot")
 
     # Main: a thread stands for its children, so the reply's word keeps the lantern root.
     page.evaluate(PICK_JS, "main")

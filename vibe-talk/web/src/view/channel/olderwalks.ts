@@ -163,8 +163,8 @@ export interface OlderWalks {
   channelViewWords(): string;
   oldestLoadedMs(): number | null;
   toggleServerHits(): void;
-  /** `#1786`. The chip under the search bar tapped: show or put away the outside hits. */
-  toggleOutsideHits(): void;
+  /** `#1797`. A bucket chip tapped: interleave its hits in the timeline, or put them away. */
+  toggleBucket(id: string): void;
   dispose(): void;
 }
 
@@ -176,6 +176,37 @@ export const SEARCH_OLDER_MS = 15000;
 export const SEARCH_OLDER_HITS = 3;
 /** How soon a second tap on the step-back control stops the walk, in milliseconds. */
 export const SEARCH_OLDER_TAP_MS = 500;
+
+/** One bucket's definition: its chip, its defaults, and where its hits come from (`#1797`). */
+export interface SearchBucketDef {
+  /** Stable bucket id; its chip is `search-bucket-<id>`. */
+  id: string;
+  /** The chip's words after the count, or a function of the bucket view. */
+  words: string | ((view: string) => string);
+  /** Whether the bucket starts on, for the screen the search starts from. */
+  defaultOn(view: string): boolean;
+  /**
+   * An outside hit supply (the Agent Transcripts bucket, `#1608`): synchronous
+   * reads of a list populated before the row renders. Built-in buckets have
+   * none; theirs come from the server's answer.
+   */
+  source?: { count(): number; hits(): { at: number; node: HTMLElement }[]; clear(): void };
+}
+
+const searchBucketDefs: SearchBucketDef[] = [
+  { id: "thread", words: "in this thread", defaultOn: (view) => view === "thread" },
+  { id: "main", words: "in main", defaultOn: (view) => view !== "thread" },
+  { id: "threads", words: (view) => (view === "thread" ? "in other threads" : "in threads"),
+    defaultOn: (view) => view === "flat" || view === "threads" },
+];
+
+/** The bucket registry: `#1608` plugs its Agent Transcripts bucket in here. */
+export const searchBuckets = {
+  register(def: SearchBucketDef): void {
+    searchBucketDefs.push(def);
+  },
+  defs: (): readonly SearchBucketDef[] => searchBucketDefs,
+};
 
 /** The older walks over `deps`. */
 /** How long a walk waits with a finger down (view/channel pull). */
@@ -860,27 +891,80 @@ function serverFreshHits(): Message[] {
 // of loading further back: just those messages, placed by time), and the rest
 // wait behind the chip under the search bar as quoted hits.
 
-/** Whether `hit` belongs to the scope on screen (this thread, else this channel). */
-function hitInScope(hit: Message): boolean {
-  if (String(hit.channel_id) !== String(selectedChannelId() || "")) return false;
-  if (selection().view === "thread") {
-    const thread = selection().threadId;
-    return thread !== null && thread !== undefined && threadOf(hit) === String(thread);
+// `#1797 vibe-talk-search-bucket-toggles` (owner 145/146, refining `#1786`):
+// the server's fresh hits fall into buckets — this thread, main, threads
+// ("other threads" in a thread view) — and a row of toggle chips under the
+// search bar, one per bucket with hits, says how many and whether they stand
+// in the timeline. Enabled buckets interleave chronologically: the home
+// bucket (this thread in a thread view, main elsewhere) as normal cards in
+// this channel, the rest quoted. A thread root counts once, in main.
+
+/** Which bucket toggles stand on, and the search identity they were set for. */
+const bucketOn = new Map<string, boolean>();
+let bucketsFor = "";
+/** The screen the standing toggles were defaulted for. */
+let bucketsView = "";
+
+/** The screen the search is judged from, as the defaults table names it. */
+function bucketView(): string {
+  return selection().view;
+}
+
+/**
+ * Every bucket back to its default for this screen: on a new search (which
+ * also clears outside supplies), and on a screen change under the same
+ * search (the defaults table is per starting screen).
+ */
+function resetBuckets(identity: string, newSearch: boolean): void {
+  bucketsFor = identity;
+  const view = bucketView();
+  bucketsView = view;
+  for (const def of searchBucketDefs) {
+    bucketOn.set(def.id, def.defaultOn(view));
+    if (newSearch && def.source) def.source.clear();
   }
-  return true;
+}
+
+const bucketOnNow = (id: string): boolean => bucketOn.get(id) === true;
+
+/** The bucket `hit` counts in, once only: this thread, else main for a root or an unthreaded message, else its thread's. */
+function hitBucket(hit: Message): string {
+  const tid = threadOf(hit);
+  if (selection().view === "thread" && tid !== null &&
+    String(hit.channel_id) === String(selectedChannelId() || "") &&
+    tid === String(selection().threadId)) return "thread";
+  if (!tid || (hit.thread && hit.thread.is_root === true)) return "main";
+  return "threads";
+}
+
+/** The home bucket, whose in-channel hits draw as normal cards. */
+function homeBucket(): string {
+  return bucketView() === "thread" ? "thread" : "main";
 }
 
 const byHitTime = (a: Message, b: Message): number =>
   (Date.parse(a.timestamp) || 0) - (Date.parse(b.timestamp) || 0);
 
-/** The fresh hits in this scope, oldest first: the cards the timeline gains. */
-function serverInScopeHits(): Message[] {
-  return serverFreshHits().filter(hitInScope).sort(byHitTime);
+/** Fresh hits per built-in bucket, oldest first in each. */
+function bucketHits(): Map<string, Message[]> {
+  const grouped = new Map<string, Message[]>();
+  for (const hit of serverFreshHits()) {
+    const id = hitBucket(hit);
+    const held = grouped.get(id);
+    if (held) held.push(hit);
+    else grouped.set(id, [hit]);
+  }
+  for (const hits of grouped.values()) hits.sort(byHitTime);
+  return grouped;
 }
 
-/** The fresh hits outside this scope, oldest first: the chip's quoted hits. */
-function serverOutScopeHits(): Message[] {
-  return serverFreshHits().filter((hit) => !hitInScope(hit)).sort(byHitTime);
+/** How many hits each bucket holds, from the server's answer or its own supply. */
+function bucketCounts(grouped: Map<string, Message[]>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const def of searchBucketDefs) {
+    counts.set(def.id, def.source ? def.source.count() : (grouped.get(def.id) || []).length);
+  }
+  return counts;
 }
 
 /** The attribute marking a row the server search placed in the timeline. */
@@ -893,33 +977,36 @@ function clearServerHits(): void {
   if (el("server-hits").children.length > 0) el("server-hits").replaceChildren();
 }
 
-/** Whether the chip under the search bar shows the outside hits (`#1786`). */
-let outsideShown = false;
-/** The query identity the outside view was opened for; a new one closes it. */
-let outsideShownFor = "";
-
 /**
- * Place the server's hits in the timeline, chronologically among the loaded
- * rows: in-scope hits as normal cards, and — while the chip under the search
- * bar is on — the outside hits as quoted rows between them. Rebuilt on every
- * server render, so a hit the page has since loaded for real goes (it is no
- * longer fresh) and its real row stands instead.
+ * Place the enabled buckets' hits in the timeline, chronologically among the
+ * loaded rows: the home bucket's in-channel hits as normal cards, every other
+ * enabled hit as a quoted row between them. Rebuilt on every server render,
+ * so a hit the page has since loaded for real goes (it is no longer fresh)
+ * and its real row stands instead.
  */
-function placeServerHits(): void {
+function placeServerHits(grouped: Map<string, Message[]>): void {
   clearServerHits();
   const placed: { at: number; node: HTMLElement }[] = [];
-  for (const hit of serverInScopeHits()) {
-    const node = deps.serverCardNode ? deps.serverCardNode(hit) : serverHitNode(hit);
-    node.setAttribute(SERVER_HIT_MARK, "card");
-    // Marked like every other hit on the page (the quoted hits are at their
-    // build in `serverHitNode`); later filter passes re-mark it as a row.
-    if (deps.serverCardNode) markSearchHits(node, searchParsed(searchField.query()).terms);
-    placed.push({ at: Date.parse(hit.timestamp) || 0, node });
-  }
-  if (outsideShown) {
-    for (const hit of serverOutScopeHits()) {
-      const node = serverHitNode(hit);
-      node.setAttribute(SERVER_HIT_MARK, "quote");
+  const channel = String(selectedChannelId() || "");
+  const home = homeBucket();
+  for (const def of searchBucketDefs) {
+    if (!bucketOnNow(def.id)) continue;
+    if (def.source) {
+      for (const { at, node } of def.source.hits()) {
+        if (!node.hasAttribute(SERVER_HIT_MARK)) node.setAttribute(SERVER_HIT_MARK, "quote");
+        node.setAttribute("data-bucket", def.id);
+        placed.push({ at, node });
+      }
+      continue;
+    }
+    for (const hit of grouped.get(def.id) || []) {
+      const asCard = def.id === home && String(hit.channel_id) === channel;
+      const node = asCard && deps.serverCardNode ? deps.serverCardNode(hit) : serverHitNode(hit);
+      node.setAttribute(SERVER_HIT_MARK, asCard ? "card" : "quote");
+      node.setAttribute("data-bucket", def.id);
+      // Marked like every other hit on the page (the quoted hits are at their
+      // build in `serverHitNode`); later filter passes re-mark it as a row.
+      if (asCard && deps.serverCardNode) markSearchHits(node, searchParsed(searchField.query()).terms);
       placed.push({ at: Date.parse(hit.timestamp) || 0, node });
     }
   }
@@ -939,24 +1026,24 @@ function placeServerHits(): void {
   }
 }
 
-/** What the chip under the search bar says, from the answer as it stands. */
-function outsideChipWords(count: number): string {
-  const scope = selection().view === "thread" ? "outside this thread" : "in other channels";
-  const hits = `${count} hit${count === 1 ? "" : "s"}`;
-  return outsideShown ? `Hide ${hits} ${scope}` : `Show ${hits} ${scope}`;
+/** A bucket's chip, or null where the page has none (a bucket plugged in later brings its own). */
+function bucketChip(id: string): HTMLButtonElement | null {
+  try {
+    return el(`search-bucket-${id}`) as HTMLButtonElement;
+  } catch (_error) {
+    return null;
+  }
 }
 
-/** The chip tapped: interleave the outside hits in the timeline, or put them away. */
-function toggleOutsideHits(): void {
-  outsideShown = !outsideShown;
-  if (outsideShown) outsideShownFor = serverSearchNow().key;
+/** A bucket chip tapped: interleave its hits in the timeline, or put them away. */
+function toggleBucket(id: string): void {
+  bucketOn.set(id, !bucketOnNow(id));
   renderServerSearch();
-  if (!outsideShown) return;
-  // The reader asked to see them: bring the first quoted hit into view (it
-  // usually stands far above, with this scope's own older card beside it),
-  // through the scroll owner (`#1251 scroll-single-owner`).
+  if (!bucketOnNow(id)) return;
+  // The reader asked to see them: bring the bucket's first hit into view (it
+  // usually stands far above), through the scroll owner (`#1251`).
   for (const row of el("discord-log").children) {
-    if (row.getAttribute(SERVER_HIT_MARK) !== "quote") continue;
+    if (row.getAttribute("data-bucket") !== id) continue;
     if (deps.intoView) deps.intoView(row, "nearest");
     break;
   }
@@ -995,12 +1082,13 @@ function toggleServerHits(): void {
 
 /**
  * Draw the server's search as it stands (`#1762 vibe-talk-server-hits-collapsed-line`,
- * scoped by `#1786 vibe-talk-search-scope-server-hits`): the fresh hits are placed
- * in the timeline — in-scope as cards, outside as quoted rows while the chip under
- * the search bar is on — the chip says how many wait outside, and the foot keeps
- * one tappable line opening the scope line, All channels, More and Search further
- * back. While typing nothing here runs at all (the schedule is a no-op for the
- * same search), so an answer landing is the only moment the timeline gains rows.
+ * scoped by `#1786` and bucketed by `#1797 vibe-talk-search-bucket-toggles`): the
+ * enabled buckets' fresh hits are placed in the timeline (home as cards, the
+ * rest quoted), the bucket chip row under the search bar says each bucket's
+ * count and state, and the foot keeps one tappable line opening the scope
+ * line, All channels, More and Search further back. While typing nothing here
+ * runs at all (the schedule is a no-op for the same search), so an answer
+ * landing is the only moment the timeline gains rows.
  */
 
 function renderServerSearch() {
@@ -1010,15 +1098,15 @@ function renderServerSearch() {
   if (section.hidden === wanted) section.hidden = !wanted;
   if (!wanted) {
     serverExpanded = false;
-    outsideShown = false;
+    bucketsFor = "";
     clearServerHits();
-    const chipOff = el("search-outside-chip") as HTMLButtonElement;
-    if (!chipOff.hidden) chipOff.hidden = true;
+    const rowOff = el("search-bucket-row");
+    if (!rowOff.hidden) rowOff.hidden = true;
     return;
   }
-  // A typed query is a new search: its details and outside hits wait for a
-  // fresh tap. Widening to every channel (the key's first part) keeps the
-  // views the reader opened.
+  // A typed query is a new search: its details wait for a fresh tap and its
+  // buckets go back to this screen's defaults. Widening to every channel
+  // (the key's first part) keeps the views the reader opened.
   const identityOf = (key: string): string => {
     try {
       const parsed = JSON.parse(key) as unknown;
@@ -1029,11 +1117,12 @@ function renderServerSearch() {
   };
   if (serverExpanded && serverExpandedFor !== "" &&
     identityOf(serverSearch.key) !== identityOf(serverExpandedFor)) serverExpanded = false;
-  if (outsideShown && outsideShownFor !== "" &&
-    identityOf(serverSearch.key) !== identityOf(outsideShownFor)) outsideShown = false;
+  const identity = identityOf(serverSearch.key);
+  if (identity !== bucketsFor) resetBuckets(identity, true);
+  else if (bucketView() !== bucketsView) resetBuckets(identity, false);
   const all = serverSearchOwner.allChannels();
-  // `#1786`: the bottom separator is retired — in-scope hits stand in the
-  // timeline as cards, and outside hits behind the chip under the search bar.
+  // `#1786`: the bottom separator is retired — the hits stand in the
+  // timeline, and the bucket row under the search bar speaks for them.
   const sep = el("server-sep");
   if (!sep.hidden) sep.hidden = true;
   const line = el("server-line") as HTMLButtonElement;
@@ -1042,17 +1131,27 @@ function renderServerSearch() {
   if (line.getAttribute("aria-expanded") !== expanded) line.setAttribute("aria-expanded", expanded);
   const detail = el("server-detail");
   if (detail.hidden === serverExpanded) detail.hidden = !serverExpanded;
-  // The chip under the search bar: the outside hits' count and way in.
-  const outside = serverOutScopeHits();
-  const chip = el("search-outside-chip") as HTMLButtonElement;
-  const showChip = outside.length > 0;
-  if (chip.hidden === showChip) chip.hidden = !showChip;
-  if (showChip) {
-    setTextIfChanged(chip, outsideChipWords(outside.length));
-    const chipOpen = outsideShown ? "true" : "false";
-    if (chip.getAttribute("aria-expanded") !== chipOpen) chip.setAttribute("aria-expanded", chipOpen);
+  // The bucket row under the search bar: one toggle chip per bucket with hits.
+  const grouped = bucketHits();
+  const counts = bucketCounts(grouped);
+  const view = bucketView();
+  let anyChip = false;
+  for (const def of searchBucketDefs) {
+    const chip = bucketChip(def.id);
+    if (!chip) continue;
+    const count = counts.get(def.id) || 0;
+    const show = count > 0;
+    if (chip.hidden === show) chip.hidden = !show;
+    if (!show) continue;
+    anyChip = true;
+    const words = typeof def.words === "function" ? def.words(view) : def.words;
+    setTextIfChanged(chip, `${count} ${words}`);
+    const pressed = bucketOnNow(def.id) ? "true" : "false";
+    if (chip.getAttribute("aria-pressed") !== pressed) chip.setAttribute("aria-pressed", pressed);
   }
-  placeServerHits();
+  const bucketRow = el("search-bucket-row");
+  if (bucketRow.hidden === anyChip) bucketRow.hidden = !anyChip;
+  placeServerHits(grouped);
   if (!serverExpanded) return;
   setTextIfChanged(el("search-scope"), searchScopeLine());
   const checkbox = el("search-all-channels") as HTMLInputElement;
@@ -1368,7 +1467,7 @@ function renderOlderControl() {
   return {
     renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField,
     searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk,
-    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleOutsideHits, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
+    renderSearchOlderNote, historyReach, renderServerSearch, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk,
     dispose() { disposed = true; },
   };
 }

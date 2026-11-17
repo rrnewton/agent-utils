@@ -12,11 +12,11 @@ holding "lantern"; the server's copy holds sixty older "lantern" hits. At a desk
   server row is placed, and the row under the eye has not moved;
   typing settles -> the first page's fifty in-channel hits stand in the timeline
   as cards (`#1786 vibe-talk-search-scope-server-hits`), the bottom separator is
-  retired, no chip appears (no hit is outside this channel), and the foot line
+  retired, the bucket row counts them in main (on, as cards), and the foot line
   only opens the search's details, with "On this screen" over the loaded hits;
   tap the line -> the scope line, All channels, More (the remaining ten cards)
   and Search further back; tap again -> collapsed; tick All channels -> the
-  server asked again, still no outside chip on this one-channel fixture.
+  server asked again, still no threads chip on this one-channel fixture.
 
 Pass --screenshots DIR to keep a PNG of each stage.
 """
@@ -253,8 +253,11 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.check(line == "Server search details", f"the foot line is not the details line: {line!r}")
     walk.check(page.evaluate("() => document.getElementById('server-hits').children.length") == 0,
                "snippets were drawn at the foot")
-    walk.check(page.evaluate("() => document.getElementById('search-outside-chip').hidden"),
-               "the outside chip appeared with no hit outside this channel")
+    walk.check((page.text_content("#search-bucket-main") or "").strip() == "50 in main" and
+               page.evaluate("() => document.getElementById('search-bucket-main').getAttribute('aria-pressed')") == "true",
+               "the main bucket chip does not count the in-channel hits as on")
+    walk.check(page.evaluate("() => document.getElementById('search-bucket-threads').hidden && document.getElementById('search-bucket-thread').hidden"),
+               "a thread bucket chip appeared on a threadless fixture")
     sep = page.text_content("#search-screen-sep") or ""
     walk.check("On this screen" in sep, f"the loaded separator is missing: {sep!r}")
     walk.check(page.evaluate("() => document.getElementById('server-sep').hidden"),
@@ -278,15 +281,15 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.until(f"() => document.querySelectorAll('#discord-log > li[data-server-hit=\"card\"]').length === {OLDER_HITS}",
                "More did not bring the remaining hits as cards")
     # All channels: asked again over every channel; this fixture has one
-    # channel, so still nothing stands outside it and no chip appears.
+    # channel, so still nothing stands in a threads bucket.
     before = len(api.searches)
     page.check("#search-all-channels")
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and len(api.searches) <= before:
         page.wait_for_timeout(25)
     walk.check(len(api.searches) > before, "All channels did not ask the server again")
-    walk.check(page.evaluate("() => document.getElementById('search-outside-chip').hidden"),
-               "the outside chip appeared on a one-channel fixture")
+    walk.check(page.evaluate("() => document.getElementById('search-bucket-threads').hidden"),
+               "a threads bucket chip appeared on a one-channel fixture")
     walk.shot("after-all-channels")
     page.uncheck("#search-all-channels")
     # Search further back asks the server to gather, from inside the expanded view.

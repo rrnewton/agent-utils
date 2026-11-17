@@ -7029,7 +7029,7 @@ const olderWalks = mountOlderWalks({
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
-const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleOutsideHits, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
+const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
 
 /**
  * The gaps a search opens in the cards and in an unpacked thread's block (web/src/view/channel
@@ -8989,7 +8989,7 @@ application.track(mountListControls({
   searchInAll: () => guardQuietly(searchInAll)(),
   serverMore: () => guardQuietly(() => serverSearchOwner.more())(),
   toggleServerHits: () => toggleServerHits(),
-  toggleOutsideHits: () => toggleOutsideHits(),
+  toggleBucket: (id) => toggleBucket(id),
   searchAllChannels: (on) => chooseSearchAllChannels(on),
   searchFurther: () => guardQuietly(searchFurtherPressed)(),
   loadOlderTurns: () => guardQuietly(voiceTranscript().loadOlderTurns)(),

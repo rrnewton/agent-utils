@@ -568,8 +568,11 @@ export interface ElementById {
   "search-float": HTMLDivElement;
   "search-further": HTMLButtonElement;
   "search-in-all": HTMLButtonElement;
+  "search-bucket-main": HTMLButtonElement;
+  "search-bucket-row": HTMLDivElement;
+  "search-bucket-thread": HTMLButtonElement;
+  "search-bucket-threads": HTMLButtonElement;
   "search-older-note": HTMLParagraphElement;
-  "search-outside-chip": HTMLButtonElement;
   "search-scope": HTMLParagraphElement;
   "search-screen-sep": HTMLDivElement;
   "search-toggle": HTMLButtonElement;

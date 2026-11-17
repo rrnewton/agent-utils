@@ -699,15 +699,21 @@
                    per-keystroke filter never pays for it. -->
               <div id="search-screen-sep" class="search-sep" role="separator" hidden><span>On this screen</span></div>
               <!--
-                `#1786 vibe-talk-search-scope-server-hits`. The server hits outside
-                the scope on screen (this thread, else this channel), counted on a
-                chip in its own row under the search bar, pushing the list down:
-                in-scope hits stand in the timeline as cards already, and a tap
-                interleaves these in the timeline in quoted style and brings the
-                first into view. Hidden while there are none; its words and its
-                showing are the server search's (`renderServerSearch`).
+                `#1797 vibe-talk-search-bucket-toggles` (owner 145/146, refining
+                `#1786`). The server's hits by bucket — this thread, main, other
+                threads — counted on toggle chips in their own row under the
+                search bar, pushing the list down: one chip per bucket with
+                hits, styled like the Documents view filters, its words and
+                showing the server search's (`renderServerSearch`). Enabled
+                buckets interleave in the timeline; a tap on a chip brings its
+                first newly shown hit into view. A fourth chip (Agent
+                Transcripts, `#1608`) plugs into this row by the same shape.
               -->
-              <button id="search-outside-chip" class="chip search-outside-chip" type="button" aria-expanded="false" hidden>Show hits outside this thread</button>
+              <div id="search-bucket-row" class="search-bucket-row" role="group" aria-label="Where the server's hits are" hidden>
+                <button id="search-bucket-thread" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in this thread</button>
+                <button id="search-bucket-main" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in main</button>
+                <button id="search-bucket-threads" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in threads</button>
+              </div>
               <ol id="thread-list" class="messages" hidden></ol>
               <ol id="discord-log" class="messages"></ol>
               <!--
