@@ -1,5 +1,5 @@
 // Read-aloud transport and its controls, owned together (`#624 voice-page-modularity`).
-import { browserSpeechChunks, createPreparedSpeech, joinBytes, readClock, readPieces, readSectionStarts, readTimelineWeights, recoveryWait, sentenceEnds, silentBefore, speechElapsedMs, speechSegments, ticketEnded, ticketTooShortForBlocks, wavLayout } from "../../core/speech/index.ts";
+import { browserSpeechChunks, chunkStartSilenceMs, createPreparedSpeech, joinBytes, readClock, readPieces, readSectionStarts, readTimelineWeights, recoveryWait, sentenceEnds, silenceFrameCount, silentBefore, speechElapsedMs, speechSegments, ticketEnded, ticketTooShortForBlocks, wavLayout } from "../../core/speech/index.ts";
 import { READ_NO_SPEECH_MS, cloudFailureText } from "../../present/call/index.ts";
 import { DEVICE_SETTINGS, MAX_READ_SPEED, MIN_READ_SPEED, clampReadSpeed } from "../../core/settings/index.ts";
 import { cardRootOf, idsOf, rowMessages, rowSeen } from "../../view/channel/index.ts";
@@ -704,6 +704,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // `#1039 documents-read-parity`: a document of several blocks holds the media keys, as a cloud
     // read of several does; one of a single block has nowhere for them to steer to.
     if (docPayload !== null && segments!.length > 1) claimMediaSession();
+    // `#1800`: a message read in several chunks holds the keeper too, so the silent loop keeps
+    // the output (and a Bluetooth sink) alive in the gaps between utterances, where the next
+    // chunk's first words were being clipped. One chunk has no gap to bridge.
+    else if (docPayload === null && flat.length > 1) claimMediaSession();
     const current = () => ticket === readingTicket && nowPlaying !== null && nowPlaying!.id === id;
     const fail = (error: unknown) => {
       if (!current()) return;
@@ -1457,6 +1461,20 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
 
   let readAloudContext: AudioContext | null = null;
   let readAloudWantsOutput = false;
+  /** The pending suspension of the context after a read, while it is kept alive (`#1800`). */
+  let readAloudQuietTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** `#1800`: the silence before a cold chunk, and how long the output stays alive after a read. */
+  const readPrerollMs = (): number => deps.deviceSettings().get(DEVICE_SETTINGS.readPrerollMs);
+  const readKeepAliveMs = (): number => deps.deviceSettings().get(DEVICE_SETTINGS.readKeepAliveMs);
+
+  /** A new read wants the output: the keep-alive suspension it was waiting out is cancelled. */
+  function cancelReadAloudQuiet() {
+    if (readAloudQuietTimer !== null) {
+      clearTimeout(readAloudQuietTimer);
+      readAloudQuietTimer = null;
+    }
+  }
 
   /**
    * The context read-aloud plays through, resumed. Null where a fetch cannot be streamed into Web
@@ -1480,18 +1498,30 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // Not while the reader has paused: the clock stays stopped until they play. `#376`.
     const paused = nowPlaying !== null && nowPlaying!.paused === true;
     readAloudWantsOutput = !paused;
+    if (!paused) cancelReadAloudQuiet();
     if (readAloudContext.state === "suspended" && !paused && typeof readAloudContext.resume === "function") {
       readAloudContext.resume().catch(() => {});
     }
     return readAloudContext;
   }
 
-  /** Nothing is being read: let the device's audio output go rather than hold it open in silence. */
-  function quietReadAloudContext() {
+  /**
+   * Nothing is being read: let the device's audio output go rather than hold it open in silence —
+   * but not at once (`#1800`). The context stays alive for the keep-alive (`readKeepAliveMs`,
+   * 25 s unless the reader chose otherwise), rendering silence, so a read that follows —
+   * autoplay's next message, the next tap — never starts on a sleeping sink. The cost is the
+   * output path (and a Bluetooth sink's connection) held for those seconds after each read.
+   * A new read cancels the wait (`cancelReadAloudQuiet`); 0 suspends at once, as before.
+   */
+  function quietReadAloudContext(atOnce = false) {
     readAloudWantsOutput = false;
-    if (readAloudContext !== null && readAloudContext.state === "running"
-      && typeof readAloudContext.suspend === "function") {
-      const context = readAloudContext;
+    cancelReadAloudQuiet();
+    if (readAloudContext === null || readAloudContext.state !== "running"
+      || typeof readAloudContext.suspend !== "function") return;
+    const context = readAloudContext;
+    const suspend = () => {
+      readAloudQuietTimer = null;
+      if (readAloudWantsOutput || readAloudContext !== context) return;
       context.suspend().then(() => {
         // A new read may have asked to resume before this asynchronous suspension completed.
         // Honor the latest intent, including a subsequent Stop or Pause, when it settles.
@@ -1499,7 +1529,16 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           context.resume().catch(() => {});
         }
       }).catch(() => {});
+    };
+    const keepAliveMs = atOnce ? 0 : readKeepAliveMs();
+    if (keepAliveMs <= 0) {
+      suspend();
+      return;
     }
+    readAloudQuietTimer = setTimeout(suspend, keepAliveMs);
+    // A page test's process holds no timer open for a suspension nobody is waiting for.
+    const timer = readAloudQuietTimer as unknown as { unref?: () => void };
+    if (typeof timer.unref === "function") timer.unref();
   }
 
   function streamingPlayer(url: string, context: AudioContext, clock = readClock()) {
@@ -1558,12 +1597,36 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       drained = true;
       emit("drained");
     };
+    // `#1800`: buffers wait here while the context is suspended, and are scheduled only once
+    // `resume()` has resolved and the context reports running, against the clock as it stands
+    // then — never against a frozen `currentTime`, which would spend the cushion standing still.
+    let resuming: Promise<void> | null = null;
+    const pump = () => {
+      if (over || !wanted) return;
+      if (context.state === "suspended" && typeof context.resume === "function") {
+        if (resuming === null) {
+          resuming = Promise.resolve(context.resume()).catch(() => {}).then(() => {
+            resuming = null;
+            pump();
+          });
+        }
+        return;
+      }
+      while (waiting.length > 0) schedule(waiting.shift()!);
+      drainIfDone();
+      endIfDone();
+    };
     const schedule = (buffer: AudioBuffer) => {
       const node = context.createBufferSource();
       node.buffer = buffer;
       node.connect(context.destination);
       const now = context.currentTime;
+      // `#1800`: a cold start — no contiguous predecessor on the shared clock — is preceded by
+      // the pre-roll silence, which a sleeping Bluetooth sink may clip instead of speech. A
+      // block beginning where its predecessor ends is gapless and gets none.
+      let cold = false;
       if (!announced) {
+        cold = clock.playAt <= now + 0.005;
         // A part's first piece: where the part before it ends, or the cushion ahead of now, whichever
         // is later. `#376 read-aloud-blocks`. Where the voice generates faster than it speaks, the
         // next block is waiting before this one ends and follows it without a gap; where it speaks
@@ -1578,8 +1641,25 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         if (firstAt !== null) gaps.push([Math.max(ranOut, firstAt), clock.playAt]);
       }
       const playAt = clock.playAt;
-      node.start(playAt);
-      const startsInMs = Math.round((playAt - now + (context.outputLatency || 0)) * 1000);
+      // The pre-roll itself, where this start is cold: silence the sink wakes on, in place
+      // ahead of the chunk's own first sample, which is scheduled whole after it.
+      let speechAt = playAt;
+      const silenceMs = chunkStartSilenceMs(cold, readPrerollMs());
+      const silenceFrames = silenceFrameCount(silenceMs, context.sampleRate);
+      if (silenceFrames > 0) {
+        const hushNode = context.createBufferSource();
+        hushNode.buffer = context.createBuffer(1, silenceFrames, context.sampleRate);
+        hushNode.connect(context.destination);
+        hushNode.start(playAt);
+        sounding.add(hushNode);
+        hushNode.onended = () => {
+          sounding.delete(hushNode);
+          endIfDone();
+        };
+        speechAt = playAt + hushNode.buffer.duration;
+      }
+      node.start(speechAt);
+      const startsInMs = Math.round((speechAt - now + (context.outputLatency || 0)) * 1000);
       if (!spoke) {
         const onset = loudFrom(buffer);
         if (onset >= 0) {
@@ -1589,7 +1669,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           emit("speech", startsInMs + Math.round((onset / buffer.sampleRate) * 1000));
         }
       }
-      clock.playAt = playAt + buffer.duration;
+      clock.playAt = speechAt + buffer.duration;
       if (firstAt === null) firstAt = playAt;
       lastEnd = clock.playAt;
       sounding.add(node);
@@ -1601,7 +1681,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         announced = true;
         // `playing` is when the first sample is due at the speaker, not when it was queued: on the
         // audio clock, so a pause in between holds it back as long as it holds the sample back.
-        announceAt(playAt, startsInMs);
+        announceAt(speechAt, startsInMs);
       }
     };
     /**
@@ -1733,8 +1813,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
             emit("loadeddata");
             if (over) return;
           }
-          if (wanted) schedule(buffer);
-          else waiting.push(buffer);
+          waiting.push(buffer);
+          pump();
         }
       } catch (error) {
         // Includes a response cut off part-way: a read that did not arrive whole did not END, and
@@ -1779,9 +1859,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         if (!over) {
           wanted = true;
           readAloudAudioContext();
-          while (waiting.length > 0) schedule(waiting.shift()!);
-          drainIfDone();
-          endIfDone();
+          pump();
         }
         return Promise.resolve();
       },
@@ -2932,7 +3010,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       playing.pauseTransport();
     } else if (audio && audio.hearsSpeech === true) {
       if (readAloudContext === null || typeof readAloudContext.suspend !== "function") return;
-      quietReadAloudContext();
+      // A pause stops the clock at once: the keep-alive is only for a read that has ENDED,
+      // whose next read should not start cold (`#1800`).
+      quietReadAloudContext(true);
     } else if (audio && typeof audio.pause === "function") {
       audio.pause();
     } else {

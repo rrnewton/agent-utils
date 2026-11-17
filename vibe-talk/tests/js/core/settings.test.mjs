@@ -141,6 +141,8 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     onOff("markReadFirstGuard", "vibe-talk.voice.mark-read-first-guard", true, THROWN),
     ["markReadFirstPercent", "vibe-talk.voice.mark-read-first-percent", 50, [[0, "0"], [100, "100"]], 50],
     ["markReadLongWords", "vibe-talk.voice.mark-read-long-words", 0, [[0, "0"], [5000, "5000"]], 0],
+    ["readPrerollMs", "vibe-talk.voice.read-preroll-ms", 300, [[0, "0"], [450, "450"], [2000, "2000"]], 300],
+    ["readKeepAliveMs", "vibe-talk.voice.read-keep-alive-ms", 25000, [[0, "0"], [30000, "30000"]], 25000],
     ["readSpeed", "vibe-talk.voice.read-speed", null, [[150, "150"], [null, null]], THROWN],
     ["twoColumnSplit", "vibe-talk.voice.two-column-split", 50, [[30, "30"], [70, "70"]], THROWN],
     ["discussWidth", "vibe-talk.voice.discuss-width", 560, [[700, "700"], [320, "320"]], 560],

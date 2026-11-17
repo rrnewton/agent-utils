@@ -1038,25 +1038,76 @@ test("the next block is scheduled to BEGIN WHERE THE CURRENT ONE ENDS, so the bo
   page.audioStreams[1].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(80).fill(0x2000))));
   await page.settle();
   const before = page.audio.sources.length;
-  assert.equal(before, 1, "the next block played before the current one had all arrived");
+  assert.equal(before, 2, "the next block played before the current one had all arrived");
   page.audioStreams[0].controller.drop();
   await page.settle();
-  const [first, second] = page.audio.sources;
+  // The first block starts cold, so its pre-roll silence precedes it (`#1800`); the next block
+  // is the one whose start this test pins to the current one's end.
+  const spoken = [...page.audio.sources].filter((source) => source.buffer.getChannelData(0)[0] !== 0)
+    .sort((a, b) => a.startedAt - b.startedAt);
+  const [first, second] = spoken;
   assert.ok(second, "the next block was not scheduled once the current one had all arrived");
   const end = first.startedAt + first.buffer.duration;
   assert.ok(Math.abs(second.startedAt - end) < 1e-9,
     `the next block starts at ${second.startedAt}, the current ends at ${end}: a gap at the boundary`);
 
   // THE CONTROL: a block whose audio comes after the one before has finished playing cannot begin
-  // where it ended, and starts the cushion ahead of now instead. The check above can tell the two.
+  // where it ended, and starts the cushion ahead of now instead — cold again, so its pre-roll
+  // silence opens the cushion and its speech follows the silence. The check above can tell the two.
   page.audio.currentTime = second.startedAt + second.buffer.duration + 1;
   page.audioStreams[1].controller.drop();
   await page.settle();
   page.audioStreams[2].controller.bytes(joined(wavHeader(1000, 1), pcm(0x2000, 0x2000)));
   await page.settle();
-  const third = page.audio.sources.at(-1);
-  assert.ok(Math.abs(third.startedAt - (page.audio.currentTime + 0.5)) < 1e-9,
-    `a late block started at ${third.startedAt} with the clock at ${page.audio.currentTime}`);
+  const [lateSilence, third] = page.audio.sources.slice(-2).sort((a, b) => a.startedAt - b.startedAt);
+  assert.ok(Math.abs(lateSilence.startedAt - (page.audio.currentTime + 0.5)) < 1e-9,
+    `a late block's pre-roll started at ${lateSilence.startedAt} with the clock at ${page.audio.currentTime}`);
+  assert.ok(Math.abs(third.startedAt - (lateSilence.startedAt + lateSilence.buffer.duration)) < 1e-9,
+    `a late block started at ${third.startedAt}, not after its pre-roll at ${lateSilence.startedAt + lateSilence.buffer.duration}`);
+});
+
+test("`#1800 vibe-talk-read-aloud-chunk-start-clipping`: a cold chunk is preceded by silence, its first samples still delivered", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
+  await page.settle();
+  const [silence, speech] = [...page.audio.sources].sort((a, b) => a.startedAt - b.startedAt);
+  assert.ok(silence && speech, "the first chunk produced fewer than two scheduled sources");
+  const silentSamples = silence.buffer.getChannelData(0);
+  assert.ok(silentSamples.every((sample) => sample === 0), "the pre-roll buffer is not silence");
+  assert.ok(Math.abs(silence.buffer.duration - 0.3) < 1e-9, `the pre-roll is ${silence.buffer.duration}s, not 0.3s`);
+  assert.ok(Math.abs(speech.startedAt - (silence.startedAt + silence.buffer.duration)) < 1e-9,
+    `speech starts at ${speech.startedAt}, not right after the pre-roll at ${silence.startedAt + silence.buffer.duration}`);
+  assert.equal(speech.buffer.getChannelData(0)[0], 0x2000 / 0x8000, "the first sample of the chunk was dropped or altered");
+  // A block continuing gaplessly from this one gets no padding: only its speech is scheduled.
+  page.audioStreams[0].controller.drop();
+  await page.settle();
+  page.audioStreams[1].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(80).fill(0x2000))));
+  await page.settle();
+  page.audioStreams[1].controller.drop();
+  await page.settle();
+  const next = page.audio.sources[2];
+  assert.ok(next, "the gapless block was not scheduled");
+  assert.equal(next.buffer.getChannelData(0)[0], 0x2000 / 0x8000, "the gapless block opens with padding, not its first sample");
+  assert.ok(Math.abs(next.startedAt - (speech.startedAt + speech.buffer.duration)) < 1e-9,
+    `the gapless block starts at ${next.startedAt}, not where its predecessor ends at ${speech.startedAt + speech.buffer.duration}`);
+});
+
+test("`#1800 vibe-talk-read-aloud-chunk-start-clipping`: nothing is scheduled on a suspended clock; the pre-roll is placed after resume", async () => {
+  const { page, rows } = await blockedRead();
+  await rows[0].dispatch("click", {});
+  await page.settle();
+  page.audio.state = "suspended";
+  page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
+  await page.settle();
+  const [silence, speech] = [...page.audio.sources].sort((a, b) => a.startedAt - b.startedAt);
+  assert.ok(silence && speech, "no pre-roll or speech was scheduled after the context resumed");
+  assert.equal(page.audio.state, "running", "the context was never resumed");
+  assert.ok(Math.abs(silence.startedAt - (page.audio.currentTime + 0.5)) < 1e-9,
+    `the pre-roll starts at ${silence.startedAt}, not the lead ahead of the resumed clock at ${page.audio.currentTime}`);
+  assert.ok(Math.abs(speech.startedAt - (silence.startedAt + 0.3)) < 1e-9,
+    `speech starts at ${speech.startedAt}, not after the pre-roll`);
 });
 
 test("THE BLOCK BEING READ IS LIT and the row counts it, 'reading 1 of 3', with Previous and Next shown", async () => {
@@ -1072,20 +1123,19 @@ test("THE BLOCK BEING READ IS LIT and the row counts it, 'reading 1 of 3', with 
   assert.equal(page.el("read-next").disabled, false);
 
   // The light moves when the next block is HEARD, not when it is asked for.
-  // Block 0 is due half a second from now (the cushion), and is 0.1 s long.
+  // Block 0's speech is due 0.8 s from now (the cushion plus its cold-start pre-roll, `#1800`),
+  // and is 0.1 s long.
   page.audioStreams[0].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
   await page.settle();
-  assert.equal(page.expireTimers(500), 1, "nothing waited for block 0 to be heard");
+  assert.equal(page.expireTimers(800), 1, "nothing waited for block 0 to be heard");
   await page.settle();
   page.audioStreams[1].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
   await page.settle();
   page.audioStreams[0].controller.drop();
   await page.settle();
   assert.equal(litBlock(row), "p:The run finished.", "the light moved before the next block was heard");
-  // Block 1 is due where block 0 ends, 0.6 s from now. Exactly two 600ms waits are armed:
-  // block 1's, and the view switcher's tab-row settle from the switch into this channel
-  // (`#1078 bottom-bar-switcher`), which expiring here only puts that row away.
-  assert.equal(page.expireTimers(600), 2, "nothing waited for block 1 to be heard (speech + tab-row settle)");
+  // Block 1 is due where block 0's speech ends, 0.9 s from now.
+  assert.equal(page.expireTimers(900), 1, "nothing waited for block 1 to be heard");
   await page.settle();
   assert.equal(litBlock(row), "li:the budget landed");
   assert.equal(page.el("read-steer-count").text(), "2 of 3");
@@ -1098,12 +1148,14 @@ test("THE BLOCK BEING READ IS LIT and the row counts it, 'reading 1 of 3', with 
   page.audioStreams[2].controller.bytes(joined(wavHeader(1000, 1), pcm(...new Array(100).fill(0x2000))));
   await page.settle();
   page.audio.state = "suspended";
-  assert.equal(page.expireTimers(700), 1, "nothing waited for block 2 to be heard");
+  assert.equal(page.expireTimers(1000), 1, "nothing waited for block 2 to be heard");
   await page.settle();
   assert.equal(litBlock(row), "li:the budget landed", "the light moved on while the audio was paused");
   page.audio.state = "running";
   page.audio.currentTime = 0.7;
   assert.equal(page.expireTimers(250), 1, "nothing looked again once the audio played on");
+  await page.settle();
+  assert.equal(page.expireTimers(300), 1, "nothing looked again as block 2 came due");
   await page.settle();
   assert.equal(litBlock(row), "li:the rewrite is a draft");
 
@@ -2109,7 +2161,10 @@ test("the blocks of a message heard to its end archive it once, after the last b
     page.audioStreams[at].controller.drop();
     await page.settle();
   }
-  assert.equal(page.audio.sources.length, 3, "not every block was scheduled");
+  // Three blocks scheduled, plus the one pre-roll silence before the cold first block (`#1800`).
+  assert.equal(page.audio.sources.filter((source) => source.buffer.getChannelData(0)[0] !== 0).length, 3,
+    "not every block was scheduled");
+  assert.equal(page.audio.sources.length, 4, "the cold first block got no pre-roll, or a gapless one was padded");
   for (const source of page.audio.sources.slice(0, -1)) source.onended();
   await page.settle();
   assert.deepEqual(page.dismissCalls, [], "archived before the last block ended");
@@ -2117,6 +2172,12 @@ test("the blocks of a message heard to its end archive it once, after the last b
   await page.settle();
   assert.deepEqual(page.dismissCalls, [{ messages: [BLOCKED_ID] }]);
   assert.equal(page.el("read-steer").hidden, true);
+  // `#1800`: the output stays alive for the keep-alive after the read ends, so a following read
+  // never starts cold; once it lapses the output is let go.
+  assert.equal(page.audio.state, "running", "the output was dropped the moment the read ended");
+  assert.equal(page.expireTimers(25000), 1, "no keep-alive suspension was armed");
+  await page.settle();
+  assert.equal(page.audio.state, "suspended", "the output was held open past the keep-alive");
 });
 
 test("`#886 voice-page-autoplay`: going on from a read in blocks keeps the media keys and the audio output to the next read", async () => {
@@ -3779,19 +3840,24 @@ test("a streamed COMBINED row fetches its next part on the first part's audio an
 
   page.audioStreams[1].controller.bytes(joined(wavHeader(24000, 1), pcm(3000, 4000)));
   await page.settle();
-  assert.equal(audio.sources.length, 1, "both parts played over each other");
+  // One part's speech so far (plus its cold-start pre-roll silence, `#1800`): the second part's
+  // speech is not scheduled until the first has all arrived.
+  assert.equal(audio.sources.filter((source) => source.buffer.getChannelData(0)[0] !== 0).length, 1,
+    "both parts played over each other");
 
   page.audioStreams[0].controller.drop();
   await page.settle();
-  audio.sources[0].onended();
+  // The first part's speech and its pre-roll silence both end (`#1800`).
+  for (const source of audio.sources) source.onended();
   await page.settle();
-  assert.equal(audio.sources.length, 2, "the second part never followed the first");
-  assert.deepEqual([...audio.sources[1].buffer.getChannelData(0)], [3000 / 0x8000, 4000 / 0x8000]);
+  const spoken = audio.sources.filter((source) => source.buffer.getChannelData(0)[0] !== 0);
+  assert.equal(spoken.length, 2, "the second part never followed the first");
+  assert.deepEqual([...spoken[1].buffer.getChannelData(0)], [3000 / 0x8000, 4000 / 0x8000]);
   assert.deepEqual(page.dismissCalls, [], "the row was filed away with half of it unheard");
 
   page.audioStreams[1].controller.drop();
   await page.settle();
-  audio.sources[1].onended();
+  spoken[1].onended();
   await page.settle();
   assert.deepEqual(page.dismissCalls, [
     { messages: ["1000000000000000001", "1000000000000000002"] },

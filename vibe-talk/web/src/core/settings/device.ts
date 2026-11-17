@@ -13,6 +13,8 @@ import {
   DEFAULT_DISCUSS_DOCKED_HEIGHT,
   DEFAULT_DISCUSS_WIDTH,
   DEFAULT_MSG_SCALE,
+  DEFAULT_READ_KEEP_ALIVE_MS,
+  DEFAULT_READ_PREROLL_MS,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
@@ -23,6 +25,8 @@ import {
   clampDiscussDockedHeight,
   clampDiscussWidth,
   clampMsgScale,
+  clampReadKeepAliveMs,
+  clampReadPrerollMs,
   clampReadSpeed,
   clampReadingWidth,
   clampTwoColumnSplit,
@@ -291,6 +295,22 @@ export const DEVICE_SETTINGS = Object.freeze({
     read: (raw: string | null) => clampQuoteReadPercent(raw === null ? DEFAULT_QUOTE_READ_PERCENT : raw),
     write: (pct: number) => String(pct),
     refused: { value: DEFAULT_QUOTE_READ_PERCENT },
+  } satisfies DeviceSetting<number>,
+  /** `#1800 vibe-talk-read-aloud-chunk-start-clipping`. The silence before a cold chunk, in
+   * milliseconds, clamped (`clampReadPrerollMs`); a refused read is the 300 ms default. */
+  readPrerollMs: {
+    key: "vibe-talk.voice.read-preroll-ms",
+    read: (raw: string | null) => clampReadPrerollMs(raw === null ? DEFAULT_READ_PREROLL_MS : raw),
+    write: (ms: number) => String(clampReadPrerollMs(ms)),
+    refused: { value: DEFAULT_READ_PREROLL_MS },
+  } satisfies DeviceSetting<number>,
+  /** `#1800 vibe-talk-read-aloud-chunk-start-clipping`. How long the output stays alive after
+   * a read, in milliseconds, clamped (`clampReadKeepAliveMs`); a refused read is 25 s. */
+  readKeepAliveMs: {
+    key: "vibe-talk.voice.read-keep-alive-ms",
+    read: (raw: string | null) => clampReadKeepAliveMs(raw === null ? DEFAULT_READ_KEEP_ALIVE_MS : raw),
+    write: (ms: number) => String(clampReadKeepAliveMs(ms)),
+    refused: { value: DEFAULT_READ_KEEP_ALIVE_MS },
   } satisfies DeviceSetting<number>,
   /** The reading pace, a percentage, or null (nothing kept) for however the agent speaks. Synced. */
   readSpeed: {

@@ -227,6 +227,44 @@ const clampReadSpeed = (value: unknown): number | null => {
   return Number.isFinite(n) ? Math.min(MAX_READ_SPEED, Math.max(MIN_READ_SPEED, n)) : null;
 };
 
+/**
+ * `#1800 vibe-talk-read-aloud-chunk-start-clipping`. The silence played before a chunk that
+ * starts on an idle output (a Bluetooth sink that slept between chunks), in milliseconds.
+ * 300 wakes the common car and headset sinks; 0 turns the pre-roll off; past two seconds the
+ * wait before every cold chunk would be worse than the clip.
+ */
+const MIN_READ_PREROLL_MS = 0;
+const MAX_READ_PREROLL_MS = 2000;
+const DEFAULT_READ_PREROLL_MS = 300;
+
+/** A pre-roll this page will apply: the default for anything that is not a number. */
+function clampReadPrerollMs(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) return DEFAULT_READ_PREROLL_MS;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return DEFAULT_READ_PREROLL_MS;
+  return Math.min(MAX_READ_PREROLL_MS, Math.max(MIN_READ_PREROLL_MS, Math.round(n)));
+}
+
+/**
+ * `#1800 vibe-talk-read-aloud-chunk-start-clipping`. How long the read-aloud output stays
+ * alive after a read ends before it is suspended, in milliseconds: back-to-back reads and
+ * autoplay's next message then never start cold. 25 s covers the gap between messages a
+ * listener works through by thumb; 0 suspends at once, as before.
+ */
+const MIN_READ_KEEP_ALIVE_MS = 0;
+const MAX_READ_KEEP_ALIVE_MS = 120000;
+const DEFAULT_READ_KEEP_ALIVE_MS = 25000;
+
+/** A keep-alive this page will apply: the default for anything that is not a number. */
+function clampReadKeepAliveMs(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) return DEFAULT_READ_KEEP_ALIVE_MS;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return DEFAULT_READ_KEEP_ALIVE_MS;
+  return Math.min(MAX_READ_KEEP_ALIVE_MS, Math.max(MIN_READ_KEEP_ALIVE_MS, Math.round(n)));
+}
+
 export {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_COLLAPSED_LINES,
@@ -236,6 +274,8 @@ export {
   DEFAULT_MARK_READ_FIRST_PERCENT,
   DEFAULT_MARK_READ_LONG_WORDS,
   DEFAULT_QUOTE_READ_PERCENT,
+  DEFAULT_READ_KEEP_ALIVE_MS,
+  DEFAULT_READ_PREROLL_MS,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   MAX_CARD_MAX_LINES,
@@ -246,6 +286,8 @@ export {
   MAX_MARK_READ_FIRST_PERCENT,
   MAX_MARK_READ_LONG_WORDS,
   MAX_QUOTE_READ_PERCENT,
+  MAX_READ_KEEP_ALIVE_MS,
+  MAX_READ_PREROLL_MS,
   MAX_READING_CH,
   MAX_READ_SPEED,
   MAX_TWO_COLUMN_SPLIT,
@@ -257,6 +299,8 @@ export {
   MIN_MARK_READ_FIRST_PERCENT,
   MIN_MARK_READ_LONG_WORDS,
   MIN_QUOTE_READ_PERCENT,
+  MIN_READ_KEEP_ALIVE_MS,
+  MIN_READ_PREROLL_MS,
   MIN_READING_CH,
   MIN_READ_SPEED,
   MIN_TWO_COLUMN_SPLIT,
@@ -268,6 +312,8 @@ export {
   clampMarkReadFirstPercent,
   clampMarkReadLongWords,
   clampQuoteReadPercent,
+  clampReadKeepAliveMs,
+  clampReadPrerollMs,
   clampReadSpeed,
   clampReadingWidth,
   clampTwoColumnSplit,

@@ -21,5 +21,6 @@ export type { SpeechHold } from "./hold.ts";
 
 export { readClock, readSectionStarts, readTimelineWeights, silentBefore } from "./read-steering.ts";
 
+export { DEFAULT_READ_PREROLL_MS, chunkStartSilenceMs, silenceFrameCount } from "./preroll.ts";
 export { outputRateFrom } from "./format.ts";
 export { recoveryMayRetry } from "./restored-turns.ts";

@@ -90,6 +90,17 @@ test("`#624 voice-page-modularity`: audio as bytes, and a read cut for a device 
   assert.equal(chunks.join(" "), long.trim());
 });
 
+test("`#1800 vibe-talk-read-aloud-chunk-start-clipping`: a cold chunk start gets the pre-roll, a gapless one gets none", () => {
+  const { chunkStartSilenceMs, silenceFrameCount, DEFAULT_READ_PREROLL_MS } = SPEECH_PIECES;
+  assert.equal(DEFAULT_READ_PREROLL_MS, 300, "the default pre-roll is not 300 ms");
+  assert.equal(chunkStartSilenceMs(true, DEFAULT_READ_PREROLL_MS), 300, "a cold start was given no silence");
+  assert.equal(chunkStartSilenceMs(false, DEFAULT_READ_PREROLL_MS), 0, "a gapless start was padded");
+  assert.equal(chunkStartSilenceMs(true, 0), 0, "a pre-roll of 0 did not turn the padding off");
+  assert.equal(silenceFrameCount(300, 48000), 14400);
+  assert.equal(silenceFrameCount(0, 48000), 0);
+  assert.equal(silenceFrameCount(300, 1000), 300);
+});
+
 test("`#624 voice-page-modularity`: the speech hold reads the server's level and cap, keeps its defaults for anything unusable, and measures a buffer in dBFS", () => {
   const { speechHoldFrom, bufferDbfs, SPEECH_HOLD_DBFS_DEFAULT, SPEECH_HOLD_CAP_MS_DEFAULT } = SPEECH_PIECES;
   const defaults = { levelDbfs: SPEECH_HOLD_DBFS_DEFAULT, capMs: SPEECH_HOLD_CAP_MS_DEFAULT };
