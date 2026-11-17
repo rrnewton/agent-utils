@@ -5833,7 +5833,8 @@ def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
                 step = obj["steps"][0]
                 allocation = obj["allocation"]
                 learned_ok = (
-                    step["rss_estimate_bytes"] == 5 * gib
+                    # #1763: learned 5 GiB peak floored at peak + 25% = 6.25 GiB.
+                    step["rss_estimate_bytes"] == 5 * gib + 5 * gib // 4
                     and step["rss_source"] == "store"
                     and step["alloc_inner_jobs"] is None
                     and allocation["stop_reason"] == "infeasible-memory"
@@ -5944,9 +5945,15 @@ def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
             all(outcome.returncode == 2 for outcome in stress_outcomes.values())
             and all("--stress 2: OK" in outcome.stderr for outcome in stress_outcomes.values())
             and all(
-                "final planned expanded graph needs" in outcome.stderr
-                and "exceeding the box memory budget" in outcome.stderr
-                and "unbounded or overflowed" not in outcome.stderr
+                # #1763: the floored learned baseline saturates the i64 domain for
+                # this near-overflow fixture, so the final guard may refuse as
+                # unbounded instead of naming a finite need; either wording is a
+                # pre-spawn refusal, which is what this check proves.
+                (
+                    "final planned expanded graph needs" in outcome.stderr
+                    and "exceeding the box memory budget" in outcome.stderr
+                )
+                or "unbounded or overflowed" in outcome.stderr
                 for outcome in stress_outcomes.values()
             )
             and not any(os.path.exists(path) for path in stress_marker.values())
@@ -6624,7 +6631,8 @@ def _memory_feedback_floor_survives_a_decline(
     :func:`_memory_feedback_decline_keeps_authored_floor_at_admission` does not cover.
 
     Without the flag the censoring-blind feedback fits the 9/10 nearest-rank percentile of those
-    peaks — the ninth smallest, 8589934592 B — and admission models 10737418240 B. With the flag
+    peaks — the ninth smallest, 8589934592 B — floors it (#1763) to 10737418240 B, and admission
+    models 13421772800 B. With the flag
     the step is DECLINED, because no peak says what it wanted; but one of them says it reached
     34359738368 B, so that is the floor the decline keeps and admission models 42949672960 B.
 
@@ -6672,7 +6680,9 @@ def _memory_feedback_floor_survives_a_decline(
     }
     said = "g.pinned: no estimate; rss_baseline_bytes=34359738368, the proven floor"
     if (
-        seen != {"py/off": "10737418240", "rs/off": "10737418240",
+        # #1763: without the flag the ordinary learned baseline is floored
+        # (8 GiB peak + 25% = 10 GiB baseline; x1.25 cap = 13421772800 B).
+        seen != {"py/off": "13421772800", "rs/off": "13421772800",
                  "py/on": "42949672960", "rs/on": "42949672960"}
         or any(o.returncode != 0 for o in (*off.values(), *on.values()))
         or said not in on["py"].stderr

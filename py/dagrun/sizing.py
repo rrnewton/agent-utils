@@ -71,9 +71,10 @@ def _scaled_between_widths_i64(cap: int, inner_jobs: int, baseline_jobs: int) ->
 
 
 #: Absolute headroom a LEARNED memory cap keeps above its learned peak, in bytes (#1763).
-#: A light step's 25% alone is a few MiB, while gate contention (parallel cargo children,
-#: page cache charged to the same cgroup) moves its peak by tens of MiB between runs, so
-#: the margin is ``max(25%, 512 MiB)`` — the #818 floor, applied to every learned cap.
+#: A light step's 25% alone is a few MiB, while gate contention (parallel child
+#: processes, page cache charged to the same cgroup) moves its peak by tens of MiB
+#: between runs, so the margin is ``max(25%, 512 MiB)`` — the #818 floor, applied to
+#: every learned cap.
 MIN_LEARNED_CAP_HEADROOM_BYTES = 536_870_912
 
 #: Percentage headroom a learned memory cap keeps above its learned peak (#1763).
@@ -86,7 +87,7 @@ def learned_mem_cap_bytes(peak_bytes: int) -> int:
     ``peak + max(25% of peak, 512 MiB)``, saturated to the shared i64 domain. A step
     whose cap is learned is never capped below this value for its learned peak: the
     percentage covers ordinary variance and the absolute floor covers the contention
-    swing a light cargo-driving step shows under a gate. An authored
+    swing a light build-driving step shows under a gate. An authored
     ``hard_mem_max_bytes`` is an instruction, not a learned cap, and is never routed
     through here. A non-positive peak still yields the floor alone, so a learned cap
     is always finite and positive.

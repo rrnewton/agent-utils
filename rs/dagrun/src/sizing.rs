@@ -33,7 +33,7 @@ pub const LEARNED_CAP_MARGIN_PCT: i64 = 25;
 
 /// Cap for a step whose memory demand was LEARNED from a recorded peak (#1763):
 /// `peak + max(25% of peak, 512 MiB)`, saturated to i64. Mirrors
-/// `learned_mem_cap_bytes` in the Python edition.
+/// `learned_mem_cap_bytes` in the other edition.
 pub fn learned_mem_cap_bytes(peak_bytes: i64) -> i64 {
     let peak = peak_bytes.max(0) as i128;
     let pct = peak * LEARNED_CAP_MARGIN_PCT as i128 / 100;
@@ -54,7 +54,7 @@ pub enum CapOomVerdict {
 
 /// Map cgroup `memory.events` OOM counters to a verdict (#1763). Pure and
 /// deterministic; tests drive it with fake counters. Mirrors
-/// `classify_memory_cap_oom` in the Python edition.
+/// `classify_memory_cap_oom` in the other edition.
 pub fn classify_memory_cap_oom(
     oom: i64,
     oom_kill: i64,

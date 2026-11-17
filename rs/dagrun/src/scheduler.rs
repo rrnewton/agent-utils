@@ -4653,7 +4653,7 @@ fn run_step(ctx: StepCtx) {
         // Owner rule 346 (#1763): an OOM kill at a LEARNED cap (derived from a
         // profile/authored RSS baseline, not an authored hard cap) is no_result,
         // never a failure. No retry; the profile row stays ok=false (censored), so
-        // the next learned cap rises. Mirrors the Python scheduler.
+        // the next learned cap rises; mirrored in the other edition.
         {
             let cap_is_learned = !matches!(step.hint.hard_mem_max_bytes, Some(hard) if hard > 0)
                 && matches!(step.hint.rss_baseline_bytes, Some(base) if base > 0);
