@@ -16,13 +16,14 @@ pub(crate) const DEFAULT_TASKS_MAX: i64 = 8192;
 pub(crate) const ISOLATIONS: [&str; 3] = ["userns", "cgroup", "root"];
 pub(crate) const HOME_MODES: [&str; 2] = ["ro", "hidden"];
 pub(crate) const COORDINATOR_SCOPES: [&str; 2] = ["worktrees", "project"];
-pub(crate) const LIMIT_KEYS: [&str; 8] = [
+pub(crate) const LIMIT_KEYS: [&str; 9] = [
     "memory_max",
     "memory_high",
     "cpu_quota",
     "tasks_max",
     "io_weight",
     "all_slots_memory_max",
+    "all_slots_memory_high",
     "all_slots_cpu_quota",
     "slot_cpu_quotas",
 ];
@@ -37,6 +38,7 @@ pub(crate) struct SandboxLimits {
     pub(crate) tasks_max: Option<i64>,
     pub(crate) io_weight: Option<i64>,
     pub(crate) all_slots_memory_max: Option<String>,
+    pub(crate) all_slots_memory_high: Option<String>,
     pub(crate) all_slots_cpu_quota: Option<String>,
     pub(crate) slot_cpu_quotas: Vec<(String, String)>,
 }
@@ -50,6 +52,7 @@ impl Default for SandboxLimits {
             tasks_max: Some(DEFAULT_TASKS_MAX),
             io_weight: None,
             all_slots_memory_max: None,
+            all_slots_memory_high: None,
             all_slots_cpu_quota: None,
             slot_cpu_quotas: Vec::new(),
         }
@@ -174,6 +177,10 @@ pub(crate) fn limits_from_obj(raw: &Value) -> Result<SandboxLimits, String> {
             map.get("all_slots_memory_max"),
             &format!("{label}all_slots_memory_max"),
         )?,
+        all_slots_memory_high: optional_str(
+            map.get("all_slots_memory_high"),
+            &format!("{label}all_slots_memory_high"),
+        )?,
         all_slots_cpu_quota: optional_str(
             map.get("all_slots_cpu_quota"),
             &format!("{label}all_slots_cpu_quota"),
@@ -192,6 +199,7 @@ pub(crate) fn limits_to_obj(limits: &SandboxLimits) -> Value {
         "tasks_max": limits.tasks_max,
         "io_weight": limits.io_weight,
         "all_slots_memory_max": limits.all_slots_memory_max,
+        "all_slots_memory_high": limits.all_slots_memory_high,
         "all_slots_cpu_quota": limits.all_slots_cpu_quota,
         "slot_cpu_quotas": limits.slot_cpu_quotas.iter().map(|(prefix, quota)| {
             json!({"slot_prefix": prefix, "cpu_quota": quota})
@@ -325,6 +333,9 @@ pub(crate) fn all_slots_properties(limits: &SandboxLimits) -> Vec<String> {
         properties.push(format!("MemoryMax={memory_max}"));
         properties.push("MemorySwapMax=0".to_string());
     }
+    if let Some(memory_high) = &limits.all_slots_memory_high {
+        properties.push(format!("MemoryHigh={memory_high}"));
+    }
     if let Some(cpu_quota) = &limits.all_slots_cpu_quota {
         properties.push(format!("CPUQuota={cpu_quota}"));
     }
@@ -348,7 +359,7 @@ pub(crate) const SETTING_KEYS: [&str; 14] = [
     "limits",
 ];
 
-const RENAMED_KEYS: [(&str, &str); 9] = [
+const RENAMED_KEYS: [(&str, &str); 10] = [
     ("home_writable", "home_private"),
     ("home_paths", "home_expose (with home: hidden)"),
     ("memory_max", "limits.memory_max"),
@@ -357,6 +368,7 @@ const RENAMED_KEYS: [(&str, &str); 9] = [
     ("tasks_max", "limits.tasks_max"),
     ("io_weight", "limits.io_weight"),
     ("all_slots_memory_max", "limits.all_slots_memory_max"),
+    ("all_slots_memory_high", "limits.all_slots_memory_high"),
     ("all_slots_cpu_quota", "limits.all_slots_cpu_quota"),
 ];
 
@@ -852,6 +864,10 @@ fn render_limits(limits: &SandboxLimits) -> String {
         (
             "all_slots_memory_max",
             render_value(&opt_string(&limits.all_slots_memory_max), 2),
+        ),
+        (
+            "all_slots_memory_high",
+            render_value(&opt_string(&limits.all_slots_memory_high), 2),
         ),
         (
             "all_slots_cpu_quota",
@@ -2063,6 +2079,32 @@ sys.stdout.write("0\n" + json.dumps(sandbox.settings_to_obj(settings), indent=2)
         );
         assert!(limits_from_obj(&json!({"bogus": 1})).is_err());
         assert!(limits_from_obj(&json!({"memory_max": "lots"})).is_err());
+    }
+
+    #[test]
+    fn aggregate_high_is_independent_of_the_slot_and_hard_limit() {
+        let mut limits = limits_from_obj(&json!({
+            "memory_high": "28G", "memory_max": "32G", "all_slots_memory_high": "52G"
+        }))
+        .expect("limits");
+        assert_eq!(all_slots_properties(&limits), ["MemoryHigh=52G"]);
+        assert_eq!(
+            slice_limit_properties(&limits, None),
+            [
+                "MemoryMax=32G",
+                "MemorySwapMax=0",
+                "MemoryHigh=28G",
+                "TasksMax=8192"
+            ]
+        );
+        limits.all_slots_memory_max = Some("58G".to_owned());
+        assert_eq!(
+            all_slots_properties(&limits),
+            ["MemoryMax=58G", "MemorySwapMax=0", "MemoryHigh=52G"]
+        );
+        assert_eq!(limits_from_obj(&limits_to_obj(&limits)).unwrap(), limits);
+        assert!(limits_from_obj(&json!({"all_slots_memory_high": "invalid"})).is_err());
+        assert!(all_slots_properties(&SandboxLimits::default()).is_empty());
     }
 
     #[test]

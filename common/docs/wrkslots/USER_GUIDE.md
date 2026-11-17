@@ -3432,7 +3432,8 @@ sandbox:
   protect_system: true
   coordinator_writable: worktrees
   limits: {memory_max: null, memory_high: null, cpu_quota: null, tasks_max: 8192,
-           io_weight: null, all_slots_memory_max: null, all_slots_cpu_quota: null}
+           io_weight: null, all_slots_memory_max: null, all_slots_memory_high: null,
+           all_slots_cpu_quota: null}
 ```
 
 This is the shape only: in the file, each list is written one item per line with a comment above
@@ -3745,3 +3746,9 @@ operations, hash-chain corruption, missing compatibility views, and later-partic
 
 The default test run uses a PID namespace for tests that only need isolated process evidence and
 runs five host-visible process tests separately. This changes test cost, not coverage or assertions.
+
+The optional `sandbox.limits.all_slots_memory_high` sets `MemoryHigh` on the
+shared slot slice, so the combined workload reclaims memory before reaching
+`all_slots_memory_max`. For example, `52G` high and `58G` max provide separate
+soft and hard boundaries. It defaults to null (unchanged behavior); setting
+only the high threshold does not disable swap or change per-slot limits.

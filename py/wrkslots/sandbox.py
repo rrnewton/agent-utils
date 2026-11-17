@@ -151,6 +151,7 @@ _RENAMED_KEYS = {
     "tasks_max": "limits.tasks_max",
     "io_weight": "limits.io_weight",
     "all_slots_memory_max": "limits.all_slots_memory_max",
+    "all_slots_memory_high": "limits.all_slots_memory_high",
     "all_slots_cpu_quota": "limits.all_slots_cpu_quota",
 }
 
@@ -180,6 +181,7 @@ class SandboxLimits:
     tasks_max: int | None = DEFAULT_TASKS_MAX
     io_weight: int | None = None
     all_slots_memory_max: str | None = None
+    all_slots_memory_high: str | None = None
     all_slots_cpu_quota: str | None = None
     # Ordered (slot-name prefix, CPUQuota) overrides; first match wins over
     # cpu_quota, so a host can cap wide lanes without raising every lane.
@@ -296,6 +298,7 @@ LIMIT_DOCS: dict[str, str] = {
     "tasks_max": f"Slot process and thread limit (default {DEFAULT_TASKS_MAX}).",
     "io_weight": "Slot IO weight, 1 to 10000.",
     "all_slots_memory_max": "Memory ceiling shared by all slots together.",
+    "all_slots_memory_high": "Memory throttling threshold shared by all slots together.",
     "all_slots_cpu_quota": "CPU ceiling shared by all slots together.",
     "slot_cpu_quotas": "Ordered per-slot CPU ceilings: a list of {slot_prefix, cpu_quota}; the first prefix matching the slot name wins over cpu_quota.",
 }
@@ -414,6 +417,7 @@ def limits_from_obj(raw: object) -> SandboxLimits:
         tasks_max=_optional_int(raw.get("tasks_max", defaults.tasks_max), label + "tasks_max"),
         io_weight=_optional_int(raw.get("io_weight"), label + "io_weight"),
         all_slots_memory_max=_optional_str(raw.get("all_slots_memory_max"), label + "all_slots_memory_max"),
+        all_slots_memory_high=_optional_str(raw.get("all_slots_memory_high"), label + "all_slots_memory_high"),
         all_slots_cpu_quota=_optional_str(raw.get("all_slots_cpu_quota"), label + "all_slots_cpu_quota"),
         slot_cpu_quotas=_slot_cpu_quotas(raw.get("slot_cpu_quotas")),
     )
@@ -710,6 +714,8 @@ def apply_slice_limits(
     root_limits: list[str] = []
     if limits.all_slots_memory_max:
         root_limits += [f"MemoryMax={limits.all_slots_memory_max}", "MemorySwapMax=0"]
+    if limits.all_slots_memory_high:
+        root_limits.append(f"MemoryHigh={limits.all_slots_memory_high}")
     if limits.all_slots_cpu_quota:
         root_limits.append(f"CPUQuota={limits.all_slots_cpu_quota}")
     for unit, properties in (
