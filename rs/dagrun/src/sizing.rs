@@ -1363,11 +1363,23 @@ mod tests {
     #[test]
     fn classify_memory_cap_oom_fake_cgroup_events() {
         // #1763 / rule 346: OOM at a learned cap is no_result; at a hard cap, fail.
-        assert_eq!(classify_memory_cap_oom(1, 3, 0, true), CapOomVerdict::NoResult);
+        assert_eq!(
+            classify_memory_cap_oom(1, 3, 0, true),
+            CapOomVerdict::NoResult
+        );
         assert_eq!(classify_memory_cap_oom(1, 3, 0, false), CapOomVerdict::Fail);
-        assert_eq!(classify_memory_cap_oom(2, 0, 0, true), CapOomVerdict::NoResult);
-        assert_eq!(classify_memory_cap_oom(0, 0, 0, true), CapOomVerdict::NotOom);
-        assert_eq!(classify_memory_cap_oom(0, 0, 0, false), CapOomVerdict::NotOom);
+        assert_eq!(
+            classify_memory_cap_oom(2, 0, 0, true),
+            CapOomVerdict::NoResult
+        );
+        assert_eq!(
+            classify_memory_cap_oom(0, 0, 0, true),
+            CapOomVerdict::NotOom
+        );
+        assert_eq!(
+            classify_memory_cap_oom(0, 0, 0, false),
+            CapOomVerdict::NotOom
+        );
     }
 
     #[test]

@@ -2999,7 +2999,10 @@ mod tests {
             None,
         );
         assert_eq!(high_plan.entries[0].rss_source, "store");
-        assert_eq!(high_plan.entries[0].rss_estimate_bytes, Some(12_000 + 536_870_912));
+        assert_eq!(
+            high_plan.entries[0].rss_estimate_bytes,
+            Some(12_000 + 536_870_912)
+        );
         assert_eq!(
             apply_plan_to_config(&cfg, &high_plan).steps[0]
                 .hint
