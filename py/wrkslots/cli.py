@@ -15664,7 +15664,9 @@ def _cmd_quarantine_journal(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     slot = _validate_name(args.slot, "slot")
+    _reset_dead_mount_findings()
     plan = _quarantine_plan(config, slot)
+    _report_dead_mounts(config, (), slot=plan.slot, slot_type=plan.slot_type)
     if not args.yes:
         payload = _quarantine_payload(plan, action="dry-run", reason=reason)
         if args.format == "json":
@@ -17008,6 +17010,53 @@ def _dead_mount_owner(
     return None
 
 
+def _discover_dead_mounts(
+    config: Config, states: Sequence[ActiveState], acted: Path
+) -> None:
+    """Record dead FUSE entries inside managed storage that no scan hit.
+
+    Some commands never stat another slot's checkout paths, so their
+    recorded findings alone would miss the entry. Every `fuse*` mount
+    point inside a slot root, a recorded checkout, or the acted-on
+    slot is probed once: a live mount answers, a dead one fails with
+    ENOTCONN/EIO and is recorded (#1802).
+    """
+
+    try:
+        entries = _read_self_mount_entries()
+    except Exception:
+        return
+    roots = tuple(_slot_roots(config).values())
+    checkouts: list[Path] = []
+    for state in states:
+        for record in state.slots:
+            for checkout in record.checkouts:
+                try:
+                    checkouts.append(
+                        _stored_path_reference(config, checkout.path, "checkout path")
+                    )
+                except Refusal:
+                    continue
+    for entry in entries:
+        if not entry.fstype.startswith("fuse"):
+            continue
+        point = entry.point
+        if point in _DEAD_MOUNT_FINDINGS.get():
+            continue
+        if not (
+            any(_path_is_within(point, root) for root in roots)
+            or any(_path_is_within(point, checkout) for checkout in checkouts)
+            or _path_is_within(point, acted)
+            or _path_is_within(acted, point)
+        ):
+            continue
+        try:
+            os.lstat(point)
+        except OSError as exc:
+            if exc.errno in _DEAD_MOUNT_ERRNOS:
+                _record_dead_mount(point)
+
+
 def _report_dead_mounts(
     config: Config,
     states: Sequence[ActiveState],
@@ -17024,6 +17073,7 @@ def _report_dead_mounts(
     """
 
     acted = _slot_directory(config, slot, slot_type)
+    _discover_dead_mounts(config, states, acted)
     reported = _DEAD_MOUNT_REPORTED.get()
     for point in _DEAD_MOUNT_FINDINGS.get():
         owner = _dead_mount_owner(config, states, point)
@@ -17044,6 +17094,45 @@ def _report_dead_mounts(
             )
             reported = (*reported, point)
     _DEAD_MOUNT_REPORTED.set(reported)
+
+
+def _report_dead_for_record(
+    config: Config, states: Sequence[ActiveState], record: ActiveRecord
+) -> None:
+    """`_report_dead_mounts` for the record a command acts on (#1802)."""
+
+    _report_dead_mounts(
+        config, states, slot=record.slot, slot_type=record.slot_type
+    )
+
+
+def _report_dead_for_journal(
+    config: Config, states: Sequence[ActiveState], raw: Mapping[str, object]
+) -> None:
+    """`_report_dead_mounts` for the slot a recovery journal names (#1802)."""
+
+    slot = raw.get("slot")
+    if not isinstance(slot, str):
+        embedded = raw.get("record")
+        if isinstance(embedded, Mapping):
+            candidate = embedded.get("slot")
+            slot = candidate if isinstance(candidate, str) else None
+    if not isinstance(slot, str):
+        return
+    for state in states:
+        for record in state.slots:
+            if record.slot == slot:
+                _report_dead_for_record(config, states, record)
+                return
+    slot_type = raw.get("slot_type")
+    _report_dead_mounts(
+        config,
+        states,
+        slot=slot,
+        slot_type=slot_type
+        if isinstance(slot_type, str) and slot_type in SLOT_TYPES
+        else "agent",
+    )
 
 
 def _global_rows(
@@ -29539,6 +29628,7 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
     right before the commit — an owner that appears, or a hold placed,
     while the lock-free rescue ran still refuses, by name.
     """
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     thresholds = _ttl_thresholds(
@@ -29555,6 +29645,7 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
     before = _find_record(
         _load_active_snapshot(config, require_repository=False), args.slot
     )
+    _report_dead_for_record(config, (), before)
     if args.expected_generation is not None and before.generation != args.expected_generation:
         raise Refusal(
             f"slot {args.slot} generation {before.generation} does not match "
@@ -45971,6 +46062,7 @@ def _register_existing(
 def _cmd_register(
     args: argparse.Namespace, *, allow_unregistered_migration_slots: bool = False
 ) -> int:
+    _reset_dead_mount_findings()
     _require_coordinator_authorized(args, "worktree registration")
     args.slot_type = _require_slot_type(args, "worktree registration")
     config = _load_new_slot_config(args, "worktree registration")
@@ -45988,6 +46080,9 @@ def _cmd_register(
             args,
             allowed_unregistered_slot=(args.slot_type, args.slot),
             migration_operation=allow_unregistered_migration_slots,
+        )
+        _report_dead_mounts(
+            config, states, slot=args.slot, slot_type=args.slot_type
         )
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
@@ -46069,6 +46164,7 @@ def _publish_import(
 
 
 def _cmd_import_existing(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     args.slot_type = _require_slot_type(args, "worktree import")
     config = (
         _load_new_slot_config(args, "worktree import --apply")
@@ -46168,6 +46264,9 @@ def _cmd_import_existing(args: argparse.Namespace) -> int:
             args,
             allowed_unregistered_slot=(args.slot_type, args.slot),
             migration_operation=True,
+        )
+        _report_dead_mounts(
+            config, states, slot=args.slot, slot_type=args.slot_type
         )
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
@@ -46269,6 +46368,7 @@ def _assert_owner_auth(
 
 
 def _cmd_adopt(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
@@ -46310,6 +46410,7 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         )
         state = _load_active(config) if local is None else local.active
         record = _find_record(state, args.slot)
+        _report_dead_for_record(config, states, record)
         _expected_generation(record, args.expected_generation)
         if record.agent != args.agent:
             raise Refusal(
@@ -46469,6 +46570,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     generation and records who authorized it.
     """
 
+    _reset_dead_mount_findings()
     reopen = bool(getattr(args, "reopen", False))
     coordinator = None
     reason = str(getattr(args, "reason", "") or "")
@@ -46500,6 +46602,7 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
+        _report_dead_for_record(config, states, record)
         _expected_generation(record, args.expected_generation)
         rename = to_agent is not None and to_agent != record.agent
         if record.agent != args.agent and (to_agent is not None or not reopen):
@@ -46701,6 +46804,7 @@ def _cmd_supersede_handoff(args: argparse.Namespace) -> int:
     handoffs are untouched.
     """
 
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
@@ -46718,6 +46822,7 @@ def _cmd_supersede_handoff(args: argparse.Namespace) -> int:
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
+        _report_dead_for_record(config, states, record)
         _expected_generation(record, args.expected_generation)
         if record.slot_type != "agent":
             raise Refusal(
@@ -46794,6 +46899,7 @@ def _cmd_supersede_handoff(args: argparse.Namespace) -> int:
 
 
 def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     if not args.recovery_note.strip():
@@ -46811,6 +46917,7 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
         before = _global_rows(states, archives)
         state = _load_active(config)
         record = _find_record(state, args.slot)
+        _report_dead_for_record(config, states, record)
         _expected_generation(record, args.expected_generation)
         _assert_caller_process(coordinator, "coordinator")
         if record.owner is not None:
@@ -47427,6 +47534,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
     and the heartbeat time-to-live.
     """
 
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
@@ -47437,6 +47545,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
         states, archives = _validate_global_state(config)
         state = _load_active(config)
         record = _find_record(state, args.slot)
+        _report_dead_for_record(config, states, record)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         if record.slot_type != "agent":
             raise Refusal(
@@ -47572,6 +47681,7 @@ def _cmd_release(args: argparse.Namespace) -> int:
 
 
 def _cmd_hold(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     reason = args.reason.strip()
@@ -47583,6 +47693,7 @@ def _cmd_hold(args: argparse.Namespace) -> int:
         states, _archives = _validate_global_state(config)
         _assert_command_registry_storage(config, states, args)
         record = _find_record(_load_active(config), args.slot)
+        _report_dead_for_record(config, states, record)
         path = _hold_path(config, record.slot, record.machine)
         existing = _load_hold(config, record.slot, record.machine)
         if existing is not None:
@@ -47629,6 +47740,7 @@ def _record_storage_absent(config: Config, record: ActiveRecord) -> bool:
 
 
 def _cmd_unhold(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     with _mutation_locks(config, args.wait_lock):
@@ -47657,6 +47769,7 @@ def _cmd_unhold(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         record = _find_record(_load_active(config), args.slot)
+        _report_dead_for_record(config, states, record)
         path = _hold_path(config, record.slot, record.machine)
         if _load_hold(config, record.slot, record.machine) is None:
             raise Refusal(f"slot {record.slot} is not held")
@@ -47762,6 +47875,7 @@ def _refuse_absent_slot_without_sidecar(
 def _cmd_adopt_checkout(args: argparse.Namespace) -> int:
     """Declare a nested linked worktree of another repository (#1400)."""
 
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     name, separator, raw_path = str(args.repo).partition("=")
@@ -47785,6 +47899,7 @@ def _cmd_adopt_checkout(args: argparse.Namespace) -> int:
         states, _archives = _validate_global_state(config, require_repository=False)
         state = _load_active(config, require_repository=False)
         record = _find_record(state, args.slot)
+        _report_dead_for_record(config, states, record)
         _expected_generation(record, args.expected_generation)
         if record.slot_type != "agent":
             raise Refusal("--repo applies only to an agent slot")
@@ -47878,6 +47993,7 @@ def _cmd_adopt_checkout(args: argparse.Namespace) -> int:
 
 
 def _cmd_read_handoff(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     reader = _capture_caller_process(args.coordinator_pid, "coordinator")
@@ -47896,6 +48012,7 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
     )
     pre_state = _load_active(config, require_repository=False)
     pre_record = _find_record(pre_state, args.slot)
+    _report_dead_for_record(config, pre_states, pre_record)
     pre_events = _load_events(config, pre_record.machine)
     # _assert_no_journal's event-log load is the slow read the production
     # dumps show; it runs here, lock-free. Under the lock only the cheap
@@ -48113,6 +48230,7 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
 
 
 def _cmd_write_handoff(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
@@ -48136,6 +48254,7 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
         record = _find_record(
             _load_active(config, require_repository=False), args.slot
         )
+        _report_dead_for_record(config, states, record)
         if record.slot_type != "agent":
             raise Refusal("validation slots cannot carry agent handoffs")
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
@@ -56190,12 +56309,14 @@ def _cmd_share_submodules(args: argparse.Namespace) -> int:
     a dirty or on-branch submodule, and any tip it cannot transfer.
     """
 
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     vcs = _GitVcs()
 
     def run() -> int:
         record = _find_record(_load_active(config), args.slot)
+        _report_dead_for_record(config, (), record)
         if args.apply:
             hold = _load_hold(config, record.slot, record.machine)
             if hold is not None:
@@ -63700,6 +63821,7 @@ def _prepared_finish_accounting_current(
 
 
 def _cmd_finish(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
@@ -63730,6 +63852,7 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _assert_record_actable(record, "finish")
+        _report_dead_for_record(config, states, record)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         _assert_validate_batch_seals_disjoint_from_record(
             config, record, action="finish"
@@ -64968,6 +65091,7 @@ def _cmd_remove(
     emit: bool = True,
     agent_batch: _AgentRemoveBatchContext | None = None,
 ) -> int:
+    _reset_dead_mount_findings()
     if (
         private_cleanup is None
         and agent_batch is None
@@ -65841,6 +65965,7 @@ def _cmd_remove_in_scope(
             state = _load_active(config, require_repository=False)
             record = _find_record(state, args.slot)
             _assert_record_actable(record, "remove")
+            _report_dead_for_record(config, states, record)
             _expected_generation(record, args.expected_generation)
             if (
                 agent_batch is not None
@@ -66475,6 +66600,7 @@ def _seal_validate_batch_targets(
                 state for state in states if state.machine == config.machine
             )
             selected_record = _find_record(selected_state, selected_slot)
+            _report_dead_for_record(config, states, selected_record)
             _expected_generation(selected_record, selected_generation)
             create_rows = _classify_disjoint_create_journals_for_record(
                 config, states, archives, selected_record
@@ -93466,6 +93592,7 @@ def _cmd_recover(
     ownerless_batch_cleanup: _OwnerlessValidationBatchContext | None = None,
     emit: bool = True,
 ) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     coordinator, runner, handoff_writer, proof_fd = _capture_remove_processes(
         args.coordinator_pid
@@ -93948,6 +94075,7 @@ def _cmd_recover(
             )
         else:
             states, archives = _validate_global_state(config)
+        _report_dead_for_journal(config, states, raw)
         before = _global_rows(states, archives)
         state = _load_active(
             config, require_repository=kind != "finish"

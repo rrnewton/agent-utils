@@ -52,6 +52,7 @@ pub(crate) fn release_slot(
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state_allow_seals(&cfg.control)?;
     validate_global(root, &cfg)?;
+    crate::hold_write::report_dead_findings(root, slot)?;
     let active = active_document(root, &cfg, &selected)?;
     let record = active
         .get("slots")

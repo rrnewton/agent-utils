@@ -729,6 +729,7 @@ pub(crate) fn hold_slot(
     }
     validate_global(root, &cfg)?;
     refuse_target_storage(root, slot)?;
+    report_dead_findings(root, slot)?;
     let active = active_document(root, &cfg, &selected)?;
     let record = active
         .get("slots")
@@ -879,6 +880,9 @@ pub(crate) fn unhold_slot(
             }
             _ => return Err(error),
         }
+    }
+    if !storage_absent_note {
+        report_dead_findings(root, slot)?;
     }
     let record =
         record.ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;

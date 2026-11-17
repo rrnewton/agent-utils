@@ -236,6 +236,7 @@ pub(crate) fn transfer_owner(
     }
     validate_global(root, &cfg)?;
     let nested = refuse_target_storage_except_nested(root, slot)?;
+    crate::hold_write::report_dead_findings(root, slot)?;
     let active = active_document(root, &cfg, &selected)?;
     let record = active
         .get("slots")

@@ -359,6 +359,7 @@ pub(crate) fn register_slot(
         }
     }
     validate_global(root, &cfg)?;
+    crate::hold_write::report_dead_findings(root, slot)?;
     // The slot and agent must be free on every machine (Python
     // `_assert_agent_and_slot_free`, including the active-slot cap).
     let ttl = config
@@ -525,6 +526,13 @@ pub(crate) fn register_slot(
     checkouts.sort_by(|left, right| left.name.cmp(&right.name));
     // Slot contents (Python `_assert_slot_contents`).
     let slot_dir = slot_directory(&cfg, slot, &slot_type)?;
+    if let Some(point) = crate::storage_state::dead_mount_at(&slot_dir) {
+        return Err(format!(
+            "{}; it lies in slot {slot}, the slot this command acts on, so the command refuses and nothing was changed\nremedy: {}",
+            crate::storage_state::dead_mount_detail(&point, Some(slot)),
+            crate::storage_state::dead_mount_remedy(&point)
+        ));
+    }
     let slot_metadata = slot_dir.symlink_metadata();
     if slot_metadata
         .map(|meta| !meta.is_dir() || meta.file_type().is_symlink())

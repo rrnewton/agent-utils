@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import os
 import subprocess
@@ -24,7 +25,6 @@ from pathlib import Path
 import pytest
 from wrkslots import cli, slotimage
 
-DIGEST = "b" * 64
 DEAD_ERRNOS = [errno.ENOTCONN, errno.EIO]
 
 
@@ -68,7 +68,9 @@ def _identity() -> dict[str, object]:
     }
 
 
-def _record(slot: str, agent: str, branch: str, head: str) -> dict[str, object]:
+def _record(
+    slot: str, agent: str, branch: str, head: str, digest: str
+) -> dict[str, object]:
     identity = _identity()
     return {
         "slot": slot, "agent": agent, "task": "do work", "purpose": "testing",
@@ -79,7 +81,7 @@ def _record(slot: str, agent: str, branch: str, head: str) -> dict[str, object]:
         "checkouts": [{
             "name": "repo", "path": f"worktrees/{slot}/repo",
             "repository": "../upstream-repo", "branch": branch, "start_point": head,
-            "remote": "origin", "remote_url_sha256": DIGEST,
+            "remote": "origin", "remote_url_sha256": digest,
             "landed_ref": "refs/remotes/origin/main", "head": head,
             "containing_remote_refs": ["refs/remotes/origin/main"], "vcs": "git",
         }],
@@ -106,9 +108,10 @@ def _fixture(base: Path) -> Path:
             upstream, "worktree", "add", "-q", "-b", branch,
             str(root / "worktrees" / slot / "repo"), "HEAD",
         )
+    digest = hashlib.sha256(str(upstream).encode("utf-8")).hexdigest()
     records = [
-        _record("slot-a", "agent-slot-a", "suite/work-a", head),
-        _record("slot-b", "agent-slot-b", "suite/work-b", head),
+        _record("slot-a", "agent-slot-a", "suite/work-a", head, digest),
+        _record("slot-b", "agent-slot-b", "suite/work-b", head, digest),
     ]
     (root / "worktrees" / "ACTIVE.node-a.json").write_text(
         json.dumps({"schema": 2, "machine": "node-a", "revision": 7, "slots": records})
@@ -275,6 +278,62 @@ def test_classify_refuses_for_its_own_slots_dead_entry(
 
     with pytest.raises(cli.Refusal, match=r"dead FUSE entry at .* owning slot slot-b"):
         _classify(root, "slot-b", "agent-slot-b")
+
+
+def _expire_owners(root: Path) -> None:
+    """Mark every recorded owner as a dead, TTL-expired generation."""
+
+    path = root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(path.read_text())
+    for record in document["slots"]:
+        record["owner"]["boot_id"] = "finished-boot"
+        record["owner"]["cgroup_path"] = "/wrkslots-test-finished"
+        record["heartbeat_at"] = "2026-10-26T00:00:00Z"
+    path.write_text(json.dumps(document))
+
+
+def _remove(root: Path, slot: str) -> int:
+    return cli._cmd_remove(
+        argparse.Namespace(
+            project_root=str(root), machine=None, slot=slot,
+            coordinator_pid=os.getpid(), expected_generation=1,
+            coordinator_authorized=True, validate_complete=False,
+            salvage_archive_root=None, wait_lock=0.0,
+        )
+    )
+
+
+def _active_slots(root: Path) -> set[str]:
+    document = json.loads((root / "worktrees" / "ACTIVE.node-a.json").read_text())
+    return {record["slot"] for record in document["slots"]}
+
+
+def test_remove_refuses_the_slot_holding_a_dead_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fixture(tmp_path)
+    _expire_owners(root)
+    dead = root / "worktrees" / "slot-b" / "repo"
+    _kill(monkeypatch, tmp_path, [dead], errno.ENOTCONN)
+
+    with pytest.raises(cli.Refusal, match=r"dead FUSE entry at .* owning slot slot-b"):
+        _remove(root, "slot-b")
+
+    assert _active_slots(root) == {"slot-a", "slot-b"}
+
+
+def test_remove_proceeds_for_another_slot_with_a_dead_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _fixture(tmp_path)
+    _expire_owners(root)
+    dead = root / "worktrees" / "slot-b" / "repo"
+    _kill(monkeypatch, tmp_path, [dead], errno.ENOTCONN)
+
+    assert _remove(root, "slot-a") == 0
+
+    assert f"dead FUSE entry at {dead}, owning slot slot-b" in capsys.readouterr().err
+    assert _active_slots(root) == {"slot-b"}
 
 
 def test_storage_census_reports_the_dead_entry_for_its_owning_slot(

@@ -250,6 +250,7 @@ pub(crate) fn adopt_slot(
     };
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
+    crate::hold_write::report_dead_findings(root, slot)?;
     let journals = parse_journals(root)?;
     if let Some(names) = journals.get("journals").and_then(Value::as_array) {
         if let Some(first) = names.first().and_then(Value::as_str) {

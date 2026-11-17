@@ -2604,6 +2604,7 @@ pub(crate) fn finish_slot(
     validate_name(&selected, "machine")?;
     validate_name(slot, "slot")?;
     validate_name(agent, "agent")?;
+    crate::hold_write::report_dead_findings(root, slot)?;
     if validation.is_empty() || validation.iter().any(|item| item.trim().is_empty()) {
         return Err("finish requires at least one non-empty --validation entry".to_string());
     }

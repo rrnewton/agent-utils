@@ -4870,6 +4870,7 @@ pub(crate) fn remove_slot(
     crate::freeze::assert_not_frozen(&cfg, &config, "remove")?;
     validate_name(&selected, "machine")?;
     validate_name(slot, "slot")?;
+    crate::hold_write::report_dead_findings(root, slot)?;
     let coordinator = read_process_identity(coordinator_pid)?;
     assert_caller(&coordinator, "coordinator")?;
     // Validate and plan with no lock held (#1287); the locked section
