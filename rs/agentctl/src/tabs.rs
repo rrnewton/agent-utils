@@ -28,6 +28,8 @@ pub struct PaneFacts {
     pub composer_text: bool,
     /// Foreground process display name, for listings.
     pub foreground: String,
+    /// The pane's working directory, when known.
+    pub cwd: String,
 }
 
 /// Observed facts about one registered agent.
@@ -43,6 +45,8 @@ pub struct AgentFacts {
     pub lifecycle: String,
     /// Whether it runs headless (no pane of its own).
     pub headless: bool,
+    /// Its recorded working directory.
+    pub cwd: String,
     /// The pinned process is proven live as the pane's foreground process.
     pub live_proven: bool,
 }
@@ -119,24 +123,44 @@ pub fn composer_holds_text(screen: &str) -> bool {
     !matches!(line.chars().last(), Some('$' | '#' | '%' | '>' | '❯' | '»'))
 }
 
+/// Whether two directories are the same or nested either way: the only
+/// corroboration, beyond an exact name match, that ties an unclaimed pane
+/// to a registered agent (its recorded cwd, a parent of it, or inside it).
+fn cwd_related(left: &str, right: &str) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && (left == right
+            || left.starts_with(&format!("{right}/"))
+            || right.starts_with(&format!("{left}/")))
+}
+
+/// The registered agent a pane duplicates: its tab label is the agent's
+/// name AND its cwd is related to the agent's recorded cwd. A label alone
+/// never does (#1793 check (1)): an owner's own shell tab that merely
+/// shares a label, in an unrelated directory, is not a duplicate.
+#[must_use]
+pub fn duplicate_of<'a>(pane: &PaneFacts, agents: &'a [AgentFacts]) -> Option<&'a AgentFacts> {
+    let label = pane.label.as_deref()?;
+    agents
+        .iter()
+        .find(|agent| agent.name == label && cwd_related(&pane.cwd, &agent.cwd))
+}
+
 /// Workspaces this registry manages: holding a claimed pane, a named viewer
-/// tab, or a pane whose tab label names a registered agent (a duplicate).
+/// tab, or a corroborated duplicate pane (name + cwd, never label alone).
 #[must_use]
 pub fn managed_workspaces(
     panes: &[PaneFacts],
     claimed_panes: &BTreeSet<String>,
     viewer_tabs: &BTreeSet<String>,
-    names: &BTreeSet<String>,
+    agents: &[AgentFacts],
 ) -> BTreeSet<String> {
     panes
         .iter()
         .filter(|pane| {
             claimed_panes.contains(&pane.pane_id)
                 || viewer_tabs.contains(&pane.tab_id)
-                || pane
-                    .label
-                    .as_deref()
-                    .is_some_and(|label| names.contains(label))
+                || duplicate_of(pane, agents).is_some()
         })
         .map(|pane| pane.workspace_id.clone())
         .collect()
@@ -156,13 +180,12 @@ pub fn plan(
     grace_seconds: f64,
     viewer_workspace: Option<&str>,
 ) -> (Vec<TabRow>, Vec<TabAction>) {
-    let names: BTreeSet<String> = agents.iter().map(|agent| agent.name.clone()).collect();
     let claimed_panes: BTreeSet<String> = agents.iter().filter_map(|a| a.pane_id.clone()).collect();
     let viewer_tabs: BTreeSet<String> = agents
         .iter()
         .filter_map(|a| a.viewer_tab_id.clone())
         .collect();
-    let managed = managed_workspaces(panes, &claimed_panes, &viewer_tabs, &names);
+    let managed = managed_workspaces(panes, &claimed_panes, &viewer_tabs, agents);
     let by_pane: BTreeMap<&str, &AgentFacts> = agents
         .iter()
         .filter_map(|a| Some((a.pane_id.as_deref()?, a)))
@@ -184,11 +207,8 @@ pub fn plan(
         if !managed.contains(&pane.workspace_id) {
             verdict = "keep (unmanaged workspace)".to_owned();
         } else if owner.is_none() {
-            // Unclaimed: a duplicate when the label names an agent, else a bare shell.
-            let duplicate = pane
-                .label
-                .as_deref()
-                .is_some_and(|label| names.contains(label));
+            // Unclaimed: a duplicate only with name+cwd corroboration.
+            let duplicate = duplicate_of(pane, agents).is_some();
             if !pane.idle_shell {
                 verdict = "keep (foreground process)".to_owned();
             } else if pane.composer_text {
@@ -291,6 +311,7 @@ mod tests {
             idle_shell: idle,
             composer_text: composer,
             foreground: if idle { "bash".into() } else { "muse".into() },
+            cwd: "/work/slot".into(),
         }
     }
     fn agent(name: &str, pane: Option<&str>) -> AgentFacts {
@@ -300,6 +321,7 @@ mod tests {
             viewer_tab_id: None,
             lifecycle: "running".into(),
             headless: false,
+            cwd: "/work/slot".into(),
             live_proven: pane.is_some(),
         }
     }
@@ -374,6 +396,37 @@ mod tests {
             None,
         );
         assert!(actions.is_empty(), "within grace: {actions:?}");
+    }
+
+    #[test]
+    fn a_label_alone_never_makes_a_duplicate() {
+        // #1793 check (1): an owner's own shell whose tab merely shares an
+        // agent's name, in an unrelated directory, is never cultivated.
+        let mut foreign = pane("w9:p1", "w9:t1", "w9", "agent-a", true, false);
+        foreign.cwd = "/elsewhere".into();
+        let panes = vec![
+            pane("w1:p1", "w1:t1", "w1", "agent-a", false, false),
+            foreign,
+        ];
+        let agents = vec![agent("agent-a", Some("w1:p1"))];
+        let order: Vec<(String, String)> = panes
+            .iter()
+            .map(|p| (p.workspace_id.clone(), p.tab_id.clone()))
+            .collect();
+        let (rows, actions) = plan(
+            &panes,
+            &order,
+            &agents,
+            &since("w9:p1", 0.0),
+            10_000.0,
+            600.0,
+            None,
+        );
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(rows
+            .iter()
+            .find(|r| r.tab_id == "w9:t1")
+            .is_some_and(|r| r.verdict.contains("unmanaged")));
     }
 
     #[test]

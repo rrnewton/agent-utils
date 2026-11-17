@@ -4594,6 +4594,10 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
     let pane_facts: Vec<crate::tabs::PaneFacts> = panes
         .iter()
         .map(|pane| crate::tabs::PaneFacts {
+            cwd: client
+                .pane_info(&pane.pane_id)
+                .map(|info| info.cwd)
+                .unwrap_or_default(),
             pane_id: pane.pane_id.clone(),
             tab_id: pane.tab_id.clone(),
             workspace_id: pane.workspace_id.clone(),
@@ -4611,6 +4615,7 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
         .filter_map(|name| {
             let status = manager.status(name).ok()?;
             Some(crate::tabs::AgentFacts {
+                cwd: status["cwd"].as_str().unwrap_or_default().to_owned(),
                 name: name.clone(),
                 pane_id: status["pane_id"].as_str().map(str::to_owned),
                 viewer_tab_id: status["viewer_tab_id"].as_str().map(str::to_owned),
@@ -4740,12 +4745,30 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
         }
         labels
     };
-    let name_set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+    let agent_facts_early: Vec<crate::tabs::AgentFacts> = names
+        .iter()
+        .filter_map(|name| {
+            let status = manager.status(name).ok()?;
+            Some(crate::tabs::AgentFacts {
+                name: name.clone(),
+                pane_id: status["pane_id"].as_str().map(str::to_owned),
+                viewer_tab_id: status["viewer_tab_id"].as_str().map(str::to_owned),
+                lifecycle: status["lifecycle"].as_str().unwrap_or_default().to_owned(),
+                headless: status["mode"].as_str() == Some("headless"),
+                cwd: status["cwd"].as_str().unwrap_or_default().to_owned(),
+                live_proven: false,
+            })
+        })
+        .collect();
     let claimed_set: std::collections::BTreeSet<String> = claimed.keys().cloned().collect();
     let viewer_set: std::collections::BTreeSet<String> = viewer_tabs.keys().cloned().collect();
     let pane_facts: Vec<crate::tabs::PaneFacts> = panes
         .iter()
         .map(|pane| crate::tabs::PaneFacts {
+            cwd: client
+                .pane_info(&pane.pane_id)
+                .map(|info| info.cwd)
+                .unwrap_or_default(),
             pane_id: pane.pane_id.clone(),
             tab_id: pane.tab_id.clone(),
             workspace_id: pane.workspace_id.clone(),
@@ -4764,7 +4787,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
         })
         .collect();
     let managed_workspaces =
-        crate::tabs::managed_workspaces(&pane_facts, &claimed_set, &viewer_set, &name_set);
+        crate::tabs::managed_workspaces(&pane_facts, &claimed_set, &viewer_set, &agent_facts_early);
     // Canonical tab order, through the Herdr socket when reachable.
     if let Some(socket) = crate::tab_order::socket_path().filter(|path| path.exists()) {
         for workspace in &managed_workspaces {
@@ -4820,13 +4843,21 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                     )
                     .ok()
                 });
-            let live_proven = status["pane_id"]
-                .as_str()
-                .is_some_and(|pane| panes.iter().any(|candidate| candidate.pane_id == pane))
-                && identity.as_ref().is_some_and(|identity| {
-                    client.process_liveness(identity) == crate::client::ProcessLiveness::Alive
-                });
+            // Promotion proof (#1793 check (2)): the recorded pane is live,
+            // its foreground is not a bare shell, Herdr recognises an agent
+            // in it, and the recorded process identity is alive in the
+            // kernel (pid + start time + executable). A label never promotes.
+            let live_proven = status["pane_id"].as_str().is_some_and(|pane| {
+                panes.iter().any(|candidate| candidate.pane_id == pane)
+                    && !client.pane_is_idle_shell(pane).unwrap_or(true)
+                    && client
+                        .pane_info(pane)
+                        .is_ok_and(|info| info.agent.is_some())
+            }) && identity.as_ref().is_some_and(|identity| {
+                client.process_liveness(identity) == crate::client::ProcessLiveness::Alive
+            });
             Some(crate::tabs::AgentFacts {
+                cwd: status["cwd"].as_str().unwrap_or_default().to_owned(),
                 name: name.clone(),
                 pane_id: status["pane_id"].as_str().map(str::to_owned),
                 viewer_tab_id: status["viewer_tab_id"].as_str().map(str::to_owned),
