@@ -1464,23 +1464,34 @@ def test_batch_refusal_after_a_deletion_keeps_its_seal(
     paths = prepare_dead_validate_slots(project, ("first", "second"))
     config = wrkslots._load_config(str(project), "testhost")
     stub_validate_batch_censuses(monkeypatch)
-    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
     seal = wrkslots._validate_batch_seal_journal_path(config)
 
-    calls: list[int] = []
+    def unused(path: object, *_a: object, **_k: object) -> None:
+        if "second" in str(path):
+            raise wrkslots.Refusal("second is in use")
 
-    def fresh_census(paths: object, **_kwargs: object) -> object:
-        calls.append(1)
-        if len(calls) == 1:
-            # The first item deletes under the starting configuration;
-            # the change then strands the batch's cleanup lock.
-            update_configuration(project, heartbeat_ttl_seconds=999)
-            return wrkslots._ProcessPathCensus((), ())
-        raise wrkslots.Refusal("fresh census unavailable")
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", unused)
 
-    monkeypatch.setattr(
-        wrkslots, "_capture_same_uid_process_path_census", fresh_census
-    )
+    deleted: list[bool] = []
+    real_state_update = wrkslots._finish_state_update
+
+    def state_update(*args: object, **kwargs: object) -> object:
+        result = real_state_update(*args, **kwargs)  # type: ignore[arg-type]
+        deleted.append(True)
+        return result
+
+    monkeypatch.setattr(wrkslots, "_finish_state_update", state_update)
+
+    real_locks = wrkslots._mutation_locks
+
+    def locks(config_: object, wait: float, **kwargs: object) -> object:
+        if deleted:
+            raise wrkslots.Refusal(
+                "configuration changed while this command was starting"
+            )
+        return real_locks(config_, wait, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", locks)
 
     result = wrkslots.main(
         [
