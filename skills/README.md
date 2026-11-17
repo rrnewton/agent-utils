@@ -41,6 +41,7 @@ copying its manual.
   reporting what changed unread, what is in flight, and what awaits the owner's decision,
   without repeating what the owner already marked Done.
 - `tick-hub` — evaluate recurring reminders and health checks from one scheduled tick.
+- `local-ci-hub` — run validation under host-wide admission and read its ledger and receipt.
 - `dagrun` — schedule a dependency graph under CPU, memory, and named-resource limits.
 - `cpuset-alloc` — reserve disjoint host CPU sets with stale-owner reclamation.
 - `parallel-experiment-runner` — run boxed, resource-bounded concurrent seed sweeps.

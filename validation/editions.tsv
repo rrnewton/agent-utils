@@ -15,4 +15,4 @@ wrkvizd	rust	absent
 agent-teams	rust	absent	
 agent-usage	rust	absent	
 gh-paced	rust	absent	
-local-ci-hub	python	absent	
+local-ci-hub	python	paused	f04187977b2164062a557d97f4e45bddfaf57cfa

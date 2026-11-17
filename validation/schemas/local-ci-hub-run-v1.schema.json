@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunHandle",
+  "description": "One run handle record (`local-ci-hub/run/v1`).",
+  "type": "object",
+  "properties": {
+    "cell": {
+      "description": "Cell or profile name, empty when unscoped.",
+      "type": "string",
+      "default": ""
+    },
+    "cleanup": {
+      "description": "Cleanup track; verdicts never wait on it.",
+      "$ref": "#/$defs/CleanupState",
+      "default": "none"
+    },
+    "commit": {
+      "description": "Exact commit the run validates (or names, when refused).",
+      "type": "string"
+    },
+    "exit_code": {
+      "description": "Component exit code once terminal, when recorded.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "host_limits_path": {
+      "description": "Host-limits file consulted for admission, when recorded.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "outcome": {
+      "description": "Ledger outcome spelling once terminal, when recorded.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_id": {
+      "description": "Run identity, unique per admitted run.",
+      "type": "string"
+    },
+    "schema": {
+      "description": "Schema tag; always `local-ci-hub/run/v1`.",
+      "type": "string"
+    },
+    "started_at": {
+      "description": "Start time as an ISO-8601 timestamp, when recorded.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "description": "Verdict lifecycle state.",
+      "$ref": "#/$defs/RunState"
+    }
+  },
+  "required": [
+    "schema",
+    "run_id",
+    "commit",
+    "state"
+  ],
+  "$defs": {
+    "CleanupState": {
+      "description": "Cleanup track of one run, orthogonal to the verdict state.",
+      "oneOf": [
+        {
+          "description": "Deletion has not been attempted or is not owed.",
+          "type": "string",
+          "const": "none"
+        },
+        {
+          "description": "Deletion was attempted and is incomplete; journaled debt.",
+          "type": "string",
+          "const": "pending"
+        },
+        {
+          "description": "The checkout is deleted (or never existed).",
+          "type": "string",
+          "const": "done"
+        }
+      ]
+    },
+    "RunState": {
+      "description": "Verdict lifecycle of one run, in wire spelling.\n\n`Finished`, `Stopped` and `Stale` are the pre-lifecycle spellings\nthe Python prototype already writes; new writers use the\nlifecycle states and must not invent further spellings.",
+      "oneOf": [
+        {
+          "description": "Admitted; no checkout exists yet.",
+          "type": "string",
+          "const": "admitted"
+        },
+        {
+          "description": "The checkout is being materialized.",
+          "type": "string",
+          "const": "materializing"
+        },
+        {
+          "description": "The validator is running.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "Evidence is being extracted from the checkout.",
+          "type": "string",
+          "const": "extracting"
+        },
+        {
+          "description": "The terminal record is being written; terminal at write.",
+          "type": "string",
+          "const": "recording"
+        },
+        {
+          "description": "Terminal: tests passed.",
+          "type": "string",
+          "const": "passed"
+        },
+        {
+          "description": "Terminal: tests failed or a CPU-budget breach timed out.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "Terminal: no result was produced; never evidence of green.",
+          "type": "string",
+          "const": "could-not-run"
+        },
+        {
+          "description": "Terminal at admission: refused, no checkout, no failure row.",
+          "type": "string",
+          "const": "refused"
+        },
+        {
+          "description": "Legacy terminal spelling (pre-lifecycle writers).",
+          "type": "string",
+          "const": "finished"
+        },
+        {
+          "description": "Legacy stopped spelling (pre-lifecycle writers).",
+          "type": "string",
+          "const": "stopped"
+        },
+        {
+          "description": "Legacy reaped spelling (pre-lifecycle writers).",
+          "type": "string",
+          "const": "stale"
+        }
+      ]
+    }
+  }
+}

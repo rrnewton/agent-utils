@@ -218,12 +218,13 @@
       "primary": "python",
       "mirror": {
         "edition": "rust",
-        "state": "absent"
+        "state": "paused",
+        "paused_at": "f04187977b2164062a557d97f4e45bddfaf57cfa"
       },
       "parity_check": null,
       "rust_entrypoint": null,
       "python_entrypoint": "py/bin/local-ci-hub",
-      "note": "Python-only; delegates canonical digest to a configured external command when present."
+      "note": "Python primary. The Rust crate is the ledger read core (typed events, one fold, one predicate) plus the run-handle schema type; it has no tracked entrypoint yet, so the mirror is paused, not absent."
     }
   ],
   "formats": [
@@ -424,6 +425,15 @@
       "generated_schema": null,
       "duplicate": "no",
       "collapse": "none"
+    },
+    {
+      "name": "local-ci-hub run handle",
+      "schema_id": "local-ci-hub/run/v1 (generated JSON Schema, draft 2020-12)",
+      "rust_definition": "rs/local-ci-hub/src/run_handle.rs (RunHandle, RunState, CleanupState)",
+      "python_definition": "py/local_ci_hub/runner.py writes handle dicts; py/tests/test_local_ci_hub.py validates samples against the generated schema",
+      "generated_schema": "validation/schemas/local-ci-hub-run-v1.schema.json",
+      "duplicate": "collapsed: one Rust type generates the schema; Python validates in tests instead of hand-maintaining a second definition",
+      "collapse": "Done in step 2a: schemars type in rs/local-ci-hub generates the schema; scripts/check_local_ci_hub_schemas.py regenerates and diffs in validation. Handle states cover the checkout lifecycle so its writers add no version bump."
     }
   ]
 }

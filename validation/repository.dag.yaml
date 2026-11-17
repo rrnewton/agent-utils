@@ -97,6 +97,20 @@ steps:
       rss_baseline_bytes: 1073741824
 
   - group: hygiene
+    job: local-ci-hub-schemas
+    desc: generated run-handle schema matches its Rust type
+    cmd: python3 scripts/check_local_ci_hub_schemas.py
+    jobs_flag: ""
+    labels: [validation-hygiene]
+    timeout: 9600
+    cpu_timeout: 1200
+    hint:
+      resources: {cargo-target: 1}
+      est_duration_s: 60
+      classification: cpu-bound
+      rss_baseline_bytes: 1073741824
+
+  - group: hygiene
     job: agent-queue-schemas
     desc: generated agent-queue schemas match their Rust types
     cmd: python3 scripts/check_agent_queue_schemas.py

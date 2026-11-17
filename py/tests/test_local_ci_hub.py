@@ -340,6 +340,30 @@ def test_run_sweep_clears_cleanup_pending(tmp_path: Path) -> None:
     assert not (runs / "run-old.json").exists()
 
 
+def test_run_handles_match_registered_schema() -> None:
+    schema_path = Path(__file__).resolve().parents[2] / "validation" / "schemas" / "local-ci-hub-run-v1.schema.json"
+    schema = json.loads(schema_path.read_text())
+    states = {v["const"] for v in schema["$defs"]["RunState"]["oneOf"]}
+    cleanups = {v["const"] for v in schema["$defs"]["CleanupState"]["oneOf"]}
+    assert schema["title"] == "RunHandle"
+    for required in ("schema", "run_id", "commit", "state"):
+        assert required in schema["required"]
+    samples = [
+        {"schema": "local-ci-hub/run/v1", "run_id": "run-1", "commit": "a" * 40,
+         "cell": "", "state": "running"},
+        {"schema": "local-ci-hub/run/v1", "run_id": "run-2", "commit": "b" * 40,
+         "cell": "full", "state": "passed", "cleanup": "done", "outcome": "pass", "exit_code": 0},
+        {"schema": "local-ci-hub/run/v1", "run_id": "run-3", "commit": "c" * 40,
+         "cell": "", "state": "could-not-run", "cleanup": "pending",
+         "outcome": "no_result", "exit_code": 75},
+        {"schema": "local-ci-hub/run/v1", "run_id": "run-4", "commit": "d" * 40,
+         "cell": "", "state": "finished"},  # legacy spelling stays valid
+    ]
+    for handle in samples:
+        assert handle["state"] in states and handle.get("cleanup", "none") in cleanups
+        assert handle["schema"] == "local-ci-hub/run/v1"
+
+
 def test_land_run_executes_under_lock(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     r = run_cli(repo, "land", "run", "--holder", "a", "--", "/bin/sh", "-c", "echo landed > landed.txt")

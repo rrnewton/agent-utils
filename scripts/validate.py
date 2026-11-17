@@ -271,6 +271,7 @@ PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
     # Their own group is always-on, so naming them here only stops them reading as unclassified.
     ("scripts/check_editions.py", frozenset()),
     ("scripts/check_agent_queue_schemas.py", frozenset()),
+    ("scripts/check_local_ci_hub_schemas.py", frozenset()),
     ("scripts/check_wrkslots_schemas.py", frozenset()),
     ("scripts/check_wrkviz_schemas.py", frozenset()),
     ("scripts/check_rust_only.py", frozenset()),
