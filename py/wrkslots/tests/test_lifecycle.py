@@ -66946,3 +66946,38 @@ def test_recover_tail_event_requires_authorization(tmp_path: Path) -> None:
     assert refused.returncode == 3
     assert "--coordinator-authorized" in refused.stderr
     assert _rba_listing(project) == listing
+
+
+def test_containing_refs_sidecar_round_trip(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    refs = [f"refs/remotes/origin/agent/branch-{index}" for index in range(5000)]
+    holder: dict[str, object] = {"containing_remote_refs": list(refs)}
+    wrkslots._sidecar_containing_refs(config, holder)
+    assert len(holder["containing_remote_refs"]) == 64  # type: ignore[arg-type]
+    reference = holder["containing_remote_refs_sidecar"]  # type: ignore[index]
+    assert isinstance(reference, dict)
+    assert reference["count"] == 5000
+    sidecar = config.control / str(reference["path"])
+    assert sidecar.is_file()
+    assert len(json.dumps(holder)) < len(json.dumps({"r": refs})) // 10
+    wrkslots._expand_containing_refs_sidecar(config, holder, "test holder")
+    assert holder["containing_remote_refs"] == refs
+    assert "containing_remote_refs_sidecar" not in holder
+
+
+def test_containing_refs_sidecar_missing_refuses_naming_digest(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    config = wrkslots._load_config(str(project), "testhost")
+    refs = [f"refs/remotes/origin/agent/branch-{index}" for index in range(5000)]
+    holder: dict[str, object] = {"containing_remote_refs": list(refs)}
+    wrkslots._sidecar_containing_refs(config, holder)
+    reference = holder["containing_remote_refs_sidecar"]  # type: ignore[index]
+    assert isinstance(reference, dict)
+    digest = str(reference["sha256"])
+    (config.control / str(reference["path"])).unlink()
+    with pytest.raises(wrkslots.StateError) as caught:
+        wrkslots._expand_containing_refs_sidecar(config, holder, "test holder")
+    assert digest in str(caught.value)

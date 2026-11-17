@@ -10660,6 +10660,25 @@ def _write_journal(
         _ensure_event_log(config)
     writer = event_writer or _event_writer(config, config.machine)
     selected_path = journal_path or _journal_path(config)
+    if payload.get("kind") == "finish":
+        # Shrink every finish-journal write (#1757): side files are
+        # written and fsynced by the transform, before the event and the
+        # journal that reference them. The event copy shrinks identically
+        # so provenance comparisons keep matching the file.
+        shrunk = json.loads(json.dumps(payload))
+        shrunk_record = shrunk.get("record")
+        if isinstance(shrunk_record, dict):
+            shrunk_checkouts = shrunk_record.get("checkouts")
+            if isinstance(shrunk_checkouts, list):
+                for checkout_obj in shrunk_checkouts:
+                    if isinstance(checkout_obj, dict):
+                        _sidecar_containing_refs(config, checkout_obj)
+        shrunk_salvage = shrunk.get("salvage")
+        if isinstance(shrunk_salvage, list):
+            for salvage_entry in shrunk_salvage:
+                if isinstance(salvage_entry, dict):
+                    _sidecar_containing_refs(config, salvage_entry)
+        payload = shrunk
     writer.append(
         "operation-progress-recorded",
         {
@@ -12564,6 +12583,25 @@ def _validate_journal_shape(
         _exact_keys(
             raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
         )
+        # Restore sidecarred containment inventories (#1757) before any
+        # reader parses the record or salvage, so every recovery reader
+        # sees the original self-contained shape.
+        record_map = raw["record"]
+        if isinstance(record_map, dict):
+            record_checkouts = record_map.get("checkouts")
+            if isinstance(record_checkouts, list):
+                for checkout_obj in record_checkouts:
+                    if isinstance(checkout_obj, dict):
+                        _expand_containing_refs_sidecar(
+                            config, checkout_obj, "finish journal.record checkout"
+                        )
+        salvage_list = raw.get("salvage")
+        if isinstance(salvage_list, list):
+            for salvage_entry in salvage_list:
+                if isinstance(salvage_entry, dict):
+                    _expand_containing_refs_sidecar(
+                        config, salvage_entry, "finish journal.salvage entry"
+                    )
         record = _record_from_obj(raw["record"], "finish journal.record")
         if record.machine != machine or record.slot != slot:
             raise StateError("finish journal record does not match its shard or slot")
@@ -55310,6 +55348,87 @@ def _finish_journal_owner(raw: Mapping[str, object]) -> ProcessIdentity | None:
     return owner
 
 
+_CONTAINING_REFS_INLINE_LIMIT = 64
+_CONTAINING_REFS_SIDECAR_DIR = "containing-refs"
+
+
+def _sidecar_containing_refs(config: Config, holder: dict[str, object]) -> None:
+    """Move one bulky containment inventory out of a finish journal (#1757).
+
+    Up to the inline limit the list stays in the journal. Beyond it the
+    full list is written, fsynced, to a digest-named side file under the
+    control directory before the journal that references it, and the
+    journal keeps the first inline entries plus the sidecar digest, count
+    and path. The side file is content-addressed, so journals sharing a
+    HEAD share it; it is removed only after its journal is gone.
+    """
+
+    refs = holder.get("containing_remote_refs")
+    if not isinstance(refs, list) or len(refs) <= _CONTAINING_REFS_INLINE_LIMIT:
+        return
+    canonical = json.dumps(refs, ensure_ascii=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    digest = hashlib.sha256(canonical).hexdigest()
+    directory = config.control / _CONTAINING_REFS_SIDECAR_DIR
+    path = directory / f"{digest}.json"
+    if not path.exists() and not path.is_symlink():
+        _atomic_write_bytes(path, canonical + b"\n")
+    holder["containing_remote_refs"] = list(refs[:_CONTAINING_REFS_INLINE_LIMIT])
+    holder["containing_remote_refs_sidecar"] = {
+        "sha256": digest,
+        "count": len(refs),
+        "path": f"{_CONTAINING_REFS_SIDECAR_DIR}/{digest}.json",
+    }
+
+
+def _expand_containing_refs_sidecar(
+    config: Config, holder: dict[str, object], label: str
+) -> None:
+    """Restore one sidecarred containment inventory in place (#1757).
+
+    A missing or differing side file refuses cleanly, naming its digest:
+    recovery never guesses at a partial inventory.
+    """
+
+    reference = holder.get("containing_remote_refs_sidecar")
+    if reference is None:
+        return
+    reference_map = _as_mapping(reference, f"{label}.containing_remote_refs_sidecar")
+    digest = _as_str(
+        reference_map["sha256"], f"{label}.containing_remote_refs_sidecar.sha256"
+    )
+    count = _as_int(
+        reference_map["count"], f"{label}.containing_remote_refs_sidecar.count"
+    )
+    stored = _as_str(
+        reference_map["path"], f"{label}.containing_remote_refs_sidecar.path"
+    )
+    sidecar = config.control / stored
+    try:
+        contents = _read_bounded_regular_file(
+            sidecar, "containing-refs sidecar", _JOURNAL_BYTES_LIMIT
+        )
+        refs = _as_list(
+            json.loads(contents.decode("utf-8")), "containing-refs sidecar"
+        )
+    except (Refusal, StateError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StateError(
+            f"finish journal containing-refs sidecar {digest} is missing or "
+            f"unreadable: {sidecar}: {exc}"
+        ) from exc
+    canonical = json.dumps(refs, ensure_ascii=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    if hashlib.sha256(canonical).hexdigest() != digest or len(refs) != count:
+        raise StateError(
+            f"finish journal containing-refs sidecar {digest} does not match "
+            f"its contents: {sidecar}"
+        )
+    holder["containing_remote_refs"] = list(refs)
+    del holder["containing_remote_refs_sidecar"]
+
+
 def _finish_journal_payload(
     config: Config,
     record: ActiveRecord,
@@ -55358,6 +55477,21 @@ def _finish_journal_payload(
         "record": _record_to_obj(record),
         "owner": _identity_to_obj(_read_process_identity(os.getpid())),
     }
+    # Shrink (#1757): bulky containment inventories go to digest-named
+    # side files, written and fsynced here, before the journal that
+    # references them is written by the caller.
+    record_obj = payload["record"]
+    if isinstance(record_obj, dict):
+        checkouts_obj = record_obj.get("checkouts")
+        if isinstance(checkouts_obj, list):
+            for checkout_obj in checkouts_obj:
+                if isinstance(checkout_obj, dict):
+                    _sidecar_containing_refs(config, checkout_obj)
+    salvage_obj = payload["salvage"]
+    if isinstance(salvage_obj, list):
+        for salvage_entry in salvage_obj:
+            if isinstance(salvage_entry, dict):
+                _sidecar_containing_refs(config, salvage_entry)
     if finish.private_cleanup is not None:
         payload["private_census_identity"] = list(
             finish.private_cleanup.target.identity
