@@ -310,6 +310,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.goto(f"{origin}/?v=docs", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
             # The mention: one mention, so the tap jumps straight to its message.

@@ -4210,7 +4210,7 @@ const openingViewOwner = createOpeningView({
   freshAt: () => loadState().freshAt,
   whenLiveAttached: (pay) => whenLiveAttached(pay),
 });
-const { windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView, openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace, reopenSavedView, payReopenRead, oweChannelRead } = openingViewOwner;
+const { windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView, openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace, reopenSavedView, payReopenRead, oweChannelRead, landOnChannel } = openingViewOwner;
 
 /**
  * The read a reopen owes the channel it put on screen: one owner in web/src/core/sync/reopen.ts (`#624
@@ -7922,6 +7922,7 @@ const welcome = createWelcome({
   readChannel: () => {
     void readEnteredChannel(false);
   },
+  landOnChannel: () => landOnChannel(),
 });
 el("welcome-start").addEventListener("click", () => welcome.dismiss());
 el("welcome-copy-config").addEventListener("click", () => void welcome.copyConfig());

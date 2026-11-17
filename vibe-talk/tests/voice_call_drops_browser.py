@@ -431,6 +431,11 @@ def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
     """The call, the yes, the service's close, and a hang-up. Answers a line for the summary."""
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
+    try:
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+        page.click("#welcome-start")
+    except Exception:
+        pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#talk", state="visible", timeout=10_000)
 
     # 1. A spoken call that greets. Microphone frames wait across the greeting's hand-off.

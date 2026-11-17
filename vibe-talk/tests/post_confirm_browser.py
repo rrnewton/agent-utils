@@ -251,6 +251,11 @@ def main() -> int:
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             # A typed call, opened as the page opens one since `#241 voice-composer`: the first
             # message sent from the call's box with nothing open.
             page.fill("#compose-text", "anything for me to post?")

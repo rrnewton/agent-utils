@@ -38,6 +38,8 @@ export interface WelcomeDependencies {
   checkAgain(): Promise<boolean>;
   /** Read the channel now selected, as entering it does. */
   readChannel(): void;
+  /** Land the reader on the channel, now the main screen is visible again. */
+  landOnChannel(): void;
 }
 
 /** The Welcome's commands. */
@@ -72,6 +74,7 @@ export function createWelcome(deps: WelcomeDependencies): Welcome {
   function dismiss(): void {
     deps.markDismissed();
     deps.showScreen("main");
+    deps.landOnChannel();
   }
 
   return {

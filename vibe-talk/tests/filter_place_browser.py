@@ -349,6 +349,11 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
     page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
+    try:
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+        page.click("#welcome-start")
+    except Exception:
+        pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
     page.click("#view-switch")
     # Messages, not rows: two of them share one row.

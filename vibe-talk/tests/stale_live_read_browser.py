@@ -232,6 +232,11 @@ def two_late_messages(desk: Desk, api: LateApi) -> tuple[int, int, int, int, int
     page = desk.page
     page.fill("#api-token", fixture.TOKEN)
     page.click("#save-token")
+    try:
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+        page.click("#welcome-start")
+    except Exception:
+        pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
     page.click("#view-switch")
     desk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {len(api.messages)}",

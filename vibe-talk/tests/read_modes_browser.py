@@ -593,6 +593,11 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
 
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
+    try:
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+        page.click("#welcome-start")
+    except Exception:
+        pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=10_000)
     page.click("#view-switch")
     page.wait_for_function("() => document.querySelectorAll('#discord-log > li').length > 10", timeout=10_000)
@@ -834,6 +839,11 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
 
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
+    try:
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+        page.click("#welcome-start")
+    except Exception:
+        pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=10_000)
     page.click("#view-switch")
     page.wait_for_function(f"() => document.querySelectorAll('#discord-log > li').length === {HELD_WINDOW}",

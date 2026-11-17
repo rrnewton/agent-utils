@@ -130,6 +130,9 @@ def expect_channel(page: Page, where: str) -> None:
     label = page.evaluate("() => document.getElementById('view-switch-label').textContent")
     check(label == "Channel", f"{where}: the view switch says {label!r}, not 'Channel'")
     page.wait_for_selector("#discord-log > li[data-id]", state="visible", timeout=10_000)
+    at_bottom = page.evaluate("""() => { const a = document.getElementById('scroll-area');
+        return a.scrollTop >= a.scrollHeight - a.clientHeight - 2; }""")
+    check(at_bottom, f"{where}: the Channel did not open at its newest message")
 
 
 def dismiss(page: Page, where: str) -> None:

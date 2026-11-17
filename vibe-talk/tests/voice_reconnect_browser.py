@@ -609,6 +609,11 @@ def main() -> int:
                 page.goto(f"{origin}/", wait_until="load")
                 page.fill("#api-token", TOKEN)
                 page.click("#save-token")
+                try:
+                    page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                    page.click("#welcome-start")
+                except Exception:
+                    pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
                 page.wait_for_selector("#talk", state="visible", timeout=10_000)
                 summary = call_a(page, api, voice, args.screenshots)
                 summary += "; " + call_b(page, api, voice, args.screenshots)

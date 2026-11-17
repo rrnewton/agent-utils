@@ -208,6 +208,11 @@ def first_row(found: Json) -> Json:
 def sign_in(desk: Desk) -> None:
     desk.page.fill("#api-token", fixture.TOKEN)
     desk.page.click("#save-token")
+    try:
+        desk.page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+        desk.page.click("#welcome-start")
+    except Exception:
+        pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     desk.page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
     desk.page.click("#view-switch")
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length >= 2",

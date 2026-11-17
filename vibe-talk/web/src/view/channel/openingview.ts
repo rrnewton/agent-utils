@@ -89,6 +89,7 @@ export interface OpeningView {
   reopenSavedView(): void;
   payReopenRead(): void;
   oweChannelRead(): void;
+  landOnChannel(): void;
 }
 
 /** Which view a channel opens in, over `deps`. */
@@ -448,8 +449,22 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
     deps.reopenReadOwed().owe(deps.replayStarted());
   }
 
+  /**
+   * Put the reader where a reopen left them, once the list is visible again (`#1781
+   * vibe-talk-first-run-welcome-channel-default`): the Welcome stood over the main screen
+   * while its first read settled, and a hidden list has no height to land in. A saved place
+   * is put back; the newest is the landing where there is none, or it is the place kept.
+   */
+  function landOnChannel(): void {
+    if (deps.screens().view() !== "discord") return;
+    returnToSavedPlace();
+    const saved = deps.uiState().saved();
+    const place = saved ? saved.place : null;
+    if (!place || place.atNewest) deps.scrollToNewest();
+  }
+
   return {
-    reopenSavedView, payReopenRead, oweChannelRead,
+    reopenSavedView, payReopenRead, oweChannelRead, landOnChannel,
     windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView,
     openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace,
   };

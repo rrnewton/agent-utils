@@ -275,6 +275,11 @@ def links_written(state: LinksState, label: str, raw: bool, stage: str) -> None:
 def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int) -> str:
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
+    try:
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+        page.click("#welcome-start")
+    except Exception:
+        pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     open_links(page, label, touch)
 
     state = page.evaluate(STATE_JS)

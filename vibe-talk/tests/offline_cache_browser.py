@@ -2660,6 +2660,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             alone = page.evaluate(GLASS_ALONE_JS)
             shot("1-call-view-glass")
@@ -3121,6 +3126,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             refused.clear()
             page.fill("#api-token", READ_TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.click("#view-switch")
             wait_rows(["200", "201", "202", "203"], "a read-scope token did not read the channel")
             def storage_state() -> str:
@@ -3260,6 +3270,11 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
             page.click("#view-switch")
             page.wait_for_selector('#discord-log > li[data-id="215"]', timeout=10_000)
@@ -3385,6 +3400,11 @@ def tile_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
             page.click("#view-switch")
             page.wait_for_selector('#discord-log > li[data-id="211"]', timeout=10_000)
@@ -3571,6 +3591,11 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
             until("() => !document.getElementById('control-pane').hidden", "the call view's pane did not appear")
 
@@ -3859,6 +3884,11 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
             page.goto(url, wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
             page.click("#view-switch")
             page.wait_for_selector('#discord-log > li[data-id="214"]', timeout=10_000)
@@ -4069,6 +4099,11 @@ def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
                 page.fill("#api-token", TOKEN)
                 page.click("#save-token")
+                try:
+                    page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                    page.click("#welcome-start")
+                except Exception:
+                    pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
                 page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
                 page.click("#view-switch")
                 until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 3",
@@ -4149,6 +4184,11 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             page.click("#view-switch")
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 3", "the channel did not open")
@@ -4286,6 +4326,11 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             page.click("#view-switch")
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 5", "the channel did not open")
@@ -4427,6 +4472,11 @@ def links_bar_walk(chromium: BrowserType, args: argparse.Namespace, label: str, 
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             page.click("#view-switch")
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 5", "the channel did not open")
@@ -4557,6 +4607,11 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             page.click("#view-switch")
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 6", "the channel did not open")
@@ -4732,6 +4787,11 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             page.click("#view-switch")
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 6", "the channel did not open")
@@ -4847,6 +4907,11 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             page.click("#view-switch")
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 4", "the channel did not open")
@@ -4956,6 +5021,11 @@ def windows_walk(chromium: BrowserType, args: argparse.Namespace) -> None:
             first.goto(url, wait_until="load")
             first.fill("#api-token", TOKEN)
             first.click("#save-token")
+            try:
+                first.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                first.click("#welcome-start")
+            except Exception:
+                pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             first.wait_for_selector("#view-switch", state="visible", timeout=10_000)
             read_for(lambda: first.click("#view-switch"), first, listed_first, "the first window's channel")
             choose(first, listed_second, "the first window's choice")
