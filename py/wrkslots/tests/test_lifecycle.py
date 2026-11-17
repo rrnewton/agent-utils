@@ -6752,8 +6752,12 @@ def test_validation_exclusion_fixture_preserves_host_root_boundary(
 
     with pytest.raises(wrkslots.Refusal):
         wrkslots._trusted_validation_exclusion_root(tmp_path / "fixture-fenced")
+    # The budgets below are hang backstops only (#1765): the verdict is the
+    # census content asserted below, never how long a same-UID census of a
+    # loaded host's process table takes, so they are sized far past any
+    # loaded run instead of the production 5 s bound this test used to copy.
     budget = wrkslots._ReadOnlyCommandBudget.start(
-        timeout_seconds=5,
+        timeout_seconds=120,
         stdout_limit=4096,
         stderr_limit=4096,
     )
@@ -6792,7 +6796,7 @@ def test_validation_exclusion_fixture_preserves_host_root_boundary(
     census = wrkslots._capture_same_uid_process_path_census(
         (tmp_path / "not-in-use",),
         budget=wrkslots._ReadOnlyCommandBudget.start(
-            timeout_seconds=5,
+            timeout_seconds=120,
             stdout_limit=16 * 1024 * 1024,
             stderr_limit=64 * 1024,
             input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
