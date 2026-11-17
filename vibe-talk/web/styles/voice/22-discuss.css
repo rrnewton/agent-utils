@@ -253,7 +253,10 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 }
 
 /* `#1524`: the hours end, in the count's dress; never dropped on a narrow row.
- * `#1813` follow-up: at least five digits show (`9715` was cut to `971…`). */
+ * `#1813` follow-up: at least five digits show (`9715` was cut to `971…`).
+ * This is also the `#1783 vibe-talk-review-nits-1761-1762-1767` (a) fix: the
+ * 8ch minimum covers the phone rule's old 2.7rem box as well, so five digits
+ * (12345) show in full there too, as the browser walk asserts. */
 #discuss-hours {
   width: 3.4rem;
   min-width: 8ch;
@@ -682,8 +685,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
     width: 2.7rem;
   }
 
+  /* `#1783` (a): five digits on a phone too (see the base rule). */
   #discuss-hours {
-    width: 2.7rem;
+    width: 4.4rem;
   }
 
   #discuss-since {

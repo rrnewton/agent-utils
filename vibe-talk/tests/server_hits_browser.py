@@ -269,6 +269,22 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
             walk.check(bool(measured["dismissHit"]),
                        f"the toast's dismiss control is covered at its centre: {measured}")
         walk.shot("toast-discuss-clear")
+        # `#1783 vibe-talk-review-nits-1761-1762-1767` (a): the hours box must
+        # show at least 5 digits in full (a 9692-hour bound clipped at 4).
+        hours_fit = page.evaluate("""() => {
+            const el = document.getElementById('discuss-hours');
+            el.value = '12345';
+            const cs = getComputedStyle(el);
+            const ctx = document.createElement('canvas').getContext('2d');
+            ctx.font = cs.font;
+            const text = ctx.measureText('12345').width;
+            const inner = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+            return {text, inner, width: el.getBoundingClientRect().width};
+        }""")
+        walk.check(hours_fit["text"] <= hours_fit["inner"] + 1,
+                   f"the hours box clips a 5-digit value: text {hours_fit['text']:.1f}px"
+                   f" in {hours_fit['inner']:.1f}px (box {hours_fit['width']:.1f}px)")
+        walk.shot("hours-five-digits")
         page.evaluate("() => { document.getElementById('status-line').hidden = true; }")
         walk.settled()
     walk.shot("before-search")
