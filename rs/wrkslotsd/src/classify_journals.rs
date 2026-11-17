@@ -950,21 +950,18 @@ fn seal_orphaned(cfg: &Cfg, path: &Path) -> bool {
     let Some(identity) = crate::status_state::identity_from_value(actor) else {
         return false;
     };
-    if crate::status_state::process_state(Some(&identity)).0 != "dead" {
-        return false;
-    }
-    // The batch process itself must also be gone (#1736 review).
-    if let Some(operator_value) = value
+    // The recorded batch process governs (#1736): orphaned iff it is
+    // dead (an earlier boot is dead via process_state), whatever the
+    // authorizing coordinator is still doing.
+    let operator = value
         .get("x")
         .and_then(|extension| extension.get("operator"))
+        .and_then(crate::status_state::identity_from_value);
+    let judged = operator.as_ref().unwrap_or(&identity);
+    if judged.pid != i64::from(std::process::id())
+        && crate::status_state::process_state(Some(judged)).0 != "dead"
     {
-        if let Some(operator) = crate::status_state::identity_from_value(operator_value) {
-            if operator.pid != i64::from(std::process::id())
-                && crate::status_state::process_state(Some(&operator)).0 == "live"
-            {
-                return false;
-            }
-        }
+        return false;
     }
     // A paired finish keeps the seal binding; any outstanding finish
     // journal is treated as potentially paired (conservative).

@@ -37770,7 +37770,11 @@ def _validate_batch_seal_orphaned(config: Config, path: Path) -> tuple[bool, str
         judged = operator if operator is not None else identity
         if judged.host_id != host_id:
             return False, "the seal's batch belongs to another machine identity"
-        if judged.boot_id != boot_id:
+        if judged.boot_id != boot_id or (
+            identity.host_id == host_id and identity.boot_id != boot_id
+        ):
+            # An earlier boot on this host, on either recorded
+            # identity: no process survives a reboot (#1764).
             reason = "the seal's batch ran in an earlier boot"
         elif judged.pid == os.getpid():
             reason = "the seal's batch is this process"

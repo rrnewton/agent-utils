@@ -599,6 +599,35 @@ def test_a_dead_actors_seal_is_retired_by_the_next_create(
     assert target.stat().st_mode & 0o777 == original
 
 
+def test_a_live_coordinators_seal_is_retired_when_its_batch_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live coordinator + dead batch: create auto-retires the seal.
+
+    The seal's actor is the authorizing harness, routinely long-lived;
+    only the recorded batch process (here the crashed invoker, dead)
+    decides orphanage (#1736, field report on a live harness).
+    """
+
+    project, target, seal, original = _crashed_seal(tmp_path, monkeypatch)
+    # Only the actor (coordinator) is rewritten live; the recorded
+    # operator stays the crashed batch process (dead).
+    raw = json.loads(seal.read_text())
+    raw["actor"] = wrkslots._identity_to_obj(
+        wrkslots._read_process_identity(os.getpid())
+    )
+    seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+    classified = _classify(project, "next")
+    assert classified.returncode == 0, classified.stderr
+
+    made = create(project, slot="next", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    assert "recovered the validation-batch seal" in made.stderr
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
+
+
 @pytest.mark.parametrize("actor", ("live", "other-host"))
 def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actor: str
@@ -627,9 +656,6 @@ def test_a_seal_whose_actor_is_not_proven_dead_here_still_binds(
         # The rewrite names this live process as actor and operator.
         assert "in progress (pid " in classified.stderr
         assert "recover" not in classified.stderr
-    elif actor == "other-boot":
-        # An ended boot is dead everywhere in wrkslots.
-        assert "interrupted validation-batch seal recorded" in classified.stderr
     else:
         # Another machine proves nothing: no recovery suggestion.
         assert "cannot be proven dead" in classified.stderr
