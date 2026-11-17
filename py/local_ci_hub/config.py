@@ -8,12 +8,6 @@ from pathlib import Path
 
 import sys
 
-if sys.version_info >= (3, 11):
-    import tomllib
-else:  # Python 3.10: the tomli package provides the same API
-    import tomli as tomllib
-
-
 class ConfigError(ValueError):
     """Raised when local-ci-hub.toml is invalid or incomplete."""
 
@@ -82,6 +76,12 @@ def load(path: Path | None, root: Path | None = None) -> Config:
     path = Path(path)
     root = root or path.parent
     try:
+        # Help and version must work in the dependency-free package smoke test.
+        # Only reading a configuration needs the Python 3.10 TOML backport.
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib
         data = tomllib.loads(path.read_text())
     except Exception as exc:
         raise ConfigError(f"invalid TOML in {path}: {exc}") from exc

@@ -280,3 +280,22 @@ def test_land_run_executes_under_lock(tmp_path: Path) -> None:
     assert r.returncode == 0 and (repo / "landed.txt").exists()
     # lock was released afterwards
     assert run_cli(repo, "land", "acquire", "--holder", "b").returncode == 0
+
+
+def test_help_starts_without_importing_a_toml_parser(tmp_path: Path) -> None:
+    script = """
+import importlib.abc, runpy, sys
+class NoToml(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {"tomli", "tomllib"}:
+            raise ModuleNotFoundError("TOML parser deliberately absent")
+sys.meta_path.insert(0, NoToml())
+sys.argv = [sys.argv[1], "--help"]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(BIN)], cwd=tmp_path,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "receipt" in result.stdout

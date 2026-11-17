@@ -3532,6 +3532,11 @@ def _watch_services(harness: Harness, report: Report) -> None:
     rust = _rust_only(harness, report, case, "watch/once",
                       ("watch", "--once", "--check-only", "--state-dir", "<ROOT>/watch-state", *_COMMON))
     health = _json(rust)
+    repair_disabled = {
+        "check": "duty", "subject": "agent_repair", "ok": None,
+        "detail": "skipped-by-config: duty agent_repair is off", "repair": None,
+        "skipped": "skipped-by-config",
+    }
     report.require(
         "watch/once/report",
         rust.returncode == 0 and not rust.stderr and isinstance(health, dict)
@@ -3539,7 +3544,9 @@ def _watch_services(harness: Harness, report: Report) -> None:
         and health.get("findings") == [{
             "check": "herdr", "subject": "server", "ok": True,
             "detail": "answers", "repair": None,
-        }]
+        }, repair_disabled]
+        and isinstance(health.get("duties"), dict)
+        and health["duties"].get("agent_repair") is False
         and health.get("notice") == {"sent": False, "reason": "check only"}
         and health.get("warnings") == []
         and isinstance(health.get("boot_id"), str)
@@ -3592,7 +3599,7 @@ def _watch_services(harness: Harness, report: Report) -> None:
     findings = health.get("findings") if isinstance(health, dict) else None
     report.require(
         "watch/configured/report",
-        rust.returncode == 1 and isinstance(findings, list) and len(findings) == 3
+        rust.returncode == 1 and isinstance(findings, list) and len(findings) == 4
         and findings[0] == {
             "check": "herdr", "subject": "server", "ok": True,
             "detail": "answers", "repair": None,
@@ -3602,9 +3609,10 @@ def _watch_services(harness: Harness, report: Report) -> None:
         and findings[1].get("detail") == "no completed restore report for this boot"
         and isinstance(findings[1].get("subject"), str)
         and _BOOT_ID.fullmatch(str(findings[1]["subject"])) is not None
-        and isinstance(findings[2], dict)
-        and findings[2].get("check") == "coordinator" and findings[2].get("ok") is False
-        and findings[2].get("subject") == "coordinator"
+        and findings[2] == repair_disabled
+        and isinstance(findings[3], dict)
+        and findings[3].get("check") == "coordinator" and findings[3].get("ok") is False
+        and findings[3].get("subject") == "coordinator"
         and isinstance(health, dict) and health.get("ok") is False
         and "no completed restore report for this boot" in rust.stderr
         and not (configured.python_root / "restore-reports").exists(),

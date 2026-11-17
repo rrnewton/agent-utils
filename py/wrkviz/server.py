@@ -32,7 +32,7 @@ def serve(archive: Path, host: str, port: int, open_browser: bool) -> None:
     server = make_server(archive, host, port)
     actual_port = int(server.server_address[1])
     url = f"http://{host}:{actual_port}/"
-    print(f"wrkviz: serving {archive.resolve()} at {url}")
+    print(f"wrkviz: serving {archive.resolve()} at {url}", flush=True)
     if open_browser:
         threading.Timer(0.2, lambda: webbrowser.open(url)).start()
     try:

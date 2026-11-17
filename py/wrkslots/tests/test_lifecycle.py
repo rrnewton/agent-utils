@@ -45079,9 +45079,11 @@ def test_recover_absent_agent_row_accepts_existing_remote_ref_containing_head(
     )
     head = record.checkouts[0].head
     descendant = child_commit(repository, head, "published on top of the agent commit")
-    # A push by URL updates no remote-tracking ref, so no local ref proves
-    # the remote holds the commit; only the remote itself can.
+    # Newer Git recognizes a configured remote's URL and updates its tracking
+    # ref even for a URL push. Remove that fixture ref explicitly: this test
+    # proves recovery consults the remote when no local tracking ref exists.
     git(repository, "push", str(remote), f"{descendant}:refs/heads/feature/kept")
+    git(repository, "update-ref", "-d", "refs/remotes/origin/feature/kept")
     assert (
         git(repository, "for-each-ref", "--contains", head, "refs/remotes/").stdout == ""
     )
@@ -59813,6 +59815,53 @@ def test_recover_checks_a_fenced_slot_without_checkouts_before_deleting(
     assert registry_journals(project) == []
 
 
+def settle_image_fixture_devices() -> None:
+    """Refresh disposable runner device evidence, then wait for queued udev work.
+
+    Settle alone does not request a fresh UUID probe after another fixture has
+    reused a loop device. Never trigger host-wide events on a developer host.
+    """
+    if shutil.which("udevadm") is None:
+        return
+    if (os.environ.get("GITHUB_ACTIONS") == "true"
+            and os.environ.get("AGENT_UTILS_TEST_HOST_PREPARED") == "1"):
+        subprocess.run([
+            "sudo", "-n", "udevadm", "trigger", "--action=change",
+            "--subsystem-match=block", "--sysname-match=loop*",
+        ], check=True, timeout=12)
+    subprocess.run(["udevadm", "settle", "--timeout=10"], check=True, timeout=12)
+
+
+@pytest.mark.parametrize("github,prepared,available,trigger", [
+    ("true", "1", True, True),
+    ("true", "", True, False),
+    ("", "1", True, False),
+    ("true", "1", False, False),
+])
+def test_image_fixture_device_refresh_requires_prepared_disposable_host(
+    monkeypatch: pytest.MonkeyPatch, github: str, prepared: str,
+    available: bool, trigger: bool,
+) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", github)
+    monkeypatch.setenv("AGENT_UTILS_TEST_HOST_PREPARED", prepared)
+    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/udevadm" if available else None)
+    calls: list[list[str]] = []
+
+    def run(args: list[str], *, check: bool, timeout: int) -> subprocess.CompletedProcess[str]:
+        assert check and timeout == 12
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    settle_image_fixture_devices()
+    assert len(calls) == (2 if trigger else 1 if available else 0)
+    if trigger:
+        assert calls[0] == ["sudo", "-n", "udevadm", "trigger", "--action=change",
+                            "--subsystem-match=block", "--sysname-match=loop*"]
+    if available:
+        assert calls[-1] == ["udevadm", "settle", "--timeout=10"]
+
+
 @pytest.mark.ordinary_environment
 def test_remove_of_an_image_backed_agent_slot_checks_use_outside_the_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -59878,9 +59927,17 @@ def test_remove_of_an_image_backed_agent_slot_checks_use_outside_the_lock(
         monkeypatch.setattr(wrkslots, "_lsof_slot_use", count_ordinary)
         monkeypatch.setattr(slotimage, "sole_file_system_doubt", count_doubt)
 
+        # The shared btrfs backing image is not an ext4 slot image. Its UUID
+        # is learned through udev; finish the fixture's asynchronous device
+        # events before asking the real fail-closed removal proof to decide.
+        settle_image_fixture_devices()
+
         returncode, stderr = single_remove(project, "slot01")
 
-        assert returncode == 0, stderr
+        # Keep the real proof strict and make any remaining host identity failure actionable.
+        assert returncode == 0, stderr + "\nloop evidence: " + json.dumps([
+            dataclasses.asdict(item) for item in slotimage.loop_evidence().values()
+        ], sort_keys=True)
         assert shared_calls == [((slot_path,), False)]
         assert all(".fenced." in path.name and not locked for path, locked in ordinary_calls)
         assert len(fence_checks) >= 1

@@ -480,14 +480,37 @@ def _parse_shard(value: str) -> tuple[int, int]:
 
 
 def _restore_owner_access(path: Path) -> None:
-    """Make a test-owned tree removable without following its symlinks."""
+    """Repair directory access through pinned descriptors, never following links.
 
-    if path.is_symlink() or not path.exists():
-        return
-    path.chmod(path.stat().st_mode | stat.S_IRWXU)
-    if path.is_dir():
-        for child in path.iterdir():
-            _restore_owner_access(child)
+    Path-length tests can leave descendants beyond PATH_MAX. Traversing with
+    absolute Path objects fails there even though fd-relative rmtree works.
+    Files need no chmod: deletion requires access to their parent directory.
+    """
+
+    def visit(name: str, parent_fd: int | None) -> None:
+        try:
+            pinned = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return
+        try:
+            metadata = os.fstat(pinned)
+            if not stat.S_ISDIR(metadata.st_mode):
+                return
+            # O_PATH opens even mode-000 directories. The short proc path
+            # refers to this pinned inode, not a pathname that could be swapped.
+            os.chmod(f"/proc/self/fd/{pinned}", metadata.st_mode | stat.S_IRWXU)
+            directory = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=pinned)
+            try:
+                with os.scandir(directory) as entries:
+                    for child in entries:
+                        if child.is_dir(follow_symlinks=False):
+                            visit(child.name, directory)
+            finally:
+                os.close(directory)
+        finally:
+            os.close(pinned)
+
+    visit(str(path), None)
 
 
 def _remove_temp_root(path: Path) -> None:
@@ -891,6 +914,39 @@ def _self_test_sweep() -> None:
         _remove_temp_root(root)
 
 
+def _self_test_deep_permission_cleanup() -> None:
+    with tempfile.TemporaryDirectory(prefix="pytest-shard-cleanup-") as fixture:
+        base = Path(fixture)
+        root = base / "owned"
+        root.mkdir()
+        outside = base / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("untouched")
+        outside.chmod(0o500)
+        (root / "link").symlink_to(outside, target_is_directory=True)
+        blocked = root / "blocked"
+        blocked.mkdir()
+        (blocked / "fetch.log").write_text("fixture")
+        blocked.chmod(0)
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for _ in range(24):
+                name = "d" * 200
+                os.mkdir(name, dir_fd=descriptor)
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+        finally:
+            os.close(descriptor)
+        try:
+            _remove_temp_root(root)
+            assert not root.exists()
+            assert (outside / "keep").read_text() == "untouched"
+            assert stat.S_IMODE(outside.stat().st_mode) == 0o500
+        finally:
+            outside.chmod(0o700)
+
+
 def _self_test_mounts_under() -> None:
     """A basetemp holding a mount is recognised, by either spelling of its path."""
 
@@ -1137,6 +1193,7 @@ def _self_test() -> int:
     _self_test_timeout()
     _self_test_sweep()
     _self_test_mounts_under()
+    _self_test_deep_permission_cleanup()
     _self_test_keep_on_failure()
     _self_test_capped_memory_cgroup()
     # The guarded worker environment redirects global git config (#1474) and

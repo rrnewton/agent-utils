@@ -237,10 +237,16 @@ checking "the read token can list tools, and post_reply is not among them"
 rpc "$READ_TOKEN" tools/list
 [ "$STATUS" = "200" ] || fail "check 2 (read tools/list): returned $STATUS, expected 200. Is the read token exactly what the server was started with? Body was: $BODY"
 read_tools="$(tool_names)"
-for expected in recent_activity list_channels digest_channel read_page count_messages find_message read_message; do
+for expected in recent_activity list_channels read_page count_messages find_message read_message; do
     grep -qx "$expected" <<<"$read_tools" || fail "check 2 (read tools/list): '$expected' was missing from the read token's tool list. Tools offered: $(tr '\n' ' ' <<<"$read_tools")"
 done
-ok "read token sees recent_activity, list_channels, digest_channel, read_page, count_messages, find_message, read_message"
+ok "read token sees recent_activity, list_channels, read_page, count_messages, find_message, read_message"
+# The legacy digest remains callable below, but discovery intentionally directs
+# agents to read_page instead (the service's hidden-but-callable contract).
+if grep -qx digest_channel <<<"$read_tools"; then
+    fail "check 2 (read tools/list): legacy digest_channel was advertised instead of staying hidden"
+fi
+ok "legacy digest_channel stays hidden from tool discovery"
 
 if grep -qx post_reply <<<"$read_tools"; then
     fail "check 2 (read tools/list): post_reply WAS offered to the read token. A read credential must not even see the posting tool. Tools offered: $(tr '\n' ' ' <<<"$read_tools")"
@@ -313,8 +319,15 @@ else
     fi
 
     nonce="gtverify-$(date +%s)-$$"
+    # Invoking this write check is an explicit request to send its test message.
+    # Exercise the same heard-request proof as the voice page; do not disable
+    # explicit_send_only or bypass the separate confirmation below.
+    user_request="Send this deployment check to the chat."
+    request POST /api/v1/voice-heard "$WRITE_TOKEN" \
+        "{\"key\":\"$nonce\",\"text\":\"$user_request\"}"
+    [ "$STATUS" = "204" ] || fail "check 6 (heard request): returned $STATUS, expected 204. Body was: $BODY"
     tool_call "$WRITE_TOKEN" post_reply \
-        "{\"channel_id\":\"$CHANNEL\",\"text\":\"vibe-talk deployment check $nonce — this message was posted by the verification script and can be deleted.\"}"
+        "{\"channel_id\":\"$CHANNEL\",\"text\":\"vibe-talk deployment check $nonce — this message was posted by the verification script and can be deleted.\",\"user_request\":\"$user_request\"}"
     [ "$STATUS" = "200" ] || fail "check 6 (propose): post_reply returned HTTP $STATUS, expected 200. Body was: $BODY"
     is_error="$(jget result.isError)"
     proposed="$(tool_text)"

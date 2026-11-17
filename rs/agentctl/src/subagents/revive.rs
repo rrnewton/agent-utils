@@ -2202,8 +2202,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             {
                 return Err(fail("recorded pane, workspace, or cwd changed"));
             }
-            let stale_custom = matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay")
-                && record.pane_reported_by_agentctl;
+            // Native panes also retain their last OSC session after the harness
+            // dies. Only matching metadata is stale; the independent death,
+            // descendant-free shell, stable snapshot and ownership proofs
+            // below remain mandatory before this presentation can be reused.
+            let stale_custom = (matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay")
+                && record.pane_reported_by_agentctl)
+                || record.adapter == "herdr";
             if info
                 .agent
                 .as_deref()

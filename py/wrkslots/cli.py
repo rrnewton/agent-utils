@@ -8014,11 +8014,9 @@ def _git_worktree_root_for_handoff_source(path: Path, label: str) -> Path | None
                 f"Git returned an unsafe worktree root {root}"
             )
         return root
-    if (
-        result.returncode == 128
-        and not stdout
-        and stderr.startswith("fatal: not a git repository")
-    ):
+    if result.returncode == 128 and not stdout:
+        # Git versions diagnose a broken gitdir differently. An observed
+        # ancestor marker must never be mistaken for external, untracked input.
         marker_after = _ancestor_git_marker(path, label)
         marker = marker_after or marker_before
         if marker is not None:
@@ -8026,7 +8024,8 @@ def _git_worktree_root_for_handoff_source(path: Path, label: str) -> Path | None
                 f"cannot determine Git provenance for {label} {path}: Git rejected "
                 f"ancestor marker {marker}; preserve the input and repair Git metadata"
             )
-        return None
+        if stderr.startswith("fatal: not a git repository"):
+            return None
     detail = stderr or stdout or f"Git exited {result.returncode} without diagnostics"
     raise Refusal(f"cannot determine Git provenance for {label} {path}: {detail}")
 

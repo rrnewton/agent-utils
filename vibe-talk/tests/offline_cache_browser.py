@@ -3901,7 +3901,7 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
                 press(x, y)
                 wait_until(f"() => window.__landedOn === {json.dumps(parent)}",
                            f"a {pressing} on {row_id}'s head did not jump to {parent}; the status line says"
-                           f" {page.evaluate('() => document.getElementById(\"status\").textContent')!r}")
+                           " " + repr(page.evaluate("() => document.getElementById('status').textContent")))
             x, y = head("side", "216", "215", True, f"before two {pressing}s on its head")
             page.evaluate(ARROW_PRESS_LATCH_JS)
             press(x, y, twice=True)

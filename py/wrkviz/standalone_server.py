@@ -219,6 +219,24 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
     which one is mandatory costs one inflate on the fallback path and removes both.
     """
 
+    # Keep browser assets stable across host mime databases and in parity with
+    # the Rust server. Ubuntu releases disagree on the default .js spelling.
+    extensions_map = {
+        **http.server.SimpleHTTPRequestHandler.extensions_map,
+        ".js": "application/javascript",
+        ".mjs": "text/javascript",
+        ".log": "text/plain",
+    }
+
+    # The wire format is part of our Python/Rust contract, not the host
+    # interpreter's choice of HTML template or HTTPStatus.__str__ behavior.
+    error_message_format = '<!DOCTYPE HTML>\n<html lang="en">\n    <head>\n        <meta charset="utf-8">\n        <title>Error response</title>\n    </head>\n    <body>\n        <h1>Error response</h1>\n        <p>Error code: %(code)d</p>\n        <p>Message: %(message)s.</p>\n        <p>Error code explanation: %(code)s - %(explain)s.</p>\n    </body>\n</html>\n'
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        """Render errors with integer status codes on every supported Python version."""
+
+        super().send_error(int(code), message, explain)
+
     _cache_control_sent = False
 
     def list_directory(self, path: str | os.PathLike[str]) -> io.BytesIO | None:
@@ -429,7 +447,7 @@ def _main() -> None:
     root = Path(__file__).resolve().parent
     server = make_static_server(root, port=args.port)
     url = f"http://127.0.0.1:{server.server_address[1]}/"
-    print(f"Serving {root} at {url}")
+    print(f"Serving {root} at {url}", flush=True)
     if args.open:
         threading.Timer(0.2, lambda: webbrowser.open(url)).start()
     try:

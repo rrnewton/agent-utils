@@ -655,47 +655,73 @@ def _phase_scenario(tmp_path: Path, env: dict[str, str]) -> tuple[list[str], dic
     exclusive phase, which queues behind the holder; then an ordinary shared
     gate and a later rerun queue behind it. Returns the run order and the
     phase ticket."""
-    order = tmp_path / "order.txt"
-    release = tmp_path / "release"
-    holder = _start_env(
-        tmp_path, env, "--", PY, "-c",
-        f"import os, time\nwhile not os.path.exists({str(release)!r}): time.sleep(0.05)")
-    _wait_for_runs(tmp_path, 1)
-    nested_script = (
-        "import subprocess, sys\n"
-        f"done = subprocess.run([sys.executable, {str(GATE)!r}, '--exclusive', '--', "
-        f"sys.executable, '-c', \"open({str(order)!r}, 'a').write('phase\\\\n')\", "
-        "'--selected', 'cross.a,cross.b,cross.c,cross.d,cross.e'])\n"
-        "sys.exit(done.returncode)\n"
-    )
-    outer = _start_env(tmp_path, env, "--", PY, "-c", nested_script)
-    queue = tmp_path / "admission" / "queue"
-    deadline = time.time() + 20
-    ticket: dict[str, object] = {}
-    while not ticket and time.time() < deadline:
-        for path in queue.glob("*.json"):
+    # Rerun classification reads the real DAG through its lazy Rust launcher.
+    # Build it before timing queue admission; a cold build is not queue latency.
+    assert _gate_module()._dag_step_labels(), "validation graph failed to load"
+    processes: list[subprocess.Popen[str]] = []
+
+    def start(env: dict[str, str], *args: str) -> subprocess.Popen[str]:
+        proc = subprocess.Popen(
+            [PY, str(GATE), *args], env=env, start_new_session=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        processes.append(proc)
+        return proc
+
+    try:
+        order = tmp_path / "order.txt"
+        release = tmp_path / "release"
+        holder = start(
+            env, "--", PY, "-c",
+            f"import os, time\nwhile not os.path.exists({str(release)!r}): time.sleep(0.05)")
+        _wait_for_runs(tmp_path, 1)
+        nested_script = (
+            "import subprocess, sys\n"
+            f"done = subprocess.run([sys.executable, {str(GATE)!r}, '--exclusive', '--', "
+            f"sys.executable, '-c', \"open({str(order)!r}, 'a').write('phase\\\\n')\", "
+            "'--selected', 'cross.a,cross.b,cross.c,cross.d,cross.e'])\n"
+            "sys.exit(done.returncode)\n"
+        )
+        outer = start(env, "--", PY, "-c", nested_script)
+        queue = tmp_path / "admission" / "queue"
+        deadline = time.time() + 20
+        ticket: dict[str, object] = {}
+        while not ticket and time.time() < deadline:
+            for path in queue.glob("*.json"):
+                try:
+                    data = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    continue
+                if data.get("class") == "exclusive":
+                    ticket = data
+            time.sleep(0.05)
+        assert ticket, "the nested phase did not queue"
+
+        def note(tag: str) -> str:
+            return f"open({str(order)!r}, 'a').write({tag!r} + '\\n')"
+
+        ordinary = start(env, "--", PY, "-c", note("ordinary"))
+        _wait_for_queue(tmp_path, 2)
+        rerun = start(env, "--rerun", "--", PY, "-c", note("rerun"),
+                           "--selected", "a.step")
+        _wait_for_queue(tmp_path, 3)
+        release.write_text("")
+        for proc in (holder, outer, ordinary, rerun):
+            out, _ = proc.communicate(timeout=60)
+            assert proc.returncode == 0, out
+        return order.read_text().split(), ticket
+
+    finally:
+        # Failed queue assertions must also reap nested gate children and the
+        # holder's wait loop. These are test-owned, isolated process groups.
+        for proc in processes:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+        for proc in processes:
             try:
-                data = json.loads(path.read_text())
-            except (OSError, ValueError):
-                continue
-            if data.get("class") == "exclusive":
-                ticket = data
-        time.sleep(0.05)
-    assert ticket, "the nested phase did not queue"
-
-    def note(tag: str) -> str:
-        return f"open({str(order)!r}, 'a').write({tag!r} + '\\n')"
-
-    ordinary = _start_env(tmp_path, env, "--", PY, "-c", note("ordinary"))
-    _wait_for_queue(tmp_path, 2)
-    rerun = _start_env(tmp_path, env, "--rerun", "--", PY, "-c", note("rerun"),
-                       "--selected", "a.step")
-    _wait_for_queue(tmp_path, 3)
-    release.write_text("")
-    for proc in (holder, outer, ordinary, rerun):
-        out, _ = proc.communicate(timeout=60)
-        assert proc.returncode == 0, out
-    return order.read_text().split(), ticket
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=5)
 
 
 def test_a_marked_nested_phase_is_not_overtaken_by_a_later_rerun(tmp_path: Path) -> None:

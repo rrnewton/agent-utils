@@ -726,6 +726,57 @@ fn restore_reports_queued_delivered_and_archived_counts_per_agent() {
 }
 
 #[test]
+fn watch_drains_the_declared_coordinator_but_not_unlisted_historical_agents() {
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    for name in ["lead", "historical"] {
+        fixture
+            .manager()
+            .start(
+                name,
+                &fixture.root,
+                StartOptions {
+                    harness: "codex".to_owned(),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        fixture
+            .manager()
+            .queue_identified(name, "pending prompt", None, None, Some(name))
+            .unwrap();
+    }
+    let mut cfg = config(&fixture, Some("lead"));
+    cfg.agents = Some(Vec::new());
+    let findings = watch_pass(&fixture, &ScriptedHost::new(), &cfg);
+    assert!(
+        findings
+            .iter()
+            .any(|row| row["check"] == "queue" && row["subject"] == "lead"),
+        "{findings:?}"
+    );
+    assert!(fixture
+        .manager()
+        .pending_prompts("lead")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fixture
+            .manager()
+            .pending_prompts("historical")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!findings
+        .iter()
+        .any(|row| row["check"] == "queue" && row["subject"] == "historical"));
+}
+
+#[test]
 fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
     let fixture = Fixture::new();
     fixture
@@ -774,6 +825,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
                 wrkslots: None,
                 state_dir: None,
                 queue_stale: Duration::from_secs(600),
+                queue_max_items: None,
             },
             &mut Default::default(),
             &mut Default::default(),
@@ -817,6 +869,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::ZERO,
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -1070,6 +1123,7 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
             wrkslots: None,
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -1115,6 +1169,7 @@ fn timer_pass(
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         repaired,
         stopped_noted,
@@ -1502,6 +1557,7 @@ fn watch_reports_a_failed_unit_it_cannot_start() {
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -1630,6 +1686,7 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
         wrkslots: None,
         state_dir: Some(fixture.root.join("watch")),
         queue_stale: Duration::from_secs(600),
+        queue_max_items: None,
     };
     let first =
         crate::restore::watch(&fixture.client, &registry, &host, &config, &options).unwrap();
@@ -1699,6 +1756,7 @@ fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it(
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -2592,6 +2650,7 @@ fn slot_image_finding(fixture: &Fixture, host: &ScriptedHost) -> Value {
             wrkslots: Some(PathBuf::from("/opt/wrkslots")),
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -2734,6 +2793,7 @@ fn watch_pass(fixture: &Fixture, host: &ScriptedHost, config: &RestoreConfig) ->
             wrkslots: None,
             state_dir: None,
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
         &mut Default::default(),
         &mut Default::default(),
@@ -2807,6 +2867,7 @@ fn watch_never_repairs_or_alerts_on_a_unit_it_could_not_check() {
             wrkslots: None,
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
     )
     .unwrap();
@@ -3601,6 +3662,7 @@ fn watch_notify_off_and_tab_hygiene_off_report_skipped_in_health() {
             wrkslots: None,
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
+            queue_max_items: None,
         },
     )
     .unwrap();
@@ -3693,4 +3755,276 @@ fn restore_revives_with_the_recorded_profile_environment() {
     let environments = fixture.client.environments.lock().unwrap();
     assert_eq!(environments.len(), 2);
     assert_eq!(environments[1], ["RECOVERY_MODE=on"]);
+}
+
+#[test]
+fn restore_refuses_a_busy_lock_without_waiting_or_touching_runtime() {
+    use fs2::FileExt;
+    let fixture = Fixture::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(registry.join(".restore.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    for dry_run in [true, false] {
+        let host = ScriptedHost::new();
+        let result = restore(
+            &fixture.client,
+            &registry,
+            &host,
+            &config,
+            &RestoreOptions {
+                dry_run,
+                ..options(None)
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("restore lock is busy"));
+        assert!(host.commands().is_empty());
+    }
+}
+
+#[test]
+fn watch_reconciles_dead_desired_agents_once_and_check_only_never_launches() {
+    let fixture = Fixture::new();
+    let old = dead_agent(&fixture);
+    let mut config = config(&fixture, Some("lane"));
+    config.units.clear();
+    config.duties.agent_repair = true;
+    config.duties.queue_drain = false;
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let run = |check_only| {
+        watch_once(
+            &fixture.client,
+            &registry,
+            &host,
+            &config,
+            &WatchOptions {
+                check_only,
+                ..repair_watch_options()
+            },
+            &mut Default::default(),
+            &mut Default::default(),
+        )
+        .into_iter()
+        .find(|row| row["check"] == "agent_repair")
+        .unwrap()
+    };
+    let plan = run(true);
+    assert_eq!(plan["ok"], false, "{plan}");
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+    let repaired = run(false);
+    assert_eq!(repaired["ok"], true, "{repaired}");
+    let new_token = fixture.manager().load("lane").unwrap().token;
+    assert_ne!(new_token, old.token);
+    let repeated = run(false);
+    assert_eq!(repeated["ok"], true, "{repeated}");
+    assert_eq!(fixture.manager().load("lane").unwrap().token, new_token);
+}
+
+#[test]
+fn restore_dry_run_reports_unavailable_herdr_without_waiting() {
+    let fixture = Fixture::new();
+    let config = config(&fixture, None);
+    fixture.client.fail_panes.store(true, Ordering::Relaxed);
+    let host = ScriptedHost::new();
+    let started = host.now();
+    let report = restore(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        &host,
+        &config,
+        &RestoreOptions {
+            dry_run: true,
+            ..options(None)
+        },
+    )
+    .unwrap();
+    assert_eq!(report["herdr"]["ready"], false);
+    assert_eq!(host.now(), started, "dry-run must not sleep for Herdr");
+    assert!(!host
+        .commands()
+        .iter()
+        .any(|command| command.contains(" start ")));
+}
+
+#[test]
+fn watch_agent_repair_is_opt_in_and_never_revives_stopped_lanes() {
+    let fixture = Fixture::new();
+    let mut old = dead_agent(&fixture);
+    let config = config(&fixture, Some("lane"));
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let findings = watch_once(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &repair_watch_options(),
+        &mut Default::default(),
+        &mut Default::default(),
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|row| row["check"] == "agent_repair" && row["skipped"] == true)
+            || findings.iter().any(|row| row["subject"] == "agent_repair")
+    );
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+    // A manually stopped worker is excluded by the same desired-state
+    // derivation restore uses. The coordinator is deliberately distinct.
+    old.lifecycle = "stopped".to_owned();
+    fixture.manager().save(&old).unwrap();
+    let mut config = config.clone();
+    config.coordinator = None;
+    config.units.clear();
+    let plan = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &RestoreOptions {
+            dry_run: true,
+            ..options(None)
+        },
+    )
+    .unwrap();
+    assert_eq!(plan["agents"][0]["action"], "skipped", "{plan}");
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+}
+
+fn repair_watch_options() -> WatchOptions {
+    WatchOptions {
+        interval: Duration::from_secs(60),
+        once: true,
+        check_only: false,
+        wrkslots: None,
+        state_dir: None,
+        queue_stale: Duration::from_secs(600),
+        queue_max_items: None,
+    }
+}
+
+#[test]
+fn watch_agent_repair_refuses_a_missing_recorded_conversation() {
+    let fixture = Fixture::new();
+    let old = dead_claude_agent(&fixture);
+    let claude = fixture.root.join("claude-config");
+    fs::create_dir_all(claude.join("projects")).unwrap();
+    let _roots = pretend_claude_roots(vec![claude]);
+    let mut config = config(&fixture, Some("lane"));
+    config.units.clear();
+    config.duties.agent_repair = true;
+    config.duties.queue_drain = false;
+    let findings = watch_pass(&fixture, &ScriptedHost::new(), &config);
+    let row = findings
+        .iter()
+        .find(|row| row["check"] == "agent_repair")
+        .unwrap();
+    assert_eq!(row["ok"], false, "{row}");
+    assert_eq!(row["repair"]["coordinator"]["action"], "refused", "{row}");
+    assert!(row["repair"]["coordinator"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("recorded session required"));
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+    assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn recovery_lifecycle_metadata_never_probes_the_dead_terminal() {
+    let fixture = Fixture::new();
+    let old = dead_agent(&fixture);
+    fixture.client.fail_panes.store(true, Ordering::Relaxed);
+    let before = fixture.client.pane_info_calls.load(Ordering::Relaxed);
+    let record = fixture.manager().recovery_record("lane").unwrap();
+    assert_eq!(record["token"], old.token);
+    assert_eq!(record["lifecycle"], "running");
+    assert_eq!(
+        fixture.client.pane_info_calls.load(Ordering::Relaxed),
+        before
+    );
+}
+
+#[test]
+fn automatic_recovery_never_discovers_an_unrecorded_shared_directory_session() {
+    let fixture = Fixture::new();
+    let mut old = dead_agent(&fixture);
+    old.native_session = None;
+    old.resume = None;
+    old.session_agent = None;
+    old.session_value = None;
+    old.launch_spec = None;
+    fixture.manager().save(&old).unwrap();
+    let mut config = config(&fixture, Some("lane"));
+    config.require_recorded_session = true;
+    let report = restore(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        &ScriptedHost::new(),
+        &config,
+        &RestoreOptions {
+            dry_run: true,
+            ..options(None)
+        },
+    )
+    .unwrap();
+    assert_eq!(report["coordinator"]["action"], "refused", "{report}");
+    assert!(report["coordinator"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("never infer ownership"));
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+}
+
+#[test]
+fn watch_writes_health_when_coordinator_lifecycle_is_locked() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "coordinator",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let mut config = config(&fixture, Some("coordinator"));
+    config.duties.queue_drain = false;
+    config.duties.tab_hygiene = false;
+    let registry = fixture.root.join("registry");
+    let options = WatchOptions {
+        once: true,
+        state_dir: Some(fixture.root.join("watch")),
+        ..repair_watch_options()
+    };
+    let manager = fixture.manager();
+    let _held = manager.lock("coordinator").unwrap();
+    let started = std::time::Instant::now();
+    let health = crate::restore::watch(
+        &fixture.client,
+        &registry,
+        &ScriptedHost::new(),
+        &config,
+        &options,
+    )
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_eq!(health["notice"]["sent"], false, "{health}");
+    assert!(
+        health["alerted"].as_object().unwrap().is_empty(),
+        "failed sends must retry"
+    );
+    assert!(fixture.root.join("watch/health.json").is_file());
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
 }

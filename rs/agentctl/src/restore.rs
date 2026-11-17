@@ -4,7 +4,7 @@
 //! named for the boot:
 //!
 //! 1. Hold `<registry>/.restore.lock`, so a boot unit and a manual run never overlap: the
-//!    second waits for the first, then finds its completed report.
+//!    second refuses promptly and can retry after the active restore finishes.
 //! 2. Replay this epoch's recorded report when it already says the restore completed. The
 //!    epoch is the kernel boot plus the user manager's identity (#1405), so a user-manager
 //!    restart in the same boot runs a real restore instead of replaying the old report.
@@ -57,7 +57,7 @@ pub const WATCH_KEYS: [&str; 5] = [
     "close_bare_shells",
 ];
 /// Per-duty switches for `agentctl watch` (#1145 Phase 1).
-pub const DUTY_NAMES: [&str; 8] = [
+pub const DUTY_NAMES: [&str; 9] = [
     "notify",
     "status_requests",
     "tab_hygiene",
@@ -65,6 +65,7 @@ pub const DUTY_NAMES: [&str; 8] = [
     "herdr",
     "slot_images",
     "restore_check",
+    "agent_repair",
     "queue_drain",
 ];
 
@@ -88,7 +89,7 @@ pub fn parse_duty_override(spec: &str) -> Result<(String, bool)> {
     }
 }
 
-/// Watch duties, each defaulting on (today's behaviour). Unknown keys refused.
+/// Watch duties default on except opt-in agent repair. Unknown keys refused.
 /// `status_requests` is accepted but owned by the notifier (`watch-agents`) in
 /// Phase 1: it gates nothing `watch` itself does yet.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -115,6 +116,9 @@ pub struct WatchDuties {
     /// This boot's restore report check.
     #[serde(default = "default_true")]
     pub restore_check: bool,
+    /// Opt-in reconciliation of desired agents through the existing restore transaction.
+    #[serde(default)]
+    pub agent_repair: bool,
     /// Typing queued prompts and stale-queue findings.
     #[serde(default = "default_true")]
     pub queue_drain: bool,
@@ -129,6 +133,7 @@ impl Default for WatchDuties {
             herdr: true,
             slot_images: true,
             restore_check: true,
+            agent_repair: false,
             queue_drain: true,
         }
     }
@@ -144,6 +149,7 @@ impl WatchDuties {
             "herdr" => self.herdr,
             "slot_images" => self.slot_images,
             "restore_check" => self.restore_check,
+            "agent_repair" => self.agent_repair,
             "queue_drain" => self.queue_drain,
             _ => false,
         }
@@ -159,6 +165,7 @@ impl WatchDuties {
             "herdr" => self.herdr = on,
             "slot_images" => self.slot_images = on,
             "restore_check" => self.restore_check = on,
+            "agent_repair" => self.agent_repair = on,
             "queue_drain" => self.queue_drain = on,
             _ => unreachable!(),
         }
@@ -298,6 +305,10 @@ pub struct RestoreConfig {
     /// The coordinator's name in this registry; revived first.
     #[serde(default)]
     pub coordinator: Option<String>,
+    /// Refuse recovery when the recorded conversation cannot resume, rather than start fresh.
+    /// Always enabled by watch agent_repair; default false for manual restore compatibility.
+    #[serde(default)]
+    pub require_recorded_session: bool,
     /// Other registries that name the coordinator.
     #[serde(default)]
     pub also_registered: Vec<AlsoRegistered>,
@@ -541,6 +552,7 @@ impl RestoreConfig {
         Self {
             schema: CONFIG_SCHEMA.to_owned(),
             coordinator: None,
+            require_recorded_session: false,
             also_registered: Vec::new(),
             units: Vec::new(),
             exclude: Vec::new(),
@@ -1929,11 +1941,25 @@ fn recover_agent<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
     name: &str,
     options: &RestoreOptions,
+    require_recorded_session: bool,
 ) -> Value {
-    let status = manager.status(name).ok();
+    // A full status probe resolves the old Herdr name before looking at
+    // death evidence. Missing native names can wait for control timeouts;
+    // lifecycle selection needs only the validated durable record.
+    let status = manager.recovery_record(name).ok();
     let lifecycle = status
         .as_ref()
         .and_then(|value| value["lifecycle"].as_str().map(str::to_owned));
+    if require_recorded_session {
+        match manager.recovery_has_recorded_session(name) {
+            Ok(true) => {}
+            other => {
+                return json!({"name": name, "action": "refused", "reason": format!(
+                "recorded session required; never infer ownership from the newest transcript in a shared directory: {}",
+                other.err().map(|error| error.to_string()).unwrap_or_else(|| "record has no conversation ID; bind its verified session first".to_owned()))})
+            }
+        }
+    }
     if lifecycle.as_deref() == Some("launch_failed") {
         if options.dry_run {
             return json!({"name": name, "action": "promote", "dry_run": true});
@@ -1960,6 +1986,10 @@ fn recover_agent<A: ManagedApi + ?Sized>(
     } else {
         None
     };
+    if require_recorded_session && unresumable.is_some() {
+        return json!({"name": name, "action": "refused", "reason": format!(
+            "recorded session required: {}", unresumable.unwrap_or_default())});
+    }
     match plan["action"].as_str().unwrap_or_default() {
         "revive" if options.dry_run && unresumable.is_some() => json!({
             "name": name, "action": "revive-fresh", "dry_run": true, "reason": unresumable,
@@ -2630,6 +2660,17 @@ pub(crate) fn derived_lifecycle(
         .ok_or_else(|| format!("{} records no lifecycle", path.display()))
 }
 
+fn restore_notice_failure(message_id: &str, error: &AgentError) -> Value {
+    // Typed delivery failures carry a durable queue artifact. Do not tell the
+    // operator nothing was queued when the coordinator still has that prompt.
+    let outcome = match error {
+        AgentError::Pending(_) => "pending",
+        AgentError::PossiblySubmitted(_) => "possibly-submitted",
+        AgentError::Client(_) | AgentError::Delivery(_) => "not-queued",
+    };
+    json!({"message_id": message_id, "outcome": outcome, "detail": error.to_string()})
+}
+
 fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
     let rows = |key: &str| report[key].as_array().cloned().unwrap_or_default();
     let mut agents = rows("agents");
@@ -2993,9 +3034,14 @@ pub fn restore<A: ManagedApi + ?Sized>(
         .mode(0o600)
         .open(registry.join(".restore.lock"))
         .map_err(|error| fail(format!("cannot open the restore lock: {error}")))?;
-    // A second restore waits for the first, then replays its completed report.
-    lock.lock_exclusive()
-        .map_err(|error| fail(format!("cannot take the restore lock: {error}")))?;
+    // Never park a diagnostic or watchdog behind a hung recovery process.
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            fail("restore already running: restore lock is busy; retry after the active restore finishes")
+        } else {
+            fail(format!("cannot take the restore lock: {error}"))
+        }
+    })?;
     let boot_id = host.boot_id()?;
     let epoch = RestoreEpoch {
         boot_id: boot_id.clone(),
@@ -3154,7 +3200,15 @@ pub fn restore<A: ManagedApi + ?Sized>(
             }
         }
     }
-    report["herdr"] = wait_for_herdr(client, host, Duration::from_secs(config.herdr_wait_seconds));
+    report["herdr"] = wait_for_herdr(
+        client,
+        host,
+        if options.dry_run {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(config.herdr_wait_seconds)
+        },
+    );
     // Desired state includes Herdr up (#742): start its unit and wait again.
     if report["herdr"]["ready"] != true {
         if let Some(unit) = config.herdr_unit.as_deref() {
@@ -3193,7 +3247,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
             } else if let Some(Err(reason)) = &bind {
                 json!({"name": name, "action": "refused", "reason": reason, "slot_bind": {"action": "refused"}})
             } else {
-                recover_agent(&manager, name, options)
+                recover_agent(&manager, name, options, config.require_recorded_session)
             };
             if let Some(Ok(verified)) = &bind {
                 row["slot_bind"] = verified.clone();
@@ -3290,7 +3344,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 continue;
             }
             eprintln!("agentctl restore: restoring {name}");
-            let mut row = recover_agent(&manager, name, options);
+            let mut row = recover_agent(&manager, name, options, config.require_recorded_session);
             if let Some(Ok(verified)) = &bind {
                 row["slot_bind"] = verified.clone();
             }
@@ -3521,6 +3575,9 @@ pub fn restore<A: ManagedApi + ?Sized>(
             let options = DrainOptions {
                 ready_timeout: Duration::from_secs(60),
                 deliver_while_working: true,
+                deadline: Some(Duration::from_secs(10)),
+                lock_timeout: Some(Duration::from_secs(1)),
+                max_items: Some(1),
                 ..DrainOptions::default()
             };
             report["notice"] = match manager.send_identified(
@@ -3534,9 +3591,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 Ok(result) => {
                     json!({"message_id": message_id, "outcome": json!(result)["outcome"]})
                 }
-                Err(error) => {
-                    json!({"message_id": message_id, "outcome": "not-queued", "detail": error.to_string()})
-                }
+                Err(error) => restore_notice_failure(&message_id, &error),
             };
         }
     }
@@ -3576,6 +3631,8 @@ pub struct WatchOptions {
     pub state_dir: Option<PathBuf>,
     /// A queued prompt pending longer than this is a finding, with its age (#804).
     pub queue_stale: Duration,
+    /// Maximum prompts per agent per pass; None retains unbounded delivery.
+    pub queue_max_items: Option<usize>,
 }
 
 /// Seconds a finding waits before the coordinator is told about it again.
@@ -3970,6 +4027,15 @@ fn service_failure(host: &dyn Host, timer: &TimerWatch) -> Check {
     )
 }
 
+fn watch_desires_agent(config: &RestoreConfig, name: &str) -> bool {
+    config.coordinator.as_deref() == Some(name)
+        || (!config.exclude.iter().any(|excluded| excluded == name)
+            && config
+                .agents
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|desired| desired == name)))
+}
+
 /// One pass of checks, repairs, and findings.
 ///
 /// Only a problem the service manager confirmed is repaired. A unit or timer that systemctl could
@@ -4299,12 +4365,18 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             // R1b on the watch pass too: a harness hand-restarted in its
             // recorded pane with its recorded session is re-pinned here,
             // not only when someone sends to it.
+            let desired_names = manager
+                .listed_names()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|name| watch_desires_agent(config, name))
+                .collect::<Vec<_>>();
             if !options.check_only {
-                for name in crate::subagents::restore_agent_names(registry) {
-                    if manager.auto_repin_resumed(&name) {
+                for name in &desired_names {
+                    if manager.auto_repin_resumed(name) {
                         findings.push(finding(
                             "repin",
-                            &name,
+                            name,
                             true,
                             "re-pinned a hand-restarted harness in its recorded pane",
                             Value::Null,
@@ -4314,7 +4386,13 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             }
             let now_millis = (host.now() * 1000.0) as u64;
             for row in if duties.queue_drain {
-                manager.drain_pending(options.queue_stale, options.check_only, now_millis)
+                manager.drain_pending_bounded(
+                    options.queue_stale,
+                    options.check_only,
+                    now_millis,
+                    options.queue_max_items,
+                    Some(&desired_names),
+                )
             } else {
                 Vec::new()
             } {
@@ -4345,6 +4423,12 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
         }
     }
 
+    if duties.agent_repair {
+        findings.push(reconcile_agents(client, registry, host, config, options));
+    } else {
+        findings.push(skipped("agent_repair"));
+    }
+
     if let (Some(name), true) = (config.coordinator.as_deref(), herdr_up) {
         if let Ok(manager) = ManagedAgents::new(client, registry) {
             let plan = manager.revive(name, true, None, Duration::from_secs(30));
@@ -4359,7 +4443,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 name,
                 alive,
                 match &plan {
-                    Ok(plan) if alive => "harness alive".to_owned(),
+                    Ok(_) if alive => "harness alive".to_owned(),
                     Ok(plan) => format!(
                         "{}: {}",
                         plan["action"].as_str().unwrap_or("?"),
@@ -4386,6 +4470,82 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     findings
 }
 
+// The watcher is only a caller of restore: its lock, identity proofs, journal,
+// desired-set rules and session verification remain the single repair authority.
+fn reconcile_agents<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    host: &dyn Host,
+    config: &RestoreConfig,
+    options: &WatchOptions,
+) -> Value {
+    if config.coordinator.is_none() {
+        return finding(
+            "agent_repair",
+            "team",
+            false,
+            "configure a registered coordinator before enabling agent repair",
+            Value::Null,
+        );
+    }
+    let mut config = config.clone();
+    config.require_recorded_session = true;
+    // Infrastructure is reconciled by the earlier watch duties. A planning
+    // pass must not wait for an unavailable server or credential.
+    config.herdr_wait_seconds = 0;
+    config.certificate_wait_seconds = Some(0);
+    let mut restore_options = RestoreOptions {
+        dry_run: true,
+        force: true,
+        startup_timeout: Duration::from_secs(30),
+        wrkslots: options.wrkslots.clone(),
+        ..RestoreOptions::default()
+    };
+    let plan = match restore(client, registry, host, &config, &restore_options) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return finding(
+                "agent_repair",
+                "team",
+                false,
+                error.to_string(),
+                Value::Null,
+            )
+        }
+    };
+    let needs_repair = std::iter::once(&plan["coordinator"])
+        .chain(plan["agents"].as_array().into_iter().flatten())
+        .any(|row| matches!(row["action"].as_str(), Some("revive" | "promote")));
+    if needs_repair && !options.check_only {
+        restore_options.dry_run = false;
+        match restore(client, registry, host, &config, &restore_options) {
+            Ok(report) => finding(
+                "agent_repair",
+                "team",
+                restore_exit_code(&report, false) == 0,
+                "reconciled desired agents through restore; see repair report for each outcome",
+                report,
+            ),
+            Err(error) => finding("agent_repair", "team", false, error.to_string(), plan),
+        }
+    } else {
+        let ready = !needs_repair && plan["would_complete"] == true;
+        finding(
+            "agent_repair",
+            "team",
+            ready,
+            if needs_repair {
+                "desired agents need repair (check only)"
+            } else if ready {
+                "desired agents already running"
+            } else {
+                "desired agents could not be verified; see repair plan for refusals"
+            },
+            plan,
+        )
+    }
+}
+
 fn health_path(options: &WatchOptions) -> Option<PathBuf> {
     options
         .state_dir
@@ -4396,6 +4556,17 @@ fn health_path(options: &WatchOptions) -> Option<PathBuf> {
         .map(|dir| dir.join("health.json"))
 }
 
+fn queue_owned_notice_budget(findings: &[Value], coordinator: Option<&str>) -> bool {
+    coordinator.is_some()
+        && findings.iter().any(|row| {
+            row["check"] == "queue"
+                && row["subject"].as_str() == coordinator
+                && row["repair"]["queued"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+        })
+}
+
 /// Tell the coordinator about failing findings, each at most once an hour, when it can hear.
 fn alert<A: ManagedApi + ?Sized>(
     client: &A,
@@ -4404,7 +4575,17 @@ fn alert<A: ManagedApi + ?Sized>(
     host: &dyn Host,
     findings: &[Value],
     alerted: &mut BTreeMap<String, f64>,
+    queue_max_items: Option<usize>,
 ) -> Value {
+    if queue_max_items.is_some()
+        && queue_owned_notice_budget(findings, config.coordinator.as_deref())
+    {
+        // send_identified also drains older queued prompts. Reserve this
+        // pass for the bounded queue drain, even if it used less than its
+        // cap: concurrent enqueues make queue-length differences inexact.
+        // Findings still go to stderr/health.json and retry next pass.
+        return json!({"sent": false, "reason": "queue delivery owns this pass's prompt budget; alert deferred to next pass"});
+    }
     let now = host.now();
     let due = findings
         .iter()
@@ -4456,13 +4637,19 @@ fn alert<A: ManagedApi + ?Sized>(
             DrainOptions {
                 ready_timeout: Duration::from_secs(30),
                 deliver_while_working: true,
+                deadline: Some(Duration::from_secs(10)),
+                lock_timeout: Some(Duration::from_secs(1)),
+                max_items: Some(1),
                 ..DrainOptions::default()
             },
             Some(&message_id),
-            None,
+            Some("watch-health"),
         )
     });
-    for row in &due {
+    let delivered = result
+        .as_ref()
+        .is_ok_and(|result| result.delivered.contains(&message_id));
+    for row in due.iter().filter(|_| delivered) {
         let key = format!(
             "{}:{}",
             row["check"].as_str().unwrap_or(""),
@@ -4472,7 +4659,7 @@ fn alert<A: ManagedApi + ?Sized>(
     }
     match result {
         Ok(result) => {
-            json!({"sent": true, "message_id": message_id, "outcome": json!(result)["outcome"]})
+            json!({"sent": delivered, "message_id": message_id, "outcome": json!(result)["outcome"]})
         }
         Err(error) => json!({"sent": false, "message_id": message_id, "reason": error.to_string()}),
     }
@@ -4791,7 +4978,15 @@ pub fn watch<A: ManagedApi + ?Sized>(
         } else if options.check_only {
             json!({"sent": false, "reason": "check only"})
         } else {
-            alert(client, registry, config, host, &findings, &mut alerted)
+            alert(
+                client,
+                registry,
+                config,
+                host,
+                &findings,
+                &mut alerted,
+                options.queue_max_items,
+            )
         };
         let line = |row: &Value| {
             format!(
@@ -4866,6 +5061,59 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn watch_queue_selection_matches_the_desired_team() {
+        let config: RestoreConfig = serde_json::from_value(json!({
+            "schema": CONFIG_SCHEMA, "coordinator": "lead",
+            "agents": ["wanted", "excluded"], "exclude": ["excluded"]
+        }))
+        .unwrap();
+        assert!(watch_desires_agent(&config, "lead"));
+        assert!(watch_desires_agent(&config, "wanted"));
+        assert!(!watch_desires_agent(&config, "excluded"));
+        assert!(!watch_desires_agent(&config, "historical"));
+        let mut derived = config;
+        derived.agents = None;
+        assert!(watch_desires_agent(&derived, "historical"));
+        assert!(!watch_desires_agent(&derived, "excluded"));
+    }
+
+    #[test]
+    fn bounded_queue_pass_reserves_its_coordinator_notice_budget() {
+        let rows = vec![finding(
+            "queue",
+            "lead",
+            true,
+            "typed three",
+            json!({"queued": 5, "typed": 3, "remaining": 2}),
+        )];
+        assert!(queue_owned_notice_budget(&rows, Some("lead")));
+        assert!(!queue_owned_notice_budget(&rows, Some("other")));
+        assert!(!queue_owned_notice_budget(&rows, None));
+        assert!(!queue_owned_notice_budget(&[], Some("lead")));
+    }
+
+    #[test]
+    fn restore_notice_keeps_durable_delivery_failures_visible() {
+        let pending = crate::agent::UndeliveredMessage {
+            message: "waiting for coordinator".to_owned(),
+            message_id: "restore-boot".to_owned(),
+            artifact: PathBuf::from("queue/inbox/restore-boot.json"),
+        };
+        for (error, expected) in [
+            (AgentError::Pending(pending.clone()), "pending"),
+            (AgentError::PossiblySubmitted(pending), "possibly-submitted"),
+            (
+                AgentError::Delivery("failed before enqueue".to_owned()),
+                "not-queued",
+            ),
+        ] {
+            let report = restore_notice_failure("restore-boot", &error);
+            assert_eq!(report["outcome"], expected);
+            assert_eq!(report["message_id"], "restore-boot");
+        }
+    }
 
     #[test]
     fn initial_pid_namespace_reads_nspid_levels() {

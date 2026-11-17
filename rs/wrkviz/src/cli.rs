@@ -267,7 +267,11 @@ fn run_userguide(rest: &[String]) -> u8 {
             "wrkviz",
             &format!(
                 "argument command: invalid choice: '{token}' (choose from {})",
-                SUBCOMMANDS.join(", ")
+                SUBCOMMANDS
+                    .iter()
+                    .map(|name| format!("'{name}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         );
     }
@@ -3676,7 +3680,7 @@ fn run_query(args: &[String]) -> u8 {
                             QUERY_USAGE,
                             "wrkviz query",
                             &format!(
-                                "argument --format: invalid choice: '{}' (choose from json, jsonl, markdown, text)",
+                                "argument --format: invalid choice: '{}' (choose from 'json', 'jsonl', 'markdown', 'text')",
                                 value
                             ),
                         );
@@ -3698,7 +3702,7 @@ fn run_query(args: &[String]) -> u8 {
                             QUERY_USAGE,
                             "wrkviz query",
                             &format!(
-                                "argument query_action: invalid choice: '{arg}' (choose from list, show, search, prompts, messages, stats)"
+                                "argument query_action: invalid choice: '{arg}' (choose from 'list', 'show', 'search', 'prompts', 'messages', 'stats')"
                             ),
                         );
                     }
@@ -3992,7 +3996,7 @@ fn run_query_transcript(
                                     usage,
                                     &prog,
                                     &format!(
-                                        "argument --which: invalid choice: '{value}' (choose from human, bot, all)"
+                                        "argument --which: invalid choice: '{value}' (choose from 'human', 'bot', 'all')"
                                     ),
                                 );
                             }
@@ -4200,10 +4204,15 @@ fn run_query_search(output: &str, format: &str, args: &[String], output_missing:
     let mut extras: Vec<String> = Vec::new();
     let mut after_separator = false;
     let mut index = 0;
-    let choice = |name: &str, value: &str, choices: &[&str], rendered: &str| -> Option<u8> {
+    let choice = |name: &str, value: &str, choices: &[&str]| -> Option<u8> {
         if choices.contains(&value) {
             return None;
         }
+        let rendered = choices
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         Some(argparse_error(
             QUERY_SEARCH_USAGE,
             prog,
@@ -4285,63 +4294,46 @@ fn run_query_search(output: &str, format: &str, args: &[String], output_missing:
                                 name,
                                 &value,
                                 &["owner-prompts", "agent-responses", "all-transcript"],
-                                "owner-prompts, agent-responses, all-transcript",
                             ) {
                                 return code;
                             }
                             corpus = Some(value);
                         }
                         1 => {
-                            if let Some(code) = choice(
-                                name,
-                                &value,
-                                &["summaries", "transcripts", "all"],
-                                "summaries, transcripts, all",
-                            ) {
+                            if let Some(code) =
+                                choice(name, &value, &["summaries", "transcripts", "all"])
+                            {
                                 return code;
                             }
                             scope = Some(value);
                         }
                         2 => {
-                            if let Some(code) = choice(
-                                name,
-                                &value,
-                                &["smart", "phrase", "literal"],
-                                "smart, phrase, literal",
-                            ) {
+                            if let Some(code) =
+                                choice(name, &value, &["smart", "phrase", "literal"])
+                            {
                                 return code;
                             }
                             match_mode = Some(value);
                         }
                         3 => {
-                            if let Some(code) = choice(
-                                name,
-                                &value,
-                                &["relevance", "newest", "oldest"],
-                                "relevance, newest, oldest",
-                            ) {
+                            if let Some(code) =
+                                choice(name, &value, &["relevance", "newest", "oldest"])
+                            {
                                 return code;
                             }
                             sort = Some(value);
                         }
                         4 => {
-                            if let Some(code) = choice(
-                                name,
-                                &value,
-                                &["any", "owner", "agent", "unclassified"],
-                                "any, owner, agent, unclassified",
-                            ) {
+                            if let Some(code) =
+                                choice(name, &value, &["any", "owner", "agent", "unclassified"])
+                            {
                                 return code;
                             }
                             prompt_author = Some(value);
                         }
                         5 => {
-                            if let Some(code) = choice(
-                                name,
-                                &value,
-                                &["any", "linked", "unlinked"],
-                                "any, linked, unlinked",
-                            ) {
+                            if let Some(code) = choice(name, &value, &["any", "linked", "unlinked"])
+                            {
                                 return code;
                             }
                             linkage = Some(value);
@@ -4360,7 +4352,6 @@ fn run_query_search(output: &str, format: &str, args: &[String], output_missing:
                                     "tool",
                                     "event",
                                 ],
-                                "user, assistant, agent, system, external, goal, tool, event",
                             ) {
                                 return code;
                             }
@@ -4389,7 +4380,6 @@ fn run_query_search(output: &str, format: &str, args: &[String], output_missing:
                                 name,
                                 &value,
                                 &["hourly", "daily", "weekly", "monthly", "quarterly"],
-                                "hourly, daily, weekly, monthly, quarterly",
                             ) {
                                 return code;
                             }
@@ -4618,7 +4608,7 @@ fn run_query_stats(output: &str, format: &str, args: &[String], output_missing: 
                                     QUERY_STATS_USAGE,
                                     "wrkviz query stats",
                                     &format!(
-                                        "argument --kind: invalid choice: '{value}' (choose from hourly, daily, weekly, monthly, quarterly)"
+                                        "argument --kind: invalid choice: '{value}' (choose from 'hourly', 'daily', 'weekly', 'monthly', 'quarterly')"
                                     ),
                                 );
                             }
@@ -4698,7 +4688,7 @@ fn run_query_list(output: &str, format: &str, args: &[String], output_missing: b
                         QUERY_LIST_USAGE,
                         "wrkviz query list",
                         &format!(
-                            "argument resource: invalid choice: '{arg}' (choose from teams, agents, phases, rollups)"
+                            "argument resource: invalid choice: '{arg}' (choose from 'teams', 'agents', 'phases', 'rollups')"
                         ),
                     );
                 }
@@ -4758,7 +4748,7 @@ fn run_query_list(output: &str, format: &str, args: &[String], output_missing: b
                                     QUERY_LIST_USAGE,
                                     "wrkviz query list",
                                     &format!(
-                                        "argument --kind: invalid choice: '{value}' (choose from hourly, daily, weekly, monthly, quarterly)"
+                                        "argument --kind: invalid choice: '{value}' (choose from 'hourly', 'daily', 'weekly', 'monthly', 'quarterly')"
                                     ),
                                 );
                             }
@@ -4790,7 +4780,7 @@ fn run_query_list(output: &str, format: &str, args: &[String], output_missing: b
                     QUERY_LIST_USAGE,
                     "wrkviz query list",
                     &format!(
-                        "argument resource: invalid choice: '{arg}' (choose from teams, agents, phases, rollups)"
+                        "argument resource: invalid choice: '{arg}' (choose from 'teams', 'agents', 'phases', 'rollups')"
                     ),
                 );
             } else {
@@ -6125,7 +6115,7 @@ fn run_discover_agents(args: &[String]) -> u8 {
                 DISCOVER_AGENTS_USAGE,
                 "wrkviz discover-agents",
                 &format!(
-                    "argument --format: invalid choice: '{value}' (choose from markdown, json)"
+                    "argument --format: invalid choice: '{value}' (choose from 'markdown', 'json')"
                 ),
             );
         }

@@ -364,7 +364,7 @@ exit $rc"#,
 
 /// Like [`RUNNER`], and a test file that says FLAKY fails unless the run is a same-commit rerun.
 const FLAKY_RUNNER: &str = r#"echo "run-$$" > "$MQ_HANDLE_FILE"
-[ -n "$MQ_RERUN_FROM" ] && echo "$MQ_RERUN_FROM" >> "$RERUNS"
+[ "$MQ_PURPOSE" = candidate-probe ] && [ -n "$MQ_RERUN_FROM" ] && echo "$MQ_RERUN_FROM" >> "$RERUNS"
 if [ "$MQ_SELECTION" = tests ]; then set -- $MQ_TESTS; else set -- $(ls tests); fi
 rc=0
 for t in "$@"; do
@@ -419,10 +419,33 @@ fn split_red_batches_splits_a_red_batch_and_confirms_each_single_before_ejecting
     let landed: Vec<i64> = landed(&report).into_iter().flatten().collect();
     assert!(landed.contains(&1) && landed.contains(&3), "{report}");
     // Each single was confirmed by one rerun of the same commit, handed the red run's handle.
-    let handed: Vec<String> = std::fs::read_to_string(&reruns)
+    // A speculative batch can have the original combined batch's commit and reuse its handle
+    // before cancellation. FLAKY_RUNNER records confirmation probes only, not those batch runs.
+    let probes: Vec<&Value> = validations
+        .iter()
+        .filter(|v| v["purpose"] == "probe")
+        .collect();
+    assert_eq!(probes.len(), 2, "{report}");
+    let mut expected_handles = Vec::new();
+    for probe in probes {
+        let original = validations
+            .iter()
+            .find(|v| {
+                v["purpose"] == "batch"
+                    && v["commit"] == probe["commit"]
+                    && v["prs"] == probe["prs"]
+                    && v["exit"] == 1
+            })
+            .expect("each confirmation must rerun its single's red commit");
+        let handle = Path::new(original["dir"].as_str().unwrap()).join("handle.txt");
+        expected_handles.push(std::fs::read_to_string(handle).unwrap().trim().to_owned());
+    }
+    expected_handles.sort();
+    let mut handed: Vec<String> = std::fs::read_to_string(&reruns)
         .unwrap_or_default()
         .lines()
         .map(str::to_owned)
         .collect();
-    assert_eq!(handed.len(), 2, "{handed:?}");
+    handed.sort();
+    assert_eq!(handed, expected_handles, "{report}");
 }

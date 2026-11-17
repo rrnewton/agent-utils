@@ -3526,6 +3526,15 @@ print(json.dumps(out, sort_keys=True))
         std::fs::create_dir_all(worktrees.join("validate")).expect("dirs");
         std::fs::create_dir_all(root.join("ignored/validate/runs")).expect("dirs");
         std::fs::create_dir_all(root.join("upstream-repo")).expect("dirs");
+        // The cleanup authority requires an owner-controlled fence root;
+        // do not inherit a developer shell's group-writable umask.
+        for directory in [&root, &worktrees, &worktrees.join("validate")] {
+            std::fs::set_permissions(
+                directory,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .expect("private fixture ancestor");
+        }
         std::fs::write(root.join("live.py"), "# probe\n").expect("live");
         std::fs::write(
             root.join(".wrkslots.yml"),

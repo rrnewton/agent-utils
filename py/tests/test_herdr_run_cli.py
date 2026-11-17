@@ -1270,18 +1270,24 @@ def test_an_argument_that_reads_like_the_utf8_option_does_not_stop_the_restart(
 def test_the_environment_is_put_back_to_the_one_executed_with(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("LC_CTYPE", "C.UTF-8")
-    monkeypatch.setenv("HERDR_RUN_TEST_KEPT", "changed")
-    monkeypatch.delenv("HERDR_RUN_TEST_GONE", raising=False)
-    original = dict(os.environb)
-    del original[b"LC_CTYPE"]
-    original[b"HERDR_RUN_TEST_KEPT"] = b"original"
-    original[b"HERDR_RUN_TEST_GONE"] = b"\xffback"
-    cli_module._restore_environment(original)
-    assert "LC_CTYPE" not in os.environ
-    assert os.environ["HERDR_RUN_TEST_KEPT"] == "original"
-    assert os.environb[b"HERDR_RUN_TEST_GONE"] == b"\xffback"
-    assert dict(os.environb) == original
+    before = dict(os.environb)
+    with monkeypatch.context() as isolated:
+        isolated.setenv("LC_CTYPE", "C.UTF-8")
+        isolated.setenv("HERDR_RUN_TEST_KEPT", "changed")
+        # Register an undo even when this name was absent before the test.
+        # _restore_environment adds it directly, outside monkeypatch's tracking.
+        isolated.setenv("HERDR_RUN_TEST_GONE", "temporary")
+        isolated.delenv("HERDR_RUN_TEST_GONE")
+        original = dict(os.environb)
+        del original[b"LC_CTYPE"]
+        original[b"HERDR_RUN_TEST_KEPT"] = b"original"
+        original[b"HERDR_RUN_TEST_GONE"] = b"\xffback"
+        cli_module._restore_environment(original)
+        assert "LC_CTYPE" not in os.environ
+        assert os.environ["HERDR_RUN_TEST_KEPT"] == "original"
+        assert os.environb[b"HERDR_RUN_TEST_GONE"] == b"\xffback"
+        assert dict(os.environb) == original
+    assert dict(os.environb) == before
 
 
 def test_proc_strings_keep_empty_arguments_and_an_empty_environment(

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import datetime as dt
 import fcntl
 import os
 import time
@@ -439,6 +440,23 @@ def test_registry_identity_covers_registry_files_and_ignores_everything_else(
     assert "file(s) in EVENTS.testhost" in described
 
 
+def _advance_heartbeat(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make an actual row change even if create and heartbeat finish in one second."""
+    config = cli._load_config(str(project), "testhost")
+    record = next(row for row in cli._load_active(config).slots if row.slot == "slot01")
+    later = (dt.datetime.fromisoformat(record.heartbeat_at) + dt.timedelta(seconds=1)).isoformat(
+        timespec="seconds"
+    )
+    with monkeypatch.context() as clock:
+        clock.setattr(cli, "_utc_now", lambda: later)
+        assert cli.main([
+            "--project-root", str(project), "heartbeat", "slot01", "--agent", "codex-1",
+            "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        ]) == 0
+    changed = next(row for row in cli._load_active(config).slots if row.slot == "slot01")
+    assert changed.heartbeat_at == later and changed != record
+
+
 def test_post_write_check_rederives_local_rows_and_falls_back_for_anything_else(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -459,12 +477,8 @@ def test_post_write_check_rederives_local_rows_and_falls_back_for_anything_else(
         validations.append("validate")
         return validate(config, require_repository=require_repository)
 
+    _advance_heartbeat(project, monkeypatch)
     monkeypatch.setattr(cli, "_validate_global_state", counted)
-    beat = command(
-        project, "heartbeat", "slot01", "--agent", "codex-1", "--owner-pid", str(os.getpid()),
-        "--expected-generation", "1",
-    )
-    assert beat.returncode == 0, beat.stderr
 
     # Only this machine's shard and log changed: its rows are re-derived, nothing else read.
     cli._assert_registry_change_limited_to_slot(config, reference, before, "slot01")
@@ -515,11 +529,7 @@ def test_post_write_check_reads_only_the_events_appended_after_the_verified_tip(
     empty = cli._RegistryIdentity(reference.config_sha256, ())
     assert cli._verified_local_log(config, empty, states, archives) is None
 
-    beat = command(
-        project, "heartbeat", "slot01", "--agent", "codex-1", "--owner-pid", str(os.getpid()),
-        "--expected-generation", "1",
-    )
-    assert beat.returncode == 0, beat.stderr
+    _advance_heartbeat(project, monkeypatch)
     appended = _event_count(project) - local.sequence
     assert appended >= 1
     loads: list[str] = []

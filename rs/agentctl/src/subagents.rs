@@ -11510,6 +11510,18 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         keys.into_iter().collect()
     }
 
+    /// Validated durable metadata without probing a terminal that may no longer exist.
+    pub(crate) fn recovery_record(&self, agent_name: &str) -> Result<Value> {
+        self.load(agent_name)?.document()
+    }
+
+    pub(crate) fn recovery_has_recorded_session(&self, agent_name: &str) -> Result<bool> {
+        let record = self.load(agent_name)?;
+        Ok(record.effective_native_session().is_some()
+            || record.resume.is_some()
+            || record.session_value.is_some())
+    }
+
     /// Report live state or an explicit probe error without reaping durable records.
     pub fn status(&self, agent_name: &str) -> Result<Value> {
         let record = self.load(agent_name)?;
@@ -12159,7 +12171,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// (restore's old report directory, #1359) is not an agent and is
     /// skipped, while a record that exists but cannot be read still gets
     /// its own error row from the caller.
-    fn listed_names(&self) -> Result<Vec<String>> {
+    pub(crate) fn listed_names(&self) -> Result<Vec<String>> {
         Ok(self
             .registered_names()?
             .into_iter()
@@ -12293,6 +12305,20 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         check_only: bool,
         now_millis: u64,
     ) -> Vec<Value> {
+        self.drain_pending_bounded(stale, check_only, now_millis, None, None)
+    }
+
+    /// Drain each agent's queue with an optional per-pass prompt bound.
+    /// The working-harness fallback shares that bound with the initial drain.
+    /// When supplied, only_names excludes every other agent before any write.
+    pub fn drain_pending_bounded(
+        &self,
+        stale: std::time::Duration,
+        check_only: bool,
+        now_millis: u64,
+        max_items: Option<usize>,
+        only_names: Option<&[String]>,
+    ) -> Vec<Value> {
         let mut rows = Vec::new();
         let Ok(agents) = self.watch_rows() else {
             return rows;
@@ -12301,6 +12327,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             let Some(name) = row["name"].as_str() else {
                 continue;
             };
+            if only_names.is_some_and(|names| !names.iter().any(|allowed| allowed == name)) {
+                continue;
+            }
             if row["mode"].as_str() == Some("headless") {
                 // Headless queues are drained by their own wrapper, never by
                 // this pass — but their oldest item's age still alarms the
@@ -12360,6 +12389,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         working_timeout: std::time::Duration::from_secs(10),
                         deadline: Some(std::time::Duration::from_secs(30)),
                         deliver_while_working: true,
+                        max_items,
                         ..DrainOptions::default()
                     },
                 );
@@ -12380,6 +12410,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         }
                     }
                 }
+                // Count this drain's confirmed/uncertain submissions, not the
+                // change in queue length: other senders may enqueue meanwhile.
+                // An error cannot prove an unused budget, so a bounded pass
+                // leaves the fallback for the next pass in that case.
+                let budget_left = max_items.is_none_or(|limit| {
+                    drained.as_ref().is_ok_and(|result| {
+                        result.delivered.len() + result.quarantined.len() < limit
+                    })
+                });
                 let drain_error = drained.err().map(|error| error.to_string());
                 let mut remaining = self
                     .pending_prompts(name)
@@ -12390,7 +12429,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 // prompt the way an urgent send does, waiting inside the call
                 // for the boundary instead of sampling it.
                 let harness = row["harness"].as_str().unwrap_or_default();
-                if remaining > 0 && (harness == "muse" || harness.starts_with("claude")) {
+                if budget_left
+                    && remaining > 0
+                    && (harness == "muse" || harness.starts_with("claude"))
+                {
                     if let Some((identifier, _)) = self
                         .pending_prompts(name)
                         .ok()

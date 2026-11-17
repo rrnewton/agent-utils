@@ -3737,3 +3737,60 @@ fn restart_with_resume_refuses_a_recorded_launch_environment_before_ending_anyth
         "a refused same-pane restart must not end the harness"
     );
 }
+
+#[test]
+fn revive_native_idle_shell_accepts_only_its_recorded_session() {
+    for harness in ["codex", "claude"] {
+        let (fixture, old) = recoverable(harness, true);
+        fixture
+            .client
+            .stale_reported_panes
+            .lock()
+            .unwrap()
+            .insert(old.pane_id.clone().unwrap());
+        let plan = fixture
+            .manager()
+            .revive("worker", true, None, TIMEOUT)
+            .unwrap();
+        assert_eq!(plan["action"], "revive", "{harness}: {plan}");
+        let result = fixture
+            .manager()
+            .revive("worker", false, Some(&old.token), TIMEOUT)
+            .unwrap();
+        assert_eq!(result["revived"], true, "{result}");
+        assert_eq!(
+            fixture.manager().load("worker").unwrap().session_value,
+            old.session_value
+        );
+    }
+}
+
+#[test]
+fn revive_native_idle_shell_refuses_foreign_or_unproved_session_metadata() {
+    for missing_shell_proof in [true, false] {
+        let (fixture, old) = recoverable("codex", true);
+        fixture
+            .client
+            .stale_reported_panes
+            .lock()
+            .unwrap()
+            .insert(old.pane_id.clone().unwrap());
+        if missing_shell_proof {
+            fixture
+                .client
+                .fail_shell_proof
+                .store(true, Ordering::Relaxed);
+        } else {
+            *fixture.client.session_override.lock().unwrap() =
+                Some((Some("codex".to_owned()), Some("another-session".to_owned())));
+        }
+        let plan = fixture
+            .manager()
+            .revive("worker", true, None, TIMEOUT)
+            .unwrap();
+        assert_eq!(plan["action"], "blocked", "{plan}");
+        assert_eq!(fixture.manager().load("worker").unwrap().token, old.token);
+        assert!(fixture.client.closed.lock().unwrap().is_empty());
+        assert_eq!(fixture.client.environments.lock().unwrap().len(), 1);
+    }
+}
