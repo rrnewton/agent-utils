@@ -220,10 +220,12 @@ already used, run `pair-link` again and send the new link; if they had not opene
 else did, and the write token should be rotated. The full protocol and its limits are under
 "Pairing a phone" in the README.
 
-**Your first channel.** The channels in the configuration are the channels in the app; there
-is no in-app step that creates the first one. To add one, add a `[[channels]]` entry (or extend
-`VIBE_TALK_CHANNELS`), restart, and run `vibe-talk doctor` again. If the app opens with no
-channels, the configuration it loaded has none that the startup probe could read.
+**Your first channel.** If the app opens with no channels, add one in **Settings → Channels →
+Add a channel**, or add a `[[channels]]` entry (or extend `VIBE_TALK_CHANNELS`), restart, and
+run `vibe-talk doctor` again. If it still opens with none, the configuration it loaded has
+none that the startup probe could read. On first open the welcome screen maps the app in one
+screen — Channel home, Threads, Discuss, Documents, Voice, Read/Pace, Done/Undo, Search —
+and the guide and the page use those same names.
 
 ## 4. When setup goes wrong
 

@@ -32,7 +32,7 @@ phone. The new `vibe-talk/SETUP.md` is the hand-off it should point at.
 | 7 | `pair-link` "could not reach the server" did not say what to check next | Error now points at `vibe-talk doctor` and at the bind address in the configuration | Done here |
 | 8 | iOS pairing is a paste-into-the-app flow that no install doc described in sequence | SETUP section 3 gives Android and iOS steps in order, including the unused-link paste | Done here |
 | 9 | The site demo page described the quickstart but linked no route or pairing guidance | Site "Running it yourself" now links SETUP first | Done here |
-| 10 | No channels after sign-in reads as an app bug; channels exist only in configuration | SETUP "Your first channel" says so and gives the restart-plus-doctor loop | Done here (docs) |
+| 10 | No channels after sign-in reads as an app bug, with two routes to the same list (in-app Settings → Channels, or configuration plus restart) that no doc named together | SETUP "Your first channel" names both routes to the same list, in the wording agreed with the first-run welcome lane | Done here (docs) |
 
 ## Follow-up proposals for the coordinator (not done here)
 
