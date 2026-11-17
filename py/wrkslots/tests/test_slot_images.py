@@ -595,6 +595,14 @@ def _sandbox_host_or_skip(isolation: str) -> None:
 
         if Path.home() != Path(pwd.getpwuid(os.getuid()).pw_dir):
             pytest.skip("isolation root needs the passwd home, not a hermetic HOME")
+        # Root live tests run only against the installed, root-owned
+        # helper - never the agent-writable checkout copy (#1583).
+        if (
+            not sandbox._INSTALLED_HELPER.is_file()
+            or sandbox._installed_helper_version(sandbox._INSTALLED_HELPER)
+            != sandbox._HELPER_VERSION
+        ):
+            pytest.skip("isolation root live tests need the installed root helper")
 
 
 @pytest.fixture

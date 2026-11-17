@@ -369,6 +369,7 @@ def test_root_helper_is_a_fixed_stdin_argv(
     helper = str(Path(sandbox.__file__).resolve())
     interpreter = os.path.realpath(sys.executable)
 
+    monkeypatch.setenv("WRKSLOTS_ALLOW_CHECKOUT_HELPER", "1")
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
     assert sandbox.root_helper() == [
         "sudo", "-n", "--", interpreter, "-I", "-B", "-S", helper, "enter-root"
@@ -392,6 +393,7 @@ def test_root_helper_carries_the_callers_dash_b_across_sudo_by_argv(
         if key != "PYTHONDONTWRITEBYTECODE"
     }
     environment["PYTHONPATH"] = str(PACKAGE_ROOT.parent)
+    environment["WRKSLOTS_ALLOW_CHECKOUT_HELPER"] = "1"
     completed = subprocess.run(
         [
             sys.executable, *flags, "-c",
@@ -785,6 +787,7 @@ def _in_scope_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
     target.mkdir(parents=True)
     (tmp_path / "control").mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("WRKSLOTS_ALLOW_CHECKOUT_HELPER", "1")
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     monkeypatch.delenv("WRKSLOTS_BOX", raising=False)
     cgroup = tmp_path / "cgroup"
@@ -842,6 +845,7 @@ def test_enter_in_place_runs_the_root_steps_in_the_callers_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     home, target, cgroup, log = _in_scope_host(tmp_path, monkeypatch)
+    monkeypatch.setenv("WRKSLOTS_ALLOW_CHECKOUT_HELPER", "1")
     _no_rediscovery(monkeypatch)
     view = _slot_view(tmp_path)
     settings = _closed_settings(target)
@@ -1052,6 +1056,7 @@ def test_a_dash_b_placement_and_root_helper_write_no_bytecode(
     before = _tree_digest(parent)
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONDONTWRITEBYTECODE"}
     environment["PYTHONPATH"] = str(parent)
+    environment["WRKSLOTS_ALLOW_CHECKOUT_HELPER"] = "1"
 
     placed = subprocess.run(
         [sys.executable, "-B", "-m", "wrkslots", "--project-root", str(root), "run", "slot-b",
@@ -1638,9 +1643,11 @@ def test_mask_git_config_masks_the_path_itself(tmp_path: Path, monkeypatch: pyte
     assert sandbox._mask_git_config(str(file)) == "file"
     assert sandbox._mask_git_config(str(directory)) == "directory"
 
-    assert mounts[0][:3] == ("mount", "/dev/null", str(file))
+    # Mounts land on verified fd paths, not names (#1583).
+    assert mounts[0][:2] == ("mount", "/dev/null")
+    assert str(mounts[0][2]).startswith("/proc/self/fd/")
     assert mounts[1] == ("remount-ro", str(file))
-    assert mounts[2][1:4] == ("tmpfs", str(directory), "tmpfs")
+    assert mounts[2][1] == "tmpfs" and str(mounts[2][2]).startswith("/proc/self/fd/")
     assert int(mounts[2][4]) & sandbox._MS_RDONLY  # type: ignore[call-overload]
     assert len(mounts) == 3
 
@@ -1691,7 +1698,8 @@ def test_mask_git_config_refuses_links_and_specials_without_following(
     # The ordinary mask, by contrast, follows the link (unchanged behaviour).
     if kind == "symlink":
         sandbox._mask(str(path))
-        assert mounts[0][:3] == ("mount", "/dev/null", str(elsewhere / "gitconfig"))
+        assert mounts[0][:2] == ("mount", "/dev/null")
+        assert str(mounts[0][2]).startswith("/proc/self/fd/")
 
 
 def test_mask_git_config_refuses_every_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -143,6 +143,22 @@ def test_enter_refuses_root_and_sudo_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert sandbox._main(["enter", "{}", "--", "/bin/true"]) == 126
 
 
+def test_sudo_identity_forgery_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Item 5/6: env-claimed uid/gid must match the sudo parent's real ids.
+    uid, gid = os.getuid(), os.getgid()
+    monkeypatch.setenv("SUDO_UID", str(uid))
+    monkeypatch.setenv("SUDO_GID", str(gid))
+    good = f"Name:\tsudo\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n"
+    sandbox._sudo_identity(good)
+    forged_uid = f"Name:\tsudo\nUid:\t{uid + 1}\t{uid + 1}\t{uid + 1}\t{uid + 1}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n"
+    with pytest.raises(sandbox.SandboxError, match="sudo monitor"):
+        sandbox._sudo_identity(forged_uid)
+    forged_gid = f"Name:\tsudo\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n"
+    monkeypatch.setenv("SUDO_GID", "987654")
+    with pytest.raises(sandbox.SandboxError, match="sudo gid"):
+        sandbox._sudo_identity(forged_gid)
+
+
 def test_no_new_privs_is_set_by_the_seal() -> None:
     # Live: after the seal prctl, /proc/self/status shows NoNewPrivs: 1.
     import subprocess

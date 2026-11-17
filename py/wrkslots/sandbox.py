@@ -1418,6 +1418,18 @@ def _mounts() -> list[tuple[str, int]]:
     return rows
 
 
+def _mount_at_fd(
+    source: str | None, target: str, fstype: str | None, flags: int, data: str | None = None
+) -> None:
+    """Mount onto `target` through its verified O_PATH fd, not its name."""
+
+    descriptor, fd_path = _target_fd_path(target)
+    try:
+        _mount(source, fd_path, fstype, flags, data)
+    finally:
+        os.close(descriptor)
+
+
 def _remount_read_only(point: str, flags: int | None = None) -> None:
     """Make the topmost mount at ``point`` read-only, keeping its other flags.
 
@@ -1428,7 +1440,7 @@ def _remount_read_only(point: str, flags: int | None = None) -> None:
 
     if flags is None:
         flags = next((value for mount_point, value in reversed(_mounts()) if mount_point == point), 0)
-    _mount(None, point, None, _MS_BIND | _MS_REMOUNT | _MS_RDONLY | flags)
+    _mount_at_fd(None, point, None, _MS_BIND | _MS_REMOUNT | _MS_RDONLY | flags)
 
 
 def _remount_tree_read_only(base: str, keep: Sequence[str] = (), keep_exact: Sequence[str] = ()) -> list[str]:
@@ -1513,7 +1525,7 @@ def _mask(path: str) -> None:
         finally:
             os.close(descriptor)
     else:
-        _mount("/dev/null", path, None, _MS_BIND)
+        _mount_at_fd("/dev/null", path, None, _MS_BIND)
         _remount_read_only(path)
 
 
@@ -1589,7 +1601,7 @@ def _mask_git_config(path: str) -> str:
         )
     try:
         if stat.S_ISDIR(info.st_mode):
-            _mount(
+            _mount_at_fd(
                 "tmpfs",
                 path,
                 "tmpfs",
@@ -1598,7 +1610,7 @@ def _mask_git_config(path: str) -> str:
             )
             return "directory"
         if stat.S_ISREG(info.st_mode):
-            _mount("/dev/null", path, None, _MS_BIND)
+            _mount_at_fd("/dev/null", path, None, _MS_BIND)
             _remount_read_only(path)
             return "file"
     except MountError as exc:
@@ -1900,7 +1912,7 @@ def build_view(spec: Mapping[str, object]) -> None:
             if failures:
                 raise SandboxError(f"could not make {alias} read-only: " + "; ".join(failures[:3]))
         else:
-            _mount("tmpfs", alias, "tmpfs", _MS_NOSUID | _MS_NODEV, "mode=0755,size=16m")
+            _mount_at_fd("tmpfs", alias, "tmpfs", _MS_NOSUID | _MS_NODEV, "mode=0755,size=16m")
 
     # 3. Trees that stay read-only whatever protect_system says: the wrkslots
     # control directory (registry, other slots and their mounts) and the root
@@ -2003,6 +2015,7 @@ def enter_userns(spec: Mapping[str, object], command: Sequence[str]) -> None:
     """Enter a new user + mount namespace, build the view, exec ``command``."""
 
     uid, gid = os.getuid(), os.getgid()
+    _maybe_pdeathsig()
     _check(_libc().unshare(_CLONE_NEWUSER | _CLONE_NEWNS), "unshare user+mount namespace")
     _write("/proc/self/setgroups", "deny")
     _write("/proc/self/uid_map", f"{uid} {uid} 1\n")
@@ -2021,6 +2034,19 @@ _PR_SET_NO_NEW_PRIVS = 38
 #: checkout copy is user-writable, so sudo may never run it as root.
 _INSTALLED_HELPER = Path("/usr/local/lib/wrkslots/sandbox.py")
 _PR_SET_DUMPABLE = 4
+_PR_SET_PDEATHSIG = 1
+
+
+def _maybe_pdeathsig() -> None:
+    """Die with the launcher ONLY when explicitly opted in (tests).
+
+    A boxed lane must normally survive its launcher shell exiting, so
+    this is never unconditional: WRKSLOTS_PDEATHSIG=1 is set by test
+    harnesses that kill their launcher and need no boxed child left.
+    """
+
+    if os.environ.get("WRKSLOTS_PDEATHSIG") == "1":
+        _prctl(_PR_SET_PDEATHSIG, 9)  # SIGKILL
 _CAP_SYS_ADMIN = 21
 _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 
@@ -2102,7 +2128,7 @@ def _prctl(option: int, value: int) -> None:
 
 
 _SPEC_BYTES_LIMIT = 16 * 1024 * 1024
-def _sudo_identity() -> tuple[int, int, list[int], str]:
+def _sudo_identity(parent_status: str | None = None) -> tuple[int, int, list[int], str]:
     """The invoking user, from sudo's record cross-checked against its parent.
 
     `SUDO_UID` alone is claimable with `setenv`; the parent process (the
@@ -2120,25 +2146,27 @@ def _sudo_identity() -> tuple[int, int, list[int], str]:
         raise SandboxError("enter-root must run through sudo (SUDO_UID/SUDO_GID are missing)") from exc
     if uid == 0:
         raise SandboxError("isolation root boxes a non-root user; the invoking user is root")
+    # Cross-check against the parent (sudo) process's real uid AND gid:
+    # with `setenv` a user can claim another uid/gid in the environment,
+    # but cannot mint a sudo parent carrying them. (The process name is
+    # not checked: comm is settable and proves nothing.)
     try:
-        parent_status = Path(f"/proc/{os.getppid()}/status").read_text(encoding="utf-8")
-        parent_uid = int(
-            next(
-                int(field)
-                for line in parent_status.splitlines()
-                if line.startswith("Uid:")
-                for field in [line.split()[1]]
-            )
-        )
-        parent_name = next(
-            line.split(":", 1)[1].strip()
+        if parent_status is None:
+            parent_status = Path(f"/proc/{os.getppid()}/status").read_text(encoding="utf-8")
+        fields = {
+            line.split(":", 1)[0]: line.split(":", 1)[1].strip()
             for line in parent_status.splitlines()
-            if line.startswith("Name:")
-        )
-    except (OSError, ValueError, StopIteration) as exc:
+            if ":" in line
+        }
+        parent_uid = int(fields["Uid"].split()[0])
+        parent_gid = int(fields["Gid"].split()[0])
+    except (OSError, ValueError, KeyError) as exc:
         raise SandboxError("enter-root parent is not readable as a sudo process") from exc
-    if parent_uid != uid or not parent_name.startswith("sudo"):
+    if parent_uid != uid:
         raise SandboxError("enter-root parent is not the sudo monitor for the invoking user")
+    caller_groups = _caller_groups(uid) or []
+    if gid != parent_gid and gid not in caller_groups:
+        raise SandboxError("the sudo gid is not the invoking user's own group")
     try:
         name = pwd.getpwuid(uid).pw_name
     except KeyError as exc:
@@ -2168,6 +2196,12 @@ _SYSTEM_TARGET_PREFIXES = (
     "/etc", "/usr", "/lib", "/lib64", "/bin", "/sbin", "/proc", "/sys", "/dev", "/boot", "/root",
 )
 
+#: Registry-claim hard bounds additionally refuse these: a slot or
+#: project root never legitimately sits directly under them. (The path
+#: denylist above cannot include /run: the runtime spec directory
+#: legitimately lives under /run/user/<uid>.)
+_CLAIM_PREFIXES = _SYSTEM_TARGET_PREFIXES + ("/var", "/opt", "/run", "/srv")
+
 
 #: Closed schemas for the root spec: any other key refuses (#1583).
 _ROOT_DOCUMENT_KEYS = frozenset(
@@ -2182,7 +2216,7 @@ _ROOT_VIEW_KEYS = frozenset(
     }
 )
 
-_TMP_SIZE = re.compile(r"([0-9]+)([KMGT]?)\Z")
+_TMP_SIZE = re.compile(r"([0-9]+)([KMGT%]?)\Z")
 
 
 def _check_root_schema(document: Mapping[str, object]) -> dict[str, object]:
@@ -2199,9 +2233,17 @@ def _check_root_schema(document: Mapping[str, object]) -> dict[str, object]:
         raise SandboxError(f"root view has unknown keys {sorted(unknown_view)}; refusing")
     tmp_size = view.get("tmp_size", DEFAULT_TMP_SIZE)
     match = _TMP_SIZE.fullmatch(str(tmp_size)) if isinstance(tmp_size, (str, int)) else None
-    multiplier = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
-    size = int(match.group(1)) * multiplier[match.group(2)] if match is not None else 0
-    if match is None or size == 0 or size > 64 * (1 << 30):
+    # Same grammar as the settings model: an absolute size with an
+    # optional K/M/G/T suffix, or "N%" (1-100) of host memory.
+    valid = False
+    if match is not None:
+        value, suffix = int(match.group(1)), match.group(2)
+        if suffix == "%":
+            valid = 1 <= value <= 100
+        else:
+            multiplier = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+            valid = 0 < value * multiplier[suffix] <= 64 * (1 << 30)
+    if not valid:
         raise SandboxError(f"root view tmp_size {tmp_size!r} is invalid; refusing")
     return view
 
@@ -2294,7 +2336,7 @@ def _verify_registered(
                 # beneath the control area, never at or over a system path.
                 if any(
                     claimed == prefix or claimed.startswith(prefix + "/")
-                    for prefix in _SYSTEM_TARGET_PREFIXES
+                    for prefix in _CLAIM_PREFIXES
                 ):
                     continue
                 if not any(
@@ -2566,7 +2608,7 @@ def _remount_nosuid_nodev(target: str) -> None:
         flags |= _MS_RDONLY
     if "noexec" in options:
         flags |= _MS_NOEXEC
-    _mount(None, target, None, flags)
+    _mount_at_fd(None, target, None, flags)
 
 
 def enter_root() -> None:
@@ -2598,6 +2640,7 @@ def enter_root() -> None:
 
     if os.geteuid() != 0:
         raise SandboxError("enter-root must run as root (through sudo -n)")
+    _maybe_pdeathsig()
     _prctl(_PR_SET_DUMPABLE, 0)
     uid, gid, db_groups, name = _sudo_identity()
     caller = _caller_groups(uid)
@@ -2753,6 +2796,13 @@ def root_helper() -> list[str]:
                 f"installed root helper {_INSTALLED_HELPER} is not version {_HELPER_VERSION}; refusing"
             )
         script = _INSTALLED_HELPER
+    elif os.environ.get("WRKSLOTS_ALLOW_CHECKOUT_HELPER") != "1":
+        # On a passwordless-sudo host the checkout copy is agent-writable
+        # code run as root; only an explicit opt-in may use it (#1583).
+        raise SandboxError(
+            f"no installed root helper at {_INSTALLED_HELPER}; refusing the "
+            "user-writable checkout copy (set WRKSLOTS_ALLOW_CHECKOUT_HELPER=1 to opt in)"
+        )
     return ["sudo", "-n", "--", _interpreter(), "-I", "-B", "-S", str(script), "enter-root"]
 
 

@@ -1016,6 +1016,7 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
                 .arg(case)
                 .arg(action)
                 .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .env("WRKSLOTS_ALLOW_CHECKOUT_HELPER", "1")
                 .output()
                 .expect("python oracle runs");
             let text = String::from_utf8(output.stdout).expect("utf8");
@@ -1172,6 +1173,7 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
                 .arg(&driver_path)
                 .arg(case)
                 .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .env("WRKSLOTS_ALLOW_CHECKOUT_HELPER", "1")
                 .output()
                 .expect("python oracle runs");
             assert!(output.status.success(), "case {case}: {:?}", output.stderr);
@@ -1294,6 +1296,7 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
                 .arg(case)
                 .arg(&root)
                 .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .env("WRKSLOTS_ALLOW_CHECKOUT_HELPER", "1")
                 .output()
                 .expect("python oracle runs");
             assert!(output.status.success(), "case {case}: {:?}", output.stderr);
@@ -1492,6 +1495,7 @@ sys.stdout.write(render(rc))
                 .arg(case)
                 .arg(&root)
                 .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .env("WRKSLOTS_ALLOW_CHECKOUT_HELPER", "1")
                 .output()
                 .expect("python oracle runs");
             assert!(output.status.success(), "case {case}: {:?}", output.stderr);
