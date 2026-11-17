@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-discuss-resummarize-stale-terms-and-dated-labels: stale terms stay current during re-summarize; earlier summaries need dates'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-discusstweak
 labels:
 - vibe-talk
 created_at: 2026-11-17T17:36:23.000000000+00:00
-updated_at: 2026-11-17T17:36:23.000000000+00:00
+updated_at: 2026-11-17T18:43:37.000000000+00:00
+closed_at: 2026-11-17T18:43:37.000000000+00:00
 ---
 
 # Description
@@ -36,3 +37,7 @@ For the labels, follow the message rows' rule (`#729`, `messageTimeLabel`): toda
 # Notes
 
 Owner UI fast-track (owner thread 135). Page-only change; path-selected validation gate.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as `8018766ad33323c841889094aba6e192fa150cec` (gate pass on `b021a30b`). While a Summarize ("Reading…") or Update ("Updating…") is in flight, the previous summary's terms stand dimmed (`#discuss-terms[data-stale]`) and headed "· from the previous summary", and the staleness banner waits hidden; a failed ask restores the previous summary whole, terms unmarked, and closing mid-request leaves the saved record to redraw them. "Earlier summary" timeline labels and the "Saved summary" line use the new `summaryTimeLabel`, following the message rows' rule (`#729`): time alone today, weekday one to six days back, month and day (year when not this year) beyond that, in the locale time the rows show. Five new panel tests pin the marking, the failure restore, and the labels (boundary days 0/1/6/7 and another year); the page suite and full validate/gate pass. A 17-image screenshot matrix (phone 412x915 scale 2.6 and desktop 1280x800, light/dark, keyboard open/closed, before/mid-re-summarize/after) was captured on a local test instance from the worktree build and reviewed image by image; it sits with coordb for the liaison. Deploy is coordb's midnight ET batch unless the owner says "deploy now".
