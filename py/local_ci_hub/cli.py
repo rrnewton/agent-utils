@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run":
         res: object = {}
         if args.op == "start":
-            res = runner.start(cfg, wait=True)
+            res = runner.start(cfg, wait=True, commit=args.commit, cell=args.cell)
         elif args.op == "stop":
             res = runner.stop(cfg, args.run_id or "")
         else:

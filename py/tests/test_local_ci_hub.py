@@ -55,6 +55,16 @@ def test_receipt_qualified_and_no_result(tmp_path: Path) -> None:
     assert out.returncode == 0 and json.loads(out.stdout)["verdict"] == "qualified"
 
 
+def test_run_start_honours_commit_and_cell(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    fake = "a" * 40
+    r = run_cli(repo, "run", "start", "--commit", fake, "--cell", "cell-a")
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = run_cli(repo, "--json", "ledger", "query", "--commit", fake)
+    rows = json.loads(out.stdout)
+    assert rows and rows[0]["commit"] == fake and rows[0].get("cell") == "cell-a"
+
+
 def test_run_failure_records_fail(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path, validate="false")
     assert run_cli(repo, "run", "start").returncode == 1  # a FAIL run exits nonzero
