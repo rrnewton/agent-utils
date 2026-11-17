@@ -4194,7 +4194,7 @@ const openingViewOwner = createOpeningView({
   idsOf: (row) => idsOf(/** @type {any} */ (row)), inColumn: (column, act) => inColumn(/** @type {any} */ (column), act),
   listPlaceTop: (area) => listPlaceTop(area), loadCanon: (channel) => loadCanon(/** @type {any} */ (channel)),
   renderColumns: () => renderColumns(), restoreChannelComposer: () => restoreChannelComposer(),
-  restoreScroll: (mark) => restoreScroll(mark), scheduleBackSync: () => scheduleBackSync(),
+  restoreScroll: (mark) => restoreScroll(mark), scrollToNewest: () => scrollToNewest(), scheduleBackSync: () => scheduleBackSync(),
   selectedChannelId: () => selectedChannelId(), selection: () => selection(),
   token: () => token(), tokenFingerprint: (value) => tokenFingerprint(value),
   upsertThreadSummary: (canon, summary) => upsertThreadSummary(canon, summary),

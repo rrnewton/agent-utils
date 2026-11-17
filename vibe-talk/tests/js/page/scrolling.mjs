@@ -9,7 +9,7 @@ import { BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, CSS_CODE, CSS_UNCONDITIONAL, 
   DISCORD_POLL_MS, HTML_CODE, LINE_PX, PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, PULL_ARM_PX,
   PULL_WAIT_MS, RELAY_FENCE_OPEN, SCRIPT, SCROLLBACK_PX, SCROLL_VIEWPORT_PX,
   SHORT_MESSAGE, assertMarkupContains, assistantSays, atBottomOf, brokenModule, brokenScript, brokenScriptEach,
-  channelSummaryText, countingChannel, cssBlock, cssBlockIn, cssBlockOutside, cssRules, deliver,
+  channelSummaryText, countingChannel, enterChannel, enterVoice, cssBlock, cssBlockIn, cssBlockOutside, cssRules, deliver,
   errorResponse, fillTranscript, focused, foldButton, gate, helpEntry, holdChannelReads,
   inTwoColumns, json, jumpSaysArrived, jumpShown, longMessage, manyThreadColumns, markupHolds,
   markupPlace, message, newPage, outgoingRetry, outgoingRows, pagedChannel, parkMidway, passTime,
@@ -424,12 +424,15 @@ test("a FIRST entry into the voice transcript lands on the newest turn", async (
   // conversation is what makes a first entry have anything in it at all: the page opens on this
   // view with nothing in the list, and restoring an earlier conversation is what fills it.
   //
-  // No helper that scrolls: `signIn` is the page's own load path and touches no scroll position.
+  // No helper that scrolls: entering the view is the page's own act and touches no scroll
+  // position beyond what entering itself does. (`#1781`: the page now opens on the Channel,
+  // so the transcript's first entry is the switch's, not the load's.)
   const page = newPage();
   page.storedTurns.set("conv_earlier", tallConversation());
   const area = page.el("scroll-area");
 
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
 
   assert.ok(
@@ -2030,10 +2033,13 @@ test("A PULL UP IS THE CHANNEL'S ALONE — NOT THE VOICE VIEW'S, AND NOT A DRAFT
   const page = newPage();
   await signIn(page);
   // The voice view shares #scroll-area, and an empty transcript is at its newest line. Its pull
-  // would re-read a channel that is not on screen.
+  // would re-read a channel that is not on screen. (`#1781`: reached through the switch now.)
+  await enterVoice(page);
   assert.equal(page.tab(), "voice");
+  // Sign-in has read the channel once, landing on it (`#1781`); the pull must add no read.
+  const readsOnVoice = page.pageReads;
   await pullUp(page, PULL_ARM_PX * 2);
-  assert.equal(page.pageReads, 0, "a pull up on the voice view read the channel");
+  assert.equal(page.pageReads, readsOnVoice, "a pull up on the voice view read the channel");
   assert.equal(page.el("pull-refresh").hidden, true, "a pull up on the voice view offered to refresh");
 
   const { area } = await parkedAtNewest(page);
@@ -2097,8 +2103,7 @@ test("a message arriving in the CHANNEL while you have scrolled up raises the ch
   const page = newPage();
   await signIn(page);
   countingChannel(page, channelOf(12));
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
 
   const area = page.el("scroll-area");
   area.scrollTop = 0; // reading older messages, not pinned to the bottom
@@ -2120,8 +2125,7 @@ test("a poll that returns the SAME messages does not offer to jump anywhere", as
   const page = newPage();
   await signIn(page);
   countingChannel(page, channelOf(12));
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
 
   const area = page.el("scroll-area");
   area.scrollTop = 0;
@@ -2230,8 +2234,7 @@ test("a list that fits on the screen offers no jump, and one that shrinks to fit
   // A channel the reader is up, which a re-read then finds is two short messages: the list shrank
   // under them to less than a screen, so there is no scrollback left to come back from.
   countingChannel(page, channelOf(12));
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
   await scrollToGap(page, halfway(page));
   assert.equal(jumpShown(page), true, "the premise: a reader up the channel is offered the jump");
   page.messages = [message({ id: "1", content: SHORT_MESSAGE }), message({ id: "2", content: SHORT_MESSAGE })];
@@ -2321,8 +2324,7 @@ test("the channel counts what arrived on the stream and in a poll, and says New 
   const polled = newPage();
   await signIn(polled);
   countingChannel(polled, channelOf(12));
-  await polled.el("view-switch").click();
-  await polled.settle();
+  await enterChannel(polled);
   await scrollToGap(polled, halfway(polled));
   polled.messages = channelOf(12, 3);
   polled.expireTimers(DISCORD_POLL_MS);
@@ -2339,8 +2341,7 @@ test("the channel counts what arrived on the stream and in a poll, and says New 
   const lost = newPage();
   await signIn(lost);
   countingChannel(lost, channelOf(12));
-  await lost.el("view-switch").click();
-  await lost.settle();
+  await enterChannel(lost);
   await scrollToGap(lost, halfway(lost));
   lost.messages = Array.from({ length: 12 }, (_, i) =>
     message({ id: String(500 + i), content: longMessage(`later ${i}`) }));
@@ -2631,8 +2632,7 @@ test("a tap on the jump only scrolls: no refresh, no fold, nothing read aloud", 
   const page = newPage();
   await signIn(page);
   countingChannel(page, channelOf(12));
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
   const area = page.el("scroll-area");
   await scrollToGap(page, halfway(page));
   const rows = () => page.el("discord-log").children.map((li) =>

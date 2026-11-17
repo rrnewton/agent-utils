@@ -45,6 +45,7 @@ export interface OpeningViewDependencies {
   renderColumns(): void;
   restoreChannelComposer(): void;
   restoreScroll(mark: { pinned: boolean; anchor: Element; top: number }): void;
+  scrollToNewest(): void;
   scheduleBackSync(): void;
   selectedChannelId(): unknown;
   selection(): { view: string; thread: ThreadSummary | null; threadId: unknown; origin: string };
@@ -400,8 +401,12 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
       // `#1781 vibe-talk-first-run-welcome-channel-default`. The Channel is the view the page
       // opens on, so a reopen — a saved channel place, or a first sign-in with none — is
       // already standing on it: no switch enters it, and the read a switch would have owed is
-      // owed here, or a fresh reader meets an empty channel that nothing ever reads.
+      // owed here, or a fresh reader meets an empty channel that nothing ever reads. A switch's
+      // first entry also landed on the newest line; with the rows only now drawn, that landing
+      // is owed here too, for a reader whose saved place is the newest (or who has none).
       returnToSavedPlace();
+      const place = saved ? saved.place : null;
+      if (!place || place.atNewest) deps.scrollToNewest();
       holdChannelPlace();
       deps.reopenReadOwed().owe(deps.replayStarted());
     }
