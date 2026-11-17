@@ -1799,3 +1799,59 @@ def test_second_enter_flushes_placeholder_after_unobserved_paste() -> None:
     assert receipt.evidence == "submitted by second_enter"
     assert len(agent.pastes) == 1
     assert agent.keys == ["Enter"]
+
+
+HOOK_SCREEN = (
+    "──────\n"
+    "Hook PreToolUse:Bash requires confirmation\n"
+    "Running this command may delete files: rm -rf build\n"
+    "Do you want to proceed?\n"
+    "❯ 1. Yes\n"
+    "  2. No\n"
+    "Esc to cancel · Tab to amend\n"
+)
+
+
+def test_hook_confirmation_is_recognized_and_never_answered() -> None:
+    # #1784: a captured Claude hook confirmation must classify as a
+    # blocking question naming the hook and the first line of its reason,
+    # and no answer plan may ever be produced for it.
+    adapter = harness_tui("claude")
+    assert adapter is not None
+    view = adapter.classify(HOOK_SCREEN)
+    assert view.state == State.QUESTION
+    assert view.question is not None
+    assert "Hook PreToolUse:Bash" in view.question.text
+    assert "Running this command may delete files" in view.question.text
+    with pytest.raises(ValueError, match="owner-only"):
+        adapter.answer_plan(view.question, 1, None)
+
+
+def test_cancelled_record_is_not_written_back_after_a_readiness_wait(tmp_path: Path) -> None:
+    # #1775 (c): while the drain waits on readiness holding the record only
+    # in memory, a cancel moves it to cancelled/; the drain's write-back
+    # must not recreate it in inbox/ as pending.
+    root = str(tmp_path)
+    enqueue(root, "cancel me while waiting", message_id="cancel-race-1")
+    inbox_item = tmp_path / "inbox" / "cancel-race-1.json"
+    assert inbox_item.is_file()
+    clock = {"now": 0.0, "moved": False}
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    def sleep(seconds: float) -> None:
+        clock["now"] += seconds
+        if not clock["moved"]:
+            clock["moved"] = True
+            cancelled = tmp_path / "cancelled"
+            cancelled.mkdir(exist_ok=True)
+            os.replace(inbox_item, cancelled / inbox_item.name)
+
+    fake = FakeAgentHerdr(["working"])
+    drain(
+        cast(HerdrClient, fake), target(), root,
+        ready_timeout=30, sleep=sleep, monotonic=monotonic,
+    )
+    assert not inbox_item.exists(), "the cancelled prompt was written back into inbox/"
+    assert (tmp_path / "cancelled" / "cancel-race-1.json").is_file()

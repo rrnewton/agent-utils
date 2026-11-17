@@ -1976,17 +1976,32 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             return error;
         }
         if runtime.cancelled() {
+            // Name the real wait (#1775 (b)): only a genuine lock acquisition
+            // is a lock wait; a Herdr failure or a composer wait that the
+            // caller's cancellation cut short is named as itself, never
+            // blamed on a queue lock nobody held.
+            let detail = error.to_string();
+            let waited = if detail.contains("cannot invoke Herdr") {
+                "cancelled while waiting for Herdr (pane resolution or readiness); \
+                 nothing was typed"
+            } else if detail.contains("composer") {
+                "cancelled while waiting for the composer to clear; nothing was typed"
+            } else {
+                "cancelled while waiting for a lock of queue; nothing was typed"
+            };
+            let queue = if waited.contains("lock of queue") {
+                format!(" {}", root.display())
+            } else {
+                String::new()
+            };
             return AgentError::Pending(UndeliveredMessage {
-                message: format!(
-                    "cancelled while waiting for a lock of queue {}; nothing was typed: {error}",
-                    root.display()
-                ),
+                message: format!("{waited}{queue}: {error}"),
                 message_id: String::new(),
                 artifact: root.to_path_buf(),
             });
         }
         match lock_bound {
-            Some(limit) if lock_runtime.cancelled() => {
+            Some(limit) if lock_runtime.cancelled() && error.to_string().contains("waiting to lock") => {
                 AgentError::Pending(UndeliveredMessage {
                     message: format!(
                         "a lock of queue {} {LOCK_BOUND_HELD} {}s lock bound; nothing was typed: {error}",
@@ -2269,6 +2284,31 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                 Err(error) => {
                     queue_lock = take_queue_lock(lock_runtime)?;
                     let _commit_lock = &queue_lock;
+                    // Re-read the record's phase under the queue lock before
+                    // writing it back (#1775 (c)): a prompt cancelled,
+                    // processed or moved while this drain waited only in
+                    // memory must never be recreated in inbox/ as pending.
+                    if !path.exists() {
+                        if let Ok(Some(agent_queue::queue::MessageState::Cancelled)) =
+                            agent_queue::queue::message_state(root, &identifier)
+                        {
+                            cancelled.push(identifier.clone());
+                        }
+                        continue 'message;
+                    }
+                    if let Some((reason, detail)) =
+                        set_aside_reason(&directories, &filename_id, &document, now_millis())
+                    {
+                        cancelled.push(set_aside(
+                            root,
+                            &directories,
+                            &path,
+                            document,
+                            reason,
+                            &detail,
+                        )?);
+                        continue 'message;
+                    }
                     // A readiness wait the hard deadline cut short says so (#702
                     // send-hard-timeout): the prompt stays pending and is safe to send again.
                     let detail = if deadline.is_some_and(|deadline| runtime.monotonic() >= deadline)
@@ -2847,6 +2887,22 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             }
             match outcome {
                 Ok(Delivered::NotStaged(detail)) => {
+                    // A cancel that landed while typing wins over the
+                    // write-back (#1775 (c)): nothing was typed, so the record
+                    // is set aside from inflight, never returned to inbox/.
+                    if let Some((reason, aside_detail)) =
+                        set_aside_reason(&directories, &filename_id, &document, now_millis())
+                    {
+                        cancelled.push(set_aside(
+                            root,
+                            &directories,
+                            &inflight_path,
+                            document,
+                            reason,
+                            &aside_detail,
+                        )?);
+                        break 'retry;
+                    }
                     // Nothing reached the composer: undo the at-most-once barrier so the
                     // prompt stays pending. A crash before the rename still quarantines it.
                     // A stranded prompt also stays pending, keeping the text it was typed as
@@ -3593,7 +3649,15 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         session_value: info.session_value,
         workspace_id: info.workspace_id,
         cwd: info.cwd,
-        pending: identifiers_if_directory(&directories.inbox)?,
+        // Pending is every item a drain may still type, in either inbox
+        // lane (#1775 (b)): an `inbox.v2/` item is pending, not invisible.
+        pending: {
+            let mut pending = identifiers_if_directory(&directories.inbox)?;
+            pending.extend(identifiers_if_directory(&directories.inbox_v2)?);
+            pending.sort();
+            pending.dedup();
+            pending
+        },
         oldest_pending_chat_age_seconds: oldest_chat_queued
             .map(|queued| now_millis.saturating_sub(queued) / 1000),
         oldest_pending_chat_queued_at_millis: oldest_chat_queued,
@@ -3766,6 +3830,62 @@ pub fn pane_lock_digest(pane_id: &str) -> String {
     format!("{:x}", Sha256::digest(encoded))
 }
 
+/// The bounded refusal for a pane whose composer holds a draft agentctl may
+/// not submit (#1775 (a)+(b)): it names the composer wait and keeps the
+/// draft's first 40 characters, so a blocked send says what it waited on
+/// instead of blaming a lock or a readiness timeout.
+fn composer_occupied_error<A: AgentApi + ?Sized>(
+    client: &A,
+    info: &AgentPaneInfo,
+    runtime: &dyn AgentRuntime,
+    refusal: Option<String>,
+) -> AgentError {
+    let preview = client
+        .read_with_runtime(&info.pane_id, "visible", Some(200), runtime)
+        .ok()
+        .and_then(|screen| {
+            crate::submission::composer_view(info.agent.as_deref().unwrap_or_default(), &screen)
+        })
+        .and_then(|view| crate::submission::composer_draft(&view))
+        // A blocked send names what it waited on (#1775 (b)): a draft
+        // agentctl itself typed is quoted (its first 40 characters — it is
+        // agentctl's own text, already in the queue); a person's draft is
+        // only described, never quoted, as everywhere else in agentctl.
+        .map(|draft| {
+            let ours = runtime
+                .typed_prompts_queue()
+                .is_some_and(|queue| {
+                    crate::stale_draft::find(
+                        &queue,
+                        &draft,
+                        crate::stale_draft::Vouching::Unproven,
+                        std::time::SystemTime::now(),
+                    )
+                    .is_some()
+                });
+            match (&draft, ours) {
+                (crate::stale_draft::Draft::Text(text), true) => {
+                    text.chars().take(40).collect::<String>()
+                }
+                (other, _) => other.describe(),
+            }
+        })
+        .filter(|preview| !preview.is_empty())
+        .or(refusal);
+    match preview {
+        Some(preview) => AgentError::delivery(format!(
+            "pane {} composer occupied: {preview:?}; the draft was left alone and \
+             nothing was typed — the prompt stays pending until the composer clears",
+            info.pane_id
+        )),
+        None => AgentError::delivery(format!(
+            "pane {} composer occupied (staged); nothing was typed — the prompt \
+             stays pending until the composer clears",
+            info.pane_id
+        )),
+    }
+}
+
 fn wait_ready<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,
@@ -3877,8 +3997,30 @@ fn wait_ready<A: AgentApi + ?Sized>(
                     recovered += 1;
                     continue;
                 }
-                Ok(None) => codex_draft_checked |= codex_unready,
-                Err(error) => draft_refused = Some(error.to_string()),
+                Ok(None) => {
+                    codex_draft_checked |= codex_unready;
+                    // A staged pane whose draft recovery found nothing of
+                    // agentctl's to submit holds someone else's draft: the
+                    // composer is occupied, and waiting out a real readiness
+                    // timeout (behind the caller's lifecycle lock) cannot
+                    // clear it (#1775 (a)). Name it and stop at once; the
+                    // prompt stays pending for a later drain. A zero timeout
+                    // is a probe, not a wait: it keeps the probe's wording.
+                    if info.status == "staged" && timeout > Duration::ZERO {
+                        return Err(composer_occupied_error(client, &info, runtime, None));
+                    }
+                }
+                Err(error) => {
+                    if info.status == "staged" && timeout > Duration::ZERO {
+                        return Err(composer_occupied_error(
+                            client,
+                            &info,
+                            runtime,
+                            Some(error.to_string()),
+                        ));
+                    }
+                    draft_refused = Some(error.to_string());
+                }
             }
         }
         let now = runtime.monotonic();
@@ -5110,6 +5252,11 @@ mod tests {
         waits: Vec<(String, String, u64)>,
         reads: Vec<String>,
         fail_run: bool,
+        fail_pane_info: bool,
+        /// Cancel this queue item (root, message ID, done flag) on the second
+        /// pane check, while a drain waits on readiness (#1775 (c) test).
+        cancel_on_check: Option<(PathBuf, String, Arc<AtomicBool>)>,
+        pane_checks: usize,
         fail_wait: bool,
         unwrapped_empty: bool,
         /// A receipt the submission returns after writing, instead of `Unconfirmed`.
@@ -5272,6 +5419,27 @@ mod tests {
         }
 
         fn pane_info(&self, pane_id: &str) -> crate::error::Result<AgentPaneInfo> {
+            if self.state.lock().expect("fake state").fail_pane_info {
+                return Err(AdapterError::unavailable(
+                    "cannot invoke Herdr: control command was cancelled",
+                ));
+            }
+            // A scripted mid-wait cancel (#1775 (c)): the drain has dropped
+            // the queue lock for its readiness wait, so cancel sets the
+            // prompt aside at once, as `agentctl cancel` did live.
+            let scripted = {
+                let mut state = self.state.lock().expect("fake state");
+                state.pane_checks += 1;
+                if state.pane_checks == 2 {
+                    state.cancel_on_check.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((root, message_id, done)) = scripted {
+                let _ = cancel(&root, &message_id, "no longer wanted");
+                done.store(true, AtomicOrdering::SeqCst);
+            }
             let mut state = self.state.lock().expect("fake state");
             let mut info = state
                 .infos
@@ -8288,6 +8456,110 @@ mod tests {
     }
 
     #[test]
+    fn cancel_during_a_readiness_wait_stays_cancelled_and_is_not_written_back() {
+        // #1775 (c): the watcher drain held the record in memory across a
+        // long readiness wait; `agentctl cancel` moved it to cancelled/,
+        // and the drain's write-back recreated it in inbox/ as pending.
+        // The fake cancels on its second pane check — after the drain has
+        // loaded the record and dropped the queue lock for its wait — and
+        // the caller's runtime is cancelled at the same moment, as the
+        // live caller's timeout cancelled it. No wall-clock waits.
+        let directory = TestDirectory::new("cancel-during-readiness");
+        let root = directory.path().to_path_buf();
+        enqueue(&root, "cancel me while waiting", Some("cancel-race-1")).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let fake = FakeAgent::with_pane(&["working"], "w1:p-cancel-race");
+        fake.state.lock().unwrap().cancel_on_check = Some((
+            root.clone(),
+            "cancel-race-1".to_owned(),
+            Arc::clone(&cancelled),
+        ));
+        let result = drain_with_runtime(
+            &fake,
+            &target_for("w1:p-cancel-race"),
+            &root,
+            DrainOptions {
+                ready_timeout: Duration::from_secs(60),
+                ..DrainOptions::default()
+            },
+            &CancellationFlagRuntime { cancelled },
+        )
+        .expect("the drain completes");
+        assert!(
+            json_paths(&root.join("inbox")).unwrap().is_empty(),
+            "the cancelled prompt is not written back into inbox/: {result:?}"
+        );
+        assert_eq!(
+            message_state(&root, "cancel-race-1").unwrap(),
+            Some(QueueMessageState::Cancelled),
+            "the prompt stays cancelled, in exactly one phase"
+        );
+    }
+
+    #[test]
+    fn an_occupied_composer_is_named_and_does_not_wait_out_the_ready_timeout() {
+        // #1775 (a)+(b): a pane whose composer holds someone else's draft
+        // must fail fast naming the composer, not wait out the readiness
+        // timeout behind a lock-of-queue label.
+        let directory = TestDirectory::new("composer-occupied");
+        let fake = FakeAgent::with_pane(&["staged"], "w1:p-composer-occupied");
+        let runtime = FakeRuntime::default();
+        let error = send_with_runtime(
+            &fake,
+            &target_for("w1:p-composer-occupied"),
+            directory.path(),
+            "typed later",
+            DrainOptions {
+                ready_timeout: Duration::from_secs(60),
+                ..DrainOptions::default()
+            },
+            &runtime,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("composer occupied"),
+            "the error names the composer wait: {error}"
+        );
+        assert!(
+            !error.to_string().contains("waiting for a lock of queue"),
+            "the composer wait is not blamed on a queue lock: {error}"
+        );
+        assert!(
+            runtime.monotonic() < Duration::from_secs(60),
+            "the wait is bounded, not the full ready timeout: {:?}",
+            runtime.monotonic()
+        );
+    }
+
+    #[test]
+    fn a_herdr_failure_during_target_resolution_is_not_blamed_on_the_queue_lock() {
+        // #1775 (b): Herdr's own cancellation surfaced through the drain's
+        // lock-wait label although no process held the queue lock.
+        let directory = TestDirectory::new("herdr-wait-labelled");
+        let root = directory.path();
+        enqueue(root, "waiting on herdr", Some("herdr-wait-1")).unwrap();
+        let fake = FakeAgent::with_pane(&["idle"], "w1:p-herdr-wait");
+        fake.state.lock().unwrap().fail_pane_info = true;
+        let result = drain_with_runtime(
+            &fake,
+            &target_for("w1:p-herdr-wait"),
+            root,
+            DrainOptions::default(),
+            &CancelRuntime::new(0),
+        )
+        .expect("the drain reports the wait as blocked, not as a lock wait");
+        let blocked = result.blocked.expect("the wait is reported");
+        assert!(
+            blocked.contains("cannot invoke Herdr"),
+            "the real wait is named: {blocked}"
+        );
+        assert!(
+            !blocked.contains("waiting for a lock of queue"),
+            "a Herdr wait is not a queue-lock wait: {blocked}"
+        );
+    }
+
+    #[test]
     fn cancellation_after_injection_quarantines_unknown_outcome() {
         let directory = TestDirectory::new("cancel-after-injection");
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -9253,6 +9525,26 @@ mod tests {
     // #1372 chat-stale-prompt-wedges-inbox: status names the oldest pending chat
     // prompt's age so other senders can cap their deferral instead of waiting
     // forever. queued_at is fixed text, so the age needs no wall clock.
+    #[test]
+    fn status_counts_an_inbox_v2_item_as_pending() {
+        // #1775 (b): status said "nothing pending" while an item sat in a
+        // pending lane; every lane a drain may type from counts.
+        let directory = TestDirectory::new("status-v2-pending");
+        prepare(directory.path()).unwrap();
+        bind_queue(directory.path(), &target()).unwrap();
+        queue_at(&directory, "note-1", "900", "agent note");
+        let v2 = directory.path().join("inbox.v2");
+        fs::create_dir_all(&v2).unwrap();
+        fs::write(
+            v2.join("note-2.json"),
+            r#"{"id":"note-2","text":"later note","queued_at":950,"delivery_attempts":0}"#,
+        )
+        .unwrap();
+        let fake = FakeAgent::new(&["working"]);
+        let snapshot = status(&fake, &target(), directory.path()).unwrap();
+        assert_eq!(snapshot.pending, ["note-1", "note-2"]);
+    }
+
     #[test]
     fn status_reports_the_oldest_pending_chat_prompts_age() {
         let directory = TestDirectory::new("status-chat-age");

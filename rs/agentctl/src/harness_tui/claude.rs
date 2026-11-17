@@ -10,6 +10,59 @@ impl HarnessTui for ClaudeTui {
     }
     fn classify(&self, screen: &str) -> View {
         let clean = plain(screen);
+        // A Claude hook confirmation (`Hook PreToolUse:Bash requires
+        // confirmation … Do you want to proceed? 1. Yes 2. No`) is an
+        // owner-only decision (#1784): recognize it as a blocking question
+        // naming the hook and the first line of its reason, so the watcher
+        // can page a person instead of reporting unrecognizable text.
+        // `answer_plan` refuses it: nothing answers it automatically.
+        {
+            let rows: Vec<_> = clean.lines().collect();
+            let hook = rows.iter().position(|row| {
+                row.to_lowercase().contains("requires confirmation")
+            });
+            if let Some(hook) = hook {
+                let mut options = vec![];
+                let mut selected = None;
+                for row in &rows {
+                    if let Some((option, is_selected)) = option_row(row, '❯') {
+                        if is_selected {
+                            selected = Some(option.number);
+                        }
+                        options.push(option);
+                    }
+                }
+                let proceeds = rows
+                    .iter()
+                    .any(|row| row.to_lowercase().contains("do you want to proceed"));
+                if proceeds && options.len() >= 2 && selected.is_some() {
+                    let reason = rows[hook + 1..]
+                        .iter()
+                        .map(|row| row.trim())
+                        .find(|row| {
+                            !row.is_empty()
+                                && !row.to_lowercase().contains("do you want to proceed")
+                                && option_row(row, '❯').is_none()
+                        })
+                        .unwrap_or_default();
+                    let heading = rows[hook].trim();
+                    let text = if reason.is_empty() {
+                        heading.to_owned()
+                    } else {
+                        format!("{heading}: {reason}")
+                    };
+                    return View::question(Question {
+                        text,
+                        options,
+                        selected,
+                        total: 1,
+                        collapsed: false,
+                        notes: false,
+                        draft: String::new(),
+                    });
+                }
+            }
+        }
         let all_rows: Vec<_> = clean.lines().collect();
         let border = all_rows.iter().rposition(|r| {
             r.trim().chars().count() >= 3 && r.trim().chars().all(|c| matches!(c, '─' | '━' | '═'))
@@ -84,6 +137,14 @@ impl HarnessTui for ClaudeTui {
         option: Option<usize>,
         text: Option<&str>,
     ) -> Result<AnswerPlan, String> {
+        // A hook confirmation is owner-only (#1784): never answered through
+        // agentctl, automatically or otherwise; a person answers at the pane.
+        if q.text.to_lowercase().contains("requires confirmation") {
+            return Err(
+                "this is an owner-only hook confirmation; answer it at the pane in person — agentctl never answers it"
+                    .to_owned(),
+            );
+        }
         if text.is_some() {
             return Err("this Claude form supports --option only; free-text forms are not recognized safely".to_owned());
         }

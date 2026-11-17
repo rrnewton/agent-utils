@@ -455,6 +455,16 @@ pub(crate) fn blocked_finding_for(
     screen: &str,
     harness: Option<&str>,
 ) -> Option<(EpisodeKind, String)> {
+    // An owner-only hook confirmation (#1784) is named with the first line
+    // of its reason, not the bare "Do you want to proceed?" approval line.
+    if let Some(view) = crate::harness_tui::harness_tui(harness) {
+        let view = view.classify(screen);
+        if let Some(question) = &view.question {
+            if question.text.to_lowercase().contains("requires confirmation") {
+                return Some((EpisodeKind::ApprovalPrompt, question.text.trim().to_owned()));
+            }
+        }
+    }
     if let Some(finding) = blocked_finding(screen).filter(|(kind, _)| kind.is_blocked()) {
         return Some(finding);
     }
@@ -995,6 +1005,11 @@ struct WatchState {
     /// When the fallback or owner was last told about the blocked coordinator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     coordinator_blocked_noticed_at: Option<f64>,
+    /// When the owner was last alarmed about one hook confirmation, by agent
+    /// and prompt (its reason line) (#1784): one alarm per prompt per window,
+    /// so a pane nobody answers does not page the owner every pass.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    hook_owner_alarmed: BTreeMap<String, f64>,
 }
 
 /// One agent's recovery-ladder episode: when blockage was first seen,
@@ -3512,6 +3527,99 @@ fn report_coordinator_blocked(
     Some(row)
 }
 
+/// Page the owner in chat about every agent waiting at an owner-only hook
+/// confirmation (#1784 agentctl-watch-recognise-hook-confirmation): the
+/// coordinator cannot answer one, so the ordinary blocked notice is not
+/// enough — a liaison pane froze for hours because nobody who could answer
+/// knew. The alarm goes through the bridge's owner path ([`alarm_owner`]),
+/// names the agent, its pane and the first line of the hook's reason, and
+/// is rate-limited per prompt (agent + reason line) to one per window.
+/// Nothing ever answers the prompt. Rows say what was found and told.
+fn report_hook_confirmations(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    observations: &[Observation],
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Vec<Value> {
+    let window = options.min_notice_interval.as_secs_f64().max(60.0);
+    state.hook_owner_alarmed.retain(|_, at| now - *at < 86_400.0);
+    let mut rows = Vec::new();
+    for observation in observations {
+        let Some(screen) = observation.screen.as_deref() else {
+            continue;
+        };
+        let Some((_, detail)) = blocked_finding_for(screen, observation.harness.as_deref())
+        else {
+            continue;
+        };
+        if !detail.to_lowercase().contains("requires confirmation") {
+            continue;
+        }
+        let agent = observation.name.clone();
+        let pane = probe
+            .agent_pane(&agent)
+            .unwrap_or_else(|| "unknown pane".to_owned());
+        let mut row = json!({
+            "agent": agent,
+            "pane": pane,
+            "blocked": true,
+            "detail": detail,
+        });
+        let key = format!("{agent}\u{1}{detail}");
+        let due = state
+            .hook_owner_alarmed
+            .get(&key)
+            .is_none_or(|at| now - at >= window);
+        if !due {
+            row["reported"] = json!(true);
+            rows.push(row);
+            continue;
+        }
+        if options.check_only {
+            row["due"] = json!(true);
+            rows.push(row);
+            continue;
+        }
+        let text = format!(
+            "[agentctl watch-agents] {agent} (pane {pane}) is waiting at an owner-only \
+             hook confirmation: {detail}. Only you can answer this in that pane — \
+             answer it there; agentctl will not answer it."
+        );
+        let alarm_id = format!(
+            "agent-watch-hook-{}-{:016x}",
+            agent,
+            {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                detail.hash(&mut hasher);
+                hasher.finish()
+            }
+        );
+        // Record the attempt either way: a missing bridge route retries
+        // after the window, not on every pass.
+        state.hook_owner_alarmed.insert(key, now);
+        match alarm_owner(notifier, &text, &alarm_id) {
+            (true, outcome) => {
+                row["reported"] = json!(true);
+                row["owner_alarm"] = outcome;
+                log(format_args!(
+                    "agent {agent} waits at an owner-only hook confirmation ({detail}); owner alarmed"
+                ));
+            }
+            (false, outcome) => {
+                row["error"] = outcome["error"].clone();
+                log(format_args!(
+                    "agent {agent} waits at an owner-only hook confirmation but the owner could not be alarmed: {outcome}"
+                ));
+            }
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 /// Who is told about a notice: the agent's nearest reachable manager, as the pass decided it,
 /// else the configured coordinator.
 fn notice_target<'a>(options: &'a WatchAgentsOptions, notice: &'a PendingNotice) -> &'a str {
@@ -3698,6 +3806,14 @@ fn watch_agents_once(
     } else {
         None
     };
+    // An owner-only hook confirmation pages the owner in chat at once
+    // (#1784): the coordinator cannot answer it, so its blocked notice
+    // alone left the pane frozen for hours.
+    let hook_confirmations = if probe_error.is_null() {
+        report_hook_confirmations(probe, notifier, state, &observations, now, options)
+    } else {
+        Vec::new()
+    };
     // Queued prompts are typed here, not parked (#804): this pass drains every
     // interactive agent's queue, and a remainder past the stale threshold keeps
     // the pass not-ok with the agent and the oldest prompt's age named.
@@ -3820,7 +3936,10 @@ fn watch_agents_once(
             })
             && coordinator_blocked
                 .as_ref()
-                .is_none_or(|row| row["blocked"] != true),
+                .is_none_or(|row| row["blocked"] != true)
+            && hook_confirmations
+                .iter()
+                .all(|row| row["blocked"] != true || row["reported"] == true),
         "probe_error": probe_error,
         "agents": seen.len(),
         "episodes": episodes,
@@ -3836,6 +3955,7 @@ fn watch_agents_once(
         "waiting": state.pending.len(),
         "delivery_waits": delivery_waits,
         "coordinator_blocked": coordinator_blocked,
+        "hook_confirmations": hook_confirmations,
         "queue_drains": queue_drains,
         "held": held,
         "owner_waits": owner_waits,
@@ -8415,6 +8535,38 @@ mod tests {
 
     const QUESTION_SCREEN: &str = "──────\nMay I delete the inactive swap file?\n❯ 1. Delete it\n  2. Keep it\nEnter to select · ↑/↓ to navigate · Esc to cancel\n";
 
+    // A captured Claude hook confirmation (#1784): no "Enter to select"
+    // footer, so the generic form reader called it unrecognizable and the
+    // pane froze for hours with no notice.
+    const HOOK_SCREEN: &str = "──────\nHook PreToolUse:Bash requires confirmation\nRunning this command may delete files: rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel · Tab to amend\n";
+
+    #[test]
+    fn a_hook_confirmation_is_a_recognized_owner_only_block() {
+        let (kind, detail) = blocked_finding_for(HOOK_SCREEN, Some("claude"))
+            .expect("a hook confirmation blocks and is named");
+        assert_eq!(kind, EpisodeKind::ApprovalPrompt);
+        assert!(detail.contains("Hook PreToolUse:Bash"), "{detail}");
+        assert!(
+            detail.contains("Running this command may delete files"),
+            "the notice names the first line of the reason: {detail}"
+        );
+        assert!(
+            !detail.contains("not recognizable"),
+            "the prompt is recognizable now: {detail}"
+        );
+        // It is never answered through agentctl.
+        let view = crate::harness_tui::harness_tui(Some("claude"))
+            .expect("claude adapter")
+            .classify(HOOK_SCREEN);
+        let question = view.question.expect("recognized question");
+        assert_eq!(view.state, crate::harness_tui::State::BlockingQuestion);
+        let error = crate::harness_tui::harness_tui(Some("claude"))
+            .expect("claude adapter")
+            .answer_plan(&question, Some(1), None)
+            .expect_err("a hook confirmation is never answered automatically");
+        assert!(error.contains("owner-only"), "{error}");
+    }
+
     #[test]
     fn a_question_dialog_is_a_blocked_finding_for_its_harness() {
         let (kind, detail) = blocked_finding_for(QUESTION_SCREEN, Some("claude"))
@@ -8428,6 +8580,42 @@ mod tests {
         // The approval table still reads without a harness form.
         assert!(blocked_finding_for("Do you want to proceed?\n", None)
             .is_some_and(|(kind, _)| kind.is_blocked()));
+    }
+
+    #[test]
+    fn a_hook_confirmation_pages_the_owner_in_chat_once_per_prompt() {
+        // #1784: the coordinator cannot answer a hook confirmation, so the
+        // pass alarms the owner in chat at once, naming the agent and the
+        // first reason line; the same prompt does not page again in window.
+        let hook_observation = |screen: &'static str| {
+            let mut row = observation("liaison", "blocked", Some(screen));
+            row.harness = Some("claude".to_owned());
+            row
+        };
+        let mut probe = ScriptedProbe(vec![
+            vec![hook_observation(HOOK_SCREEN)],
+            vec![hook_observation(HOOK_SCREEN)],
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let options = options();
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert_eq!(notifier.alarms.len(), 1, "{report}");
+        let (alarm_id, text) = &notifier.alarms[0];
+        assert!(alarm_id.starts_with("agent-watch-hook-liaison-"), "{alarm_id}");
+        assert!(text.contains("liaison"), "{text}");
+        assert!(
+            text.contains("Running this command may delete files"),
+            "the owner is told the first reason line: {text}"
+        );
+        assert!(text.contains("Only you can answer this in that pane"), "{text}");
+        assert_eq!(report["hook_confirmations"][0]["reported"], true, "{report}");
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_030.0, &options);
+        assert_eq!(
+            notifier.alarms.len(),
+            1,
+            "the same prompt is rate-limited per prompt: {report}"
+        );
     }
 
     #[test]

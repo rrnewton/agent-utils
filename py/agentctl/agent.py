@@ -2308,6 +2308,32 @@ def _wait_ready(
                 except HerdrUnavailable as exc:
                     detail += f" Screen read failed: {exc}"
             raise AgentDeliveryError(f"pane {info.pane_id} is blocked; {detail}")
+        if info.status == "staged" and timeout > 0:
+            # A staged pane holds a draft this edition may not submit: the
+            # composer is occupied, and waiting out a real readiness timeout
+            # behind the caller's lifecycle lock cannot clear it (#1775 (a)).
+            # Name it and stop; the prompt stays pending for a later drain.
+            # A zero timeout is a probe, not a wait: it keeps its wording.
+            # A person's draft is described, never quoted, as everywhere
+            # else in agentctl.
+            try:
+                from agentctl.submission import composer_view
+
+                composer = composer_view(
+                    info.agent or "",
+                    client.read(info.pane_id, source="visible", lines=200),
+                )
+            except Exception:
+                composer = None
+            draft = composer.composer_solid.strip() if composer is not None else ""
+            if draft:
+                rows = len(draft.splitlines())
+                raise AgentDeliveryError(
+                    f"pane {info.pane_id} composer occupied: "
+                    f"{len(draft)} characters on {rows} row(s); "
+                    "the draft was left alone and nothing was typed — "
+                    "the prompt stays pending until the composer clears"
+                )
         if monotonic() >= deadline:
             raise AgentDeliveryError(
                 f"pane {info.pane_id} did not become idle/done within {timeout:g}s; last status={info.status}"
@@ -2497,6 +2523,12 @@ def _drain(
                 except (AgentDeliveryError, HerdrUnavailable) as exc:
                     fcntl.flock(descriptor, fcntl.LOCK_EX)
                     blocked = _bounded_error(str(exc), max_artifact_bytes)
+                    # Re-check the record's phase under the queue lock
+                    # before writing it back (#1775 (c)): a prompt cancelled
+                    # or moved while this drain waited only in memory must
+                    # never be recreated in inbox/ as pending.
+                    if not os.path.exists(path):
+                        break
                     if (document.get("delivery_state") != "pending"
                             or document.get("delivery_error") != blocked):
                         document["delivery_state"] = "pending"
@@ -2810,7 +2842,9 @@ def status(
         _validate_private_directory(path, "queue state directory")
         return sorted(name[:-5] for name in os.listdir(path) if name.endswith(".json"))
 
-    pending_ids = identifiers(inbox)
+    # Pending is every item a drain may still type, in either inbox lane
+    # (#1775 (b)): an inbox.v2/ item is pending, not invisible.
+    pending_ids = sorted(set(identifiers(inbox)) | set(identifiers(os.path.join(root, "inbox.v2"))))
     result: dict[str, object] = {
         "pane_id": info.pane_id, "agent": info.agent, "agent_status": info.status,
         "session_agent": info.session_agent, "session_value": info.session_value,

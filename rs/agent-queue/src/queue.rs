@@ -790,6 +790,15 @@ pub fn quarantine_raw(path: &Path, failed: &Path, outcome: &str, error: &str) ->
 /// that died between the barrier and its first input - stranded live
 /// trial messages as `possibly_submitted` although nothing was ever typed.
 fn repend_never_typed(directories: &QueueDirectories, path: &Path) -> Result<bool> {
+    // A cancelled item is never written back to a pending lane (#1775 (c)).
+    if path.file_name().is_some_and(|filename| {
+        directories
+            .cancel
+            .join(filename.to_string_lossy().into_owned())
+            .exists()
+    }) {
+        return Ok(false);
+    }
     let Ok(mut document) = load_message(path) else {
         return Ok(false);
     };
@@ -859,6 +868,15 @@ pub fn repend_stranded_inflight(directories: &QueueDirectories) -> Result<Vec<St
         let Ok(mut document) = load_message(&path) else {
             continue;
         };
+        // A cancelled item is never written back to a pending lane (#1775 (c)).
+        if path.file_name().is_some_and(|filename| {
+            directories
+                .cancel
+                .join(filename.to_string_lossy().into_owned())
+                .exists()
+        }) {
+            continue;
+        }
         // A live claim by a concurrent drain (#1480): leave it for its owner.
         if path
             .file_name()
@@ -920,6 +938,25 @@ pub fn recover_inflight(directories: &QueueDirectories) -> Result<Vec<String>> {
             .is_some_and(|filename| claim_owner_alive(directories, filename))
         {
             continue;
+        }
+        // A cancelled item is set aside, never quarantined or written back
+        // to a pending lane (#1775 (c)).
+        if let Ok(document) = load_message(&path) {
+            if let Some((reason, detail)) = set_aside_reason(
+                directories,
+                &message_id_from_path(&path).unwrap_or_default(),
+                &document,
+                (unix_seconds() * 1000.0) as u64,
+            ) {
+                if reason == "cancelled" {
+                    let root = directories
+                        .inbox
+                        .parent()
+                        .map_or_else(|| Path::new(".").to_path_buf(), Path::to_path_buf);
+                    set_aside(&root, directories, &path, document, reason, &detail)?;
+                    continue;
+                }
+            }
         }
         if repend_never_typed(directories, &path)? {
             continue;
