@@ -941,6 +941,7 @@ fn dead_adoption_retirement_respects_pending_name_and_move_reservations() {
                     workspace_id: record.workspace_id.clone(),
                     journal_id: new_journal_id().unwrap(),
                     started_at: unix_seconds(),
+                    keep_alias_until: None,
                 })
                 .unwrap(),
             "move" => manager

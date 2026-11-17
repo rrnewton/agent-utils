@@ -13,6 +13,7 @@
 //!   locks/<name>.lock         the agent's lifecycle lock
 //!   locks/<name>.rank.lock    its rank companion
 //!   archive/<name>-<token>/   retired agents
+//!   aliases/<old>.json        rename aliases kept by `rename --keep-alias`
 //!   .progress/, .waiting/, .renames/, .revives/, .inbox/                 other collections
 //! ```
 //!
@@ -74,17 +75,22 @@ pub const RENAMES_TRIPWIRE_TEXT: &str = "This registry uses agentctl registry la
 builds older than layout 2 stop at this file; upgrade agentctl. Readers of rename journals skip it.\n";
 /// The directory holding the registry's chat bridges, one entry each.
 pub const BRIDGES: &str = "bridges";
+/// The directory holding rename aliases, one `aliases/<old>.json` per kept old name
+/// (#1777 agentctl-rename-keep-alias). A collection of its own, like `agents/` and
+/// `locks/`, so no number of aliases buries the registry's fixed items.
+pub const ALIASES: &str = "aliases";
 /// Names no agent may take: each is a directory of the registry itself.
 /// `turnover-pins` holds services-turnover pin files (#1220), not an agent.
 /// `restore` (its `reports/` collection) and `restore-reports`
 /// joined when an older migration moved the former into `agents/` as if it
 /// were an agent (#1425): every known registry directory belongs here, in
 /// one list shared by migration, listing, and doctor.
-pub const RESERVED_NAMES: [&str; 7] = [
+pub const RESERVED_NAMES: [&str; 8] = [
     "archive",
     AGENTS,
     LOCKS,
     BRIDGES,
+    ALIASES,
     "turnover-pins",
     "restore",
     "restore-reports",
@@ -130,6 +136,18 @@ pub fn agents_directory(registry: &Path) -> PathBuf {
 #[must_use]
 pub fn locks_directory(registry: &Path) -> PathBuf {
     registry.join(LOCKS)
+}
+
+/// `REGISTRY/aliases`.
+#[must_use]
+pub fn aliases_directory(registry: &Path) -> PathBuf {
+    registry.join(ALIASES)
+}
+
+/// The alias record for old name `name`: `REGISTRY/aliases/<name>.json`.
+#[must_use]
+pub fn alias_path(registry: &Path, name: &str) -> PathBuf {
+    aliases_directory(registry).join(format!("{name}.json"))
 }
 
 /// An agent's directory in layout 2, whether or not it exists.
@@ -499,6 +517,12 @@ pub fn prepare(registry: &Path) -> Result<()> {
     fsio::create_private_directory(
         &locks_directory(registry),
         "agent lock collection",
+        false,
+        true,
+    )?;
+    fsio::create_private_directory(
+        &aliases_directory(registry),
+        "agent alias collection",
         false,
         true,
     )

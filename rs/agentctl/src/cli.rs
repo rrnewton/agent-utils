@@ -141,8 +141,11 @@ enum Commands {
     #[command(after_help = "Example: agentctl move reviewer")]
     Move(Named),
     /// Rename a running native or adopted agent: registry entry, Herdr agent name, and tab label together. Use it when an agent's warm context is still useful but its purpose changed; prefer a new agent otherwise. An interrupted rename refuses both names until the same command is rerun
-    #[command(after_help = "Example: agentctl rename reviewer release-reviewer")]
+    #[command(after_help = "Examples:\n  agentctl rename reviewer release-reviewer\n  agentctl rename reviewer release-reviewer --keep-alias 14d\n\nWith --keep-alias DURATION the old name stays as an alias (REGISTRY/aliases/OLD.json) until\nit expires: commands addressed to OLD reach the same agent, printing one note on standard\nerror, and no new agent may register as OLD while the alias lives. Without it the old name\nis gone at once, as before. `agentctl alias list` shows live aliases, `agentctl alias rm\nOLD` removes one early; an expired alias is removed the next time it is met.")]
     Rename(Rename),
+    /// Show or remove the old names kept by `rename --keep-alias`
+    #[command(after_help = "Examples:\n  agentctl alias list\n  agentctl alias rm reviewer")]
+    Alias(Alias),
     /// Pin the terminal and foreground harness process of an agent whose record pins no harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness process or observed native session is refused. For a Muse pane or root slot relay, whose process is pinned at launch, only record that process's launch spec
     #[command(after_help = "Example: agentctl anchor reviewer")]
     Anchor(Anchor),
@@ -1414,6 +1417,23 @@ struct Rename {
     /// New registered name (lowercase letters, digits, hyphens)
     #[arg(value_name = "NEW")]
     new_name: String,
+    /// Keep the old name as an alias of the new one for this long (for example 14d, 48h, 30m); without it the old name stops resolving at once
+    #[arg(long = "keep-alias", value_name = "DURATION")]
+    keep_alias: Option<String>,
+}
+
+#[derive(Args)]
+struct Alias {
+    #[command(subcommand)]
+    command: AliasCommand,
+}
+
+#[derive(Subcommand)]
+enum AliasCommand {
+    /// List the live rename aliases as JSON (expired ones are removed)
+    List,
+    /// Remove one alias now; the old name is unknown afterwards
+    Rm(Named),
 }
 
 #[derive(Args)]
@@ -3834,6 +3854,7 @@ fn writes_registry(command: &Commands) -> bool {
         Commands::Revive(value) => !value.dry_run,
         Commands::RetireStaleRegistration(value) => !value.dry_run,
         Commands::Coordinator(value) => !matches!(value.command, CoordinatorCommand::Show),
+        Commands::Alias(value) => matches!(value.command, AliasCommand::Rm(_)),
         Commands::Team(value) => !matches!(value.command, TeamCommand::Verify(_)),
         Commands::Start(_)
         | Commands::Console(_)
@@ -5220,7 +5241,15 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return Ok(0);
         }
         Commands::Move(value) => manager.move_to_project_workspace(&value.name)?,
-        Commands::Rename(value) => manager.rename(&value.agent.name, &value.new_name)?,
+        Commands::Rename(value) => manager.rename_keep_alias(
+            &value.agent.name,
+            &value.new_name,
+            value.keep_alias.as_deref(),
+        )?,
+        Commands::Alias(value) => match &value.command {
+            AliasCommand::List => manager.alias_list()?,
+            AliasCommand::Rm(named) => manager.alias_remove(&named.name)?,
+        },
         Commands::Promote(value) => {
             manager.promote(&value.name, value.expected_token.as_deref())?
         }
@@ -5688,7 +5717,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             } else {
                 manager.drain(&value.agent.name, options)?
             };
-            write_json(&result).map_err(Failure::Output)?;
+            let mut document = json!(result);
+            if let Some(alias) = manager.alias_use() {
+                document["alias"] = alias;
+            }
+            write_json(&document).map_err(Failure::Output)?;
             return Ok(if result.blocked.is_some() {
                 75
             } else if result.quarantined.is_empty() {
@@ -5816,6 +5849,16 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             unreachable!()
         }
     };
+    // A name resolved through a rename alias reports the agent it reached
+    // and the alias it came through (#1777).
+    if let Some(alias) = manager.alias_use() {
+        if result.is_object() {
+            if result["name"].as_str() == alias["old"].as_str() {
+                result["name"] = alias["new"].clone();
+            }
+            result["alias"] = alias;
+        }
+    }
     add_capabilities(&mut result);
     if let Some((waiting, _)) = &send_waiting {
         result["waiting_requests"] = waiting.clone();

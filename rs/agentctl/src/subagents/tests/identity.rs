@@ -691,6 +691,158 @@ fn a_crash_between_publication_and_the_directory_move_recovers_with_one_history_
     assert!(!registry(&fixture).join("agents/worker").exists());
 }
 
+fn alias_document(fixture: &Fixture, old: &str) -> Value {
+    agent::read_private_json(&registry(fixture).join(format!("aliases/{old}.json"))).unwrap()
+}
+
+#[test]
+fn rename_with_alias_keeps_the_old_name_reaching_the_agent() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    // A prompt queued before the rename survives in the moved queue.
+    fixture
+        .manager()
+        .queue_identified("worker", "queued before the rename", None, None, None)
+        .unwrap();
+    let result = fixture
+        .manager()
+        .rename_keep_alias("worker", "reviewer", Some("14d"))
+        .unwrap();
+    assert_eq!(result["alias"]["old"], "worker");
+    assert_eq!(result["alias"]["new"], "reviewer");
+    assert!(result["alias"]["until"].as_f64().unwrap() > unix_seconds());
+    let alias = alias_document(&fixture, "worker");
+    assert_eq!(alias["schema"], "agentctl-alias/v1");
+    assert_eq!(alias["new"], "reviewer");
+    assert_eq!(alias["token"], record(&fixture, "reviewer")["token"]);
+    // Status, send and the surviving queue all reach the renamed agent by
+    // its old name.
+    let manager = fixture.manager();
+    let status = manager.status("worker").unwrap();
+    assert_eq!(status["name"], "reviewer");
+    assert_eq!(manager.alias_use().unwrap()["old"], json!("worker"));
+    let pending = fixture.manager().pending_prompts("worker").unwrap();
+    assert_eq!(pending.len(), 1);
+    send(&fixture, "worker", "work under the old name").unwrap();
+    assert_eq!(
+        runs(&fixture).last().map(String::as_str),
+        Some("work under the old name")
+    );
+    let listed = fixture.manager().alias_list().unwrap();
+    assert_eq!(listed[0]["old"], "worker");
+    assert_eq!(listed[0]["new"], "reviewer");
+}
+
+#[test]
+fn an_alias_whose_agent_was_replaced_refuses() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .manager()
+        .rename_keep_alias("worker", "reviewer", Some("14d"))
+        .unwrap();
+    // The new name is reused by a different generation: the alias must not
+    // deliver its predecessor's mail to it.
+    let mut replaced = record(&fixture, "reviewer");
+    replaced["token"] = json!("a-different-generation");
+    write_record(&fixture, "reviewer", &replaced);
+    let error = send(&fixture, "worker", "nobody").expect_err("replaced token");
+    assert!(
+        error.to_string().contains("different generation"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("reviewer"), "{error}");
+    assert!(registry(&fixture).join("aliases/worker.json").exists());
+}
+
+#[test]
+fn an_expired_alias_refuses_and_is_pruned() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .manager()
+        .rename_keep_alias("worker", "reviewer", Some("14d"))
+        .unwrap();
+    let mut alias = alias_document(&fixture, "worker");
+    alias["created"] = json!(0.5);
+    alias["expires"] = json!(1.0);
+    agent::atomic_json(
+        &registry(&fixture).join("aliases/worker.json"),
+        &alias,
+    )
+    .unwrap();
+    let error = fixture
+        .manager()
+        .status("worker")
+        .expect_err("expired alias");
+    assert!(error.to_string().contains("expired"), "{error}");
+    assert!(error.to_string().contains("reviewer"), "{error}");
+    assert!(!registry(&fixture).join("aliases/worker.json").exists());
+}
+
+#[test]
+fn registering_the_old_name_while_an_alias_lives_refuses() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    fixture
+        .manager()
+        .rename_keep_alias("worker", "reviewer", Some("14d"))
+        .unwrap();
+    let error = fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                ..StartOptions::default()
+            },
+        )
+        .expect_err("alias owns the old name");
+    assert!(error.to_string().contains("alias of 'reviewer'"), "{error}");
+    // Removing the alias frees the name's resolution again.
+    let removed = fixture.manager().alias_remove("worker").unwrap();
+    assert_eq!(removed["removed"], true);
+    let error = send(&fixture, "worker", "nobody").expect_err("alias removed");
+    assert!(error.to_string().contains("unknown agent"), "{error}");
+}
+
+#[test]
+fn a_crash_mid_rename_with_alias_leaves_no_alias_or_a_complete_one() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    FAIL_RENAME_DIRECTORY_MOVE.with(|fail_once| fail_once.set(true));
+    let error = fixture
+        .manager()
+        .rename_keep_alias("worker", "reviewer", Some("14d"))
+        .expect_err("injected crash");
+    assert!(error.to_string().contains("simulated crash"), "{error}");
+    assert_eq!(journal_count(&fixture), 1);
+    assert!(!registry(&fixture).join("aliases/worker.json").exists());
+    // The journal carries the alias: the plain rerun completes both.
+    let result = fixture.manager().rename("worker", "reviewer").unwrap();
+    assert_eq!(result["recovered"], true);
+    assert_eq!(result["alias"]["old"], "worker");
+    let alias = alias_document(&fixture, "worker");
+    assert_eq!(alias["token"], record(&fixture, "reviewer")["token"]);
+    send(&fixture, "worker", "after recovery").unwrap();
+    assert_eq!(
+        runs(&fixture).last().map(String::as_str),
+        Some("after recovery")
+    );
+}
+
+#[test]
+fn rename_without_keep_alias_keeps_the_old_behaviour() {
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let result = fixture.manager().rename("worker", "reviewer").unwrap();
+    assert!(result.get("alias").is_none());
+    assert!(!registry(&fixture).join("aliases/worker.json").exists());
+    let error = send(&fixture, "worker", "nobody").expect_err("old name is gone");
+    assert!(error.to_string().contains("unknown agent"), "{error}");
+}
+
 #[test]
 fn rename_recovery_after_the_harness_exits_finishes_the_registry_only() {
     let fixture = Fixture::new();

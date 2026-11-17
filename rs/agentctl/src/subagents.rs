@@ -13,6 +13,7 @@ use std::os::unix::fs::{
 };
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -672,6 +673,10 @@ struct RenameJournal {
     workspace_id: Option<String>,
     journal_id: String,
     started_at: f64,
+    /// With `rename --keep-alias`: the unix time the `aliases/<old>.json` record
+    /// expires. Written into the journal before the rename starts, so a rerun
+    /// that finishes the rename creates the same alias (#1777).
+    keep_alias_until: Option<f64>,
 }
 
 impl RenameJournal {
@@ -704,6 +709,17 @@ impl RenameJournal {
             .as_f64()
             .filter(|value| value.is_finite())
             .ok_or_else(invalid)?;
+        // A journal written before --keep-alias has no such key; a newer key a
+        // later build adds is likewise ignored here, as above (#813).
+        let keep_alias_until = match object.get("keep_alias_until") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_f64()
+                    .filter(|value| value.is_finite() && *value > started_at)
+                    .ok_or_else(invalid)?,
+            ),
+        };
         if text("schema") != Some(RENAME_JOURNAL_SCHEMA)
             || path.file_name().and_then(|name| name.to_str()) != Some(&format!("{token}.json"))
             || token.is_empty()
@@ -732,11 +748,15 @@ impl RenameJournal {
             workspace_id: optional("workspace_id")?,
             journal_id: journal_id.to_owned(),
             started_at,
+            keep_alias_until,
         })
     }
 
     fn document(&self) -> Value {
-        json!({
+        // `keep_alias_until` appears only when a rename keeps the old name,
+        // so a plain rename's journal is byte-for-byte the document both
+        // editions have always written.
+        let mut document = json!({
             "schema": RENAME_JOURNAL_SCHEMA,
             "token": self.token,
             "old": self.old,
@@ -748,12 +768,136 @@ impl RenameJournal {
             "workspace_id": self.workspace_id,
             "journal_id": self.journal_id,
             "started_at": self.started_at,
-        })
+        });
+        if let Some(until) = self.keep_alias_until {
+            document["keep_alias_until"] = json!(until);
+        }
+        document
     }
 
     fn names(&self, candidates: &[&str]) -> bool {
         candidates.contains(&self.old.as_str()) || candidates.contains(&self.new.as_str())
     }
+}
+
+/// Schema tag of an alias record in `REGISTRY/aliases/<old>.json` (#1777).
+const ALIAS_SCHEMA: &str = "agentctl-alias/v1";
+
+/// One kept old name: `aliases/<old>.json` points at the agent now named `new`,
+/// but only while that agent is still the generation `token` names and
+/// `expires` has not passed. Written atomically inside the rename journal's
+/// completion, so a crash mid-rename leaves no alias or a complete one.
+#[derive(Clone, Debug, PartialEq)]
+struct AliasRecord {
+    old: String,
+    new: String,
+    token: String,
+    created: f64,
+    expires: f64,
+}
+
+impl AliasRecord {
+    fn parse(value: &Value, path: &Path) -> Result<Self> {
+        let invalid = || fail(format!("invalid alias record: {}", path.display()));
+        let object = value.as_object().ok_or_else(invalid)?;
+        let text = |key: &str| object.get(key).and_then(Value::as_str);
+        let number = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+        };
+        let (old, new, token) = (
+            text("old").ok_or_else(invalid)?,
+            text("new").ok_or_else(invalid)?,
+            text("token").ok_or_else(invalid)?,
+        );
+        let (created, expires) = (
+            number("created").ok_or_else(invalid)?,
+            number("expires").ok_or_else(invalid)?,
+        );
+        if text("schema") != Some(ALIAS_SCHEMA)
+            || !name_pattern(old)
+            || !name_pattern(new)
+            || old == new
+            || token.is_empty()
+            || expires <= created
+            || path.file_name().and_then(|name| name.to_str())
+                != Some(&format!("{old}.json"))
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            old: old.to_owned(),
+            new: new.to_owned(),
+            token: token.to_owned(),
+            created,
+            expires,
+        })
+    }
+
+    fn document(&self) -> Value {
+        json!({
+            "schema": ALIAS_SCHEMA,
+            "old": self.old,
+            "new": self.new,
+            "token": self.token,
+            "created": self.created,
+            "expires": self.expires,
+        })
+    }
+
+    fn expired(&self, now: f64) -> bool {
+        now >= self.expires
+    }
+}
+
+/// Parse a `--keep-alias` duration (`14d`, `48h`, `30m`, `90s`) into seconds.
+pub(crate) fn parse_alias_duration(value: &str) -> Result<f64> {
+    let invalid = || {
+        fail(format!(
+            "invalid --keep-alias duration {value:?}; use a count and a unit, for example 14d, 48h, 30m or 90s"
+        ))
+    };
+    let (count, unit) = value.split_at(value.len().saturating_sub(1));
+    let count: u64 = count.parse().map_err(|_| invalid())?;
+    let factor: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return Err(invalid()),
+    };
+    if count == 0 {
+        return Err(invalid());
+    }
+    Ok((count * factor) as f64)
+}
+
+/// `2026-12-01 09:30 ET` for a unix time: America/New_York wall time. EDT
+/// (UTC-4) runs from the second Sunday of March to the first Sunday of
+/// November; EST (UTC-5) otherwise.
+pub(crate) fn format_et(unix: f64) -> String {
+    use chrono::TimeZone;
+    let utc = chrono::Utc
+        .timestamp_opt(unix as i64, 0)
+        .single()
+        .unwrap_or_default();
+    let year = chrono::Datelike::year(&utc);
+    let nth_sunday = |month: u32, nth: u32| {
+        let first = chrono::Utc
+            .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+            .single()
+            .unwrap_or_default();
+        let offset = (7 - chrono::Datelike::weekday(&first).num_days_from_sunday()) % 7;
+        first + chrono::Duration::days(i64::from(offset + 7 * (nth - 1)))
+    };
+    let edt_start = nth_sunday(3, 2) + chrono::Duration::hours(7);
+    let edt_end = nth_sunday(11, 1) + chrono::Duration::hours(6);
+    let offset_hours = if utc >= edt_start && utc < edt_end { -4 } else { -5 };
+    let zone = chrono::FixedOffset::east_opt(offset_hours * 3_600)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("zero offset is valid"));
+    utc.with_timezone(&zone).format("%Y-%m-%d %H:%M ET").to_string()
 }
 
 /// A fresh random rename journal id (32 lowercase hexadecimal digits, like a UUID4 hex).
@@ -6636,6 +6780,11 @@ pub struct ManagedAgents<'a, A: ManagedApi + ?Sized> {
     cloud_list_timeout: Option<Duration>,
     /// Wait for an agent's lifecycle lock as a priority sender: see [`Self::with_lock_priority`].
     lock_priority: bool,
+    /// Whether the alias note has been printed in this process: one note per
+    /// command however many loads it does (#1777).
+    alias_noted: AtomicBool,
+    /// The alias this manager resolved a name through, for JSON output.
+    alias_used: Mutex<Option<AliasRecord>>,
     #[cfg(test)]
     revive_wrkslots_executable: Option<PathBuf>,
     /// The registry launch environment as a test pretends it, instead of `profiles.json`.
@@ -6666,6 +6815,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             cloud_tools: CloudTools::default(),
             cloud_list_timeout: None,
             lock_priority: false,
+            alias_noted: AtomicBool::new(false),
+            alias_used: Mutex::new(None),
             #[cfg(test)]
             revive_wrkslots_executable: None,
             #[cfg(test)]
@@ -6790,6 +6941,194 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// Create layout 2's directories and tripwire before the first layout-2 write.
     fn prepare_layout(&self) -> Result<()> {
         agent_queue::registry::prepare(&self.registry).map_err(|error| fail(error.to_string()))
+    }
+
+    /// The alias record for `old`, when one is on disk (live or expired).
+    fn read_alias(&self, old: &str) -> Result<Option<AliasRecord>> {
+        let path = agent_queue::registry::alias_path(&self.registry, old);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(fail(format!("cannot inspect alias {}: {error}", path.display()))),
+        }
+        let document = agent::read_private_json(&path)?;
+        AliasRecord::parse(&document, &path).map(Some)
+    }
+
+    /// Delete an alias record and publish the directory (lazy pruning).
+    fn prune_alias(&self, old: &str) -> Result<()> {
+        let path = agent_queue::registry::alias_path(&self.registry, old);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(fail(format!("cannot remove alias {}: {error}", path.display()))),
+        }
+        agent::sync_directory(&agent_queue::registry::aliases_directory(&self.registry))
+    }
+
+    /// Follow `requested` through live aliases to the current agent name.
+    ///
+    /// An alias resolves only to the record carrying its token: a replaced
+    /// agent (same new name, different token) and an expired alias both
+    /// refuse, naming the new name. Expired aliases are pruned here.
+    fn resolve_alias(&self, requested: &str) -> Result<Option<(String, AliasRecord)>> {
+        if name(requested).is_err() {
+            return Ok(None);
+        }
+        let now = unix_seconds();
+        let mut current = requested.to_owned();
+        let mut first: Option<AliasRecord> = None;
+        for _ in 0..8 {
+            let Some(alias) = self.read_alias(&current)? else {
+                break;
+            };
+            if alias.expired(now) {
+                let target = alias.new.clone();
+                self.prune_alias(&alias.old)?;
+                return Err(fail(format!(
+                    "'{requested}' was an alias of '{target}' until {}; the alias has expired — use {target}",
+                    format_et(alias.expires)
+                )));
+            }
+            if first.is_none() {
+                first = Some(alias.clone());
+            } else if first.as_ref().is_some_and(|kept| kept.token != alias.token) {
+                return Err(fail(format!(
+                    "'{requested}' is an alias of '{}', but the alias chain changes generation; use {}",
+                    alias.new, alias.new
+                )));
+            }
+            current = alias.new.clone();
+        }
+        let Some(mut kept) = first else {
+            return Ok(None);
+        };
+        if current == requested {
+            return Ok(None);
+        }
+        // The alias lives only while its token still names the agent at the
+        // resolved name: a replaced agent refuses rather than receiving mail
+        // meant for its predecessor.
+        let directory = self.directory(&current)?;
+        if !directory.exists() {
+            return Err(fail(format!(
+                "'{requested}' is an alias of '{current}', but no agent is registered as '{current}'; use {current} once it is registered, or remove the alias with `agentctl alias rm {requested}`"
+            )));
+        }
+        let record = self.read_record(&current)?;
+        if record.token != kept.token {
+            return Err(fail(format!(
+                "'{requested}' is an alias of '{current}', but the agent now registered as '{current}' is a different generation; use {current} directly, or remove the alias with `agentctl alias rm {requested}`"
+            )));
+        }
+        kept.new = current.clone();
+        Ok(Some((current, kept)))
+    }
+
+    /// Print the one alias note for this process and remember it for JSON.
+    fn note_alias(&self, requested: &str, alias: &AliasRecord) {
+        *self.alias_used.lock().unwrap_or_else(|poison| poison.into_inner()) =
+            Some(alias.clone());
+        if !self.alias_noted.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "agentctl: '{requested}' is an alias of '{}' until {}; use {}",
+                alias.new,
+                format_et(alias.expires),
+                alias.new
+            );
+        }
+    }
+
+    /// The alias this manager resolved through, as a JSON field value.
+    pub(crate) fn alias_use(&self) -> Option<Value> {
+        self.alias_used
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|alias| {
+                json!({
+                    "old": alias.old,
+                    "new": alias.new,
+                    "until": alias.expires,
+                    "until_et": format_et(alias.expires),
+                })
+            })
+    }
+
+    /// Refuse to register a new agent under a name a live alias still owns.
+    fn refuse_live_alias(&self, agent_name: &str) -> Result<()> {
+        let Some(alias) = self.read_alias(agent_name)? else {
+            return Ok(());
+        };
+        if alias.expired(unix_seconds()) {
+            return self.prune_alias(agent_name);
+        }
+        Err(fail(format!(
+            "'{agent_name}' is an alias of '{}' until {}; registering a new agent as '{agent_name}' is refused while the alias lives — use {}, or remove the alias with `agentctl alias rm {agent_name}`",
+            alias.new,
+            format_et(alias.expires),
+            alias.new
+        )))
+    }
+
+    /// Every live alias, oldest first; expired ones are pruned on the way.
+    pub fn alias_list(&self) -> Result<Value> {
+        let directory = agent_queue::registry::aliases_directory(&self.registry);
+        let mut aliases = Vec::new();
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(json!([]));
+            }
+            Err(error) => {
+                return Err(fail(format!(
+                    "cannot list aliases {}: {error}",
+                    directory.display()
+                )))
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| fail(error.to_string()))?;
+            let Some(old) = entry
+                .file_name()
+                .to_str()
+                .and_then(|file| file.strip_suffix(".json"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Some(alias) = self.read_alias(&old)? else {
+                continue;
+            };
+            if alias.expired(unix_seconds()) {
+                self.prune_alias(&old)?;
+                continue;
+            }
+            aliases.push(json!({
+                "old": alias.old,
+                "new": alias.new,
+                "token": alias.token,
+                "created": alias.created,
+                "expires": alias.expires,
+                "until_et": format_et(alias.expires),
+            }));
+        }
+        aliases.sort_by(|left, right| left["old"].as_str().cmp(&right["old"].as_str()));
+        Ok(json!(aliases))
+    }
+
+    /// Remove one alias; afterwards the old name is unknown again.
+    pub fn alias_remove(&self, old: &str) -> Result<Value> {
+        name(old)?;
+        let Some(alias) = self.read_alias(old)? else {
+            return Err(fail(format!("no alias for '{old}'")));
+        };
+        self.prune_alias(old)?;
+        Ok(json!({
+            "old": alias.old,
+            "new": alias.new,
+            "removed": true,
+        }))
     }
 
     /// Move agent `agent_name`'s directory, from whichever layout holds it, to `destination` in
@@ -7466,6 +7805,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent_name: &str,
         recovery: Option<&mut RecoveryAction>,
     ) -> Result<AgentRecord> {
+        // Every name-taking command funnels through here, so alias resolution
+        // lives here rather than in each command (#1777): a live alias loads
+        // the record it points at, with one note per process.
+        let (effective, alias) = match self.resolve_alias(agent_name)? {
+            Some((resolved, alias)) => (resolved, Some(alias)),
+            None => (agent_name.to_owned(), None),
+        };
+        if let Some(alias) = &alias {
+            self.note_alias(agent_name, alias);
+        }
+        let agent_name = effective.as_str();
         self.directory(agent_name)?;
         agent::validate_private_directory(&self.registry, "agent registry", false)?;
         self.refuse_pending_rename_with_stop_advice(&[agent_name], recovery)?;
@@ -9037,7 +9387,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Rename a live agent: registry entry, Herdr agent name and tab label together.
     pub fn rename(&self, old: &str, new: &str) -> Result<Value> {
-        let mut result = self.rename_record(old, new)?;
+        self.rename_inner(old, new, None)
+    }
+
+    /// Rename, keeping `old` as an alias of the agent for `keep_alias`
+    /// (a duration such as `14d`; see [`parse_alias_duration`]).
+    pub fn rename_keep_alias(
+        &self,
+        old: &str,
+        new: &str,
+        keep_alias: Option<&str>,
+    ) -> Result<Value> {
+        let seconds = keep_alias.map(parse_alias_duration).transpose()?;
+        self.rename_inner(old, new, seconds)
+    }
+
+    fn rename_inner(
+        &self,
+        old: &str,
+        new: &str,
+        keep_alias_seconds: Option<f64>,
+    ) -> Result<Value> {
+        let mut result = self.rename_record(old, new, keep_alias_seconds)?;
         // The designation follows the agent by token whatever its name; this keeps the name it
         // records readable.
         if let Err(error) = self.follow_rename(new) {
@@ -9046,7 +9417,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         Ok(result)
     }
 
-    fn rename_record(&self, old: &str, new: &str) -> Result<Value> {
+    fn rename_record(
+        &self,
+        old: &str,
+        new: &str,
+        keep_alias_seconds: Option<f64>,
+    ) -> Result<Value> {
         self.refuse_pending_revive(&[old, new])?;
         name(old)?;
         name(new)?;
@@ -9071,6 +9447,22 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             }
             return self.finish_rename(found, true);
         }
+        // Renaming through an alias would move the wrong record: name the
+        // agent itself. A live alias on the new name likewise refuses, as a
+        // registration would.
+        if let Some(alias) = self.read_alias(old)? {
+            if alias.expired(unix_seconds()) {
+                self.prune_alias(old)?;
+            } else {
+                return Err(fail(format!(
+                    "'{old}' is an alias of '{}' until {}; rename {} instead",
+                    alias.new,
+                    format_et(alias.expires),
+                    alias.new
+                )));
+            }
+        }
+        self.refuse_live_alias(new)?;
         let record = self.load(old)?;
         record.refuse_nested_rename()?;
         if !record.anchors_with_harness_identity() || record.lifecycle != "running" {
@@ -9101,6 +9493,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if fs::symlink_metadata(self.directory(new)?).is_ok() {
             return Err(fail(format!("agent '{new}' is already registered")));
         }
+        let started_at = unix_seconds();
         let journal = RenameJournal {
             token: record.token.clone(),
             old: old.to_owned(),
@@ -9111,7 +9504,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             terminal_id: record.terminal_id.clone(),
             workspace_id: record.workspace_id.clone(),
             journal_id: new_journal_id()?,
-            started_at: unix_seconds(),
+            started_at,
+            keep_alias_until: keep_alias_seconds.map(|seconds| started_at + seconds),
         };
         let _queue_locks = self.queue_locks(old)?;
         let _pane_lock = self.pane_lock(&pane)?;
@@ -9309,8 +9703,25 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 "agent '{new}' was moved without its rename history; refusing to guess"
             )));
         }
+        // The alias is the rename's last write, inside the journal: before it
+        // the old name is simply gone, after it the alias is complete, and a
+        // crash in between is finished by rerunning the rename (#1777).
+        let alias = journal.keep_alias_until.map(|until| AliasRecord {
+            old: old.to_owned(),
+            new: new.to_owned(),
+            token: journal.token.clone(),
+            created: journal.started_at,
+            expires: until,
+        });
+        if let Some(alias) = &alias {
+            self.prepare_layout()?;
+            agent::atomic_json(
+                &agent_queue::registry::alias_path(&self.registry, old),
+                &alias.document(),
+            )?;
+        }
         self.remove_rename_journal(journal)?;
-        Ok(json!({
+        let mut result = json!({
             "name": new,
             "previous_name": old,
             "token": record.token,
@@ -9320,7 +9731,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             "external_references": format!(
                 "wrkslots slots, chat bindings and scheduled prompts that name '{old}' are not changed by agentctl"
             ),
-        }))
+        });
+        if let Some(alias) = &alias {
+            result["alias"] = json!({
+                "old": alias.old,
+                "new": alias.new,
+                "until": alias.expires,
+                "until_et": format_et(alias.expires),
+            });
+        }
+        Ok(result)
     }
 
     /// Every non-presentation anchor must hold; only the name and label may be OLD or NEW.
@@ -10236,6 +10656,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let directory = self.directory(agent_name)?;
         self.refuse_pending_rename(&[agent_name])?;
+        self.refuse_live_alias(agent_name)?;
         if fs::symlink_metadata(&directory).is_ok() {
             return Err(fail(format!(
                 "agent {agent_name:?} already registered; stop it before reusing the name"
@@ -10633,6 +11054,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         };
         let _generation_lock = self.lock(agent_name)?;
         let directory = self.directory(agent_name)?;
+        self.refuse_live_alias(agent_name)?;
         if fs::symlink_metadata(&directory).is_ok() {
             return Err(fail(format!(
                 "agent {agent_name:?} already registered; stop it before reusing the name"
@@ -12334,7 +12756,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// An interactive agent's pending prompts as `(id, queued_at millis)`, oldest
     /// first (#804): the watcher drains these and reports their ages.
     pub fn pending_prompts(&self, agent_name: &str) -> Result<Vec<(String, Option<u64>)>> {
-        let queue = self.queue(agent_name)?;
+        let effective = match self.resolve_alias(agent_name)? {
+            Some((resolved, alias)) => {
+                self.note_alias(agent_name, &alias);
+                resolved
+            }
+            None => agent_name.to_owned(),
+        };
+        let queue = self.queue(&effective)?;
         agent::pending_prompts(&queue)
     }
 
@@ -13717,8 +14146,8 @@ its drain would also type, so it was not queued",
         // Refuse an unregistered name: never create a queue for one (a
         // stray `agents/<typo>/queue/` in the registry is worse than the
         // typo).
-        self.load(agent_name)?;
-        let queue = self.queue(agent_name)?;
+        let record = self.load(agent_name)?;
+        let queue = self.queue(&record.name)?;
         crate::failed_digest::ack_failed(&queue, ids, all).map_err(fail)
     }
 
@@ -13727,8 +14156,8 @@ its drain would also type, so it was not queued",
         &self,
         agent_name: &str,
     ) -> Result<Vec<crate::failed_digest::FailedEntry>> {
-        self.load(agent_name)?;
-        let queue = self.queue(agent_name)?;
+        let record = self.load(agent_name)?;
+        let queue = self.queue(&record.name)?;
         Ok(crate::failed_digest::failed_entries(&queue))
     }
 
