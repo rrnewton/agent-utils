@@ -2,7 +2,7 @@
 // documents linked in chat, and the full-screen reader for one of them. Its
 // public interface; the page mounts it once and shows it as the `docs` view.
 
-export { createDocumentsList, dedupeDocumentRows, documentIdentity } from "./list.ts";
+export { createDocumentsList, dedupeDocumentRows, documentIdentity, documentMatchesNameFilter } from "./list.ts";
 export type { DocumentsList, DocumentsListDependencies, DocumentsListPlace } from "./list.ts";
 export { DOC_STATES_KEY, parseDocStates, serializeDocStates, withDocFlag } from "./docstate.ts";
 export { createDocumentsReader, currentOutlineIndex, highlightSearchTerms, openDocumentNotice } from "./reader.ts";
@@ -216,6 +216,9 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     onOpen: (key, terms) => {
       void openDocument(key, terms);
     },
+    // The default search is the list's local name filter (`#1767`); only the
+    // "Search text" checkbox takes the field to the server.
+    onFilter: (query) => list.setNameFilter(query),
     onStatus: deps.onStatus,
   });
 

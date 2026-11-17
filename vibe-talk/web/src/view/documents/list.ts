@@ -66,6 +66,10 @@ export interface DocumentsList {
   undoHide(): boolean;
   /** State from another device landed: reread it and redraw. */
   reloadStates(): void;
+  /** Narrow the list to documents whose name matches `text`, locally (`#1767`); blank shows all. */
+  setNameFilter(text: string): void;
+  /** The current local name filter's text. */
+  nameFilter(): string;
   unmount(): void;
 }
 
@@ -202,6 +206,23 @@ function byOldest(a: DocumentRow, b: DocumentRow): number {
 }
 
 /**
+ * The limited local name match (`#1767 vibe-talk-documents-list-filename-search`):
+ * every word of `query`, folded lower-case, appears in the words the list
+ * already holds for `row` — its file name, its title, and its key and address
+ * (which carry owner/repo and path). Purely local: no server round trip, and
+ * a blank query matches everything. Fetched times are shown on cards but are
+ * never matched; the match is name and title only.
+ */
+export function documentMatchesNameFilter(row: DocumentRow, query: string): boolean {
+  const words = query.toLowerCase().split(/\s+/).filter((word) => word !== "");
+  if (words.length === 0) return true;
+  const haystack = [row.file_name, row.title, displayTitle(row), row.key, row.url]
+    .join("\n")
+    .toLowerCase();
+  return words.every((word) => haystack.includes(word));
+}
+
+/**
  * The document a row names, ignoring which address named it (`#1263
  * documents-list-cards`): a GitHub file linked at two refs (or by its blob
  * and raw addresses, which mint one key) is one document, so its identity
@@ -308,6 +329,10 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   let starredOnly = false;
   // Hidden documents shown dimmed (the hamburger's "Show hidden"); this device only.
   let showingHidden = false;
+  // The local name filter (`#1767`): narrows by file name/title as the owner
+  // types, composed with the bucket, Starred and hidden filters, never
+  // reordering, and re-applied by every render (so live refreshes keep it).
+  let nameFilterText = "";
   // The hide the Undo chip offers to take back, and its timer.
   let undoOffer: { key: string; timer: ReturnType<typeof setTimeout> } | null = null;
   // A committed swipe's click, claimed so the card does not also open.
@@ -320,6 +345,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       const state = docStateOf(held, row.key);
       if (state.hidden && !showingHidden) return false;
       if (starredOnly && !state.starred) return false;
+      if (!documentMatchesNameFilter(row, nameFilterText)) return false;
       return true;
     });
   }
@@ -798,9 +824,12 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     if (shown.length === 0) {
       const note = document.createElement("p");
       note.className = "doc-empty";
-      note.textContent = starredOnly
-        ? "No starred documents."
-        : "No documents of this type.";
+      const filterWords = nameFilterText.trim();
+      note.textContent = filterWords !== ""
+        ? `No documents match "${filterWords}".`
+        : starredOnly
+          ? "No starred documents."
+          : "No documents of this type.";
       list.replaceChildren(head, note, ...(undo ? [undo] : []), bucketBar());
       return;
     }
@@ -1097,6 +1126,11 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       states.reload();
       render(rowsNow);
     },
+    setNameFilter(text: string): void {
+      nameFilterText = typeof text === "string" ? text : "";
+      render(rowsNow);
+    },
+    nameFilter: () => nameFilterText,
     unmount(): void {
       endUndoOffer();
       wiredOuter = false;

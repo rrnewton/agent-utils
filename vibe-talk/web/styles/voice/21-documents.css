@@ -90,8 +90,18 @@
 }
 #docs-search-bar {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 6px;
   margin-top: 6px;
+}
+/* The full-text opt-in (`#1767`): beside the field, never wrapping alone. */
+.docs-search-fulltext {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  font-size: 0.9em;
 }
 #docs-search-bar[hidden] {
   display: none;
@@ -113,6 +123,10 @@
   border: 1px solid;
   border-radius: 10px;
   background: transparent;
+  /* A button's own text colour, not the bar buttons' white: on a light
+     ground the hit's words were white on white (`#1767` screenshots). */
+  color: inherit;
+  font: inherit;
   text-align: left;
   cursor: pointer;
 }

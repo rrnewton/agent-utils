@@ -186,6 +186,7 @@ export interface ElementById {
   "docs-reader": HTMLDivElement;
   "docs-search-bar": HTMLDivElement;
   "docs-search-field": HTMLInputElement;
+  "docs-search-fulltext": HTMLInputElement;
   "docs-search-go": HTMLButtonElement;
   "docs-search-note": HTMLParagraphElement;
   "docs-search-results": HTMLOListElement;

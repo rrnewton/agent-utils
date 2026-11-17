@@ -2187,10 +2187,12 @@ test("documents search: hits render with the searched count; a result opens at i
   const toggle = fakeElement("button");
   const bar = fakeElement("div"); bar.hidden = true;
   const field = fakeElement("input"); field.value = "final";
+  // Full-text mode (`#1767`): the server search runs only with Search text on.
+  const fulltext = fakeElement("input"); fulltext.checked = true;
   const go = fakeElement("button");
   const note = fakeElement("p");
   const results = fakeElement("ol");
-  const byId = (id) => ({ "docs-search-toggle": toggle, "docs-search-bar": bar, "docs-search-field": field, "docs-search-go": go, "docs-search-note": note, "docs-search-results": results })[id];
+  const byId = (id) => ({ "docs-search-toggle": toggle, "docs-search-bar": bar, "docs-search-field": field, "docs-search-fulltext": fulltext, "docs-search-go": go, "docs-search-note": note, "docs-search-results": results })[id];
   const opened = [];
   const paths = [];
   const savedDocument = globalThis.document;
@@ -2212,6 +2214,83 @@ test("documents search: hits render with the searched count; a result opens at i
     assert.ok(hit.textContent.includes("Alpha"), "the result does not name its document");
     dispatchClick(hit);
     assert.deepEqual(opened, [["doc-a", ["final"]]], "the result did not open its document at the match");
+    search.unmount();
+  } finally {
+    globalThis.document = savedDocument;
+  }
+});
+
+test("documents list filter: filename and title match case-insensitively, order kept, no server search (#1767)", async () => {
+  const { documentMatchesNameFilter } = requireModule(LIST, "src/view/documents/list.ts");
+  assert.equal(typeof documentMatchesNameFilter, "function", "list does not export documentMatchesNameFilter");
+  const probe = { key: "github:acme/widgets@main:docs/Alpha-Plan.md", url: "https://example.com/Alpha-Plan.md", title: "Quarterly Roadmap", file_name: "Alpha-Plan.md", kind: "github_markdown", fetched: true, fetched_ms: 5, moved_to: null, mention_count: 1, mentions: [] };
+  assert.equal(documentMatchesNameFilter(probe, "alpha-plan"), true, "filename fragment does not match");
+  assert.equal(documentMatchesNameFilter(probe, "ROADMAP"), true, "title fragment is not case-insensitive");
+  assert.equal(documentMatchesNameFilter(probe, "acme widgets"), true, "repo metadata already on the row does not match");
+  assert.equal(documentMatchesNameFilter(probe, "zebra"), false, "an unrelated word matched");
+  assert.equal(documentMatchesNameFilter(probe, "  "), true, "a blank filter hid a row");
+
+  const rows = [
+    { key: "doc-a", url: "https://example.com/alpha-plan.md", title: "Quarterly Roadmap", file_name: "alpha-plan.md", mention_count: 1, kind: "github_markdown", fetched: true, fetched_ms: 100, moved_to: null, last_mentioned_ms: 100, mentions: [] },
+    { key: "doc-b", url: "https://example.com/beta-notes.md", title: "Beta scratch", file_name: "beta-notes.md", mention_count: 1, kind: "github_markdown", fetched: true, fetched_ms: 200, moved_to: null, last_mentioned_ms: 200, mentions: [] },
+    { key: "doc-c", url: "https://example.com/gamma.md", title: "Alpha appendix", file_name: "gamma.md", mention_count: 1, kind: "github_markdown", fetched: false, fetched_ms: null, moved_to: null, last_mentioned_ms: 300, mentions: [] },
+  ];
+  await withList(() => ({ documents: rows, total: 3 }), async ({ list, listEl, paths, keys }) => {
+    assert.equal(typeof list.setNameFilter, "function", "the list offers no setNameFilter");
+    await list.refresh();
+    assert.deepEqual(keys(), ["doc-a", "doc-b", "doc-c"]);
+    list.setNameFilter("ALPHA");
+    assert.deepEqual(keys(), ["doc-a", "doc-c"], "the filter did not keep filename and title hits in list order");
+    list.setNameFilter("roadmap");
+    assert.deepEqual(keys(), ["doc-a"], "a title-only fragment did not narrow the list");
+    list.setNameFilter("zebra");
+    assert.deepEqual(keys(), [], "a no-match filter still showed cards");
+    assert.ok(listEl.textContent.includes("No documents match"), `the no-match state is missing: ${listEl.textContent.slice(0, 200)}`);
+    list.setNameFilter("");
+    assert.deepEqual(keys(), ["doc-a", "doc-b", "doc-c"], "clearing the filter did not restore the list");
+    assert.ok(!paths.some((path) => path.includes("/search")), `the local filter called the server: ${paths.join(", ")}`);
+  });
+});
+
+test("documents search bar: unchecked typing filters locally with no server call; ticking Search text searches the server (#1767)", async () => {
+  const { createDocumentsSearch } = requireModule(SEARCH, "src/view/documents/search.ts");
+  const toggle = fakeElement("button");
+  const bar = fakeElement("div"); bar.hidden = true;
+  const field = fakeElement("input"); field.value = "";
+  const fulltext = fakeElement("input"); fulltext.checked = false;
+  const go = fakeElement("button");
+  const note = fakeElement("p");
+  const results = fakeElement("ol");
+  const byId = (id) => ({ "docs-search-toggle": toggle, "docs-search-bar": bar, "docs-search-field": field, "docs-search-fulltext": fulltext, "docs-search-go": go, "docs-search-note": note, "docs-search-results": results })[id];
+  const filtered = [];
+  const paths = [];
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => fakeElement(tag), createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }) };
+  const fire = (el, type, event = {}) => { for (const fn of [...(el.listeners[type] || [])]) fn({ target: el, preventDefault() {}, ...event }); };
+  try {
+    const search = createDocumentsSearch({
+      api: async (path) => { paths.push(path); return { searched: 1, terms: ["zebra"], hits: [{ key: "doc-a", title: "Alpha", kind: "paste", fetched_ms: 5, title_match: false, snippet: "a zebra line", snippet_start: 2 }] }; },
+      byId,
+      onOpen: () => {},
+      onFilter: (query) => filtered.push(query),
+    });
+    dispatchClick(toggle);
+    field.value = "alpha";
+    fire(field, "input");
+    assert.deepEqual(filtered, ["alpha"], "typing with Search text off did not filter the list locally");
+    assert.deepEqual(paths, [], "typing with Search text off called the server");
+    // Tick Search text with words in the field: the server full-text search runs.
+    field.value = "zebra";
+    fulltext.checked = true;
+    fire(fulltext, "change");
+    await flush([]);
+    assert.ok(paths.some((path) => path.startsWith("/api/v1/documents/search?q=zebra")), `ticking Search text did not search the server: ${paths.join(", ")}`);
+    assert.equal(filtered[filtered.length - 1], "", "ticking Search text did not clear the local filter");
+    // Untick: back to the local filter over the current words, server hits put away.
+    fulltext.checked = false;
+    fire(fulltext, "change");
+    assert.equal(filtered[filtered.length - 1], "zebra", "unticking Search text did not restore the local filter");
+    assert.equal(results.children.length, 0, "unticking Search text left server hits on screen");
     search.unmount();
   } finally {
     globalThis.document = savedDocument;

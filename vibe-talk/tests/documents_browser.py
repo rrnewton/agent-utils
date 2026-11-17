@@ -249,11 +249,31 @@ def check_fetch_since_prompt(page: Page, width: int, height: int, use_touch: boo
 
 
 def check_doc_search(page: Page, width: int, height: int) -> None:
-    """Fetched-documents search (`#1266 documents-search`): a result, the
-    stated reach, and the reader opened at the highlighted match."""
+    """Documents search (`#1266 documents-search`, `#1767
+    vibe-talk-documents-list-filename-search`): the default filters the list
+    locally by file name with no server search; "Search text" runs the
+    fetched-documents search, whose result opens the reader at the
+    highlighted match."""
     page.click("#docs-search-toggle")
     page.wait_for_selector("#docs-search-field", state="visible", timeout=20_000)
+    # Default mode: typing a file-name fragment narrows the list in place.
+    total_cards = page.locator("#documents-list .doc-card").count()
+    check(total_cards > 1, f"the search check needs several cards, saw {total_cards}")
+    page.fill("#docs-search-field", "demo-doc")
+    page.wait_for_function(
+        "() => document.querySelectorAll('#documents-list .doc-card').length === 1",
+        timeout=20_000)
+    check("demo-doc" in (page.locator("#documents-list .doc-card").first.text_content() or ""),
+          "the local filter did not keep the named document")
+    # A fragment matching nothing says so instead of showing a bare list.
+    page.fill("#docs-search-field", "zzz-no-such-document")
+    page.wait_for_function(
+        "() => (document.getElementById('documents-list')?.textContent || '')"
+        ".includes('No documents match')",
+        timeout=20_000)
+    # Full-text mode: tick Search text, then the server search runs.
     page.fill("#docs-search-field", "final")
+    page.check("#docs-search-fulltext")
     page.click("#docs-search-go")
     page.wait_for_selector(".doc-search-hit", timeout=20_000)
     note = page.locator("#docs-search-note").text_content() or ""

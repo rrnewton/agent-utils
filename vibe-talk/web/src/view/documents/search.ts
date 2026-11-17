@@ -1,11 +1,15 @@
-// The Documents search (`#1266 documents-search`): a Search button in the
-// Documents list that searches only FETCHED documents, through the server's
-// documents scope (`GET /api/v1/documents/search`), which runs the message
-// search's language and matching over fetched titles plus bodies. The bar,
-// result list and highlight reuse the message search's shape: a field, a
-// status line saying how far the search reached ("N fetched documents
-// searched", so the bounded cache's reach is never silent), and results that
-// open the reader at the match. All server words are untrusted: text only.
+// The Documents search (`#1266 documents-search`, `#1767
+// vibe-talk-documents-list-filename-search`): by default a LIMITED, purely
+// local filter — typing narrows the already-downloaded list in place over
+// file name and title (plus the key/address words the rows already carry),
+// with no server round trip. The "Search text" checkbox (off by default)
+// switches to full-text search of the downloaded markdown on the server,
+// through #1266's documents scope (`GET /api/v1/documents/search`), which
+// runs the message search's language and matching over fetched titles plus
+// bodies; its status line says how far the search reached ("N fetched
+// documents searched", so the bounded cache's reach is never silent), and
+// its results open the reader at the match. All server words are untrusted:
+// text only.
 
 import { createListening } from "../dom/index.ts";
 
@@ -25,6 +29,8 @@ export interface DocumentsSearchDependencies {
   byId(id: string): HTMLElement;
   /** Open document `key` in the reader at its match of `terms`. */
   onOpen(key: string, terms: readonly string[]): unknown;
+  /** Narrow the list locally to `query` (the default mode, `#1767`); no server call. */
+  onFilter?(query: string): unknown;
   onStatus?(text: string): unknown;
 }
 
@@ -117,12 +123,36 @@ export function createDocumentsSearch(deps: DocumentsSearchDependencies): Docume
     }
   }
 
+  /** Whether full-text mode is on: the "Search text" checkbox, off by default. */
+  function fullTextOn(): boolean {
+    const box = el("docs-search-fulltext") as HTMLInputElement | null;
+    return box !== null && box.checked === true;
+  }
+
+  /** Put the server hits and their reach line away (local mode shows neither). */
+  function clearServerResults(): void {
+    const note = el("docs-search-note");
+    if (note) {
+      note.hidden = true;
+      note.textContent = "";
+    }
+    const list = el("docs-search-results");
+    if (list) list.replaceChildren();
+  }
+
+  /** Apply the field's words as the local list filter (`#1767` default mode). */
+  function applyLocal(field: HTMLInputElement | null): void {
+    clearServerResults();
+    deps.onFilter?.(field?.value ?? "");
+  }
+
   function wire(): void {
     if (wired) return;
     wired = true;
     const toggle = el("docs-search-toggle");
     const bar = el("docs-search-bar");
     const field = el("docs-search-field") as HTMLInputElement | null;
+    const fulltext = el("docs-search-fulltext") as HTMLInputElement | null;
     const go = el("docs-search-go");
     if (toggle && bar) {
       listening.listen(toggle, "click", () => {
@@ -133,13 +163,36 @@ export function createDocumentsSearch(deps: DocumentsSearchDependencies): Docume
       });
     }
     if (go && field) {
-      listening.listen(go, "click", () => void search(field.value ?? ""));
+      listening.listen(go, "click", () => {
+        if (fullTextOn()) void search(field.value ?? "");
+        else applyLocal(field);
+      });
     }
     if (field) {
+      // As-you-type is the local filter's whole point; the server search
+      // stays on Enter/Search so it never fires per keystroke.
+      listening.listen(field, "input", () => {
+        if (!fullTextOn()) applyLocal(field);
+      });
       listening.listen(field, "keydown", (event: KeyboardEvent) => {
         if (event.key === "Enter" && !event.isComposing) {
           event.preventDefault();
-          void search(field.value ?? "");
+          if (fullTextOn()) void search(field.value ?? "");
+          else applyLocal(field);
+        }
+      });
+    }
+    if (fulltext && field) {
+      listening.listen(fulltext, "change", () => {
+        if (fullTextOn()) {
+          // Full text takes over: the whole list returns, and words already
+          // typed search the downloaded text at once.
+          deps.onFilter?.("");
+          const words = (field.value ?? "").trim();
+          if (words !== "") void search(words);
+          else clearServerResults();
+        } else {
+          applyLocal(field);
         }
       });
     }
