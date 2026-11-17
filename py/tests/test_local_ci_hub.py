@@ -134,7 +134,7 @@ def _row_ref_repo(tmp_path: Path) -> tuple[Path, Path]:
         '[project]\nname="toy"\n[validate]\ncommand=["/bin/true"]\n'
         'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\ncounted_repos=["primary","owner/primary"]\n'
         f'evidence_root="{evidence}"\nlocation={{path="ci-ledger"}}\n'
-        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=true\n'
+        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=true\nera_records=["r1","r2","r-full","r-partial-fail","r-partial-pass","r-full-fail"]\n'
         '[receipt.release_payload]\npath="target/validate/primary"\nprofile="validate"\ndebug_assertions=true\noverflow_checks=true\n'
         '[land]\nstate_dir="ignored/local-ci-hub"\n')
     subprocess.run(["git", "add", "-A"], cwd=repo, timeout=15)

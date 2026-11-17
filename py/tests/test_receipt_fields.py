@@ -21,7 +21,8 @@ def _cfg(tmp_path: Path) -> Config:
     return Config(path=tmp_path / "local-ci-hub.toml", root=tmp_path,
                   ledger_dir=tmp_path / "ledger", state_dir=tmp_path / "state",
                   require_full_evidence=True, repo="repo-a",
-                  counted_repos=["repo-a", "repo-b"], known_gaps=["gap-1", "gap-2"])
+                  counted_repos=["repo-a", "repo-b"], known_gaps=["gap-1", "gap-2"],
+                  era_records=["r1"])
 
 
 def _verdict(tmp_path: Path, row: dict[str, object]) -> str:
@@ -43,7 +44,9 @@ def _good_v6() -> dict[str, object]:
             "profile": "full", "selection_mode": "full",
             "admission": "host-limits-live",
             "admission_floor_evidence": {"floor_kind": "current-main",
-                                         "floor_sha": SHA, "observed_main_sha": SHA},
+                                         "floor_sha": SHA, "observed_main_sha": SHA,
+                                         "floor_tree": "b" * 40, "authority": "host-limits-live",
+                                         "plan_sha256s": ["d" * 64], "pin_bindings": {}},
             "tooling_sha": "c" * 40, "log_identity": "log-r1",
             "finished_at": "2026-11-17T00:00:00Z",
             "cell_results": {"run_id": "r1", "commit": SHA},
@@ -125,22 +128,125 @@ def test_schema4_era_and_gap_names(tmp_path: Path) -> None:
     assert _verdict(tmp_path / "c", skip) == "qualified"  # legitimate intentional skip
 
 
-def test_era_cutover_both_sides(tmp_path: Path) -> None:
+def test_era_frozen_set_both_sides(tmp_path: Path) -> None:
     legacy = {k: v for k, v in _good_v6().items()
               if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
                            "admission", "admission_floor_evidence", "tooling_sha",
                            "producer", "record_id", "log_identity", "cell_results")}
-    before = dict(legacy, finished_at="2026-11-16T23:59:59Z")
-    assert _verdict(tmp_path / "a", before) == "qualified"  # predates the cutover
-    after = dict(legacy, finished_at="2026-11-17T00:00:01Z")
-    assert _verdict(tmp_path / "b", after) != "qualified"  # new runs may not omit fields
-    absent = {k: v for k, v in before.items() if k != "finished_at"}
-    assert _verdict(tmp_path / "c", absent) != "qualified"
-    junk = dict(before, finished_at="not-a-time")
-    assert _verdict(tmp_path / "d", junk) != "qualified"
-    v4_after = dict(before, schema_version=4, finished_at="2026-11-17T00:00:01Z")
-    v4_after.pop("repo", None)
-    assert _verdict(tmp_path / "e", v4_after) != "qualified"  # missing repo, after cutover
+    assert _verdict(tmp_path / "a", legacy) == "qualified"  # run r1 is on the frozen era list
+    unlisted = dict(legacy, run_id="r-new", finished_at="2020-01-01T00:00:00Z")
+    assert _verdict(tmp_path / "b", unlisted) != "qualified"  # backdating cannot join the era
+    v4 = dict(legacy, schema_version=4)
+    assert _verdict(tmp_path / "c", v4) == "qualified"
+    v4_unlisted = dict(v4, run_id="r-new")
+    assert _verdict(tmp_path / "d", v4_unlisted) != "qualified"
+    neg = dict(legacy, schema_version=-1)
+    assert _verdict(tmp_path / "e", neg) != "qualified"
+
+
+def test_failures_and_negative_counts_refuse(tmp_path: Path) -> None:
+    assert _verdict(tmp_path / "a", dict(_good_v6(), failures=1)) != "qualified"
+    v5 = {k: v for k, v in _good_v6().items() if k != "schema_version"}
+    v5["schema_version"] = 5
+    assert _verdict(tmp_path / "b", dict(v5, failures=5)) != "qualified"
+    assert _verdict(tmp_path / "c", dict(v5, tree_dirty=True)) != "qualified"
+    over = dict(_good_v6(), gates_run=3, gates_expected=1, intentional_skipped_nodes=-2)
+    assert _verdict(tmp_path / "d", over) != "qualified"  # negative skips hide nothing
+    nofloor = dict(_good_v6(), admission_floor_evidence={"floor_kind": "frozen-target"})
+    assert _verdict(tmp_path / "e", nofloor) != "qualified"
+
+
+def _floor(**over: object) -> dict[str, object]:
+    base: dict[str, object] = {"floor_kind": "current-main", "floor_sha": SHA,
+                               "observed_main_sha": SHA, "floor_tree": "b" * 40,
+                               "authority": "host-limits-live",
+                               "plan_sha256s": ["d" * 64], "pin_bindings": {}}
+    base.update(over)
+    return base
+
+
+def test_single_clause_isolations(tmp_path: Path) -> None:
+    v5 = dict(_good_v6(), schema_version=5)
+    cases = [
+        dict(_good_v6(), admission_floor_evidence=_floor(floor_tree="x")),
+        dict(_good_v6(), admission_floor_evidence=_floor(authority="")),
+        dict(_good_v6(), admission_floor_evidence=_floor(plan_sha256s=[])),
+        dict(_good_v6(), admission_floor_evidence=_floor(floor_kind="bogus-kind")),
+        dict(_good_v6(), admission_floor_evidence={k: v for k, v in _floor().items() if k != "pin_bindings"}),
+        dict(_good_v6(), admission_floor_evidence=_floor(observed_main_sha="")),
+        dict(_good_v6(), cell_results="bound-elsewhere"),
+        dict(_good_v6(), coverage=None), dict(_good_v6(), skipped_nodes="x"),
+        dict(_good_v6(), coverage={"planned_test_nodes": 0, "zero_executed_nodes": [], "absent_nodes": []}),
+        dict(_good_v6(), coverage={"planned_test_nodes": 1, "zero_executed_nodes": ["n"], "absent_nodes": []}),
+        dict(v5, producer="nobody"), dict(v5, admission="made-up-kind"),
+        dict(v5, tooling_sha="unknown"), dict(v5, profile="partial"),
+        {k: v for k, v in v5.items() if k != "commit_anchored"},
+        dict(_good_v6(), passed_tests=8, known_gaps=["gap-1"]),  # count short
+        dict(_good_v6(), passed_tests=9, known_gaps=["gap-1", "junk"]),  # membership
+        dict(_good_v6(), passed_tests=9, known_gaps=2),  # bare count, not names
+        dict(_good_v6(), passed_tests=20, known_gaps=["gap-1", "gap-2"]),
+        {k: v for k, v in _good_v6().items() if k != "commit_anchored"},
+        dict(_good_v6(), admission_floor_evidence=_floor(floor_sha="x", observed_main_sha="x")),
+        dict(_good_v6(), executed_tests=0, passed_tests=0),
+        dict(v5, admission_floor_evidence=_floor(floor_sha="x", observed_main_sha="x")),
+        dict(_good_v6(), admission_floor_evidence=_floor(observed_main_sha="b" * 40)),
+    ]
+    for index, row in enumerate(cases):
+        assert _verdict(tmp_path / f"s{index}", row) != "qualified", row
+
+
+def test_era_and_v5_isolations(tmp_path: Path) -> None:
+    v5 = dict(_good_v6(), schema_version=5)
+    era = {k: v for k, v in _good_v6().items()
+           if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
+                        "admission", "admission_floor_evidence", "tooling_sha",
+                        "producer", "record_id", "log_identity", "cell_results")}
+    cases = [
+        dict(v5, repo=None), dict(v5, admission_floor_evidence=_floor(floor_kind="bogus-kind")),
+        dict(v5, admission_floor_evidence=_floor(floor_sha="x")),
+        dict(v5, admission_floor_evidence=_floor(observed_main_sha="b" * 40)),
+        dict(_good_v6(), tree_dirty=True), dict(_good_v6(), gates_run=None),
+        dict(_good_v6(), intentional_skipped_nodes="x"),
+        dict(era, commit_anchored=False), dict(era, profile="partial"),
+        dict(era, tree_dirty=True), dict(era, failures=1),
+        dict(era, coverage={"planned_test_nodes": -1, "zero_executed_nodes": [], "absent_nodes": []}),
+        dict(era, gates_run=1, gates_expected=2), dict(era, passed_tests=9.5),
+        dict(era, passed_tests=20),
+    ]
+    # repo=None above is a present-but-null repo; drop the key instead:
+    cases[0] = {k: v for k, v in v5.items() if k != "repo"}
+    for index, row in enumerate(cases):
+        assert _verdict(tmp_path / f"e{index}", row) != "qualified", row
+
+
+def test_release_identity_at_schema6(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path / "cfg")
+    cfg.release_payload = {"path": "target/validate/primary", "profile": "validate",
+                           "debug_assertions": True, "overflow_checks": True}
+    era_row = {k: v for k, v in _good_v6().items()
+               if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
+                            "admission", "admission_floor_evidence", "tooling_sha",
+                            "producer", "record_id", "log_identity", "cell_results")}
+    era_row.update(release_builder="builder-a",
+                   e2e_payload={"path": "target/debug/primary", "profile": "debug",
+                                "debug_assertions": True, "overflow_checks": True})
+    cfg2 = _cfg(tmp_path / "cfg2")
+    cfg2.release_payload = cfg.release_payload
+    cfg2.ledger_dir.mkdir(parents=True, exist_ok=True)
+    event2 = {"schema": "validate-ledger/v1", "event_type": "run.result",
+              "event_id": "e2", "run_id": "r1", "commit": SHA,
+              "outcome": "pass", "legacy_row": era_row}
+    (cfg2.ledger_dir / "ledger.jsonl").write_text(json.dumps(event2) + "\n")
+    assert str(show(cfg2, SHA)["verdict"]) != "qualified"  # superseded payload, era record
+    row = dict(_good_v6(), release_builder="builder-a",
+               e2e_payload={"path": "target/debug/primary", "profile": "debug",
+                            "debug_assertions": True, "overflow_checks": True})
+    cfg.ledger_dir.mkdir(parents=True, exist_ok=True)
+    event = {"schema": "validate-ledger/v1", "event_type": "run.result",
+             "event_id": "e1", "run_id": "r1", "commit": SHA,
+             "outcome": "pass", "legacy_row": row}
+    (cfg.ledger_dir / "ledger.jsonl").write_text(json.dumps(event) + "\n")
+    assert str(show(cfg, SHA)["verdict"]) != "qualified"  # superseded payload at v6
 
 
 def test_adapter_maps_and_drops(tmp_path: Path) -> None:

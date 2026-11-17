@@ -85,7 +85,7 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
         if "schema_version" not in r:
             return 0  # unversioned legacy record: era rules
         value = r.get("schema_version")
-        if isinstance(value, bool) or not isinstance(value, int) or value > 6:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 6:
             return None
         return value
 
@@ -113,22 +113,21 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
                     out[key] = totals[key]
         return out
 
-    def _era_ok(r: dict[str, object]) -> bool:
-        # Era evidence only before the schema-version cutover: a
-        # new run can never qualify by omitting fields. Absent or
-        # unparseable finish times refuse.
-        import datetime as _dt
-        raw = r.get("finished_at")
-        if not isinstance(raw, str) or not raw:
-            return False
-        try:
-            when = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            cut = _dt.datetime.fromisoformat(cfg.schema_cutover.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        if when.tzinfo is None or cut.tzinfo is None:
-            return False
-        return when < cut
+    def _era_listed(r: dict[str, object]) -> bool:
+        # Frozen era set: only records whose identity the consumer
+        # committed at cutover may use era rules. A record's
+        # identity is its record_id, its run_id, or the sha256 of
+        # its canonical row (see `receipt era-list`).
+        listed = set(cfg.era_records)
+        for key in ("record_id", "run_id"):
+            value = r.get(key)
+            if isinstance(value, str) and value in listed:
+                return True
+        from .ledger import canonical_bytes as _canon
+        import hashlib as _hl
+        body = {k: v for k, v in r.items()
+                if not str(k).startswith("_") and k != "digest"}
+        return _hl.sha256(_canon(body)).hexdigest() in listed
 
     def _repo_allowed(r: dict[str, object], version: int) -> bool:
         # A foreign repository never qualifies at any version. A
@@ -142,7 +141,7 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             return isinstance(repo, str) and repo in allowed
         if version >= 5:
             return False  # schema 5+ must name its repository
-        return _era_ok(r)  # below schema 5: era evidence only
+        return _era_listed(r)  # below schema 5: frozen era set only
 
     def _strict_pass(r: dict[str, object]) -> bool:
         r = _with_totals(r)
@@ -151,11 +150,9 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
         version = _version_of(r)
         if version is None:
             return False  # malformed or future schema version: refused
-        if version == 0 and not _era_ok(r):
-            return False  # unversioned: era evidence only
+        if version < 5 and not _era_listed(r):
+            return False  # below schema 5: frozen era set only
         if not _repo_allowed(r, version):
-            return False
-        if r.get("commit_anchored") is False:
             return False
         if not _release_identity_ok(cfg, r):
             return False  # superseded/mismatched release identity never qualifies
@@ -170,26 +167,35 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
                 return False  # unregistered producer
             if not isinstance(r.get("record_id"), str) or not r.get("record_id"):
                 return False
-            if not isinstance(r.get("run_id"), str) or not r.get("run_id"):
-                return False
-            tree = r.get("tree")
+            tree = r.get("tree")  # run_id itself is envelope-guaranteed by the fold
             if not isinstance(tree, str) or _HEX40.fullmatch(tree) is None:
                 return False
             if r.get("tree_dirty") is not False:
                 return False
-            for key in ("executed_tests", "passed_tests", "failures"):
-                if not _is_int(r.get(key)):
-                    return False
-            if int(str(r.get("executed_tests"))) <= 0:
-                return False
+            # int totals are enforced by the passed/executed block below
             kinds = cfg.admission_kinds or ["host-limits-live"]
             if r.get("admission") not in kinds:
                 return False  # missing or unknown admission kind
             floor = r.get("admission_floor_evidence")
             if not isinstance(floor, dict) or floor.get("floor_kind") not in _FLOOR_KINDS:
                 return False
-            if floor.get("floor_kind") == "current-main" and floor.get("floor_sha") != floor.get("observed_main_sha"):
+            floor_sha = floor.get("floor_sha")
+            floor_tree = floor.get("floor_tree")
+            if not isinstance(floor_tree, str) or _HEX40.fullmatch(floor_tree) is None:
                 return False
+            if not isinstance(floor.get("authority"), str) or not floor.get("authority"):
+                return False
+            plans = floor.get("plan_sha256s")
+            if not isinstance(plans, list) or not plans:
+                return False
+            if not isinstance(floor.get("pin_bindings"), (dict, list)):
+                return False
+            if floor.get("floor_kind") == "current-main":
+                observed = floor.get("observed_main_sha")
+                if not isinstance(observed, str) or _HEX40.fullmatch(observed) is None:
+                    return False
+                if floor_sha != observed:
+                    return False
             tooling = r.get("tooling_sha")
             if not isinstance(tooling, str) or _HEX40.fullmatch(tooling) is None:
                 return False  # unknown tooling never qualifies
@@ -205,12 +211,37 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
                 return False
             if r.get("profile") != "full" or r.get("selection_mode") != "full":
                 return False
+        if version == 5:
+            # Schema 5 identity clauses (schema 6 adds its own below).
+            if r.get("commit_anchored") is not True or r.get("tree_dirty") is not False:
+                return False
+            if r.get("profile") != "full" or r.get("selection_mode") != "full":
+                return False
+            producers5 = cfg.producers or ["local-ci-hub"]
+            if r.get("producer") not in producers5:
+                return False
+            kinds5 = cfg.admission_kinds or ["host-limits-live"]
+            if r.get("admission") not in kinds5:
+                return False
+            tooling5 = r.get("tooling_sha")
+            if not isinstance(tooling5, str) or _HEX40.fullmatch(tooling5) is None:
+                return False
+            floor5 = r.get("admission_floor_evidence")
+            if not isinstance(floor5, dict) or floor5.get("floor_kind") not in _FLOOR_KINDS:
+                return False
+            _sha5 = floor5.get("floor_sha")
+            if not isinstance(_sha5, str) or _HEX40.fullmatch(_sha5) is None:
+                return False
+            if floor5.get("floor_kind") == "current-main" and _sha5 != floor5.get("observed_main_sha"):
+                return False
         if version >= 5:
+            if r.get("failures") != 0:
+                return False  # any failure refuses, at schema 5 and 6
             # Gate accounting closes; named skip lists are lists.
             ran = _count_of(r.get("gates_run"))
             expected = _count_of(r.get("gates_expected"))
             skipped = _count_of(r.get("intentional_skipped_nodes", 0))
-            if ran is None or expected is None or skipped is None or ran + skipped != expected:
+            if ran is None or expected is None or skipped is None or ran < 0 or expected < 0 or skipped < 0 or ran + skipped != expected:
                 return False
             for key in ("skipped_nodes", "dependency_skipped_nodes", "unaccounted_nodes"):
                 value = r.get(key)
@@ -225,7 +256,7 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
                 return False
             if cov.get("zero_executed_nodes") not in ([],) or cov.get("absent_nodes") not in ([],):
                 return False
-        if cfg.require_full_evidence and version < 5:
+        if version < 5:
             # Era rules for older records (schema 5+ clauses above
             # already ran unconditionally for their versions).
             tests_val = r.get("executed_tests")
@@ -235,13 +266,11 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
                 return False
             if r.get("tree_dirty") not in (None, False) or (r.get("failures") or 0) != 0:
                 return False
-            if cfg.release_payload is not None and r.get("release_builder") is not None and r.get("e2e_payload") != cfg.release_payload:
-                return False  # only the configured current release identity qualifies; superseded payloads are supplemental
             cov = r.get("coverage")
             if isinstance(cov, dict):
                 planned = cov.get("planned_test_nodes")
                 planned_n = planned if _is_int(planned) else (len(planned) if isinstance(planned, list) else 0)
-                if not planned_n or cov.get("zero_executed_nodes") not in ([],) or cov.get("absent_nodes") not in ([],):
+                if not isinstance(planned_n, int) or planned_n <= 0 or cov.get("zero_executed_nodes") not in ([],) or cov.get("absent_nodes") not in ([],):
                     return False  # per-node coverage must be reported, planned, and clean
             if r.get("gates_run") is not None and r.get("gates_expected") is not None and r["gates_run"] != r["gates_expected"]:
                 return False
@@ -293,9 +322,11 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             raw = str(r.get("finished_at") or "")
             try:
                 parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                return parsed.astimezone(_dt.timezone.utc).isoformat()
             except ValueError:
-                return raw
+                return ""
+            if parsed.tzinfo is None:
+                return ""  # zone-less counts as oldest, never newest
+            return parsed.astimezone(_dt.timezone.utc).isoformat()
         newest_pass = max(_when(r) for r in strict_passes)
         newest_fail = max(_when(r) for r in genuine_fails)
         fail_veto = newest_fail >= newest_pass

@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     for op in ("append", "publish", "query", "newest-green", "first-bad", "ingest", "digest"):
         q = ls.add_parser(op)
         q.add_argument("--commit", default=""); q.add_argument("--result", default="PASS"); q.add_argument("--cell", default="")
-    rec = sub.add_parser("receipt"); rec.add_argument("op", choices=["show", "verify"]); rec.add_argument("commit")
+    rec = sub.add_parser("receipt"); rec.add_argument("op", choices=["show", "verify", "era-list"]); rec.add_argument("commit", nargs="?", default="")
     rem = sub.add_parser("remote"); rem.add_argument("op", choices=["status", "dispatch"]); rem.add_argument("--workflow", default=""); rem.add_argument("--ref", default="")
     hea = sub.add_parser("health"); hea.add_argument("--probe", default="")
     lan = sub.add_parser("land"); lan.add_argument("op", choices=["acquire", "release", "run", "verify"]); lan.add_argument("--holder", default="agent"); lan.add_argument("--commit", default=""); lan.add_argument("--target", default="HEAD"); lan.add_argument("command", nargs="*")
@@ -183,6 +183,16 @@ def main(argv: list[str] | None = None) -> int:
             _out(rows_out, args.json); return 0
         _out(res, args.json); return 0
     if args.cmd == "receipt":
+        if args.op == "era-list":
+            import hashlib as _hl
+            from .ledger import Ledger as _Led, canonical_bytes as _canon
+            out_rows = []
+            for row in _Led(cfg).rows():
+                body = {k: v for k, v in row.items() if not str(k).startswith("_") and k != "digest"}
+                out_rows.append({"record_id": row.get("record_id"), "run_id": row.get("run_id"),
+                                 "sha256": _hl.sha256(_canon(body)).hexdigest()})
+            _out({"schema": "local-ci-hub/era-list/v1", "records": out_rows}, args.json)
+            return 0
         res = receipt_mod.show(cfg, args.commit)
         _out(res, args.json)
         return 0 if res["qualified"] else 1

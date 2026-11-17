@@ -1,6 +1,12 @@
 # Receipt-field contract for local-ci-hub (revised)
 
-Status: revised after the consumer's check. No receipt code
+Status: revised after the consumer's check. Era rule: records
+below schema 6 qualify only when their identity is on the frozen
+era list the consumer commits in project configuration
+(`era_records`: record ids, run ids, or sha256 hashes of the
+canonical record, listed once by the `receipt era-list` command).
+Every other record must be schema 6 and pass every clause; a new
+run can never join the era by omitting fields or backdating. No receipt code
 changes until the coordinator relays the consumer's check of this
 revision. It names the fields one terminal record must carry for
 the receipt predicate to qualify a run, who computes each field,
