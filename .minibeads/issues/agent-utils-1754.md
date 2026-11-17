@@ -1,6 +1,6 @@
 ---
 title: 'local-ci-hub-step1-host-limits: host-limits file, live admission and limp mode for local-ci-hub'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -51,3 +51,13 @@ hand later. The gate reads none of the new keys in this step.
 
 Spec and background are held out of tree by the coordinator; this
 issue records only the behaviour above, with synthetic fixtures.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main at 52e22bbc. The host-limits
+module, live admission with the young-run charge and event-bounded
+refusal, limp built-ins, doctor reporting and sweep deferral are in,
+with deterministic tests (35 focused, green in the gate's 281 steps).
+No host file was created; installation stays a manual host-admin
+step. The gate evidence is partial only in its skipped-unverified
+cross checks, as the landing notice recorded.
