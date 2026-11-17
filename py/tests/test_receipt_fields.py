@@ -381,6 +381,18 @@ def test_era_list_time_bound_and_unknown_cutoff(tmp_path: Path) -> None:
     assert _era_list_via_cli(tmp_path, cfg, "") is None  # missing cutoff refuses
 
 
+def test_era_list_timeless_cutoff_refused(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    cfg.ledger_dir.mkdir(parents=True, exist_ok=True)
+    row = {"schema": "validate-ledger/v1", "event_type": "run.result",
+           "event_id": "e1", "run_id": "r-timeless", "commit": SHA, "outcome": "pass",
+           "legacy_row": {"run_id": "r-timeless", "commit": SHA, "result": "pass",
+                          "commit_anchored": True, "executed_tests": 1,
+                          "passed_tests": 1, "failures": 0}}
+    (cfg.ledger_dir / "ledger.jsonl").write_text(json.dumps(row) + "\n")
+    assert _era_list_via_cli(tmp_path, cfg, "r-timeless") is None  # refuses, lists nothing
+
+
 def test_adapter_maps_and_drops(tmp_path: Path) -> None:
     out = result_adapter.adapt({
         "test_results": {"totals": {"executed_tests": 7, "passed_tests": 7,

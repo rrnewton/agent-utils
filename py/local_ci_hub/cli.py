@@ -236,15 +236,27 @@ def main(argv: list[str] | None = None) -> int:
                     return None
                 return parsed if parsed.tzinfo is not None else None
             bound = _stamp(cutoff)
-            # A timeless cutoff (unresolvable evidence) bounds at
-            # the ledger end: it was found, so it is not unknown.
+            if bound is None:
+                print(f"cutoff record {args.commit} has no parseable, "
+                      "timezone-aware finished_at; name a timed cutoff record",
+                      file=sys.stderr)
+                return 2
             entries: list[str] = []
             for row in all_rows:
                 ver = row.get("schema_version")
                 if isinstance(ver, int) and not isinstance(ver, bool) and ver >= 6:
                     continue  # only below-schema-6 rows can be era records
+                # Foreign rows bound the search but are never
+                # listed: only this configuration's counted rows
+                # can become era records.
+                _repo = row.get("repo")
+                _allowed = set(cfg.counted_repos) | set(cfg.repo_aliases)
+                if cfg.repo:
+                    _allowed.add(cfg.repo)
+                if _repo is not None and _repo not in _allowed:
+                    continue
                 when = _stamp(row)
-                if bound is not None and (when is None or when > bound):
+                if when is None or when > bound:
                     continue  # bounded by record time, never shard path order
                 body = {k: v for k, v in row.items() if not str(k).startswith("_") and k != "digest"}
                 ident = row.get("record_id") or row.get("run_id")

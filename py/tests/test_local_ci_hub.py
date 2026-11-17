@@ -178,8 +178,19 @@ def _write_ledger(repo: Path, events: list[dict[str, object]]) -> None:
     stripped = "\n".join(ln for ln in config.read_text().splitlines()
                          if not ln.startswith("era_records=")) + "\n"
     config.write_text(stripped)  # regenerate from scratch on every write
-    out = run_cli(repo, "--json", "receipt", "era-list", str(events[-1].get("run_id", "")))
-    entries = json.loads(out.stdout)["era_records"]
+    import hashlib as _hl
+    from local_ci_hub.config import load as _load
+    from local_ci_hub.ledger import Ledger as _Led, canonical_bytes as _canon
+    _cfg = _load(config)
+    entries = []
+    for _row in _Led(_cfg).rows():
+        _ver = _row.get("schema_version")
+        if isinstance(_ver, int) and not isinstance(_ver, bool) and _ver >= 6:
+            continue
+        _body = {k: v for k, v in _row.items() if not str(k).startswith("_") and k != "digest"}
+        _ident = _row.get("record_id") or _row.get("run_id")
+        if isinstance(_ident, str) and _ident:
+            entries.append(f"{_ident}:{_hl.sha256(_canon(_body)).hexdigest()}")
     config.write_text(config.read_text().replace(
         "require_full_evidence=true\n",
         "require_full_evidence=true\nera_records=" + json.dumps(entries) + "\n"))
