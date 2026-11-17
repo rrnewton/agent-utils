@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-live-seal-reported-as-interrupted: a live validation-batch seal is refused as interrupted and pointed at recover'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-16T15:45:41-05:00
-updated_at: 2026-11-16T15:45:41-05:00
+updated_at: 2026-11-17T04:33:45-05:00
+closed_at: 2026-11-17T04:33:45-05:00
 ---
 
 # Description
@@ -32,3 +33,7 @@ The seal gate (`_refuse_partial_state` in `py/wrkslots/cli.py`, and the matching
 # Notes
 
 Related: the seal-ownership tests in `py/wrkslots/tests/test_validate_batch_seal_ownership.py` already distinguish live and dead actors for classification and recovery; the refusal wording does not. Land separately from #1735 wrkslots-remove-holds-state-lock-through-salvage when ready.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as eae2fbb4. Every seal gate now judges the batch process recorded in the seal's forward-compatible "x" slot (schema stays 1; older readers parse and retire the seal as before) with the same proven-identity liveness as the rest of wrkslots: a live batch reads "in progress (pid N, since T)" and waits under --wait-lock (pidfd-driven, re-judged on every wake); only a proven-dead batch is "interrupted" with recover named; zombies and reused pids are dead; recover fails closed on an unknowable seal unless the coordinator passes --coordinator-authorized --override-unjudgeable-seal. Python and Rust parity, with deterministic tests including an actual remove-validate-batch child blocked in its census.
