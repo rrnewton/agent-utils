@@ -25,8 +25,11 @@ import pytest
 from wrkslots import cli
 from wrkslots.tests.test_lifecycle import (
     create,
+    finish,
     make_project,
+    mark_owner_dead,
     prepare_removal_journal,
+    set_liveness,
 )
 
 
@@ -173,6 +176,96 @@ def test_wait_lock_waits_for_a_live_journal_then_proceeds(
         worker.join(timeout=30)
         assert not worker.is_alive()
         assert outcome["returncode"] == 0
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=30)
+
+
+def _live_finish_journal(project: Path, sleeper_pid: int) -> tuple[Path, dict[str, object]]:
+    journal_path = prepare_removal_journal(project)
+    config = _config(project)
+    raw = json.loads(journal_path.read_text(encoding="utf-8"))
+    raw["owner"] = _identity_obj(sleeper_pid)
+    cli._write_journal(config, raw, journal_path=journal_path)
+    return journal_path, raw
+
+
+def test_remove_waits_for_a_live_finish_journal_then_proceeds(
+    tmp_path: Path,
+) -> None:
+    """#1755: a second remove waits out a live finish, then proceeds."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    assert create(
+        project, slot="slot02", agent="codex-2", branch="codex/task2"
+    ).returncode == 0
+    assert finish(project, slot="slot02", agent="codex-2").returncode == 0
+
+    sleeper = _sleeper()
+    try:
+        journal_path, raw = _live_finish_journal(project, sleeper.pid)
+        mark_owner_dead(project, slot="slot02")
+        config = _config(project)
+        outcome: dict[str, object] = {}
+
+        def run_remove() -> None:
+            outcome["returncode"] = cli.main(
+                [
+                    "--project-root", str(project), "--wait-lock", "30",
+                    "remove", "slot02",
+                    "--coordinator-pid", str(os.getpid()),
+                    "--expected-generation", "1",
+                ]
+            )
+
+        worker = threading.Thread(target=run_remove, daemon=True)
+        worker.start()
+        # Condition: the remove is still waiting while the journal is
+        # held (a refusal would have finished the thread at once).
+        worker.join(timeout=2)
+        assert worker.is_alive()
+        assert journal_path.exists()
+
+        cli._clear_journal(config, raw, journal_path=journal_path)
+
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+        assert outcome["returncode"] == 0
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=30)
+
+
+def test_remove_with_a_tiny_wait_lock_refuses_and_names_the_holder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#1755: an expired bound refuses as today, naming the holder pid."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    assert create(
+        project, slot="slot02", agent="codex-2", branch="codex/task2"
+    ).returncode == 0
+    assert finish(project, slot="slot02", agent="codex-2").returncode == 0
+
+    sleeper = _sleeper()
+    try:
+        journal_path, _raw = _live_finish_journal(project, sleeper.pid)
+        mark_owner_dead(project, slot="slot02")
+        result = cli.main(
+            [
+                "--project-root", str(project), "--wait-lock", "0.2",
+                "remove", "slot02",
+                "--coordinator-pid", str(os.getpid()),
+                "--expected-generation", "1",
+            ]
+        )
+        assert result == 75
+        err = capsys.readouterr().err
+        assert "BUSY: busy: live 'finish' mutation" in err
+        assert f"by pid {sleeper.pid}" in err
+        assert journal_path.exists()
     finally:
         sleeper.terminate()
         sleeper.wait(timeout=30)

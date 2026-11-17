@@ -38637,6 +38637,8 @@ def _assert_no_journal(
         if classification == "live":
             assert actor is not None
             if wait_seconds > 0.0 and time.monotonic() < deadline:
+                # Event-driven (#1755): wake when the journal changes,
+                # then re-judge from the top; never sleep-poll.
                 _wait_for_control_change(
                     config,
                     max(0.0, deadline - time.monotonic()),
@@ -61558,6 +61560,27 @@ def _cmd_remove_in_scope(
     prepared_private_finish: _PreparedPrivateFinish | None = None
     prepared_deferred_finish: _PreparedDeferredFinish | None = None
     finish_context: _FinishContext | None = None
+    # --wait-lock also covers a live finish journal (#1755): wait for
+    # it here, holding no registry lock, bounded by the same budget.
+    # The locked assertions below then re-check instantly; a journal
+    # that appears in between still refuses as busy, as today. Scoped
+    # validation finishes classify their journals instead and skip
+    # this, exactly as their locked path does.
+    if not scoped_validation_finish:
+        _assert_no_journal(
+            config,
+            allowed=(
+                frozenset()
+                if agent_batch is None
+                else frozenset(agent_batch.group_journals)
+            ),
+            wait_seconds=(
+                _remaining_lock_wait(wait_deadline)
+                if wait_deadline is not None
+                else float(args.wait_lock)
+            ),
+            target_slot=args.slot,
+        )
     with lock_scope, _agent_batch_item_deadline(agent_batch):
         if prepared_removal is not None:
             # One record commit (#1287): re-check this slot's identity,

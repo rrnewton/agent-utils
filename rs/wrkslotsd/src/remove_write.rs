@@ -4223,6 +4223,32 @@ pub(crate) fn remove_slot(
         coordinator_pid,
         ignored_mode,
     )?;
+    // --wait-lock also covers a live finish journal (#1755): wait for
+    // it here, holding no registry lock, bounded by the same budget,
+    // then re-check from the top. A dead owner still refuses at once.
+    {
+        let budget = crate::ensure_states::lock_wait();
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let journals = parse_journals(root)?;
+            let first = journals
+                .get("journals")
+                .and_then(Value::as_array)
+                .and_then(|names| names.first())
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let Some(first) = first else { break };
+            let message = crate::journals_state::journal_blocker_message(&cfg.control, &first);
+            if !message.starts_with("busy:") || budget.is_zero() {
+                return Err(message);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(message);
+            }
+            crate::journals_state::wait_for_control_change(&cfg.control, remaining);
+        }
+    }
     let locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
     let journals = parse_journals(root)?;

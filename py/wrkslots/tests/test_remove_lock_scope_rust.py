@@ -56,6 +56,78 @@ def test_remove_gathers_before_the_project_root_flock(tmp_path: Path) -> None:
         assert bundles, "lock-free preparation did not run before the lock"
 
 
+def _write_live_finish_journal(root: Path, pid: int) -> Path:
+    import json
+
+    from wrkslots.tests.test_transfer_owner_write_rust import _live_identity
+
+    journal = root / "worktrees" / "ACTIVE.node-a.journal"
+    journal.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "kind": "finish",
+                "machine": "node-a",
+                "slot": "slot-a",
+                "finished_at": "2026-10-26T02:00:00Z",
+                "owner": _live_identity(pid),
+            }
+        )
+        + "\n"
+    )
+    return journal
+
+
+def test_remove_waits_for_a_live_finish_journal_then_proceeds(tmp_path: Path) -> None:
+    """#1755 (Rust): remove waits out a live finish journal."""
+
+    import threading
+
+    with _own_fs(tmp_path) as base:
+        root = _fixture(base)
+        sleeper = subprocess.Popen(["sleep", "120"])
+        try:
+            journal = _write_live_finish_journal(root, sleeper.pid)
+            env = dict(os.environ)
+            env["WRKSLOTS_WAIT_LOCK"] = "30"
+            outcome: dict[str, subprocess.CompletedProcess[str]] = {}
+
+            def run() -> None:
+                outcome["result"] = _run_remove(root, env)
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            worker.join(timeout=3)
+            assert worker.is_alive(), "remove refused instead of waiting"
+            assert journal.exists()
+            journal.unlink()
+            worker.join(timeout=900)
+            assert not worker.is_alive()
+            assert outcome["result"].returncode == 0, outcome["result"].stderr
+        finally:
+            sleeper.kill()
+            sleeper.wait()
+
+
+def test_remove_with_a_tiny_wait_refuses_and_names_the_holder(tmp_path: Path) -> None:
+    """#1755 (Rust): an expired bound refuses busy, naming the pid."""
+
+    with _own_fs(tmp_path) as base:
+        root = _fixture(base)
+        sleeper = subprocess.Popen(["sleep", "120"])
+        try:
+            _write_live_finish_journal(root, sleeper.pid)
+            env = dict(os.environ)
+            env["WRKSLOTS_WAIT_LOCK"] = "0.2"
+            result = _run_remove(root, env)
+            assert result.returncode != 0
+            assert "busy: live 'finish' mutation" in result.stderr
+            assert f"by pid {sleeper.pid}" in result.stderr
+        finally:
+            sleeper.kill()
+            sleeper.wait()
+
+
 def _run_remove(root: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     from wrkslots.tests.rust_binary import rust_wrkslotsd
 

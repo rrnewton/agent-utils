@@ -344,6 +344,33 @@ pub(crate) fn journal_blocker_message(control: &Path, name: &str) -> String {
     interrupted
 }
 
+/// Block until the control directory changes or the timeout passes
+/// (#1755), mirroring `_wait_for_control_change`: inotify, never a
+/// sleep poll. Where inotify is unavailable the wait degrades to a
+/// single bounded sleep of the remaining budget.
+pub(crate) fn wait_for_control_change(control: &Path, timeout: std::time::Duration) {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::fs::inotify::{add_watch, init, CreateFlags, WatchFlags};
+    if timeout.is_zero() {
+        return;
+    }
+    let fallback = |timeout: std::time::Duration| std::thread::sleep(timeout);
+    let Ok(fd) = init(CreateFlags::NONBLOCK | CreateFlags::CLOEXEC) else {
+        fallback(timeout);
+        return;
+    };
+    if add_watch(&fd, control, WatchFlags::ALL_EVENTS).is_err() {
+        fallback(timeout);
+        return;
+    }
+    let timespec = rustix::event::Timespec {
+        tv_sec: timeout.as_secs() as _,
+        tv_nsec: timeout.subsec_nanos() as _,
+    };
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    let _ = poll(&mut fds, Some(&timespec));
+}
+
 /// The exact command that resumes one interrupted mutation (#1700).
 pub(crate) fn recover_command(slot: Option<&str>, kind: Option<&str>) -> String {
     match (slot, kind) {
