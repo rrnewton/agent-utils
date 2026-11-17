@@ -9,6 +9,7 @@ import { moduleForTests } from "../../../web/build.mjs";
 
 const CORE = await moduleForTests("src/core/transcripts/index.ts");
 const SEARCH = await moduleForTests("src/core/search/index.ts");
+const VIEW = await moduleForTests("src/view/transcript/index.ts");
 
 function testClock() {
   const timers = new Map();
@@ -66,4 +67,21 @@ test("server search keeps transcript hits apart and clears them on a new search"
   assert.deepEqual(owner.state().transcriptHits.map((one) => one.id), ["x1"]);
   owner.schedule("key-2", true);
   assert.deepEqual(owner.state().transcriptHits, [], "a new search forgets the old transcript hits");
+});
+
+test("a chunk's time is said the channel rows' way in Eastern, never as a raw ISO stamp", () => {
+  const was = process.env.TZ;
+  process.env.TZ = "America/New_York";
+  try {
+    // 16:30 UTC is 12:30 PM in America/New_York (the zone this test pins).
+    const said = VIEW.chunkWhen({ timestamp: "2026-10-12T16:30:00.000Z" });
+    assert.equal(said, "10/12 12:30 PM");
+    assert.ok(!said.includes("T16:30"), "a raw ISO stamp reached the screen");
+    // A time that cannot be parsed shows the raw value, by the owner's rule.
+    assert.equal(VIEW.chunkWhen({ timestamp: "not-a-time" }), "not-a-time");
+    assert.equal(VIEW.chunkWhen({ timestamp: "" }), "");
+  } finally {
+    if (was === undefined) delete process.env.TZ;
+    else process.env.TZ = was;
+  }
 });

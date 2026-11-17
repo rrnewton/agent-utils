@@ -9,6 +9,7 @@ import {
   sortTranscripts,
   transcriptLabel,
 } from "../../core/transcripts/index.ts";
+import { messageTimeLabel } from "../../present/time/index.ts";
 import type { TranscriptThread } from "../../core/transcripts/index.ts";
 
 /** A served message, the parts this view reads. */
@@ -25,6 +26,17 @@ export interface TranscriptsDependencies {
   api(path: string): Promise<unknown>;
   intoView?(element: Element, block: string): void;
   setStatus?(text: string): void;
+}
+
+/**
+ * A chunk's time the way the channel rows say it (`#1608` review): the
+ * page's own formatter on the reader's clock — Eastern for the owner —
+ * never a raw ISO stamp. A time that cannot be parsed shows as sent.
+ */
+export function chunkWhen(chunk: { timestamp: string }): string {
+  const at = Date.parse(chunk.timestamp);
+  if (Number.isNaN(at)) return String(chunk.timestamp || "");
+  return messageTimeLabel({ timestamp: chunk.timestamp });
 }
 
 /** The Transcripts view's commands. */
@@ -90,8 +102,7 @@ export function createTranscriptsView(deps: TranscriptsDependencies): Transcript
       item.dataset.transcriptMessage = String(chunk.id);
       const when = document.createElement("div");
       when.className = "transcript-when";
-      const at = Date.parse(chunk.timestamp);
-      when.textContent = Number.isNaN(at) ? "" : new Date(at).toISOString();
+      when.textContent = chunkWhen(chunk);
       const body = document.createElement("div");
       body.className = "transcript-body";
       body.textContent = chunk.content;

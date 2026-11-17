@@ -253,6 +253,8 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     page.type("#search-field", "lantern", delay=30)
     walk.until("() => { const chip = document.getElementById('search-bucket-transcripts'); return chip && !document.getElementById('search-bucket-row').hidden; }",
                "the Agent Transcripts chip did not appear in the bucket row")
+    page.evaluate("() => document.getElementById('search-bucket-transcripts').scrollIntoView({block: 'center'})")
+    walk.settled()
     chip = page.text_content("#search-bucket-transcripts") or ""
     walk.check("1" in chip and "Agent Transcripts" in chip, f"the chip does not count its hits: {chip!r}")
     walk.check(page.evaluate("() => document.getElementById('search-bucket-transcripts').getAttribute('aria-pressed')") == "false",
@@ -263,6 +265,8 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     page.click("#search-bucket-transcripts")
     walk.until("() => document.querySelectorAll('#discord-log > li[data-bucket=\"transcripts\"]').length === 1",
                "tapping the chip did not interleave the transcript hit")
+    page.evaluate("() => document.getElementById('search-bucket-transcripts').scrollIntoView({block: 'center'})")
+    walk.settled()
     walk.shot("search-chip-on")
     page.click("#discord-log > li[data-bucket=\"transcripts\"]")
     walk.until("() => !document.getElementById('transcripts-view').hidden && document.querySelector('.transcript-highlight')",

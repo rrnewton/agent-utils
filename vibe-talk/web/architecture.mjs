@@ -65,7 +65,7 @@ export const PACKAGES = Object.freeze({
   "view/dom": BASE,
   "view/catchup": [...BASE, "view/dom", "view/composer"],
   "view/documents": [...BASE, "view/dom"],
-  "view/transcript": [...BASE, "view/dom", "core/transcripts"],
+  "view/transcript": [...BASE, "view/dom", "core/transcripts", "present/time"],
   "view/shell": [...BASE, "view/dom"],
   "view/settings": [...BASE, "view/dom", "core/channels", "core/navigation", "core/outbox", "core/settings", "present/notices", "present/settings"],
   // The composition root (`#624 voice-page-modularity`, step 17): it alone may name every
