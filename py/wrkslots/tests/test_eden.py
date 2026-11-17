@@ -1430,6 +1430,76 @@ def test_eden_cap_report_counts_both(tmp_path: Path) -> None:
     }
 
 
+def test_partition_counts_an_outside_mount_by_its_in_image_state_dir(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "image"
+    state = image / "validate" / "s1" / ".eden-state"
+    state.mkdir(parents=True)
+    mounts = ("/mounts/validate/s1", "/host/one", "/host/two")
+    state_dirs = {
+        "/mounts/validate/s1": str(state),
+        "/host/one": "/home/u/local/.eden",
+    }
+
+    outer, in_image = eden.partition_checkouts(
+        mounts, (str(image),), state_dirs=state_dirs
+    )
+
+    assert in_image == ("/mounts/validate/s1",)
+    assert outer == ("/host/one", "/host/two")
+    # Without state dirs the same outside mount is judged by path alone.
+    assert eden.partition_checkouts(mounts, (str(image),)) == (mounts, ())
+
+
+def test_checkouts_by_state_dir_pairs_and_dedupes() -> None:
+    runner = _fake_runner(
+        {
+            "/state-a": (0, "/m/one\n/m/two\n", ""),
+            "/state-b": (0, "/m/two\n/m/three\n", ""),
+        }
+    )
+
+    pairs = eden.checkouts_by_state_dir(runner, ("/state-a", "/state-b"))
+
+    assert pairs == (
+        ("/m/one", "/state-a"),
+        ("/m/two", "/state-a"),
+        ("/m/three", "/state-b"),
+    )
+    assert eden.count_checkouts(runner, ("/state-a", "/state-b")) == (
+        "/m/one",
+        "/m/two",
+        "/m/three",
+    )
+
+
+def test_eden_cap_report_counts_an_outside_mount_with_slot_state_in_image(
+    tmp_path: Path,
+) -> None:
+    from wrkslots import worktreesimage
+
+    config = _image_config(tmp_path)
+    validate = worktreesimage.validate_external_dir(config.worktrees)
+    slot_state = validate / "s1" / ".eden-state"
+    slot_state.mkdir(parents=True)
+    outside_mount = str(tmp_path / "eden-mounts" / "validate" / "s1")
+    runner = _fake_runner(
+        {
+            "/state-a": (0, "/host/one\n", ""),
+            str(slot_state): (0, f"{outside_mount}\n", ""),
+        }
+    )
+
+    report = wrkslots_cli._eden_cap_report(
+        config, runner=runner, cmdlines=(), known=("/state-a", str(slot_state))
+    )
+
+    assert report["outer_mounts"] == ["/host/one"]
+    assert report["in_image_mounts"] == [outside_mount]
+    assert (report["outer"], report["in_image"], report["total"]) == (1, 1, 2)
+
+
 def test_slot_view_accepts_an_eden_slot_without_git_directories(
     tmp_path: Path,
 ) -> None:

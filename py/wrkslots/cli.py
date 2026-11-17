@@ -41286,8 +41286,12 @@ def _eden_cap_report(
     if known is None:
         known = _eden_known_config_dirs(config)
     dirs = eden.discover_config_dirs(cmdlines, known)
-    mounts = eden.count_checkouts(runner, dirs)
-    outer, in_image = eden.partition_checkouts(mounts, _eden_image_roots(config))
+    pairs = eden.checkouts_by_state_dir(runner, dirs)
+    outer, in_image = eden.partition_checkouts(
+        [mount for mount, _state in pairs],
+        _eden_image_roots(config),
+        state_dirs=dict(pairs),
+    )
     return {
         "cap": config.eden_host_cap,
         "outer": len(outer),

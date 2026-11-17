@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,14 +93,18 @@ def parse_mount_list(stdout: str) -> tuple[str, ...]:
     )
 
 
-def count_checkouts(runner: Runner, config_dirs: Sequence[str]) -> tuple[str, ...]:
-    """All Eden mounts on the host, deduplicated by mount path.
+def checkouts_by_state_dir(
+    runner: Runner, config_dirs: Sequence[str]
+) -> tuple[tuple[str, str], ...]:
+    """Every Eden mount on the host with the state dir that lists it.
 
-    Fail-closed: a state dir whose daemon cannot be queried raises,
-    so an uncertain count never reads as room under the cap.
+    Deduplicated by mount path; the first state dir that lists a mount
+    owns it. Fail-closed: a state dir whose daemon cannot be queried
+    raises, so an uncertain count never reads as room under the cap.
     """
 
-    mounts: list[str] = []
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for config_dir in config_dirs:
         rc, stdout, stderr = runner(
             ["eden", "--config-dir", config_dir, "list"]
@@ -111,15 +115,36 @@ def count_checkouts(runner: Runner, config_dirs: Sequence[str]) -> tuple[str, ..
                 f"{stderr.strip() or stdout.strip() or 'eden list failed'}"
             )
         for mount in parse_mount_list(stdout):
-            if mount not in mounts:
-                mounts.append(mount)
-    return tuple(mounts)
+            if mount not in seen:
+                seen.add(mount)
+                pairs.append((mount, config_dir))
+    return tuple(pairs)
+
+
+def count_checkouts(runner: Runner, config_dirs: Sequence[str]) -> tuple[str, ...]:
+    """All Eden mounts on the host, deduplicated by mount path.
+
+    Fail-closed like :func:`checkouts_by_state_dir`.
+    """
+
+    return tuple(mount for mount, _state in checkouts_by_state_dir(runner, config_dirs))
 
 
 def partition_checkouts(
-    mounts: Sequence[str], image_roots: Sequence[str]
+    mounts: Sequence[str],
+    image_roots: Sequence[str],
+    state_dirs: Mapping[str, str] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Split mounts into (outer, in-image) by path containment (#1566).
+    """Split mounts into (outer, in-image) (#1566).
+
+    A mount counts in-image when its path, or the state dir of the
+    daemon that lists it (``state_dirs[mount]``), lies inside an image
+    root. The state dir is what decides where a checkout's storage
+    lives: since #1730 ``create --eden`` mounts every Eden slot outside
+    the project at ``eden_mount_root`` while the slot's daemon state,
+    overlay and redirection targets stay in the slot, so a path-only
+    test counts every new in-image checkout outer. A mount with no
+    known state dir is judged by its path alone, as before.
 
     Symlinks are resolved on both sides, so an alias into the image
     counts in-image and an alias out counts outer; the same checkout
@@ -131,6 +156,7 @@ def partition_checkouts(
     """
 
     roots = tuple(os.path.realpath(root) for root in image_roots)
+    states = state_dirs or {}
     outer: list[str] = []
     in_image: list[str] = []
     seen: set[str] = set()
@@ -139,7 +165,11 @@ def partition_checkouts(
         if resolved in seen:
             continue
         seen.add(resolved)
-        if any(is_inside(resolved, root) for root in roots):
+        candidates = [resolved]
+        state = states.get(mount)
+        if state is not None:
+            candidates.append(os.path.realpath(state))
+        if any(is_inside(path, root) for path in candidates for root in roots):
             in_image.append(mount)
         else:
             outer.append(mount)
