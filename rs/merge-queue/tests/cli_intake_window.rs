@@ -399,8 +399,19 @@ fn an_ejected_change_resubmitted_at_a_new_head_is_validated_in_the_same_run() {
     let (fx, started, gates) = setup("intake-resubmit-new-head");
     fx.branch("a", &[("tests/a", "FAIL\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
-    fx.branch("b", &[("tests/b", "ok\n")]);
+    // Two files, so change 2's rebuilt candidate (3 files) has a gate of
+    // its own, distinct from change 1's (2 files) and from the stacked
+    // candidate's (4 files): each phase below is held by its own gate, so
+    // no phase can finish -- and the run cannot drain -- before the test
+    // has seen the phase start. The old one-file change 2 rebuilt onto a
+    // gate the failing change had already opened, so on a loaded host the
+    // run could land change 2 and drain before the resubmission was
+    // recorded, and change 1 was left queued at the run's end (#1765).
+    fx.branch("b", &[("tests/b", "ok\n"), ("tests/b2", "ok\n")]);
     fx.mq_ok(&["submit", "2", "--head", "b"]);
+    // The fixed head exists before the run starts, so nothing but the
+    // submit itself is left in the resubmission chain below.
+    fx.branch("a2", &[("tests/a", "ok\n")]);
     let mut daemon = Daemon::start(&fx);
     wait_for("both batches to validate", Duration::from_secs(240), || {
         started_lines(&started).len() == 2
@@ -411,21 +422,44 @@ fn an_ejected_change_resubmitted_at_a_new_head_is_validated_in_the_same_run() {
     wait_for("change 1 to be ejected", Duration::from_secs(240), || {
         status(&fx, 1) == "ejected"
     });
+    // Change 2 is rebuilt without change 1 and validates again on its
+    // own gate (3 files, still closed): it is now genuinely in flight,
+    // and the run cannot drain while it is.
+    wait_for(
+        "change 2 to be rebuilt without change 1",
+        Duration::from_secs(240),
+        || started_lines(&started).iter().any(|line| line == "b b2 t0"),
+    );
     // Resubmit change 1 at a fixed head while change 2 is still in flight.
-    fx.branch("a2", &[("tests/a", "ok\n")]);
     let out = fx.mq_ok(&["submit", "1", "--head", "a2"]);
     assert!(out.contains("recorded #1"), "{out}");
-    // It validates again beside change 2 in this same run.
+    // It validates again beside change 2 in this same run. The initial
+    // stacked batch produced the same started line, so the wait counts
+    // second occurrences.
     wait_for(
         "change 1 to validate at its new head",
         Duration::from_secs(240),
-        || started_lines(&started).len() >= 3,
+        || {
+            started_lines(&started)
+                .iter()
+                .filter(|line| *line == "a b b2 t0")
+                .count()
+                >= 2
+        },
     );
     open(&gates, 3);
+    open(&gates, 4);
     assert_eq!(daemon.exit_code(Duration::from_secs(240)), Some(0));
     let reports = reports(&fx);
     assert_eq!(reports.len(), 1, "{reports:?}");
-    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(
+        status(&fx, 1),
+        "landed",
+        "started: {:?}\nevents: {:?}\nreport: {:?}",
+        started_lines(&started),
+        events(&fx),
+        reports[0]
+    );
     assert_eq!(status(&fx, 2), "landed");
     let intake = reports[0]["intake"].as_array().unwrap();
     assert!(
