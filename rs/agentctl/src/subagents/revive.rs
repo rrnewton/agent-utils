@@ -3109,6 +3109,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 false,
                 false,
             )?;
+            // Persist the journal directory entry before the enrollment can exit its harness.
+            // Fsyncing the journal itself does not make a newly created parent durable.
+            if enrollment.is_some() {
+                agent::sync_directory(&self.registry)?;
+            }
             let root = pin_directory(&self.registry.join(".restarts"), agent_name)?;
             let doc = json!({
                 "schema": "agentctl-restart/v1",
