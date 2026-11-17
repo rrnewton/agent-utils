@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-bare-short-refs-render: bare :thread:/:msg:/:issue: refs render as short links in vibe-talk'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-17T19:51:00.000000000+00:00
-updated_at: 2026-11-17T19:51:00.000000000+00:00
+updated_at: 2026-11-17T22:00:00.000000000+00:00
+closed_at: 2026-11-17T22:00:00.000000000+00:00
 ---
 
 # Description
@@ -114,3 +115,21 @@ it, and Slack gives it no permalink. Recommendation sent to coordb:
 expand refs on the bridge's trace path with the same
 `render_reply_links` (stored text stays as written, as replies do);
 not built here.
+
+## Resolution
+
+[watermelon-full-preview] Landed 587f4321 on main (gate pass on 87b06c01,
+full, 2026-11-17T21:39:33Z; combined tree with the upstream
+`vibe-talk/src/main.rs` doctor change verified before landing). The
+renderer now draws `:msg:` as a message link, holds bare references to
+the bridge's canonical-number exactness, titles thread/message short
+links "Opens here", and joins a resolved thread to this server's filed
+name as 🧵NNN/slug on page draws (never the index). Unit tests red
+before and green after; full vibe-talk lib suite green; browser walk at
+desktop and phone sizes green; screenshot matrix (phone 412x915 and
+desktop, light and dark, keyboard open and closed, Discuss docked, a
+trace-post fixture and the slug example, before and after) reviewed by
+coordb's liaison. Not covered: a real-server timeline screenshot (the
+fake-Discord backend implements no timeline read) and a live bridge
+short-refs file (the resolution path is unchanged from #1565). Bridge
+trace-path expansion is #1801 agentctl-trace-posts-expand-short-refs.
