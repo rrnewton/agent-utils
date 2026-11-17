@@ -1295,6 +1295,84 @@ pub(crate) fn outstanding_journal_paths(cfg: &Cfg) -> Result<Vec<PathBuf>> {
     outstanding(&cfg.control, None)
 }
 
+/// Restore one sidecarred containment inventory in place (#1757,
+/// mirrors `_expand_containing_refs_sidecar`): a missing or differing
+/// side file refuses cleanly, naming its digest.
+fn expand_containing_refs_sidecar(
+    cfg: &Cfg,
+    holder: &mut Map<String, Value>,
+    label: &str,
+) -> Result<()> {
+    let Some(reference) = holder.get("containing_remote_refs_sidecar").cloned() else {
+        return Ok(());
+    };
+    let reference = reference
+        .as_object()
+        .ok_or_else(|| format!("{label}.containing_remote_refs_sidecar must be an object"))?;
+    let digest = reference
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let count = reference.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let stored = reference
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let sidecar = cfg.control.join(stored);
+    let refs: Vec<Value> = (|| -> Option<Vec<Value>> {
+        let text = std::fs::read_to_string(&sidecar).ok()?;
+        serde_json::from_str::<Value>(&text)
+            .ok()?
+            .as_array()
+            .cloned()
+    })()
+    .ok_or_else(|| {
+        format!(
+            "finish journal containing-refs sidecar {digest} is missing or unreadable: {}",
+            sidecar.display()
+        )
+    })?;
+    let canonical = serde_json::to_string(&Value::Array(refs.clone())).unwrap_or_default();
+    let actual = {
+        use sha2::{Digest as _, Sha256};
+        format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    };
+    if actual != digest || refs.len() as u64 != count {
+        return Err(format!(
+            "finish journal containing-refs sidecar {digest} does not match its contents: {}",
+            sidecar.display()
+        ));
+    }
+    holder.insert("containing_remote_refs".to_string(), Value::Array(refs));
+    holder.remove("containing_remote_refs_sidecar");
+    Ok(())
+}
+
+/// Restore every sidecarred inventory in a finish journal (#1757).
+fn expand_finish_sidecars(cfg: &Cfg, raw: &mut Map<String, Value>) -> Result<()> {
+    if let Some(checkouts) = raw
+        .get_mut("record")
+        .and_then(Value::as_object_mut)
+        .and_then(|record| record.get_mut("checkouts"))
+        .and_then(Value::as_array_mut)
+    {
+        for checkout in checkouts {
+            if let Some(holder) = checkout.as_object_mut() {
+                expand_containing_refs_sidecar(cfg, holder, "finish journal.record checkout")?;
+            }
+        }
+    }
+    if let Some(salvage) = raw.get_mut("salvage").and_then(Value::as_array_mut) {
+        for entry in salvage {
+            if let Some(holder) = entry.as_object_mut() {
+                expand_containing_refs_sidecar(cfg, holder, "finish journal.salvage entry")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn classify_one(
     cfg: &Cfg,
     config: &Value,
@@ -1332,7 +1410,10 @@ fn classify_one(
         }
     }
     let (bytes, identity) = read_identity(path)?;
-    let raw = strict_obj(&bytes)?;
+    let mut raw = strict_obj(&bytes)?;
+    if raw.get("kind").and_then(Value::as_str) == Some("finish") {
+        expand_finish_sidecars(cfg, &mut raw)?;
+    }
     let (machine_s, kind, _slot_s) = validate_journal_shape(
         cfg,
         path.file_name()
