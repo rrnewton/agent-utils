@@ -57239,22 +57239,23 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
         )
         snapshot_revision = _audit_registry_revision(all_states)
         records = [record for state in states for record in state.slots]
-        # Stream each log once, retaining only the kinds an audit row
-        # can still consult (#1794): the registry state itself was
-        # already derived by _validate_global_state above, so the full
-        # parsed history (tens of thousands of events, a few of them
-        # tens of megabytes) is never held for the rest of the audit.
+        # Retain only the kinds an audit row can still consult
+        # (#1794): the registry state itself was already derived by
+        # _validate_global_state above, so the full parsed history
+        # (tens of thousands of events, a few of them tens of
+        # megabytes) is dropped here and never held for the rest of
+        # the audit. The load itself goes through the memoised
+        # verified chain the prewarm already checked outside the lock.
         event_logs: dict[str, tuple[dict[str, object], ...]] = {}
         event_counts: dict[str, int] = {}
         for state in states:
-            retained: list[dict[str, object]] = []
-            total = 0
-            for event in _iter_events(config, state.machine):
-                total += 1
-                if event.get("kind") in _AUDIT_EVENT_KINDS:
-                    retained.append(event)
-            event_logs[state.machine] = tuple(retained)
-            event_counts[state.machine] = total
+            machine_events = _load_events(config, state.machine)
+            event_counts[state.machine] = len(machine_events)
+            event_logs[state.machine] = tuple(
+                event
+                for event in machine_events
+                if event.get("kind") in _AUDIT_EVENT_KINDS
+            )
         seal_targets, seal_errors = _audit_validate_batch_seal_evidence(config)
         if not all_machines:
             seal_targets = tuple(
