@@ -14,6 +14,8 @@ export type { ChipsOverComposer, ChipsOverComposerDependencies } from "./chips.t
 export { createUndoOffer, createUndoStamps } from "./undo.ts";
 export type { UndoOffer, UndoStamps } from "./undo.ts";
 export { SCREENS, createScreens } from "./screens.ts";
+export { WELCOME_DISMISSED_KEY, createWelcome } from "./welcome.ts";
+export type { Welcome, WelcomeDependencies } from "./welcome.ts";
 export { SCREEN_TITLES, createScreenShowing } from "./screenshowing.ts";
 export type { ScreenShowing, ScreenShowingDependencies } from "./screenshowing.ts";
 export type { Screens } from "./screens.ts";

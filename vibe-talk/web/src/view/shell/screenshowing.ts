@@ -11,7 +11,7 @@ import { SCREENS } from "./screens.ts";
 import type { Screens } from "./screens.ts";
 
 /** What the header calls each screen that is a DESTINATION rather than the app itself. */
-const SCREEN_TITLES: Readonly<Record<string, string>> = Object.freeze({ settings: "Settings", help: "Help" });
+const SCREEN_TITLES: Readonly<Record<string, string>> = Object.freeze({ settings: "Settings", help: "Help", welcome: "Welcome" });
 
 /** What showing a screen asks of the page. */
 export interface ScreenShowingDependencies {

@@ -71,7 +71,7 @@ import {childByClass,
   setHiddenIfChanged,
   setTextIfChanged,
   shownNode,} from "../view/dom/index.ts";
-import {SCREEN_TITLES, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
+import {SCREEN_TITLES, WELCOME_DISMISSED_KEY, createActionMenu, createChannelDirectoryView, createDeploymentWords, createChannelSelection, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, createWelcome, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow} from "../view/shell/index.ts";
 import {KEYBOARD_SEND_PARTS,
   NEWLINE_KEYS,
   createComposerBoxes,
@@ -7877,6 +7877,54 @@ const { apply: applyClientConfig } = createClientConfig({
  * (`createSignIn`, `#624 voice-page-modularity`). The page destructures its acts under their old
  * names; the Save button's own words and timer stay with its owner (`saveTokenButton`, below).
  */
+// The first-run Welcome (`#1781 vibe-talk-first-run-welcome-channel-default`): shown once after
+// first sign-in on a device with neither a dismissed mark nor a saved UI record, and re-opened
+// from Settings and Help ever after. With no channel configured it is the guided setup: the
+// SETUP guide's config steps, a snippet to copy, and a Check again over the client-config path
+// sign-in itself uses. It configures nothing itself.
+/** @type {import("../view/shell/index.ts").Welcome} */
+const welcome = createWelcome({
+  el: (id) => el(id),
+  showScreen: (name) => showScreen(name),
+  dismissed: () => {
+    try {
+      return deviceStorage().getItem(WELCOME_DISMISSED_KEY) === "1";
+    } catch (_error) {
+      return true;
+    }
+  },
+  markDismissed: () => {
+    try {
+      deviceStorage().setItem(WELCOME_DISMISSED_KEY, "1");
+    } catch (_error) {
+      // Storage refused: the saved-record check still keeps a returning reader unblocked.
+    }
+  },
+  hasSavedRecord: () => uiState.saved() !== null,
+  hasChannel: () => channelDirectory.channels().length > 0,
+  copyText: async (text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  },
+  checkAgain: async () => {
+    try {
+      applyClientConfig(await apiDecoded("ClientConfigResponse", "/api/v1/client-config"));
+      return channelDirectory.channels().length > 0;
+    } catch (_error) {
+      return false;
+    }
+  },
+});
+el("welcome-start").addEventListener("click", () => welcome.dismiss());
+el("welcome-copy-config").addEventListener("click", () => void welcome.copyConfig());
+el("welcome-check-again").addEventListener("click", () => void welcome.recheck());
+el("open-welcome").addEventListener("click", () => welcome.showWelcome());
+el("help-open-welcome").addEventListener("click", () => welcome.showWelcome());
+
 const { signIn, saveToken, forgetToken, setTokenState, noTokenSentence } = createSignIn({
   el: (id) => el(id),
   field: (id) => /** @type {{value: string}} */ (/** @type {unknown} */ (el(id))),
@@ -7896,7 +7944,11 @@ const { signIn, saveToken, forgetToken, setTokenState, noTokenSentence } = creat
   threading: () => providerFacts.threading(),
   reconcileChannelSnapshot: (drawn) => reconcileChannelSnapshot(drawn),
   clearError: () => clearError(),
-  reopenSavedView: () => reopenSavedView(),
+  reopenSavedView: () => {
+    reopenSavedView();
+    // `#1781`: a genuine first run meets the Welcome once sign-in has put the main screen up.
+    welcome.maybeShowFirstRun();
+  },
   setState: (state) => setState(state),
   voiceTranscript: () => voiceTranscript(),
   startSettingsSync: () => startSettingsSync(),
@@ -8143,7 +8195,10 @@ const application = createApplication({
       }
     },
     () => {
-      showView("voice");
+      // `#1781 vibe-talk-first-run-welcome-channel-default`. The Channel is the default view:
+      // only a saved record that says Voice opens there, so a returning Voice reader sees no
+      // flash of the other pane and no change. Deep links still win later (`applyDeepLink`).
+      showView(uiState.saved() && uiState.saved().view === "voice" ? "voice" : "discord");
       renderEmptyState();
       voiceCall().renderControls();
     },
@@ -8164,6 +8219,7 @@ const application = createApplication({
         if (hydrateFromCache()) {
           showScreen("main");
           reopenSavedView();
+          welcome.maybeShowFirstRun();
         }
         // `#625 signin-flash`. ...and with no saved shell to show, NO screen until the proof
         // arrives: the sign-in form is served hidden and stays so, and "Checking your token…"

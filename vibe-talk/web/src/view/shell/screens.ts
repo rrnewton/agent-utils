@@ -4,8 +4,8 @@
 // the main screen shows (the call's or the channel's). Showing and hiding the screens and panes, and what goes
 // with each change, are view/shell's and the page's (`createScreenShowing`, `showView`).
 
-/** The screens: three sections stacked in one grid cell, and `hidden` picks. */
-const SCREENS: readonly string[] = Object.freeze(["signin", "main", "settings", "help"]);
+/** The screens: sections stacked in one grid cell, and `hidden` picks. */
+const SCREENS: readonly string[] = Object.freeze(["signin", "main", "settings", "help", "welcome"]);
 
 /** The screens' commands and questions. */
 export interface Screens {
@@ -30,7 +30,7 @@ export interface Screens {
   setView(name: string): void;
 }
 
-/** On the sign-in screen, the call's view behind it. */
+/** On the sign-in screen, the channel's view behind it (`#1781 vibe-talk-first-run-welcome-channel-default`: the Channel is the default view; Voice is where a saved choice puts the reader, never the fresh default). */
 export function createScreens(): Screens {
   let screenBeforeSettings = "signin";
   let currentScreen = "signin";
@@ -39,7 +39,7 @@ export function createScreens(): Screens {
    * (`keysFromKeyboard`). Put back to Settings whenever Help is left (`arrive`).
    */
   let helpReturn = "settings";
-  let currentView = "voice";
+  let currentView = "discord";
 
   return {
     screen: () => currentScreen,

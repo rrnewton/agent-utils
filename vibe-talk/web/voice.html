@@ -1454,6 +1454,7 @@
               </section>
               <div class="settings-head-actions">
                 <button id="fold-settings-all" class="secondary" type="button">Expand all</button>
+                <button id="open-welcome" class="secondary" type="button">Welcome</button>
                 <button id="open-help" class="secondary" type="button">Open help</button>
               </div>
             </div>
@@ -2907,6 +2908,8 @@
             <p class="hint">
               What each control does, and what it costs. Every entry here is reachable from the
               matching <strong>?</strong> on the settings screen; tap a heading to open it.
+              New here? The <button id="help-open-welcome" class="secondary" type="button">Welcome screen</button>
+              gives the whole map in a minute.
             </p>
             <button id="fold-help" class="secondary" type="button">Expand all</button>
 
@@ -4100,6 +4103,90 @@
                 voice agent between your questions.
               </p>
             </details>
+          </div>
+        </section>
+
+        <!-- ------------------------------------------------------------------ welcome screen -->
+        <!--
+          `#1781 vibe-talk-first-run-welcome-channel-default`. The first-run map of the app: one
+          short screen, shown once on first launch and re-openable from Settings ("Welcome") and
+          from Help ever after. One or two lines per surface, in the order the app is actually
+          used — the Channel is home, and Voice is one tool among several for keeping up with it.
+          The guided add step stands only while no channel is configured: the SETUP guide's
+          config steps, a snippet to copy, and a Check again that re-reads the channel list.
+          Channels come from the server's configuration, so nothing here configures anything.
+        -->
+        <section id="screen-welcome" class="screen" tabindex="-1" aria-label="Welcome" hidden>
+          <div class="settings-column">
+            <h1 class="welcome-title">Welcome to vibe-talk</h1>
+            <p class="hint">
+              vibe-talk keeps you caught up with your chat channels: read what arrived, reply
+              without friction, and clear what you have handled. It opens on the Channel — that
+              is home. Here is what is what.
+            </p>
+            <dl class="welcome-list">
+              <div class="welcome-item">
+                <dt>Channel</dt>
+                <dd>Your messages, newest at the foot. Pick a channel in the bar, read, and reply in the box below — this is where the app opens.</dd>
+              </div>
+              <div class="welcome-item">
+                <dt>Threads</dt>
+                <dd>Replies gathered under their first message, so one topic stays together instead of scattering through the channel.</dd>
+              </div>
+              <div class="welcome-item">
+                <dt>Discuss</dt>
+                <dd>A catch-up over the channel or thread on screen: what happened while you were away, without reading every line.</dd>
+              </div>
+              <div class="welcome-item">
+                <dt>Documents</dt>
+                <dd>Documents linked in chat, listed and read here properly — no trip to another app to follow a link.</dd>
+              </div>
+              <div class="welcome-item">
+                <dt>Voice</dt>
+                <dd>Talk to the same channels hands-free: hear what is new and dictate a reply. One tap on the Voice/Channel switch, any time.</dd>
+              </div>
+              <div class="welcome-item">
+                <dt>Read / Pace</dt>
+                <dd>Have messages read aloud and set the pace, for listening through a channel the way you would read it.</dd>
+              </div>
+              <div class="welcome-item">
+                <dt>Done / Undo</dt>
+                <dd>Mark what you have handled Done and it folds away; Undo brings it straight back. Your list stays what is left to do.</dd>
+              </div>
+              <div class="welcome-item">
+                <dt>Search</dt>
+                <dd>The magnifying glass (or <kbd>/</kbd>) finds any message across what the app has read — a decision, a name, a link.</dd>
+              </div>
+            </dl>
+            <div id="welcome-guide" hidden>
+              <h2 class="welcome-guide-title">Add your first channel</h2>
+              <p class="hint">
+                The channels in the configuration are the channels in the app. To add the
+                first one:
+              </p>
+              <ol class="welcome-steps">
+                <li>Add a channel to the server's configuration — its id, a name to call it, and <code>writable = true</code> where replies should post — or extend <code>VIBE_TALK_CHANNELS</code> instead.</li>
+                <li>Restart the server.</li>
+                <li>Run <code>vibe-talk doctor</code> and fix what it names.</li>
+                <li>Come back here and press Check again.</li>
+              </ol>
+              <pre class="welcome-snippet" id="welcome-snippet">[[channels]]
+id = "CHANNEL_ID"
+label = "My channel"
+writable = true</pre>
+              <div class="welcome-actions">
+                <button id="welcome-copy-config" class="secondary" type="button">Copy config</button>
+                <button id="welcome-check-again" class="secondary" type="button">Check again</button>
+              </div>
+              <p id="welcome-guide-state" class="hint" aria-live="polite"></p>
+            </div>
+            <div class="welcome-actions">
+              <button id="welcome-start" class="secondary" type="button">Start reading</button>
+            </div>
+            <p class="hint">
+              You can re-open this screen any time from Settings, beside Open help. Everything
+              here is explained in depth in Help, one tap from each setting it belongs to.
+            </p>
           </div>
         </section>
       </div>

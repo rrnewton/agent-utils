@@ -299,6 +299,7 @@ export interface ElementById {
   "help-message-cache": HTMLDetailsElement;
   "help-message-links": HTMLDetailsElement;
   "help-microphone": HTMLDetailsElement;
+  "help-open-welcome": HTMLButtonElement;
   "help-reading-width": HTMLDetailsElement;
   "help-resuming": HTMLDetailsElement;
   "help-rich-headers": HTMLDetailsElement;
@@ -409,6 +410,7 @@ export interface ElementById {
   "open-help": HTMLButtonElement;
   "open-in-view": HTMLSelectElement;
   "open-settings": HTMLButtonElement;
+  "open-welcome": HTMLButtonElement;
   "outgoing-log": HTMLOListElement;
   "own-read-actions": HTMLParagraphElement;
   "own-read-apply": HTMLButtonElement;
@@ -531,6 +533,7 @@ export interface ElementById {
   "screen-main": HTMLElement;
   "screen-settings": HTMLElement;
   "screen-signin": HTMLElement;
+  "screen-welcome": HTMLElement;
   "screens": HTMLDivElement;
   "scroll-area": HTMLDivElement;
   "scroll-tools": HTMLDivElement;
@@ -732,6 +735,12 @@ export interface ElementById {
   "voice-system-prompt": HTMLTextAreaElement;
   "voice-system-prompt-fold": HTMLDetailsElement;
   "voice-system-prompt-state": HTMLParagraphElement;
+  "welcome-check-again": HTMLButtonElement;
+  "welcome-copy-config": HTMLButtonElement;
+  "welcome-guide": HTMLDivElement;
+  "welcome-guide-state": HTMLParagraphElement;
+  "welcome-snippet": HTMLPreElement;
+  "welcome-start": HTMLButtonElement;
   "width-grip": HTMLDivElement;
   "wit-voice-picker": HTMLDivElement;
   "wit-voice-state": HTMLParagraphElement;

@@ -2129,7 +2129,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     },
     /** Which screen is showing. Exactly one, or this throws — a page with none is a blank app. */
     screen() {
-      const showing = ["signin", "main", "settings", "help"].filter(
+      const showing = ["signin", "main", "settings", "help", "welcome"].filter(
         (s) => !page.el(`screen-${s}`).hidden
       );
       assert.equal(showing.length, 1, `exactly one screen must show, not ${showing.join("+")}`);
@@ -4975,6 +4975,10 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
   page.setUserActivation = (activation) => {
     navigator.userActivation = activation;
   };
+  // `#1781 vibe-talk-first-run-welcome-channel-default`. The suite's pages are returning readers
+  // by default: the Welcome was dismissed on this device long ago, so no test meets it unasked.
+  // A test of the first run itself deletes the mark again from `arrange`.
+  if (!store.has("vibe-talk.welcome.dismissed")) store.set("vibe-talk.welcome.dismissed", "1");
   // The page makes its first requests while the script is still running, so a test that needs to
   // hold or fail THOSE — a reload that must draw before the network answers — arranges the fixture
   // here, before a line of the page has run.
@@ -6495,8 +6499,18 @@ const textOfRow = (li) => li.children.find((node) => node.hasClass("body"));
 /** Load the Discord tab with a given set of channel messages. */
 async function showDiscord(page, messages) {
   page.messages = messages;
-  await page.el("view-switch").click();
-  await page.settle();
+  // `#1781 vibe-talk-first-run-welcome-channel-default`. The Channel is the view the page opens
+  // on, so the switch is pressed away and back: entering the channel is what reads it, and a
+  // page already there has read it with other messages. From the call's view the way back is
+  // one press; from Documents, two.
+  for (let presses = 0; page.tab() === "discord" && presses < 3; presses += 1) {
+    await page.el("view-switch").click();
+    await page.settle();
+  }
+  for (let presses = 0; page.tab() !== "discord" && presses < 3; presses += 1) {
+    await page.el("view-switch").click();
+    await page.settle();
+  }
   assert.equal(page.tab(), "discord", "the switch did not reach the channel view");
   return page.el("discord-log").children;
 }
