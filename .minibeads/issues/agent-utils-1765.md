@@ -44,6 +44,10 @@ Tracked for step 2 only (not fixed in step 1): `vibe-talk.check.thread-pin-picke
 
 The differential's Python oracle reads user-manager evidence through bounded busctl queries; a contended manager starves the budget and the editions diverge. Test-only fix: `_wait_for_user_manager` waits for the manager to answer behind a 120 s backstop that skips; the case is un-quarantined.
 
+## Step 2 follow-up: chat_service idle-backstop waits on the wall clock
+
+`rs/agentctl` chat_service idle-backstop tests (`idle_backstop_case` and its callers in `rs/agentctl/src/chat_service.rs`) assert on wall-clock time ("waited 5.52s, got 0 reads") and failed under full-host load in a local validate. Same rule-346 class: wait on a condition (or a fake clock) with a generous backstop. Taken after the current step-2 change lands; kept in this issue (no new number needed).
+
 ## Step 2 root cause: browser checks sample on wall deadlines
 
 `thread-pin-picker-browser` polled conditions on 10 s wall deadlines (11 s exit-1 failures); its waits now keep the same conditions behind 120 s backstops. `pack-still-browser` recorded frames for 900 ms of wall time, so a starved main thread produced no slide (`460.4375 -> 460.4375`); it now records until the slide condition holds (with a frame-count backstop), assertions unchanged.
