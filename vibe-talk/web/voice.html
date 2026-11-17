@@ -346,15 +346,6 @@
                 </svg>
               </button>
               <!--
-                `#1786 vibe-talk-search-scope-server-hits`. The server hits outside
-                the scope on screen (this thread, else this channel), counted on a
-                chip UNDER the search bar: in-scope hits stand in the timeline as
-                cards already, and a tap interleaves these in the timeline in
-                quoted style. Hidden while there are none; its words and its
-                showing are the server search's (`renderServerSearch`).
-              -->
-              <button id="search-outside-chip" class="chip search-outside-chip" type="button" aria-expanded="false" hidden>Show hits outside this thread</button>
-              <!--
                 `#212 link-filter`. Toggles that float UNDER the Links button while Links is on, and
                 only then, as the owner asked: "3 buttons to pop up under the link icon I just
                 clicked. They should be named PRs Commits Actions and be toggled on by default.
@@ -707,6 +698,16 @@
                    Shown only while a search is typed; one row, set once, so the
                    per-keystroke filter never pays for it. -->
               <div id="search-screen-sep" class="search-sep" role="separator" hidden><span>On this screen</span></div>
+              <!--
+                `#1786 vibe-talk-search-scope-server-hits`. The server hits outside
+                the scope on screen (this thread, else this channel), counted on a
+                chip in its own row under the search bar, pushing the list down:
+                in-scope hits stand in the timeline as cards already, and a tap
+                interleaves these in the timeline in quoted style and brings the
+                first into view. Hidden while there are none; its words and its
+                showing are the server search's (`renderServerSearch`).
+              -->
+              <button id="search-outside-chip" class="chip search-outside-chip" type="button" aria-expanded="false" hidden>Show hits outside this thread</button>
               <ol id="thread-list" class="messages" hidden></ol>
               <ol id="discord-log" class="messages"></ol>
               <!--

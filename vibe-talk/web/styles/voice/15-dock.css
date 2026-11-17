@@ -42,6 +42,13 @@
  * curve, and the owner photographed the first word of this line missing on an iPhone 16. The
  * horizontal safe-area insets in the padding are the other half of that fix; only the bottom inset
  * was ever applied before it. Both halves are still here, and both are still asserted. */
+/* `#1786 vibe-talk-search-scope-server-hits`: while the server search's details
+   stand open at the foot of the list, its controls (More, Search further back)
+   own the foot and the status pill waits rather than cover them. */
+#frame-body:has(#server-detail:not([hidden])) #status-line {
+  visibility: hidden;
+}
+
 #status-line {
   position: absolute;
   z-index: var(--z-pill);

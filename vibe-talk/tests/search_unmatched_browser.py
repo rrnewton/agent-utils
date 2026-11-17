@@ -526,8 +526,10 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     chip = (page.text_content("#search-outside-chip") or "").strip()
     walk.check(chip in ("Show 2 hits outside this thread", "Hide 2 hits outside this thread"),
                f"the chip says {chip!r}")
-    if chip.startswith("Show"):
+    # A fresh tap either way, so showing them brings the first into view.
+    if chip.startswith("Hide"):
         walk.press("#search-outside-chip")
+    walk.press("#search-outside-chip")
     walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3",
                "the chip did not interleave the outside hits in the thread")
     walk.check(page.evaluate(HITS_JS) == ["151", "152", "150"],

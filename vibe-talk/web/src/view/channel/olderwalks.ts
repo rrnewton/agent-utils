@@ -946,6 +946,15 @@ function toggleOutsideHits(): void {
   outsideShown = !outsideShown;
   if (outsideShown) outsideShownFor = serverSearchNow().key;
   renderServerSearch();
+  if (!outsideShown) return;
+  // The reader asked to see them: bring the first quoted hit into view (it
+  // usually stands far above, with this scope's own older card beside it).
+  for (const row of el("discord-log").children) {
+    if (row.getAttribute(SERVER_HIT_MARK) !== "quote") continue;
+    const node = row as HTMLElement;
+    if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "nearest" });
+    break;
+  }
 }
 
 /** What the one tappable line says, from the answer as it stands. */
