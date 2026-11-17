@@ -6468,6 +6468,96 @@ def test_validation_exclusion_mount_alias_refuses_mutated_layout(
         )
 
 
+def test_validation_exclusion_roots_load_in_order(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    assert wrkslots._load_config(str(project), None).validation_exclusion_roots == ()
+    assert wrkslots._effective_validation_exclusion_roots(
+        wrkslots._load_config(str(project), None)
+    ) == (Path("/data/misc"),)
+    update_configuration(
+        project,
+        validation_exclusion_roots=["/srv/exclusion-b", "/srv/exclusion-a"],
+    )
+    config = wrkslots._load_config(str(project), None)
+    assert config.validation_exclusion_roots == (
+        Path("/srv/exclusion-b"),
+        Path("/srv/exclusion-a"),
+    )
+    assert wrkslots._effective_validation_exclusion_roots(config) == (
+        Path("/data/misc"),
+        Path("/srv/exclusion-b"),
+        Path("/srv/exclusion-a"),
+    )
+
+
+def test_validation_exclusion_roots_reject_relative_paths(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    update_configuration(project, validation_exclusion_roots=["relative/root"])
+    with pytest.raises(
+        wrkslots.Refusal, match="configuration.validation_exclusion_roots"
+    ):
+        wrkslots._load_config(str(project), None)
+
+
+def test_trusted_validation_exclusion_root_uses_configured_candidate(
+    tmp_path: Path,
+) -> None:
+    fenced = tmp_path / "fenced"
+    fenced.mkdir()
+    selected, _identity, alias = wrkslots._trusted_validation_exclusion_root(
+        fenced, (Path("/tmp"),)
+    )
+    assert selected == Path("/tmp")
+    assert alias == fenced
+
+
+def test_trusted_validation_exclusion_root_refusal_names_each_failure(
+    tmp_path: Path,
+) -> None:
+    fenced = tmp_path / "fenced"
+    fenced.mkdir()
+    wrong_mode = tmp_path / "wrong-mode"
+    wrong_mode.mkdir(mode=0o755)
+    wrong_owner = tmp_path / "wrong-owner"
+    wrong_owner.mkdir()
+    wrong_owner.chmod(0o1777)
+    missing = tmp_path / "missing-root"
+    with pytest.raises(wrkslots.Refusal) as caught:
+        wrkslots._trusted_validation_exclusion_root(
+            fenced, (missing, wrong_mode, wrong_owner, Path("/dev/shm"))
+        )
+    message = str(caught.value)
+    assert str(fenced) in message
+    assert "found 0" in message
+    assert f"{missing}: not found" in message
+    assert str(wrong_mode) in message
+    assert "mode 0755" in message
+    assert "mode is not 01777" in message
+    assert str(wrong_owner) in message
+    assert "not root-owned" in message
+    assert "/dev/shm" in message
+    assert "another filesystem" in message
+    remedy = caught.value.remedy
+    assert remedy is not None
+    assert "sudo install -d -o root -g root -m 1777" in remedy
+    assert "validation_exclusion_roots in .wrkslots.yml" in remedy
+    assert "wrkslots recover" in remedy
+
+
+def test_trusted_validation_exclusion_root_picks_first_qualifying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fenced = tmp_path / "fenced"
+    fenced.mkdir()
+    monkeypatch.setattr(
+        wrkslots, "_path_alias_on_mount", lambda path, root, records: path
+    )
+    selected, _identity, _alias = wrkslots._trusted_validation_exclusion_root(
+        fenced, (Path("/tmp"), Path("/var/tmp"))
+    )
+    assert selected == Path("/tmp")
+
+
 def test_validation_exclusion_fixture_is_selected_only_in_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

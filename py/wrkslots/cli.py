@@ -609,6 +609,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "salvage_push_remotes",
         "ttl_rescue_ref_root",
         "reclaimable_ignored_paths",
+        "validation_exclusion_roots",
         "provisioned_allowlist",
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
@@ -764,6 +765,15 @@ CONFIG_KEY_DOCS: dict[str, str] = {
         "validation checkout whose only residue is ignored regular files inside these "
         "subtrees still counts as pristine; any other ignored file, a symlink, or nested "
         "Git data keeps it preserved. Absent or empty: any ignored file keeps it preserved."
+    ),
+    "validation_exclusion_roots": (
+        "Absolute directories offered as validation exclusion guard parents, after the "
+        "built-in /data/misc. Each must still be a canonical root-owned (uid 0, gid 0) "
+        "directory with mode 01777 on the same filesystem as the path being removed; "
+        "the first qualifying candidate in list order hosts the guard. Configuration "
+        "only offers candidates and cannot weaken those checks. Absent means only "
+        "/data/misc is tried. List the key in ignorable_keys so an older wrkslots "
+        "ignores it instead of refusing."
     ),
     "provisioned_allowlist": (
         "Checkout-relative paths or globs of provisioning output that finish tolerates "
@@ -1429,6 +1439,8 @@ class Config:
     ttl_rescue_ref_root: str = "refs/rescue"
     #: Checkout-relative build-output subtrees that leave a frozen clone pristine.
     reclaimable_ignored_paths: tuple[str, ...] = ()
+    #: Extra validation exclusion guard parents, after the built-in root.
+    validation_exclusion_roots: tuple[Path, ...] = ()
     #: Provisioning output finish tolerates without a snapshot (#1369).
     provisioned_allowlist: tuple[str, ...] = ()
     disk_advisory_bytes: int | None = None
@@ -4515,6 +4527,8 @@ def _canonical_config_payload(value: Mapping[str, object]) -> dict[str, object]:
         canonical.pop("salvage_push_remotes")
     if canonical.get("reclaimable_ignored_paths") == []:
         canonical.pop("reclaimable_ignored_paths")
+    if canonical.get("validation_exclusion_roots") == []:
+        canonical.pop("validation_exclusion_roots")
     if canonical.get("provisioned_allowlist") == []:
         canonical.pop("provisioned_allowlist")
     if canonical.get("slot_representation") == "worktree":
@@ -4862,6 +4876,23 @@ def _validate_eden_mount_root(raw: object, root: Path) -> Path:
     return candidate
 
 
+def _validate_validation_exclusion_root(value: str) -> Path:
+    """One configured exclusion root: a canonical absolute path."""
+
+    candidate = Path(value)
+    if (
+        not candidate.is_absolute()
+        or value != os.path.normpath(value)
+        or ".." in candidate.parts
+        or not candidate.name
+    ):
+        raise Refusal(
+            "configuration.validation_exclusion_roots entries must be canonical "
+            f"absolute paths: {value!r}"
+        )
+    return candidate
+
+
 def _eden_mount_root(config: Config) -> Path:
     """Where Eden checkouts mount on this host (#1730).
 
@@ -5059,6 +5090,18 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             _validate_reclaimable_ignored_path,
         )
     )
+    validation_exclusion_roots = (
+        ()
+        if "validation_exclusion_roots" not in raw
+        else tuple(
+            _validate_validation_exclusion_root(item)
+            for item in _string_tuple(
+                raw["validation_exclusion_roots"],
+                "configuration.validation_exclusion_roots",
+                str,
+            )
+        )
+    )
     disk_keys = (
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
@@ -5134,6 +5177,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             else "refs/rescue"
         ),
         reclaimable_ignored_paths=reclaimable_ignored_paths,
+        validation_exclusion_roots=validation_exclusion_roots,
         provisioned_allowlist=provisioned_allowlist,
         disk_advisory_bytes=disk_values[0],
         disk_provisioning_floor_bytes=disk_values[1],
@@ -16568,6 +16612,66 @@ def _proof_mirror_doctor_findings(config: Config) -> list[dict[str, object]]:
             "(regenerable cache; clean-caches drops mirrors idle for 7 days)",
         )
     ]
+
+
+def _validation_exclusion_doctor_findings(
+    config: Config,
+) -> list[dict[str, object]]:
+    """Warn for each validate filesystem with no qualifying exclusion root.
+
+    A warning, not a failure: ownerless validation cleanup on that
+    filesystem will refuse until a root-owned 01777 directory on it is
+    provisioned and listed in ``validation_exclusion_roots``.
+    """
+
+    anchors = [
+        _validate_slots_directory(config),
+        config.root / "ignored" / "validate" / "cargo-homes",
+        _frozen_validation_directory(config),
+    ]
+    try:
+        records = _self_mountinfo_records()
+    except Refusal:
+        return []
+    roots = _effective_validation_exclusion_roots(config)
+    findings: list[dict[str, object]] = []
+    seen_devices: set[int] = set()
+    for anchor in anchors:
+        try:
+            device = anchor.stat(follow_symlinks=False).st_dev
+        except OSError:
+            continue
+        if device in seen_devices:
+            continue
+        seen_devices.add(device)
+        failures: list[str] = []
+        for candidate in roots:
+            entry, reason = _evaluate_validation_exclusion_candidate(
+                anchor, candidate, records
+            )
+            if entry is not None:
+                break
+            failures.append(reason)
+        else:
+            finding = _operational_finding(
+                "validation-exclusion-root",
+                None,
+                config.machine,
+                "no qualifying validation exclusion root for "
+                f"{anchor} (filesystem "
+                f"{_validation_exclusion_filesystem(anchor, records, 'validation path')}): "
+                + "; ".join(failures)
+                + ". Ownerless validation cleanup on this filesystem will refuse.",
+            )
+            finding["remedy"] = (
+                "provision a root-owned 01777 directory on the same filesystem "
+                f"as {anchor} (for example 'sudo install -d -o root -g root "
+                "-m 1777 <mountpoint>/.wrkslots-exclusion') and add it to "
+                "validation_exclusion_roots in .wrkslots.yml; diagnosis alone "
+                "authorizes no mutation"
+            )
+            findings.append(finding)
+    return findings
 
 
 def _proof_mirror_receipt(remote_url_sha256: str) -> dict[str, object] | None:
@@ -55799,6 +55903,12 @@ def _cmd_doctor_scan_timed(args: argparse.Namespace, config: Config) -> int:
                 lambda: _eden_backing_doctor_findings(config, states),
             )
         )
+        findings.extend(
+            timed(
+                "validation_exclusion",
+                lambda: _validation_exclusion_doctor_findings(config),
+            )
+        )
         # Interrupted mutations, as status reports them (#1700).
         journal_paths = [
             *_outstanding_journals(config),
@@ -73067,7 +73177,7 @@ def _ownerless_validation_exclusion_from_obj(
         _as_str(raw["source_alias"], "ownerless validation exclusion.source_alias")
     )
     if (
-        root not in _OWNERLESS_VALIDATION_EXCLUSION_ROOTS
+        root not in _effective_validation_exclusion_roots(config)
         or not root.is_absolute()
         or guard != root / _ownerless_validation_exclusion_name(config, fenced)
         or not source_alias.is_absolute()
@@ -73214,60 +73324,133 @@ def _path_alias_on_mount(
     return alias
 
 
+def _effective_validation_exclusion_roots(
+    config: Config | None = None,
+) -> tuple[Path, ...]:
+    """Built-in exclusion candidates plus the configured ones, in order.
+
+    Configuration only offers candidates: every entry must still pass
+    the same root-owned, mode-01777, canonical, same-filesystem checks,
+    so a configured path can never weaken the guard guarantee.
+    """
+
+    configured = config.validation_exclusion_roots if config is not None else ()
+    return tuple(dict.fromkeys((*_OWNERLESS_VALIDATION_EXCLUSION_ROOTS, *configured)))
+
+
+def _validation_exclusion_filesystem(
+    path: Path,
+    records: Sequence[tuple[int, str, Path, Path, str, str]],
+    label: str,
+) -> str:
+    try:
+        record = _mountinfo_record_for_path(path, records, label)
+    except Refusal:
+        return "an unidentified filesystem"
+    return f"device {record[1]} ({record[4]}) mounted at {record[3]}"
+
+
+def _evaluate_validation_exclusion_candidate(
+    fenced: Path,
+    candidate: Path,
+    records: Sequence[tuple[int, str, Path, Path, str, str]],
+) -> tuple[tuple[Path, tuple[int, int, int], Path] | None, str]:
+    """Judge one candidate; return its entry or the exact failure reason."""
+
+    try:
+        metadata = candidate.stat(follow_symlinks=False)
+    except OSError:
+        return None, f"{candidate}: not found (no such directory)"
+    facts = (
+        f"{candidate} (uid {metadata.st_uid}, gid {metadata.st_gid}, "
+        f"mode {stat.S_IMODE(metadata.st_mode):04o}, "
+        f"sticky {'yes' if metadata.st_mode & 0o1000 else 'no'}, "
+        f"filesystem {_validation_exclusion_filesystem(candidate, records, 'validation exclusion root')})"
+    )
+    try:
+        resolved = candidate.resolve(strict=True)
+        descriptor = os.open(
+            candidate,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        return None, f"{facts}: cannot be opened as a directory ({exc})"
+    try:
+        identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            _fd_mount_id(descriptor, str(candidate)),
+        )
+    finally:
+        os.close(descriptor)
+    if resolved != candidate:
+        return None, f"{facts}: not canonical (resolves to {resolved})"
+    if not stat.S_ISDIR(metadata.st_mode):
+        return None, f"{facts}: not a directory"
+    if stat.S_IMODE(metadata.st_mode) != 0o1777:
+        return None, f"{facts}: mode is not 01777 (root-owned sticky)"
+    if metadata.st_uid != 0 or metadata.st_gid != 0:
+        return None, f"{facts}: not root-owned (requires uid 0, gid 0)"
+    try:
+        source_alias = _path_alias_on_mount(fenced, candidate, records)
+    except Refusal as exc:
+        return None, f"{facts}: {exc}"
+    try:
+        _mountinfo_record_for_path(candidate, records, "validation exclusion root")
+    except Refusal as exc:
+        return None, f"{facts}: {exc}"
+    return (candidate, identity, source_alias), ""
+
+
 def _trusted_validation_exclusion_root(
     fenced: Path,
+    roots: Sequence[Path] | None = None,
 ) -> tuple[Path, tuple[int, int, int], Path]:
-    """Select one root-owned sticky path with an unambiguous same-filesystem view."""
+    """Select the first trusted root-owned sticky parent for ``fenced``.
 
+    Candidates are tried in list order (the built-in root first, then
+    ``validation_exclusion_roots`` from the configuration) and the
+    first that passes every check wins. Uniqueness is not required:
+    the journal records the chosen root, guard and their identities,
+    and crash recovery revalidates those recorded values instead of
+    re-running this selection.
+    """
+
+    candidates = (
+        _OWNERLESS_VALIDATION_EXCLUSION_ROOTS if roots is None else tuple(roots)
+    )
     records = _self_mountinfo_records()
-    direct: list[tuple[Path, tuple[int, int, int], Path]] = []
-    aliases: list[tuple[Path, tuple[int, int, int], Path]] = []
     source_mount = _mountinfo_record_for_path(fenced.parent, records, "validation path")
-    for candidate in _OWNERLESS_VALIDATION_EXCLUSION_ROOTS:
-        try:
-            metadata = candidate.stat(follow_symlinks=False)
-            resolved = candidate.resolve(strict=True)
-            descriptor = os.open(
-                candidate,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            )
-        except OSError:
-            continue
-        try:
-            identity = (
-                metadata.st_dev,
-                metadata.st_ino,
-                _fd_mount_id(descriptor, str(candidate)),
-            )
-        finally:
-            os.close(descriptor)
-        if (
-            resolved != candidate
-            or not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != 0
-            or metadata.st_gid != 0
-            or stat.S_IMODE(metadata.st_mode) != 0o1777
-        ):
-            continue
-        try:
-            source_alias = _path_alias_on_mount(fenced, candidate, records)
-        except Refusal:
-            continue
-        destination_mount = _mountinfo_record_for_path(
-            candidate, records, "validation exclusion root"
+    failures: list[str] = []
+    for candidate in candidates:
+        entry, reason = _evaluate_validation_exclusion_candidate(
+            fenced, candidate, records
         )
-        entry = (candidate, identity, source_alias)
-        if destination_mount[0] == source_mount[0]:
-            direct.append(entry)
-        else:
-            aliases.append(entry)
-    selected = direct if direct else aliases
-    if len(selected) != 1:
-        raise Refusal(
-            "validation exclusion requires exactly one trusted root-owned, same-filesystem "
-            f"sticky parent; found {len(selected)}"
-        )
-    return selected[0]
+        if entry is not None:
+            return entry
+        failures.append(reason)
+    filesystem = _validation_exclusion_filesystem(
+        fenced.parent, records, "validation path"
+    )
+    detail = "; ".join(failures) if failures else "no candidates configured"
+    raise Refusal(
+        "validation exclusion found no trusted root-owned, same-filesystem "
+        f"sticky parent for {fenced} (filesystem {filesystem}): found 0 "
+        f"qualifying candidates: {detail}. supported layout: ownerless "
+        "validation cleanup moves the fenced path into a root-owned "
+        "mode-000 guard under one sticky parent on the same filesystem; "
+        "each candidate must be a canonical root-owned (uid 0, gid 0) "
+        "directory with mode 01777 on that filesystem",
+        remedy=(
+            "provision a root-owned 01777 directory on the same filesystem "
+            f"as {fenced} (for example 'sudo install -d -o root -g root "
+            f"-m 1777 {source_mount[3]}/.wrkslots-exclusion'), add it to "
+            "validation_exclusion_roots in .wrkslots.yml, then rerun "
+            "'wrkslots recover --coordinator-authorized "
+            "--coordinator-pid <current-coordinator-pid>' with the same "
+            "validation cleanup flags"
+        ),
+    )
 
 
 def _root_validation_exclusion_command(
@@ -73344,7 +73527,7 @@ def _restore_ownerless_validation_exclusion(
     if exclusion_value is None:
         # An unrecorded guard can exist only if the process died between root mkdir
         # and the durable identity write. Never infer authority over it from its name.
-        for root in _OWNERLESS_VALIDATION_EXCLUSION_ROOTS:
+        for root in _effective_validation_exclusion_roots(config):
             guard = root / _ownerless_validation_exclusion_name(config, fenced)
             if guard.exists() or guard.is_symlink():
                 raise Refusal(
@@ -73525,7 +73708,9 @@ def _begin_ownerless_validation_exclusion(
         raise Refusal(f"canonical validation path reappeared before cleanup: {target}")
     if not fenced.is_dir() or fenced.is_symlink():
         raise Refusal(f"fenced validation path disappeared before exclusion: {fenced}")
-    root, root_identity, source_alias = _trusted_validation_exclusion_root(fenced)
+    root, root_identity, source_alias = _trusted_validation_exclusion_root(
+        fenced, _effective_validation_exclusion_roots(config)
+    )
     guard = root / _ownerless_validation_exclusion_name(config, fenced)
     payload = guard / _OWNERLESS_VALIDATION_EXCLUSION_ENTRY
     assert authorization.parent_identity is not None

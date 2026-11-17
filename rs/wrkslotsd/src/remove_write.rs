@@ -5116,6 +5116,7 @@ mod private_history_tests {
             machine: "testhost".to_string(),
             harness_repo: None,
             eden_mount_root: None,
+            validation_exclusion_roots: Vec::new(),
         };
         let history = submodule_private_history(&cfg, &repo, &repo, &kept)
             .unwrap()

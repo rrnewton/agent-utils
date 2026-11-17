@@ -494,7 +494,7 @@ pub(crate) fn release_frozen_incomplete(
         .cloned()
         .ok_or_else(|| "ownerless validation journal must be an object".to_string())?;
     crate::remove_write::write_journal(&cfg, &selected, &journal_value)?;
-    let roots = crate::validation_exclusion::exclusion_roots();
+    let roots = crate::validation_exclusion::exclusion_roots(&cfg);
     if let Err(error) = crate::validation_exclusion::execute_ownerless_validation(
         &cfg,
         &config,

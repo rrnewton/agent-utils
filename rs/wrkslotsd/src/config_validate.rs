@@ -31,7 +31,7 @@ const REQUIRED: [&str; 6] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 27] = [
+const OPTIONAL: [&str; 28] = [
     "machine",
     "liveness_batch_command",
     "max_active_slots",
@@ -47,6 +47,7 @@ const OPTIONAL: [&str; 27] = [
     "salvage_push_remotes",
     "ttl_rescue_ref_root",
     "reclaimable_ignored_paths",
+    "validation_exclusion_roots",
     "provisioned_allowlist",
     "disk_advisory_bytes",
     "disk_provisioning_floor_bytes",
@@ -1414,6 +1415,22 @@ pub(crate) fn parse_harness_declaration(
     Ok((json!(harness), products))
 }
 
+/// One configured exclusion root: a canonical absolute path.
+pub(crate) fn validate_validation_exclusion_root(value: &str) -> Result<String> {
+    let candidate = PathBuf::from(value);
+    let parts: Vec<&str> = value.split('/').collect();
+    if !candidate.is_absolute()
+        || value != normpath_absolute(value)
+        || parts.contains(&"..")
+        || candidate.file_name().is_none()
+    {
+        return Err(format!(
+            "configuration.validation_exclusion_roots entries must be canonical absolute paths: {value:?}"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 /// The configured Eden mount root (#1730): canonical absolute, outside the project.
 pub(crate) fn validate_eden_mount_root(value: &Value, root: &Path) -> Result<String> {
     let raw = as_str(value, "configuration.eden_mount_root")?;
@@ -1611,6 +1628,15 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         )
         .map_err(|error| format!("configuration.provisioned_allowlist: {error}"))?,
     };
+    let validation_exclusion_roots = match raw.get("validation_exclusion_roots") {
+        None => Vec::new(),
+        Some(value) => string_tuple(
+            value,
+            "configuration.validation_exclusion_roots",
+            validate_validation_exclusion_root,
+            true,
+        )?,
+    };
     let reclaimable = match raw.get("reclaimable_ignored_paths") {
         None => Vec::new(),
         Some(value) => string_tuple(
@@ -1754,6 +1780,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "post_provision_hooks": hooks,
         "post_provision_hook_slot_types": hook_slot_types,
         "reclaimable_ignored_paths": reclaimable,
+        "validation_exclusion_roots": validation_exclusion_roots,
         "provisioned_allowlist": provisioned_allowlist,
         "repo_cache_globs": repo_cache_globs.iter().map(|(name, globs)| json!([name, globs])).collect::<Vec<_>>(),
         "retire_freeze": raw.get("retire_freeze").cloned().unwrap_or(Value::Null),

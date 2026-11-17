@@ -2144,6 +2144,36 @@ parent and `validate-cargo-*` name and cannot be Git worktree roots. The cleanup
 cwd, executable, root, descriptor, mapping, and mount checks, then deletes only the excluded path.
 Any later participant may resume its journal with plain `recover --coordinator-pid PID`.
 
+Deletion itself needs one deployment provision. After the final liveness census, wrkslots moves
+the fenced path into a root-owned mode-000 guard under a trusted sticky parent and deletes it
+through held descriptors, so no same-UID process can rename, reopen or replace it in between.
+That parent must be a canonical root-owned (uid 0, gid 0) directory with mode 01777 on the same
+filesystem as the path being removed. The built-in candidate is `/data/misc`; the
+`validation_exclusion_roots` configuration key in `.wrkslots.yml` adds more candidates after it,
+and the first qualifying candidate in list order hosts the guard. Configuration only offers
+candidates: every one must pass the same ownership, mode, canonical-path and same-filesystem
+checks, so listing a directory can never weaken the guarantee. There is deliberately no command
+flag for this; the list is project configuration, reviewed with the project.
+
+When no candidate qualifies, cleanup refuses and names the path it judged, its filesystem, and
+each candidate with the exact reason it failed (missing, not canonical, wrong mode, wrong owner,
+or another filesystem). Provision one directory on the filesystem that holds the validate paths,
+then list it and rerun the same recover command:
+
+```sh
+sudo install -d -o root -g root -m 1777 <mountpoint>/.wrkslots-exclusion
+```
+
+```yaml
+validation_exclusion_roots:
+  - <mountpoint>/.wrkslots-exclusion
+```
+
+`wrkslots doctor` warns, once per validate filesystem, when none of its candidates qualifies;
+the warning is diagnostic and does not change doctor's result. Uniqueness among qualifying
+candidates is not required: the removal journal records the chosen root, guard and their
+identities, and crash recovery revalidates those recorded values.
+
 `--ownerless-validate-checkout` remains accepted so existing automation and pre-upgrade journals
 fail with an explicit preservation message. It performs the bounded authored-work,
 HANDOFF, submodule, remote-binding, and liveness checks, but it does not create a cleanup journal or

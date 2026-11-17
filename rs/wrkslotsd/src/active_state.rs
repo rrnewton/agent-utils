@@ -46,6 +46,8 @@ pub(crate) struct Cfg {
     pub(crate) harness_repo: Option<String>,
     /// Configured Eden mount root (#1730); None derives the default.
     pub(crate) eden_mount_root: Option<PathBuf>,
+    /// Extra validation exclusion guard parents, after the built-in root.
+    pub(crate) validation_exclusion_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -1335,6 +1337,17 @@ pub(crate) fn load_cfg(
             .get("eden_mount_root")
             .and_then(Value::as_str)
             .map(PathBuf::from),
+        validation_exclusion_roots: config
+            .get("validation_exclusion_roots")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
     Ok((cfg, selected))
 }
@@ -1381,6 +1394,7 @@ mod eden_mount_tests {
             machine: "node-a".to_owned(),
             harness_repo: None,
             eden_mount_root: mount_root,
+            validation_exclusion_roots: Vec::new(),
             root,
         }
     }

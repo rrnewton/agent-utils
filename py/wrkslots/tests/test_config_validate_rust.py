@@ -75,6 +75,9 @@ def _expected(
             for types in config.post_provision_hook_slot_types
         ],
         "reclaimable_ignored_paths": list(config.reclaimable_ignored_paths),
+        "validation_exclusion_roots": [
+            str(path) for path in config.validation_exclusion_roots
+        ],
         "provisioned_allowlist": list(config.provisioned_allowlist),
         "repo_cache_globs": [[name, list(globs)] for name, globs in config.repo_cache_globs],
         "retire_freeze": config.retire_freeze,

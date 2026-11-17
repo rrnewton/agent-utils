@@ -24,17 +24,25 @@ type Result<T> = std::result::Result<T, String>;
 /// `_OWNERLESS_VALIDATION_EXCLUSION_ROOTS`); tests pass `/tmp`.
 pub(crate) const EXCLUSION_ROOTS: &[&str] = &["/data/misc"];
 
-/// The exclusion roots for one run: the production roots, or
-/// the `WRKSLOTS_TEST_EXCLUSION_ROOTS` colon-separated override
-/// fixture tests use to keep the guard on the checkout's own
-/// filesystem (the census-churn seam has the same shape).
-pub(crate) fn exclusion_roots() -> Vec<PathBuf> {
+/// The exclusion roots for one run: the built-in root plus the
+/// configured `validation_exclusion_roots`, in order, or the
+/// `WRKSLOTS_TEST_EXCLUSION_ROOTS` colon-separated override fixture
+/// tests use to keep the guard on the checkout's own filesystem.
+/// Configuration only offers candidates; every entry must still pass
+/// the trusted-root checks in `trusted_root`.
+pub(crate) fn exclusion_roots(cfg: &Cfg) -> Vec<PathBuf> {
     if let Ok(raw) = std::env::var("WRKSLOTS_TEST_EXCLUSION_ROOTS") {
         if !raw.is_empty() {
             return raw.split(':').map(PathBuf::from).collect();
         }
     }
-    EXCLUSION_ROOTS.iter().map(PathBuf::from).collect()
+    let mut roots: Vec<PathBuf> = EXCLUSION_ROOTS.iter().map(PathBuf::from).collect();
+    for candidate in &cfg.validation_exclusion_roots {
+        if !roots.contains(candidate) {
+            roots.push(candidate.clone());
+        }
+    }
+    roots
 }
 
 /// A parsed `/proc/self/mountinfo` record: (mount id, major:minor,
@@ -163,7 +171,77 @@ fn alias_on_mount(
     Ok(alias)
 }
 
-/// Python `_trusted_validation_exclusion_root`.
+fn filesystem_description(path: &Path, records: &[MountRecord], label: &str) -> String {
+    match record_for_path(records, path, label) {
+        Ok(record) => format!(
+            "device {} ({}) mounted at {}",
+            record.dev,
+            record.fs,
+            record.point.display()
+        ),
+        Err(_) => "an unidentified filesystem".to_string(),
+    }
+}
+
+/// Judge one candidate; return its entry or the exact failure reason.
+fn evaluate_candidate(
+    fenced: &Path,
+    candidate: &Path,
+    records: &[MountRecord],
+) -> std::result::Result<(PathBuf, (u64, u64, u64), PathBuf), String> {
+    let metadata = match candidate.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Err(format!("{}: not found (no such directory)", candidate.display())),
+    };
+    let facts = format!(
+        "{} (uid {}, gid {}, mode {:04o}, sticky {}, filesystem {})",
+        candidate.display(),
+        metadata.uid(),
+        metadata.gid(),
+        metadata.permissions_mode(),
+        if metadata.permissions_mode() & 0o1000 != 0 {
+            "yes"
+        } else {
+            "no"
+        },
+        filesystem_description(candidate, records, "validation exclusion root")
+    );
+    let resolved = match candidate.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Err(format!("{facts}: cannot be opened as a directory ({error})"));
+        }
+    };
+    if resolved != candidate {
+        return Err(format!("{facts}: not canonical (resolves to {})", resolved.display()));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{facts}: not a directory"));
+    }
+    if metadata.permissions_mode() != 0o1777 {
+        return Err(format!("{facts}: mode is not 01777 (root-owned sticky)"));
+    }
+    if metadata.uid() != 0 || metadata.gid() != 0 {
+        return Err(format!("{facts}: not root-owned (requires uid 0, gid 0)"));
+    }
+    let identity = match open_directory_identity(candidate, "validation exclusion root") {
+        Ok(identity) => identity,
+        Err(error) => return Err(format!("{facts}: {error}")),
+    };
+    let alias = match alias_on_mount(fenced, candidate, records) {
+        Ok(alias) => alias,
+        Err(error) => return Err(format!("{facts}: {error}")),
+    };
+    if let Err(error) = record_for_path(records, candidate, "validation exclusion root") {
+        return Err(format!("{facts}: {error}"));
+    }
+    Ok((candidate.to_path_buf(), identity, alias))
+}
+
+/// Python `_trusted_validation_exclusion_root`: the first candidate
+/// in list order that passes every check wins. Uniqueness is not
+/// required: the journal records the chosen root, guard and their
+/// identities, and crash recovery revalidates those recorded values.
 fn trusted_root(fenced: &Path, roots: &[PathBuf]) -> Result<(PathBuf, (u64, u64, u64), PathBuf)> {
     let records = mount_records()?;
     let source_mount = record_for_path(
@@ -171,48 +249,76 @@ fn trusted_root(fenced: &Path, roots: &[PathBuf]) -> Result<(PathBuf, (u64, u64,
         fenced.parent().unwrap_or(fenced),
         "validation path",
     )?;
-    let mut direct = Vec::new();
-    let mut aliases = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     for candidate in roots {
-        let Ok(metadata) = candidate.symlink_metadata() else {
-            continue;
-        };
-        let Ok(resolved) = candidate.canonicalize() else {
-            continue;
-        };
-        if resolved != *candidate
-            || !metadata.is_dir()
-            || metadata.uid() != 0
-            || metadata.gid() != 0
-            || metadata.permissions_mode() != 0o1777
-        {
-            continue;
-        }
-        let Ok(identity) = open_directory_identity(candidate, "validation exclusion root") else {
-            continue;
-        };
-        let Ok(alias) = alias_on_mount(fenced, candidate, &records) else {
-            continue;
-        };
-        let Ok(destination_mount) =
-            record_for_path(&records, candidate, "validation exclusion root")
-        else {
-            continue;
-        };
-        if destination_mount.mount_id == source_mount.mount_id {
-            direct.push((candidate.clone(), identity, alias));
-        } else {
-            aliases.push((candidate.clone(), identity, alias));
+        match evaluate_candidate(fenced, candidate, &records) {
+            Ok(entry) => return Ok(entry),
+            Err(reason) => failures.push(reason),
         }
     }
-    let selected = if direct.is_empty() { aliases } else { direct };
-    if selected.len() != 1 {
-        return Err(format!(
-            "validation exclusion requires exactly one trusted root-owned, same-filesystem sticky parent; found {}",
-            selected.len()
-        ));
+    let filesystem = filesystem_description(
+        fenced.parent().unwrap_or(fenced),
+        &records,
+        "validation path",
+    );
+    let detail = if failures.is_empty() {
+        "no candidates configured".to_string()
+    } else {
+        failures.join("; ")
+    };
+    Err(format!(
+        "validation exclusion found no trusted root-owned, same-filesystem sticky parent for {} (filesystem {filesystem}): found 0 qualifying candidates: {detail}. supported layout: ownerless validation cleanup moves the fenced path into a root-owned mode-000 guard under one sticky parent on the same filesystem; each candidate must be a canonical root-owned (uid 0, gid 0) directory with mode 01777 on that filesystem. remedy: provision a root-owned 01777 directory on the same filesystem as {} (for example 'sudo install -d -o root -g root -m 1777 {}/.wrkslots-exclusion'), add it to validation_exclusion_roots in .wrkslots.yml, then rerun 'wrkslots recover --coordinator-authorized --coordinator-pid <current-coordinator-pid>' with the same validation cleanup flags",
+        fenced.display(),
+        fenced.display(),
+        source_mount.point.display()
+    ))
+}
+
+/// Doctor warning details: one per validate filesystem with no
+/// qualifying exclusion root. A warning, not a failure.
+pub(crate) fn doctor_details(cfg: &Cfg) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let anchors = [
+        crate::validation_recovery::validate_slots_directory(cfg),
+        cfg.root.join("ignored/validate/cargo-homes"),
+        crate::validation_recovery::frozen_validation_directory(cfg),
+    ];
+    let Ok(records) = mount_records() else {
+        return Vec::new();
+    };
+    let roots = exclusion_roots(cfg);
+    let mut seen_devices: Vec<u64> = Vec::new();
+    let mut details = Vec::new();
+    for anchor in &anchors {
+        let Ok(metadata) = anchor.symlink_metadata() else {
+            continue;
+        };
+        if seen_devices.contains(&metadata.dev()) {
+            continue;
+        }
+        seen_devices.push(metadata.dev());
+        let mut failures: Vec<String> = Vec::new();
+        let mut qualified = false;
+        for candidate in &roots {
+            match evaluate_candidate(anchor, candidate, &records) {
+                Ok(_) => {
+                    qualified = true;
+                    break;
+                }
+                Err(reason) => failures.push(reason),
+            }
+        }
+        if !qualified {
+            details.push(format!(
+                "no qualifying validation exclusion root for {} (filesystem {}): {}. Ownerless validation cleanup on this filesystem will refuse.",
+                anchor.display(),
+                filesystem_description(anchor, &records, "validation path"),
+                failures.join("; ")
+            ));
+        }
     }
-    Ok(selected.into_iter().next().expect("one root"))
+    details
 }
 
 trait PermissionsMode {
@@ -1398,5 +1504,87 @@ mod tests {
         let _ = git;
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&frozen_root);
+    }
+
+    #[test]
+    fn trusted_root_uses_configured_candidate_on_same_filesystem() {
+        let fenced = std::env::temp_dir().join("wrkslotsd-trusted-fenced");
+        std::fs::create_dir_all(&fenced).expect("fenced");
+        let (root, _identity, alias) =
+            trusted_root(&fenced, &[PathBuf::from("/tmp")]).expect("trusted root");
+        assert_eq!(root, PathBuf::from("/tmp"));
+        assert_eq!(alias, fenced);
+    }
+
+    #[test]
+    fn trusted_root_refusal_names_each_failure() {
+        let base = std::env::temp_dir().join(format!(
+            "wrkslotsd-trusted-refusal-{}",
+            std::process::id()
+        ));
+        let fenced = base.join("fenced");
+        std::fs::create_dir_all(&fenced).expect("fenced");
+        let wrong_mode = base.join("wrong-mode");
+        std::fs::create_dir(&wrong_mode).expect("wrong mode dir");
+        std::fs::set_permissions(&wrong_mode, std::fs::Permissions::from_mode(0o755))
+            .expect("wrong mode");
+        let wrong_owner = base.join("wrong-owner");
+        std::fs::create_dir(&wrong_owner).expect("wrong owner dir");
+        std::fs::set_permissions(&wrong_owner, std::fs::Permissions::from_mode(0o1777))
+            .expect("wrong owner mode");
+        let missing = base.join("missing-root");
+        let error = trusted_root(
+            &fenced,
+            &[
+                missing.clone(),
+                wrong_mode.clone(),
+                wrong_owner.clone(),
+                PathBuf::from("/dev/shm"),
+            ],
+        )
+        .expect_err("no candidate qualifies");
+        assert!(error.contains(&fenced.display().to_string()), "{error}");
+        assert!(error.contains("found 0"), "{error}");
+        assert!(error.contains(&format!("{}: not found", missing.display())), "{error}");
+        assert!(error.contains("mode 0755"), "{error}");
+        assert!(error.contains("mode is not 01777"), "{error}");
+        assert!(error.contains("not root-owned"), "{error}");
+        assert!(error.contains("/dev/shm"), "{error}");
+        assert!(error.contains("another filesystem"), "{error}");
+        assert!(error.contains("sudo install -d -o root -g root -m 1777"), "{error}");
+        assert!(error.contains("validation_exclusion_roots in .wrkslots.yml"), "{error}");
+        assert!(error.contains("wrkslots recover"), "{error}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn exclusion_roots_extend_builtin_in_order() {
+        let root = std::env::temp_dir().join("wrkslotsd-roots-project");
+        std::fs::create_dir_all(root.join("worktrees")).expect("dirs");
+        std::fs::write(root.join("live.py"), "# probe\n").expect("live");
+        std::fs::write(
+            root.join(".wrkslots.yml"),
+            "schema: 2\nmachine: node-a\nworktrees_dir: worktrees\ndefault_remote: origin\ndefault_landed_ref: refs/remotes/origin/main\nheartbeat_ttl_seconds: 60\nliveness_command: live.py\nvalidation_exclusion_roots:\n  - /srv/exclusion-b\n  - /srv/exclusion-a\n",
+        )
+        .expect("config");
+        std::fs::write(
+            root.join("worktrees/ACTIVE.node-a.json"),
+            json!({"schema": 2, "machine": "node-a", "revision": 1, "slots": []}).to_string(),
+        )
+        .expect("active");
+        std::fs::write(
+            root.join("worktrees/ARCHIVED.node-a.json"),
+            json!({"schema": 2, "machine": "node-a", "revision": 1, "records": []}).to_string(),
+        )
+        .expect("archived");
+        let (cfg, _selected) = crate::active_state::load_cfg(Some(&root), None).expect("cfg");
+        assert_eq!(
+            cfg.validation_exclusion_roots,
+            vec![
+                PathBuf::from("/srv/exclusion-b"),
+                PathBuf::from("/srv/exclusion-a"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

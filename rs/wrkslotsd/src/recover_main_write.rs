@@ -394,7 +394,7 @@ pub(crate) fn recover_main(
             .cloned()
             .ok_or_else(|| "ownerless validation journal must be an object".to_string())?;
         crate::remove_write::write_journal(&cfg, &selected, &journal_value)?;
-        let roots = crate::validation_exclusion::exclusion_roots();
+        let roots = crate::validation_exclusion::exclusion_roots(&cfg);
         let message = crate::validation_exclusion::execute_ownerless_validation(
             &cfg,
             &config,
@@ -480,7 +480,7 @@ pub(crate) fn recover_main(
             .as_object()
             .cloned()
             .ok_or_else(|| "ownerless validation journal must be an object".to_string())?;
-        let roots = crate::validation_exclusion::exclusion_roots();
+        let roots = crate::validation_exclusion::exclusion_roots(&cfg);
         let message = crate::validation_exclusion::execute_ownerless_validation(
             &cfg,
             &config,

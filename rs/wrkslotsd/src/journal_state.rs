@@ -908,7 +908,11 @@ fn exclusion_from_obj(cfg: &Cfg, fenced: &Path, value: &Value) -> Result<()> {
     let root = as_str(&raw["root"], &format!("{label}.root"))?;
     let guard = as_str(&raw["guard"], &format!("{label}.guard"))?;
     let source_alias = as_str(&raw["source_alias"], &format!("{label}.source_alias"))?;
-    if root != "/data/misc" || !root.starts_with('/') {
+    if !crate::validation_exclusion::exclusion_roots(cfg)
+        .iter()
+        .any(|candidate| candidate.to_string_lossy() == root)
+        || !root.starts_with('/')
+    {
         return Err("ownerless validation exclusion paths are not canonical".to_owned());
     }
     let expected_guard = PathBuf::from(root).join(exclusion_name(cfg, fenced)?);
