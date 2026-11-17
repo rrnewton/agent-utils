@@ -55,6 +55,7 @@ fn message(
         content_html: String::new(),
         noise,
         thread: thread.map(|(thread_id, is_root)| MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,
@@ -390,6 +391,7 @@ impl ChatClient for MainOnlyBackend {
                 let threads = latest
                     .into_iter()
                     .map(|(id, held)| vibe_talk::threads::ThreadSummary {
+                        class: None,
                         id,
                         root: None,
                         title: String::new(),

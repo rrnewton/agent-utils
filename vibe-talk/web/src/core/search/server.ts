@@ -23,6 +23,8 @@ export interface ServerSearchState {
   /** Why the last ask failed, or "". */
   failed: string;
   hits: Message[];
+  /** Transcript hits, apart from `hits` (`#1608`): hidden by default behind the bucket chip. */
+  transcriptHits: Message[];
   scopes: SearchScope[];
   /** Messages the server tested, over every page asked for. */
   examined: number;
@@ -72,7 +74,7 @@ export interface ServerSearch {
 /** Nothing searched yet. */
 export function createServerSearch(deps: ServerSearchDependencies): ServerSearch {
   let serverSearch: ServerSearchState = {
-    key: "", ticket: 0, loading: false, failed: "", hits: [], scopes: [], examined: 0, resume: null,
+    key: "", ticket: 0, loading: false, failed: "", hits: [], transcriptHits: [], scopes: [], examined: 0, resume: null,
   };
   let serverSearchTimer: TimerHandle | null = null;
   /** Whether the search covers every channel (`#search-all-channels`). */
@@ -89,6 +91,9 @@ export function createServerSearch(deps: ServerSearchDependencies): ServerSearch
       if (serverSearch.ticket !== ticket) return;
       const known = new Set(state.hits.map((hit) => `${hit.channel_id} ${hit.id}`));
       state.hits = [...state.hits, ...answer.hits.filter((hit) => !known.has(`${hit.channel_id} ${hit.id}`))];
+      const knownTranscripts = new Set(state.transcriptHits.map((hit) => `${hit.channel_id} ${hit.id}`));
+      const freshTranscripts = (answer.transcript_hits || []).filter((hit) => !knownTranscripts.has(`${hit.channel_id} ${hit.id}`));
+      state.transcriptHits = [...state.transcriptHits, ...freshTranscripts];
       state.scopes = answer.scopes;
       state.examined += answer.scopes.reduce((sum, scope) => sum + scope.examined, 0);
       state.resume = typeof answer.resume_below_ms === "number" ? answer.resume_below_ms : null;
@@ -116,7 +121,7 @@ export function createServerSearch(deps: ServerSearchDependencies): ServerSearch
       if (serverSearchTimer !== null) deps.clock.clearTimeout(serverSearchTimer);
       serverSearchTimer = null;
       serverSearch = { key, ticket: serverSearch.ticket + 1, loading: key !== "" && open, failed: "",
-        hits: [], scopes: [], examined: 0, resume: null };
+        hits: [], transcriptHits: [], scopes: [], examined: 0, resume: null };
       // Closing the search clears the server's section at once; that is the
       // reader's act, not a keystroke of typing.
       if (key === "") {

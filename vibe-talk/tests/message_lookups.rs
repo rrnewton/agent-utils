@@ -57,6 +57,7 @@ fn thread_message(id: &str, n: i64, content: &str) -> Message {
         content_html: String::new(),
         noise: false,
         thread: Some(MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,

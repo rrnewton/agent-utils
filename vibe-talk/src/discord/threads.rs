@@ -134,6 +134,7 @@ impl NativeThread {
 
     fn membership(&self, root: bool) -> MessageThread {
         MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,
@@ -156,6 +157,7 @@ impl NativeThread {
             .map_err(|_| shape("thread activity timestamp is out of range"))?
             .to_string();
         Ok(ThreadSummary {
+            class: None,
             hue: None,
             id: self.id.clone(),
             root: None,
@@ -835,6 +837,7 @@ impl HttpDiscordClient {
                 // A native thread channel is created only on its first reply. Until then its
                 // root still offers Thread and Reply's start option through the common record.
                 message.thread = Some(MessageThread {
+                    class: None,
                     hue: None,
                     display_name: None,
                     summary: None,
@@ -1739,6 +1742,7 @@ fn confirm_bridge_post(
         Some(_) => Ok(()),
         None => {
             message.thread = Some(MessageThread {
+                class: None,
                 hue: None,
                 display_name: None,
                 summary: None,
@@ -3034,6 +3038,7 @@ mod tests {
         assert_eq!(
             posted.thread,
             Some(MessageThread {
+                class: None,
                 hue: None,
                 display_name: None,
                 summary: None,

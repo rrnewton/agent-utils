@@ -384,3 +384,12 @@
   flex-wrap: wrap;
 }
 
+
+/* `#1608 agent-transcripts-timeline`: bucket chips and the Transcripts view. */
+.search-bucket-row { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.3rem 0; }
+.search-bucket-chip[aria-pressed="true"] { font-weight: 700; }
+.transcripts-list, .transcripts-log { list-style: none; margin: 0; padding: 0; }
+.transcript-row { display: block; width: 100%; text-align: left; padding: 0.5rem 0.25rem; background: none; border: none; cursor: pointer; color: inherit; }
+.transcript-chunk { padding: 0.5rem 0.25rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.transcript-when { opacity: 0.65; font-size: 0.85em; }
+.transcript-highlight { outline: 2px solid currentColor; outline-offset: 2px; }

@@ -313,6 +313,29 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn thread_class(
+        &self,
+        _: &ChannelId,
+        _: &str,
+    ) -> Result<Option<crate::transcripts::ThreadClass>, StoreError> {
+        refuse()
+    }
+
+    async fn set_thread_class(
+        &self,
+        _: &ChannelId,
+        _: &str,
+        _: &crate::transcripts::ThreadClass,
+    ) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn transcript_threads(
+        &self,
+    ) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
+        refuse()
+    }
+
     async fn thread_pins(&self, _: &ChannelId) -> Result<ThreadPins, StoreError> {
         refuse()
     }

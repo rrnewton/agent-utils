@@ -956,6 +956,7 @@ async fn a_message_nobody_has_answered_heads_its_own_empty_thread_which_its_firs
     assert_eq!(
         lone.thread,
         Some(MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,

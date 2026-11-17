@@ -713,7 +713,21 @@
                 <button id="search-bucket-thread" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in this thread</button>
                 <button id="search-bucket-main" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in main</button>
                 <button id="search-bucket-threads" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in threads</button>
+                <button id="search-bucket-transcripts" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in Agent Transcripts</button>
               </div>
+              <!-- `#1608 agent-transcripts-timeline`: the Transcripts view.
+                   Agent-day trace threads and their chunks; never a thread
+                   name, never a raw-feed row. Its own scoped search. -->
+              <section id="transcripts-view" aria-label="Agent transcripts" hidden>
+                <input id="transcripts-search" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Search transcripts" aria-label="Search transcripts" />
+                <p id="transcripts-note" class="hint"></p>
+                <ol id="transcripts-list" class="transcripts-list"></ol>
+                <div id="transcripts-day" hidden>
+                  <button id="transcripts-back" class="chip" type="button">All transcripts</button>
+                  <h3 id="transcripts-title"></h3>
+                  <ol id="transcripts-log" class="transcripts-log"></ol>
+                </div>
+              </section>
               <ol id="thread-list" class="messages" hidden></ol>
               <ol id="discord-log" class="messages"></ol>
               <!--

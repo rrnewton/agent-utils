@@ -3017,6 +3017,7 @@ mod threads_tests {
         TimelinePage {
             messages,
             thread: Some(ThreadSummary {
+                class: None,
                 hue: None,
                 id: "t".to_owned(),
                 root: Some(root),

@@ -56,6 +56,7 @@ fn message(id: &str, thread: Option<&str>) -> Message {
         content_html: String::new(),
         noise: false,
         thread: thread.map(|thread| MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,

@@ -22,6 +22,7 @@ use vibe_talk::contract::{
     NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
     ThreadPinChangeResponse, ThreadPinsResponse, TimelineResponse, TokenScope, TranscriptRole,
+    TranscriptThreadInfo, TranscriptsResponse,
     UpstreamClearAttemptView, UpstreamClearNowOutcome, UpstreamClearNowResponse,
     UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame, VoicePostPrefix,
     VoicePromptSettings, VoiceSend, VoiceSettings,
@@ -99,6 +100,7 @@ fn message(id: &str) -> Message {
 fn threaded_message(id: &str) -> Message {
     Message {
         thread: Some(MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,
@@ -156,6 +158,7 @@ fn threaded_message(id: &str) -> Message {
 
 fn thread_summary(root: Option<Message>) -> ThreadSummary {
     ThreadSummary {
+        class: None,
         hue: None,
         id: "t1".into(),
         root,
@@ -1236,6 +1239,34 @@ fn samples() -> Value {
         // `#605 server-side-search`: a search that stopped on its budget, with a hit, beside a
         // channel the read token did not search; and one that searched a whole channel, finding
         // nothing. So every optional field is seen present and omitted.
+        // `#1608 agent-transcripts-timeline`: the index, with a team beside one without.
+        "TranscriptsResponse": [
+            to(&TranscriptsResponse {
+                transcripts: vec![
+                    TranscriptThreadInfo {
+                        channel: channel(),
+                        thread_id: "1700.0001".into(),
+                        agent: "coordx".into(),
+                        team: Some("team-a".into()),
+                        day: "2026-11-15".into(),
+                        source: "metadata",
+                    },
+                    TranscriptThreadInfo {
+                        channel: channel(),
+                        thread_id: "1701.0001".into(),
+                        agent: "lane-b".into(),
+                        team: None,
+                        day: "2026-11-14".into(),
+                        source: "title",
+                    },
+                ],
+                untrusted_content_notice: "third-party text",
+            }),
+            to(&TranscriptsResponse {
+                transcripts: Vec::new(),
+                untrusted_content_notice: "third-party text",
+            }),
+        ],
         "SearchResponse": [
             to(&SearchResponse {
                 hits: vec![Message {
@@ -1260,12 +1291,14 @@ fn samples() -> Value {
                         ..SearchScope::empty(channel())
                     },
                 ],
+                transcript_hits: vec![threaded.clone()],
                 resume_below_ms: Some(1_758_801_600_000),
                 upstream: "none",
                 untrusted_content_notice: "third-party text",
             }),
             to(&SearchResponse {
                 hits: Vec::new(),
+                transcript_hits: Vec::new(),
                 scopes: vec![SearchScope {
                     state: "searched",
                     examined: 412,

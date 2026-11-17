@@ -37,6 +37,7 @@ fn message(id: &str, thread: &str, root: bool, minutes: u64) -> Message {
         content_html: String::new(),
         noise: false,
         thread: Some(MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,
@@ -113,6 +114,7 @@ impl ChatClient for Backend {
             .iter()
             .enumerate()
             .map(|(i, thread)| ThreadSummary {
+                class: None,
                 hue: None,
                 id: (*thread).to_owned(),
                 root: Some(messages[i].clone()),

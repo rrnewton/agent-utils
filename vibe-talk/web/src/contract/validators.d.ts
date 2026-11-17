@@ -608,6 +608,12 @@ export interface ChannelInfo {
 }
 
 /**
+ * How a thread came to be classed. Sticky: once classed, an edit or a
+ * metadata-less re-read never unclasses; only `Owner` changes a class.
+ */
+export type ClassSource = "metadata" | "title" | "owner";
+
+/**
  * What the web app needs to know at startup.
  */
 export interface ClientConfigResponse {
@@ -1612,6 +1618,13 @@ export interface MessageThread {
    */
   broadcast?: boolean;
   /**
+   * This thread's transcript class, when it is an agent transcript
+   * (`#1608 agent-transcripts-timeline`; [`crate::transcripts`]). Formed
+   * by this server from the bridge's trace metadata or the root title,
+   * never trusted from a page. Absent is an ordinary conversation thread.
+   */
+  class?: ThreadClass | null;
+  /**
    * On a thread's ROOT, the thread's name as [`ThreadSummary::display_name`] gives it: what a
    * summariser filed, served by the same rule (`#484 summary-card-threshold`). `#528
    * thread-card-markdown-and-cap`: a page that holds a root draws its thread's summary card from
@@ -2176,6 +2189,8 @@ export interface SearchResponse {
    * Matching messages, newest first, across every channel searched: those created from
    * `resume_below_ms` (or the oldest held) up to the search's start. Rendered as a timeline
    * page's messages are, each carrying the observation that put it in the server's copy.
+   * Transcript hits are NOT here: they ride in `transcript_hits`, apart
+   * from the raw feed (`#1608 agent-transcripts-timeline`).
    */
   hits: Message[];
   /**
@@ -2188,6 +2203,12 @@ export interface SearchResponse {
    * One per channel asked about, saying whether it was searched and how far back.
    */
   scopes: SearchScope[];
+  /**
+   * Matching transcript messages, newest first, kept apart from `hits`:
+   * search hides them by default and the page reveals them only behind
+   * the Agent Transcripts bucket chip (`#1608`, owner 145/146).
+   */
+  transcript_hits?: Message[];
   /**
    * Standing reminder that the content is third-party text.
    */
@@ -2482,6 +2503,28 @@ export interface SyncedSetting {
 }
 
 /**
+ * A thread classed as one agent's transcript for one ET day.
+ */
+export interface ThreadClass {
+  /**
+   * The agent whose main session this traces.
+   */
+  agent: string;
+  /**
+   * The ET day, `YYYY-MM-DD`.
+   */
+  day: string;
+  /**
+   * How this class was decided.
+   */
+  source: ClassSource;
+  /**
+   * The agent-teams team, when the bridge knew it.
+   */
+  team?: string | null;
+}
+
+/**
  * What one thread pin or unpin did: `PUT`/`DELETE /api/v1/channels/{id}/thread-pins/{thread_id}`.
  */
 export interface ThreadPinChangeResponse {
@@ -2554,6 +2597,13 @@ export interface ThreadPinsResponse {
  * One thread in the thread list, independent of the underlying provider's channel model.
  */
 export interface ThreadSummary {
+  /**
+   * This thread's transcript class, when it is an agent transcript
+   * (`#1608 agent-transcripts-timeline`). A transcript summary carries a
+   * class and NO display name: transcripts are never given the
+   * `slug: description` thread treatment (design section 3).
+   */
+  class?: ThreadClass | null;
   /**
    * A short hyphenated name for the thread, chosen once by a summariser and then kept even if
    * the thread drifts, so the reader always finds it under the same name. Absent until named.
@@ -2779,6 +2829,52 @@ export type TokenScope = "read" | "write";
  * Who spoke a `vibe-talk-v1` transcript line.
  */
 export type TranscriptRole = "user" | "assistant";
+
+/**
+ * One classed transcript thread in the Transcripts index
+ * (`#1608 agent-transcripts-timeline`, design section 2).
+ */
+export interface TranscriptThreadInfo {
+  /**
+   * The agent whose main session this traces.
+   */
+  agent: string;
+  /**
+   * The channel the trace thread sits in.
+   */
+  channel: ChannelInfo;
+  /**
+   * The ET day, `YYYY-MM-DD`.
+   */
+  day: string;
+  /**
+   * How the class was decided: `metadata`, `title`, or `owner`.
+   */
+  source: string;
+  /**
+   * The agent-teams team, when the bridge knew it.
+   */
+  team?: string | null;
+  /**
+   * The day-thread's id in that channel.
+   */
+  thread_id: string;
+}
+
+/**
+ * `GET /api/v1/transcripts`: every classed transcript thread, newest day
+ * first, then agent. Store-only: no upstream read (design section 5).
+ */
+export interface TranscriptsResponse {
+  /**
+   * The classed transcript threads.
+   */
+  transcripts: TranscriptThreadInfo[];
+  /**
+   * Standing reminder that the content is third-party text.
+   */
+  untrusted_content_notice: string;
+}
 
 /**
  * One push, as Settings shows it. `#232 upstream-mark-read`.
@@ -3296,6 +3392,7 @@ export interface Contract {
   CatchupFollowupRequest: CatchupFollowupRequest;
   CatchupFollowupResponse: CatchupFollowupResponse;
   CatchupUpdateRequest: CatchupUpdateRequest;
+  TranscriptsResponse: TranscriptsResponse;
 }
 
 /** A contract type a peer may extend with new `type` tags. */

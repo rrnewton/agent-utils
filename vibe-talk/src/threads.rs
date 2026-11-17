@@ -110,6 +110,12 @@ impl TimelineRequest {
 /// Thread membership attached to a message without conflating it with a reply reference.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MessageThread {
+    /// This thread's transcript class, when it is an agent transcript
+    /// (`#1608 agent-transcripts-timeline`; [`crate::transcripts`]). Formed
+    /// by this server from the bridge's trace metadata or the root title,
+    /// never trusted from a page. Absent is an ordinary conversation thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<crate::transcripts::ThreadClass>,
     /// Opaque thread identifier, scoped to the configured channel.
     pub id: String,
     /// The original channel message, if this provider exposes one.
@@ -156,6 +162,12 @@ pub struct MessageThread {
 /// One thread in the thread list, independent of the underlying provider's channel model.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ThreadSummary {
+    /// This thread's transcript class, when it is an agent transcript
+    /// (`#1608 agent-transcripts-timeline`). A transcript summary carries a
+    /// class and NO display name: transcripts are never given the
+    /// `slug: description` thread treatment (design section 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<crate::transcripts::ThreadClass>,
     /// Opaque identifier used for reading or posting to this thread.
     pub id: String,
     /// The original message, when available and readable.

@@ -1474,6 +1474,50 @@
           "withheld": 0
         }
       ],
+      "transcript_hits": [
+        {
+          "author": "someone",
+          "author_id": "7",
+          "author_is_bot": false,
+          "channel_id": "100",
+          "content": "[build-bot] Status, 15:05Z. hello",
+          "content_html": "<p><em>hello</em></p>\n",
+          "edited_timestamp": "2026-09-25T12:04:30.000100Z",
+          "heading": {
+            "cut": 28,
+            "tag": "build-bot",
+            "time": "15:05Z",
+            "title": "Status"
+          },
+          "id": "301",
+          "noise": true,
+          "reactions": [
+            {
+              "count": 1,
+              "emoji": "👀",
+              "owner_reacted": true
+            },
+            {
+              "count": 2,
+              "custom": true,
+              "custom_id": "112233",
+              "emoji": "party-parrot"
+            }
+          ],
+          "reply_to": "200",
+          "spoken_content": "hello, spoken",
+          "spoken_time": "noon",
+          "thread": {
+            "id": "t1",
+            "is_root": false,
+            "reply_count": 3,
+            "reply_count_exact": true,
+            "root_message_id": "200"
+          },
+          "timestamp": "2026-09-25T12:00:00+00:00",
+          "upstream_url": "https://chat.google.com/room/AAAa1/BBBb2/CCCc3"
+        }
+      ],
       "untrusted_content_notice": "third-party text",
       "upstream": "none"
     },
@@ -2020,6 +2064,46 @@
       ],
       "untrusted_content_notice": "third-party text",
       "view": "threads"
+    }
+  ],
+  "TranscriptsResponse": [
+    {
+      "transcripts": [
+        {
+          "agent": "coordx",
+          "channel": {
+            "added": false,
+            "alias": null,
+            "id": "100",
+            "label": "general",
+            "provider": "discord",
+            "writable": true
+          },
+          "day": "2026-11-15",
+          "source": "metadata",
+          "team": "team-a",
+          "thread_id": "1700.0001"
+        },
+        {
+          "agent": "lane-b",
+          "channel": {
+            "added": false,
+            "alias": null,
+            "id": "100",
+            "label": "general",
+            "provider": "discord",
+            "writable": true
+          },
+          "day": "2026-11-14",
+          "source": "title",
+          "thread_id": "1701.0001"
+        }
+      ],
+      "untrusted_content_notice": "third-party text"
+    },
+    {
+      "transcripts": [],
+      "untrusted_content_notice": "third-party text"
     }
   ],
   "UpstreamClearNowResponse": [

@@ -560,7 +560,14 @@ pub struct SearchResponse {
     /// Matching messages, newest first, across every channel searched: those created from
     /// `resume_below_ms` (or the oldest held) up to the search's start. Rendered as a timeline
     /// page's messages are, each carrying the observation that put it in the server's copy.
+    /// Transcript hits are NOT here: they ride in `transcript_hits`, apart
+    /// from the raw feed (`#1608 agent-transcripts-timeline`).
     pub hits: Vec<Message>,
+    /// Matching transcript messages, newest first, kept apart from `hits`:
+    /// search hides them by default and the page reveals them only behind
+    /// the Agent Transcripts bucket chip (`#1608`, owner 145/146).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_hits: Vec<Message>,
     /// One per channel asked about, saying whether it was searched and how far back.
     pub scopes: Vec<SearchScope>,
     /// Where the next answer continues, as `below`: every message the server holds of every
@@ -811,6 +818,35 @@ pub struct MessagesResponse {
     /// [`crate::threads::TimelinePage::as_of`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
+    /// Standing reminder that the content is third-party text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// One classed transcript thread in the Transcripts index
+/// (`#1608 agent-transcripts-timeline`, design section 2).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TranscriptThreadInfo {
+    /// The channel the trace thread sits in.
+    pub channel: ChannelInfo,
+    /// The day-thread's id in that channel.
+    pub thread_id: String,
+    /// The agent whose main session this traces.
+    pub agent: String,
+    /// The agent-teams team, when the bridge knew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// The ET day, `YYYY-MM-DD`.
+    pub day: String,
+    /// How the class was decided: `metadata`, `title`, or `owner`.
+    pub source: &'static str,
+}
+
+/// `GET /api/v1/transcripts`: every classed transcript thread, newest day
+/// first, then agent. Store-only: no upstream read (design section 5).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct TranscriptsResponse {
+    /// The classed transcript threads.
+    pub transcripts: Vec<TranscriptThreadInfo>,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -1882,6 +1918,8 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<CatchupFollowupResponse>(),
         // `#1388` landing 2. Appended, for the same reason.
         generator.subschema_for::<CatchupUpdateRequest>(),
+        // `#1608 agent-transcripts-timeline`. Appended, for the same reason.
+        generator.subschema_for::<TranscriptsResponse>(),
     ]
 }
 

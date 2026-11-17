@@ -69,6 +69,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Trust dialogs | supported | supported | partial | none | n/a |
 | Headless mode itself | supported | none | in progress | none | — |
 | Transcript reading | supported | supported | supported | none | supported (typed events) |
+| `--trace-thread` harvesting | supported | supported | supported | none | supported (typed events) |
 | `tail` / `console` / `read` | partial | partial | partial | partial | supported |
 | Session identity | supported | supported | supported | none | supported (Claude only) |
 | Takeover / handback | n/a (is the target) | none | none | none | supported (Claude only) |
@@ -380,6 +381,26 @@ last event, model output, open request, and tool call in flight
   sees only the screen and the process tree.
 - **Headless**: supported — the typed event log replaces the transcript
   (`rs/agentctl/src/headless/events.rs`, `tail.rs`).
+
+### `--trace-thread` harvesting
+
+The chat bridge harvesting one agent's transcript into a daily trace
+thread (`agentctl chat run --trace-thread`, #714/#832; collector in
+`rs/agentctl/src/chat_trace.rs`, driver in
+`rs/agentctl/src/chat_service.rs`). This is a different capability from
+transcript *reading* above: it posts the agent's non-reply text to chat,
+where vibe-talk classes it into the Transcripts view (#1608). It needs a
+decodable transcript, so its coverage follows the decoder list, not the
+screen.
+
+- **Claude Code**: supported — harvested from the session transcript
+  through the #710 reader (`rs/agent-harness`).
+- **Codex**: supported — the same reader over the rollout files.
+- **Muse**: supported — the same reader over the session journal.
+- **Unknown TUI**: none — no transcript is known, so there is no
+  outside-the-fence text to collect; its chat replies still work.
+- **Headless**: supported (typed events) — the typed event log stands in
+  for a transcript file.
 
 ### `tail` / `console` / `read`
 

@@ -84,6 +84,8 @@ export interface ChannelViewsDependencies {
   markListView(): void;
   paintAllThreadFocus(): void;
   pinsView(): { only: boolean };
+  /** `#1608`: whether the Transcripts view stands in for the lists. */
+  transcriptsOpen?(): boolean;
   renderOutgoingMessages(): void;
   syncCanonDismissed(): void;
   timelineRows(): { messages: Message[]; threads: ThreadSummary[] };
@@ -380,9 +382,10 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     // All comes back to the thread selected in it, and any other view to none.
     deps.paintAllThreadFocus();
     // `#206 pin-message`. The Pinned filter's list stands in for whichever of these is up.
-    deps.el("thread-list").hidden = deps.selection().view !== "threads" || deps.pinsView().only;
-    deps.el("discord-log").hidden = deps.selection().view === "threads" || deps.pinsView().only;
-    deps.el("pinned-log").hidden = !deps.pinsView().only;
+    const transcriptsUp = deps.transcriptsOpen ? deps.transcriptsOpen() : false;
+    deps.el("thread-list").hidden = transcriptsUp || deps.selection().view !== "threads" || deps.pinsView().only;
+    deps.el("discord-log").hidden = transcriptsUp || deps.selection().view === "threads" || deps.pinsView().only;
+    deps.el("pinned-log").hidden = transcriptsUp || !deps.pinsView().only;
     // `#216 compose-hint`. Where the message goes, said in the box rather than in a heading line above
     // it, and the same words as the box's name for a screen reader.
     const destination = deps.selection().threadId ? "Reply in this thread" : "Message the main channel";

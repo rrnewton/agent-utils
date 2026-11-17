@@ -1385,6 +1385,10 @@ impl HttpSlackClient {
             .into_iter()
             .next();
         ThreadSummary {
+            class: message
+                .as_ref()
+                .and_then(|root_message| root_message.thread.as_ref())
+                .and_then(|thread| thread.class.clone()),
             hue: None,
             id: root.ts.clone(),
             title: title(root, message.as_ref()),

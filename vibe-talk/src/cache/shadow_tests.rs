@@ -527,6 +527,7 @@ fn main_page(limit: usize) -> shadow::Ask {
 fn root(id: &str, text: &str, created_ms: i64) -> Message {
     let mut root = message(id, "ada", text, created_ms);
     root.thread = Some(crate::threads::MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,

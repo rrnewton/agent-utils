@@ -306,6 +306,13 @@ fn routes(state: AppState) -> Router {
             get(api::search_channel),
         )
         .route("/api/v1/search", get(api::search_all))
+        // `#1608 agent-transcripts-timeline`: the Transcripts index and one
+        // agent-day's chunks — the only surface transcript threads read on.
+        .route("/api/v1/transcripts", get(api::transcripts))
+        .route(
+            "/api/v1/transcripts/{channel_id}/{thread_id}",
+            get(api::transcript_thread),
+        )
         .route("/api/v1/channels/{channel_id}/count", get(api::count))
         // `#717 vt-unread-recap`. READ scope: a window grouped by thread with Done tags.
         .route("/api/v1/channels/{channel_id}/recap", get(api::recap))

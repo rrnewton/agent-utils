@@ -295,6 +295,7 @@ fn message(id: &str, content: &str) -> Message {
 impl Threads {
     fn summary(&self, n: usize) -> ThreadSummary {
         ThreadSummary {
+            class: None,
             hue: None,
             id: THREADS[n].to_owned(),
             root: Some(message(
@@ -322,6 +323,7 @@ impl Threads {
         let summary = self.summary(n);
         let mut root = summary.root.expect("a root");
         root.thread = Some(MessageThread {
+            class: None,
             id: summary.id,
             root_message_id: Some(root.id.clone()),
             is_root: true,

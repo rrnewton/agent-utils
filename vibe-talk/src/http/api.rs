@@ -2363,6 +2363,194 @@ pub async fn search_all(
 }
 
 /// `GET /api/v1/channels/{channel_id}/timeline` — all views share one allowlist boundary.
+
+/// Record the transcript classes a page carries, attach stored classes to
+/// rows that lack one, and return the classed thread ids (`#1608`).
+/// Best-effort: a store that cannot say leaves rows as they arrived.
+async fn attach_transcript_classes(
+    state: &AppState,
+    channel: &crate::model::ChannelId,
+    page: &mut crate::threads::TimelinePage,
+) -> std::collections::HashSet<String> {
+    use crate::store::StateStore as _;
+    let mut seen: Vec<(String, crate::transcripts::ThreadClass)> = Vec::new();
+    for summary in page.threads.iter().chain(page.thread.iter()) {
+        if let Some(class) = &summary.class {
+            seen.push((summary.id.clone(), class.clone()));
+        }
+    }
+    for message in &page.messages {
+        if let Some(thread) = &message.thread {
+            if let Some(class) = &thread.class {
+                seen.push((thread.id.clone(), class.clone()));
+            }
+        }
+    }
+    for (thread_id, class) in &seen {
+        let _ = state.store.set_thread_class(channel, thread_id, class).await;
+    }
+    let stored: std::collections::HashMap<String, crate::transcripts::ThreadClass> =
+        match state.store.transcript_threads().await {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|row| row.channel == *channel)
+                .map(|row| (row.thread_id, row.class))
+                .collect(),
+            Err(_) => std::collections::HashMap::new(),
+        };
+    let mut classed = std::collections::HashSet::new();
+    for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+        if summary.class.is_none() {
+            summary.class = stored.get(&summary.id).cloned();
+        }
+        if summary.class.is_some() {
+            classed.insert(summary.id.clone());
+        }
+    }
+    for message in &mut page.messages {
+        if let Some(thread) = &mut message.thread {
+            if thread.class.is_none() {
+                thread.class = stored.get(&thread.id).cloned();
+            }
+            if thread.class.is_some() {
+                classed.insert(thread.id.clone());
+            }
+        }
+    }
+    classed
+}
+
+/// Keep transcript threads out of a raw-feed page (`#1608`, design 2):
+/// the Threads list drops them, Main/Flat drop their messages, and a
+/// direct Thread read of one answers empty — its home is Transcripts.
+fn exclude_transcripts(
+    page: &mut crate::threads::TimelinePage,
+    view: crate::threads::TimelineView,
+) {
+    match view {
+        crate::threads::TimelineView::Threads => {
+            page.threads.retain(|summary| summary.class.is_none());
+        }
+        crate::threads::TimelineView::Thread => {
+            if page
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.class.is_some())
+                || page
+                    .messages
+                    .iter()
+                    .any(|m| m.thread.as_ref().is_some_and(|t| t.class.is_some()))
+            {
+                page.messages.clear();
+                page.thread = None;
+                page.notice =
+                    Some("transcript thread: open it in Transcripts".to_owned());
+            }
+        }
+        crate::threads::TimelineView::Main | crate::threads::TimelineView::Flat => {
+            page.messages.retain(|message| {
+                message
+                    .thread
+                    .as_ref()
+                    .is_none_or(|thread| thread.class.is_none())
+            });
+        }
+    }
+}
+
+/// `GET /api/v1/transcripts`: the Transcripts index — classed day-threads,
+/// newest day first, then agent. Store-only; no upstream read.
+pub async fn transcripts(
+    State(state): State<AppState>,
+    ReadScope(_caller): ReadScope,
+) -> Result<Json<crate::contract::TranscriptsResponse>, ApiError> {
+    use crate::store::StateStore as _;
+    let channels = ops::channels(&state).await;
+    let by_id: std::collections::HashMap<String, crate::model::ChannelInfo> = channels
+        .into_iter()
+        .map(|channel| (channel.id.as_str().to_owned(), channel))
+        .collect();
+    let rows = state.store.transcript_threads().await.unwrap_or_default();
+    let transcripts = rows
+        .into_iter()
+        .filter_map(|row| {
+            let channel = by_id.get(row.channel.as_str())?.clone();
+            Some(crate::contract::TranscriptThreadInfo {
+                channel,
+                thread_id: row.thread_id,
+                agent: row.class.agent,
+                team: row.class.team,
+                day: row.class.day,
+                source: row.class.source.as_str(),
+            })
+        })
+        .collect();
+    Ok(Json(crate::contract::TranscriptsResponse {
+        transcripts,
+        untrusted_content_notice: untrusted::NOTICE,
+    }))
+}
+
+/// `GET /api/v1/transcripts/{channel_id}/{thread_id}`: one agent-day's
+/// chunks, oldest first, legacy label lines dropped. The one surface a
+/// transcript thread may be read on (`#1608`).
+pub async fn transcript_thread(
+    State(state): State<AppState>,
+    ReadScope(caller): ReadScope,
+    Path((channel_id, thread_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    use crate::store::StateStore as _;
+    let channel_ref = crate::model::ChannelId(channel_id.clone());
+    let class = state
+        .store
+        .thread_class(&channel_ref, &thread_id)
+        .await
+        .ok()
+        .flatten();
+    let request = crate::threads::TimelineRequest {
+        view: crate::threads::TimelineView::Thread,
+        thread_id: Some(thread_id.clone()),
+        before: None,
+        after: None,
+        limit: ops::MAX_PAGE,
+    };
+    let (channel, mut page) = ops::timeline(&state, caller, &channel_id, &request).await?;
+    attach_transcript_classes(&state, &channel.id, &mut page).await;
+    let is_transcript = class.is_some()
+        || page
+            .messages
+            .iter()
+            .any(|m| m.thread.as_ref().is_some_and(|t| t.class.is_some()));
+    if !is_transcript {
+        return Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+            "not a transcript thread",
+        ));
+    }
+    for message in &mut page.messages {
+        let stripped =
+            crate::transcripts::strip_legacy_label(&message.content).to_owned();
+        message.content = stripped;
+    }
+    crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
+    let returned = page.messages.len();
+    Ok(no_store(Json(TimelineResponse {
+        pins_revision: None,
+        bookmark: None,
+        returned,
+        channel,
+        view: crate::threads::TimelineView::Thread,
+        limit: ops::MAX_PAGE,
+        page,
+        dismissed: Vec::new(),
+        reply_dismissals: None,
+        page_build: Some(crate::http::assets::page_build()),
+        untrusted_content_notice: untrusted::NOTICE,
+    })))
+}
+
+/// `GET /api/v1/channels/{channel_id}/timeline`: one channel view's page.
 pub async fn timeline(
     State(state): State<AppState>,
     ReadScope(caller): ReadScope,
@@ -2411,6 +2599,10 @@ pub async fn timeline(
         limit,
     };
     let (channel, mut page) = ops::timeline(&state, caller, &channel_id, &request).await?;
+    // `#1608 agent-transcripts-timeline`: class what this page carries,
+    // then keep transcripts out of every raw-feed view.
+    attach_transcript_classes(&state, &channel.id, &mut page).await;
+    exclude_transcripts(&mut page, request.view);
     // `#427 server-thread-hues`. Here beside the rendering, for its reason: this route's only
     // reader is the page. A write-scope read colours threads it is the first to meet; a
     // read-scope one only carries colours already assigned, and the page falls back for the rest.
@@ -6443,6 +6635,7 @@ fn fill_pin_links<'p>(
             .thread_id
             .as_deref()
             .map(|id| crate::threads::MessageThread {
+                class: None,
                 hue: None,
                 display_name: None,
                 summary: None,
@@ -9007,4 +9200,55 @@ pub async fn prepare_document_speech(
         }],
         expires_in_seconds: crate::speech_tickets::TICKET_TTL.as_secs(),
     }))
+}
+
+#[cfg(test)]
+mod transcript_exclusion_tests {
+    use super::exclude_transcripts;
+    use crate::threads::{TimelinePage, TimelineView};
+
+    fn classed(content: &str) -> crate::model::Message {
+        let mut message = crate::cache::fixtures::message("m1", "agent", content, 1_000);
+        message.thread = Some(crate::threads::MessageThread {
+            class: Some(crate::transcripts::ThreadClass {
+                agent: "coordx".to_owned(),
+                team: None,
+                day: "2026-11-15".to_owned(),
+                source: crate::transcripts::ClassSource::Metadata,
+            }),
+            hue: None,
+            display_name: None,
+            summary: None,
+            id: "1700.0001".to_owned(),
+            root_message_id: None,
+            is_root: true,
+            broadcast: false,
+            reply_count: Some(2),
+            reply_count_exact: true,
+        });
+        message
+    }
+
+    #[test]
+    fn transcripts_leave_every_raw_feed_view() {
+        // `#1608`: Main/Flat drop their messages, Threads drops the summary,
+        // and a direct Thread read answers empty.
+        let plain = crate::cache::fixtures::message("m0", "owner", "hello", 500);
+        for view in [TimelineView::Main, TimelineView::Flat] {
+            let mut page = TimelinePage {
+                messages: vec![plain.clone(), classed("thinking")],
+                ..TimelinePage::default()
+            };
+            exclude_transcripts(&mut page, view);
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.messages[0].content, "hello");
+        }
+        let mut page = TimelinePage {
+            messages: vec![classed("thinking")],
+            ..TimelinePage::default()
+        };
+        exclude_transcripts(&mut page, TimelineView::Thread);
+        assert!(page.messages.is_empty());
+        assert!(page.notice.is_some());
+    }
 }

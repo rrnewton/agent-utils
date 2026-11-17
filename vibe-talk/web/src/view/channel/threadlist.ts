@@ -42,6 +42,12 @@ export interface ThreadListDependencies {
   changeChannelView(view: string, id?: string, summary?: unknown, origin?: string | null, before?: unknown, drill?: { id: string; top: number } | null): unknown;
   defaultChannelView(): string;
   chooseView(view: string): void;
+  /** `#1608`: open the Transcripts view (the picker's Transcripts entry). */
+  openTranscripts?(): void;
+  /** `#1608`: whether the Transcripts view is the one on screen. */
+  transcriptsOpen?(): boolean;
+  /** `#1608`: leave the Transcripts view for another picker choice. */
+  closeTranscripts?(): void;
   openThreadFromList(id: string, summary: unknown): unknown;
   selectSideThread(id: string, summary: unknown): unknown;
   closeSideThread(): unknown;
@@ -358,6 +364,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   const VIEW_CHOICES: ReadonlyArray<[string, string]> = [["main", "Main"], ["flat", "All"], ["threads", "Thread list"], ["columns", "Two columns"]];
 
   function viewChoiceOnScreen(): string {
+    if (deps.transcriptsOpen && deps.transcriptsOpen()) return "transcripts";
     if (deps.layoutColumns()) return "columns";
     if (deps.layoutThreadList()) return "threads";
     if (deps.selection().view === "thread" && deps.selection().threadId) return `thread:${deps.selection().threadId}`;
@@ -367,6 +374,8 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   function renderThreadSelect(): void {
     const select = el("thread-select") as HTMLSelectElement;
     const options: Array<[string, string]> = [["main", "Main"]];
+    // `#1608 agent-transcripts-timeline`: Transcripts, beside Main/All/Thread list.
+    options.push(["transcripts", "Transcripts"]);
     if (deps.threading()) {
       options.push(["flat", "All"]);
       if (deps.threadListOffered()) {
@@ -445,7 +454,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   function drawThreadPickerPopup(select: HTMLSelectElement): void {
     if (!pickerPopup) return;
     const rows: HTMLElement[] = [];
-    const fixed: Array<[string, string]> = [["main", "Main"]];
+    const fixed: Array<[string, string]> = [["main", "Main"], ["transcripts", "Transcripts"]];
     if (deps.threading()) {
       fixed.push(["flat", "All"]);
       if (deps.threadListOffered()) {
@@ -570,6 +579,11 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
 
   function onThreadSelect(): unknown {
     const value = String((el("thread-select") as HTMLSelectElement).value);
+    if (value === "transcripts") {
+      if (deps.openTranscripts) deps.openTranscripts();
+      return undefined;
+    }
+    if (deps.transcriptsOpen && deps.transcriptsOpen() && deps.closeTranscripts) deps.closeTranscripts();
     if (VIEW_CHOICES.some(([view]) => view === value)) {
       deps.chooseView(value);
       return undefined;

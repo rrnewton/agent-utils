@@ -595,6 +595,7 @@ mod tests {
 
     fn summary(id: &str, at: &str) -> ThreadSummary {
         ThreadSummary {
+            class: None,
             hue: None,
             id: id.to_owned(),
             root: None,

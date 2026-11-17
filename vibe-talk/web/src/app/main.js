@@ -156,6 +156,7 @@ import {createDraftQueries, createOutboxLoads} from "../core/outbox/index.ts";
 import {createOutboxDispatch} from "../core/outbox/index.ts";
 import {createSendTakeBack} from "../view/channel/index.ts";
 import {createThreadList as createThreadListView} from "../view/channel/index.ts";
+import {createTranscriptsView} from "../view/transcript/index.ts";
 import {createWebPorts} from "../platform/web/index.ts";
 import {createOfflineCache, createThreadStrip} from "../view/channel/index.ts";
 import {createScrollTrace, createScrollTraceControls} from "../view/channel/index.ts";
@@ -1865,6 +1866,9 @@ const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHo
 
 /** Channel views, threads and the channel composer are web/src/view/channel's now
  * (`createChannelViews`, `#624 voice-page-modularity`). */
+// `#1608`: set by the Transcripts view's open/close wrappers below, read
+// by paints wired before the view itself is created.
+let transcriptsViewActive = false;
 const channelViews = createChannelViews({
   el: (id) => el(id),
   leftEl: (id) => leftEl(id),
@@ -1891,6 +1895,7 @@ const channelViews = createChannelViews({
   markListView: () => markListView(),
   paintAllThreadFocus: () => paintAllThreadFocus(),
   pinsView: () => pinsView(),
+  transcriptsOpen: () => transcriptsViewActive,
   renderOutgoingMessages: () => renderOutgoingMessages(),
   syncCanonDismissed: () => syncCanonDismissed(),
   invalidateDock: () => listKeepersMount.invalidateDock(),
@@ -4261,7 +4266,31 @@ function createThreadList(deps) {
     }),
   });
 }
+// `#1608 agent-transcripts-timeline`: the Transcripts view, beside
+// Main/All/Thread list in the view picker. Its own scoped search; a search
+// hit in Agent Transcripts opens its day here, at that message.
+const transcriptsView = createTranscriptsView({
+  el: (id) => el(id),
+  api: (path) => api(path),
+  intoView: (element, block) => scrollKeeping.intoView(element, block),
+  setStatus: (text) => setStatus(text),
+});
+function openTranscripts() {
+  transcriptsViewActive = true;
+  void transcriptsView.open();
+  renderChannelNavigation();
+}
+function closeTranscripts() {
+  if (!transcriptsViewActive) return;
+  transcriptsViewActive = false;
+  transcriptsView.close();
+  renderChannelNavigation();
+}
+
 const threadList = createThreadList({
+  openTranscripts: () => openTranscripts(),
+  transcriptsOpen: () => transcriptsViewActive,
+  closeTranscripts: () => closeTranscripts(),
   byId: el,
   leftById: leftEl,
   inThisColumn,
@@ -7041,6 +7070,8 @@ const olderWalks = mountOlderWalks({
   layoutColumnsShown: () => layoutShown.columns(), lastPaneCurrent: () => lastPane.current(),
   sidePaneValue: sidePane, serverSearchOwner, serverFactsTokenScope: () => serverFacts.tokenScope(),
   searchFurtherRunning, serverCopyOpen, gathering, repliesWalks, historyReadToStart,
+  transcriptsOpen: () => transcriptsViewActive,
+  openTranscriptHit: (hit) => { openTranscripts(); void transcriptsView.openAt(hit); },
   api, channelName, channelDirectoryChannels: () => channelDirectory.channels(),
   jumpToMessageLink, messageBody, markSearchHits, searchParsed, heldMessagesById,
   serverCardNode: (hit) => discordNode(/** @type {any} */ ([hit])),
@@ -7050,6 +7081,9 @@ const olderWalks = mountOlderWalks({
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
 const { renderOlderControl, olderControlPressed, searchOlder, searchOlderFromField, searchReplies, searchOffered, searchKey, endSearchWalks, endSearchWalk, stopSearchWalk, renderSearchOlderNote, historyReach, searchFurtherPressed, chooseSearchAllChannels, renderRepliesSearch, renderServerSearch, scheduleServerSearch, channelViewWords, oldestLoadedMs, toggleServerHits, toggleBucket, serviceWords, repliesFloor, repliesSearchOffered, allCover, allLoaded, repliesKey, endRepliesWalk } = olderWalks;
+// `#1608`: the Transcripts view's own search and way back to its index.
+el("transcripts-search").addEventListener("input", () => transcriptsView.searchChanged());
+el("transcripts-back").addEventListener("click", () => { void transcriptsView.refresh(); });
 
 /**
  * The gaps a search opens in the cards and in an unpacked thread's block (web/src/view/channel

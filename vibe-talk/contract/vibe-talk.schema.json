@@ -871,6 +871,26 @@
       ],
       "type": "object"
     },
+    "ClassSource": {
+      "description": "How a thread came to be classed. Sticky: once classed, an edit or a\nmetadata-less re-read never unclasses; only `Owner` changes a class.",
+      "oneOf": [
+        {
+          "const": "metadata",
+          "description": "Slack `agentctl_trace` metadata (primary).",
+          "type": "string"
+        },
+        {
+          "const": "title",
+          "description": "The fixed root title (fallback).",
+          "type": "string"
+        },
+        {
+          "const": "owner",
+          "description": "The owner's explicit override.",
+          "type": "string"
+        }
+      ]
+    },
     "ClientConfigResponse": {
       "description": "What the web app needs to know at startup.",
       "properties": {
@@ -1910,6 +1930,17 @@
           "description": "Whether this thread reply was also sent to the channel itself — the provider's own\nbroadcast marker (Slack's `thread_broadcast` subtype). `#1165 reply-count-broadcast-only`:\nsuch a reply appears in both places, in its thread and on the channel, and counts toward\nits thread on the page; a reply a backend places only on the channel carries no marker\nand does not. Absent on the wire means false, which is also what an older server meant,\nand false on a root and on every reply of a backend with no broadcast to mark.",
           "type": "boolean"
         },
+        "class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "This thread's transcript class, when it is an agent transcript\n(`#1608 agent-transcripts-timeline`; [`crate::transcripts`]). Formed\nby this server from the bridge's trace metadata or the root title,\nnever trusted from a page. Absent is an ordinary conversation thread."
+        },
         "display_name": {
           "description": "On a thread's ROOT, the thread's name as [`ThreadSummary::display_name`] gives it: what a\nsummariser filed, served by the same rule (`#484 summary-card-threshold`). `#528\nthread-card-markdown-and-cap`: a page that holds a root draws its thread's summary card from\nthe read that brought the root, and from its saved copy on a reload, rather than waiting for\na read of the thread list. Absent on replies, until named, and from an older server.",
           "type": [
@@ -2642,7 +2673,7 @@
       "description": "`GET /api/v1/channels/{id}/search` and `GET /api/v1/search`: what the server's own copy of\neach channel holds that matches a query, and how far back that search reached. `#605\nserver-side-search`; see [`crate::server_search`].",
       "properties": {
         "hits": {
-          "description": "Matching messages, newest first, across every channel searched: those created from\n`resume_below_ms` (or the oldest held) up to the search's start. Rendered as a timeline\npage's messages are, each carrying the observation that put it in the server's copy.",
+          "description": "Matching messages, newest first, across every channel searched: those created from\n`resume_below_ms` (or the oldest held) up to the search's start. Rendered as a timeline\npage's messages are, each carrying the observation that put it in the server's copy.\nTranscript hits are NOT here: they ride in `transcript_hits`, apart\nfrom the raw feed (`#1608 agent-transcripts-timeline`).",
           "items": {
             "$ref": "#/$defs/Message"
           },
@@ -2660,6 +2691,13 @@
           "description": "One per channel asked about, saying whether it was searched and how far back.",
           "items": {
             "$ref": "#/$defs/SearchScope"
+          },
+          "type": "array"
+        },
+        "transcript_hits": {
+          "description": "Matching transcript messages, newest first, kept apart from `hits`:\nsearch hides them by default and the page reveals them only behind\nthe Agent Transcripts bucket chip (`#1608`, owner 145/146).",
+          "items": {
+            "$ref": "#/$defs/Message"
           },
           "type": "array"
         },
@@ -3081,6 +3119,36 @@
       ],
       "type": "object"
     },
+    "ThreadClass": {
+      "description": "A thread classed as one agent's transcript for one ET day.",
+      "properties": {
+        "agent": {
+          "description": "The agent whose main session this traces.",
+          "type": "string"
+        },
+        "day": {
+          "description": "The ET day, `YYYY-MM-DD`.",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/ClassSource",
+          "description": "How this class was decided."
+        },
+        "team": {
+          "description": "The agent-teams team, when the bridge knew it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent",
+        "day",
+        "source"
+      ],
+      "type": "object"
+    },
     "ThreadPinChangeResponse": {
       "description": "What one thread pin or unpin did: `PUT`/`DELETE /api/v1/channels/{id}/thread-pins/{thread_id}`.",
       "properties": {
@@ -3163,6 +3231,17 @@
     "ThreadSummary": {
       "description": "One thread in the thread list, independent of the underlying provider's channel model.",
       "properties": {
+        "class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "This thread's transcript class, when it is an agent transcript\n(`#1608 agent-transcripts-timeline`). A transcript summary carries a\nclass and NO display name: transcripts are never given the\n`slug: description` thread treatment (design section 3)."
+        },
         "display_name": {
           "description": "A short hyphenated name for the thread, chosen once by a summariser and then kept even if\nthe thread drifts, so the reader always finds it under the same name. Absent until named.",
           "type": [
@@ -3509,6 +3588,67 @@
           "type": "string"
         }
       ]
+    },
+    "TranscriptThreadInfo": {
+      "description": "One classed transcript thread in the Transcripts index\n(`#1608 agent-transcripts-timeline`, design section 2).",
+      "properties": {
+        "agent": {
+          "description": "The agent whose main session this traces.",
+          "type": "string"
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel the trace thread sits in."
+        },
+        "day": {
+          "description": "The ET day, `YYYY-MM-DD`.",
+          "type": "string"
+        },
+        "source": {
+          "description": "How the class was decided: `metadata`, `title`, or `owner`.",
+          "type": "string"
+        },
+        "team": {
+          "description": "The agent-teams team, when the bridge knew it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thread_id": {
+          "description": "The day-thread's id in that channel.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel",
+        "thread_id",
+        "agent",
+        "day",
+        "source"
+      ],
+      "type": "object"
+    },
+    "TranscriptsResponse": {
+      "description": "`GET /api/v1/transcripts`: every classed transcript thread, newest day\nfirst, then agent. Store-only: no upstream read (design section 5).",
+      "properties": {
+        "transcripts": {
+          "description": "The classed transcript threads.",
+          "items": {
+            "$ref": "#/$defs/TranscriptThreadInfo"
+          },
+          "type": "array"
+        },
+        "untrusted_content_notice": {
+          "description": "Standing reminder that the content is third-party text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "transcripts",
+        "untrusted_content_notice"
+      ],
+      "type": "object"
     },
     "UpstreamClearAttemptView": {
       "description": "One push, as Settings shows it. `#232 upstream-mark-read`.",
@@ -4451,6 +4591,9 @@
     },
     {
       "$ref": "#/$defs/CatchupUpdateRequest"
+    },
+    {
+      "$ref": "#/$defs/TranscriptsResponse"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

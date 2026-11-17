@@ -650,6 +650,7 @@ mod tests {
         );
         // What upstream_url forms is read back.
         let thread = crate::threads::MessageThread {
+            class: None,
             id: "spaces/AAAa1/threads/BBBb2".to_owned(),
             root_message_id: None,
             is_root: false,

@@ -260,6 +260,7 @@ mod tests {
 
     fn a_thread(id: &str, is_root: bool) -> MessageThread {
         MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,

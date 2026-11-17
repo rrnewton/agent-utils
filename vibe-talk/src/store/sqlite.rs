@@ -531,6 +531,21 @@ pub const MIGRATIONS: &[&str] = &[
         revision   INTEGER NOT NULL
     ) STRICT;
     ",
+    // v27 — transcript thread classes. `#1608 agent-transcripts-timeline`.
+    // One row per classed day-thread: the durable record the Transcripts
+    // index reads (design section 2.2). Ids and the class only, no text.
+    "
+    CREATE TABLE thread_class (
+        channel_id TEXT    NOT NULL,
+        thread_id  TEXT    NOT NULL,
+        agent      TEXT    NOT NULL,
+        team       TEXT,
+        day        TEXT    NOT NULL,
+        source     TEXT    NOT NULL,
+        decided_ms INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, thread_id)
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -2804,6 +2819,130 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn thread_class(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+    ) -> Result<Option<crate::transcripts::ThreadClass>, StoreError> {
+        let channel = channel.clone();
+        let thread_id = thread_id.to_owned();
+        self.with_connection(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT agent, team, day, source FROM thread_class \
+                     WHERE channel_id = ?1 AND thread_id = ?2",
+                )
+                .map_err(backend)?;
+            let row = statement
+                .query_row(rusqlite::params![channel.as_str(), thread_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .optional()
+                .map_err(backend)?;
+            Ok(row.and_then(|(agent, team, day, source)| {
+                crate::transcripts::ClassSource::parse(&source).map(|source| {
+                    crate::transcripts::ThreadClass {
+                        agent,
+                        team,
+                        day,
+                        source,
+                    }
+                })
+            }))
+        })
+        .await
+    }
+
+    async fn set_thread_class(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        class: &crate::transcripts::ThreadClass,
+    ) -> Result<(), StoreError> {
+        let channel = channel.clone();
+        let thread_id = thread_id.to_owned();
+        let class = class.clone();
+        self.with_connection(move |connection| {
+            // Sticky: keep an existing row unless the new class is the
+            // owner's own override (design section 2.2).
+            connection
+                .execute(
+                    "INSERT INTO thread_class \
+                     (channel_id, thread_id, agent, team, day, source, decided_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT(channel_id, thread_id) DO UPDATE SET \
+                       agent = excluded.agent, team = excluded.team, \
+                       day = excluded.day, source = excluded.source, \
+                       decided_ms = excluded.decided_ms \
+                     WHERE excluded.source = 'owner'",
+                    rusqlite::params![
+                        channel.as_str(),
+                        thread_id,
+                        class.agent,
+                        class.team,
+                        class.day,
+                        class.source.as_str(),
+                        now_ms()
+                    ],
+                )
+                .map_err(backend)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn transcript_threads(
+        &self,
+    ) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
+        self.with_connection(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT channel_id, thread_id, agent, team, day, source, decided_ms \
+                     FROM thread_class ORDER BY day DESC, agent ASC, thread_id ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .map_err(backend)?;
+            let mut found = Vec::new();
+            for row in rows {
+                let (channel, thread_id, agent, team, day, source, decided_ms) =
+                    row.map_err(backend)?;
+                let Some(source) = crate::transcripts::ClassSource::parse(&source) else {
+                    continue;
+                };
+                found.push(super::TranscriptThreadRow {
+                    channel: ChannelId(channel),
+                    thread_id,
+                    class: crate::transcripts::ThreadClass {
+                        agent,
+                        team,
+                        day,
+                        source,
+                    },
+                    decided_ms,
+                });
+            }
+            Ok(found)
+        })
+        .await
+    }
+
     async fn thread_pins(&self, channel: &ChannelId) -> Result<ThreadPins, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| {
@@ -3471,6 +3610,9 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM thread_pin_revisions", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM thread_class", [])
                 .map_err(backend)?;
             // The bookmarks, revisions and all, for the pins' reason: the next one starts from the
             // clock, past every revision a page may still hold. `#240 reading-bookmark`.
@@ -4862,6 +5004,69 @@ mod tests {
         assert!(
             store.channel_aliases().await.expect("read back").is_empty(),
             "a purge that leaves the aliases behind has not erased everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_class_is_sticky_survives_restart_and_lists_for_transcripts() {
+        // `#1608 agent-transcripts-timeline` (design section 2.2).
+        let dir = TempDir::new("sqlite-thread-class");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        let channel = ChannelId("C1".to_owned());
+        let class = crate::transcripts::ThreadClass {
+            agent: "coordx".to_owned(),
+            team: None,
+            day: "2026-11-15".to_owned(),
+            source: crate::transcripts::ClassSource::Metadata,
+        };
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            store
+                .set_thread_class(&channel, "1700.0001", &class)
+                .await
+                .expect("class it");
+            // A metadata re-read never unclasses or replaces.
+            let other = crate::transcripts::ThreadClass {
+                agent: "other".to_owned(),
+                ..class.clone()
+            };
+            store
+                .set_thread_class(&channel, "1700.0001", &other)
+                .await
+                .expect("sticky");
+            assert_eq!(
+                store
+                    .thread_class(&channel, "1700.0001")
+                    .await
+                    .expect("read")
+                    .expect("classed")
+                    .agent,
+                "coordx"
+            );
+        }
+        let store = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        let rows = store.transcript_threads().await.expect("index");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].thread_id, "1700.0001");
+        assert_eq!(rows[0].class.day, "2026-11-15");
+        // Only the owner's override replaces a class.
+        let owned = crate::transcripts::ThreadClass {
+            agent: "owner-pick".to_owned(),
+            source: crate::transcripts::ClassSource::Owner,
+            ..class.clone()
+        };
+        store
+            .set_thread_class(&channel, "1700.0001", &owned)
+            .await
+            .expect("override");
+        assert_eq!(
+            store
+                .thread_class(&channel, "1700.0001")
+                .await
+                .expect("read")
+                .expect("classed")
+                .agent,
+            "owner-pick"
         );
     }
 
@@ -7687,7 +7892,7 @@ mod tests {
         // there are add tables, dropped here as their notes say.
         connection
             .execute_batch(
-                "DROP TABLE IF EXISTS thread_pins; DROP TABLE IF EXISTS thread_pin_revisions; DROP TABLE IF EXISTS discuss_records; DROP TABLE IF EXISTS reply_pointers; DROP TABLE IF EXISTS history_modes;
+                "DROP TABLE IF EXISTS thread_class; DROP TABLE IF EXISTS thread_pins; DROP TABLE IF EXISTS thread_pin_revisions; DROP TABLE IF EXISTS discuss_records; DROP TABLE IF EXISTS reply_pointers; DROP TABLE IF EXISTS history_modes;
                  DROP TABLE IF EXISTS own_decided; ALTER TABLE dismissals DROP COLUMN own;
                  DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
                  DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;

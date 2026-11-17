@@ -1104,6 +1104,14 @@ impl Raw {
         self.str_field("thread_ts").and_then(ids::canonical_ts)
     }
 
+    /// This message's transcript class, from its own trace metadata
+    /// (`#1608 agent-transcripts-timeline`; [`crate::transcripts`]). An
+    /// entry classes its thread even read before its root, because entries
+    /// carry agent and day too.
+    pub fn trace_class(&self) -> Option<crate::transcripts::ThreadClass> {
+        crate::transcripts::class_of_metadata(&self.value)
+    }
+
     /// Whether this is a thread reply also sent to the conversation (`thread_broadcast`), which
     /// history lists among the conversation's own messages.
     pub fn is_broadcast(&self) -> bool {
@@ -1211,8 +1219,18 @@ impl Raw {
         // count of nothing exact.
         let thread_ts = self.thread_ts().unwrap_or_else(|| self.ts.clone());
         let is_root = thread_ts == self.ts;
+        // Transcript class (`#1608`): metadata first; on a root without it,
+        // the fixed trace title is the fallback (design section 2.1).
+        let class = self.trace_class().or_else(|| {
+            if is_root {
+                crate::transcripts::class_of_title(text)
+            } else {
+                None
+            }
+        });
         let reply_count = is_root.then(|| self.reply_count());
         let thread = Some(MessageThread {
+            class,
             hue: None,
             display_name: None,
             summary: None,
@@ -2051,6 +2069,7 @@ mod tests {
             )
         );
         let thread = MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,

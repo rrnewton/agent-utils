@@ -178,6 +178,7 @@ async fn a_reply_in_an_existing_thread_reaches_the_live_stream_within_one_poll_f
     assert_eq!(
         reply.message.thread,
         Some(MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,

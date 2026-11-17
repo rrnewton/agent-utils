@@ -45,6 +45,7 @@ export { createDraftQueries, createOutboxLoads } from "../core/outbox/index.ts";
 export { createOutboxDispatch } from "../core/outbox/index.ts";
 export { createSendTakeBack } from "../view/channel/index.ts";
 export { createThreadList as createThreadListView } from "../view/channel/index.ts";
+export { createTranscriptsView } from "../view/transcript/index.ts";
 export { createWebPorts } from "../platform/web/index.ts";
 export { createOfflineCache, createThreadStrip } from "../view/channel/index.ts";
 export { createScrollTrace, createScrollTraceControls } from "../view/channel/index.ts";

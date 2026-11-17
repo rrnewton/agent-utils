@@ -6226,6 +6226,7 @@ async fn post_each(
                         // It roots that thread now, whether or not the provider's answer for a
                         // message that had no replies yet said so; the page draws it as one.
                         one.thread = Some(crate::threads::MessageThread {
+                            class: None,
                             hue: None,
                             display_name: None,
                             summary: None,
@@ -8574,6 +8575,7 @@ mod tests {
 
     fn summary(id: &str, updated_at: &str, replies: u64) -> crate::threads::ThreadSummary {
         crate::threads::ThreadSummary {
+            class: None,
             id: id.to_owned(),
             root: None,
             title: id.to_owned(),

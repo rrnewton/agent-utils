@@ -710,6 +710,7 @@ mod tests {
             content_html: String::new(),
             noise: false,
             thread: thread.map(|id| MessageThread {
+                class: None,
                 hue: None,
                 display_name: None,
                 summary: None,

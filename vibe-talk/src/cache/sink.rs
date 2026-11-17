@@ -2582,6 +2582,7 @@ impl Sink {
                     .as_ref()
                     .and_then(|thread| thread.reply_count);
                 crate::threads::ThreadSummary {
+                    class: None,
                     id: record.thread_id,
                     title: crate::threads::root_title(&message),
                     reply_count: record.reply_count.or(counted),

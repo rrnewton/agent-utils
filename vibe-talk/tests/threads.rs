@@ -32,6 +32,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
         content_html: String::new(),
         noise: false,
         thread: thread.then(|| MessageThread {
+            class: None,
             hue: None,
             display_name: None,
             summary: None,
@@ -149,6 +150,7 @@ impl ChatClient for ThreadBackend {
         let mut root = message("10", "root", true);
         root.reactions = self.root_reactions.lock().unwrap().clone();
         let summary = ThreadSummary {
+            class: None,
             hue: None,
             id: THREAD.to_owned(),
             root: Some(root.clone()),
@@ -1119,6 +1121,7 @@ async fn a_channel_scoped_to_one_conversation_has_no_replies_outside_main_to_spe
     let (app, backend) = journal(false);
     backend.seed("2", 0);
     *backend.scope.lock().unwrap() = Some(ThreadSummary {
+        class: None,
         hue: None,
         id: THREAD.to_owned(),
         root: None,

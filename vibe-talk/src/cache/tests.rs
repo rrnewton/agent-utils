@@ -1026,6 +1026,7 @@ fn a_deleted_root_with_replies_leaves_its_replies_in_their_thread() {
     let fx = Fixture::new("cache-root");
     let mut root = m(1);
     root.thread = Some(MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,
@@ -1340,6 +1341,7 @@ fn thread_records_need_replies_and_their_activity_only_moves_forward() {
     let fx = Fixture::new("cache-threads");
     let mut unanswered = m(1);
     unanswered.thread = Some(MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,
@@ -1586,6 +1588,7 @@ fn a_bounded_flat_page_never_deletes_a_reply_or_stamps_a_thread() {
         .map(|i| {
             let mut root = m(i * 10);
             root.thread = Some(MessageThread {
+                class: None,
                 hue: None,
                 display_name: None,
                 summary: None,
@@ -2251,6 +2254,7 @@ fn a_channel_erase_cascades_everywhere_and_the_index_stays_intact() {
     let other = ChanKey::new("p", "C2");
     let mut root = m(1);
     root.thread = Some(MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,
@@ -2419,6 +2423,7 @@ fn with_a_thread(tag: &str) -> (Fixture, ChanKey, Scope) {
     let other = ChanKey::new("p", "C2");
     let mut root = m(1);
     root.thread = Some(MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,

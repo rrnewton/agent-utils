@@ -126,6 +126,7 @@ impl ChatClient for Threaded {
         let root = messages.first().cloned();
         Ok(TimelinePage {
             threads: vec![ThreadSummary {
+                class: None,
                 hue: None,
                 id: "t1".to_owned(),
                 root,

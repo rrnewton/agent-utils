@@ -70,6 +70,8 @@ export function mountListControls(deps: ListControlsDependencies): ListControls 
   listen(el("search-bucket-thread"), "click", () => deps.toggleBucket("thread"));
   listen(el("search-bucket-main"), "click", () => deps.toggleBucket("main"));
   listen(el("search-bucket-threads"), "click", () => deps.toggleBucket("threads"));
+  // `#1608`: the Agent Transcripts bucket chip, plugged into the same row.
+  listen(el("search-bucket-transcripts"), "click", () => deps.toggleBucket("transcripts"));
   listen(el("server-more"), "click", () => deps.serverMore());
   listen(el("search-all-channels"), "change", () => deps.searchAllChannels((el("search-all-channels") as HTMLInputElement).checked));
   listen(el("search-further"), "click", () => deps.searchFurther());

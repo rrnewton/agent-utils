@@ -443,6 +443,7 @@ fn a_new_reply_counts_on_its_held_root() {
     let fx = Fixture::new("c8-root-count");
     let mut root = message("1700000000.000100", "ada", "question", T0);
     root.thread = Some(crate::threads::MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,

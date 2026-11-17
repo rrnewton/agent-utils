@@ -37,6 +37,7 @@ fn mid(ts: &str) -> MessageId {
 
 fn slack_thread(root_ts: &str, is_root: bool) -> MessageThread {
     MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,
@@ -188,6 +189,7 @@ fn a_discord_clients_links_come_from_its_configured_guild() {
     // native thread read serves the reply under its parent channel's id, and a link naming
     // the parent finds no such message there.
     let thread = MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,
@@ -206,6 +208,7 @@ fn a_discord_clients_links_come_from_its_configured_guild() {
     );
     // Its root, a message of the parent channel itself, links by the parent.
     let root = MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,
@@ -234,6 +237,7 @@ fn a_google_chat_bridges_links_come_from_its_resource_names() {
     let client = HttpDiscordClient::new(&discord_config(None)).expect("client");
     let chan = ChannelId("spaces/AAAa1".to_owned());
     let thread = MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,

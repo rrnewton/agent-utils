@@ -1113,6 +1113,13 @@ impl ThreadNames {
         let read_at = Instant::now();
         let mut answered = HashSet::new();
         for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+            // Transcripts are never named (`#1608`, design section 3): no
+            // model call, no stored name, no `slug: description` fallback.
+            if summary.class.is_some() {
+                summary.display_name = None;
+                summary.summary = None;
+                continue;
+            }
             answered.insert(summary.id.clone());
             match self.lookup(deps, channel, &summary.id).await {
                 Lookup::Known(record) => {
@@ -1192,6 +1199,10 @@ impl ThreadNames {
             let Some(thread) = message.thread.as_ref().filter(|thread| thread.is_root) else {
                 continue;
             };
+            // Transcripts are never named (`#1608`, design section 3).
+            if thread.class.is_some() {
+                continue;
+            }
             let long_root = root_overflows_card(Some(message), max_lines);
             if !thread_summary_shown(thread.reply_count, thread.reply_count_exact, long_root) {
                 continue;
@@ -2260,6 +2271,7 @@ mod tests {
     #[test]
     fn a_thread_is_due_when_unnamed_and_then_on_the_schedule() {
         let thread = |replies: Option<u64>| ThreadSummary {
+            class: None,
             hue: None,
             id: "t".to_owned(),
             root: None,
@@ -2333,6 +2345,7 @@ mod tests {
             sentence_below_cap: false,
         };
         let active_at = |seconds: i64| ThreadSummary {
+            class: None,
             hue: None,
             id: "t".to_owned(),
             root: None,
@@ -2356,6 +2369,7 @@ mod tests {
             "quiet since it was written: left to age"
         );
         let unparseable = ThreadSummary {
+            class: None,
             hue: None,
             updated_at: "yesterday".to_owned(),
             ..active_at(0)

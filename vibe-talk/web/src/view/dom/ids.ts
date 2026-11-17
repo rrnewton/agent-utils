@@ -526,6 +526,7 @@ export interface ElementById {
   "search-bucket-row": HTMLDivElement;
   "search-bucket-thread": HTMLButtonElement;
   "search-bucket-threads": HTMLButtonElement;
+  "search-bucket-transcripts": HTMLButtonElement;
   "search-count": HTMLSpanElement;
   "search-empty": HTMLParagraphElement;
   "search-field": HTMLInputElement;
@@ -669,6 +670,14 @@ export interface ElementById {
   "topbar-row": HTMLDivElement;
   "topbar-title": HTMLSpanElement;
   "transcript": HTMLOListElement;
+  "transcripts-back": HTMLButtonElement;
+  "transcripts-day": HTMLDivElement;
+  "transcripts-list": HTMLOListElement;
+  "transcripts-log": HTMLOListElement;
+  "transcripts-note": HTMLParagraphElement;
+  "transcripts-search": HTMLInputElement;
+  "transcripts-title": HTMLHeadingElement;
+  "transcripts-view": HTMLElement;
   "undo-bookmark": HTMLButtonElement;
   "undo-dismiss": HTMLButtonElement;
   "undo-dismiss-label": HTMLSpanElement;

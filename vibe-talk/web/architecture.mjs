@@ -49,6 +49,7 @@ export const PACKAGES = Object.freeze({
   "core/navigation": BASE,
   "core/outbox": BASE,
   "core/search": BASE,
+  "core/transcripts": BASE,
   "core/settings": BASE,
   "core/speech": BASE,
   "core/sync": BASE,
@@ -64,6 +65,7 @@ export const PACKAGES = Object.freeze({
   "view/dom": BASE,
   "view/catchup": [...BASE, "view/dom", "view/composer"],
   "view/documents": [...BASE, "view/dom"],
+  "view/transcript": [...BASE, "view/dom", "core/transcripts"],
   "view/shell": [...BASE, "view/dom"],
   "view/settings": [...BASE, "view/dom", "core/channels", "core/navigation", "core/outbox", "core/settings", "present/notices", "present/settings"],
   // The composition root (`#624 voice-page-modularity`, step 17): it alone may name every
@@ -77,7 +79,7 @@ export const PACKAGES = Object.freeze({
     "core/outbox", "core/search", "core/settings", "core/speech", "core/sync",
     "platform/web",
     "present/call", "present/notices", "present/rows", "present/settings", "present/time",
-    "view/channel", "view/composer", "view/dom", "view/settings", "view/shell", "view/voice", "view/documents", "view/catchup",
+    "view/channel", "view/composer", "view/dom", "view/settings", "view/shell", "view/voice", "view/documents", "view/catchup", "view/transcript", "core/transcripts",
   ],
 });
 

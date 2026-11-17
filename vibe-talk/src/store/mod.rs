@@ -1412,6 +1412,20 @@ pub struct ThreadPins {
     pub revision: i64,
 }
 
+/// One classed transcript thread, for the Transcripts index
+/// (`#1608 agent-transcripts-timeline`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptThreadRow {
+    /// The channel the trace thread sits in.
+    pub channel: ChannelId,
+    /// The day-thread's id in that channel.
+    pub thread_id: String,
+    /// The class decided for it.
+    pub class: crate::transcripts::ThreadClass,
+    /// When this server decided it, Unix milliseconds.
+    pub decided_ms: i64,
+}
+
 /// What one thread pin or unpin did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadPinChange {
@@ -2585,6 +2599,29 @@ pub trait StateStore: Send + Sync {
 
     /// The revision this channel's thread pins are at.
     async fn thread_pins_revision(&self, channel: &ChannelId) -> Result<i64, StoreError>;
+
+    /// One thread's transcript class, when this server has classed it.
+    /// `#1608 agent-transcripts-timeline`; the durable record lives in the
+    /// store, not the disposable message cache (design section 2.2).
+    async fn thread_class(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+    ) -> Result<Option<crate::transcripts::ThreadClass>, StoreError>;
+
+    /// Record one thread's transcript class. Sticky: an existing class is
+    /// never removed, and only an `Owner`-source class replaces another.
+    async fn set_thread_class(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        class: &crate::transcripts::ThreadClass,
+    ) -> Result<(), StoreError>;
+
+    /// Every classed transcript thread, for the Transcripts index.
+    async fn transcript_threads(
+        &self,
+    ) -> Result<Vec<TranscriptThreadRow>, StoreError>;
 
     /// Set one thread's explicit pin state. Idempotent.
     async fn set_thread_pin(

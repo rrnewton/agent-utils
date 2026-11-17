@@ -105,6 +105,8 @@ struct State {
     next_pin_seq: u64,
     /// Channel to its pin revision; absent is `0`, as a missing row is in the real store.
     pin_revisions: BTreeMap<String, i64>,
+    /// `(channel, thread)` to its transcript class. `#1608 agent-transcripts-timeline`.
+    thread_classes: BTreeMap<(String, String), crate::transcripts::ThreadClass>,
     /// `(channel, thread)` to its explicit thread-pin state. `#1550 thread-list-pins`.
     thread_pins: BTreeMap<(String, String), bool>,
     /// Channel to its thread-pin revision.
@@ -1337,6 +1339,62 @@ impl StateStore for FakeStore {
             unpinned: Vec::new(),
             revision,
         })
+    }
+
+    async fn thread_class(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+    ) -> Result<Option<crate::transcripts::ThreadClass>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .thread_classes
+            .get(&(channel.as_str().to_owned(), thread_id.to_owned()))
+            .cloned())
+    }
+
+    async fn set_thread_class(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        class: &crate::transcripts::ThreadClass,
+    ) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let key = (channel.as_str().to_owned(), thread_id.to_owned());
+        let replace = match state.thread_classes.get(&key) {
+            None => true,
+            Some(_) => class.source == crate::transcripts::ClassSource::Owner,
+        };
+        if replace {
+            state.thread_classes.insert(key, class.clone());
+        }
+        Ok(())
+    }
+
+    async fn transcript_threads(
+        &self,
+    ) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let mut rows: Vec<super::TranscriptThreadRow> = state
+            .thread_classes
+            .iter()
+            .map(|((channel, thread_id), class)| super::TranscriptThreadRow {
+                channel: ChannelId(channel.clone()),
+                thread_id: thread_id.clone(),
+                class: class.clone(),
+                decided_ms: 0,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.class
+                .day
+                .cmp(&a.class.day)
+                .then_with(|| a.class.agent.cmp(&b.class.agent))
+        });
+        Ok(rows)
     }
 
     async fn thread_pins(&self, channel: &ChannelId) -> Result<ThreadPins, StoreError> {

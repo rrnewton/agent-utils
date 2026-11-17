@@ -984,6 +984,7 @@ mod tests {
             .iter()
             .map(|inside| Message {
                 thread: inside.map(|is_root| crate::threads::MessageThread {
+                    class: None,
                     hue: None,
                     display_name: None,
                     summary: None,

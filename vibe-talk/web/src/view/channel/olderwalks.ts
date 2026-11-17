@@ -94,8 +94,12 @@ export interface OlderWalksDependencies {
   threadPresenceAny(): boolean;
   providerOfChannel(id: string): { name?: unknown } | null;
   channelDirectoryName(): string;
+  /** `#1608`: whether the Transcripts screen is the one searching (its bucket defaults on). */
+  transcriptsOpen?(): boolean;
+  /** `#1608`: a transcript hit tapped — open the Transcripts view at that message. */
+  openTranscriptHit?(hit: Message): void;
   serverSearchOwner: {
-    state(): { key: string; ticket: number; loading: boolean; failed: string; hits: Message[]; scopes: SearchScope[]; examined: number; resume: number | null };
+    state(): { key: string; ticket: number; loading: boolean; failed: string; hits: Message[]; transcriptHits?: Message[]; scopes: SearchScope[]; examined: number; resume: number | null };
     allChannels(): boolean;
     schedule(key: string, open: boolean): void;
     chooseAllChannels(on: unknown): void;
@@ -907,6 +911,8 @@ let bucketsView = "";
 
 /** The screen the search is judged from, as the defaults table names it. */
 function bucketView(): string {
+  // `#1608`: searching from the Transcripts screen defaults its bucket on.
+  if (deps.transcriptsOpen && deps.transcriptsOpen()) return "transcripts";
   return selection().view;
 }
 
@@ -976,6 +982,34 @@ function clearServerHits(): void {
   for (const node of [...list.children]) if (node.hasAttribute(SERVER_HIT_MARK)) list.removeChild(node);
   if (el("server-hits").children.length > 0) el("server-hits").replaceChildren();
 }
+
+/** The Agent Transcripts bucket's fresh hits, oldest first (`#1608`). */
+function transcriptBucketHits(): Message[] {
+  const held = heldMessagesById();
+  return [...(serverSearchNow().transcriptHits || [])]
+    .filter((hit) => !held.has(String(hit.id)))
+    .sort(byHitTime);
+}
+
+// The transcripts bucket plugs into the #1797 row (agreed interface with
+// mu-searchscope): off by default everywhere except the Transcripts
+// screen; tapping a hit opens that day in the Transcripts view.
+searchBuckets.register({
+  id: "transcripts",
+  words: "in Agent Transcripts",
+  defaultOn: (view) => view === "transcripts",
+  source: {
+    count: () => transcriptBucketHits().length,
+    hits: () => transcriptBucketHits().map((hit) => {
+      const node = serverHitNode(hit);
+      node.addEventListener("click", () => {
+        if (deps.openTranscriptHit) deps.openTranscriptHit(hit);
+      });
+      return { at: Date.parse(hit.timestamp) || 0, node };
+    }),
+    clear: () => {},
+  },
+});
 
 /**
  * Place the enabled buckets' hits in the timeline, chronologically among the
