@@ -87,6 +87,7 @@ export interface OpeningView {
   returnToSavedPlace(): void;
   reopenSavedView(): void;
   payReopenRead(): void;
+  oweChannelRead(): void;
 }
 
 /** Which view a channel opens in, over `deps`. */
@@ -394,6 +395,15 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
       returnToSavedPlace();
       holdChannelPlace();
       deps.reopenReadOwed().owe(deps.replayStarted());
+    } else if (deps.screens().view() === "discord" && deps.selectedChannelId() &&
+        (!saved || saved.view === "discord")) {
+      // `#1781 vibe-talk-first-run-welcome-channel-default`. The Channel is the view the page
+      // opens on, so a reopen — a saved channel place, or a first sign-in with none — is
+      // already standing on it: no switch enters it, and the read a switch would have owed is
+      // owed here, or a fresh reader meets an empty channel that nothing ever reads.
+      returnToSavedPlace();
+      holdChannelPlace();
+      deps.reopenReadOwed().owe(deps.replayStarted());
     }
     saveUiState();
   }
@@ -421,8 +431,20 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
     else pay();
   }
 
+  /**
+   * Owe the channel's first read when sign-in lands on it by default (`#1781
+   * vibe-talk-first-run-welcome-channel-default`): the reopen above may already be settled
+   * (a deep link's apply, a channel choice), and no switch will enter the channel to read it.
+   * Nothing is owed once a read has gone on the wire. Paid by `payReopenRead`, as a reopen's is.
+   */
+  function oweChannelRead(): void {
+    if (deps.screens().view() !== "discord" || !deps.selectedChannelId()) return;
+    if (Number(deps.replayStarted()) > 0) return;
+    deps.reopenReadOwed().owe(deps.replayStarted());
+  }
+
   return {
-    reopenSavedView, payReopenRead,
+    reopenSavedView, payReopenRead, oweChannelRead,
     windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView,
     openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace,
   };

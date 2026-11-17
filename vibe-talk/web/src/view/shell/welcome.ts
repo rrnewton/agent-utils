@@ -28,12 +28,16 @@ export interface WelcomeDependencies {
   markDismissed(): void;
   /** Whether the page holds a saved UI record: a returning reader's own evidence. */
   hasSavedRecord(): boolean;
+  /** Whether the page was opened by an explicit link, whose destination outranks the Welcome. */
+  hasDeepLink(): boolean;
   /** Whether any channel is configured yet. */
   hasChannel(): boolean;
   /** Copy `text` for the reader; answers whether it was copied. */
   copyText(text: string): Promise<boolean>;
   /** Re-read the channel list from the server; answers whether one is configured now. */
   checkAgain(): Promise<boolean>;
+  /** Read the channel now selected, as entering it does. */
+  readChannel(): void;
 }
 
 /** The Welcome's commands. */
@@ -72,7 +76,7 @@ export function createWelcome(deps: WelcomeDependencies): Welcome {
 
   return {
     maybeShowFirstRun() {
-      if (deps.dismissed() || deps.hasSavedRecord()) return false;
+      if (deps.dismissed() || deps.hasSavedRecord() || deps.hasDeepLink()) return false;
       showWelcome();
       return true;
     },
@@ -87,6 +91,7 @@ export function createWelcome(deps: WelcomeDependencies): Welcome {
     async recheck() {
       deps.el("welcome-guide-state").textContent = "Checking…";
       if (await deps.checkAgain()) {
+        deps.readChannel();
         dismiss();
       } else {
         render();

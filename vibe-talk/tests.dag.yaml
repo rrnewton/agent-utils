@@ -1509,6 +1509,27 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1781 vibe-talk-first-run-welcome-channel-default` in the browser engine at 412x915 (scale
+  # 2.6) and 1280x800, light and dark, the keyboard emulated as a visualViewport shrink on the
+  # phone with the Discuss half-pane open: a fresh sign-in meets the Welcome once and dismisses
+  # onto the Channel, a reload and a saved Voice choice meet neither surprise, the Welcome
+  # re-opens from Settings and Help, the no-channel Welcome is the guided config setup whose
+  # Check again lands on the channel once configured, and `?v=docs` still wins.
+  - group: check
+    job: firstrun-browser
+    desc: First run in current Chromium at 412x915 and 1280x800, light and dark — Welcome once, Channel the default, saved Voice honoured, guided no-channel setup, deep link wins
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/firstrun_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 20
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#371 channel-search-hash` in the browser engine at 1280x800: one Slack service whose channels are
   # written `#name`; the bar's picker lists them without the '#', so typing `team` into the focused
   # picker through CDP chooses `#team-builds`, and the channel browser counts the seconds of a slow

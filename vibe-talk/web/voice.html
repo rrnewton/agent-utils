@@ -4124,6 +4124,28 @@
               without friction, and clear what you have handled. It opens on the Channel — that
               is home. Here is what is what.
             </p>
+            <div id="welcome-guide" hidden>
+              <h2 class="welcome-guide-title">Add your first channel</h2>
+              <p class="hint">
+                The channels in the configuration are the channels in the app. To add the
+                first one:
+              </p>
+              <ol class="welcome-steps">
+                <li>Add a channel to the server's configuration — its id, a name to call it, and <code>writable = true</code> where replies should post — or extend <code>VIBE_TALK_CHANNELS</code> instead.</li>
+                <li>Restart the server.</li>
+                <li>Run <code>vibe-talk doctor</code> and fix what it names.</li>
+                <li>Come back here and press Check again.</li>
+              </ol>
+              <pre class="welcome-snippet" id="welcome-snippet">[[channels]]
+id = "CHANNEL_ID"
+label = "My channel"
+writable = true</pre>
+              <div class="welcome-actions">
+                <button id="welcome-copy-config" class="secondary" type="button">Copy config</button>
+                <button id="welcome-check-again" class="secondary" type="button">Check again</button>
+              </div>
+              <p id="welcome-guide-state" class="hint" aria-live="polite"></p>
+            </div>
             <dl class="welcome-list">
               <div class="welcome-item">
                 <dt>Channel</dt>
@@ -4158,28 +4180,6 @@
                 <dd>The magnifying glass (or <kbd>/</kbd>) finds any message across what the app has read — a decision, a name, a link.</dd>
               </div>
             </dl>
-            <div id="welcome-guide" hidden>
-              <h2 class="welcome-guide-title">Add your first channel</h2>
-              <p class="hint">
-                The channels in the configuration are the channels in the app. To add the
-                first one:
-              </p>
-              <ol class="welcome-steps">
-                <li>Add a channel to the server's configuration — its id, a name to call it, and <code>writable = true</code> where replies should post — or extend <code>VIBE_TALK_CHANNELS</code> instead.</li>
-                <li>Restart the server.</li>
-                <li>Run <code>vibe-talk doctor</code> and fix what it names.</li>
-                <li>Come back here and press Check again.</li>
-              </ol>
-              <pre class="welcome-snippet" id="welcome-snippet">[[channels]]
-id = "CHANNEL_ID"
-label = "My channel"
-writable = true</pre>
-              <div class="welcome-actions">
-                <button id="welcome-copy-config" class="secondary" type="button">Copy config</button>
-                <button id="welcome-check-again" class="secondary" type="button">Check again</button>
-              </div>
-              <p id="welcome-guide-state" class="hint" aria-live="polite"></p>
-            </div>
             <div class="welcome-actions">
               <button id="welcome-start" class="secondary" type="button">Start reading</button>
             </div>

@@ -4210,7 +4210,7 @@ const openingViewOwner = createOpeningView({
   freshAt: () => loadState().freshAt,
   whenLiveAttached: (pay) => whenLiveAttached(pay),
 });
-const { windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView, openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace, reopenSavedView, payReopenRead } = openingViewOwner;
+const { windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView, openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace, reopenSavedView, payReopenRead, oweChannelRead } = openingViewOwner;
 
 /**
  * The read a reopen owes the channel it put on screen: one owner in web/src/core/sync/reopen.ts (`#624
@@ -7901,6 +7901,7 @@ const welcome = createWelcome({
     }
   },
   hasSavedRecord: () => uiState.saved() !== null,
+  hasDeepLink: () => deepLinks.wanted() !== null || documentsQueryValue("v") === "docs",
   hasChannel: () => channelDirectory.channels().length > 0,
   copyText: async (text) => {
     try {
@@ -7917,6 +7918,9 @@ const welcome = createWelcome({
     } catch (_error) {
       return false;
     }
+  },
+  readChannel: () => {
+    void readEnteredChannel(false);
   },
 });
 el("welcome-start").addEventListener("click", () => welcome.dismiss());
@@ -7946,7 +7950,10 @@ const { signIn, saveToken, forgetToken, setTokenState, noTokenSentence } = creat
   clearError: () => clearError(),
   reopenSavedView: () => {
     reopenSavedView();
-    // `#1781`: a genuine first run meets the Welcome once sign-in has put the main screen up.
+    // `#1781 vibe-talk-first-run-welcome-channel-default`. Sign-in lands on the Channel by
+    // default: owe its first read (the reopen may already be settled), and a genuine first
+    // run meets the Welcome once the main screen is up.
+    oweChannelRead();
     welcome.maybeShowFirstRun();
   },
   setState: (state) => setState(state),
