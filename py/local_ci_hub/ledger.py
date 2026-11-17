@@ -118,7 +118,7 @@ class Ledger:
                 merged["_digest_ok"] = (expect == ev["digest"])
             merged["_evidence_ok"] = bool(evidence_ok and rows[rid].get("_evidence_ok", True))  # once refused, always refused
             rows[rid] = merged
-        counted = set(self.cfg.counted_repos) | {self.cfg.repo}
+        counted = set(self.cfg.counted_repos)
         return [rows[r] for r in order if rows[r].get("repo") is None or rows[r].get("repo") in counted]
 
     def _resolve_ref(self, codec: dict[str, object], host: str | None = None) -> tuple[dict[str, object], bool]:
@@ -189,7 +189,7 @@ class Ledger:
         run_id = run_id or f"run-{uuid.uuid4().hex[:12]}"
         ev: dict[str, object] = {
             "schema": SCHEMA, "kind": "run.result", "event_id": uuid.uuid4().hex,
-            "run_id": run_id, "commit": commit, "result": result.upper(),
+            "run_id": run_id, "commit": commit, "result": result.lower(),
             "cell": cell, "command": command, "host": host or short_host(),
             "team": self.cfg.team, "finished_at": _now(),
         }

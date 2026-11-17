@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(res, dict):
             if res.get("state") == "refused" or res.get("outcome") == "no_result":
                 return 75
-            if res.get("result") in ("FAIL", "TIMEOUT"):
+            if res.get("result") in ("FAIL", "TIMEOUT", "fail", "timeout"):
                 return 1
             code = res.get("exit_code")
             if isinstance(code, int) and code in (0, 1, 75):

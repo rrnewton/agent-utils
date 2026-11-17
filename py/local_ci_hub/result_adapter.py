@@ -51,9 +51,9 @@ def adapt(raw: dict[str, object]) -> dict[str, object]:
         obj: object = raw.get(name)
         if isinstance(obj, dict):
             out[name] = obj
-    known = _count(raw.get("known_gaps", nested.get("known_gaps")))
-    if known is not None and known >= 0:
-        out["known_gaps"] = known
+    gaps = raw.get("known_gaps", nested.get("known_gaps"))
+    if isinstance(gaps, list) and all(isinstance(g, str) for g in gaps):
+        out["known_gaps"] = list(gaps)  # named ids only, never a bare count
     gates = raw.get("gates")
     if isinstance(gates, list):
         out["gates"] = gates

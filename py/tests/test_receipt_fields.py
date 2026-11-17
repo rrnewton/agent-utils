@@ -20,7 +20,8 @@ SHA = "a" * 40
 def _cfg(tmp_path: Path) -> Config:
     return Config(path=tmp_path / "local-ci-hub.toml", root=tmp_path,
                   ledger_dir=tmp_path / "ledger", state_dir=tmp_path / "state",
-                  require_full_evidence=True, repo="repo-a", counted_repos=[])
+                  require_full_evidence=True, repo="repo-a",
+                  counted_repos=["repo-a", "repo-b"], known_gaps=["gap-1", "gap-2"])
 
 
 def _verdict(tmp_path: Path, row: dict[str, object]) -> str:
@@ -36,9 +37,16 @@ def _verdict(tmp_path: Path, row: dict[str, object]) -> str:
 
 def _good_v6() -> dict[str, object]:
     return {"commit": SHA, "run_id": "r1", "result": "pass", "schema_version": 6,
-            "repo": "repo-a", "commit_anchored": True, "tree_dirty": False,
+            "repo": "repo-a", "producer": "local-ci-hub", "record_id": "rec-r1",
+            "tree": "b" * 40, "commit_anchored": True, "tree_dirty": False,
             "executed_tests": 10, "passed_tests": 10, "failures": 0,
             "profile": "full", "selection_mode": "full",
+            "admission": "host-limits-live",
+            "admission_floor_evidence": {"floor_kind": "current-main",
+                                         "floor_sha": SHA, "observed_main_sha": SHA},
+            "tooling_sha": "c" * 40, "log_identity": "log-r1",
+            "finished_at": "2026-11-17T00:00:00Z",
+            "cell_results": {"run_id": "r1", "commit": SHA},
             "gates_run": 1, "gates_expected": 1,
             "coverage": {"planned_test_nodes": 1, "zero_executed_nodes": [], "absent_nodes": []}}
 
@@ -61,7 +69,7 @@ def test_schema_versions_gate_and_coverage_thresholds(tmp_path: Path) -> None:
     legacy = {k: v for k, v in _good_v6().items()
               if k not in ("schema_version", "repo", "gates_run", "gates_expected", "coverage")}
     assert _verdict(tmp_path / "a", legacy) == "qualified"  # era rules, not vacuous clauses
-    v5 = dict(legacy, schema_version=5)
+    v5 = dict(legacy, schema_version=5, repo="repo-a")
     assert _verdict(tmp_path / "b", v5) != "qualified"  # schema 5 requires gates+coverage
     v5_full = dict(v5, gates_run=1, gates_expected=1,
                    coverage={"planned_test_nodes": 1, "zero_executed_nodes": [], "absent_nodes": []})
@@ -71,7 +79,7 @@ def test_schema_versions_gate_and_coverage_thresholds(tmp_path: Path) -> None:
 
 
 def test_known_gap_exception_must_be_ledgered(tmp_path: Path) -> None:
-    short = dict(_good_v6(), passed_tests=9, known_gaps=1)
+    short = dict(_good_v6(), passed_tests=9, known_gaps=["gap-1"])
     assert _verdict(tmp_path / "a", short) == "qualified"
     unledgered = dict(_good_v6(), passed_tests=9)
     assert _verdict(tmp_path / "b", unledgered) != "qualified"
@@ -81,13 +89,48 @@ def test_known_gap_exception_must_be_ledgered(tmp_path: Path) -> None:
     assert _verdict(tmp_path / "c", nested) == "qualified"  # totals read nested
 
 
+def _without(key: str) -> dict[str, object]:
+    return {k: v for k, v in _good_v6().items() if k != key}
+
+
+def test_per_clause_refusals(tmp_path: Path) -> None:
+    cases = [
+        dict(_good_v6(), producer="nobody"), dict(_good_v6(), tooling_sha="unknown"),
+        dict(_good_v6(), admission="made-up-kind"), _without("record_id"),
+        _without("log_identity"), _without("tree"), dict(_good_v6(), tree_dirty=True),
+        _without("passed_tests"), dict(_good_v6(), executed_tests=0.5),
+        dict(_good_v6(), finished_at="zzz"), dict(_good_v6(), selection_mode="only"),
+        dict(_good_v6(), cell_results={"run_id": "zzz", "commit": SHA}),
+        dict(_good_v6(), admission_floor_evidence={"floor_kind": "current-main",
+                                                   "floor_sha": "b" * 40, "observed_main_sha": SHA}),
+        dict(_good_v6(), schema_version="6"), dict(_good_v6(), schema_version=6.0),
+        dict(_good_v6(), schema_version=99), dict(_good_v6(), passed_tests=20),
+        dict(_good_v6(), passed_tests=8, known_gaps=["junk"]), dict(_good_v6(), result=" Pass "),
+    ]
+    for index, row in enumerate(cases):
+        assert _verdict(tmp_path / f"c{index}", row) != "qualified", row
+
+
+def test_schema4_era_and_gap_names(tmp_path: Path) -> None:
+    v4 = {k: v for k, v in _good_v6().items()
+          if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
+                       "admission", "admission_floor_evidence", "tooling_sha",
+                       "producer", "record_id", "log_identity", "cell_results")}
+    v4["schema_version"] = 4
+    assert _verdict(tmp_path / "a", v4) == "qualified"  # era rules only
+    gap = dict(_good_v6(), passed_tests=8, known_gaps=["gap-1", "gap-2"])
+    assert _verdict(tmp_path / "b", gap) == "qualified"  # named, ledgered gaps
+    skip = dict(_good_v6(), gates_run=1, gates_expected=2, intentional_skipped_nodes=["n"])
+    assert _verdict(tmp_path / "c", skip) == "qualified"  # legitimate intentional skip
+
+
 def test_adapter_maps_and_drops(tmp_path: Path) -> None:
     out = result_adapter.adapt({
         "test_results": {"totals": {"executed_tests": 7, "passed_tests": 7,
                                     "filtered_tests": 1, "failures": 0}},
         "profile": "full", "gates_run": [1, 2], "coverage": {"planned_test_nodes": 2},
         "executed_tests": -3, "release_builder": 42})
-    assert out["executed_tests"] == 7 and out["filtered_tests"] == 1
+    assert out["executed_tests"] == 7 and out["filtered_tests"] == 1 and "known_gaps" not in out
     assert out["gates_run"] == 2 and "release_builder" not in out
     assert result_adapter.from_result_file(tmp_path / "absent.json") == {}
 
@@ -103,7 +146,7 @@ def test_runner_record_shape(tmp_path: Path) -> None:
     state_root = repo / "host-state"
     (repo / "local-ci-hub.toml").write_text(
         '[project]\nname="toy"\nrepo="repo-a"\n[validate]\ncommand=["/bin/true"]\n'
-        'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\nlocation={path="ci-ledger"}\n'
+        'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\ncounted_repos=["repo-a"]\nlocation={path="ci-ledger"}\n'
         '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=false\n[land]\nstate_dir="ignored/local-ci-hub"\n')
     (repo / "host-limits.toml").write_text(
         'version = 1\n[admission]\nmax_concurrent_validation_runs = 4\n'
@@ -129,6 +172,6 @@ def test_runner_record_shape(tmp_path: Path) -> None:
                            cwd=repo, capture_output=True, text=True, timeout=60, env=env)
     row = json.loads(query.stdout)[0]
     assert row["schema_version"] == 6 and row["repo"] == "repo-a"
-    assert row["result"] == "PASS" and row["producer"] == "local-ci-hub"
+    assert row["result"] == "PASS" and row["producer"] == "local-ci-hub"  # fold spelling; writer is lowercase
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", str(row["finished_at"]))
     assert row["admission"] == "host-limits-live" and row["tooling_sha"]

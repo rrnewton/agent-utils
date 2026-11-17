@@ -48,8 +48,12 @@ class Config:
     digest_command: list[str] | None = None
     repos: list[dict[str, object]] = field(default_factory=list)
     counted_repos: list[str] = field(default_factory=list)
-    repo: str = "example"
+    repo: str | None = None
+    repo_aliases: list[str] = field(default_factory=list)
     producer: str = "local-ci-hub"
+    producers: list[str] = field(default_factory=lambda: ["local-ci-hub"])
+    admission_kinds: list[str] = field(default_factory=lambda: ["host-limits-live"])
+    known_gaps: list[str] = field(default_factory=list)
 
     @property
     def ledger_file(self) -> Path:
@@ -115,8 +119,12 @@ def load(path: Path | None, root: Path | None = None) -> Config:
         release_payload=dict(rec["release_payload"]) if rec.get("release_payload") else None,
         digest_command=list(rec["digest_command"]) if rec.get("digest_command") else None,
         counted_repos=[str(v) for v in led.get("counted_repos", [])],
-        repo=str(proj.get("repo", proj.get("name", "example"))),
+        repo=str(proj["repo"]) if proj.get("repo") else (str(led["repo"]) if led.get("repo") else None),
+        repo_aliases=[str(v) for v in led.get("repo_aliases", [])],
         producer=str(led.get("producer", "local-ci-hub")),
+        producers=[str(v) for v in led.get("producers", ["local-ci-hub"])],
+        admission_kinds=[str(v) for v in data.get("receipt", {}).get("admission_kinds", ["host-limits-live"])] if isinstance(data.get("receipt", {}).get("admission_kinds"), list) else ["host-limits-live"],
+        known_gaps=[str(v) for v in rec.get("known_gaps", [])],
     )
     unknown = set(cfg.qualifying) - {"local-ledger-pass", "remote-pass"}
     if unknown:

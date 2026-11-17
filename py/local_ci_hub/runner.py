@@ -55,16 +55,22 @@ def _record_fields(cfg: Config, *, commit: str, run_id: str,
     base_tree = _git(cfg.root, "rev-parse", f"{base_sha}^{{tree}}") or tree
     tool_root = Path(__file__).resolve().parents[2]
     tooling = _git(tool_root, "rev-parse", "HEAD") or "unknown"
-    dirty = bool(_git(cfg.root, "status", "--porcelain"))
+    if _git(tool_root, "status", "--porcelain", "--untracked-files=no"):
+        tooling = "unknown"  # a dirty tool tree names no exact tooling
+    dirty = bool(_git(cfg.root, "status", "--porcelain", "--untracked-files=no"))
     adapted = result_adapter.from_result_file(cfg.state_dir / f"{run_id}.result.json")
     fields: dict[str, object] = {
         "schema_version": 6, "producer": cfg.producer, "repo": cfg.repo,
         "record_id": f"rec-{run_id}", "tree": tree, "base_sha": base_sha,
         "base_tree": base_tree, "commit_anchored": False, "tree_dirty": dirty,
         "admission": "host-limits-live",
-        "admission_floor_evidence": {
-            "floor_kind": "current-main", "floor_sha": commit,
-            "observed_main_sha": _commit(cfg.root), "floor_tree": tree},
+        # No floor is proved here: a current-main floor must be
+        # observed under the admission lock, which this runner
+        # does not yet do, so it writes an explicit none kind
+        # that the predicate refuses.
+        "admission_floor_evidence": {"floor_kind": "none"},
+        "log_identity": str(cfg.state_dir / f"{run_id}.log"),
+        "cell_results": {"run_id": run_id, "commit": commit},
         "tooling_sha": tooling, "cwd": str(cfg.root),
         "host": socket.gethostname().split(".")[0],
         "started_at": started_at,
@@ -73,6 +79,11 @@ def _record_fields(cfg: Config, *, commit: str, run_id: str,
                               "inputs": inputs.as_dict() if hasattr(inputs, "as_dict") else {}},
     }
     fields.update(adapted)
+    cells = fields.get("cell_results")
+    if isinstance(cells, dict):
+        merged = {"run_id": run_id, "commit": commit}
+        merged.update(cells)
+        fields["cell_results"] = merged
     return fields
 
 
@@ -223,7 +234,7 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "",
     handle: dict[str, object] = {
         "schema": "local-ci-hub/run/v1", "run_id": run_id, "commit": commit, "cell": cell,
         "state": "running", "command": cfg.validate_command, "log": str(log),
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "admitted_at_epoch": admitted_epoch, "first_steady_sample": False,
         "pid": None, "host_limits_path": str(eff.path), "bound_by": bound_by,
         "decision": decision.as_dict(), "inputs": inputs.as_dict(),
@@ -237,8 +248,11 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "",
     hp.write_text(json.dumps(handle, indent=1))
     lock_fd = os.open(handles / f"{run_id}.lock", os.O_RDWR | os.O_CREAT)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    run_env = dict(os.environ)
+    run_env["LOCAL_CI_HUB_RUN_ID"] = run_id
+    run_env["LOCAL_CI_HUB_RESULT_FILE"] = str(cfg.state_dir / f"{run_id}.result.json")
     with log.open("wb") as lf:
-        proc = subprocess.Popen(cfg.validate_command, cwd=cfg.root, stdout=lf, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cfg.validate_command, cwd=cfg.root, stdout=lf, stderr=subprocess.STDOUT, env=run_env)
     handle["pid"] = proc.pid
     hp.write_text(json.dumps(handle, indent=1))
     if not wait:
@@ -262,8 +276,7 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "",
     outcome, exit_code = host_limits.classify_outcome(
         validator_exit=rc, breach=breach, wall_breached=wall_breached,
         cpu_breached=cpu_breached, cpu_bound_by=cpu_bound_by)
-    ledger_result = {"pass": "PASS", "fail": "FAIL", "timeout": "TIMEOUT",
-                     "no_result": "NO_RESULT"}[outcome]
+    ledger_result = outcome  # canonical lowercase writer spelling
     Ledger(cfg).append_result(commit=commit, result=ledger_result, run_id=run_id, cell=cell,
                               command=" ".join(cfg.validate_command),
                               extra=_record_fields(cfg, commit=commit, run_id=run_id,
