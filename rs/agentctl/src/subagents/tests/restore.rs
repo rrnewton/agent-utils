@@ -4028,3 +4028,239 @@ fn watch_writes_health_when_coordinator_lifecycle_is_locked() {
     assert!(fixture.root.join("watch/health.json").is_file());
     assert!(fixture.client.runs.lock().unwrap().is_empty());
 }
+
+fn disk_config(fixture: &Fixture) -> RestoreConfig {
+    let mut cfg = config(fixture, Some("coordinator"));
+    cfg.units.clear();
+    cfg.duties.queue_drain = false;
+    cfg.duties.restore_check = false;
+    cfg.disks = vec![crate::restore::DiskWatch {
+        path: PathBuf::from("/workspace"),
+        warn_below_bytes: 130_000_000_000,
+        alert_below_bytes: 110_000_000_000,
+        usage_command: vec!["/host/read-only-slot-sizes".to_owned()],
+    }];
+    cfg
+}
+
+#[test]
+fn watch_disk_thresholds_are_strict_and_failures_are_visible() {
+    let fixture = Fixture::new();
+    let cfg = disk_config(&fixture);
+    let host = ScriptedHost::new();
+    for (free, severity, ok) in [
+        (130_000_000_000u64, "healthy", true),
+        (129_999_999_999, "warning", true),
+        (110_000_000_000, "warning", true),
+        (109_999_999_999, "critical", false),
+    ] {
+        host.answer("/bin/df", 0, &format!("Avail\n{free}\n"), "");
+        let findings = watch_pass(&fixture, &host, &cfg);
+        let disk = findings.iter().find(|row| row["check"] == "disk").unwrap();
+        assert_eq!(disk["severity"], severity, "{disk}");
+        assert_eq!(disk["available_bytes"], free);
+        assert_eq!(disk["ok"], ok);
+        assert!(disk["repair"].is_null());
+    }
+    host.answer("/bin/df", 1, "", "cannot stat filesystem");
+    let findings = watch_pass(&fixture, &host, &cfg);
+    let disk = findings.iter().find(|row| row["check"] == "disk").unwrap();
+    assert_eq!(disk["ok"], false);
+    assert!(disk["detail"]
+        .as_str()
+        .unwrap()
+        .contains("cannot stat filesystem"));
+    assert!(host
+        .commands()
+        .iter()
+        .all(|cmd| !cmd.contains("read-only-slot-sizes")));
+    assert!(!changed_anything(&host));
+}
+
+#[test]
+fn watch_disk_alert_is_queue_only_and_hourly_even_across_watch_restarts() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "coordinator",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let cfg = disk_config(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let options = WatchOptions {
+        interval: Duration::from_secs(60),
+        once: true,
+        check_only: false,
+        wrkslots: None,
+        state_dir: Some(fixture.root.join("disk-watch")),
+        queue_stale: Duration::from_secs(600),
+        queue_max_items: Some(3),
+    };
+    // The coordinator need not be idle or even reachable for its durable alert to be queued.
+    fixture.client.fail_panes.store(true, Ordering::Relaxed);
+    for elapsed in [0, 60, 3540] {
+        host.sleep(Duration::from_secs(elapsed));
+        host.answer("/bin/df", 0, "Avail\n67000000000\n", "");
+        if elapsed != 60 {
+            host.answer(
+                "/host/read-only-slot-sizes",
+                0,
+                "largest: /slots/b/target 90 GiB\n/slots/a/target 30 GiB\n",
+                "",
+            );
+        }
+        let health =
+            crate::restore::watch(&fixture.client, &registry, &host, &cfg, &options).unwrap();
+        if elapsed != 60 {
+            assert_eq!(health["notice"]["queued"], true, "{health}");
+        }
+        assert_eq!(
+            fixture
+                .manager()
+                .pending_prompts("coordinator")
+                .unwrap()
+                .len(),
+            if elapsed == 3540 { 2 } else { 1 }
+        );
+    }
+    assert!(
+        fixture.client.runs.lock().unwrap().is_empty(),
+        "no pane input"
+    );
+    assert_eq!(
+        host.commands()
+            .iter()
+            .filter(|cmd| cmd.contains("read-only-slot-sizes"))
+            .count(),
+        2
+    );
+    let queue = fixture.manager().queue("coordinator").unwrap();
+    let bodies = fs::read_dir(queue.join("inbox"))
+        .unwrap()
+        .map(|row| fs::read_to_string(row.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body.contains("/slots/b/target 90 GiB")),
+        "{bodies:?}"
+    );
+}
+
+#[test]
+fn watch_disk_config_is_loaded_and_validated_from_watch_json() {
+    let fixture = Fixture::new();
+    let registry = fixture.root.join("registry");
+    config(&fixture, None);
+    let path = registry.join("watch.json");
+    let mut document = json!({"schema":"agentctl-watch/v1", "disks":[{
+        "path":"/workspace", "warn_below_bytes":130, "alert_below_bytes":110,
+        "usage_command":["/host/slot-sizes"]
+    }]});
+    fs::write(&path, document.to_string()).unwrap();
+    assert_eq!(
+        RestoreConfig::load_for_watch(&registry)
+            .unwrap()
+            .disks
+            .len(),
+        1
+    );
+    assert!(RestoreConfig::load(&registry).unwrap().disks.is_empty());
+    for (key, value) in [
+        ("path", json!("relative")),
+        ("warn_below_bytes", json!(110)),
+        ("alert_below_bytes", json!(0)),
+        ("usage_command", json!(["relative-program"])),
+    ] {
+        let old = document["disks"][0][key].clone();
+        document["disks"][0][key] = value;
+        fs::write(&path, document.to_string()).unwrap();
+        assert!(
+            RestoreConfig::load_for_watch(&registry).is_err(),
+            "{document}"
+        );
+        document["disks"][0][key] = old;
+    }
+}
+
+#[test]
+fn watch_disk_check_only_never_queues_or_runs_usage() {
+    let fixture = Fixture::new();
+    let cfg = disk_config(&fixture);
+    let host = ScriptedHost::new();
+    host.answer("/bin/df", 0, "Avail\n67000000000\n", "");
+    let options = WatchOptions {
+        once: true,
+        check_only: true,
+        state_dir: Some(fixture.root.join("disk-watch")),
+        ..repair_watch_options()
+    };
+    let health = crate::restore::watch(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        &host,
+        &cfg,
+        &options,
+    )
+    .unwrap();
+    assert_eq!(health["notice"]["sent"], false);
+    assert!(health["alerted"].as_object().unwrap().is_empty());
+    assert!(host
+        .commands()
+        .iter()
+        .all(|cmd| !cmd.contains("read-only-slot-sizes")));
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+}
+
+#[test]
+fn watch_disk_failed_diagnostic_still_alerts_and_locked_queue_retries() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    manager
+        .start(
+            "coordinator",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let cfg = disk_config(&fixture);
+    let host = ScriptedHost::new();
+    let options = WatchOptions {
+        once: true,
+        state_dir: Some(fixture.root.join("disk-watch")),
+        ..repair_watch_options()
+    };
+    let registry = fixture.root.join("registry");
+    let held = manager.lock("coordinator").unwrap();
+    host.answer("/bin/df", 0, "Avail\n67000000000\n", "");
+    host.answer("/host/read-only-slot-sizes", 1, "", "timed out");
+    let started = std::time::Instant::now();
+    let health = crate::restore::watch(&fixture.client, &registry, &host, &cfg, &options).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(health["notice"]["queued"], false, "{health}");
+    assert!(health["alerted"].as_object().unwrap().is_empty());
+    drop(held);
+    host.sleep(Duration::from_secs(60));
+    host.answer("/bin/df", 0, "Avail\n67000000000\n", "");
+    host.answer("/host/read-only-slot-sizes", 1, "", "timed out");
+    let health = crate::restore::watch(&fixture.client, &registry, &host, &cfg, &options).unwrap();
+    assert_eq!(health["notice"]["queued"], true, "{health}");
+    let queue = manager.queue("coordinator").unwrap();
+    let message = fs::read_to_string(queue.join("inbox").join(format!(
+        "{}.json",
+        health["notice"]["message_id"].as_str().unwrap()
+    )))
+    .unwrap();
+    assert!(message.contains("usage diagnostic unavailable") && message.contains("timed out"));
+    assert!(fixture.client.runs.lock().unwrap().is_empty());
+}

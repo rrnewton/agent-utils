@@ -1431,8 +1431,34 @@ pass listing unrepaired findings it has not reported in the last hour.
 `--once` runs a single pass and exits 0 when every check passed, 1 otherwise;
 `--check-only` repairs, remounts, and sends nothing.
 
+Optional disk pressure checks never delete files or start cleanup. For example,
+add this to `watch.json` (thresholds are bytes; GB here means 1,000,000,000 bytes):
+
+```json
+"disks": [{
+  "path": "/srv/workspace",
+  "warn_below_bytes": 130000000000,
+  "alert_below_bytes": 110000000000,
+  "usage_command": ["/srv/tools/read-only-slot-sizes", "--top", "5"]
+}]
+```
+
+Available space below the warning threshold appears in `health.json` and the
+journal. Below the alert threshold, or when space cannot be measured, the watch
+queues a coordinator notice without typing into its pane. A durable queued notice
+starts a one-hour cooldown per filesystem path, persisted across watch restarts;
+failed queue attempts remain visible and retry. This works even when the terminal
+server is down. `duties.notify=false` and `--check-only` suppress notices.
+
+The optional `usage_command` is an operator-configured **read-only** diagnostic
+argv (absolute program, no shell evaluation). Use the host's existing slot manager
+to list its largest target directories. It runs only when an alert is due, with a
+30-second deadline; up to 4096 output characters are attached. Diagnostic failures
+are included in the alert rather than hiding low space. The free-space probe uses
+GNU `df`, with a five-second deadline. No disks are monitored unless configured.
+
 Watch settings read on every pass live in `REGISTRY/watch.json` (schema
-`agentctl-watch/v1`): `duties`, `herdr_unit`, `timers`,
+`agentctl-watch/v1`): `duties`, `herdr_unit`, `timers`, `disks`,
 `bare_shell_grace_seconds` (default 600), and `close_bare_shells` (default
 true). The same keys in `restore.json` still work as a fallback with a
 warning naming `watch.json`; a key set in both files is refused naming both

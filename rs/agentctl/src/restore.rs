@@ -49,8 +49,9 @@ pub const WATCH_CONFIG_FILE: &str = "watch.json";
 /// Schema of the watch configuration.
 pub const WATCH_CONFIG_SCHEMA: &str = "agentctl-watch/v1";
 /// Keys whose home is `watch.json`; still read from `restore.json` as fallback.
-pub const WATCH_KEYS: [&str; 5] = [
+pub const WATCH_KEYS: [&str; 6] = [
     "duties",
+    "disks",
     "herdr_unit",
     "timers",
     "bare_shell_grace_seconds",
@@ -189,10 +190,15 @@ struct WatchFile {
     #[serde(default)]
     timers: Option<Vec<TimerWatch>>,
     #[serde(default)]
+    disks: Option<Vec<DiskWatch>>,
+    #[serde(default)]
     bare_shell_grace_seconds: Option<u64>,
     #[serde(default)]
     close_bare_shells: Option<bool>,
 }
+
+mod disk;
+pub use disk::DiskWatch;
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -355,6 +361,9 @@ pub struct RestoreConfig {
     /// Timers the watch keeps firing.
     #[serde(default)]
     pub timers: Vec<TimerWatch>,
+    /// Read-only filesystem space checks, configured in watch.json. Empty disables them.
+    #[serde(default)]
+    pub disks: Vec<DiskWatch>,
     /// Scheduled commands `install-units --scheduled` renders as persistent
     /// timer/service user unit pairs (#743).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -487,6 +496,9 @@ impl RestoreConfig {
                 config.close_bare_shells = v;
             }
         }
+        if let Some(disks) = watch.disks {
+            config.disks = disks;
+        }
         config.validate(&watch_path)?;
         Ok(config)
     }
@@ -566,6 +578,7 @@ impl RestoreConfig {
             report_dir: None,
             herdr_unit: None,
             timers: Vec::new(),
+            disks: Vec::new(),
             scheduled: Vec::new(),
             bare_shell_grace_seconds: default_bare_shell_grace(),
             close_bare_shells: default_true(),
@@ -625,6 +638,13 @@ impl RestoreConfig {
             return Err(invalid(
                 "timers need a .timer unit and a positive max_age_seconds",
             ));
+        }
+        let mut disk_paths = std::collections::BTreeSet::new();
+        for disk in &self.disks {
+            disk.validate().map_err(|reason| invalid(&reason))?;
+            if !disk_paths.insert(&disk.path) {
+                return Err(invalid("disks paths must be unique"));
+            }
         }
         let mut scheduled_names = std::collections::BTreeSet::new();
         for entry in &self.scheduled {
@@ -4049,7 +4069,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     timer_repaired_at: &mut BTreeMap<String, f64>,
     timer_stopped_noted: &mut std::collections::BTreeSet<String>,
 ) -> Vec<Value> {
-    let mut findings = Vec::new();
+    let mut findings: Vec<Value> = config.disks.iter().map(|disk| disk.check(host)).collect();
     let duties = &config.duties;
     // `herdr_up` is still probed when the herdr duty is off: queue_drain and
     // the coordinator check need to know, but nothing is started or reported.
@@ -4577,6 +4597,12 @@ fn alert<A: ManagedApi + ?Sized>(
     alerted: &mut BTreeMap<String, f64>,
     queue_max_items: Option<usize>,
 ) -> Value {
+    // Disk pressure is queued without typing, even when normal delivery owns the pass.
+    // A durable pending notice starts its cooldown; a busy coordinator must not collect
+    // a new copy every minute while waiting to read the first one.
+    if let Some(notice) = disk::alert(client, registry, config, host, findings, alerted) {
+        return notice;
+    }
     if queue_max_items.is_some()
         && queue_owned_notice_budget(findings, config.coordinator.as_deref())
     {
@@ -4589,7 +4615,7 @@ fn alert<A: ManagedApi + ?Sized>(
     let now = host.now();
     let due = findings
         .iter()
-        .filter(|row| row["ok"] == false)
+        .filter(|row| row["ok"] == false && row["check"] != "disk")
         // A stopped timer's later passes in the same episode are not new reports
         // (#1277): only its first, un-cooldowned row may alert.
         .filter(|row| row["operator_stopped"] != true || row["cooldown"] != true)
