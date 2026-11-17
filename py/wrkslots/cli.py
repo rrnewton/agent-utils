@@ -39874,6 +39874,24 @@ def _run_post_provision_hooks(
         hook_index = step % len(hooks)
         command = hooks[hook_index]
         path = _stored_path(config, checkout.path, "hook checkout path")
+        if checkout.vcs == "eden" or not (path / ".git").exists():
+            # Hooks are Git provisioning steps; an Eden (Sapling)
+            # mount or any checkout without a Git working tree has
+            # nothing for them to act on, and `git submodule` there
+            # fails with "cannot be used without a working tree"
+            # (#1731).  Skip the step, recording the progress so
+            # recovery recomputes the same plan.
+            print(
+                f"post-provision hook {step + 1}/{total} checkout={checkout.name}: "
+                f"skipped (no Git working tree at {path})",
+                file=sys.stderr,
+            )
+            journal["hook_progress"] = step + 1
+            journal["hook_failure"] = None
+            _write_journal(
+                config, journal, event_writer=event_writer, journal_path=journal_path
+            )
+            continue
         attempt = {
             "checkout": checkout.name,
             "hook_index": hook_index,
@@ -39885,6 +39903,11 @@ def _run_post_provision_hooks(
             config, journal, event_writer=event_writer, journal_path=journal_path
         )
         env = os.environ.copy()
+        # Ambient Git location variables would retarget the hook's
+        # Git at another repository (or a bare one) regardless of its
+        # working directory (#1731); the checkout cwd decides.
+        for name in _SETUP_HOOKS_CLEARED_ENV:
+            env.pop(name, None)
         env.update(
             {
                 "WRKSLOTS_PROJECT_ROOT": str(config.root),

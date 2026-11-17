@@ -1395,6 +1395,22 @@ fn create_slot_inner(
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         );
+        // Hooks are Git provisioning steps; an Eden (Sapling) mount
+        // or any checkout without a Git working tree has nothing for
+        // them to act on (#1731). Skip, advancing progress so the
+        // journal plan recomputes identically on recovery.
+        let skips_hooks = checkout.get("vcs").and_then(Value::as_str) == Some("eden")
+            || !path.join(".git").exists();
+        if skips_hooks {
+            for _hook in hooks.iter() {
+                progress += 1;
+                write_journal(
+                    &cfg,
+                    &make_journal(&created, &heartbeat_at, progress, &Value::Null),
+                )?;
+            }
+            continue;
+        }
         for (hook_index, hook) in hooks.iter().enumerate() {
             let running = json!({
                 "checkout": checkout_name,
@@ -1408,6 +1424,14 @@ fn create_slot_inner(
             )?;
             let output = Command::new("/bin/sh")
                 .args(["-c", hook])
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+                .env_remove("GIT_NAMESPACE")
+                .env_remove("GIT_PREFIX")
                 .current_dir(&path)
                 .env(
                     "WRKSLOTS_PROJECT_ROOT",

@@ -458,6 +458,7 @@
         "py/wrkslots/tests/test_heartbeat_write_rust.py",
         "py/wrkslots/tests/test_hold_state_rust.py",
         "py/wrkslots/tests/test_hold_write_rust.py",
+        "py/wrkslots/tests/test_hook_worktree.py",
         "py/wrkslots/tests/test_image_convert_rust.py",
         "py/wrkslots/tests/test_image_mount_family_rust.py",
         "py/wrkslots/tests/test_image_set_default_rust.py",

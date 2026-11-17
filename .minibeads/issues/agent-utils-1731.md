@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-reverie-only-slot-submodule-hook: post-provision submodule hook runs where there is no working tree'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -46,3 +46,20 @@ submodule update has no working tree to act on.
 Related: post-provision hooks run before the active row is
 published; a failed hook is a provisioning failure retained for
 `recover`.
+
+## Resolution
+
+`_run_post_provision_hooks` (Python) and the create hook loop in
+`rs/wrkslotsd/src/create_write.rs` ran every configured hook in
+every created checkout. For an Eden (Sapling) checkout the cwd is
+the Eden mount, which has no Git working tree, so a Git hook such
+as `git submodule update --init --recursive` fails with "cannot
+be used without a working tree"; ambient GIT_DIR-style variables
+could likewise retarget a hook's Git away from its checkout.
+Both editions now skip hook steps for checkouts that are Eden or
+lack a `.git` (progress still advances, so recovery recomputes
+the same plan) and drop the ambient Git location variables
+(`_SETUP_HOOKS_CLEARED_ENV`) from the hook environment.
+Tests: `py/wrkslots/tests/test_hook_worktree.py` (Eden skip with
+a failing hook, ambient GIT_DIR scrubbed); Rust create
+differentials unchanged and green.
