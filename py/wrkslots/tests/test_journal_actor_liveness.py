@@ -132,7 +132,7 @@ def test_legacy_journal_without_actor_generation_gets_legacy_wording(
 
 
 def test_wait_lock_waits_for_a_live_journal_then_proceeds(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project)
@@ -150,14 +150,35 @@ def test_wait_lock_waits_for_a_live_journal_then_proceeds(
         raw["owner"] = _identity_obj(sleeper.pid)
         cli._write_journal(config, raw, journal_path=journal_path)
 
+        # The wait-lock bound is a hang backstop only (#1765): the adopt
+        # proceeds as soon as the journal clears, so the bound is sized far
+        # past anything a loaded gate needs instead of the 30 s that a
+        # starved worker or clearing thread could outrun.
         adopt = [
-            "--project-root", str(project), "--wait-lock", "30",
+            "--project-root", str(project), "--wait-lock", "300",
             "adopt", "slot02",
             "--agent", "codex-2", "--owner-pid", str(os.getpid()),
             "--expected-generation", "1",
         ]
         started = threading.Event()
+        waiting = threading.Event()
         outcome: dict[str, object] = {}
+        real_wait = cli._wait_for_control_change
+
+        def observed_wait(
+            config_: cli.Config,
+            timeout_seconds: float,
+            *,
+            pid: int | None = None,
+            recheck: object = None,
+        ) -> None:
+            # The adopt has met the live journal and is waiting on it.
+            waiting.set()
+            real_wait(
+                config_, timeout_seconds, pid=pid, recheck=recheck  # type: ignore[arg-type]
+            )
+
+        monkeypatch.setattr(cli, "_wait_for_control_change", observed_wait)
 
         def run_adopt() -> None:
             started.set()
@@ -165,15 +186,17 @@ def test_wait_lock_waits_for_a_live_journal_then_proceeds(
 
         worker = threading.Thread(target=run_adopt, daemon=True)
         worker.start()
-        assert started.wait(timeout=30)
-        # The adopt is waiting on the live journal, not refused.
+        assert started.wait(timeout=300)
+        # Condition, not elapsed time: the adopt is inside its wait for
+        # the live journal, not refused and not merely unscheduled.
+        assert waiting.wait(timeout=300)
         assert worker.is_alive()
         assert journal_path.exists()
 
         # The journaled mutation finishes and clears its journal.
         cli._clear_journal(config, raw, journal_path=journal_path)
 
-        worker.join(timeout=30)
+        worker.join(timeout=300)
         assert not worker.is_alive()
         assert outcome["returncode"] == 0
     finally:
