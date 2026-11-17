@@ -260,7 +260,8 @@
       ],
       "reverse_dependencies": [],
       "test_files": [
-        "py/tests/test_local_ci_hub.py"
+        "py/tests/test_local_ci_hub.py",
+        "py/tests/test_host_limits.py"
       ]
     },
     "merge-queue": {

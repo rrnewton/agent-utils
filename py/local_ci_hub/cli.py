@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from . import health as health_mod
+from . import host_limits
 from . import land as land_mod
 from . import receipt as receipt_mod
 from . import remote as remote_mod
@@ -35,8 +36,18 @@ identities this ledger counts; rows with no repo always count);
 [remote] provider (none|github);
 [receipt] qualifying is an AND list from {local-ledger-pass, remote-pass}
 and release_payload is the canonical release identity a PASS must carry.
+Host limits: one admin-installed host file caps concurrency, cleanup
+debt, disk floor and per-run box ceilings for every instance on the
+host; project requests only clamp down under it. With no host file the
+tool runs on conservative built-in limp limits and warns on every run;
+doctor reports the missing file as an error and shows every effective
+value with its source. Admission is live, from measured headroom: a
+refusal is no result, never a test failure. Sweep deletions defer
+while a measurement hold or host quiet is active.
 Local-only: provider=none and publish=none needs no network or credentials.
-Every subcommand accepts --json. Exit codes: 0 ok/qualified/pass, 1 not-qualified/fail, 2 usage/config error."""
+Every subcommand accepts --json. Exit codes: 0 ok/qualified/pass,
+1 not-qualified or real test failure, 2 usage/config error,
+75 could-not-run or refused (no result was produced)."""
 
 
 def _out(obj: object, as_json: bool) -> None:
@@ -65,9 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("userguide")
     sub.add_parser("doctor")
     r = sub.add_parser("run"); rs = r.add_subparsers(dest="op", required=True)
-    for op in ("start", "list", "stop", "status"):
+    for op in ("start", "list", "stop", "status", "sweep"):
         q = rs.add_parser(op)
-        q.add_argument("--wait", action="store_true"); q.add_argument("--commit", default=""); q.add_argument("--cell", default=""); q.add_argument("run_id", nargs="?")
+        q.add_argument("--wait", action="store_true"); q.add_argument("--commit", default=""); q.add_argument("--cell", default=""); q.add_argument("--admission-wait-secs", type=float, default=0.0); q.add_argument("run_id", nargs="?")
     led = sub.add_parser("ledger"); ls = led.add_subparsers(dest="op", required=True)
     for op in ("append", "publish", "query", "newest-green", "first-bad", "ingest", "digest"):
         q = ls.add_parser(op)
@@ -86,25 +97,73 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr); return 2
     if args.cmd == "doctor":
+        import os as _os
+        import time as _time
+
+        eff = host_limits.load_effective(reader="doctor")
+        head = host_limits.sample_headroom()
+        handles = eff.state_root / "runs"
+        handles.mkdir(parents=True, exist_ok=True)
+        v, y, p = runner.count_live(handles, _time.time())
+        free_bytes, free_components = host_limits.measure_free_bytes(cfg.root)
+        gate_g, gate_cap, gate_note = host_limits.count_gate_runs()
+        deferred, defer_sources = host_limits.sweep_deferral(_time.time())
+        total = host_limits.mem_total_bytes()
+        sanity: list[str] = []
+        if total > 0 and eff.memory_max_bytes > total:
+            sanity.append("run_scope.memory_max_bytes exceeds MemTotal")
+        other_root = cfg.state_dir / "runs"
+        other_handles = 0
+        if other_root.is_dir() and other_root.resolve() != handles.resolve():
+            other_handles = sum(1 for _ in other_root.glob("*.json"))
+        host_section: dict[str, object] = {
+            "limits": eff.as_dict(), "headroom": head.as_dict(),
+            "live": {"v": v, "y": y, "p": p, "cleanup_pending_max": eff.cleanup_pending_max},
+            "free": {"bytes": free_bytes, "floor": eff.slot_fs_min_free_bytes,
+                     "components": free_components},
+            "gate": {"g": gate_g, "g_cap": gate_cap, "note": gate_note,
+                     "reads_host_limits": False},
+            "sweep_deferral": {"deferred": deferred, "sources": defer_sources},
+            "other_root_handles": other_handles,
+            "mem_total_bytes": total, "sanity_errors": sanity,
+            "unknown_key_errors": list(eff.unknown_keys),
+            "state_root_problems": host_limits.check_state_root(eff.state_root),
+        }
+        if other_handles:
+            host_section["other_root_error"] = (
+                f"run handles exist under another root {other_root}; "
+                "cleanup debt there stays visible until swept or retired")
         checks = {
             "git": bool(shutil.which("git")), "config": str(cfg.path),
             "validate_command": cfg.validate_command, "provider": cfg.provider,
             "ledger": str(cfg.ledger_file), "gh_needed": cfg.provider != "none",
             "gh": bool(shutil.which("gh")) if cfg.provider != "none" else "not-required",
+            "host_limits": host_section,
+            "host": _os.uname().nodename.split(".")[0] if hasattr(_os, "uname") else "",
         }
-        _out({"schema": "local-ci-hub/doctor/v1", "ok": bool(checks["git"]), "checks": checks}, args.json)
-        return 0 if checks["git"] else 1
+        ok = bool(checks["git"]) and not eff.errors and not sanity and not other_handles
+        _out({"schema": "local-ci-hub/doctor/v1", "ok": ok, "checks": checks}, args.json)
+        return 0 if ok else 1
     if args.cmd == "run":
         res: object = {}
         if args.op == "start":
-            res = runner.start(cfg, wait=True, commit=args.commit, cell=args.cell)
+            res = runner.start(cfg, wait=True, commit=args.commit, cell=args.cell,
+                               admission_wait_s=args.admission_wait_secs)
+        elif args.op == "sweep":
+            res = runner.sweep(cfg)
         elif args.op == "stop":
             res = runner.stop(cfg, args.run_id or "")
         else:
             res = runner.list_runs(cfg)
         _out(res, args.json)
-        if isinstance(res, dict) and (res.get("state") == "refused" or res.get("result") == "FAIL"):
-            return 1
+        if isinstance(res, dict):
+            if res.get("state") == "refused" or res.get("outcome") == "no_result":
+                return 75
+            if res.get("result") in ("FAIL", "TIMEOUT"):
+                return 1
+            code = res.get("exit_code")
+            if isinstance(code, int) and code in (0, 1, 75):
+                return code
         return 0
     if args.cmd == "ledger":
         ledger = Ledger(cfg)

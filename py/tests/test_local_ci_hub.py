@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,13 @@ BIN = Path(__file__).resolve().parents[2] / "py" / "bin" / "local-ci-hub"
 
 
 def run_cli(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(BIN), *args], cwd=cwd, capture_output=True, text=True, timeout=60)
+    env = dict(os.environ)
+    host_file = cwd / "host-limits.toml"
+    if host_file.exists():
+        env["AGENT_UTILS_HOST_LIMITS_CONFIG"] = str(host_file)
+        env["AGENT_UTILS_HOST_LIMITS_STAT_A"] = str(cwd / "stat-a.txt")
+        env["AGENT_UTILS_HOST_LIMITS_STAT_B"] = str(cwd / "stat-b.txt")
+    return subprocess.run([sys.executable, str(BIN), *args], cwd=cwd, capture_output=True, text=True, timeout=60, env=env)
 
 
 def toy_repo(tmp_path: Path, validate: str = "true") -> Path:
@@ -24,6 +31,16 @@ def toy_repo(tmp_path: Path, validate: str = "true") -> Path:
         '[project]\nname="toy"\n[validate]\ncommand=["/bin/sh","-c","' + validate + '"]\n'
         'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\nlocation={path="ci-ledger"}\n'
         '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=false\n[land]\nstate_dir="ignored/local-ci-hub"\n')
+    state_root = repo / "host-state"
+    (repo / "host-limits.toml").write_text(
+        'version = 1\n[admission]\nmax_concurrent_validation_runs = 4\n'
+        'cleanup_pending_max = 6\nslot_fs_min_free_bytes = 1\n'
+        '[run_scope]\ncpu_quota_cpus = 2\nmemory_max_bytes = 1048576\npids_max = 1024\n'
+        f'[paths]\nstate_root = "{state_root}"\n')
+    zero = "\n".join(["cpu  0 0 0 0 0 0 0 0 0 0"] + [f"cpu{i} 0 0 0 0 0 0 0 0 0 0" for i in range(4)]) + "\n"
+    idle = "\n".join(["cpu  0 0 0 100 0 0 0 0 0 0"] + [f"cpu{i} 0 0 0 100 0 0 0 0 0 0" for i in range(4)]) + "\n"
+    (repo / "stat-a.txt").write_text(zero)
+    (repo / "stat-b.txt").write_text(idle)
     subprocess.run(["git", "add", "-A"], cwd=repo, timeout=15)
     subprocess.run(["git", "commit", "-qm", "toy: init"], cwd=repo, timeout=15)
     return repo
@@ -282,6 +299,39 @@ def test_canonical_bytes_deterministic() -> None:
     a = {"b": 1, "a": {"y": [1, 2], "x": "é"}}
     assert canonical_bytes(a) == canonical_bytes({"a": {"x": "é", "y": [1, 2]}, "b": 1})
     assert digest(a) != digest({"b": 2, "a": {"y": [1, 2], "x": "é"}})
+
+
+def test_doctor_reports_host_limits(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    out = run_cli(repo, "--json", "doctor")
+    assert out.returncode == 0, out.stdout + out.stderr
+    section = json.loads(out.stdout)["checks"]["host_limits"]
+    assert section["limits"]["file_present"] is True
+    assert section["gate"]["g"] == "unknown"  # unset admission dir: informational only
+    assert section["live"]["cleanup_pending_max"] == 6
+
+
+def test_run_refused_below_disk_floor_is_no_result(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    host_file = repo / "host-limits.toml"
+    host_file.write_text(host_file.read_text().replace(
+        "slot_fs_min_free_bytes = 1", "slot_fs_min_free_bytes = 1000000000000000000"))
+    r = run_cli(repo, "--json", "run", "start")
+    assert r.returncode == 75, r.stdout + r.stderr  # refused: no result, never a failure
+    out = run_cli(repo, "--json", "ledger", "query")
+    assert json.loads(out.stdout) == []  # no checkout, no FAIL row
+
+
+def test_run_sweep_clears_cleanup_pending(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    runs = repo / "host-state" / "runs"
+    runs.mkdir(parents=True)
+    (repo / "host-state").chmod(0o700)
+    (runs / "run-old.json").write_text(json.dumps(
+        {"run_id": "run-old", "state": "cleanup-pending"}))
+    out = run_cli(repo, "--json", "run", "sweep")
+    assert out.returncode == 0 and json.loads(out.stdout)["deleted"] == 1
+    assert not (runs / "run-old.json").exists()
 
 
 def test_land_run_executes_under_lock(tmp_path: Path) -> None:
