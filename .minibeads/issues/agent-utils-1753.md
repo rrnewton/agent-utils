@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-agent-batch-archive-ignored: remove-agent-batch cannot archive gitignored files and refuses them only after full salvage'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -69,3 +69,18 @@ cleanup: 45 of 46 dead slots carry create-hook provisioning output;
 #1751 (shared census cost), #1752 (referenced-ignored-paths warning
 cost), #1302 (gitignored files outside the regenerable caches),
 #1686 (finish-recorded ignored decisions).
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 44e74fb1
+(gated 1272ff30 on 95db7464, replayed over d5f99889 with the
+combined tree f43fb5f6 verified: the three batch ignored-files
+tests pass there). `remove-agent-batch --archive-ignored` now
+archives each slot's gitignored files with the single-remove
+verified tar, receipts and read-back, and without the flag the
+batch refuses a condemned slot before the shared census and
+salvage, with the same refusal text; a finish-recorded decision
+(#1686) still governs its slot. Tests:
+`test_remove_agent_batch_refuses_ignored_files_before_census_and_salvage`
+(census and salvage counters stay at zero) and
+`test_remove_agent_batch_archive_ignored_removes_slots`.
