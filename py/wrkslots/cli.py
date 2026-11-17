@@ -3157,6 +3157,97 @@ def _relative_inside(root: Path, raw: str, label: str) -> tuple[str, Path]:
     return lexical, absolute
 
 
+#: Errnos that mean a FUSE mount's server is gone (#1802): the entry is
+#: still in the mount table, but every lookup through it fails. Sandbox
+#: mount namespaces hold slave copies of such entries, so one slot's
+#: dead Eden mount used to refuse every other slot's commands host-wide.
+_DEAD_MOUNT_ERRNOS = frozenset({errno.ENOTCONN, errno.EIO})
+
+#: FUSE mount points found dead by this command's scans, in the order
+#: found. Reset by the commands that report them (heartbeat, create,
+#: classify-create-journals); every other reader leaves it alone.
+_DEAD_MOUNT_FINDINGS: contextvars.ContextVar[tuple[Path, ...]] = (
+    contextvars.ContextVar("wrkslots_dead_mount_findings", default=())
+)
+_DEAD_MOUNT_REPORTED: contextvars.ContextVar[tuple[Path, ...]] = (
+    contextvars.ContextVar("wrkslots_dead_mount_reported", default=())
+)
+
+
+def _dead_mount_point(path: Path) -> Path | None:
+    """The FUSE mount point at or above ``path`` in this process's mount table, or None.
+
+    Only a table-listed ``fuse*`` mount proves the entry is a mount at
+    all (and so not a symlink the caller must refuse); a stat failure
+    anywhere else keeps its ordinary meaning.
+    """
+
+    try:
+        entries = _read_self_mount_entries()
+    except Exception:
+        return None
+    best: Path | None = None
+    for entry in entries:
+        if not entry.fstype.startswith("fuse"):
+            continue
+        if _path_is_within(path, entry.point) and (
+            best is None or len(entry.point.parts) > len(best.parts)
+        ):
+            best = entry.point
+    return best
+
+
+def _record_dead_mount(point: Path) -> None:
+    found = _DEAD_MOUNT_FINDINGS.get()
+    if point not in found:
+        _DEAD_MOUNT_FINDINGS.set((*found, point))
+
+
+def _dead_mount_detail(point: Path, slot: str | None) -> str:
+    """The finding text for one dead mount, naming its owning slot."""
+
+    return f"dead FUSE entry at {point}, owning slot {slot or 'unknown'}"
+
+
+def _entry_counts_as_directory(entry: Path) -> bool:
+    """Whether a slots-root entry names a directory, for root enumerations.
+
+    A dead FUSE mount point cannot be stat'ed; it still counts (its
+    name occupies the slot path), and the entry is recorded (#1802).
+    """
+
+    try:
+        return entry.is_dir() or entry.is_symlink()
+    except OSError as exc:
+        dead = _is_dead_mount_failure(entry, exc)
+        if dead is None:
+            raise
+        _record_dead_mount(dead)
+        return True
+
+
+def _dead_mount_remedy(point: Path) -> str:
+    return (
+        f"unmount the dead FUSE entry at {point} from this mount namespace "
+        "(or restart the sandbox that holds the slave copy), then rerun; "
+        "the entry belongs to its owning slot's lifecycle, so no other "
+        "slot's command repairs or removes it"
+    )
+
+
+def _is_dead_mount_failure(path: Path, exc: OSError) -> Path | None:
+    """The dead FUSE mount point responsible for ``exc`` at ``path``, or None."""
+
+    if exc.errno not in _DEAD_MOUNT_ERRNOS:
+        return None
+    return _dead_mount_point(path)
+
+
+def _reset_dead_mount_findings() -> None:
+    _DEAD_MOUNT_FINDINGS.set(())
+    _DEAD_MOUNT_REPORTED.set(())
+
+
 def _ensure_no_symlink_components(root: Path, path: Path, label: str) -> None:
     try:
         relative = path.relative_to(root)
@@ -3169,6 +3260,13 @@ def _ensure_no_symlink_components(root: Path, path: Path, label: str) -> None:
             if current.is_symlink():
                 raise Refusal(f"{label} crosses a symlink: {current}")
         except OSError as exc:
+            dead = _is_dead_mount_failure(current, exc)
+            if dead is not None:
+                # A dead FUSE mount point is a mount, not a symlink; the
+                # owning slot's own commands refuse it by name when the
+                # recorded findings are reported (#1802).
+                _record_dead_mount(dead)
+                continue
             raise Refusal(f"cannot inspect {label} path {current}: {exc}") from exc
 
 
@@ -12884,15 +12982,36 @@ def _registry_storage_inconsistencies(
 
     for record in sorted(records, key=lambda item: (item.machine, item.slot)):
         slot_path = _slot_directory(config, record.slot, record.slot_type)
-        slot_present = slot_path.exists() or slot_path.is_symlink()
-        slot_safe = slot_path.is_dir() and not slot_path.is_symlink()
+        slot_dead: Path | None = None
+        try:
+            slot_present = slot_path.exists() or slot_path.is_symlink()
+            slot_safe = slot_path.is_dir() and not slot_path.is_symlink()
+        except OSError as exc:
+            slot_dead = _is_dead_mount_failure(slot_path, exc)
+            if slot_dead is None:
+                raise
+            _record_dead_mount(slot_dead)
+            slot_present, slot_safe = True, False
         slot_inspectable = slot_safe
         unmounted = (
             _unmounted_slot_image(config, record.slot, record.slot_type, slot_path)
             if slot_safe
             else None
         )
-        if unmounted is not None:
+        if slot_dead is not None:
+            # Row-scoped like every finding here (#1802): the entry is
+            # reported for its owning slot and inspects nothing further.
+            slot_inspectable = False
+            note(
+                "dead-fuse-entry",
+                "row",
+                _dead_mount_detail(slot_dead, record.slot),
+                _dead_mount_remedy(slot_dead),
+                slot=record.slot,
+                slot_type=record.slot_type,
+                machine=record.machine,
+            )
+        elif unmounted is not None:
             # Row-scoped like every finding here: it refuses a command naming
             # this slot and is only reported for others. No Git inspection runs
             # against the empty mount point, so it is not misreported as a
@@ -13023,7 +13142,24 @@ def _registry_storage_inconsistencies(
             if not slot_inspectable:
                 continue
             registered = path.absolute() in listed_by_repository[repository]
-            present = path.exists() or path.is_symlink()
+            try:
+                present = path.exists() or path.is_symlink()
+            except OSError as exc:
+                dead = _is_dead_mount_failure(path, exc)
+                if dead is None:
+                    raise
+                _record_dead_mount(dead)
+                note(
+                    "dead-fuse-entry",
+                    "row",
+                    _dead_mount_detail(dead, record.slot),
+                    _dead_mount_remedy(dead),
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=checkout.name,
+                )
+                continue
             if not present:
                 if registered:
                     note(
@@ -13038,7 +13174,25 @@ def _registry_storage_inconsistencies(
                         checkout=checkout.name,
                     )
                 continue
-            if path.is_symlink() or not path.is_dir():
+            try:
+                unsafe = path.is_symlink() or not path.is_dir()
+            except OSError as exc:
+                dead = _is_dead_mount_failure(path, exc)
+                if dead is None:
+                    raise
+                _record_dead_mount(dead)
+                note(
+                    "dead-fuse-entry",
+                    "row",
+                    _dead_mount_detail(dead, record.slot),
+                    _dead_mount_remedy(dead),
+                    slot=record.slot,
+                    slot_type=record.slot_type,
+                    machine=record.machine,
+                    checkout=checkout.name,
+                )
+                continue
+            if unsafe:
                 note(
                     "unsafe-checkout-path",
                     "row",
@@ -13170,7 +13324,7 @@ def _registry_storage_inconsistencies(
             actual = {
                 entry.name
                 for entry in root.iterdir()
-                if (entry.is_dir() or entry.is_symlink())
+                if _entry_counts_as_directory(entry)
                 and not entry.name.startswith("EVENTS.")
                 and entry != config.control / "wrkslots"
                 and not _is_representation_directory(config, entry)
@@ -14631,6 +14785,42 @@ def _create_plan_confined_to_slot(
     return True
 
 
+def _journal_dead_mount(
+    config: Config, raw: Mapping[str, object], *, probe_table: bool = False
+) -> Path | None:
+    """The dead FUSE mount point inside a create journal's own slot, or None.
+
+    Recorded findings decide by themselves; the mount table is probed
+    only when a probe in the journal's slot just failed with a
+    dead-mount errno, which together with a table-listed ``fuse*``
+    mount inside the slot proves the entry dead (#1802).
+    """
+
+    slot = raw.get("slot")
+    slot_type = raw.get("slot_type", "agent")
+    if not isinstance(slot, str) or not isinstance(slot_type, str):
+        return None
+    if slot_type not in SLOT_TYPES:
+        return None
+    try:
+        slot_path = _slot_directory(config, slot, slot_type)
+    except Refusal:
+        return None
+    for point in _DEAD_MOUNT_FINDINGS.get():
+        if _path_is_within(point, slot_path):
+            return point
+    if not probe_table:
+        return None
+    try:
+        entries = _read_self_mount_entries()
+    except Exception:
+        return None
+    for entry in entries:
+        if entry.fstype.startswith("fuse") and _path_is_within(entry.point, slot_path):
+            return entry.point
+    return None
+
+
 def _classify_create_journal(
     config: Config,
     path: Path,
@@ -14767,6 +14957,37 @@ def _classify_create_journal(
             if skipped_paths is not None and path not in skipped_paths:
                 skipped_paths.append(path)
             return None
+        raise
+    except (Refusal, OSError) as error:
+        # #1802: a dead FUSE entry in the journal's own slot fails its
+        # checkout probes (a stat's ENOTCONN/EIO, or the Refusal the Git
+        # invocation made of it). A caller naming another slot skips the
+        # journal exactly like the #1436 case above; the journal's own
+        # slot refuses, naming the entry.
+        named_slot = raw.get("slot")
+        dead = _journal_dead_mount(config, raw) if isinstance(named_slot, str) else None
+        if (
+            dead is None
+            and isinstance(error, OSError)
+            and error.errno in _DEAD_MOUNT_ERRNOS
+            and isinstance(named_slot, str)
+        ):
+            dead = _journal_dead_mount(config, raw, probe_table=True)
+            if dead is not None:
+                _record_dead_mount(dead)
+        if dead is not None and isinstance(named_slot, str):
+            if (
+                requested_slot is not None
+                and named_slot != requested_slot
+                and _create_plan_confined_to_slot(config, raw, named_slot)
+            ):
+                if skipped_paths is not None and path not in skipped_paths:
+                    skipped_paths.append(path)
+                return None
+            raise Refusal(
+                _dead_mount_detail(dead, named_slot),
+                remedy=_dead_mount_remedy(dead),
+            ) from error
         raise
     rebound_coordinator_state, _rebound_coordinator_detail = _process_state(coordinator)
     rebound_owner_state, _rebound_owner_detail = _create_journal_owner_state(
@@ -16183,7 +16404,17 @@ def _assert_record_registered(
             continue
         path = _stored_path(config, checkout.path, "checkout path")
         _relative, repository = _stored_repository_path(config, checkout.repository)
-        if path.is_symlink() or not path.is_dir():
+        try:
+            unsafe = path.is_symlink() or not path.is_dir()
+        except OSError as exc:
+            dead = _is_dead_mount_failure(path, exc)
+            if dead is None:
+                raise
+            _record_dead_mount(dead)
+            raise Refusal(
+                _dead_mount_detail(dead, record.slot), remedy=_dead_mount_remedy(dead)
+            ) from exc
+        if unsafe:
             raise Refusal(f"checkout path is missing or not a real directory: {path}")
         if path.absolute() not in vcs.listed_worktrees(repository):
             raise Refusal(f"Git does not list {path} as a worktree of {repository}")
@@ -16546,7 +16777,7 @@ def _assert_registry_storage_consistent(
         actual_slots = {
             entry.name
             for entry in root.iterdir()
-            if (entry.is_dir() or entry.is_symlink())
+            if _entry_counts_as_directory(entry)
             and not entry.name.startswith("EVENTS.")
             and entry != config.control / "wrkslots"
             and not _is_representation_directory(config, entry)
@@ -16749,6 +16980,70 @@ def _assert_command_registry_storage(
             file=sys.stderr,
         )
     return findings
+
+
+def _dead_mount_owner(
+    config: Config, states: Sequence[ActiveState], point: Path
+) -> str | None:
+    """The slot a dead mount point belongs to, by directory or by record."""
+
+    for slot_type, root in _slot_roots(config).items():
+        if _path_is_within(point, root):
+            relative = point.relative_to(root)
+            if relative.parts:
+                return relative.parts[0]
+    for state in states:
+        for record in state.slots:
+            for checkout in record.checkouts:
+                try:
+                    checkout_path = _stored_path_reference(
+                        config, checkout.path, "checkout path"
+                    )
+                except Refusal:
+                    continue
+                if _path_is_within(point, checkout_path) or _path_is_within(
+                    checkout_path, point
+                ):
+                    return record.slot
+    return None
+
+
+def _report_dead_mounts(
+    config: Config,
+    states: Sequence[ActiveState],
+    *,
+    slot: str,
+    slot_type: str,
+) -> None:
+    """Report this command's dead FUSE findings; refuse its own slot's (#1802).
+
+    A dead entry in another slot is a finding, printed once per command;
+    the command proceeds. A dead entry inside the slot this command acts
+    on (or holding it) refuses, naming the entry, before anything is
+    written.
+    """
+
+    acted = _slot_directory(config, slot, slot_type)
+    reported = _DEAD_MOUNT_REPORTED.get()
+    for point in _DEAD_MOUNT_FINDINGS.get():
+        owner = _dead_mount_owner(config, states, point)
+        detail = _dead_mount_detail(point, owner)
+        if _path_is_within(point, acted) or _path_is_within(acted, point):
+            raise Refusal(
+                f"{detail}; it lies in slot {slot}, the slot this command "
+                "acts on, so the command refuses and nothing was changed",
+                remedy=_dead_mount_remedy(point),
+            )
+        if point not in reported:
+            print(
+                f"WARNING: {detail}. state: RETAINED -- this command acts "
+                f"on slot {slot}, does not inspect the dead entry, and "
+                f"changed nothing for its owning slot. remedy: "
+                f"{_dead_mount_remedy(point)}",
+                file=sys.stderr,
+            )
+            reported = (*reported, point)
+    _DEAD_MOUNT_REPORTED.set(reported)
 
 
 def _global_rows(
@@ -19731,7 +20026,17 @@ class _GitVcs:
         # names the pre-rename path; Git then refuses to chdir there.
         # The repository argument is the worktree's true current
         # location, so pin it unless the caller named one explicitly.
-        if "GIT_WORK_TREE" not in env and (repository / ".git").exists():
+        try:
+            has_dotgit = (repository / ".git").exists()
+        except OSError as exc:
+            dead = _is_dead_mount_failure(repository, exc)
+            if dead is None:
+                raise
+            _record_dead_mount(dead)
+            raise Refusal(
+                _dead_mount_detail(dead, None), remedy=_dead_mount_remedy(dead)
+            ) from exc
+        if "GIT_WORK_TREE" not in env and has_dotgit:
             env["GIT_WORK_TREE"] = str(repository)
         network_operation = _GitVcs._network_operation(args)
         if expected_network_config is not None:
@@ -38383,7 +38688,17 @@ def _assert_slot_contents_values(
     checkouts: Sequence[Checkout],
 ) -> Path:
     slot_path = _slot_directory(config, slot, slot_type)
-    if not slot_path.is_dir() or slot_path.is_symlink():
+    try:
+        slot_unsafe = not slot_path.is_dir() or slot_path.is_symlink()
+    except OSError as exc:
+        dead = _is_dead_mount_failure(slot_path, exc)
+        if dead is None:
+            raise
+        _record_dead_mount(dead)
+        raise Refusal(
+            _dead_mount_detail(dead, slot), remedy=_dead_mount_remedy(dead)
+        ) from exc
+    if slot_unsafe:
         if _path_is_absent(slot_path):
             raise _SlotDirectoryAbsent(slot_path)
         raise Refusal(f"slot directory is missing or unsafe: {slot_path}")
@@ -44302,6 +44617,7 @@ def _assert_harness_create_allowed(config: Config, args: argparse.Namespace) -> 
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     _require_coordinator_authorized(args, "worktree creation")
     args.slot_type = _require_slot_type(args, "worktree creation")
     config = _load_new_slot_config(args, "worktree creation")
@@ -44430,6 +44746,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                                 f"slot {args.slot!r} is archived on {refreshed_archive.machine}; "
                                 "finished slots are never reused"
                             )
+        _report_dead_mounts(
+            config, states, slot=args.slot, slot_type=args.slot_type
+        )
         before = _global_rows(states, archives)
         local = (
             None
@@ -45013,6 +45332,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
 def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
     """Classify existing create journals without locks, authorization, or writes."""
 
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     if getattr(args, "all_kinds", False):
         return _cmd_classify_all_journals(args, config)
@@ -45048,6 +45368,7 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
         _validate_global_state_beside_absent_batch(config)
     )
     _assert_not_in_absent_batch(slot, absent_slots)
+    _report_dead_mounts(config, before_states, slot=slot, slot_type=slot_type)
     # #873: by default only the local machine's journals are classified; a
     # foreign shard is noted, never allowed to block a local verdict.
     all_machines = bool(getattr(args, "all_machines", False))
@@ -45092,6 +45413,7 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
         excluded_paths=absent_paths | frozenset(skipped_paths),
         machines=machines,
     )
+    _report_dead_mounts(config, after_states, slot=slot, slot_type=slot_type)
     payload = {
         "blocking": False,
         "foreign_shards": foreign_notes,
@@ -46795,6 +47117,7 @@ def _heartbeat_wait_seconds(args: argparse.Namespace, ttl_seconds: float) -> flo
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
+    _reset_dead_mount_findings()
     config = _load_config(args.project_root, args.machine)
     try:
         ttl_seconds = float(
@@ -46823,6 +47146,9 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                 "no slot registry exists for it on this project"
             )
         record = _find_record(state, args.slot)
+        _report_dead_mounts(
+            config, states, slot=record.slot, slot_type=record.slot_type
+        )
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         _assert_validate_batch_seals_disjoint_from_record(
             config, record, action="heartbeat"
@@ -46967,6 +47293,9 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                 "this slot and leave it; if more work is needed, create a new slot with "
                 "'wrkslots create'"
             )
+        _report_dead_mounts(
+            config, states, slot=record.slot, slot_type=record.slot_type
+        )
         before = _global_rows(states, archives)
         updated = dataclasses.replace(record, heartbeat_at=_utc_now())
         _write_active_state(

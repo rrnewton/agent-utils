@@ -407,6 +407,42 @@ pub(crate) fn refuse_target_storage_except_nested(
     Ok(warnings)
 }
 
+/// Report dead FUSE findings (#1802), mirroring the Python
+/// `_report_dead_mounts`: another slot's dead entry is warned about
+/// and retained; the acted-on slot's dead entry refuses, naming it.
+pub(crate) fn report_dead_findings(root: Option<&Path>, acted_slot: &str) -> Result<()> {
+    for value in [
+        crate::storage_state::parse_storage(root)?,
+        crate::git_storage_state::parse_storage_git(root)?,
+    ] {
+        let Some(findings) = value.get("findings").and_then(Value::as_array) else {
+            continue;
+        };
+        for finding in findings {
+            if finding.get("kind").and_then(Value::as_str) != Some("dead-fuse-entry") {
+                continue;
+            }
+            let detail = finding
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let remedy = finding
+                .get("remedy")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if finding.get("slot").and_then(Value::as_str) == Some(acted_slot) {
+                return Err(format!(
+                    "{detail}; it lies in slot {acted_slot}, the slot this command acts on, so the command refuses and nothing was changed\nremedy: {remedy}"
+                ));
+            }
+            eprintln!(
+                "WARNING: {detail}. state: RETAINED -- this command acts on slot {acted_slot}, does not inspect the dead entry, and changed nothing for its owning slot. remedy: {remedy}"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct ConfigLock {
     _file: std::fs::File,
     _config_file: Option<std::fs::File>,

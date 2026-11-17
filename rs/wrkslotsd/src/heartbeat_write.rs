@@ -415,6 +415,7 @@ pub(crate) fn heartbeat(
     // strictly heartbeat; remove/retire/write-handoff keep their own
     // nested handling (see #1400).
     let _nested_warnings = refuse_target_storage_except_nested(root, slot)?;
+    crate::hold_write::report_dead_findings(root, slot)?;
     for detail in &_nested_warnings {
         // Only a PRESENT nested worktree is tolerated; a deleted path is
         // stale bookkeeping and still refuses (Python parity).

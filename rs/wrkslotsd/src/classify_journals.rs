@@ -1941,6 +1941,7 @@ fn classify_create_journals_inner(
         return Err(ClassifyError::Blocked { payload, message });
     }
     crate::hold_write::validate_global(root, &cfg)?;
+    crate::hold_write::report_dead_findings(root, &slot).map_err(ClassifyError::Other)?;
     // Load every machine's ACTIVE/ARCHIVED documents.
     let mut states: Vec<(String, Vec<Value>)> = Vec::new();
     let mut archives: Vec<Vec<Value>> = Vec::new();

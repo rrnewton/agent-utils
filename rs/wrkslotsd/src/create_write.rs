@@ -1264,6 +1264,14 @@ fn create_slot_inner(
     } else {
         Vec::new()
     };
+    crate::hold_write::report_dead_findings(root, slot)?;
+    if let Some(point) = crate::storage_state::dead_mount_at(&slot_path) {
+        return Err(format!(
+            "{}; it lies in slot {slot}, the slot this command acts on, so the command refuses and nothing was changed\nremedy: {}",
+            crate::storage_state::dead_mount_detail(&point, Some(slot)),
+            crate::storage_state::dead_mount_remedy(&point)
+        ));
+    }
     // Journal + worktrees.
     if let Some(parent) = slot_path.parent() {
         std::fs::create_dir_all(parent)

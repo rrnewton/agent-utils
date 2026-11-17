@@ -380,6 +380,19 @@ fn parse_storage_git_inner(root: Option<&Path>, tolerate_unavailable: bool) -> R
             let registered = listed.contains(&path);
             let present = path.symlink_metadata().is_ok();
             if !present {
+                if let Some(point) = crate::storage_state::dead_mount_at(&path) {
+                    findings.push(note(
+                        "dead-fuse-entry",
+                        "row",
+                        Some(slot),
+                        Some(slot_type),
+                        Some(machine),
+                        Some(&name),
+                        crate::storage_state::dead_mount_detail(&point, Some(slot)),
+                        crate::storage_state::dead_mount_remedy(&point),
+                    ));
+                    continue;
+                }
                 if registered {
                     findings.push(note(
                         "git-registration-without-directory",

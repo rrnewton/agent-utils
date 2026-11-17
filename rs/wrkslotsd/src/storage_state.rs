@@ -277,7 +277,7 @@ fn normalize_absolute(path: &Path) -> PathBuf {
     out
 }
 
-struct MountEntry {
+pub(crate) struct MountEntry {
     mount_point: String,
     fstype: String,
     source: String,
@@ -335,6 +335,62 @@ fn unescape_mount_field(field: &str) -> String {
         .replace("\\011", "\t")
         .replace("\\012", "\n")
         .replace("\\134", "\\")
+}
+
+/// ENOTCONN (107) and EIO (5): a FUSE mount whose server is gone
+/// (#1802). The entry stays in the mount table, but every lookup
+/// through it fails; slave copies persist per mount namespace, so one
+/// slot's dead Eden mount must not refuse other slots' commands.
+pub(crate) fn is_dead_mount_errno(errno: Option<i32>) -> bool {
+    matches!(errno, Some(107) | Some(5))
+}
+
+/// The deepest `fuse*` mount point in `entries` at or above `path`,
+/// when the stat of `path` failed with a dead-mount errno; the pure
+/// core of [`dead_mount_at`], testable on fixture tables.
+pub(crate) fn dead_mount_point(
+    path: &Path,
+    entries: &[MountEntry],
+    stat_errno: Option<i32>,
+) -> Option<PathBuf> {
+    if !is_dead_mount_errno(stat_errno) {
+        return None;
+    }
+    entries
+        .iter()
+        .filter(|entry| entry.fstype.starts_with("fuse"))
+        .map(|entry| PathBuf::from(&entry.mount_point))
+        .filter(|point| path.starts_with(point))
+        .max_by_key(|point| point.components().count())
+}
+
+/// The dead FUSE mount point responsible for a failed stat of
+/// `path` in this process's mount table, or None.
+pub(crate) fn dead_mount_at(path: &Path) -> Option<PathBuf> {
+    let errno = std::fs::symlink_metadata(path)
+        .err()
+        .and_then(|error| error.raw_os_error());
+    if !is_dead_mount_errno(errno) {
+        return None;
+    }
+    let entries = mount_entries().ok()?;
+    dead_mount_point(path, &entries, errno)
+}
+
+/// The finding text for one dead mount, naming its owning slot.
+pub(crate) fn dead_mount_detail(point: &Path, slot: Option<&str>) -> String {
+    format!(
+        "dead FUSE entry at {}, owning slot {}",
+        point.display(),
+        slot.unwrap_or("unknown")
+    )
+}
+
+pub(crate) fn dead_mount_remedy(point: &Path) -> String {
+    format!(
+        "unmount the dead FUSE entry at {} from this mount namespace (or restart the sandbox that holds the slave copy), then rerun; the entry belongs to its owning slot's lifecycle, so no other slot's command repairs or removes it",
+        point.display()
+    )
 }
 
 fn file_identity(path: &Path) -> Option<(u64, u64)> {
@@ -1022,6 +1078,21 @@ pub(crate) fn parse_storage(root: Option<&Path>) -> Result<Value> {
                 .map(|meta| meta.file_type().is_symlink())
                 .unwrap_or(false);
         if !safe {
+            if let Some(point) = dead_mount_at(&slot_path) {
+                // Row-scoped like every finding here (#1802): reported
+                // for its owning slot, inspected no further.
+                findings.push(note(
+                    "dead-fuse-entry",
+                    "row",
+                    Some(slot),
+                    Some(slot_type),
+                    Some(machine),
+                    None,
+                    dead_mount_detail(&point, Some(slot)),
+                    &dead_mount_remedy(&point),
+                ));
+                continue;
+            }
             let (kind, detail) = if present {
                 (
                     "unsafe-slot-directory",
@@ -1276,4 +1347,85 @@ pub(crate) fn parse_storage(root: Option<&Path>) -> Result<Value> {
         "machines": machines,
         "findings": findings,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(point: &str, fstype: &str) -> MountEntry {
+        MountEntry {
+            mount_point: point.to_string(),
+            fstype: fstype.to_string(),
+            source: "edenfs:".to_string(),
+            device: "0:276".to_string(),
+            root: "/".to_string(),
+        }
+    }
+
+    fn table() -> Vec<MountEntry> {
+        vec![
+            entry("/", "ext4"),
+            entry("/srv/slots/slot-b/repo", "fuse"),
+            entry("/srv/slots/slot-b/repo/nested", "fuse.edenfs"),
+            entry("/srv/slots/slot-a/repo", "ext4"),
+        ]
+    }
+
+    #[test]
+    fn dead_mount_point_matches_only_fuse_entries_on_dead_errnos() {
+        let table = table();
+        // ENOTCONN (107) and EIO (5) on or below a fuse mount point.
+        for errno in [107, 5] {
+            assert_eq!(
+                dead_mount_point(
+                    Path::new("/srv/slots/slot-b/repo/.git"),
+                    &table,
+                    Some(errno)
+                ),
+                Some(PathBuf::from("/srv/slots/slot-b/repo")),
+                "errno {errno}"
+            );
+        }
+        // The deepest fuse entry wins for paths below stacked mounts.
+        assert_eq!(
+            dead_mount_point(
+                Path::new("/srv/slots/slot-b/repo/nested/file"),
+                &table,
+                Some(107)
+            ),
+            Some(PathBuf::from("/srv/slots/slot-b/repo/nested"))
+        );
+        // A live stat, another errno, or a non-FUSE mount proves nothing.
+        assert_eq!(
+            dead_mount_point(Path::new("/srv/slots/slot-b/repo"), &table, None),
+            None
+        );
+        assert_eq!(
+            dead_mount_point(Path::new("/srv/slots/slot-b/repo"), &table, Some(13)),
+            None
+        );
+        assert_eq!(
+            dead_mount_point(Path::new("/srv/slots/slot-a/repo"), &table, Some(107)),
+            None
+        );
+        assert_eq!(
+            dead_mount_point(Path::new("/elsewhere"), &table, Some(107)),
+            None
+        );
+    }
+
+    #[test]
+    fn dead_mount_text_names_the_entry_and_its_slot() {
+        let point = Path::new("/srv/slots/slot-b/repo");
+        assert_eq!(
+            dead_mount_detail(point, Some("slot-b")),
+            "dead FUSE entry at /srv/slots/slot-b/repo, owning slot slot-b"
+        );
+        assert_eq!(
+            dead_mount_detail(point, None),
+            "dead FUSE entry at /srv/slots/slot-b/repo, owning slot unknown"
+        );
+        assert!(dead_mount_remedy(point).contains("/srv/slots/slot-b/repo"));
+    }
 }
