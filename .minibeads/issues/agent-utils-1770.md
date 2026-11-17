@@ -1,6 +1,6 @@
 ---
 title: 'local-ci-hub-run-handle-format: register the run handle states, fix the editions mirror lag, add the skill pointer'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -55,3 +55,13 @@ coordinator takes this question to the consumer and slot owner.
 
 Receipt-field contract is drafted separately and agreed before
 any receipt code changes; it is not part of this step.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main at 18009725. The run
+handle format is registered with its generated schema, the
+editions mirror state is corrected, and the skill pointer exists.
+The gate was red only on an unrelated browser step, whose solo
+rerun passed. The receipt contract and sweeper authority answers
+arrived during this step and are handled as follow-ups; no
+lifecycle or receipt code changed here.
