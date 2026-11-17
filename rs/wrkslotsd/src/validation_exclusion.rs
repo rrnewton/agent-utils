@@ -171,6 +171,10 @@ fn alias_on_mount(
     Ok(alias)
 }
 
+/// One qualifying candidate: its path, (dev, ino, mount id) identity,
+/// and the authenticated alias of the fenced path on its mount.
+type ExclusionEntry = (PathBuf, (u64, u64, u64), PathBuf);
+
 fn filesystem_description(path: &Path, records: &[MountRecord], label: &str) -> String {
     match record_for_path(records, path, label) {
         Ok(record) => format!(
@@ -188,10 +192,15 @@ fn evaluate_candidate(
     fenced: &Path,
     candidate: &Path,
     records: &[MountRecord],
-) -> std::result::Result<(PathBuf, (u64, u64, u64), PathBuf), String> {
+) -> std::result::Result<ExclusionEntry, String> {
     let metadata = match candidate.symlink_metadata() {
         Ok(metadata) => metadata,
-        Err(_) => return Err(format!("{}: not found (no such directory)", candidate.display())),
+        Err(_) => {
+            return Err(format!(
+                "{}: not found (no such directory)",
+                candidate.display()
+            ))
+        }
     };
     let facts = format!(
         "{} (uid {}, gid {}, mode {:04o}, sticky {}, filesystem {})",
@@ -209,11 +218,16 @@ fn evaluate_candidate(
     let resolved = match candidate.canonicalize() {
         Ok(resolved) => resolved,
         Err(error) => {
-            return Err(format!("{facts}: cannot be opened as a directory ({error})"));
+            return Err(format!(
+                "{facts}: cannot be opened as a directory ({error})"
+            ));
         }
     };
     if resolved != candidate {
-        return Err(format!("{facts}: not canonical (resolves to {})", resolved.display()));
+        return Err(format!(
+            "{facts}: not canonical (resolves to {})",
+            resolved.display()
+        ));
     }
     if !metadata.is_dir() {
         return Err(format!("{facts}: not a directory"));
@@ -242,7 +256,7 @@ fn evaluate_candidate(
 /// in list order that passes every check wins. Uniqueness is not
 /// required: the journal records the chosen root, guard and their
 /// identities, and crash recovery revalidates those recorded values.
-fn trusted_root(fenced: &Path, roots: &[PathBuf]) -> Result<(PathBuf, (u64, u64, u64), PathBuf)> {
+fn trusted_root(fenced: &Path, roots: &[PathBuf]) -> Result<ExclusionEntry> {
     let records = mount_records()?;
     let source_mount = record_for_path(
         &records,
@@ -1518,10 +1532,8 @@ mod tests {
 
     #[test]
     fn trusted_root_refusal_names_each_failure() {
-        let base = std::env::temp_dir().join(format!(
-            "wrkslotsd-trusted-refusal-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("wrkslotsd-trusted-refusal-{}", std::process::id()));
         let fenced = base.join("fenced");
         std::fs::create_dir_all(&fenced).expect("fenced");
         let wrong_mode = base.join("wrong-mode");
@@ -1545,14 +1557,23 @@ mod tests {
         .expect_err("no candidate qualifies");
         assert!(error.contains(&fenced.display().to_string()), "{error}");
         assert!(error.contains("found 0"), "{error}");
-        assert!(error.contains(&format!("{}: not found", missing.display())), "{error}");
+        assert!(
+            error.contains(&format!("{}: not found", missing.display())),
+            "{error}"
+        );
         assert!(error.contains("mode 0755"), "{error}");
         assert!(error.contains("mode is not 01777"), "{error}");
         assert!(error.contains("not root-owned"), "{error}");
         assert!(error.contains("/dev/shm"), "{error}");
         assert!(error.contains("another filesystem"), "{error}");
-        assert!(error.contains("sudo install -d -o root -g root -m 1777"), "{error}");
-        assert!(error.contains("validation_exclusion_roots in .wrkslots.yml"), "{error}");
+        assert!(
+            error.contains("sudo install -d -o root -g root -m 1777"),
+            "{error}"
+        );
+        assert!(
+            error.contains("validation_exclusion_roots in .wrkslots.yml"),
+            "{error}"
+        );
         assert!(error.contains("wrkslots recover"), "{error}");
         let _ = std::fs::remove_dir_all(&base);
     }

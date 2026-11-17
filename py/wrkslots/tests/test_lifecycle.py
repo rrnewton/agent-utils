@@ -6499,11 +6499,44 @@ def test_validation_exclusion_roots_reject_relative_paths(tmp_path: Path) -> Non
         wrkslots._load_config(str(project), None)
 
 
+def _fake_exclusion_candidate_stats(
+    monkeypatch: pytest.MonkeyPatch,
+    fakes: Mapping[Path, tuple[int, int, int]],
+) -> None:
+    """Fake candidate stat facts so namespace shards see the same owners."""
+
+    real_stat = Path.stat
+
+    def fake_stat(
+        self: Path, *, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        if self in fakes:
+            uid, gid, mode = fakes[self]
+            return os.stat_result(
+                (stat.S_IFDIR | mode, 1, 1, 1, uid, gid, 0, 0, 0, 0)
+            )
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+
+
+def _fake_exclusion_mount_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = (
+        (10, "0:44", Path("/"), Path("/tmp"), "btrfs", "/dev/md0"),
+        (11, "0:45", Path("/"), Path("/dev"), "tmpfs", "tmpfs"),
+    )
+    monkeypatch.setattr(wrkslots, "_self_mountinfo_records", lambda: records)
+
+
 def test_trusted_validation_exclusion_root_uses_configured_candidate(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fenced = tmp_path / "fenced"
     fenced.mkdir()
+    _fake_exclusion_mount_records(monkeypatch)
+    _fake_exclusion_candidate_stats(monkeypatch, {Path("/tmp"): (0, 0, 0o1777)})
     selected, _identity, alias = wrkslots._trusted_validation_exclusion_root(
         fenced, (Path("/tmp"),)
     )
@@ -6512,7 +6545,7 @@ def test_trusted_validation_exclusion_root_uses_configured_candidate(
 
 
 def test_trusted_validation_exclusion_root_refusal_names_each_failure(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fenced = tmp_path / "fenced"
     fenced.mkdir()
@@ -6522,6 +6555,15 @@ def test_trusted_validation_exclusion_root_refusal_names_each_failure(
     wrong_owner.mkdir()
     wrong_owner.chmod(0o1777)
     missing = tmp_path / "missing-root"
+    _fake_exclusion_mount_records(monkeypatch)
+    _fake_exclusion_candidate_stats(
+        monkeypatch,
+        {
+            wrong_mode: (0, 0, 0o755),
+            wrong_owner: (1000, 1000, 0o1777),
+            Path("/dev/shm"): (0, 0, 0o1777),
+        },
+    )
     with pytest.raises(wrkslots.Refusal) as caught:
         wrkslots._trusted_validation_exclusion_root(
             fenced, (missing, wrong_mode, wrong_owner, Path("/dev/shm"))
@@ -6549,6 +6591,11 @@ def test_trusted_validation_exclusion_root_picks_first_qualifying(
 ) -> None:
     fenced = tmp_path / "fenced"
     fenced.mkdir()
+    _fake_exclusion_mount_records(monkeypatch)
+    _fake_exclusion_candidate_stats(
+        monkeypatch,
+        {Path("/tmp"): (0, 0, 0o1777), Path("/var/tmp"): (0, 0, 0o1777)},
+    )
     monkeypatch.setattr(
         wrkslots, "_path_alias_on_mount", lambda path, root, records: path
     )

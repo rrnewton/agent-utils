@@ -640,12 +640,7 @@ fn doctor_cli_once(
     }
     findings.extend(harness_findings(&cfg, &records_all));
     for detail in crate::validation_exclusion::doctor_details(&cfg) {
-        let mut finding = note(
-            "validation-exclusion-root",
-            None,
-            Some(&selected),
-            detail,
-        );
+        let mut finding = note("validation-exclusion-root", None, Some(&selected), detail);
         finding["remedy"] = json!(
             "provision a root-owned 01777 directory on the same filesystem as the named path (for example 'sudo install -d -o root -g root -m 1777 <mountpoint>/.wrkslots-exclusion') and add it to validation_exclusion_roots in .wrkslots.yml; diagnosis alone authorizes no mutation"
         );
