@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-warn-ignored-paths-referenced-per-slot-cost: compute the referenced-ignored-paths scan once per batch instead of once per slot'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -54,3 +54,18 @@ so the whole scan repeats per slot for identical output.
 referenced-ignored-paths warning about 20 s (21%, this issue), the
 shared census about 25 s (26%, #1751), git salvage / private-history
 subprocesses about 28 s (#1437, another lane).
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as ca60e86b
+(gated bae16fc1 on d4196dc3, no overlap at landing). The bounded
+referenced-ignored-paths corpus (`.minibeads/issues`, `ai_docs`,
+`reviews`; 1000 files / 32 MiB) is now built once and cached per
+repository tree — keyed by the project root plus each scanned
+file's size and mtime, so a changed tree is scanned afresh — and
+every slot of a batch warns from that one scan. Warning text,
+order and bounds are unchanged. Regression test
+`test_remove_agent_batch_scans_referenced_ignored_paths_once`:
+two refused slots print the identical warning per slot while the
+cited record file is read exactly once (reads == 2 before the
+fix, verified on the base tree; == 1 after).
