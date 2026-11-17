@@ -589,6 +589,12 @@ def _sandbox_host_or_skip(isolation: str) -> None:
             pytest.skip("isolation root needs a non-root user with sudo")
         if subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode:
             pytest.skip("isolation root needs passwordless sudo")
+        # Root mode takes the passwd home only (#1583): a hermetic
+        # test HOME (as under dagrun) can never satisfy it.
+        import pwd
+
+        if Path.home() != Path(pwd.getpwuid(os.getuid()).pw_dir):
+            pytest.skip("isolation root needs the passwd home, not a hermetic HOME")
 
 
 @pytest.fixture
@@ -691,13 +697,23 @@ def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
         "from pathlib import Path\n"
         "from wrkslots import sandbox\n"
         "base = Path(sys.argv[1])\n"
-        f"view = sandbox.SlotView({slot!r}, 'agent', base / 'slot', base / 'state', (), base / 'control', 'worktree', base / 'project')\n"
+        f"view = sandbox.SlotView({slot!r}, 'agent', base / 'slot', base / 'control' / 'slot-state' / 'agent' / 's1', (), base / 'control', 'worktree', base / 'project')\n"
         f"settings = sandbox.SandboxSettings(isolation={isolation!r}, tmp_size='64M', limits=sandbox.SandboxLimits(tasks_max=256))\n"
         "sandbox.run(view, settings, sys.argv[2:])\n"
     )
+    # Root mode takes the passwd home only (#1583): run it against the
+    # real home (writes land in the layer; the host home stays untouched).
+    run_home = Path.home() if isolation == "root" else home
+    if isolation == "root":
+        # The probe's ~/.local/bin/tool lives in the fake home; seed the
+        # layer with it instead of touching the real home.
+        tool = box_base / "control" / "slot-state" / "agent" / "s1" / "home/.local/bin/tool"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        tool.write_text("#!/bin/sh\necho tool\n", encoding="utf-8")
+        tool.chmod(0o755)
     environment = {
         **os.environ,
-        "HOME": str(home),
+        "HOME": str(run_home),
         "BASE": str(box_base),
         "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
     }
@@ -713,8 +729,16 @@ def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
     finally:
         subprocess.run(["systemctl", "--user", "stop", sandbox.slice_name("agent", slot)], capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
-    assert _probe_results(result.stdout) == _EXPECTED, result.stdout + result.stderr
-    _assert_home_untouched_and_layered(box_base, home, box_base / "state")
+    # The real home has no fixture tool for the probe to run (root only).
+    expected = {**_EXPECTED, "local_bin_runs": False} if isolation == "root" else _EXPECTED
+    assert _probe_results(result.stdout) == expected, result.stdout + result.stderr
+    if isolation == "root":
+        state = box_base / "control" / "slot-state" / "agent" / "s1"
+        assert not (run_home / "new-top-level").exists()
+        assert (state / "home/new-top-level").exists()
+        assert (state / "home/.cache/private").exists()
+    else:
+        _assert_home_untouched_and_layered(box_base, home, box_base / "control" / "slot-state" / "agent" / "s1")
 
 
 def test_wrkslots_run_boxes_a_plain_worktree_slot(box_base: Path) -> None:
@@ -861,7 +885,8 @@ def test_other_slots_and_the_registry_are_read_only_from_a_box(
     )
     environment = {
         **os.environ,
-        "HOME": str(home),
+        # Root mode takes the passwd home only (#1583).
+        "HOME": str(Path.home()) if isolation == "root" else str(home),
         "OTHER": str(other),
         "CONTROL": str(control),
         "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
@@ -877,10 +902,8 @@ def test_other_slots_and_the_registry_are_read_only_from_a_box(
         )
     finally:
         subprocess.run(["systemctl", "--user", "stop", sandbox.slice_name("agent", slot)], capture_output=True, check=False)
-    if isolation == "root" and not protect_system:
-        # Root mode takes no mount policy from the spec (#1583).
-        assert result.returncode != 0 and "protect_system=false" in result.stderr
-        return
+    # Root mode forces protect_system on whatever the spec claimed
+    # (#1583), so the False cases confine exactly like the True ones.
     assert result.returncode == 0, result.stderr
     assert _probe_results(result.stdout) == {
         "own_slot_write": True,
@@ -1196,7 +1219,12 @@ def test_coordinator_box_confines_writes(box_base: Path, isolation: str, scope: 
         return subprocess.run(
             [sys.executable, "-m", "wrkslots", "--machine", "testhost", *arguments],
             cwd=project, capture_output=True, text=True, timeout=timeout,
-            env={**environment, "PROJECT": str(project), "SLOT": "cs1"}, check=False,
+            env={
+                **environment,
+                # Root mode takes the passwd home only (#1583).
+                **({"HOME": str(Path.home())} if isolation == "root" else {}),
+                "PROJECT": str(project), "SLOT": "cs1",
+            }, check=False,
         )
 
     created = wrkslots(

@@ -77,7 +77,7 @@ def test_unregistered_and_forged_claims_are_refused(tmp_path: Path) -> None:
         sandbox._verify_registered(document, view, os.getuid())
     # N1: a spec-supplied home owned by someone else (a system home) refuses.
     forged = {**view, "home": "/etc"}
-    with pytest.raises(sandbox.SandboxError, match="invoking user's home"):
+    with pytest.raises(sandbox.SandboxError, match="passwd home"):
         sandbox._verify_registered(document, forged, os.getuid())
     # N1: a spec-supplied slot_path the registry row does not name refuses.
     registered["slot"] = "s1"
@@ -97,14 +97,18 @@ def test_closed_schema_tmp_size_and_policy_are_enforced(tmp_path: Path) -> None:
     view: dict[str, object] = dict(raw_view)
     with pytest.raises(sandbox.SandboxError, match="tmp_size"):
         sandbox._check_root_schema({**document, "view": {**view, "tmp_size": "1;evil"}})
-    # N3/N4: spec mount policy refuses in root mode.
+    # N3/N4: spec mount policy is forced, never taken, in root mode.
     trusted = sandbox._verify_registered(document, view, os.getuid())
-    with pytest.raises(sandbox.SandboxError, match="protect_system"):
-        sandbox._check_root_policy({**view, "protect_system": False}, trusted, os.getuid())
+    falsy_values: list[object] = [False, None, 0, "", []]
+    for falsy in falsy_values:
+        forced = {**view, "protect_system": falsy, "propagate": ["/x"]}
+        sandbox._force_root_policy(forced, trusted, os.getuid())
+        assert forced["protect_system"] is True
+        assert forced["propagate"] == []
     with pytest.raises(sandbox.SandboxError, match="Eden"):
-        sandbox._check_root_policy({**view, "eden_root_cover": True}, trusted, os.getuid())
-    with pytest.raises(sandbox.SandboxError, match="propagation"):
-        sandbox._check_root_policy({**view, "propagate": ["/x"]}, trusted, os.getuid())
+        sandbox._force_root_policy({**view, "eden_root_cover": True}, trusted, os.getuid())
+    with pytest.raises(sandbox.SandboxError, match="tmp_size"):
+        sandbox._check_root_schema({**document, "view": {**view, "tmp_size": "0"}})
 
 
 def test_paths_outside_trusted_roots_are_refused(tmp_path: Path) -> None:
@@ -128,6 +132,33 @@ def test_paths_outside_trusted_roots_are_refused(tmp_path: Path) -> None:
             sandbox._check_root_paths(bad, trusted, os.getuid())
     finally:
         link.unlink()
+
+
+def test_enter_refuses_root_and_sudo_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # HIGH: the userns entry must never run privileged (126 = refused).
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    assert sandbox._main(["enter", "{}", "--", "/bin/true"]) == 126
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    monkeypatch.setenv("SUDO_UID", "1000")
+    assert sandbox._main(["enter", "{}", "--", "/bin/true"]) == 126
+
+
+def test_no_new_privs_is_set_by_the_seal() -> None:
+    # Live: after the seal prctl, /proc/self/status shows NoNewPrivs: 1.
+    import subprocess
+    import sys
+
+    completed = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import ctypes; libc = ctypes.CDLL(None); "
+            "assert libc.prctl(38, 1, 0, 0, 0) == 0; "
+            "print([l for l in open('/proc/self/status') if l.startswith('NoNewPrivs')][0].strip())",
+        ],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "NoNewPrivs:\t1" in completed.stdout
 
 
 def test_seal_and_dumpable_are_pinned() -> None:

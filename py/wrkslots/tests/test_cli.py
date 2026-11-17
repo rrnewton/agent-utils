@@ -371,12 +371,12 @@ def test_root_helper_is_a_fixed_stdin_argv(
 
     monkeypatch.setattr(sys, "dont_write_bytecode", False)
     assert sandbox.root_helper() == [
-        "sudo", "-n", "--", interpreter, "-I", "-B", helper, "enter-root"
+        "sudo", "-n", "--", interpreter, "-I", "-B", "-S", helper, "enter-root"
     ]
 
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     assert sandbox.root_helper() == [
-        "sudo", "-n", "--", interpreter, "-I", "-B", helper, "enter-root"
+        "sudo", "-n", "--", interpreter, "-I", "-B", "-S", helper, "enter-root"
     ]
 
 
@@ -402,9 +402,9 @@ def test_root_helper_carries_the_callers_dash_b_across_sudo_by_argv(
 
     assert completed.returncode == 0, completed.stderr
     argv = json.loads(completed.stdout)
-    assert argv[4:6] == ["-I", "-B"]
-    assert argv[6].endswith("sandbox.py")
-    assert argv[7] == "enter-root"
+    assert argv[4:7] == ["-I", "-B", "-S"]
+    assert argv[7].endswith("sandbox.py")
+    assert argv[8] == "enter-root"
 
 
 # ----------------------------------------------- run --place-only (slices once)
@@ -856,7 +856,7 @@ def test_enter_in_place_runs_the_root_steps_in_the_callers_scope(
 
     argv, spec = caught.value.argv, caught.value.spec
     assert argv[:6] == ["sudo", "-n", "--", os.path.realpath(sys.executable), "-I", "-B"]
-    assert argv[6:8] == [str(Path(sandbox.__file__).resolve()), "enter-root"]
+    assert argv[6:9] == ["-S", str(Path(sandbox.__file__).resolve()), "enter-root"]
     assert list((tmp_path / "runtime" / "wrkslots").glob("sandbox-*.json")) == []  # spec removed when the exec does not happen
     # The slice check (one escape), then the sudo probe; no scope was created or
     # joined (no busctl, no systemd-run) and no limit was applied (no systemctl).
@@ -1067,8 +1067,8 @@ def test_a_dash_b_placement_and_root_helper_write_no_bytecode(
     assert placed.returncode == 0, placed.stderr
     assert set(json.loads(placed.stdout)) == {"enclosing", "all_slots", "slot"}
     assert helper.returncode == 0, helper.stderr
-    assert json.loads(helper.stdout)[4:6] == ["-I", "-B"]
-    assert json.loads(helper.stdout)[6] == str(parent / "wrkslots" / "sandbox.py")
+    assert json.loads(helper.stdout)[4:7] == ["-I", "-B", "-S"]
+    assert json.loads(helper.stdout)[7] == str(parent / "wrkslots" / "sandbox.py")
     assert _tree_digest(parent) == before
 
     # The probe can see a write: the same import without -B fills the cache.

@@ -436,6 +436,7 @@ pub(crate) fn userns_helper_argv(
     let mut argv = vec![
         interpreter.to_string(),
         "-I".to_string(),
+        "-S".to_string(),
         module.to_string(),
         "enter".to_string(),
         spec_json.to_string(),
@@ -455,6 +456,7 @@ pub(crate) fn root_helper_argv(interpreter: &str, module: &str) -> Vec<String> {
         interpreter.to_string(),
         "-I".to_string(),
         "-B".to_string(),
+        "-S".to_string(),
         module.to_string(),
         "enter-root".to_string(),
     ]
