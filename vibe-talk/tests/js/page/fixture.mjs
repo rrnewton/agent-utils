@@ -7300,6 +7300,7 @@ const typedFrames = (socket) => socket.sent.filter((s) => s.includes('"user_mess
 /** A live neutral-protocol call, past its greeting. Returns the socket. */
 async function startNeutralCall(page, { greeting = false } = {}) {
   await signIn(page);
+  await enterVoice(page);
   page.setFetch(async () =>
     json(200, {
       websocket_url: "wss://example.invalid/private-voice",
@@ -7372,6 +7373,7 @@ async function startChatting(page, first = "hello") {
   page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
   await page.el("save-token").click();
   await page.settle();
+  await enterVoice(page);
   page.setFetch(MINTED);
 
   await compose(page, first);

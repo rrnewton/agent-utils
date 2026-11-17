@@ -18,7 +18,7 @@ import { CALL, CAPTURE_RESUME_MS, CHANNEL, CLEAR_ARMED_MS, DEFAULT_POST_PREFIX, 
   sourceStringTable, speakRelay, speech, spokenDraft, sseMessage, startChatting, startNeutralCall,
   startTalking, startTalkingNamed, state, statusText, test, threadData, turnDone, untilDeepLink,
   vendorAccepts, voicePostPrefixView, voicePromptView, watchTurns, withEarlierConversation, words,
-  youSay } from "./fixture.mjs";
+  enterVoice, youSay } from "./fixture.mjs";
 
 const proposalWatches = (page) => page.requests.filter((r) => r.startsWith("GET /api/v1/post-proposals"));
 
@@ -1051,8 +1051,9 @@ async function sentElsewherePage({ message: id = "204", thread = "spaces/A/threa
     },
   }]);
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
-  assert.equal(page.tab(), "voice", "fixture: the page did not open on the call's view");
+  assert.equal(page.tab(), "voice", "fixture: the switch did not reach the call's view");
   assert.equal(page.el("discord-channel").value, CHANNEL.id, "fixture: the picker is not on the other channel");
   return page;
 }
@@ -1485,6 +1486,8 @@ test("`#1303 voice-transcript-share`: an open page picks up turns recorded on an
 
   const desktop = await reloadOf(phone);
   assert.match(desktop.renderedText(), /said on the phone/);
+  // `#1781`: the pickup is the call view's, and the page now opens on the Channel.
+  await enterVoice(desktop);
 
   // The phone records more while the desktop page stays open.
   const held = desktop.storedTurns.get("conv_shared");

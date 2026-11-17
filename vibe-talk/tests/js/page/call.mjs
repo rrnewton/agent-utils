@@ -25,7 +25,7 @@ import { CANNED, CAPTURE_RESUME_MS, CHANNEL, CHARS_PER_LINE, COLLAPSE_OVER_CHARS
   shownIds, signIn, sourceCalls, sourceConstant, sourceStringTable, speakRelay, speech, spokenDraft, sseMessage,
   startChatting, startNeutralCall, startTalking, startTalkingNamed, startV1Call, state, storedTexts,
   tapPin, test, threadBadge, turnDone, typedFrames, v1Minted, vendorAccepts, watchTurns,
-  withEarlierConversation, words, youSay } from "./fixture.mjs";
+  enterDocs, enterVoice, withEarlierConversation, words, youSay } from "./fixture.mjs";
 
 /** One buffer of microphone audio arriving from the browser's audio graph. */
 function speakInto(page) {
@@ -2541,11 +2541,7 @@ test("#1040: a call started with a document open tells its agent once, ahead of 
     outline: ["Demo deployment report", "Results"],
   }];
   await signIn(page);
-  await page.el("view-switch").click();
-  await page.settle();
-  await page.el("view-switch").click();
-  await page.settle();
-  assert.equal(page.tab(), "docs", "the switch did not reach Documents");
+  await enterDocs(page);
   let card;
   for (let tries = 0; tries < 10 && !card; tries += 1) {
     await page.settle();
@@ -3326,6 +3322,7 @@ test("THE BOX IS IN THE CALL'S TRANSCRIPT IN EVERY STATE, AND THE SWITCH NEVER L
   // Idle.
   const idle = newPage();
   await signIn(idle);
+  await enterVoice(idle);
   check(idle, "idle");
   const resting = bar(idle);
   // Writing changes nothing on the bar.
@@ -4309,6 +4306,7 @@ test("walking back through the record does not move the line the reader is looki
   const page = newPage();
   storedCall(page, "conv_long", 100, RECORD_EPOCH);
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
 
   const area = page.el("scroll-area");
@@ -4333,6 +4331,7 @@ test("arriving at the top of the record takes the next step without a tap", asyn
   const page = newPage();
   storedCall(page, "conv_long", 100, RECORD_EPOCH);
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
 
   const area = page.el("scroll-area");
@@ -4354,6 +4353,7 @@ test("REACHING THE BEGINNING TAKES THE OFFER AWAY, AND DOES NOT JERK THE READER 
   const page = newPage();
   storedCall(page, "conv_long", TRANSCRIPT_PAGE_LIMIT + 20, RECORD_EPOCH);
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
 
   const area = page.el("scroll-area");
@@ -4458,6 +4458,7 @@ test("Clear takes the walk with it, rather than offering to refill the screen it
   const page = newPage();
   storedCall(page, "conv_long", 100, RECORD_EPOCH);
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
   assert.equal(page.el("load-older-turns").hidden, false);
 
@@ -4483,6 +4484,7 @@ test("browsing the record neither writes to it nor sends any of it to the voice 
   const page = newPage();
   storedCall(page, "conv_long", 100, RECORD_EPOCH);
   await signIn(page);
+  await enterVoice(page);
   await page.settle();
 
   await page.el("load-older-turns").click();
