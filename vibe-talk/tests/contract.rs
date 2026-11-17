@@ -1306,6 +1306,7 @@ fn samples() -> Value {
                     through_id: Some(MessageId("1011".into())),
                     truncated: true,
                     noise_hidden: 1,
+                    fetch_blocked: false,
                 },
                 unread_ids: vec![MessageId("1010".into()), MessageId("1011".into())],
                 markable_ids: vec![MessageId("1010".into())],
@@ -1345,6 +1346,7 @@ fn samples() -> Value {
                     through_id: None,
                     truncated: false,
                     noise_hidden: 0,
+                    fetch_blocked: false,
                 },
                 unread_ids: Vec::new(),
                 markable_ids: Vec::new(),
@@ -1382,6 +1384,7 @@ fn samples() -> Value {
                     through_id: Some(MessageId("1011".into())),
                     truncated: false,
                     noise_hidden: 1,
+                    fetch_blocked: false,
                 },
                 unread: vec![
                     CatchupUnreadRef {
@@ -1412,6 +1415,7 @@ fn samples() -> Value {
                         through_id: Some(MessageId("1011".into())),
                         truncated: false,
                         noise_hidden: 1,
+                    fetch_blocked: false,
                     },
                     covered_ids: vec![MessageId("1010".into())],
                     cited_ids: vec![MessageId("1010".into())],

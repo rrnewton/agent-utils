@@ -46,7 +46,12 @@ export interface CatchupPreview {
 }
 
 /** The window the server read, as far as the panel reports it. */
-export type CatchupWindow = Pick<WireWindow, "count" | "unread_count">;
+export type CatchupWindow = Pick<WireWindow, "count" | "unread_count"> & {
+  /** Whether older messages exist outside the window (`#1761`). */
+  truncated?: boolean;
+  /** Whether fetching those older messages stopped refused (`#1761`). */
+  fetch_blocked?: boolean;
+};
 
 /** One covered message the footer links to. */
 export type CatchupFooterLink = WireFooterLink;
@@ -310,6 +315,8 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
     window: rawWindow === null ? null : {
       count: numberOrNull(rawWindow.count) ?? 0,
       unread_count: numberOrNull(rawWindow.unread_count) ?? 0,
+      truncated: rawWindow.truncated === true,
+      fetch_blocked: rawWindow.fetch_blocked === true,
     },
     unread_ids: stringsOf(record.unread_ids),
     markable_ids: stringsOf(record.markable_ids),
@@ -371,6 +378,8 @@ function asSavedAnswer(value: unknown): { answer: CatchupAnswer; created_ms: num
       window: rawWindow === null ? null : {
         count: numberOrNull(rawWindow.count) ?? 0,
         unread_count: numberOrNull(rawWindow.unread_count) ?? 0,
+        truncated: rawWindow.truncated === true,
+        fetch_blocked: rawWindow.fetch_blocked === true,
       },
       unread_ids: stringsOf(record.covered_ids),
       markable_ids: stringsOf(record.markable_ids),
@@ -458,6 +467,8 @@ export function asCatchupPreview(value: unknown): CatchupPreview {
     window: rawWindow === null ? null : {
       count: numberOrNull(rawWindow.count) ?? 0,
       unread_count: numberOrNull(rawWindow.unread_count) ?? 0,
+      truncated: rawWindow.truncated === true,
+      fetch_blocked: rawWindow.fetch_blocked === true,
     },
     unread,
   };
@@ -1397,6 +1408,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   }
 
   let previewUnread: CatchupUnreadRef[] = [];
+  let previewWindowCount = 0;
   let boundCount = 0;
   // `#1524`: the bound's explicit start when set by the hours end; null means
   // the count end owns it and the start is that count's oldest message.
@@ -1452,7 +1464,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     drawingBound = true;
     try {
       count.value = String(bound.count);
-      count.max = String(previewUnread.length);
+      // `#1761`: the bound's ceiling is the full window (a filled thread's
+      // whole length), not only the newest held page's unread count.
+      count.max = String(Math.max(previewUnread.length, previewWindowCount));
       hours.value = String(bound.hours);
       since.value = bound.sinceMs === null ? "" : hhmm(bound.sinceMs);
     } finally {
@@ -1463,21 +1477,33 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   }
 
   /** Read the scope's preview and offer its bound; no model is asked. */
-  function previewFor(scope: DiscussScope): void {
+  function previewFor(scope: DiscussScope, again = false): void {
     generation += 1;
     const asked = generation;
     lastScope = scope;
     deps.byId("discuss-scope").textContent = scope.label;
-    deps.byId("discuss-status").textContent = "Checking what to summarize…";
+    if (!again) deps.byId("discuss-status").textContent = "Checking what to summarize…";
     void deps.catchupPreview(scope.channelId, scope).then(
       (value) => {
         if (asked !== generation || !isOpen()) return;
         const preview = asCatchupPreview(value);
         previewUnread = preview.unread;
+        previewWindowCount = preview.window?.count ?? preview.unread.length;
         boundCount = preview.unread.length;
         boundStartMs = null;
+        // `#1761`: a thread whose older pages are still being fetched polls
+        // again — each preview fetches one more page — so the held count on
+        // screen grows toward the whole thread before Summarize is offered.
+        if (scope.threadId !== null && preview.window?.truncated === true && preview.window.fetch_blocked !== true) {
+          deps.byId("discuss-status").textContent = `Fetching older messages… ${previewWindowCount} held so far.`;
+          drawBound();
+          previewFor(scope, true);
+          return;
+        }
         if (previewUnread.length === 0) {
           deps.byId("discuss-status").textContent = "Nothing unread here.";
+        } else if (preview.window?.fetch_blocked === true) {
+          deps.byId("discuss-status").textContent = `${previewUnread.length} unread ready. Older messages could not be fetched, so a summary covers only what is held.`;
         } else {
           deps.byId("discuss-status").textContent = `${previewUnread.length} unread ready.`;
         }
@@ -1520,7 +1546,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         lastAnswer = answer;
         const unread = answer.window?.unread_count ?? answer.unread_ids.length;
         const count = answer.window?.count ?? answer.unread_ids.length;
-        deps.byId("discuss-status").textContent = `Read ${unread} unread of ${count}`;
+        // `#1761`: a window cut short of the thread's start says so, visibly —
+        // never a partial window presented as the whole.
+        deps.byId("discuss-status").textContent = answer.window?.truncated === true
+          ? `Read ${unread} unread of ${count}. Older messages are not covered: fetching them did not finish.`
+          : `Read ${unread} unread of ${count}`;
         drawAnswer(answer, null);
         drawTerms(answer);
         drawFooter(answer, scope);

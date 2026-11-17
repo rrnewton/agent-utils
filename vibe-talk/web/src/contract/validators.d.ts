@@ -402,6 +402,12 @@ export interface CatchupWindow {
    */
   count: number;
   /**
+   * Whether filling a thread's missing older pages stopped on a refused or
+   * failed read (`#1761`): the window covers only what is held, and
+   * `truncated` says older messages exist outside it. Absent when false.
+   */
+  fetch_blocked?: boolean;
+  /**
    * The window's oldest message, when it has one.
    */
   from_id: MessageId | null;

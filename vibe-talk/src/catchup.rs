@@ -85,7 +85,7 @@ const MAX_CONTEXT_BODY_CHARS: usize = 320;
 ///
 /// Sized for the default 150-message window: about 320 characters a message, which keeps the
 /// single model call quick while still carrying an ordinary message whole.
-const MAX_TOTAL_BODY_CHARS: usize = 48_000;
+pub(crate) const MAX_TOTAL_BODY_CHARS: usize = 48_000;
 
 /// The caps a news body passes through when the window is over [`MAX_TOTAL_BODY_CHARS`].
 const NEWS_BODY_CAPS: [usize; 6] = [MAX_NEWS_BODY_CHARS, 600, 300, 160, 80, 0];
@@ -247,6 +247,69 @@ pub fn build_context(
         markable_ids,
         window,
     }
+}
+
+/// Split `messages` into ordered chunks, each small enough for one model call
+/// ([`MAX_TOTAL_BODY_CHARS`] of plain body text), for a window too large for a
+/// single call (`#1761`). Chunks keep the given order and together cover every
+/// non-noise message exactly once; one message larger than the budget forms a
+/// chunk alone (its body is then cut by [`build_context`], marked in place).
+/// A window that fits returns exactly one chunk, so a caller that summarizes
+/// chunk-by-chunk only differs from a single call when the window is large.
+#[must_use]
+pub fn chunk_contexts(
+    messages: &[Message],
+    read: &HashSet<MessageId>,
+    owner: &Owner,
+) -> Vec<BuiltContext> {
+    let mut groups: Vec<Vec<Message>> = Vec::new();
+    let mut current: Vec<Message> = Vec::new();
+    let mut current_chars = 0_usize;
+    for message in messages {
+        if message.noise {
+            continue;
+        }
+        let chars = neutralize(&message.content).chars().count();
+        if !current.is_empty() && current_chars + chars > MAX_TOTAL_BODY_CHARS {
+            groups.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current_chars += chars;
+        current.push(message.clone());
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+        .iter()
+        .map(|group| build_context(group, read, owner))
+        .collect()
+}
+
+/// The request that merges ordered chunk summaries into one briefing
+/// (`#1761`): the same system prompt governs it, so the merged answer keeps
+/// the shipped shape, and every citation is copied exactly so the caller's
+/// usual citation check can place it against the whole window.
+#[must_use]
+pub fn merge_prompt(chunk_answers: &[String], total: usize) -> String {
+    let mut prompt = format!(
+        "Below are summaries of consecutive parts of one thread, in order, \
+         together covering all {total} messages. Combine them into one \
+         briefing for the whole thread, following the same rules: group by \
+         workstream, keep it terse, and copy every citation exactly as \
+         [m:<full-id>] from the part summaries — never invent, shorten, or \
+         alter an id, and drop a claim rather than keep it without its \
+         citation. Say in the briefing that it covers all {total} messages.\n"
+    );
+    for (index, answer) in chunk_answers.iter().enumerate() {
+        prompt.push_str(&format!(
+            "\n--- Part {} of {} ---\n{}",
+            index + 1,
+            chunk_answers.len(),
+            answer
+        ));
+    }
+    prompt
 }
 
 /// The bodies at the caps in force: per message first, then, while the whole is still over
@@ -763,6 +826,38 @@ mod tests {
 
     fn read_set(ids: &[&str]) -> HashSet<MessageId> {
         ids.iter().map(|id| MessageId((*id).to_owned())).collect()
+    }
+
+    #[test]
+    fn chunks_partition_a_large_window_in_order_and_fit_one_call() {
+        // `#1761`: 211 bodies of 400 chars exceed one call's budget; the
+        // chunks together cover every message exactly once, in order.
+        let body = "x".repeat(400);
+        let messages: Vec<Message> = (0..211)
+            .map(|seq| message(&format!("m{seq}"), "Grace", "U_GRACE", &body))
+            .collect();
+        let chunks = chunk_contexts(&messages, &read_set(&[]), &owner());
+        assert!(chunks.len() > 1, "one chunk: the window fits one call");
+        let covered: Vec<String> = chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .unread_ids
+                    .iter()
+                    .map(|id| id.as_str().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let want: Vec<String> = messages
+            .iter()
+            .map(|held| held.id.as_str().to_owned())
+            .collect();
+        assert_eq!(covered, want, "every message once, in order");
+        // A window that fits stays exactly one chunk.
+        let small = vec![message("1001", "Grace", "U_GRACE", "short")];
+        assert_eq!(chunk_contexts(&small, &read_set(&[]), &owner()).len(), 1);
+        let merged = merge_prompt(&["- a [m:m1]".to_owned()], 211);
+        assert!(merged.contains("all 211 messages"), "{merged}");
     }
 
     #[test]

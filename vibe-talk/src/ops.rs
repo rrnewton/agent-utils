@@ -6797,6 +6797,22 @@ pub struct CatchupFetch {
     pub truncated: bool,
     /// Messages the owner's noise rules call read, hidden from `messages` and counted here.
     pub noise_hidden: usize,
+    /// Whether filling a thread's missing older pages stopped on a refused or
+    /// failed timeline read (`#1761`): the window then covers only what is held,
+    /// and `truncated` says older messages exist outside it.
+    pub fetch_blocked: bool,
+}
+
+/// How far a Discuss thread read may go past the held copy (`#1761`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatchupFill {
+    /// The held copy alone, as `#1348 discuss-cache-only` shipped.
+    CacheOnly,
+    /// One paced timeline page toward the thread's start, then re-answer: the
+    /// panel polls this so the owner watches the held count grow.
+    Step,
+    /// Paced timeline pages until the thread's start (or a bound refuses).
+    All,
 }
 
 /// Fetch the window one Discuss read covers: a channel's newest `window` messages in `view`
@@ -6826,6 +6842,36 @@ pub async fn catchup_fetch(
     thread_id: Option<&str>,
     window: usize,
 ) -> Result<CatchupFetch, OpError> {
+    catchup_fetch_filled(
+        state,
+        caller,
+        channel_id,
+        view,
+        thread_id,
+        window,
+        CatchupFill::CacheOnly,
+    )
+    .await
+}
+
+/// [`catchup_fetch`] with a thread fill (`#1761 vibe-talk-discuss-99-message-cap`):
+/// when the held walk over one whole thread stops short of its start (or holds
+/// nothing of it), fetch the missing older pages through the ordinary paced
+/// timeline read — the same rate-budgeted path every page read takes — until
+/// the thread's start, the [`MAX_RECAP_PAGES`] bound, or a refused read.
+/// `Step` fetches one page per call so a polling caller shows progress; `All`
+/// fetches to the start. A refused or failed page never fails the read: what
+/// is held still answers, with `truncated` and `fetch_blocked` set. Channel
+/// scopes never fill: they keep the `#1348` cache-only rule whole.
+pub async fn catchup_fetch_filled(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    view: crate::threads::TimelineView,
+    thread_id: Option<&str>,
+    window: usize,
+    fill: CatchupFill,
+) -> Result<CatchupFetch, OpError> {
     use crate::threads::TimelineView;
     let channel = allowed(state, channel_id).await?;
     let whole_thread = thread_id.is_some();
@@ -6841,7 +6887,7 @@ pub async fn catchup_fetch(
     // every held answer. Flat is composed as the cache holds it: Main's walk, plus the
     // held replies of every thread rooted in it (the cache has no Flat scope of its own
     // on most shapes).
-    let (mut held, truncated) = if !may_serve(state, caller) {
+    let (mut held, mut truncated) = if !may_serve(state, caller) {
         (Vec::new(), false)
     } else if whole_thread {
         catchup_walk_scope(state, &channel.id, TimelineView::Thread, thread_id, target).await
@@ -6872,6 +6918,53 @@ pub async fn catchup_fetch(
         }
         (held, truncated)
     };
+    // `#1761`: a whole-thread read whose held walk stopped short of the start
+    // (or holds nothing) fetches its missing older pages, one paced timeline
+    // page per step, newest-held-first. Every fetched page also lands in the
+    // cache through the ordinary read path, so the held copy grows behind it.
+    let mut fetch_blocked = false;
+    if whole_thread && fill != CatchupFill::CacheOnly && (truncated || held.is_empty()) {
+        let mut steps = match fill {
+            CatchupFill::Step => 1,
+            _ => MAX_RECAP_PAGES,
+        };
+        while steps > 0 {
+            steps -= 1;
+            let before = held
+                .iter()
+                .min_by_key(|message| {
+                    (message.created_ms().unwrap_or(i64::MAX), message.id.clone())
+                })
+                .map(|message| message.id.as_str().to_owned());
+            let request = crate::threads::TimelineRequest {
+                view: TimelineView::Thread,
+                thread_id: thread_id.map(str::to_owned),
+                before,
+                after: None,
+                limit: MAX_PAGE,
+            };
+            match timeline(state, caller, channel_id, &request).await {
+                Ok((_, page)) => {
+                    let more = page.has_more;
+                    let empty_page = page.messages.is_empty();
+                    held.extend(page.messages);
+                    held.sort_by_key(|message| {
+                        (message.created_ms().unwrap_or(i64::MAX), message.id.clone())
+                    });
+                    held.dedup_by(|next, kept| next.id == kept.id);
+                    truncated = more;
+                    if !more || empty_page {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    fetch_blocked = true;
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+    }
     // Held messages arrive unstamped and unmarked, as the cache holds them: stamp and mark
     // them as every served answer's are, before anything downstream prints their fields.
     let noise = crate::noise::filter_for(state, &channel.id).await;
@@ -6896,6 +6989,7 @@ pub async fn catchup_fetch(
         read,
         truncated,
         noise_hidden,
+        fetch_blocked,
     })
 }
 

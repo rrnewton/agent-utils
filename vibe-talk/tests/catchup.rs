@@ -309,6 +309,150 @@ async fn fetch_of_a_thread_covers_it_whole_from_the_cache() {
     assert!(!fetched.truncated);
 }
 
+/// `#1761`: fill only the newest 99-message page of a 211-message thread, as a
+/// page that was opened but never scrolled back leaves the cache.
+async fn fill_newest_page(
+    state: &vibe_talk::state::AppState,
+    view: TimelineView,
+    thread_id: Option<&str>,
+) {
+    let request = TimelineRequest {
+        view,
+        thread_id: thread_id.map(str::to_owned),
+        before: None,
+        after: None,
+        limit: 99,
+    };
+    let (_, page) = vibe_talk::ops::timeline(state, Scope::Write, WRITE_CHANNEL, &request)
+        .await
+        .expect("newest page read");
+    assert!(page.has_more, "the fixture thread has older pages");
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(std::time::Duration::from_secs(20)));
+}
+
+#[tokio::test]
+async fn thread_fill_walks_past_the_newest_page_to_the_whole_thread() {
+    // `#1761`: the cache-only walk stops at the newest page (99 of 211); the
+    // filled read steps back one page per Step, then to the start under All.
+    let messages: Vec<Message> = (0..211)
+        .map(|seq| message(seq, Some((THREAD_A, seq == 0)), false))
+        .collect();
+    let backend = backend_with(messages.clone());
+    let (state, _store, _summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill_newest_page(&state, TimelineView::Thread, Some(THREAD_A)).await;
+
+    let held_only = vibe_talk::ops::catchup_fetch(
+        &state,
+        Scope::Write,
+        WRITE_CHANNEL,
+        TimelineView::Thread,
+        Some(THREAD_A),
+        150,
+    )
+    .await
+    .expect("held fetch");
+    assert_eq!(held_only.messages.len(), 99, "the held walk's first page");
+    assert!(held_only.truncated);
+
+    let stepped = vibe_talk::ops::catchup_fetch_filled(
+        &state,
+        Scope::Write,
+        WRITE_CHANNEL,
+        TimelineView::Thread,
+        Some(THREAD_A),
+        150,
+        vibe_talk::ops::CatchupFill::Step,
+    )
+    .await
+    .expect("step fetch");
+    assert_eq!(stepped.messages.len(), 198, "one fetched page further back");
+    assert!(stepped.truncated);
+
+    let filled = vibe_talk::ops::catchup_fetch_filled(
+        &state,
+        Scope::Write,
+        WRITE_CHANNEL,
+        TimelineView::Thread,
+        Some(THREAD_A),
+        150,
+        vibe_talk::ops::CatchupFill::All,
+    )
+    .await
+    .expect("filled fetch");
+    assert_eq!(filled.messages.len(), 211, "the whole thread");
+    assert!(!filled.truncated);
+    assert!(!filled.fetch_blocked);
+    let ids: Vec<&str> = filled
+        .messages
+        .iter()
+        .map(|held| held.id.as_str())
+        .collect();
+    let want: Vec<&str> = messages.iter().map(|held| held.id.as_str()).collect();
+    assert_eq!(ids, want, "every message, oldest first");
+}
+
+#[tokio::test]
+async fn a_211_message_thread_is_filled_chunked_and_counted() {
+    // `#1761`: only the newest page is held; the read fills the rest, then a
+    // window over one call's body budget is summarized in ordered chunks and
+    // merged, with the server's own coverage count up front.
+    let messages: Vec<Message> = (0..211)
+        .map(|seq| {
+            let mut held = message(seq, Some((THREAD_A, seq == 0)), false);
+            held.content = format!("message {seq} {}", "detail ".repeat(50));
+            held
+        })
+        .collect();
+    let backend = backend_with(messages.clone());
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill_newest_page(&state, TimelineView::Thread, Some(THREAD_A)).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    summarizer.answer_with("one point worth knowing");
+    let app = vibe_talk::http::router(state);
+    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+    let (status, body) = post(
+        &app,
+        &path,
+        Some(WRITE_TOKEN),
+        &json!({ "thread_id": THREAD_A }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["window"]["count"], json!(211), "{body}");
+    assert_eq!(body["window"]["truncated"], json!(false), "{body}");
+    let text = body["text"].as_str().expect("text");
+    assert!(
+        text.starts_with("Covers all 211 messages of this thread."),
+        "{text}"
+    );
+    // Chunks plus one merge; the chunk prompts together name every message.
+    let calls = summarizer.prompt_calls();
+    assert_eq!(calls.len(), 3, "two chunks and a merge: {calls:?}");
+    let cited = |prompt: &str| -> std::collections::HashSet<String> {
+        prompt
+            .split("[m:")
+            .skip(1)
+            .filter_map(|rest| rest.split(&[' ', '|', ']'][..]).next().map(str::to_owned))
+            .filter(|id| id != "<full-id>")
+            .collect()
+    };
+    let covered: std::collections::HashSet<String> = cited(&calls[0].1)
+        .union(&cited(&calls[1].1))
+        .cloned()
+        .collect();
+    let want: std::collections::HashSet<String> = messages
+        .iter()
+        .map(|held| held.id.as_str().to_owned())
+        .collect();
+    assert_eq!(covered, want, "every message in exactly one chunk");
+    assert!(calls[2].1.contains("211"), "the merge names the count");
+}
+
 #[tokio::test]
 async fn fetch_from_an_empty_cache_holds_nothing_and_reads_nothing() {
     let backend = backend_with(vec![message(0, None, false)]);

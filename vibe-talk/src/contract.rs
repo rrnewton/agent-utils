@@ -1588,6 +1588,11 @@ pub struct CatchupWindow {
     pub truncated: bool,
     /// Messages the owner's noise rules call read, hidden from the window and counted here.
     pub noise_hidden: usize,
+    /// Whether filling a thread's missing older pages stopped on a refused or
+    /// failed read (`#1761`): the window covers only what is held, and
+    /// `truncated` says older messages exist outside it. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fetch_blocked: bool,
 }
 
 /// One unread message a Discuss answer covers, for the panel's footer list.

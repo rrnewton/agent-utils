@@ -152,7 +152,7 @@ function answer(overrides = {}) {
   };
 }
 
-function fixture({ selection = { view: "flat", threadId: null, thread: null }, respond, previewBody, nowMs } = {}) {
+function fixture({ selection = { view: "flat", threadId: null, thread: null }, respond, previewBody, previewBodies, nowMs } = {}) {
   const els = {};
   for (const id of IDS) els[id] = fakeElement(id.includes("mark") || id.endsWith("open") || id.endsWith("close") || id.endsWith("retry") ? "button" : "div");
   els["discuss-panel"].hidden = true;
@@ -179,6 +179,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     },
     catchupPreview: (channelId, scope) => {
       calls.previews.push({ channelId, scope });
+      if (previewBodies) return Promise.resolve(previewBodies[Math.min(calls.previews.length - 1, previewBodies.length - 1)]);
       return Promise.resolve(previewBody ?? preview());
     },
     ...(nowMs === undefined ? {} : { now: () => nowMs }),
@@ -373,6 +374,43 @@ test("catchup: the hours end moves together with N and since (#1524)", async () 
     click(fx.els["discuss-summarize"]);
     await flush();
     assert.equal(fx.calls.posts.at(-1).body.since_ms, unread[0].at_ms);
+  } finally { fx.restore(); }
+});
+
+test("catchup: a thread preview polls while older pages fetch, and the count caps at the whole thread (#1761)", async () => {
+  const fx = fixture({
+    selection: { view: "thread", threadId: "t1", thread: { title: "Long thread" } },
+    previewBodies: [
+      preview({ window: { count: 99, unread_count: 2, truncated: true } }),
+      preview({ window: { count: 198, unread_count: 2, truncated: true } }),
+      preview({ window: { count: 211, unread_count: 2, truncated: false } }),
+    ],
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    await flush();
+    assert.equal(fx.calls.previews.length, 3, "the preview did not poll the fetch");
+    assert.equal(fx.els["discuss-status"].textContent, "2 unread ready.");
+    assert.equal(fx.els["discuss-count"].max, "211", "the count caps at the preview page, not the thread");
+  } finally { fx.restore(); }
+});
+
+test("catchup: a blocked thread fetch says so and stops polling (#1761)", async () => {
+  const fx = fixture({
+    selection: { view: "thread", threadId: "t1", thread: { title: "Long thread" } },
+    previewBodies: [preview({ window: { count: 99, unread_count: 2, truncated: true, fetch_blocked: true } })],
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    await flush();
+    assert.equal(fx.calls.previews.length, 1, "a blocked fetch polled on");
+    assert.match(fx.els["discuss-status"].textContent, /could not be fetched/);
   } finally { fx.restore(); }
 });
 

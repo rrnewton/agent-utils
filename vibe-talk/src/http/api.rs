@@ -2576,14 +2576,22 @@ pub async fn catchup_preview(
         .map(str::trim)
         .filter(|id| !id.is_empty());
     let (view, view_name) = catchup_view(thread_id, query.view.as_deref())?;
+    // `#1761`: a thread preview fetches one missing older page per call, so a
+    // polling panel watches the held count grow toward the thread's start.
+    let fill = if thread_id.is_some() {
+        ops::CatchupFill::Step
+    } else {
+        ops::CatchupFill::CacheOnly
+    };
     let fetched = crate::read_reason::ReadReason::Discuss
-        .scope(ops::catchup_fetch(
+        .scope(ops::catchup_fetch_filled(
             &state,
             Scope::Write,
             &channel_id,
             view,
             thread_id,
             state.config.summaries.catchup_window_messages,
+            fill,
         ))
         .await?;
     let owner = crate::owner::Owner::of(&state);
@@ -2615,6 +2623,7 @@ pub async fn catchup_preview(
             through_id: fetched.messages.last().map(|message| message.id.clone()),
             truncated: fetched.truncated,
             noise_hidden: fetched.noise_hidden,
+            fetch_blocked: fetched.fetch_blocked,
         },
         unread,
     })))
@@ -2649,14 +2658,21 @@ pub async fn catchup(
         .filter(|id| !id.is_empty());
     let (view, view_name) = catchup_view(thread_id, body.view.as_deref())?;
     let context_began = std::time::Instant::now();
+    // `#1761`: a whole-thread read fills its missing older pages first.
+    let fill = if thread_id.is_some() {
+        ops::CatchupFill::All
+    } else {
+        ops::CatchupFill::CacheOnly
+    };
     let mut fetched = crate::read_reason::ReadReason::Discuss
-        .scope(ops::catchup_fetch(
+        .scope(ops::catchup_fetch_filled(
             &state,
             Scope::Write,
             &channel_id,
             view,
             thread_id,
             state.config.summaries.catchup_window_messages,
+            fill,
         ))
         .await?;
     // The panel's bound (`discuss-summarize-button`): only what the chosen time covers.
@@ -2680,26 +2696,61 @@ pub async fn catchup(
     // Cache-only (`#1348 discuss-cache-only`): a window the cache holds nothing of is
     // answered saying so, with no model call — never a fetch to fill it.
     let held_nothing = fetched.messages.is_empty();
+    let mut chunked = false;
     let model_began = std::time::Instant::now();
-    let raw = if held_nothing {
-        if thread_id.is_some() {
-            "This server's cache holds nothing of this thread yet. Open it once so the \
+    let raw =
+        if held_nothing {
+            if thread_id.is_some() {
+                "This server's cache holds nothing of this thread yet. Open it once so the \
              server holds it, then Discuss."
-                .to_owned()
+                    .to_owned()
+            } else {
+                "This server's cache holds nothing of this channel yet.".to_owned()
+            }
         } else {
-            "This server's cache holds nothing of this channel yet.".to_owned()
-        }
-    } else {
-        agent
-            .complete_prompt(&system, &built.prompt)
-            .await
-            .map_err(|error| match error {
-                // A backend with no free-form prompt in the side-agent seat is the same
-                // deployment fact as no side agent at all, and gets the same clear answer.
-                crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),
-                other => ApiError::from(OpError::Summarizer(other)),
-            })?
-    };
+            // `#1761`: a window too large for one call is summarized in ordered
+            // chunks, then merged — every message covered by exactly one chunk.
+            let chunks = crate::catchup::chunk_contexts(&fetched.messages, &fetched.read, &owner);
+            if chunks.len() <= 1 {
+                agent
+                    .complete_prompt(&system, &built.prompt)
+                    .await
+                    .map_err(|error| match error {
+                        // A backend with no free-form prompt in the side-agent seat is the same
+                        // deployment fact as no side agent at all, and gets the same clear answer.
+                        crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),
+                        other => ApiError::from(OpError::Summarizer(other)),
+                    })?
+            } else {
+                chunked = true;
+                let mut answers: Vec<String> = Vec::with_capacity(chunks.len());
+                for (index, chunk) in chunks.iter().enumerate() {
+                    let prompt = if index == 0 && !warmup.is_empty() {
+                        format!("{warmup}\n\n{}", chunk.prompt)
+                    } else {
+                        chunk.prompt.clone()
+                    };
+                    answers.push(agent.complete_prompt(&system, &prompt).await.map_err(
+                        |error| match error {
+                            crate::summarize::SummaryError::NotConfigured(_) => {
+                                discuss_not_available()
+                            }
+                            other => ApiError::from(OpError::Summarizer(other)),
+                        },
+                    )?);
+                }
+                agent
+                    .complete_prompt(
+                        &system,
+                        &crate::catchup::merge_prompt(&answers, fetched.messages.len()),
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),
+                        other => ApiError::from(OpError::Summarizer(other)),
+                    })?
+            }
+        };
     let model_ms = if held_nothing {
         0
     } else {
@@ -2778,7 +2829,16 @@ pub async fn catchup(
         };
         Some((cite_time(message), address, false))
     };
-    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &allowed, cite);
+    let (mut text, cited_ids) = crate::catchup::shape_answer(&raw, &allowed, cite);
+    // `#1761`: a chunked summary states its whole-thread coverage up front,
+    // server-written so the count is the server's own, not the model's.
+    if chunked {
+        text = format!(
+            "Covers all {} messages of this thread.\n\n{}",
+            fetched.messages.len(),
+            text
+        );
+    }
     // The addresses `shape_answer` just built, recomputed through the same
     // `cite` (out-of-scope ones with their flag, via
     // `catchup::trusted_cite_address`): exactly the citation hrefs the
@@ -2885,6 +2945,7 @@ pub async fn catchup(
         through_id: fetched.messages.last().map(|message| message.id.clone()),
         truncated: fetched.truncated,
         noise_hidden: fetched.noise_hidden,
+        fetch_blocked: fetched.fetch_blocked,
     };
     let model = state
         .catchup_model
@@ -3329,6 +3390,7 @@ pub async fn catchup_update(
         through_id: fetched.messages.last().map(|held| held.id.clone()),
         truncated: fetched.truncated,
         noise_hidden: fetched.noise_hidden,
+        fetch_blocked: fetched.fetch_blocked,
     };
     let stamp = crate::contract::CatchupStamp {
         context_ms,

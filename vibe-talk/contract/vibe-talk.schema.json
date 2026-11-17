@@ -580,6 +580,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "fetch_blocked": {
+          "description": "Whether filling a thread's missing older pages stopped on a refused or\nfailed read (`#1761`): the window covers only what is held, and\n`truncated` says older messages exist outside it. Absent when false.",
+          "type": "boolean"
+        },
         "from_id": {
           "anyOf": [
             {
