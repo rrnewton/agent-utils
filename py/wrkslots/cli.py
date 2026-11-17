@@ -88576,18 +88576,26 @@ def _cmd_recover(
                         "running; wait for the batch to finish"
                     )
                 if _seal_state != "dead" and not bool(
-                    getattr(args, "coordinator_authorized", False)
+                    getattr(args, "override_unjudgeable_seal", False)
                 ):
                     # Fail closed on a seal nobody can judge (#1736
-                    # review); the explicit override is the
-                    # coordinator's own authorization, given only after
-                    # confirming no batch is running.
+                    # review); the dedicated override -- not the routine
+                    # --coordinator-authorized every coordinator run
+                    # passes -- is the coordinator's explicit decision,
+                    # given only after confirming no batch is running.
                     raise Refusal(
                         f"validation-batch seal recorded in {_seal_path}; "
                         f"its owner cannot be proven dead here "
                         f"({_seal_detail}), so recover refuses it; if no "
                         "batch is running, rerun with "
-                        "--coordinator-authorized to override"
+                        "--coordinator-authorized --override-unjudgeable-seal"
+                    )
+                if _seal_state != "dead" and not bool(
+                    getattr(args, "coordinator_authorized", False)
+                ):
+                    raise Refusal(
+                        "--override-unjudgeable-seal requires "
+                        "--coordinator-authorized as well"
                     )
                 # #885: an exact-slot create journal that overlaps no seal
                 # target is recovered before the seal, whose pairing would
@@ -92577,6 +92585,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--discard-partial",
         action="store_true",
         help="discard an incomplete temp write only when its prior durable file is valid",
+    )
+    recover.add_argument(
+        "--override-unjudgeable-seal",
+        action="store_true",
+        help=(
+            "retire a validation-batch seal whose owner cannot be judged here "
+            "(another machine, an unreadable journal): the coordinator's explicit "
+            "decision, requiring --coordinator-authorized as well, given only after "
+            "confirming no batch is running (default: off, an unknowable seal refuses)"
+        ),
     )
     recover.add_argument(
         "--discard-stale-image-copy",

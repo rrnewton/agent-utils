@@ -1364,17 +1364,35 @@ def test_recover_fails_closed_on_an_unknowable_seal_without_override(
     project, target, seal, original = _crashed_seal(tmp_path, monkeypatch)
     _rewrite_actor(seal, host_id="0" * 32)
 
+    # Even the routine --coordinator-authorized does not override:
+    # the dedicated flag is the explicit decision.
     refused = raw_command_with_census_authority_stub(
-        project, "recover", "--coordinator-pid", str(os.getpid())
+        project,
+        "recover",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
     )
     assert refused.returncode == 3, refused.stderr
-    assert "--coordinator-authorized" in refused.stderr
+    assert "--override-unjudgeable-seal" in refused.stderr
+    assert seal.exists()
+
+    unauthenticated = raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--override-unjudgeable-seal",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+    assert unauthenticated.returncode == 3, unauthenticated.stderr
+    assert "requires --coordinator-authorized as well" in unauthenticated.stderr
     assert seal.exists()
 
     recovered = raw_command_with_census_authority_stub(
         project,
         "recover",
         "--coordinator-authorized",
+        "--override-unjudgeable-seal",
         "--coordinator-pid",
         str(os.getpid()),
     )
@@ -1393,10 +1411,11 @@ def test_an_old_format_seal_without_x_is_recovered_as_before(
     del raw["x"]
     seal.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
 
+    # No authorization at all: a dead actor's old-format seal
+    # recovers exactly as before, with no override needed.
     recovered = raw_command_with_census_authority_stub(
         project,
         "recover",
-        "--coordinator-authorized",
         "--coordinator-pid",
         str(os.getpid()),
     )
