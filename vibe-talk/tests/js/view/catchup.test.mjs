@@ -21,7 +21,7 @@ const {
   DISCUSS_BINDING_RULES, WIDEN_OR_SIDEWAYS_ACTION, discussScopeKey, isSameDiscussScope,
   linkDecision, normalizeDiscussScope, viewChangeDecision,
   applyStrikes, citationIdsOf, hasWord, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, FRESH_CLASS,
-  hoursSinceStart, countForHours, boundForHours,
+  hoursSinceStart, countForHours, boundForHours, summaryTimeLabel,
 } = VIEW;
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -542,6 +542,58 @@ test("catchup: a citation tap in the answer jumps; unknown terms draw collapsed"
   } finally { fx.restore(); }
 });
 
+test("catchup: re-summarize marks the standing terms as the previous summary's until the new answer lands (#1787)", async () => {
+  const second = deferred();
+  let posts = 0;
+  const fx = fixture({ respond: () => {
+    posts += 1;
+    return posts === 1 ? Promise.resolve(answer({ unknown_terms: ["old-term"] })) : second.promise;
+  } });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    assert.equal(fx.els["discuss-terms"].hidden, false);
+    assert.equal(fx.els["discuss-terms"].getAttribute("data-stale"), null, "fresh terms marked stale");
+    click(fx.els["discuss-summarize"]);
+    assert.equal(fx.els["discuss-status"].textContent, "Reading…");
+    assert.equal(fx.els["discuss-terms"].getAttribute("data-stale"), "true", "stale terms still presented as current");
+    assert.match(fx.els["discuss-terms-summary"].textContent, /from the previous summary/);
+    assert.equal(fx.els["discuss-terms-list"].children[0].textContent, "old-term", "the old list vanished instead of being marked");
+    second.resolve(answer({ unknown_terms: ["new-term"], text: "Fresh point." }));
+    await flush();
+    assert.equal(fx.els["discuss-terms"].getAttribute("data-stale"), null, "new terms stayed marked stale");
+    assert.equal(fx.els["discuss-terms-summary"].textContent, "Terms I didn't understand (1)");
+    assert.equal(fx.els["discuss-terms-list"].children[0].textContent, "new-term");
+  } finally { fx.restore(); }
+});
+
+test("catchup: a failed re-summarize restores the previous summary and its terms unmarked (#1787)", async () => {
+  let posts = 0;
+  const fx = fixture({ respond: () => {
+    posts += 1;
+    return posts === 1
+      ? Promise.resolve(answer({ unknown_terms: ["old-term"] }))
+      : Promise.reject(new Error("HTTP 502 chat_error: upstream slow"));
+  } });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.match(fx.els["discuss-status"].textContent, /upstream slow/);
+    assert.equal(fx.els["discuss-retry"].hidden, false, "no retry was offered");
+    assert.equal(fx.els["discuss-answer"].textContent, "Two things happened.", "the failed ask dropped the standing summary");
+    assert.equal(fx.els["discuss-terms"].getAttribute("data-stale"), null, "restored terms stayed marked stale");
+    assert.equal(fx.els["discuss-terms-summary"].textContent, "Terms I didn't understand (1)");
+    assert.equal(fx.els["discuss-terms-list"].children[0].textContent, "old-term");
+    assert.equal(fx.els["discuss-footer"].hidden, false, "the restored summary lost its footer");
+  } finally { fx.restore(); }
+});
+
 test("catchup: the footer covers N and each link jumps with its ref", async () => {
   const fx = fixture();
   try {
@@ -809,6 +861,66 @@ test("catchup: reopening draws the saved record and asks nothing", async () => {
     await flush();
     assert.equal(fx.calls.updates.length, 1);
     assert.deepEqual(fx.calls.posts, [], "Update refetched a full summary");
+  } finally { fx.restore(); }
+});
+
+test("catchup: Update marks the standing terms stale and restores them on failure (#1787)", async () => {
+  const fx = fixture();
+  const record = savedRecord();
+  record.current_summary.unknown_terms = ["old-term"];
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    return Promise.resolve(record);
+  };
+  const attempt = deferred();
+  fx.deps.catchupUpdate = (channelId, scope) => {
+    fx.calls.updates.push({ channelId, scope });
+    return attempt.promise;
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(fx.els["discuss-terms"].hidden, false);
+    assert.equal(fx.els["discuss-terms"].getAttribute("data-stale"), null, "fresh terms marked stale");
+    click(fx.els["discuss-update"]);
+    assert.equal(fx.els["discuss-status"].textContent, "Updating…");
+    assert.equal(fx.els["discuss-terms"].getAttribute("data-stale"), "true", "stale terms still presented as current");
+    assert.match(fx.els["discuss-terms-summary"].textContent, /from the previous summary/);
+    attempt.reject(new Error("HTTP 502 chat_error: upstream slow"));
+    await flush();
+    assert.equal(fx.els["discuss-terms"].getAttribute("data-stale"), null, "restored terms stayed marked stale");
+    assert.equal(fx.els["discuss-terms-summary"].textContent, "Terms I didn't understand (1)");
+    assert.equal(fx.els["discuss-terms-list"].children[0].textContent, "old-term");
+  } finally { fx.restore(); }
+});
+
+test("catchup: summary time labels name the day away from today (#1787)", () => {
+  const now = new Date(2026, 10, 17, 15, 0).getTime();
+  const today = summaryTimeLabel(new Date(2026, 10, 17, 9, 15).getTime(), now);
+  assert.match(today, /^\d{1,2}:\d{2}\s?(AM|PM)$/, `today's label named a day: ${today}`);
+  assert.equal(summaryTimeLabel(new Date(2026, 10, 16, 15, 42).getTime(), now).startsWith("Mon "), true, "yesterday kept the time alone");
+  assert.equal(summaryTimeLabel(new Date(2026, 10, 11, 15, 42).getTime(), now).startsWith("Wed "), true, "six days back lost its weekday");
+  assert.equal(summaryTimeLabel(new Date(2026, 10, 10, 15, 42).getTime(), now).startsWith("Nov 10, "), true, "seven days back lost its date");
+  assert.equal(summaryTimeLabel(new Date(2025, 11, 31, 15, 42).getTime(), now).startsWith("Dec 31, 2025, "), true, "another year lost its year");
+});
+
+test("catchup: timeline and saved labels date a previous day's summary (#1787)", async () => {
+  const now = new Date(2026, 8, 22, 12, 0).getTime();
+  const fx = fixture({ nowMs: now });
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    return Promise.resolve(savedRecord());
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.match(fx.els["discuss-status"].textContent, /Saved summary · Sun \d{1,2}:\d{2}\s?(AM|PM)/);
+    const timeline = fx.els["discuss-timeline"].children;
+    assert.match(timeline[0].children[0].textContent, /Earlier summary · Sun \d{1,2}:\d{2}\s?(AM|PM) · 1 unread/);
   } finally { fx.restore(); }
 });
 

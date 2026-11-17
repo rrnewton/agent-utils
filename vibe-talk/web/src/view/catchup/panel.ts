@@ -481,6 +481,37 @@ export function hhmm(atMs: number): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/** The fixed English day names, as `dayLabel` (present/time) keeps them. */
+const SUMMARY_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const SUMMARY_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+/** The most days back a label names by weekday alone, as the rows do (`#729`). */
+const SUMMARY_WEEKDAY_DAYS = 6;
+
+/** Calendar days from `at`'s day to `now`'s, from the local fields (a clock-change day is one day). */
+function summaryDaysBefore(at: Date, now: Date): number {
+  const day = (when: Date): number => Date.UTC(when.getFullYear(), when.getMonth(), when.getDate());
+  return Math.round((day(now) - day(at)) / 86_400_000);
+}
+
+/**
+ * `#1787`. When a summary was made, as its label says it: the message rows'
+ * rule (`#729`) — today's is the time alone, one to six days back adds the
+ * weekday, anything older names the month and day (and the year when it is
+ * not this year) — in the locale time the rows show. Kept here, not imported
+ * from present/time: this package may not import it (`web/architecture.mjs`),
+ * as `hhmm` above is kept here too. "Nov 16, 3:42 PM", never a bare time of
+ * day a previous day's summary could hide behind.
+ */
+export function summaryTimeLabel(createdMs: number, nowMs: number): string {
+  const at = new Date(createdMs);
+  const time = at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const days = summaryDaysBefore(at, new Date(nowMs));
+  if (days === 0) return time;
+  if (days >= 1 && days <= SUMMARY_WEEKDAY_DAYS) return `${SUMMARY_WEEKDAYS[at.getDay()]} ${time}`;
+  const year = at.getFullYear() === new Date(nowMs).getFullYear() ? "" : `, ${at.getFullYear()}`;
+  return `${SUMMARY_MONTHS[at.getMonth()]} ${at.getDate()}${year}, ${time}`;
+}
+
 /**
  * The bound for "last `n` unread": how many, and the instant the POST bounds at
  * (the Nth-newest unread's own time, so the server covers exactly those N).
@@ -1134,9 +1165,26 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     restrike();
   }
 
+  /**
+   * `#1787`. While a replacement is read, the standing terms are the previous
+   * summary's: dim them (the stylesheet's `data-stale` rule) and say so in
+   * their heading, so they never present as the new answer's. The next
+   * `drawTerms` — the new answer's, or the restored one's — clears the mark.
+   */
+  function markTermsStale(): void {
+    const box = maybe("discuss-terms");
+    if (box === null || box.hidden) return;
+    box.setAttribute("data-stale", "true");
+    const summary = maybe("discuss-terms-summary");
+    if (summary !== null && !summary.textContent.includes("previous summary")) {
+      summary.textContent = `${summary.textContent} · from the previous summary`;
+    }
+  }
+
   /** The terms the answer did not understand, collapsed (`#1351`). */
   function drawTerms(answer: CatchupAnswer): void {
     const box = deps.byId("discuss-terms");
+    box.removeAttribute("data-stale");
     box.hidden = answer.unknown_terms.length === 0;
     if (answer.unknown_terms.length === 0) return;
     deps.byId("discuss-terms-summary").textContent =
@@ -1245,7 +1293,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         details.className = "discuss-old";
         const summary = document.createElement("summary");
         const count = entry.answer.window?.unread_count ?? entry.answer.unread_ids.length;
-        summary.textContent = `Earlier summary · ${entry.created_ms > 0 ? hhmm(entry.created_ms) : "—"} · ${count} unread`;
+        summary.textContent = `Earlier summary · ${entry.created_ms > 0 ? summaryTimeLabel(entry.created_ms, nowMs()) : "—"} · ${count} unread`;
         details.appendChild(summary);
         const body = document.createElement("div");
         if (entry.answer.text_html !== "") insertSanitizedHtml(body, entry.answer.text_html);
@@ -1275,6 +1323,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     deps.byId("discuss-scope").textContent = scope.label;
     deps.byId("discuss-status").textContent = "Updating…";
     deps.byId("discuss-retry").hidden = true;
+    // `#1787`: the standing summary's terms are the old one's while it updates.
+    markTermsStale();
     setPending(true);
     void deps.catchupUpdate(scope.channelId, scope).then(
       (value) => {
@@ -1294,6 +1344,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       (error: unknown) => {
         setPending(false);
         if (asked !== generation || !isOpen()) return;
+        // `#1787`: the old summary stands again, its terms current once more.
+        if (lastAnswer !== null) drawTerms(lastAnswer);
         if (isDiscussUnavailable(error)) {
           deps.byId("discuss-status").textContent = DISCUSS_UNAVAILABLE_HINT;
           deps.showError?.(DISCUSS_UNAVAILABLE_HINT);
@@ -1352,7 +1404,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           deps.byId("discuss-stamp").hidden = stampLine === "";
           if (!quiet) {
             deps.byId("discuss-status").textContent =
-              `Saved summary · ${shape.created_ms > 0 ? hhmm(shape.created_ms) : "—"}`;
+              `Saved summary · ${shape.created_ms > 0 ? summaryTimeLabel(shape.created_ms, nowMs()) : "—"}`;
           }
         }
         drawStale(shape);
@@ -1523,6 +1575,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (pending) return;
     // `#1501`: a new Summarize stops the summary it replaces, by its key.
     stopOwnReading();
+    // `#1787`: the summary being replaced — kept whole so a failed ask puts
+    // it back exactly as it stood, terms included.
+    const previous = lastAnswer;
+    const previousReadMs = readCreatedMs;
+    const staleWasHidden = deps.byId("discuss-stale").hidden;
     readCreatedMs = 0;
     lastSinceMs = sinceMs;
     generation += 1;
@@ -1536,6 +1593,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     deps.byId("discuss-stamp").textContent = "";
     deps.byId("discuss-stamp").hidden = true;
     deps.byId("discuss-retry").hidden = true;
+    // `#1787`: nothing of the old answer presents as current while its
+    // replacement is read — the banner waits, the terms stand marked.
+    deps.byId("discuss-stale").hidden = true;
+    markTermsStale();
     setPending(true);
     const body: CatchupRequestBody = { thread_id: scope.threadId, view: scope.view, since_ms: sinceMs };
     void deps.catchupPost(scope.channelId, body).then(
@@ -1563,6 +1624,19 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       (error: unknown) => {
         setPending(false);
         if (asked !== generation || !isOpen()) return;
+        // `#1787`: a failed ask changes nothing — the summary it would have
+        // replaced stands again whole, its terms unmarked.
+        if (previous !== null) {
+          lastAnswer = previous;
+          readCreatedMs = previousReadMs;
+          drawAnswer(previous, foldRecord);
+          drawTerms(previous);
+          drawFooter(previous, scope);
+          const stampLine = formatStampLine(previous.stamp);
+          deps.byId("discuss-stamp").textContent = stampLine;
+          deps.byId("discuss-stamp").hidden = stampLine === "";
+          deps.byId("discuss-stale").hidden = staleWasHidden;
+        }
         // A deployment with no summarizer refuses the same way every time: say the
         // hint and offer no retry, where a failed attempt gets its error and one.
         if (isDiscussUnavailable(error)) {

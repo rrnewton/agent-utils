@@ -5480,6 +5480,9 @@ const TUNING_BANDS = {
   WEEKDAY_TIME_DAYS: [6, 6,
     "the most calendar days back a row's time names by its weekday (#729 vt-older-message-dates): the " +
     "owner's six, so the weekday never stands for today's, nor for last week's same day, which says its date"],
+  SUMMARY_WEEKDAY_DAYS: [6, 6,
+    "the most calendar days back a Discuss summary label names by its weekday (#1787): the rows' " +
+    "six (WEEKDAY_TIME_DAYS), so a summary and the messages under it name a day the same way"],
   QUICK_REPLY_GAP_PX: [4, 24,
     "how far under the selected words the quick reply stands (#727 vt-selection-quick-reply): closer and it " +
     "covers a phone's selection handles; further and the words it answers and the box read as apart"],

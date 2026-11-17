@@ -334,6 +334,12 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   cursor: pointer;
 }
 
+/* `#1787`: the previous summary's terms while its replacement is read —
+ * still on screen, but dimmed and headed "from the previous summary". */
+#discuss-terms[data-stale="true"] {
+  opacity: 0.55;
+}
+
 #discuss-stale {
   margin: 8px 0 0;
   color: var(--warn);
