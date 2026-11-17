@@ -12491,8 +12491,36 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         supersede_key: Option<&str>,
         message_id: Option<&str>,
     ) -> Result<QueueResult> {
-        let (_lock, _probe) =
-            self.delivery_lock(agent_name, DrainOptions::default(), message_id, false)?;
+        self.queue_identified_with_lock_timeout(
+            agent_name,
+            text,
+            not_after,
+            supersede_key,
+            message_id,
+            None,
+        )
+    }
+
+    /// Queue without typing, with a bounded lifecycle-lock wait for watch health notices.
+    pub(crate) fn queue_identified_with_lock_timeout(
+        &self,
+        agent_name: &str,
+        text: &str,
+        not_after: Option<u64>,
+        supersede_key: Option<&str>,
+        message_id: Option<&str>,
+        lock_timeout: Option<Duration>,
+    ) -> Result<QueueResult> {
+        let (_lock, _probe) = self.delivery_lock(
+            agent_name,
+            DrainOptions {
+                lock_timeout,
+                deadline: lock_timeout,
+                ..DrainOptions::default()
+            },
+            message_id,
+            false,
+        )?;
         let record = self.load(agent_name)?;
         if record.is_headless() || record.is_cloud() {
             return Err(fail(
