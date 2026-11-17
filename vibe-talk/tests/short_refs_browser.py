@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Short references in a message, in real Chromium at 1280x800 and 390x852.
 
-`#1565 vibe-talk-short-ref-links`, `#1607 short-ref-emoji-render`. The server
-draws `:thread:060` as a marked thread link labelled `🧵060`, `:email:1846`
-as a marked message link labelled `✉️1846`, `:issue:1565` as a tracker link
-keeping its written label, and an unresolvable reference as plain `🧵999`
-with a dotted underline (tested in `src/render.rs`); this walk hands the page
-bodies as the server writes them and checks the taps: a thread link drills
-into the thread, a message link highlights its message in Main, and the
-unknown reference is no link at all.
+`#1565 vibe-talk-short-ref-links`, `#1607 short-ref-emoji-render`,
+`#1796 vibe-talk-bare-short-refs-render`. The server draws `:thread:060` as
+a marked thread link labelled `🧵060/runner-wedged` (its filed slug),
+`:msg:1847` as a marked message link labelled `✉️1847`, both titled
+"Opens here", `:issue:1565` as a tracker link keeping its written label,
+and an unresolvable reference as plain `🧵999` with a dotted underline
+(tested in `src/render.rs`); this walk hands the page bodies as the server
+writes them and checks the taps: a thread link drills into the thread, a
+message link highlights its message in Main, and the unknown reference is
+no link at all.
 
 Pass --screenshots DIR to keep a PNG of each step for review.
 """
@@ -55,15 +57,17 @@ class ShortRefApi(fixture.FakeApi):
         html = (
             '<p>see <a href="?c=' + CHAN + '&v=thread&t=spaces%2FA%2Fthreads%2Fone" '
             f'data-msg="{mark(CHAN, "", THREAD)}" data-shortref="thread" '
-            'target="_blank" rel="noopener noreferrer nofollow">🧵060</a> and '
+            'title="Opens here" '
+            'target="_blank" rel="noopener noreferrer nofollow">🧵060/runner-wedged</a> and '
             f'<a href="?c={CHAN}&v=all&m=discord:{CHAN}:201" '
             f'data-msg="{mark(CHAN, "201")}" data-shortref="email" '
-            'target="_blank" rel="noopener noreferrer nofollow">✉️1846</a> and '
+            'title="Opens here" '
+            'target="_blank" rel="noopener noreferrer nofollow">✉️1847</a> and '
             '<a href="https://tracker.example.invalid/issues/1565" '
             'target="_blank" rel="noopener noreferrer nofollow">:issue:1565</a> and '
             '<span class="shortref-unknown">🧵999</span></p>\n'
         )
-        citing = message(3, "see :thread:060 and :email:1846 and :issue:1565 and :thread:999")
+        citing = message(3, "see :thread:060 and :msg:1847 and :issue:1565 and :thread:999")
         citing["content_html"] = html
         self.messages = [
             message(0, "main channel announcement"),
@@ -230,15 +234,22 @@ def short_ref_walk(desk: Desk, api: ShortRefApi) -> None:
       const issue = [...document.querySelectorAll('a')].find(a => a.textContent === ':issue:1565');
       return {
         thread: thread ? thread.textContent : null,
+        threadTitle: thread ? thread.getAttribute('title') : null,
         email: email ? email.textContent : null,
+        emailTitle: email ? email.getAttribute('title') : null,
         unknown: unknown ? unknown.textContent : null,
         unknownIsLink: unknown ? unknown.tagName === 'A' : null,
         issue: issue ? issue.getAttribute('href') : null,
         overflow: document.documentElement.scrollWidth - window.innerWidth,
       };
     }""")
-    desk.check(found["thread"] == "🧵060", f"the thread reference is not a link: {found}")
-    desk.check(found["email"] == "✉️1846", f"the message reference is not a link: {found}")
+    desk.check(found["thread"] == "🧵060/runner-wedged",
+               f"the thread reference does not carry its slug: {found}")
+    desk.check(found["threadTitle"] == "Opens here",
+               f"the thread link is not titled Opens here: {found}")
+    desk.check(found["email"] == "✉️1847", f"the message reference is not a link: {found}")
+    desk.check(found["emailTitle"] == "Opens here",
+               f"the message link is not titled Opens here: {found}")
     desk.check(found["unknown"] == "🧵999" and found["unknownIsLink"] is False,
                f"the unknown reference is not plain text: {found}")
     desk.check(found["issue"] == "https://tracker.example.invalid/issues/1565",
