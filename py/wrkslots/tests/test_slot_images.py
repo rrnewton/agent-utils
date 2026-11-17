@@ -241,6 +241,60 @@ def _view(base: Path) -> sandbox.SlotView:
     )
 
 
+class _FakeSystemctl:
+    """A fake ``systemctl --user`` for the slice-limit retry tests (#1765)."""
+
+    def __init__(self, failures: list[str]) -> None:
+        self.failures = list(failures)
+        self.set_property_calls = 0
+        self.TimeoutExpired = subprocess.TimeoutExpired
+
+    def run(self, argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "show" in argv:
+            return subprocess.CompletedProcess(argv, 0, "LoadState=loaded\n", "")
+        if "set-property" in argv:
+            self.set_property_calls += 1
+            if self.failures:
+                return subprocess.CompletedProcess(argv, 1, "", self.failures.pop(0))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def test_slice_limits_retry_a_transient_manager_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = _FakeSystemctl(["Failed to set properties: Connection timed out"])
+    monkeypatch.setattr(sandbox, "subprocess", fake)
+    applied = sandbox.apply_slice_limits(
+        _view(tmp_path), sandbox.SandboxLimits(tasks_max=256)
+    )
+    assert fake.set_property_calls == 2
+    assert any("TasksMax=256" in line for line in applied)
+    assert "retrying limits on" in capsys.readouterr().err
+
+
+def test_slice_limits_permanent_manager_error_fails_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeSystemctl(["Failed to set properties: Invalid property TasksMax"])
+    monkeypatch.setattr(sandbox, "subprocess", fake)
+    with pytest.raises(sandbox.SandboxError, match="Invalid property"):
+        sandbox.apply_slice_limits(_view(tmp_path), sandbox.SandboxLimits(tasks_max=256))
+    assert fake.set_property_calls == 1
+
+
+def test_slice_limits_transient_until_the_backstop_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeSystemctl(["org.freedesktop.DBus.Error.NoReply"] * 100)
+    monkeypatch.setattr(sandbox, "subprocess", fake)
+    monkeypatch.setattr(sandbox, "_SLICE_LIMIT_BACKSTOP_SECONDS", 0.6)
+    monkeypatch.setattr(sandbox, "_SLICE_LIMIT_POLL_SECONDS", 0.02)
+    with pytest.raises(sandbox.SandboxError, match=r"after \d+ tries: .*NoReply"):
+        sandbox.apply_slice_limits(_view(tmp_path), sandbox.SandboxLimits(tasks_max=256))
+    assert fake.set_property_calls > 1
+
+
 def test_build_spec_layers_home_and_binds_blessed_paths(tmp_path: Path) -> None:
     home = _fake_home(tmp_path)
     for directory in ("slot", "repo.git", "control", "project/ai_docs"):
@@ -686,7 +740,6 @@ def _assert_home_untouched_and_layered(base: Path, home: Path, state: Path) -> N
     assert not (base / "outside/no").exists() and not (base / "project/src/no").exists()
 
 
-@pytest.mark.load_quarantine  # #1765 wrkslots-load-sensitive-gate-tests
 @pytest.mark.parametrize("isolation", ["userns", "root"])
 def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
     _sandbox_host_or_skip(isolation)
@@ -858,7 +911,6 @@ report home_new_file 'echo x > ~/new-top-level'
 """
 
 
-@pytest.mark.load_quarantine  # #1765 wrkslots-load-sensitive-gate-tests
 @pytest.mark.parametrize("isolation", ["userns", "root"])
 @pytest.mark.parametrize("layout", ["nested", "flat"])
 @pytest.mark.parametrize("protect_system", [True, False])
@@ -1223,7 +1275,6 @@ report tmp_write 'echo x > /tmp/probe'
 """
 
 
-@pytest.mark.load_quarantine  # #1765 wrkslots-load-sensitive-gate-tests
 @pytest.mark.parametrize("isolation", ["userns", "root"])
 @pytest.mark.parametrize("scope", ["worktrees", "project"])
 def test_coordinator_box_confines_writes(box_base: Path, isolation: str, scope: str) -> None:

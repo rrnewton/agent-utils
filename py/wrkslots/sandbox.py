@@ -692,6 +692,103 @@ def slice_limit_properties(limits: SandboxLimits, slot: str | None = None) -> li
     return properties
 
 
+#: Transient user-manager failures (#1765 wrkslots-load-sensitive-gate-tests):
+#: the manager is contended, not refusing, so setting limits waits on the
+#: slice's own state and tries again. Anything else fails at once.
+_TRANSIENT_MANAGER_MARKERS = (
+    "NoReply",
+    "timed out",
+    "is destructive",
+    "Connection reset by peer",
+    "Resource temporarily unavailable",
+)
+
+#: Generous backstop for the slice-limit condition wait (#1765); it bounds a
+#: wedged manager, never decides the verdict on a working one.
+_SLICE_LIMIT_BACKSTOP_SECONDS = 180.0
+_SLICE_LIMIT_POLL_SECONDS = 0.25
+
+
+def _is_transient_manager_error(text: str) -> bool:
+    return any(marker in text for marker in _TRANSIENT_MANAGER_MARKERS)
+
+
+def _slice_loaded(unit: str, timeout: float | None) -> bool:
+    """The retry condition: the user manager has the slice loaded."""
+
+    try:
+        shown = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=LoadState"],
+            capture_output=True, text=True, check=False, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return shown.returncode == 0 and "LoadState=loaded" in shown.stdout
+
+
+def _set_slice_limits(unit: str, properties: list[str], deadline_ns: int | None) -> None:
+    """Start one slice and set its properties, retrying transient refusals.
+
+    Between tries the wait is the slice's LoadState (re-checked with
+    ``systemctl show``), never a try count. The backstop raises the usual
+    refusal carrying the last manager error and the number of tries.
+    """
+
+    what = f"setting limits on {unit}"
+    backstop_ns = time.monotonic_ns() + int(_SLICE_LIMIT_BACKSTOP_SECONDS * 1_000_000_000)
+    limit_ns = backstop_ns if deadline_ns is None else min(deadline_ns, backstop_ns)
+    tries = 0
+    last_error = ""
+    while True:
+        tries += 1
+        if time.monotonic_ns() >= limit_ns:
+            raise SandboxError(
+                f"cannot set limits on {unit} after {tries - 1} tries: {last_error}"
+            )
+        timeout = (limit_ns - time.monotonic_ns()) / 1_000_000_000
+        try:
+            # A slice has to be loaded before its properties can be set;
+            # starting it is idempotent and leaves no process behind.
+            subprocess.run(
+                ["systemctl", "--user", "start", unit],
+                capture_output=True, check=False, timeout=timeout,
+            )
+            result = subprocess.run(
+                ["systemctl", "--user", "set-property", "--runtime", unit, *properties],
+                capture_output=True, text=True, check=False, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if deadline_ns is not None and time.monotonic_ns() >= deadline_ns:
+                raise _deadline_refusal(what) from exc
+            result = None
+            last_error = "systemctl timed out"
+        if result is not None and result.returncode == 0:
+            return
+        if result is not None:
+            last_error = result.stderr.strip()
+            if not _is_transient_manager_error(last_error):
+                raise SandboxError(f"cannot set limits on {unit}: {last_error}")
+        # Transient: wait on the condition (the slice loaded), then retry.
+        while True:
+            if time.monotonic_ns() >= limit_ns:
+                raise SandboxError(
+                    f"cannot set limits on {unit} after {tries} tries: {last_error}"
+                )
+            remaining = (limit_ns - time.monotonic_ns()) / 1_000_000_000
+            if _slice_loaded(unit, max(0.05, min(remaining, 5.0))):
+                break
+            time.sleep(_SLICE_LIMIT_POLL_SECONDS)
+        if time.monotonic_ns() >= limit_ns:
+            raise SandboxError(
+                f"cannot set limits on {unit} after {tries} tries: {last_error}"
+            )
+        print(
+            f"wrkslots: retrying limits on {unit} (try {tries + 1}): {last_error}",
+            file=sys.stderr,
+        )
+        time.sleep(_SLICE_LIMIT_POLL_SECONDS)
+
+
 def apply_slice_limits(
     view: SlotView,
     limits: SandboxLimits,
@@ -721,27 +818,7 @@ def apply_slice_limits(
     ):
         if not properties:
             continue
-        # A slice has to be loaded before its properties can be set; starting
-        # it is idempotent and leaves no process behind.
-        what = f"setting limits on {unit}"
-        try:
-            subprocess.run(
-                ["systemctl", "--user", "start", unit],
-                capture_output=True,
-                check=False,
-                timeout=_timeout(deadline_ns, what),
-            )
-            result = subprocess.run(
-                ["systemctl", "--user", "set-property", "--runtime", unit, *properties],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=_timeout(deadline_ns, what),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise _deadline_refusal(what) from exc
-        if result.returncode != 0:
-            raise SandboxError(f"cannot set limits on {unit}: {result.stderr.strip()}")
+        _set_slice_limits(unit, properties, deadline_ns)
         applied.append(f"{unit}: {' '.join(properties)}")
     return applied
 

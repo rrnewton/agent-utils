@@ -81,15 +81,10 @@ def _collect_1765(extra_env: dict[str, str]) -> str:
     return result.stdout + result.stderr
 
 
-def test_1765_cases_excluded_by_default_and_named() -> None:
+def test_1765_cases_returned_and_collected_by_default() -> None:
+    # Step 2 (#1765): the slice-limit retry, the fixed census clock and the
+    # ownerless manager wait returned these cases; they collect by default.
     out = _collect_1765({})
-    for name in _1765_CASES:
-        assert f"quarantined: " in out and name in out
-    assert "#1765" in out
-
-
-def test_1765_cases_run_with_optin() -> None:
-    out = _collect_1765({"WRKSLOTS_INCLUDE_QUARANTINED": "1"})
     for name in _1765_CASES:
         assert name in out
     assert "quarantined: " not in out

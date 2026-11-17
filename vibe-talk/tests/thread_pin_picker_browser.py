@@ -288,7 +288,7 @@ def open_popup(desk: Desk) -> list[Json]:
     page.click("#thread-select")
     desk.wait_for("() => { const p = document.querySelector('.thread-picker-popup');"
                   " return p && !p.hidden && p.querySelectorAll('.thread-picker-thread').length === 3; }",
-                  "the picker's pop-up did not list three threads")
+                  "the picker's pop-up did not list three threads", seconds=120)
     desk.settled()
     found = page.evaluate(POPUP_JS)
     assert isinstance(found, dict)
@@ -305,10 +305,10 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     page: Page = desk.page
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
-    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.wait_for_selector("#search-toggle", state="visible", timeout=120_000)
     page.click("#view-switch")
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length >= 3",
-                  "the channel did not open")
+                  "the channel did not open", seconds=120)
     desk.settled()
 
     rows = open_popup(desk)
@@ -348,7 +348,7 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     # Pin the newest plain thread: it joins the pinned group, ahead by recency.
     page.click(".thread-picker-popup .thread-pin[aria-label^='Pin release']")
     desk.wait_for("() => document.querySelector(\".thread-pin[aria-label^='Unpin release']\") !== null",
-                  "pinning the release thread did not take")
+                  "pinning the release thread did not take", seconds=120)
     desk.settled()
     rows = open_popup_rows(page)
     thread_rows = [r for r in rows if r["pinned"] is not None]
@@ -359,9 +359,9 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
 
     # Persistence: a reload reads the server's records back.
     page.reload(wait_until="load")
-    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.wait_for_selector("#search-toggle", state="visible", timeout=120_000)
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length >= 3",
-                  "the channel did not reopen after reload")
+                  "the channel did not reopen after reload", seconds=120)
     desk.settled()
     rows = open_popup(desk)
     thread_rows = [r for r in rows if r["pinned"] is not None]
@@ -372,7 +372,7 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     # Unpin the bang-bound thread: it leaves the group and stays unpinned.
     page.click(".thread-picker-popup .thread-pin[aria-label^='Unpin @liteinst']")
     desk.wait_for("() => document.querySelector(\".thread-pin[aria-label^='Pin @liteinst']\") !== null",
-                  "unpinning the bang-bound thread did not take")
+                  "unpinning the bang-bound thread did not take", seconds=120)
     desk.settled()
     rows = open_popup_rows(page)
     thread_rows = [r for r in rows if r["pinned"] is not None]
@@ -382,16 +382,16 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
                f"the unpinned bang thread did not fall to the recents: {texts(rows)}")
     desk.shot("3-popup-bang-unpinned")
     page.reload(wait_until="load")
-    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.wait_for_selector("#search-toggle", state="visible", timeout=120_000)
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length >= 3",
-                  "the channel did not reopen after the second reload")
+                  "the channel did not reopen after the second reload", seconds=120)
     desk.settled()
     rows = open_popup(desk)
     page.wait_for_function(
         "() => { const rows = [...document.querySelectorAll('.thread-picker-thread')];"
         " const last = rows[rows.length - 1];"
         " return last && last.querySelector('.thread-pin')?.getAttribute('aria-pressed') === 'false'"
-        " && last.textContent.includes('@liteinst'); }", timeout=10_000)
+        " && last.textContent.includes('@liteinst'); }", timeout=120_000)
     rows = open_popup_rows(page)
     thread_rows = [r for r in rows if r["pinned"] is not None]
     desk.check(thread_rows[-1]["pinned"] == "false" and "@liteinst" in str(thread_rows[-1]["text"]),
@@ -406,7 +406,7 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
     }""")
     page.wait_for_function(
         "() => (document.querySelector('#thread-card-text')?.textContent || '')"
-        ".includes('release-day')", timeout=10_000)
+        ".includes('release-day')", timeout=120_000)
     desk.shot("4-thread-header-slug")
     desk.notes.append("thread header leads with the slug")
     with api.lock:

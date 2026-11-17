@@ -187,7 +187,8 @@ WATCH_JS = """async ({id, ms}) => {
         const step = () => {
             const t = performance.now() - start;
             frames.push({t, card: card().getBoundingClientRect().top, next: nextCard().getBoundingClientRect().top});
-            if (t < ms) requestAnimationFrame(step); else done();
+            const slid = before.next - nextCard().getBoundingClientRect().top > 20;
+            if ((!slid || frames.length < 12) && frames.length < 2400) requestAnimationFrame(step); else done();
         };
         requestAnimationFrame(step);
     });

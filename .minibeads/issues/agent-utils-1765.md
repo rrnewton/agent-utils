@@ -35,3 +35,15 @@ updated_at: 2026-11-17T04:00:00-05:00
 Related: #1267 wrkslots-load-robust (the case-level quarantine this reuses), #1250 vibe-talk-timing-robust (the `disabled-optin` mechanism), #1748 standalone-wrkslots-scenario-wall-clock-budget (the scenario-only budget exemption this builds on). Step 2 starts only after step 1 has landed and been reported.
 
 Tracked for step 2 only (not fixed in step 1): `vibe-talk.check.thread-pin-picker-browser` flakes under load (failed 2 of 4 full validates on an unrelated tree, 11 s, exit 1); examine it as a vibe-talk browser check in step 2.
+
+## Step 2 root cause: contended user manager refuses slice limits once
+
+`apply_slice_limits` started each slice and set its properties exactly once; inside a gate (dozens of steps creating slices under `dagrun-*` parents on a hot host) a transient manager refusal (D-Bus timeout/NoReply, destructive transaction, connection contention) failed the box at once (exit 126). Not reproduced outside gates in 32 concurrent runs at load 25-45. Fix: `_set_slice_limits` retries only the named transient markers, waiting on the slice's `LoadState` between tries with a 180 s backstop that raises the existing refusal with the last error and the try count, logging every retry. The three live sandbox cases are un-quarantined; deterministic fake-systemctl tests cover transient-then-success, permanent-fails-at-once, and transient-until-backstop.
+
+## Step 2 root cause: ownerless plan reads starved busctl evidence
+
+The differential's Python oracle reads user-manager evidence through bounded busctl queries; a contended manager starves the budget and the editions diverge. Test-only fix: `_wait_for_user_manager` waits for the manager to answer behind a 120 s backstop that skips; the case is un-quarantined.
+
+## Step 2 root cause: browser checks sample on wall deadlines
+
+`thread-pin-picker-browser` polled conditions on 10 s wall deadlines (11 s exit-1 failures); its waits now keep the same conditions behind 120 s backstops. `pack-still-browser` recorded frames for 900 ms of wall time, so a starved main thread produced no slide (`460.4375 -> 460.4375`); it now records until the slide condition holds (with a frame-count backstop), assertions unchanged.

@@ -128,10 +128,30 @@ def _python(
     return wrkslots_cli._cmd_recover_ownerless_agent_worktree(args)
 
 
-@pytest.mark.load_quarantine  # #1765 wrkslots-load-sensitive-gate-tests
+def _wait_for_user_manager() -> None:
+    """Condition wait (#1765): the plan comparison reads user-manager
+    evidence (busctl) whose budget a contended manager can starve. Wait
+    until the manager answers, behind a generous backstop that skips."""
+
+    import time
+
+    deadline = time.monotonic() + 120.0
+    while True:
+        answered = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True, check=False,
+        ).returncode == 0
+        if answered:
+            return
+        if time.monotonic() >= deadline:
+            pytest.skip("the systemd user manager did not answer within 120s (#1765)")
+        time.sleep(0.5)
+
+
 def test_ownerless_worktree_plan_matches_python(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    _wait_for_user_manager()
     rust_root, rust_orphan, head, digest = _fixture(tmp_path / "rust")
     oracle_root, oracle_orphan, oracle_head, oracle_digest = _fixture(tmp_path / "oracle")
     assert _python(oracle_root, oracle_orphan, oracle_head, oracle_digest) == 0
