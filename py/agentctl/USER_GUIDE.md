@@ -1087,6 +1087,32 @@ wrapper is asked to stop. The lineage records the old session as ended
 (`turned-over`) and the new one with relation `turnover` and its handoff.
 Headless agents only in this build.
 
+### Enroll an existing lane in a cgroup slot during restart (Rust edition)
+
+Use the slot manager's configured memory limits when an owned, unboxed local
+Claude Code, Codex, or Muse lane next restarts:
+
+```sh
+agentctl restart reviewer --when-idle --slot review-slot \
+  --slot-project /work/project --slot-isolation cgroup
+```
+
+The slot must already exist and resolve to the lane's exact recorded working
+directory. Configure its limits in the slot manager first. This command does
+not migrate a running process or change the checkout, profile, conversation,
+or queue. It refuses adopted agents, existing boxes, other isolation modes,
+`--team`, and `--refresh-profile` enrollment combinations before exiting.
+
+The private restart journal records the intended slot and a digest of the old
+registration before graceful exit. The old registration stays active until the
+replacement proves its native identity and the slot manager accepts its owner
+transfer. An interrupted launch retains both journals and its staged candidate;
+`agentctl revive reviewer` resumes that transaction without a second live launch.
+An owner-bind refusal also retains the old registration and candidate for retry.
+A changed source record, slot directory, isolation, or journal identity refuses
+recovery rather than falling back to an unboxed launch. Ordinary restart and
+revive behavior is unchanged when no enrollment was requested.
+
 ### Restore a team after the host restarts (Rust edition)
 
 After a reboot every harness is gone, the Herdr server may not be running, and

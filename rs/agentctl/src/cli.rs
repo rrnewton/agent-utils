@@ -1386,6 +1386,15 @@ struct Restart {
     /// Relaunch from the launch profile's current definition (argv, environment, model, reasoning effort) instead of the recorded launch, keeping the conversation, queue and token. Checked before the harness exits; refused when the profile now names another harness or mode
     #[arg(long, conflicts_with = "team")]
     refresh_profile: bool,
+    /// Enroll this owned, unboxed lane in its current checkout's registered slot during restart (Rust edition)
+    #[arg(long, requires_all = ["slot_project", "slot_isolation"], conflicts_with_all = ["team", "refresh_profile"])]
+    slot: Option<String>,
+    /// Existing slot manager project root; required with --slot
+    #[arg(long, requires = "slot")]
+    slot_project: Option<PathBuf>,
+    /// Enrollment isolation; only cgroup is supported (limits come from the slot manager)
+    #[arg(long, requires = "slot", value_parser = ["cgroup"])]
+    slot_isolation: Option<String>,
     /// How long --when-idle may wait in seconds, greater than 0 and at most 3600 (default: 3600)
     #[arg(long, default_value = "3600", value_name = "SECONDS")]
     wait_idle: f64,
@@ -5431,13 +5440,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 )?
             } else {
                 let name = value.name.as_deref().expect("clap requires NAME or --team");
-                let result = manager.restart_stopping(
+                let result = manager.restart_enrolling(
                     name,
                     value.when_idle,
                     Duration::from_secs_f64(value.wait_idle),
                     Duration::from_secs_f64(value.startup_timeout),
                     value.stop_background_tasks,
                     value.refresh_profile,
+                    value.slot.map(|slot| SlotLaunch {
+                        slot,
+                        project: value.slot_project,
+                        isolation: value.slot_isolation,
+                        ..SlotLaunch::default()
+                    }),
                 )?;
                 manager.bring_coordinator_tab_forward(name, tab_socket);
                 result
@@ -9038,6 +9053,48 @@ mod tests {
                 .expect("short help")
                 .to_string();
             assert!(help.contains(required), "{command} -h omitted {required:?}");
+        }
+    }
+
+    #[test]
+    fn restart_slot_enrollment_cli_requires_an_explicit_narrow_target() {
+        let valid = [
+            "agentctl",
+            "restart",
+            "worker",
+            "--slot",
+            "review-slot",
+            "--slot-project",
+            "/work/project",
+            "--slot-isolation",
+            "cgroup",
+        ];
+        assert!(Cli::try_parse_from(valid).is_ok());
+        for extra in ["--refresh-profile", "--team"] {
+            assert!(Cli::try_parse_from(valid.into_iter().chain([extra])).is_err());
+        }
+        for invalid in [
+            vec!["agentctl", "restart", "worker", "--slot", "review-slot"],
+            vec![
+                "agentctl",
+                "restart",
+                "worker",
+                "--slot-project",
+                "/work/project",
+            ],
+            vec![
+                "agentctl",
+                "restart",
+                "worker",
+                "--slot",
+                "review-slot",
+                "--slot-project",
+                "/work/project",
+                "--slot-isolation",
+                "root",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(invalid).is_err());
         }
     }
 

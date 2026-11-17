@@ -445,6 +445,14 @@ arguments and conversation (`split_conversation`, `fresh_arguments`,
 - **Headless**: supported — the wrapper resumes its recorded session;
   restore skips live wrappers and never repeats a published revive.
 
+Rust `restart --slot NAME --slot-project ROOT --slot-isolation cgroup` supports
+owned, unboxed local **Claude Code, Codex, and Muse** lanes with a known native
+conversation. Enrollment is limited to the same checkout and uses the existing
+restart/revive journals; owner transfer must succeed before the old registration
+is retired. Interrupted recovery keeps this intent. **Unknown TUI, headless,
+adopted, cloud, and already-boxed** enrollment is unsupported. Limits remain the
+slot manager's configuration; this is a restart, not live process migration.
+
 Opt-in `watch` agent repair uses the existing restore transaction for the
 configured desired set, including within-boot outages (#333 recovery-reconciler).
 It requires a recorded conversation and refuses fresh fallback. Native Claude
