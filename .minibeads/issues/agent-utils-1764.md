@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-seal-identity-st-dev-after-reboot: accept a cross-boot seal identity when only the anonymous device changed'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-17T04:02:30.182619061+00:00
-updated_at: 2026-11-17T04:02:30.182619061+00:00
+updated_at: 2026-11-17T06:08:19.451888459+00:00
+closed_at: 2026-11-17T06:08:19.451888249+00:00
 ---
 
 # Description
@@ -80,3 +81,15 @@ outright, even though no process survives a reboot.
 Reported from a live registry after a host reboot; the fix is proven
 with fixtures that reproduce the recorded journal shape, never by
 touching that registry.
+
+## Resolution
+
+Landed on main as c543a2bdc87dc28d328f5b0be0b9255820033f2e (gate
+green). The seal restore/re-fence path now accepts a cross-boot
+identity on inode, handle type and handle bytes plus a proven same
+filesystem (recorded stable filesystem id in new journals; the
+configured anchor for older ones), an earlier-boot same-host actor is
+dead for the orphan judgement, and the Rust journal parser accepts
+the new per-target filesystem id. Regression tests cover the reported
+shape and the same-boot, different-handle, different-inode and
+different-filesystem refusals.
