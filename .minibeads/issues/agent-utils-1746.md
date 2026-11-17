@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-validate-remove-subvolume-delete-first: delete a subvolume-backed validate slot subvolume-first'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - wrkslots
 created_at: 2026-11-16T18:16:44-05:00
-updated_at: 2026-11-16T18:16:44-05:00
+updated_at: 2026-11-16T19:28:10-05:00
+closed_at: 2026-11-16T19:28:10-05:00
 ---
 
 # Description
@@ -46,3 +47,20 @@ run `btrfs subvolume delete` on an already-empty subvolume.
   and keeps the slot recoverable.
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as
+`86305bb23089db1ad6862782ed193315e423ed40` (gated `bc63defc`,
+owner-priority gate pass). `_finish_remove_paths` now tries
+`_validate_subvolume_delete_first` after the unchanged census/fence
+proof and validation-proof recheck: for a worktrees-image-backed
+validate slot it unmounts the bind, refuses when content sits
+underneath (bind restored, nothing deleted), deletes the whole slot
+subvolume, prunes each checkout registration with `git worktree
+prune`, and deletes the branch, skipping the per-file walks.
+Non-subvolume layouts, per-slot disk images, and slots with
+initialized submodules keep the old path. Stub-runner tests record
+the umount/delete/prune order with no per-file walk and the
+underneath-content refusal deleting nothing; they fail on the parent
+code and pass landed.
