@@ -277,6 +277,61 @@ def test_rename_moves_registry_name_herdr_name_and_label_together(
         manager.send("old", "nobody")
 
 
+def test_rename_with_alias_keeps_the_old_name_reaching_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch, "old")
+    result = manager.rename("old", "new", keep_alias="14d")
+    assert result["alias"]["old"] == "old" and result["alias"]["new"] == "new"
+    alias = json.loads((manager.registry / "aliases" / "old.json").read_text())
+    assert alias["schema"] == "agentctl-alias/v1"
+    assert alias["token"] == manager.get("new").token
+    assert manager.status("old")["name"] == "new"
+    assert manager.alias_used is not None and manager.alias_used["old"] == "old"
+    manager.send("old", "work under the old name")
+    assert fake.submitted[-1] == "work under the old name"
+    assert manager.alias_list()[0]["new"] == "new"
+
+
+def test_an_alias_whose_agent_was_replaced_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch, "old")
+    manager.rename("old", "new", keep_alias="14d")
+    record = manager.get("new")
+    record.token = "a-different-generation"
+    manager._save(record)
+    with pytest.raises(AgentDeliveryError, match="different generation"):
+        manager.send("old", "nobody")
+    assert (manager.registry / "aliases" / "old.json").exists()
+
+
+def test_an_expired_alias_refuses_and_is_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch, "old")
+    manager.rename("old", "new", keep_alias="14d")
+    path = manager.registry / "aliases" / "old.json"
+    alias = json.loads(path.read_text())
+    alias["created"], alias["expires"] = 0.5, 1.0
+    path.write_text(json.dumps(alias))
+    with pytest.raises(AgentDeliveryError, match="expired"):
+        manager.status("old")
+    assert not path.exists()
+
+
+def test_registering_the_old_name_while_an_alias_lives_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake, pane = _started(tmp_path, monkeypatch, "old")
+    manager.rename("old", "new", keep_alias="14d")
+    with pytest.raises(AgentDeliveryError, match="alias of 'new'"):
+        manager.start("old", cwd=str(tmp_path), harness="claude")
+    assert manager.alias_remove("old")["removed"] is True
+    with pytest.raises(AgentDeliveryError, match="unknown agent"):
+        manager.send("old", "nobody")
+
+
 @pytest.mark.parametrize("prepare,message", [
     ("registered", "already registered"),
     ("herdr-name", "already named"),

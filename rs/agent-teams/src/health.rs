@@ -170,18 +170,11 @@ pub fn pinned_agent(declaration: &Declaration) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The registry's designated coordinator name, read from the designation
-/// file (`REGISTRY/coordinator.json`, kept current by `coordinator set` and
-/// rename) with `agentctl coordinator show` as fallback. File-first keeps
-/// `check` subprocess-free per declaration.
+/// The registry's designated coordinator name, resolved the way agentctl
+/// itself resolves the designation (by token, through `coordinator show`),
+/// so a rename of the designated coordinator is followed; the designation
+/// file is only the fallback for older binaries.
 pub fn designated_name(registry: &Path) -> Option<String> {
-    if let Ok(text) = std::fs::read_to_string(registry.join("coordinator.json")) {
-        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            if let Some(name) = value.get("name").and_then(Value::as_str) {
-                return Some(name.to_string());
-            }
-        }
-    }
     registry_coordinator_name(registry)
 }
 

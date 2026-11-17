@@ -437,8 +437,33 @@ def _close_descriptor(
 
 def _name(value: str) -> str:
     if not _NAME.fullmatch(value) or value in registry_layout.RESERVED_NAMES:
-        raise AgentDeliveryError("agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; registry directory names ('archive', 'agents', 'locks', 'bridges', 'turnover-pins', 'restore', 'restore-reports') are reserved")
+        raise AgentDeliveryError("agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; registry directory names ('archive', 'agents', 'locks', 'bridges', 'aliases', 'turnover-pins', 'restore', 'restore-reports') are reserved")
     return value
+
+
+#: Schema tag of an alias record in ``REGISTRY/aliases/<old>.json`` (#1777).
+ALIAS_SCHEMA = "agentctl-alias/v1"
+
+
+def parse_alias_duration(value: str) -> float:
+    """Parse a ``--keep-alias`` duration (``14d``, ``48h``, ``30m``, ``90s``) into seconds."""
+    factors = {"s": 1, "m": 60, "h": 3_600, "d": 86_400}
+    if len(value) < 2 or value[-1] not in factors or not value[:-1].isdigit() or int(value[:-1]) == 0:
+        raise AgentDeliveryError(
+            f"invalid --keep-alias duration {value!r}; use a count and a unit, "
+            "for example 14d, 48h, 30m or 90s"
+        )
+    return float(int(value[:-1]) * factors[value[-1]])
+
+
+def format_et(unix: float) -> str:
+    """``2026-12-01 09:30 ET`` for a unix time (America/New_York wall time)."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    return datetime.fromtimestamp(unix, timezone.utc).astimezone(
+        ZoneInfo("America/New_York")
+    ).strftime("%Y-%m-%d %H:%M ET")
 
 
 def harness_arguments(
@@ -2384,6 +2409,10 @@ class ManagedAgents:
         # Tests may set this explicit launch environment override (``None`` reads
         # ``profiles.json``; use ``False`` for an explicit absence).
         self.launch_env_override: LaunchEnv | None | bool = None
+        # Alias note state: one note per process, and the alias resolved
+        # through, for JSON output (#1777 agentctl-rename-keep-alias).
+        self._alias_noted = False
+        self.alias_used: dict[str, object] | None = None
 
     def _project_launch_env(self) -> LaunchEnv | None:
         """The registry's ``launch_env``, refusing one whose file or directories are missing."""
@@ -2413,6 +2442,9 @@ class ManagedAgents:
     def _lock(self, name: str) -> Iterator[None]:
         self._prepare()
         _name(name)
+        # The lifecycle lock belongs to the agent: locking by a kept old
+        # name locks the renamed agent (#1777).
+        name = self._resolve_alias(name)
         registry_layout.prepare_locks(self.registry)
         # Locks live outside agent directories, so stop/reuse cannot replace a held inode. The
         # lock follows the agent's directory (#593 registry-agents-subdir): a layout-1 agent is
@@ -2510,7 +2542,152 @@ class ManagedAgents:
         agent._fsync_dir(str(archive))
         agent._fsync_dir(str(source.parent))
 
+    def _read_alias(self, old: str) -> dict[str, object] | None:
+        """The alias record for ``old``, when one is on disk (live or expired)."""
+        path = registry_layout.alias_path(self.registry, old)
+        if not os.path.lexists(path):
+            return None
+        document = agent._read_queue_json(str(path), "alias record", require_private=True)
+        if (
+            not isinstance(document, dict)
+            or document.get("schema") != ALIAS_SCHEMA
+            or document.get("old") != old
+            or not isinstance(document.get("new"), str)
+            or not isinstance(document.get("token"), str)
+            or not document.get("token")
+            or not isinstance(document.get("created"), (int, float))
+            or not isinstance(document.get("expires"), (int, float))
+            or not float(document["expires"]) > float(document["created"])
+        ):
+            raise AgentDeliveryError(f"invalid alias record: {path}")
+        return document
+
+    def _prune_alias(self, old: str) -> None:
+        """Delete an alias record and publish the directory (lazy pruning)."""
+        try:
+            os.unlink(registry_layout.alias_path(self.registry, old))
+        except FileNotFoundError:
+            return
+        agent._fsync_dir(str(registry_layout.aliases_directory(self.registry)))
+
+    def _resolve_alias(self, requested: str) -> str:
+        """Follow ``requested`` through live aliases to the current agent name.
+
+        An alias resolves only to the record carrying its token: a replaced
+        agent and an expired alias both refuse, naming the new name. Expired
+        aliases are pruned here.
+        """
+        try:
+            _name(requested)
+        except AgentDeliveryError:
+            return requested
+        now = time.time()
+        current = requested
+        first: dict[str, object] | None = None
+        for _ in range(8):
+            alias = self._read_alias(current)
+            if alias is None:
+                break
+            if now >= float(alias["expires"]):
+                target = str(alias["new"])
+                self._prune_alias(str(alias["old"]))
+                raise AgentDeliveryError(
+                    f"{requested!r} was an alias of {target!r} until "
+                    f"{format_et(float(alias['expires']))}; the alias has expired — use {target}"
+                )
+            if first is None:
+                first = alias
+            elif first["token"] != alias["token"]:
+                raise AgentDeliveryError(
+                    f"{requested!r} is an alias of {alias['new']!r}, but the alias "
+                    f"chain changes generation; use {alias['new']}"
+                )
+            current = str(alias["new"])
+        if first is None or current == requested:
+            return requested
+        directory = self._directory(current)
+        if not directory.exists():
+            raise AgentDeliveryError(
+                f"{requested!r} is an alias of {current!r}, but no agent is registered "
+                f"as {current!r}; use {current} once it is registered, or remove the "
+                f"alias with `agentctl alias rm {requested}`"
+            )
+        record = AgentRecord.load(directory / "agent.json", current)
+        if record.token != first["token"]:
+            raise AgentDeliveryError(
+                f"{requested!r} is an alias of {current!r}, but the agent now registered "
+                f"as {current!r} is a different generation; use {current} directly, or "
+                f"remove the alias with `agentctl alias rm {requested}`"
+            )
+        kept = dict(first)
+        kept["new"] = current
+        self._note_alias(requested, kept)
+        return current
+
+    def _note_alias(self, requested: str, alias: dict[str, object]) -> None:
+        """Print the one alias note for this process and remember it for JSON."""
+        self.alias_used = {
+            "old": alias["old"],
+            "new": alias["new"],
+            "until": alias["expires"],
+            "until_et": format_et(float(alias["expires"])),
+        }
+        if not self._alias_noted:
+            self._alias_noted = True
+            print(
+                f"agentctl: {requested!r} is an alias of {alias['new']!r} until "
+                f"{format_et(float(alias['expires']))}; use {alias['new']}",
+                file=sys.stderr,
+            )
+
+    def _refuse_live_alias(self, name: str) -> None:
+        """Refuse to register a new agent under a name a live alias still owns."""
+        alias = self._read_alias(name)
+        if alias is None:
+            return
+        if time.time() >= float(alias["expires"]):
+            self._prune_alias(name)
+            return
+        raise AgentDeliveryError(
+            f"{name!r} is an alias of {alias['new']!r} until "
+            f"{format_et(float(alias['expires']))}; registering a new agent as {name!r} "
+            f"is refused while the alias lives — use {alias['new']}, or remove the "
+            f"alias with `agentctl alias rm {name}`"
+        )
+
+    def alias_list(self) -> list[dict[str, object]]:
+        """Every live alias, sorted by old name; expired ones are pruned."""
+        directory = registry_layout.aliases_directory(self.registry)
+        aliases: list[dict[str, object]] = []
+        for entry in sorted(os.listdir(directory) if directory.exists() else []):
+            if not entry.endswith(".json"):
+                continue
+            alias = self._read_alias(entry[: -len(".json")])
+            if alias is None:
+                continue
+            if time.time() >= float(alias["expires"]):
+                self._prune_alias(str(alias["old"]))
+                continue
+            aliases.append({
+                "old": alias["old"], "new": alias["new"], "token": alias["token"],
+                "created": alias["created"], "expires": alias["expires"],
+                "until_et": format_et(float(alias["expires"])),
+            })
+        return aliases
+
+    def alias_remove(self, old: str) -> dict[str, object]:
+        """Remove one alias; afterwards the old name is unknown again."""
+        _name(old)
+        alias = self._read_alias(old)
+        if alias is None:
+            raise AgentDeliveryError(f"no alias for {old!r}")
+        self._prune_alias(old)
+        return {"old": alias["old"], "new": alias["new"], "removed": True}
+
     def _load(self, name: str) -> AgentRecord:
+        # Every name-taking command funnels through here, so alias resolution
+        # lives here rather than in each command (#1777).
+        name = self._resolve_alias(name)
         directory = self._directory(name)
         agent._validate_private_directory(str(self.registry), "agent registry")
         self._refuse_pending_rename(name)
@@ -3014,7 +3191,9 @@ class ManagedAgents:
             self._verify_pinned_parent_directory(parent, label="revive candidate")
 
     def _queue(self, name: str) -> str:
-        return str(self._directory(name) / "queue")
+        # A queue belongs to the agent: addressing it by a kept old name
+        # finds the renamed agent's queue (#1777).
+        return str(self._directory(self._resolve_alias(name)) / "queue")
 
     def _move_intent_path(self, name: str) -> Path:
         return self._directory(name) / "move.json"
@@ -3605,6 +3784,7 @@ class ManagedAgents:
                         )
                 directory = self._directory(name)
                 self._refuse_pending_rename(name)
+                self._refuse_live_alias(name)
                 if os.path.lexists(directory):
                     raise AgentDeliveryError(f"agent {name!r} already registered; stop it before reusing the name")
                 self._create_agent_directory(directory)
@@ -3857,6 +4037,7 @@ class ManagedAgents:
         )
         with self._lock(name):
             directory = self._directory(name)
+            self._refuse_live_alias(name)
             if os.path.lexists(directory):
                 raise AgentDeliveryError(
                     f"agent {name!r} already registered; stop it before reusing the name"
@@ -4652,9 +4833,9 @@ class ManagedAgents:
             record = self._load_expected(name, expected_token)
             self._require_automation(record)
             client = cast(HerdrClient, _WorkspaceClient(
-                self.client, record, queue=self._queue(name),
+                self.client, record, queue=self._queue(record.name),
                 expected_workspace=self._project_workspace(),
-                peer_panes=self._peer_panes(name), claims=self._peer_claims(name),
+                peer_panes=self._peer_panes(record.name), claims=self._peer_claims(record.name),
             ))
             return agent.send(
                 client, self._target(record), self._queue(name), text,
@@ -4679,9 +4860,9 @@ class ManagedAgents:
             record = self._load(name)
             self._require_automation(record)
             client = cast(HerdrClient, _WorkspaceClient(
-                self.client, record, queue=self._queue(name),
+                self.client, record, queue=self._queue(record.name),
                 expected_workspace=self._project_workspace(),
-                peer_panes=self._peer_panes(name), claims=self._peer_claims(name),
+                peer_panes=self._peer_panes(record.name), claims=self._peer_claims(record.name),
             ))
             return agent.drain(
                 client, self._target(record), self._queue(name),
@@ -4696,7 +4877,7 @@ class ManagedAgents:
             self._require_policy(record)
             self._checked(record)
             text = agent.read(self.client, self._target(record), lines=lines)
-            agent._atomic_json(str(self._directory(name) / "output.json"),
+            agent._atomic_json(str(self._directory(record.name) / "output.json"),
                                {"text": text, "captured_at": time.time(), "pane_id": record.pane_id})
             return text
 
@@ -6851,8 +7032,15 @@ class ManagedAgents:
                     "launch_spec_source": "anchor",
                 }
 
-    def rename(self, old: str, new: str) -> dict[str, object]:
-        """Rename a live agent: registry entry, Herdr agent name and tab label together."""
+    def rename(self, old: str, new: str, keep_alias: str | None = None) -> dict[str, object]:
+        """Rename a live agent: registry entry, Herdr agent name and tab label together.
+
+        With ``keep_alias`` (a duration such as ``14d``) the old name stays as
+        an alias of the agent until it expires (#1777).
+        """
+        keep_alias_seconds = (
+            parse_alias_duration(keep_alias) if keep_alias is not None else None
+        )
         _name(old)
         _name(new)
         if old == new:
@@ -6870,6 +7058,16 @@ class ManagedAgents:
                             f"rerun exactly `agentctl rename {found['old']} {found['new']}`"
                         )
                     return self._finish_rename(found, recovered=True)
+                alias = self._read_alias(old)
+                if alias is not None:
+                    if time.time() >= float(alias["expires"]):
+                        self._prune_alias(old)
+                    else:
+                        raise AgentDeliveryError(
+                            f"{old!r} is an alias of {alias['new']!r} until "
+                            f"{format_et(float(alias['expires']))}; rename {alias['new']} instead"
+                        )
+                self._refuse_live_alias(new)
                 record = self._load(old)
                 if record._nested_storage is not None:
                     raise AgentDeliveryError(
@@ -6897,13 +7095,16 @@ class ManagedAgents:
                     raise AgentDeliveryError(f"move of {old!r} is incomplete; rerun `agentctl move {old}`")
                 if os.path.lexists(self._directory(new)):
                     raise AgentDeliveryError(f"agent {new!r} is already registered")
+                started_at = time.time()
                 journal: dict[str, object] = {
                     "schema": "agentctl-rename/v1", "token": record.token,
                     "old": old, "new": new, "adapter": record.adapter,
                     "pane_id": record.pane_id, "tab_id": record.tab_id,
                     "terminal_id": record.terminal_id, "workspace_id": record.workspace_id,
-                    "journal_id": uuid.uuid4().hex, "started_at": time.time(),
+                    "journal_id": uuid.uuid4().hex, "started_at": started_at,
                 }
+                if keep_alias_seconds is not None:
+                    journal["keep_alias_until"] = started_at + keep_alias_seconds
                 with self._queue_locks(old), self._pane_lock(record.pane_id):
                     self._checked(record)
                     _WorkspaceClient(self.client, record).verify_recipient(record.pane_id)
@@ -7013,8 +7214,22 @@ class ManagedAgents:
             raise AgentDeliveryError(
                 f"agent {new!r} was moved without its rename history; refusing to guess"
             )
+        # The alias is the rename's last write, inside the journal: before it
+        # the old name is simply gone, after it the alias is complete, and a
+        # crash in between is finished by rerunning the rename (#1777).
+        alias: dict[str, object] | None = None
+        if journal.get("keep_alias_until") is not None:
+            alias = {
+                "schema": ALIAS_SCHEMA, "old": old, "new": new,
+                "token": journal["token"], "created": journal["started_at"],
+                "expires": journal["keep_alias_until"],
+            }
+            registry_layout.prepare(self.registry)
+            agent._atomic_json(
+                str(registry_layout.alias_path(self.registry, old)), alias
+            )
         self._remove_rename_journal(journal)
-        return {
+        result: dict[str, object] = {
             "name": new, "previous_name": old, "token": record.token, "pane_id": pane_id,
             "recovered": recovered, "herdr_steps": herdr_steps,
             "external_references": (
@@ -7022,6 +7237,12 @@ class ManagedAgents:
                 "are not changed by agentctl"
             ),
         }
+        if alias is not None:
+            result["alias"] = {
+                "old": old, "new": new, "until": alias["expires"],
+                "until_et": format_et(float(alias["expires"])),
+            }
+        return result
 
     def _verify_rename_recipient(self, record: AgentRecord, journal: dict[str, object]) -> None:
         """Every non-presentation anchor must hold; only the name and label may be OLD or NEW."""

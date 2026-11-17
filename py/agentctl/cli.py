@@ -231,6 +231,15 @@ def parser() -> argparse.ArgumentParser:
         "otherwise. An interrupted rename refuses both names until the same command is rerun.",
         "agentctl rename reviewer release-reviewer", named=True)
     rename.add_argument("new_name", metavar="NEW", help="new registered name (lowercase letters, digits, hyphens)")
+    rename.add_argument("--keep-alias", metavar="DURATION", default=None,
+        help="keep the old name as an alias of the new one for this long (for example 14d, 48h, 30m); "
+             "without it the old name stops resolving at once")
+    alias = command("alias", "Show or remove the old names kept by `rename --keep-alias`.",
+        "agentctl alias list")
+    alias_commands = alias.add_subparsers(dest="alias_command", required=True, metavar="COMMAND")
+    alias_commands.add_parser("list", help="list the live rename aliases as JSON (expired ones are removed)")
+    alias_rm = alias_commands.add_parser("rm", help="remove one alias now; the old name is unknown afterwards")
+    alias_rm.add_argument("name", metavar="NAME", help="registered session name (lowercase letters, digits, hyphens)")
     anchor = command("anchor", "Pin the terminal and foreground harness process of an agent whose record pins no "
         "harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness "
         "process or observed native session is refused. For a Muse pane or root slot relay, whose process is "
@@ -730,7 +739,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "set-model":
             raise ValueError("set-model is implemented only by the Rust edition")
         elif args.command == "rename":
-            result = sessions.rename(name, args.new_name)
+            result = sessions.rename(name, args.new_name, keep_alias=args.keep_alias)
+        elif args.command == "alias":
+            result = (sessions.alias_list() if args.alias_command == "list"
+                      else sessions.alias_remove(args.name))
         elif args.command == "revive":
             if args.refresh_profile:
                 raise ValueError("--refresh-profile is implemented only by the Rust edition")
@@ -812,6 +824,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = sessions.runtime_operation(name, "migrate", backend=args.backend, mode=args.mode)
         else:
             raise ValueError(f"unsupported command: {args.command}")
+        # A name resolved through a rename alias reports the agent it reached
+        # and the alias it came through (#1777).
+        if sessions.alias_used is not None and isinstance(result, dict):
+            if result.get("name") == sessions.alias_used["old"]:
+                result["name"] = sessions.alias_used["new"]
+            result["alias"] = sessions.alias_used
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except (AgentPending, AgentPossiblySubmitted) as exc:

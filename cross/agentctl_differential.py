@@ -67,7 +67,8 @@ def _normalize(value: object, conversations: set[str] | None = None) -> object:
     if isinstance(value, list):
         return [_normalize(item, conversations) for item in value]
     if isinstance(value, dict):
-        return {str(key): ("<TOKEN>" if key == "token" else 0 if key in ("created_at", "captured_at")
+        return {str(key): ("<TOKEN>" if key == "token" else 0 if key in ("created_at", "captured_at", "until", "expires", "created")
+                          else "<ET>" if key == "until_et"
                           else "<PROCESS_IDENTITY>" if key == "custom_process_identity"
                           # Each edition's fixture runs its own harness process: only its
                           # pid and start time differ, the rest of the identity is compared.
@@ -3972,6 +3973,46 @@ def _model_override_edition(harness: Harness, report: Report) -> None:
     )
 
 
+def _rename_alias(harness: Harness, report: Report) -> None:
+    """`rename --keep-alias`: the old name keeps reaching the same agent (#1777)."""
+    common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
+    case = harness.case("rename-alias")
+    if not _start(harness, report, case, "alias/start", "--harness", "claude"):
+        return
+    _pair(harness, report, case, "alias/rename", ("rename", "worker", "reviewer", "--keep-alias", "14d", *common))
+    report.require("alias/record-written", all(
+        (root / "registry" / "aliases" / "worker.json").exists()
+        and json.loads((root / "registry" / "aliases" / "worker.json").read_text())["new"] == "reviewer"
+        for root in (case.python_root, case.rust_root)), "rename kept no alias record")
+    # Commands addressed to the old name reach the renamed agent, with the
+    # note on stderr (compared loosely: each edition's expiry minute is its own).
+    python, rust = harness.invoke(case, ("status", "worker", *common))
+    report.require("alias/status-by-old", python.returncode == rust.returncode == 0
+                   and _json(python) == _json(rust)
+                   and isinstance(_json(python), dict)
+                   and cast(dict, _json(python)).get("name") == "reviewer"
+                   and cast(dict, _json(python)).get("alias", {}).get("old") == "worker"
+                   and all("is an alias of 'reviewer'" in outcome.stderr
+                           for outcome in (python, rust)),
+                   f"status by the old name disagreed: python={python!r} rust={rust!r}")
+    python, rust = harness.invoke(case, ("send", "worker", "via the old name", *common))
+    report.require("alias/send-by-old", python.returncode == rust.returncode == 0
+                   and _json(python) == _json(rust)
+                   and all(_submission_count(root, "via the old name") == 1
+                           for root in (case.python_root, case.rust_root)),
+                   f"send by the old name disagreed: python={python!r} rust={rust!r}")
+    _pair(harness, report, case, "alias/list", ("alias", "list", *common))
+    outcomes = harness.invoke(case, ("start", "worker", "--harness", "claude", *common))
+    report.require("alias/register-refused", all(
+        outcome.returncode != 0 and "alias of 'reviewer'" in outcome.stderr
+        for outcome in outcomes), f"registering the old name was not refused: {outcomes!r}")
+    _pair(harness, report, case, "alias/rm", ("alias", "rm", "worker", *common))
+    outcomes = harness.invoke(case, ("send", "worker", "nobody", *common))
+    report.require("alias/removed-is-unknown", all(
+        outcome.returncode != 0 and "unknown agent" in outcome.stderr
+        for outcome in outcomes), f"the removed alias still resolved: {outcomes!r}")
+
+
 def _groups() -> list[tuple[str, object]]:
     # Imported here: the group's module imports this one's helpers.
     from agentctl_nested_records import nested_records
@@ -3993,7 +4034,7 @@ def _groups() -> list[tuple[str, object]]:
         ("dead-recovery", _managed_dead_recovery),
         ("stop-recovery", _stop_recovery_quoted_globals),
         ("revive", _revive_interop), ("adoption", _adoption),
-        ("identity", _identity_and_rename), ("nested-records", nested_records),
+        ("identity", _identity_and_rename), ("rename-alias", _rename_alias), ("nested-records", nested_records),
         ("invalid-cli", _invalid_cli), ("watch", _watch_services),
         ("model-override", _model_override_edition),
         ("restore", _restore_team), ("mcp", _mcp_stdio),

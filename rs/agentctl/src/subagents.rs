@@ -580,7 +580,7 @@ pub(crate) fn name(value: &str) -> Result<&str> {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
         return Err(fail(
-            "agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; registry directory names ('archive', 'agents', 'locks', 'bridges', 'turnover-pins', 'restore', 'restore-reports') are reserved",
+            "agent name must start with a lowercase letter and contain 1-32 lowercase letters, digits or hyphens; registry directory names ('archive', 'agents', 'locks', 'bridges', 'aliases', 'turnover-pins', 'restore', 'restore-reports') are reserved",
         ));
     }
     Ok(value)
@@ -7167,6 +7167,17 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ) -> Result<LifecycleLock> {
         use agent_queue::registry::Location;
         name(agent_name)?;
+        // The lifecycle lock belongs to the agent: locking by a kept old
+        // name locks the renamed agent (#1777).
+        let resolved;
+        let agent_name = match self.resolve_alias(agent_name)? {
+            Some((current, alias)) => {
+                self.note_alias(agent_name, &alias);
+                resolved = current;
+                resolved.as_str()
+            }
+            None => agent_name,
+        };
         agent::create_private_directory(&self.registry, "agent registry", true, true)?;
         agent::create_private_directory(
             &agent_queue::registry::locks_directory(&self.registry),
@@ -8066,7 +8077,16 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     }
 
     fn queue(&self, agent_name: &str) -> Result<PathBuf> {
-        Ok(self.directory(agent_name)?.join("queue"))
+        // A queue belongs to the agent, so addressing it by a kept old name
+        // finds the renamed agent's queue (#1777).
+        let effective = match self.resolve_alias(agent_name)? {
+            Some((resolved, alias)) => {
+                self.note_alias(agent_name, &alias);
+                resolved
+            }
+            None => agent_name.to_owned(),
+        };
+        Ok(self.directory(&effective)?.join("queue"))
     }
 
     fn move_intent_path(&self, agent_name: &str) -> Result<PathBuf> {

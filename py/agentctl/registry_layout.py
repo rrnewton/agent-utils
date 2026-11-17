@@ -62,11 +62,14 @@ RENAMES_TRIPWIRE_TEXT = (
 )
 #: The directory holding the registry's chat bridges, one entry each.
 BRIDGES = "bridges"
+#: The directory holding rename aliases, one ``aliases/<old>.json`` per kept old
+#: name (#1777 agentctl-rename-keep-alias), a collection of its own.
+ALIASES = "aliases"
 #: Every known registry directory, one list shared with the Rust edition:
 #: migration, listing and doctor all refuse these as agent names. ``restore``
 #: and ``restore-reports`` joined after an older migration moved the former
 #: into ``agents/`` as if it were an agent.
-RESERVED_NAMES = ("archive", AGENTS, LOCKS, BRIDGES, "turnover-pins", "restore", "restore-reports")
+RESERVED_NAMES = ("archive", AGENTS, LOCKS, BRIDGES, ALIASES, "turnover-pins", "restore", "restore-reports")
 #: Registry-wide ``.<stem>.lock`` files that are fixed items, not agents' layout-1 locks.
 FIXED_LOCK_STEMS = ("identity", "coordinator", "restore")
 LEGACY_SUPPORT_ENDS = "2026-11-26"
@@ -91,6 +94,16 @@ def agents_directory(registry: Path) -> Path:
 def locks_directory(registry: Path) -> Path:
     """``REGISTRY/locks``, the directory holding the agents' lifecycle locks."""
     return registry / LOCKS
+
+
+def aliases_directory(registry: Path) -> Path:
+    """``REGISTRY/aliases``, the directory holding rename alias records."""
+    return registry / ALIASES
+
+
+def alias_path(registry: Path, name: str) -> Path:
+    """The alias record for old name ``name``: ``REGISTRY/aliases/<name>.json``."""
+    return aliases_directory(registry) / f"{name}.json"
 
 
 def current_directory(registry: Path, name: str) -> Path:
@@ -289,6 +302,7 @@ def prepare(registry: Path) -> None:
     if not os.path.lexists(renames / RENAMES_TRIPWIRE):
         _create_noreplace(renames / RENAMES_TRIPWIRE, RENAMES_TRIPWIRE_TEXT)
     _create_private_directory(locks_directory(registry), "agent lock collection")
+    _create_private_directory(aliases_directory(registry), "agent alias collection")
 
 
 def prepare_locks(registry: Path) -> None:
@@ -690,7 +704,7 @@ def auto_migrate(registry: Path, environment: Callable[[str], str | None] = os.e
 
 __all__ = [
     "AGENTS", "AUTO_MIGRATE_VARIABLE", "CURRENT", "FIXED_LOCK_STEMS", "LEGACY", "LEGACY_SUPPORT_ENDS",
-    "BRIDGES", "LOCKS", "REMOVAL_ISSUE", "RENAMES_TRIPWIRE", "RENAMES_TRIPWIRE_TEXT", "RESERVED_NAMES", "TRIPWIRE", "TRIPWIRE_TEXT", "agents_directory",
+    "ALIASES", "BRIDGES", "LOCKS", "REMOVAL_ISSUE", "RENAMES_TRIPWIRE", "RENAMES_TRIPWIRE_TEXT", "RESERVED_NAMES", "TRIPWIRE", "TRIPWIRE_TEXT", "agents_directory", "alias_path", "aliases_directory",
     "auto_migrate", "current_directory", "current_names", "directory", "directory_at", "is_agent_name",
     "is_tripwire", "legacy_directory", "nested_agents_registry", "legacy_lock_files", "legacy_names", "locate", "lock_paths",
     "lock_still_current", "locks_directory", "migrate", "names", "notice", "prepare", "prepare_locks", "record_directories", "stray_names",

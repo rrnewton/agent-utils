@@ -117,6 +117,32 @@ When the registry's designated coordinator changes (a session is retired and a s
 
 Never stop or retire the designated coordinator first and designate the successor afterwards: sends in between answer `undeliverable` and sit in senders' outboxes until the designation exists.
 
+## Rename an agent, keeping its old name for a while
+
+`agentctl rename OLD NEW` moves the registry entry (and its queue), the
+Herdr agent name and the tab label; the coordinator designation follows
+by token. With `--keep-alias DURATION` (for example `14d`; no default —
+without the flag the old name stops resolving at once):
+
+- an alias record `REGISTRY/aliases/OLD.json` (old, new, token, created,
+  expires) is written inside the rename journal, so a crash mid-rename
+  leaves no alias or a complete one;
+- every command addressed to OLD (send, read, status, drain, and the
+  rest) reaches the agent now named NEW, printing one note on standard
+  error (`'OLD' is an alias of 'NEW' until <date ET>; use NEW`) and
+  carrying the resolved name plus an `alias` field in JSON output;
+- the alias resolves only while NEW still carries the token it was
+  renamed from: a replaced agent or an expired alias refuses, naming
+  NEW, and an expired alias is removed the next time it is met;
+- no new agent may register as OLD while the alias lives;
+- `agentctl alias list` shows live aliases, `agentctl alias rm OLD`
+  removes one early.
+
+Things that name OLD in their own files (systemd units, `restore.json`,
+chat bridge config, watcher state, slot records, scheduled dispatch
+commands) are not rewritten by a rename; the alias covers only
+name resolution through agentctl itself.
+
 ## "Attach yourself to Herdr" (or "to agentctl")
 
 The owner wants to watch your session in Herdr, beside the agents you start.

@@ -2852,12 +2852,14 @@ pub fn spec_write_agents<A: ManagedApi + ?Sized>(
     apply: bool,
 ) -> Result<Value> {
     let config = RestoreConfig::load(registry)?;
-    let coordinator = config.coordinator.clone().or_else(|| {
-        let text = fs::read_to_string(registry.join("coordinator.json")).ok()?;
-        serde_json::from_str::<Value>(&text).ok()?["name"]
-            .as_str()
-            .map(str::to_owned)
-    });
+    // The designation follows the agent by token, so resolve it the way the
+    // restore itself does rather than reading the file's (possibly old) name.
+    let coordinator = match config.coordinator.clone() {
+        Some(name) => Some(name),
+        None => crate::subagents::ManagedAgents::new(client, registry)
+            .and_then(|manager| manager.designated_coordinator())
+            .unwrap_or_default(),
+    };
     let live_panes: std::collections::BTreeSet<String> = client
         .panes()
         .map(|panes| panes.into_iter().map(|pane| pane.pane_id).collect())
