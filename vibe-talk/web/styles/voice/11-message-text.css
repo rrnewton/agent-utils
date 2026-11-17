@@ -499,12 +499,6 @@
   scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
 }
 
-/* The expanded view's own controls get the same reserved room at the foot. */
-#server-more,
-#search-further {
-  scroll-margin-bottom: calc(max(var(--scroll-tools-clearance, 0px), 2.75rem) + 0.5rem);
-}
-
 /* `#1786` draws in-scope server hits as timeline cards and outside hits as
  * quoted rows, both marked `data-server-hit`: the same foot reserve, so the
  * first of them brought to the foot rests clear of the Newest chip too. */
