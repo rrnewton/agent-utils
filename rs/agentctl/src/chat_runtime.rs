@@ -12637,6 +12637,37 @@ stay held until an operator repairs or deletes it, and deleting it forgets which
         self.render_outbound_links(body).2
     }
 
+    /// The wire text of one trace post (`#1801
+    /// agentctl-trace-posts-expand-short-refs`): the post's references
+    /// expanded exactly as a reply's are at send time — Slack link markup,
+    /// or Markdown links on the converted path, with link titles stripped
+    /// as a reply's are (#658/#1709) — from this state's local records
+    /// alone. The post's own text is never changed: the caller posts this
+    /// text and keeps the post as written, so a retry renders the same.
+    /// Guard notices are recorded as a reply's are; warnings are the
+    /// caller's to log.
+    pub(crate) fn render_trace_links(
+        &self,
+        channel_id: &str,
+        body: &str,
+    ) -> (String, Vec<String>, Vec<String>) {
+        let effective_format = self
+            .config
+            .effective_slack_format(channel_id)
+            .ok()
+            .flatten();
+        let (linked_body, link_warnings, guard_notices) = self.render_outbound_links_as(
+            body,
+            matches!(effective_format, Some(SlackFormat::Converted)),
+        );
+        self.record_bare_ref_notices(&guard_notices);
+        let linked_body = match effective_format {
+            Some(SlackFormat::Converted) => linked_body,
+            _ => crate::chat_links::strip_link_titles(&linked_body),
+        };
+        (linked_body, link_warnings, guard_notices)
+    }
+
     /// The next short message number, assigned at admission and never reused
     /// (`message-numbers.json`, the reply-alias rule). A number burned by an
     /// admission that later fails is simply skipped.
@@ -22004,6 +22035,130 @@ pub(crate) mod tests {
             status["requests"][0]["thread_permalink"],
             json!("https://acme.slack.com/archives/C0123ABCD/p1700000000000100")
         );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// #1801 agentctl-trace-posts-expand-short-refs: a trace post's wire
+    /// text expands references exactly as a reply's does, from the same
+    /// local state; the post's own text is never changed, an unresolvable
+    /// reference stays plain with a warning, and code is not expanded.
+    #[test]
+    fn a_trace_post_expands_references_like_a_reply() {
+        let root = temporary("trace-links");
+        let mut configuration = config_without_reaction();
+        configuration.channel_ids = vec!["C0123ABCD".to_owned()];
+        configuration.slack_workspace_url = Some("https://acme.slack.com".to_owned());
+        configuration.issue_url_template =
+            Some("https://github.com/OWNER/REPO/issues/{n}".to_owned());
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let message = InboundMessage::new(
+            ChannelId::new("C0123ABCD").expect("channel"),
+            MessageId::new("1700000000.000100").expect("message"),
+            ThreadId::new("1700000000.000100").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "please look",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("delivery-1").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery");
+        let key = state
+            .admit_batch(&batch)
+            .expect("admission")
+            .new_request_keys
+            .into_iter()
+            .next()
+            .expect("key");
+        // Building the prompt assigns the request its reply alias, as in
+        // `a_captured_reply_with_link_tokens_posts_link_markup`.
+        state.prompt(&key, "").expect("prompt");
+
+        let body = "see :thread:001, :email:1, :issue:658 and :thread:999";
+        let (wire, warnings, _notices) = state.render_trace_links("C0123ABCD", body);
+        assert!(
+            wire.contains(
+                "<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:thread:001>"
+            ),
+            "{wire}"
+        );
+        assert!(
+            wire.contains("<https://acme.slack.com/archives/C0123ABCD/p1700000000000100|:email:1>"),
+            "{wire}"
+        );
+        assert!(
+            wire.contains("<https://github.com/OWNER/REPO/issues/658|#658>"),
+            "{wire}"
+        );
+        assert!(wire.contains("and :thread:999"), "{wire}");
+        assert!(
+            warnings.iter().any(|warning| warning.contains("999")),
+            "{warnings:?}"
+        );
+        // The post's own text stands as written; only the wire text expands.
+        assert_eq!(
+            body,
+            "see :thread:001, :email:1, :issue:658 and :thread:999"
+        );
+
+        let (wire, _warnings, _notices) = state.render_trace_links(
+            "C0123ABCD",
+            "Run `:thread:001` first.\n```\n:thread:001\n```\nThen :thread:001.",
+        );
+        assert_eq!(wire.matches("|:thread:001>").count(), 1, "{wire}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// #1801 on the converted path (#1709): a trace post's references are
+    /// Markdown links, as a converted reply's are, never Slack markup the
+    /// converter would read as one raw address.
+    #[test]
+    fn a_trace_post_on_the_converted_path_expands_as_markdown() {
+        let root = temporary("trace-links-converted");
+        let mut configuration = config_without_reaction();
+        configuration.channel_ids = vec!["C0123ABCD".to_owned()];
+        configuration.slack_workspace_url = Some("https://acme.slack.com".to_owned());
+        configuration.slack_format = Some(crate::chat_runtime::SlackFormat::Converted);
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let message = InboundMessage::new(
+            ChannelId::new("C0123ABCD").expect("channel"),
+            MessageId::new("1700000000.000100").expect("message"),
+            ThreadId::new("1700000000.000100").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "please look",
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("delivery-1").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery");
+        let key = state
+            .admit_batch(&batch)
+            .expect("admission")
+            .new_request_keys
+            .into_iter()
+            .next()
+            .expect("key");
+        state.prompt(&key, "").expect("prompt");
+
+        let (wire, _warnings, _notices) = state.render_trace_links("C0123ABCD", "see :thread:001");
+        assert!(
+            wire.contains(
+                "[:thread:001](https://acme.slack.com/archives/C0123ABCD/p1700000000000100)"
+            ),
+            "{wire}"
+        );
+        assert!(!wire.contains("<https"), "{wire}");
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

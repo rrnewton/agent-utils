@@ -1255,12 +1255,30 @@ fn spawn_trace_driver(
                         seq + 1,
                         Some(&post.trigger),
                     );
+                    // #1801: references expand on the wire exactly as a
+                    // reply's do; the post itself stays as the agent wrote
+                    // it, so a retry renders the same. A state that cannot
+                    // be read posts the text as written, never holds it.
+                    let wire = match crate::chat_runtime::BridgeState::inspect(&root_dir) {
+                        Ok(state) => {
+                            let (text, warnings, notices) =
+                                state.render_trace_links(&channel, &post.text);
+                            for warning in &warnings {
+                                service_log(format!("agentctl: trace link: {warning}"));
+                            }
+                            for notice in &notices {
+                                service_log(format!("agentctl: trace guard: {notice}"));
+                            }
+                            text
+                        }
+                        Err(_) => post.text.clone(),
+                    };
                     match publish_trace(
                         &root_dir,
                         &channel,
                         thread.as_deref(),
                         &uuid,
-                        &post.text,
+                        &wire,
                         metadata,
                         &mut metadata_ok,
                     ) {
