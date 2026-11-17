@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-documents-list-filename-search: limited filename and title search in the Documents list'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -81,3 +81,19 @@ match from a full-text hit.
 2026-11-17 request (FAST-TRACK, owner rule 286). The full-text decision
 (keep #1266's server search rather than a server-side `rg`) is recorded
 in the Design section above and in the landing report.
+
+## Resolution
+
+[watermelon-full-preview] Delivered on main by
+ebfd627c48e85cb73a215ef6402a52ced1dbf935: the Documents search field
+filters the list locally by file name and title as the owner types (no
+server call), and the "Search text" checkbox switches to #1266's server
+full-text search over fetched documents. Page tests in
+vibe-talk/tests/js/view/documents.test.mjs cover filename, title,
+case-insensitive matching, the no-server-call default, and the checkbox
+path; vibe-talk/tests/documents_browser.py covers both modes at phone
+and desktop sizes against the real server; the existing server tests
+cover the full-text path. Screenshot matrix (16 images, TEST instance)
+in /tmp/docfilter-shots, inspected by mu-docfilter; liaison review
+pending before announcement. Local validate and owner-priority gate
+both passed.
