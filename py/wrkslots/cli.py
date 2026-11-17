@@ -63825,28 +63825,58 @@ def _remove_validate_batch(
                     private_cleanup.same_uid_census_performed
                 )
     finally:
-        with _mutation_locks(config, args.wait_lock):
-            # A refused invocation may find another operation's seal here; only
-            # the exact file this invocation published is its to retire.
-            loaded_seal = (
-                _load_validate_batch_seal_journal(config)
-                if _validate_batch_seal_is_owned(config, owned_seal)
-                else None
-            )
-            has_finish = loaded_seal is not None and any(
+        try:
+            with _mutation_locks(config, args.wait_lock):
+                # A refused invocation may find another operation's seal here; only
+                # the exact file this invocation published is its to retire.
+                loaded_seal = (
+                    _load_validate_batch_seal_journal(config)
+                    if _validate_batch_seal_is_owned(config, owned_seal)
+                    else None
+                )
+                has_finish = loaded_seal is not None and any(
+                    _as_str(
+                        _load_journal(config, selected_path=journal_path)[1].get("kind"),
+                        "journal.kind",
+                    )
+                    == "finish"
+                    for journal_path in _outstanding_journals(config)
+                )
+                if loaded_seal is not None and not has_finish:
+                    _recover_validate_batch_seal_journal(
+                        config,
+                        recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+                        emit=False,
+                    )
+        except Refusal:
+            # The cleanup lock itself refused (for example the
+            # configuration changed while this batch was starting,
+            # #1744). A batch that deleted nothing must still release
+            # the exact seal it published -- restoring the sealed
+            # modes and retiring the file without the lock -- instead
+            # of stranding it for the next operation. Once anything
+            # was deleted the seal stays for recover, as designed.
+            if removed:
+                raise
+            if not _validate_batch_seal_is_owned(config, owned_seal):
+                raise
+            if any(
                 _as_str(
-                    _load_journal(config, selected_path=journal_path)[1].get("kind"),
+                    _load_journal(config, selected_path=journal_path)[1].get(
+                        "kind"
+                    ),
                     "journal.kind",
                 )
                 == "finish"
                 for journal_path in _outstanding_journals(config)
+            ):
+                raise
+            _recover_validate_batch_seal_journal(
+                config,
+                recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+                emit=False,
             )
-            if loaded_seal is not None and not has_finish:
-                _recover_validate_batch_seal_journal(
-                    config,
-                    recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
-                    emit=False,
-                )
+            raise
     payload = {
         "schema": 1,
         "batch_limit": VALIDATE_REMOVE_BATCH_LIMIT,

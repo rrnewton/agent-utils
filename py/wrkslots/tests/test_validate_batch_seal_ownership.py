@@ -21,6 +21,7 @@ from wrkslots.tests.test_lifecycle import (
     make_project,
     make_validate_row_absent,
     mark_owner_dead,
+    prepare_dead_validate_slots,
     raw_command_with_census_authority_stub,
     remove_completed_validation,
     run_absent_validate_recovery,
@@ -1422,6 +1423,84 @@ def test_an_old_format_seal_without_x_is_recovered_as_before(
     assert recovered.returncode == 0, recovered.stderr
     assert not seal.exists()
     assert target.stat().st_mode & 0o777 == original
+
+
+def test_batch_refusal_before_any_deletion_releases_its_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#1744: a refused batch that deleted nothing releases its seal.
+
+    The shared census both changes the configuration (so the batch's
+    own cleanup lock then refuses, as in the field report) and
+    refuses, retaining every slot. The batch must still restore the
+    sealed mode and retire the exact seal it published.
+    """
+
+    project, target, seal = _prepare(tmp_path, monkeypatch)
+    original = target.stat().st_mode & 0o777
+
+    def refusing_census(paths: object, **_kwargs: object) -> object:
+        update_configuration(project, heartbeat_ttl_seconds=999)
+        raise wrkslots.Refusal("shared census unavailable")
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", refusing_census)
+
+    assert remove_completed_validation(project) == 3
+    assert "configuration changed" in capsys.readouterr().err
+    assert not seal.exists()
+    assert target.stat().st_mode & 0o777 == original
+    assert [row["slot"] for row in active_slots(project)] == ["target"]
+
+
+def test_batch_refusal_after_a_deletion_keeps_its_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1744: once anything was deleted, the seal stays for recover."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    paths = prepare_dead_validate_slots(project, ("first", "second"))
+    config = wrkslots._load_config(str(project), "testhost")
+    stub_validate_batch_censuses(monkeypatch)
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", lambda *_a, **_k: None)
+    seal = wrkslots._validate_batch_seal_journal_path(config)
+
+    calls: list[int] = []
+
+    def fresh_census(paths: object, **_kwargs: object) -> object:
+        calls.append(1)
+        if len(calls) == 1:
+            # The first item deletes under the starting configuration;
+            # the change then strands the batch's cleanup lock.
+            update_configuration(project, heartbeat_ttl_seconds=999)
+            return wrkslots._ProcessPathCensus((), ())
+        raise wrkslots.Refusal("fresh census unavailable")
+
+    monkeypatch.setattr(
+        wrkslots, "_capture_same_uid_process_path_census", fresh_census
+    )
+
+    result = wrkslots.main(
+        [
+            "--project-root",
+            str(project),
+            "remove-validate-batch",
+            "--slot",
+            "first=1",
+            "--slot",
+            "second=1",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert result == 3
+    assert not paths["first"].exists()
+    assert paths["second"].is_dir()
+    assert seal.is_file()
 
 
 def test_recover_refuses_a_seal_whose_batch_is_still_running(
