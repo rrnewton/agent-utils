@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-server-hits-collapsed-line: server hits collapse to one line so typing filters instantly'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -34,3 +34,7 @@ Today the section (#server-search in voice.html: scope line, All-channels checkb
 - Screenshot matrix per the standing acceptance (light/dark x keyboard open/closed x phone/desktop, Discuss half-pane open in at least the phone shots, before and after the targeted state), reviewed image by image.
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as c5dc7a14 (gated tree a9d469d4, replayed over 6e80ecfb). Typing runs only the on-screen filter: the same search scheduled again is a no-op and a new search is neither asked nor drawn until the typing rests. The server section stands at the foot of the list as one tappable line ("50+ more hits on the server"; "N+" while a further page remains, "Search the server" until an answer is known) under "On the server, not loaded here" ("including other channels" added while All channels is ticked), with "On this screen" over the loaded hits; a tap draws the scope line, All channels, the snippets, More and Search further back, and a second tap collapses them. Placement: the foot of the scrolling list, below the newest loaded message, where the #1734 landing leaves it mostly off screen; a fixed bottom bar was rejected because it would overlay the composer and the keyboard-shrunken viewport. Measured on a 300-message fixture (Chromium, synchronous input dispatch): per-keystroke filter median 26.6 -> 21.1 ms phone (412x915), 27.7 -> 26.2 ms desk (1280x800) — the local filter was already the cost and is unchanged in kind; the defect numbers are the answer's arrival: the watched hit row moved 5089.5 px before, 0.0 px after, and the section went from 456 DOM nodes (50 snippets drawn unasked) to 10 (the line alone). Tests: tests/server_hits_browser.py (8/8: light/dark x keyboard x phone/desk, Discuss half-pane open on phone), the #605-#608 fake-DOM stage and tests/search_unmatched_browser.py updated to the tap, search_scroll_browser (#1734) green. Screenshot matrix in /tmp/mu-serverhits-shots (before/ 16, after/ 49, every image inspected; the Discuss panel's 404 line in the shots is the fake API not serving its summary route, present before and after alike).
