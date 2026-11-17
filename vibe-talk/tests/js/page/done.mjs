@@ -16,7 +16,7 @@ import { CHANNEL, CLEAR_ARMED_MS, CSS, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FAD
   rowWithId, savedScopes, scopeKey, selectedId, serveByChannel, serverFloor, showDiscord, shownIds,
   sideIds, sideRow, signIn, sourceConstant, sseMessage, statusText, tallChannel, test, textOfRow,
   threadBadge, threadData, threadPage, timelineReads, turnTodoOn, twoColumnServer, twoColumns,
-  unreadChip, unreadSaid, untilDeepLink, upstreamReadButton, viewOf, withLiveChannel } from "./fixture.mjs";
+  enterVoice, unreadChip, unreadSaid, untilDeepLink, upstreamReadButton, viewOf, withLiveChannel } from "./fixture.mjs";
 
 /** Done's act in its module (`createDoneAct`, `#624`): a patch there, a page built with patches, a slip there. */
 const doneActPatch = ([find, replace]) => ({ file: "src/view/channel/doneact.ts", find, replace });
@@ -1012,6 +1012,7 @@ test("THE CALL'S BOX IS A TEXT FIELD TO THE KEYMAP: no single key fires in it, a
   // types a character is the box's, and Esc leaves the box for the list, keeping the draft.
   const page = newPage();
   await signIn(page);
+  await enterVoice(page);
   assert.equal(page.tab(), "voice");
   const box = page.el("compose-text");
   box.focus();
@@ -3185,6 +3186,9 @@ test("`#892 voice-page-optimistic-done`: a page closed before the server heard a
   assert.equal(next.dealtWith.has("4"), false, "the Undo did not land after the Done it undoes");
   assert.deepStrictEqual(keptWrites(next), [], "writes the server has are still kept");
   await reopenedChannel(next);
+  // `#1781`: the reopen's read is sign-in's own, from before the kept writes landed; the
+  // poll behind it is the read that draws what the server then holds.
+  next.expireTimers(DISCORD_POLL_MS);
   for (let i = 0; i < 3; i += 1) await next.settle();
   assert.equal(channelRow(next, "2").getAttribute("data-archived"), "true", "the reopened page does not draw the kept Done");
   assert.equal(channelRow(next, "4").getAttribute("data-archived"), "false", "the reopened page draws a Done its kept Undo put back");

@@ -22,7 +22,7 @@ import { BASE_CSS, BOTTOM_SLACK_PX, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS_COD
   settingsGroup, showDiscord, shownIds, signIn, sourceConstant, speakRelay, splitPost, sseMessage,
   startTalking, takesASide, tallChannel, test, threadBadge, threadButton, threadData, threadOptions,
   threadPage, timelineAnswer, turnSummariesOn, turnTodoOn, unreadChip, viewOf, wavHeader, whoOf,
-  withLiveChannel, chooseReadMode} from "./fixture.mjs";
+  withLiveChannel, chooseReadMode, enterChannel, enterDocs, enterVoice} from "./fixture.mjs";
 
 // Device speech is selected by the backend; cloud audio remains covered by the existing tests.
 const DEVICE_SPEECH = { backend: "browser", label: "Device voice", playback: "browser", local_only: true };
@@ -348,6 +348,10 @@ test("device speech clears watchdogs on stop and replaces the failed status on a
   const page = devicePage();
   await signIn(page);
   const rows = await inReadingMode(page, [message()]);
+  // `#1781`: landing on the Channel at sign-in arms a minute timer of the channel's own at
+  // the finish watchdog's delay; the watchdog is counted against it below.
+  const finishMs = sourceConstant("BROWSER_SPEECH_FINISH_MS");
+  const strayFinish = [...page.timers.values()].filter((timer) => timer.ms === finishMs).length;
   await rows[0].dispatch("click", {});
   page.deviceSpeech.utterances[0].fail("not-allowed");
   assert.match(page.el("status").textContent, /was blocked/);
@@ -356,7 +360,7 @@ test("device speech clears watchdogs on stop and replaces the failed status on a
   assert.match(page.el("status").textContent, /Reading with Device voice/);
   await readButton(page).click();
   assert.equal(page.expireTimers(sourceConstant("BROWSER_SPEECH_START_MS")), 0);
-  assert.equal(page.expireTimers(sourceConstant("BROWSER_SPEECH_FINISH_MS")), 0);
+  assert.equal(page.expireTimers(finishMs), strayFinish, "the finish watchdog outlived the stop");
   assert.equal(page.el("error").hidden, true);
   assert.deepEqual(page.dismissCalls, []);
 });
@@ -466,17 +470,17 @@ test("settings does not offer agent audio when this server has none", async () =
 test("READ REPLACES TALK IN THE CHANNEL VIEW, and Talk comes back in the transcript", async () => {
   const page = newPage();
   await signIn(page);
+  // `#1781`: the page opens on the Channel, where Read stands in Talk's place.
+  assert.equal(readButton(page).hidden, false, "Read is not offered where the messages are");
+  assert.equal(page.el("talk").hidden, true, "Talk is still taking room in the channel view");
+
+  await enterVoice(page);
   assert.equal(readButton(page).hidden, true, "Read is offered over the voice transcript");
   assert.equal(page.el("talk").hidden, false);
 
   await showDiscord(page, [message({ id: "1000000000000000001" })]);
-  assert.equal(readButton(page).hidden, false, "Read is not offered where the messages are");
-  assert.equal(page.el("talk").hidden, true, "Talk is still taking room in the channel view");
-
-  await page.el("view-switch").click();
-  await page.settle();
-  assert.equal(readButton(page).hidden, true, "Read followed the reader back to the transcript");
-  assert.equal(page.el("talk").hidden, false);
+  assert.equal(readButton(page).hidden, false, "Read did not come back with the channel view");
+  assert.equal(page.el("talk").hidden, true, "Talk followed the reader back to the channel");
 });
 
 test("tapping a message in reading mode speaks THAT message", async () => {
@@ -3264,6 +3268,7 @@ test("...and without being told, it says nobody rather than guessing", async () 
 test("CLEAR IS NOT OFFERED OVER THE CHANNEL, because the channel is not ours to clear", async () => {
   const page = newPage();
   await signIn(page);
+  await enterVoice(page);
   assert.equal(page.el("clear-view").hidden, false, "Clear left the transcript, where it belongs");
 
   await showDiscord(page, [message({ id: "1000000000000000001" })]);
@@ -3273,8 +3278,7 @@ test("CLEAR IS NOT OFFERED OVER THE CHANNEL, because the channel is not ours to 
     "Clear is offered over a Discord channel, where it either means nothing or means something alarming"
   );
 
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterVoice(page);
   assert.equal(page.el("clear-view").hidden, false, "Clear did not come back with the transcript");
 });
 
@@ -4228,6 +4232,9 @@ test("each channel uses its own provider's capabilities in a multi-provider depl
 
 test("thread views show roots in Main and the bar's selector offers Main, All, and each thread", async () => {
   const page = await threadPage();
+  // `#1781`: sign-in read the channel once, landing on it; what follows counts from there.
+  const callsAtOpen = page.timelineCalls.length;
+  const readsAtOpen = page.pageReads;
   // `#189 restore-ui-state`: a channel whose provider has threads opens in All, read as All.
   assert.equal(page.el("thread-select").value, "flat", "a threaded channel did not open in All");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
@@ -4252,8 +4259,8 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
     "the thread reply-count decorator must sit underneath the root message");
   assert.equal(threadButton(page.el("discord-log").children[2]).textContent, "about 1 reply");
   // Drawn from All, which holds every row of Main: no read. `#220 view-switch-instant`.
-  assert.deepStrictEqual(page.timelineCalls.map(viewOf), ["flat"], "Main was read though All holds it");
-  assert.equal(page.pageReads, 0);
+  assert.deepStrictEqual(page.timelineCalls.slice(callsAtOpen).map(viewOf), [], "Main was read though All holds it");
+  assert.equal(page.pageReads, readsAtOpen);
   const empty = newPage();
   empty.threadingSupported = true;
   await signIn(empty);
@@ -5458,11 +5465,7 @@ async function openWiredDocument(page) {
     content: WIRE_BLOCKS.join("\n\n") + "\n", outline: [],
   }];
   await signIn(page);
-  await page.el("view-switch").click();
-  await page.settle();
-  await page.el("view-switch").click();
-  await page.settle();
-  assert.equal(page.tab(), "docs", "fixture: the switch did not reach Documents");
+  await enterDocs(page);
   let card;
   for (let tries = 0; tries < 10 && !card; tries += 1) {
     await page.settle();

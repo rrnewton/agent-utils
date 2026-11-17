@@ -2738,9 +2738,13 @@ test("a send timeout stops spinning and a late acknowledgement cannot silently r
   await showDiscord(page, []);
   const finish = delayedReply(page);
   await page.el("channel-compose-text").setValue("mobile connection stalled");
+  // `#1781`: landing on the Channel at sign-in arms its own minute timers at this same
+  // delay (the thread directory's refresh), so the send's timeout is counted against them.
+  const timeoutMs = sourceConstant("OUTGOING_TIMEOUT_MS");
+  const armedBefore = [...page.timers.values()].filter((timer) => timer.ms === timeoutMs).length;
   const submitted = page.el("channel-send").click();
   await page.settle();
-  assert.equal(page.expireTimers(sourceConstant("OUTGOING_TIMEOUT_MS")), 1);
+  assert.equal(page.expireTimers(timeoutMs), armedBefore + 1, "the send armed no timeout of its own");
   await submitted;
   await page.settle();
   assert.equal(outgoingRows(page)[0].getAttribute("data-send-state"), "unconfirmed");

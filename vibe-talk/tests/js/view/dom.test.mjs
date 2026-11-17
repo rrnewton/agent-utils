@@ -235,9 +235,9 @@ test("`#624 voice-page-modularity`: undo stamps only rise, so two offers up at o
 
 test("`#624 voice-page-modularity`: the screens remember where Settings and Help go back to, as each screen is arrived at", () => {
   const { createScreens, SCREENS } = VIEW_SHELL;
-  assert.deepStrictEqual([...SCREENS], ["signin", "main", "settings", "help"]);
+  assert.deepStrictEqual([...SCREENS], ["signin", "main", "settings", "help", "welcome"]);
   const screens = createScreens();
-  assert.deepStrictEqual([screens.screen(), screens.view(), screens.beforeSettings(), screens.helpReturn()], ["signin", "voice", "signin", "settings"]);
+  assert.deepStrictEqual([screens.screen(), screens.view(), screens.beforeSettings(), screens.helpReturn()], ["signin", "discord", "signin", "settings"]);
   screens.arrive("main", "signin");
   screens.arrive("settings", "main");
   assert.equal(screens.beforeSettings(), "main", "Settings goes back to the screen it was opened from");
@@ -2483,7 +2483,7 @@ test("`#624 voice-page-modularity`: the page's last document listeners are mount
 
 test("`#624 voice-page-modularity`: showing a screen hides the others first, shows it last, and does what goes with the change in order", () => {
   const { createScreens, createScreenShowing, SCREEN_TITLES } = VIEW_SHELL;
-  assert.deepStrictEqual({ ...SCREEN_TITLES }, { settings: "Settings", help: "Help" });
+  assert.deepStrictEqual({ ...SCREEN_TITLES }, { settings: "Settings", help: "Help", welcome: "Welcome" });
   const el = elements();
   const screens = createScreens();
   const log = [];

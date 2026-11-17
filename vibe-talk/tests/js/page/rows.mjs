@@ -12,7 +12,7 @@ import { ACKNOWLEDGED, BASE_CSS, CHANNEL, CODER, COLLAPSE_OVER_CHARS, CSS, CSS_C
   TWO_COLUMN_QUERY, VIEW_CHANNEL, asksFor, assertMarkupContains, assistantSays, atBottomOf, bodyOf,
   bookmarkAt, bookmarkRow, boxesOf, brokenModule, brokenScript, builtSince, cardPart, cardRow,
   channelSummaryText, chipsOf, chooseReadMode, cssBlock, cssBlockIn, cssBlockOutside, cssRules,
-  deliver, doneButton, elidedOf, errorResponse, excerptOf, focused, foldButton, forwardPage,
+  deliver, doneButton, elidedOf, enterChannel, errorResponse, excerptOf, focused, foldButton, forwardPage,
   forwardReadKinds, forwardTimeline, freshness, gate, gatherChip, headOf, headerCard, hitsIn, hold,
   holdCountsRead, inReadingMode, inboxChannel, inboxId, inboxOnMain, inlineAnchors, joined, json,
   keyboardPage, lineText, linkPairs, longMessage, marksPending, mdBoxes, mediaBody, message, metaOf,
@@ -835,8 +835,7 @@ test("the channel view counts only when the count is the CHANNEL'S, and pluraliz
   page.channelPage = async () =>
     json(200, { channel: CHANNEL, messages: page.messages, has_more: false });
 
-  await page.el("view-switch").click();
-  await page.settle();
+  await enterChannel(page);
   assert.match(channelSummaryText(page), /^2 messages from lead team$/);
 
   page.messages = [message({ id: "1" })];

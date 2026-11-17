@@ -13,7 +13,7 @@ import { BASE_CSS, CANNED, CONVAI_WRITE, CSS, CSS_CODE, CSS_UNCONDITIONAL, DESKT
   HTML_CODE, MODULE_CODE, PAGE_CODE, PAGE_ELEMENTS, PAGE_IDS, SCRIPT, SCRIPT_CODE,
   SEAM_DETAIL_MAX_WORDS, SEAM_DETAIL_MIN_WORDS, SEARCH_LANGUAGE, assertMarkupContains, barSlice,
   bigCardData, brokenModule, brokenScript, channelSummaryText, compose, cssBlock, cssBlockIn, cssBlockOutside,
-  cssRules, cssRulesElsewhere, cssWithout, errorResponse, forwardTimeline, freshness, json,
+  cssRules, cssRulesElsewhere, cssWithout, enterVoice, errorResponse, forwardTimeline, freshness, json,
   longMessage, markupHolds, markupPlace, mediaBody, message, newPage, pagedChannel, passTime, pickThread,
   press, reReadChannel, replyButton, replyInStream, seamDetail, searchLanguage, secondOfSpeech,
   session_lines, showDiscord, signIn, speech, startNeutralCall, startTalking, state, storedTexts,
@@ -440,18 +440,12 @@ test("the view control is ONE button carrying the word for the view you are in, 
   const page = newPage();
   await signIn(page);
   const label = page.el("view-switch-label");
-  assert.equal(label.textContent, "Voice", "the switch must name the view you are IN");
+  // `#1781`: the page opens on the Channel, whose word this is.
+  assert.equal(label.textContent, "Channel", "the switch must name the view you are IN");
   // `#820 voice-page-action-menu`. A real button; `#845 voice-toggle-colours`, pressed (lit) on the call's view.
-  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "true");
-
-  await page.el("view-switch").click();
-  await page.settle();
-
-  assert.equal(page.tab(), "discord");
-  assert.equal(label.textContent, "Channel", "the word did not follow the switch");
   assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "false", "the channel's view is the darker, unpressed one");
 
-  // `documents-view-client`: the switch is three-way now — the next press shows Documents.
+  // `documents-view-client`: the switch is three-way — the next press shows Documents.
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "docs");
@@ -459,9 +453,15 @@ test("the view control is ONE button carrying the word for the view you are in, 
   assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "false", "only the call's view is the pressed, lit one");
 
   await page.el("view-switch").click();
+  await page.settle();
   assert.equal(page.tab(), "voice");
-  assert.equal(label.textContent, "Voice");
+  assert.equal(label.textContent, "Voice", "the word did not follow the switch");
   assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "true");
+
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "discord");
+  assert.equal(label.textContent, "Channel");
+  assert.equal(page.el("view-switch").getAttribute("aria-pressed"), "false");
 });
 
 test("the view control is a real button: pressed on the call's view, filled in the accent", () => {
@@ -546,15 +546,17 @@ test("`#1078 bottom-bar-switcher`: the pane stands over the bar, Outline is in t
   await signIn(page);
   const cells = () => [...page.el("view-cards").children];
   const current = () => cells().find((cell) => cell.getAttribute("aria-current") === "true")?.getAttribute("data-view");
+  // `#1781`: the page opens on the Channel, so the row's first step is off it.
+  assert.equal(current(), "discord", "the row does not open on the view the page is on");
   await page.el("view-switch").click();
   assert.equal(page.el("view-cards").hidden, false, "the tab row did not show on a press");
   assert.deepStrictEqual(cells().map((cell) => cell.textContent), ["Voice", "Channel", "Documents"]);
-  assert.equal(current(), "discord", "the first press did not land on Channel");
+  assert.equal(current(), "docs", "the first press did not step to Documents");
   assert.equal(page.el("view-switch").getAttribute("aria-expanded"), "true", "the switch does not say the row is up");
   await page.el("view-switch").click();
-  assert.equal(current(), "docs", "the second press did not step to Documents");
+  assert.equal(current(), "voice", "the second press did not step to Voice");
   await page.el("view-switch").click();
-  assert.equal(current(), "voice", "the highlight did not wrap back to Voice");
+  assert.equal(current(), "discord", "the highlight did not wrap back to Channel");
   await passTime(page, 600);
   assert.equal(page.el("view-cards").hidden, true, "the tab row stayed up after the settle");
   assert.equal(page.el("view-switch").getAttribute("aria-expanded"), "false", "the switch still says the row is up");
@@ -566,6 +568,7 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
   page.enableStreamedAudio();
   page.enableAbort();
   await signIn(page);
+  await enterVoice(page);
   const item = page.el("reader-toggle");
   const word = () => page.el("reader-toggle-label").text();
   const said = () => page.documentElement.getAttribute("data-reader");
@@ -648,6 +651,7 @@ test("#1545 hamburger-show-hidden-list-only: Show hidden only on the Documents l
     content: "# Field notes\n\nAlpha.\n", outline: [],
   }];
   await signIn(page);
+  await enterVoice(page);
   // Call view: neither item, and no empty Reader box.
   assert.equal(page.el("docs-show-hidden").hidden, true, "Show hidden is offered over the call");
   assert.equal(page.el("reader-box").hidden, true, "the empty Reader box is drawn over the call");
@@ -1161,6 +1165,7 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   assert.ok(budget > 300 && budget < PHONE_PX, `the budget arithmetic is broken: ${budget}px`);
   const page = newPage();
   await signIn(page);
+  await enterVoice(page);
 
   const report = (where, { cost, shown }) =>
     `${where}: ${shown.join(" + ")} need ${cost.toFixed(1)}px of the ${budget.toFixed(1)}px a ` +
@@ -1306,8 +1311,9 @@ test("the picker is offered where there is a channel to pick, and nowhere else",
   // it belongs to the VIEW rather than to the screen — one line of `PACK_VIEWS`, not a branch.
   const page = newPage();
   await signIn(page);
-  assert.equal(page.tab(), "voice");
-  assert.equal(page.el("discord-channel").hidden, true, "a channel picker over the call view");
+  // `#1781`: the page opens on the channel, the picker's own view.
+  assert.equal(page.tab(), "discord");
+  assert.equal(page.el("discord-channel").hidden, false, "the picker is missing from its own view");
 
   await showDiscord(page, [message({ content: "hi" })]);
   assert.equal(page.el("discord-channel").hidden, false, "the picker is missing from its own view");

@@ -601,6 +601,11 @@ const FIXTURE_TREE = {
   // Documents, and the switch is last in every view. The trays, menus and tab row hang off the bar
   // out of its flow and stay out of this list, as the fetch menu always has.
   "control-bar": ["open-settings", "bar-pack", "prompts-tray", "action-menu-open", "doc-outline-open", "docs-fetch", "view-switch"],
+  // The reader/call row in the dock, in markup order (`#1781`: tests now cross Documents on
+  // the switch's rotation, which moves the audio toggle out of this row and back — a move
+  // only a real parent can prove). Its members' heights are not the model's business here.
+  "control-pane": ["speaker", "clear-view", "hang-up", "audio-source", "read-speed", "speed-popover",
+    "read-aloud-stop", "read-aloud", "talk"],
   // `#410 inline-reply-editor`. The reply's box, kept in the left column's place while no reply is open
   // and moved into the stream of a column and back, so what is inside it goes with it: whether the focus
   // is in the reply's box is a question of where that box is.
@@ -6520,6 +6525,15 @@ async function enterChannel(page) {
   assert.equal(page.tab(), "discord", "the switch did not reach the channel view");
 }
 
+/** Press the view switch until the Documents view shows (`#1781`: reached from any view). */
+async function enterDocs(page) {
+  for (let presses = 0; page.tab() !== "docs" && presses < 3; presses += 1) {
+    await page.el("view-switch").click();
+    await page.settle();
+  }
+  assert.equal(page.tab(), "docs", "the switch did not reach Documents");
+}
+
 /**
  * Press the view switch until the call's view shows (`#1781
  * vibe-talk-first-run-welcome-channel-default`: the page now opens on the Channel, so a test
@@ -10539,7 +10553,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   sentCards, sentOk, sentWithoutKey, serveByChannel, serveScoped, servedBookmarkPage, serverFloor,
   serviceOf, servicesPage, session_lines, setReadNew, settingsChannel, settingsFoldState,
   settingsGroup, settingsHeading, settingsHeadings, settingsOptions, settingsSection,
-  enterChannel, enterVoice, settleRedraftWait, settleSend, settleSpokenYes, showDiscord, showLinks, showPinned, shownIds,
+  enterChannel, enterDocs, enterVoice, settleRedraftWait, settleSend, settleSpokenYes, showDiscord, showLinks, showPinned, shownIds,
   sideAtFoot, sideIds, sideRow, signIn, sourceCalls, sourceConstant, sourceString, sourceStringTable, speakRelay,
   discordSplitPost, speech, splitPost, spokenDraft, sseDelete, sseMessage, sseUpdate, stackPlaces, startChatting,
   startNeutralCall, startOf, startTalking, startTalkingNamed, startV1Call, state, statusText,

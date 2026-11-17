@@ -9,7 +9,7 @@ import { moduleForTests } from "../../../web/build.mjs";
 
 import { CHANNEL, CSS, GLYPHS, HOLD_MS, HTML_CODE, PRESENT_ROWS, REPO, SCRIPT, PAGE_CODE, SCRIPT_CODE, SETTINGS,
   assertMarkupContains, assistantSays, atBottomOf, backFacts, backlog, brokenModule, brokenScript,
-  cssBlock, cssRules, doneButton, inReadingMode, linkPairs, linksOf, longMessage, message, mouseTo, newPage,
+  cssBlock, cssRules, doneButton, enterDocs, inReadingMode, linkPairs, linksOf, longMessage, message, mouseTo, newPage,
   pagedTimeline, passTime, press, reReadChannel, readAloudMessages, reloadWith, reopenedChannel, rowMore,
   rowMoreButton, rowMoreMenu, rowState, rowWithId, search, showDiscord, showLinks, signIn,
   sourceConstant, startTalking, statusText, storedPin, tapKind, tapPin, test, threadData,
@@ -277,11 +277,7 @@ test("`#1082 documents-back-chain`: list -> document -> Back lands on the list, 
   const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
   page.documents = [{ key: "paste:listed", title: "Listed report", content: "# Listed report\n\nWords.\n", outline: ["Listed report"] }];
   await signIn(page);
-  await page.el("view-switch").click();
-  await page.settle();
-  await page.el("view-switch").click();
-  await page.settle();
-  assert.equal(page.tab(), "docs", "fixture: the switch did not reach Documents");
+  await enterDocs(page);
   let card;
   for (let tries = 0; tries < 10 && !card; tries += 1) {
     await page.settle();

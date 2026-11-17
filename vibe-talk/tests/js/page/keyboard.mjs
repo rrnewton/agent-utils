@@ -9,7 +9,7 @@ import { CHANNEL, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD
   HTML_CODE, KEYMAP_TABLE, LINE_PX, PAGE_ELEMENTS, RUN_TAIL, PAGE_CODE, SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX,
   SHORT_MESSAGE, UNPACK_STORAGE, asksFor, atBottomOf, backlog, bid, bodyOf, bookmarkAt, bookmarkRow,
   brokenModule, brokenScript, brokenScriptEach, builtSince, cardIds, cardRow, channelRow, chooseReadMode, compose,
-  cssBlock, cssRules, deliver, doneButton, elidedOf, enterRunThread, failedSend, fillTranscript,
+  cssBlock, cssRules, deliver, doneButton, elidedOf, enterRunThread, enterVoice, failedSend, fillTranscript,
   focusName, focusOn, focused, foldButton, forwardPage, forwardTimeline, heldRow, helpEntry,
   inlineAnchors, joiningChannel, json, keyOn, keyboardMedia, keyboardPage, keyboardPageAtTop,
   keyboardSaid, litCards, litIds, litRows, longMessage, markupHolds, message, mouseOnto, mouseTo,
@@ -618,7 +618,8 @@ test("Ctrl+S AND Cmd+S GO TO THE MESSAGE BOX from the list, the search field and
   assert.equal(focused(call), call.el("compose-text"), `Ctrl+S on the call's view left the focus on ${focusName(call)}`);
   const idle = newPage();
   await signIn(idle);
-  assert.equal(idle.tab(), "voice", "a fresh page did not open on the call's view");
+  await enterVoice(idle);
+  assert.equal(idle.tab(), "voice", "the switch did not reach the call's view");
   const writes = () => idle.requests.filter((request) => !request.startsWith("GET")).length;
   const before = writes();
   event = await press(idle, idle.el("scroll-area"), "s", { ctrlKey: true });
@@ -732,7 +733,8 @@ test("m and Ctrl+Enter on the call's view go to the agent's box, as Ctrl+S does,
   for (const [key, fields] of [["m", {}], ["Enter", { ctrlKey: true }], ["Enter", { metaKey: true }]]) {
     const page = newPage();
     await signIn(page);
-    assert.equal(page.tab(), "voice", "a fresh page did not open on the call's view");
+    await enterVoice(page);
+    assert.equal(page.tab(), "voice", "the switch did not reach the call's view");
     const writes = () => page.requests.filter((request) => !request.startsWith("GET")).length;
     const before = writes();
     const what = `${Object.keys(fields).filter((f) => fields[f] === true).concat([key]).join("+")}`;

@@ -2018,10 +2018,13 @@ test("a channel opens in All where its provider has threads, and in Main where i
   page.threads = data.threads;
   page.channelPage = async () => json(200, { channel: plain, messages: [message({ id: "310", channel_id: plain.id })] });
   await signIn(page);
+  // `#1781`: sign-in has read the channel once already, landing on it; the entry below is
+  // the one this test counts.
+  const readAtSignIn = readKinds(page).length;
   await showDiscord(page, data.messages);
   assert.equal(page.el("thread-select").value, "flat", "a channel with threads did not open in All");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "202", "203", "204"]);
-  assert.deepStrictEqual(readKinds(page), ["flat"], "the channel was not read once, as All");
+  assert.deepStrictEqual(readKinds(page).slice(readAtSignIn), ["flat"], "the channel was not read once, as All");
 
   // The reader prefers Main here. A choice in one channel is not carried into the next...
   await pickThread(page, "main");
@@ -2198,9 +2201,10 @@ test("a saved view that no longer holds falls back to the default rather than fa
     const store = new Map(first.storage);
     store.set(UI_STATE_KEY, damaged);
     const page = reloadWith(store, threadData().messages, (p) => { p.threadingSupported = true; });
-    assert.equal(page.tab(), "voice", "a damaged record reopened anything");
+    // `#1781`: the default a damaged record falls back to is the Channel now, not the call.
+    assert.equal(page.tab(), "discord", "a damaged record reopened anything but the default");
     assert.notEqual(store.get(UI_STATE_KEY), damaged, "a damaged record was kept");
-    assert.equal(savedUiState(page).view, "voice", "the record left is not this page's own");
+    assert.equal(savedUiState(page).view, "discord", "the record left is not this page's own");
     await page.settle();
   }
 });
@@ -2422,7 +2426,12 @@ test("signing out forgets where the reader was, with the messages", async () => 
   const again = newPage(page.storage);
   assert.equal(again.screen(), "signin");
   await signIn(again);
-  assert.equal(again.tab(), "voice", "a signed-out record reopened the channel");
+  // `#1781`: sign-in lands on the Channel by default; what signing out forgot is the saved
+  // place in it, so the channel opens in its default view, not the thread that was left open.
+  assert.equal(again.tab(), "discord", "signing in did not land on the default view");
+  assert.equal(savedUiState(again).view, "discord");
+  assert.notEqual(again.el("thread-select").value, `thread:${page.threads[0].id}`,
+    "a signed-out record reopened the thread that was left open");
 });
 
 // --- `#205 channel-view-memory`: each channel keeps the view the reader chose in it -------------
@@ -2680,7 +2689,7 @@ test("a record saved before each channel kept its own view is carried forward, n
   const store = new Map(first.storage);
   store.set(UI_STATE_KEY, JSON.stringify({ ...v1, chosen: "yes" }));
   const damaged = reloadWith(store, threadData().messages, (p) => { p.threadingSupported = true; });
-  assert.equal(damaged.tab(), "voice", "a damaged v1 record reopened anything");
+  assert.equal(damaged.tab(), "discord", "a damaged v1 record reopened anything but the default");
   assert.deepStrictEqual(savedUiState(damaged).channels, [], "a damaged v1 record left a choice behind");
   await damaged.settle();
 });
