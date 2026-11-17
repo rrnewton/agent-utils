@@ -888,15 +888,22 @@ def box_breach(memory_events: str | None = None,
 
 
 def classify_outcome(*, validator_exit: int, breach: str | None,
-                     wall_breached: bool, cpu_breached: bool) -> tuple[str, int]:
+                     wall_breached: bool, cpu_breached: bool,
+                     cpu_bound_by: str = "instance") -> tuple[str, int]:
     """Map one finished run to (ledger outcome, component exit).
 
     Real test failure is exit 1. A CPU-budget breach is a timeout,
-    also exit 1 with its own outcome. A wall-backstop breach and a
-    host-imposed box breach are no result, exit 75, never a failure.
-    This mapping lives only in this tool's result handling.
+    also exit 1 with its own outcome, but only when the binding
+    budget was set by the project or CLI: when the host file clamped
+    the budget (bound-by host, as recorded in the handle), the
+    breach is host-imposed and is no result, exit 75, like a box
+    breach. A wall-backstop breach and a host-imposed box breach
+    are likewise no result, never a failure. This mapping lives
+    only in this tool's result handling.
     """
     if breach is not None or wall_breached:
+        return "no_result", 75
+    if cpu_breached and cpu_bound_by == "host":
         return "no_result", 75
     if cpu_breached:
         return "timeout", 1

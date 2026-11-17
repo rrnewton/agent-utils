@@ -211,8 +211,11 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "",
         mem_events = mem_path.read_text(errors="replace") if mem_path.exists() else None
         pids_events = pids_path.read_text(errors="replace") if pids_path.exists() else None
     breach = host_limits.box_breach(mem_events, pids_events)
+    _cpu_quota, cpu_bound_by = host_limits.clamp_request(
+        getattr(cfg, "cpu_quota_cpus", None), limits.cpu_quota_cpus)
     outcome, exit_code = host_limits.classify_outcome(
-        validator_exit=rc, breach=breach, wall_breached=wall_breached, cpu_breached=cpu_breached)
+        validator_exit=rc, breach=breach, wall_breached=wall_breached,
+        cpu_breached=cpu_breached, cpu_bound_by=cpu_bound_by)
     ledger_result = {"pass": "PASS", "fail": "FAIL", "timeout": "TIMEOUT",
                      "no_result": "NO_RESULT"}[outcome]
     Ledger(cfg).append_result(commit=commit, result=ledger_result, run_id=run_id, cell=cell,

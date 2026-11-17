@@ -230,6 +230,12 @@ def test_box_breach_maps_to_no_result_never_failure() -> None:
                                wall_breached=True, cpu_breached=False) == ("no_result", 75)
     assert hl.classify_outcome(validator_exit=1, breach=None,
                                wall_breached=False, cpu_breached=True) == ("timeout", 1)
+    # A CPU breach of a host-clamped budget is host-imposed: no result.
+    assert hl.classify_outcome(validator_exit=1, breach=None, wall_breached=False,
+                               cpu_breached=True, cpu_bound_by="host") == ("no_result", 75)
+    # A CPU breach of a project/CLI-set budget that binds is a timeout.
+    assert hl.classify_outcome(validator_exit=1, breach=None, wall_breached=False,
+                               cpu_breached=True, cpu_bound_by="instance") == ("timeout", 1)
     assert hl.classify_outcome(validator_exit=1, breach=None,
                                wall_breached=False, cpu_breached=False) == ("fail", 1)
     assert hl.classify_outcome(validator_exit=0, breach=None,
