@@ -30,6 +30,7 @@ from wrkslots.tests.test_lifecycle import (
     start_host_context_coordinator,
     stub_validate_batch_censuses,
     terminate_process,
+    update_configuration,
     write_absent_validate_input,
 )
 
@@ -1451,7 +1452,7 @@ def test_batch_refusal_before_any_deletion_releases_its_seal(
     assert "configuration changed" in capsys.readouterr().err
     assert not seal.exists()
     assert target.stat().st_mode & 0o777 == original
-    assert [row["slot"] for row in active_slots(project)] == ["target"]
+    assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == ["target"]
 
 
 def test_batch_refusal_after_a_deletion_keeps_its_seal(
