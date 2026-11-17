@@ -286,7 +286,7 @@ def test_slice_limits_permanent_manager_error_fails_at_once(
 def test_slice_limits_transient_until_the_backstop_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake = _FakeSystemctl(["org.freedesktop.DBus.Error.NoReply"] * 100000)
+    fake = _FakeSystemctl(["org.freedesktop.DBus.Error.NoReply"] * 1000000)
     monkeypatch.setattr(sandbox, "subprocess", fake)
     monkeypatch.setattr(sandbox, "_SLICE_LIMIT_BACKSTOP_SECONDS", 2.0)
     sleeps: list[float] = []
