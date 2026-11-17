@@ -300,7 +300,12 @@ impl SearchText {
     /// so a bridge-expanded short reference draws as one short-labelled link,
     /// its thread or message label the emoji and number (`#1713
     /// vibe-talk-short-ref-link-double-render`).
-    pub const VERSION: &'static str = "render-9";
+    /// `render-10`: a `:msg:` reference draws as a message link, a resolved
+    /// thread reference may carry its filed slug (`🧵NNN/slug`), short links
+    /// carry the `Opens here` title, and only bridge-canonical numbers are
+    /// references (`#1796 vibe-talk-bare-short-refs-render`); the slug is a
+    /// page label, never indexed, as a PR name is (`render-5`).
+    pub const VERSION: &'static str = "render-10";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -923,8 +928,8 @@ pub const RENDERED_GENERATION_BYTES: usize = 8 * 1024 * 1024;
 /// code block costs milliseconds, and the timeline sends the same window again on every refresh.
 ///
 /// What a body renders to depends only on its text, its markup, the single-newline rule it is drawn
-/// under, the names of its mentions and the stamp of the thread names it was drawn with
-/// ([`crate::pr_names::stamp`]: a name learned in the background is in a body from its next
+/// under, the names of its mentions and the stamps of the names it was drawn with
+/// ([`crate::pr_names::stamp`] and the short-ref slug stamp: a name learned in the background is in a body from its next
 /// read, not whenever this cache happens to drop it), so those are the key, compared in full: a
 /// hash only finds the candidates. Two generations, each
 /// bounded by [`RENDERED_GENERATION_BYTES`]: a body is put in the young one, and when that is full
@@ -1022,7 +1027,8 @@ impl RenderCache {
         profiles: Option<&str>,
     ) -> Option<String> {
         let key = self.key(text, markup, rule, mentions, profiles);
-        let names_stamp = crate::pr_names::stamp();
+        let names_stamp =
+            crate::pr_names::stamp() ^ crate::short_refs::thread_slugs_stamp().rotate_left(32);
         let mut generations = self
             .generations
             .lock()
@@ -1060,7 +1066,8 @@ impl RenderCache {
             text: text.to_owned(),
             mentions: mentions.to_vec(),
             profiles: profiles.map(str::to_owned),
-            names_stamp: crate::pr_names::stamp(),
+            names_stamp: crate::pr_names::stamp()
+                ^ crate::short_refs::thread_slugs_stamp().rotate_left(32),
             html: html.to_owned(),
         };
         self.generations
@@ -2659,9 +2666,9 @@ pub const TAGS: [&str; 26] = [
 /// are [`RESTATED_CLASS`] and the highlighter's [`highlight::CLASSES`].
 pub const MENTION_CLASS: &str = "mention";
 
-/// The class on a short reference (`:thread:NNNN`, `:email:NNNN`, `:issue:NNNN`)
-/// that resolved to nothing: drawn as plain text with a subtle dotted underline,
-/// never as a wrong link. `#1565 vibe-talk-short-ref-links`.
+/// The class on a short reference (`:thread:NNNN`, `:email:NNNN`, `:msg:NNNN`,
+/// `:issue:NNNN`) that resolved to nothing: drawn as plain text with a subtle
+/// dotted underline, never as a wrong link. `#1565 vibe-talk-short-ref-links`.
 pub const SHORTREF_UNKNOWN_CLASS: &str = "shortref-unknown";
 
 /// The sanitizer, built once.
@@ -2867,7 +2874,7 @@ fn adjust<'a>(
     // Last, so every link the walks above made or kept is a link by now and its text is passed
     // over, and a mention is a chip rather than text.
     link_references(arena, root, &references::reference_links(), &refused)
-        + link_short_refs(arena, root, &refused)
+        + link_short_refs(arena, root, &refused, names)
 }
 
 /// The host short-reference links are first drawn on; [`mark_message_links`] rewrites every
@@ -2875,18 +2882,22 @@ fn adjust<'a>(
 /// never followed. `#1565 vibe-talk-short-ref-links`.
 const SHORTREF_HOST: &str = "https://shortrefs.invalid";
 
-/// Every `:thread:NNNN`, `:email:NNNN` and `:issue:NNNN` in the words made a link where it
-/// resolves, and marked where it does not. See [`crate::short_refs`]. Text inside a link is
-/// left as it is, and so is what `refused` holds; code is not text here. A reference that
-/// resolves to nothing stays plain text under [`SHORTREF_UNKNOWN_CLASS`], never a wrong link.
-/// Thread and message references are DRAWN as the emoji and number Slack draws
-/// ([`short_ref_label`], `#1607 short-ref-emoji-render`); what was written still travels
-/// beside the drawn body, so Copy text copies it as written.
+/// Every `:thread:NNNN`, `:email:NNNN`, `:msg:NNNN` and `:issue:NNNN` in the words made a
+/// link where it resolves, and marked where it does not. See [`crate::short_refs`]. Text
+/// inside a link is left as it is, and so is what `refused` holds; code is not text here. A
+/// reference that resolves to nothing stays plain text under
+/// [`SHORTREF_UNKNOWN_CLASS`], never a wrong link. Thread and message references are DRAWN
+/// as the emoji and number Slack draws ([`short_ref_label`], `#1607
+/// short-ref-emoji-render`); what was written still travels beside the drawn body, so Copy
+/// text copies it as written. A thread drawn for the page (`names` is
+/// [`Names::Page`]) may carry its filed slug ([`short_ref_label`], `#1796`); the index
+/// never draws one, as it draws no PR name.
 /// Answers what the links made may add to the HTML, as [`link_references`] does.
 fn link_short_refs<'a>(
     arena: &'a Arena<'a>,
     root: &'a AstNode<'a>,
     refused: &HashSet<*const AstNode<'a>>,
+    names: Names,
 ) -> usize {
     const LINK_MARKUP: usize = 160;
     let refs = crate::short_refs::short_refs();
@@ -2914,16 +2925,29 @@ fn link_short_refs<'a>(
                 );
             }
             let shown = &text[token.start..token.end];
-            let label = short_ref_label(token.kind, shown);
+            let slug = match (token.kind, names) {
+                (ShortRefKind::Thread, Names::Page) => {
+                    refs.thread(token.number).and_then(|resolved| {
+                        resolved.thread.as_deref().and_then(|root| {
+                            crate::short_refs::thread_slug(&resolved.channel, root)
+                        })
+                    })
+                }
+                _ => None,
+            };
+            let label = short_ref_label(token.kind, shown, slug.as_deref());
             let made: &'a AstNode<'a> = match short_ref_url(&refs, token.kind, token.number) {
                 Some(url) => {
                     added += LINK_MARKUP + 2 * url.len() + label.len();
+                    // The owner's form (`#1796`): a thread or message short
+                    // link opens here, so it says so; an issue link opens
+                    // the tracker and carries no title, as before.
+                    let title = match token.kind {
+                        ShortRefKind::Issue => String::new(),
+                        _ => "Opens here".to_owned(),
+                    };
                     let link: &'a AstNode<'a> = arena.alloc(
-                        NodeValue::Link(Box::new(comrak::nodes::NodeLink {
-                            url,
-                            title: String::new(),
-                        }))
-                        .into(),
+                        NodeValue::Link(Box::new(comrak::nodes::NodeLink { url, title })).into(),
                     );
                     link.append(arena.alloc(NodeValue::Text(label.into()).into()));
                     link
@@ -2952,11 +2976,18 @@ fn link_short_refs<'a>(
 /// its number — the standard emoji `thread` and `email` name in `slack/emoji_names.tsv`,
 /// which is how Slack itself draws `:thread:NNNN` and `:email:NNNN`. The digits keep the
 /// form they were written in. An issue has no standard emoji, so it keeps its written
-/// form. `#1607 short-ref-emoji-render`.
-fn short_ref_label(kind: ShortRefKind, shown: &str) -> String {
+/// form. `#1607 short-ref-emoji-render`. With a slug (`#1796
+/// vibe-talk-bare-short-refs-render`, the form chosen over the written
+/// `:thread:NNN/slug`), a thread is drawn `🧵NNN/slug`; the slug is the name this server
+/// filed for the thread, joined at draw time ([`crate::short_refs::thread_slug`]).
+fn short_ref_label(kind: ShortRefKind, shown: &str, slug: Option<&str>) -> String {
     match kind {
-        ShortRefKind::Thread => format!("🧵{}", &shown[":thread:".len()..]),
+        ShortRefKind::Thread => match slug {
+            Some(slug) => format!("🧵{}/{slug}", &shown[":thread:".len()..]),
+            None => format!("🧵{}", &shown[":thread:".len()..]),
+        },
         ShortRefKind::Email => format!("✉️{}", &shown[":email:".len()..]),
+        ShortRefKind::Msg => format!("✉️{}", &shown[":msg:".len()..]),
         ShortRefKind::Issue => shown.to_owned(),
     }
 }
@@ -2966,6 +2997,7 @@ fn short_ref_label(kind: ShortRefKind, shown: &str) -> String {
 enum ShortRefKind {
     Thread,
     Email,
+    Msg,
     Issue,
 }
 
@@ -2977,12 +3009,17 @@ struct ShortRefToken {
     end: usize,
 }
 
-/// The short-reference tokens in `text`: `:thread:`, `:email:` or `:issue:` and its digits,
-/// not glued to a word before it. A number too large to read is no token.
+/// The short-reference tokens in `text`: `:thread:`, `:email:`, `:msg:` or `:issue:` and
+/// its digits, not glued to a word or a colon before it, and written exactly as the
+/// bridge writes it (`chat_links::render_tagged`): a thread number is its alias,
+/// zero-padded to three digits and never zero; another number is plain decimal with no
+/// leading zero and never zero. Any other shape is ordinary text, never a dotted
+/// near-miss. A number too large to read is no token.
 fn short_ref_tokens(text: &str) -> Vec<ShortRefToken> {
-    const KINDS: [(&str, ShortRefKind); 3] = [
+    const KINDS: [(&str, ShortRefKind); 4] = [
         (":thread:", ShortRefKind::Thread),
         (":email:", ShortRefKind::Email),
+        (":msg:", ShortRefKind::Msg),
         (":issue:", ShortRefKind::Issue),
     ];
     let bytes = text.as_bytes();
@@ -2990,8 +3027,8 @@ fn short_ref_tokens(text: &str) -> Vec<ShortRefToken> {
     let mut at = 0;
     while at < bytes.len() {
         if bytes[at] == b':' {
-            let before_ok =
-                at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let before_ok = at == 0
+                || !(bytes[at - 1].is_ascii_alphanumeric() || matches!(bytes[at - 1], b'_' | b':'));
             if before_ok {
                 if let Some((prefix, kind)) = KINDS
                     .iter()
@@ -3003,13 +3040,21 @@ fn short_ref_tokens(text: &str) -> Vec<ShortRefToken> {
                         end += 1;
                     }
                     if end > digits_start {
-                        if let Ok(number) = text[digits_start..end].parse::<u64>() {
-                            tokens.push(ShortRefToken {
-                                kind: *kind,
-                                number,
-                                start: at,
-                                end,
-                            });
+                        let digits = &text[digits_start..end];
+                        if let Ok(number) = digits.parse::<u64>() {
+                            let canonical = number != 0
+                                && match kind {
+                                    ShortRefKind::Thread => digits == format!("{number:03}"),
+                                    _ => digits == number.to_string(),
+                                };
+                            if canonical {
+                                tokens.push(ShortRefToken {
+                                    kind: *kind,
+                                    number,
+                                    start: at,
+                                    end,
+                                });
+                            }
                         }
                         at = end;
                         continue;
@@ -3039,7 +3084,7 @@ fn short_ref_url(
                 resolved.thread.unwrap_or_default()
             )
         }),
-        ShortRefKind::Email => refs.message(number).map(|resolved| {
+        ShortRefKind::Email | ShortRefKind::Msg => refs.message(number).map(|resolved| {
             format!(
                 "{SHORTREF_HOST}/message/{}/{}/{}",
                 resolved.channel,
@@ -3218,14 +3263,28 @@ fn label_link<'a>(node: &'a AstNode<'a>, names: Names) {
     // vibe-talk-short-ref-link-double-render`): the link's whole label is the
     // written `:thread:NNN` / `:email:NNN`, so it is drawn as the emoji and
     // number a plain reference is (`#1607 short-ref-emoji-render`), never the
-    // colons. An issue's label stays as the bridge wrote it (`#N`).
+    // colons, with its thread's slug when one is filed (`#1796`), and titled
+    // as a bare reference's link is. An issue's label stays as the bridge
+    // wrote it (`#N`).
     let tokens = short_ref_tokens(&shown);
     if let [token] = tokens.as_slice() {
         if token.start == 0
             && token.end == shown.len()
             && !matches!(token.kind, ShortRefKind::Issue)
         {
-            let label = short_ref_label(token.kind, &shown);
+            let slug = match (token.kind, names) {
+                (ShortRefKind::Thread, Names::Page) => {
+                    let refs = crate::short_refs::short_refs();
+                    refs.thread(token.number).and_then(|resolved| {
+                        resolved.thread.as_deref().and_then(|root| {
+                            crate::short_refs::thread_slug(&resolved.channel, root)
+                        })
+                    })
+                }
+                _ => None,
+            };
+            let label = short_ref_label(token.kind, &shown, slug.as_deref());
+            link.title = "Opens here".to_owned();
             drop(ast);
             let kids: Vec<_> = node.children().collect();
             if let Some((first, rest)) = kids.split_first() {
@@ -5988,6 +6047,10 @@ mod search_text_tests {
             "render-9",
             "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
         ),
+        (
+            "render-10",
+            "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
+        ),
     ];
 
     fn corpus_digest() -> String {
@@ -6878,6 +6941,125 @@ mod short_ref_tests {
         assert!(html.contains("✉️9999"), "{html}");
         assert!(!html.contains(":thread:999"), "{html}");
         assert!(!html.contains("data-shortref"), "{html}");
+    }
+
+    #[test]
+    fn a_msg_reference_draws_as_a_message_link() {
+        // `#1796 vibe-talk-bare-short-refs-render`: `:msg:NNNN` names a
+        // message exactly as `:email:NNNN` does.
+        let html = drawn("see :msg:1847");
+        assert!(html.contains(">✉️1847<"), "{html}");
+        assert!(html.contains("data-shortref=\"email\""), "{html}");
+        assert!(
+            html.contains("href=\"?c=C0123ABCD&v=all&m=slack:C0123ABCD:"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn short_links_carry_the_opens_here_title() {
+        // The owner's form: a short link to a thread or message in this app
+        // is titled "Opens here" (no address in it, #1565 Q2); an issue
+        // link opens the tracker, not here, and carries none.
+        let html = drawn("see :thread:060 and :email:1847");
+        assert!(html.contains("title=\"Opens here\""), "{html}");
+        let issue = drawn("see :issue:1565");
+        assert!(!issue.contains("Opens here"), "{issue}");
+    }
+
+    #[test]
+    fn noncanonical_numbers_and_glued_tokens_stay_literal() {
+        // The bridge's exactness (#658): a thread number is its alias as
+        // written (zero-padded, never 0), a message/issue number plain
+        // decimal with no leading zero; a token glued to a word or a
+        // colon before it is no token. None of these is a reference, so
+        // none is dotted either: the text stands as written.
+        for text in [
+            "see :thread:60",
+            "see :thread:000",
+            "see :email:01847",
+            "see :issue:0",
+            "see x:thread:060",
+            "see ::thread:060",
+        ] {
+            let html = drawn(text);
+            assert!(!html.contains("data-shortref"), "{text}: {html}");
+            assert!(!html.contains("shortref-unknown"), "{text}: {html}");
+        }
+        assert!(drawn("see :thread:60").contains(":thread:60"));
+    }
+
+    #[test]
+    fn a_trace_post_links_only_the_refs_outside_code() {
+        // A #714/#832 trace post as vibe-talk receives it: prose, a fence
+        // quoting a citation, and file names. Only the bare references
+        // outside code become links.
+        let html = drawn(
+            "Fixed the wedge in chat_runtime.rs; see :thread:060 and :msg:1847.\n\
+             ```\n:thread:060 in a fence stays text\n```\n\
+             Back to :issue:1565.",
+        );
+        assert!(html.contains(">🧵060</a>"), "{html}");
+        assert!(html.contains(">✉️1847</a>"), "{html}");
+        assert!(html.contains(">:issue:1565</a>"), "{html}");
+        assert!(html.contains("in a fence stays text"), "{html}");
+        assert_eq!(html.matches("data-shortref").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn a_slugged_thread_draws_its_slug_with_the_link() {
+        // `#1796`: the slug is this server's filed name for the thread the
+        // short-refs table names, joined at draw time.
+        let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        let _guard = ShortRefsGuard::set(
+            refs,
+            Some("https://tracker.example.invalid/issues/{n}".to_owned()),
+        );
+        let _slugs = crate::short_refs::SlugsGuard::set(vec![(
+            "C0123ABCD".to_owned(),
+            "1700000000.000100".to_owned(),
+            "runner-wedged".to_owned(),
+        )]);
+        let html = drawn("see :thread:060");
+        assert!(html.contains(">🧵060/runner-wedged</a>"), "{html}");
+        assert!(html.contains("title=\"Opens here\""), "{html}");
+    }
+
+    #[test]
+    fn a_name_that_is_no_slug_draws_no_slug() {
+        let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        let _guard = ShortRefsGuard::set(
+            refs,
+            Some("https://tracker.example.invalid/issues/{n}".to_owned()),
+        );
+        let _slugs = crate::short_refs::SlugsGuard::set(vec![(
+            "C0123ABCD".to_owned(),
+            "1700000000.000100".to_owned(),
+            "Runner Wedged!".to_owned(),
+        )]);
+        let html = drawn("see :thread:060");
+        assert!(html.contains(">🧵060</a>"), "{html}");
+        assert!(!html.contains("Runner"), "{html}");
+    }
+
+    #[test]
+    fn a_bridge_expanded_thread_carries_its_slug() {
+        let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        let _guard = ShortRefsGuard::set(
+            refs,
+            Some("https://tracker.example.invalid/issues/{n}".to_owned()),
+        );
+        let _slugs = crate::short_refs::SlugsGuard::set(vec![(
+            "C0123ABCD".to_owned(),
+            "1700000000.000100".to_owned(),
+            "runner-wedged".to_owned(),
+        )]);
+        let read = crate::slack::mrkdwn::to_markdown(
+            "poll ([https://acme.slack.com/archives/C0123ABCD/p1700000000000100 :thread:060]\
+             (https://acme.slack.com/archives/C0123ABCD/p1700000000000100%7C:thread:060))",
+        );
+        let html = to_html(&read, Markup::Slack);
+        assert!(html.contains(">🧵060/runner-wedged</a>"), "{html}");
     }
 
     #[test]

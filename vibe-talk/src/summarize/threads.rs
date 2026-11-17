@@ -1036,7 +1036,8 @@ impl ThreadNames {
 
     /// The name this server already holds in memory for one thread, without reading the store or
     /// queueing anything. `#269 approval-card-inline`: what a send card says its thread is called,
-    /// and nothing when the thread has not been read here since the server started.
+    /// and nothing when the thread has not been read here since the server started. The short-ref
+    /// renderer's slug join ([`crate::short_refs::ThreadSlugs`]) reads through this too.
     #[must_use]
     pub fn known_name(&self, channel: &ChannelId, thread: &str) -> Option<String> {
         self.lock()
@@ -1841,6 +1842,16 @@ impl ThreadNames {
             }
         }
         Ok(Some(record))
+    }
+}
+
+impl crate::short_refs::ThreadSlugs for ThreadNames {
+    fn slug(&self, channel: &str, thread: &str) -> Option<String> {
+        self.known_name(&ChannelId(channel.to_owned()), thread)
+    }
+
+    fn stamp(&self) -> u64 {
+        self.named() as u64
     }
 }
 

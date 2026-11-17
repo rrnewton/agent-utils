@@ -864,6 +864,11 @@ async fn main() -> anyhow::Result<()> {
     let thread_names = Arc::new(vibe_talk::summarize::threads::ThreadNames::with_interval(
         std::time::Duration::from_secs(config.summaries.thread_naming_interval_seconds),
     ));
+    // `#1796 vibe-talk-bare-short-refs-render`: the short-ref renderer joins
+    // a resolved `:thread:NNN` to the name filed here for its slug.
+    vibe_talk::short_refs::set_thread_slugs(
+        Arc::clone(&thread_names) as Arc<dyn vibe_talk::short_refs::ThreadSlugs>
+    );
     // `catchup-side-agent`: the Discuss side agent, beside the summariser and built from the
     // same [summaries.llm] section retuned. Absent without one; the endpoint says so.
     let catchup_summarizer = vibe_talk::summarize::catchup_summarizer_for(&config.summaries);

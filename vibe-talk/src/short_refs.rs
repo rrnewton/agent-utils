@@ -1,6 +1,9 @@
-//! Short references in message text: `:thread:NNNN`, `:email:NNNN`, `:issue:NNNN`.
+//! Short references in message text: `:thread:NNNN`, `:email:NNNN`, `:msg:NNNN`,
+//! `:issue:NNNN`.
 //! `#1565 vibe-talk-short-ref-links`, from the design note
-//! `ai_docs/plans/2026-11-15-thread-and-message-short-refs.md` (owner 093).
+//! `ai_docs/plans/2026-11-15-thread-and-message-short-refs.md` (owner 093);
+//! `#1796 vibe-talk-bare-short-refs-render` adds the `:msg:` alias and the
+//! filed-name slug a resolved thread link draws ([`thread_slug`]).
 //!
 //! The chat bridge assigns every thread a reply-alias number and every admitted
 //! message a short number, and publishes them in `short-refs.json`
@@ -315,6 +318,107 @@ impl Drop for ShortRefsGuard {
     fn drop(&mut self) {
         TEST_REFS.with(|cell| *cell.borrow_mut() = self.0.take());
         TEST_ISSUE.with(|cell| *cell.borrow_mut() = self.1.take());
+    }
+}
+
+/// Where a resolved thread's slug comes from: this server's own filed
+/// thread names (`#1796 vibe-talk-bare-short-refs-render`, coordb
+/// 2026-11-17). `short-refs.json` names a thread by its channel and root
+/// `ts`; the name this server filed for that thread is its slug. The
+/// lookup is a memory read that never waits and queues nothing, exactly
+/// as [`crate::pr_names`] reaches the renderer.
+pub trait ThreadSlugs: Send + Sync {
+    /// The name held for the thread `channel`/`thread` (a root `ts`), or
+    /// `None` when none is held. The name is NOT yet held to slug shape;
+    /// [`thread_slug`] does that.
+    fn slug(&self, channel: &str, thread: &str) -> Option<String>;
+    /// A stamp that changes when a held name is filed, so a body drawn
+    /// before it is drawn again after: the render cache's key holds it
+    /// beside the PR-names stamp.
+    fn stamp(&self) -> u64;
+}
+
+static SLUGS: LazyLock<RwLock<Option<Arc<dyn ThreadSlugs>>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Install the thread-name source [`thread_slug`] reads. Called once at
+/// startup with the server's `ThreadNames`; never called in tests, which
+/// install their own through [`SlugsGuard`].
+pub fn set_thread_slugs(slugs: Arc<dyn ThreadSlugs>) {
+    *SLUGS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slugs);
+}
+
+/// The installed thread-name source, or a test's own on this thread.
+fn slugs() -> Option<Arc<dyn ThreadSlugs>> {
+    #[cfg(test)]
+    if let Some(slugs) = TEST_SLUGS.with(|cell| cell.borrow().clone()) {
+        return Some(slugs);
+    }
+    SLUGS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The slug of the thread `channel`/`thread` names, when this server
+/// holds a name for it and that name is a valid thread slug
+/// ([`crate::summarize::threads::valid_thread_slug`]). A name that is
+/// not a slug is no slug: the reference draws without one rather than
+/// carrying words it cannot vouch for.
+#[must_use]
+pub fn thread_slug(channel: &str, thread: &str) -> Option<String> {
+    slugs()?
+        .slug(channel, thread)
+        .filter(|name| crate::summarize::threads::valid_thread_slug(name))
+}
+
+/// The installed source's stamp (0 when none is installed).
+#[must_use]
+pub fn thread_slugs_stamp() -> u64 {
+    slugs().map_or(0, |slugs| slugs.stamp())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own thread-name source, on its own thread.
+    static TEST_SLUGS: std::cell::RefCell<Option<Arc<dyn ThreadSlugs>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A test's own thread names, from `(channel, thread)` pairs, until the
+/// guard is dropped. The stamp is the map's length, so a test that files
+/// another name mid-draw changes it as a filing does.
+#[cfg(test)]
+pub struct SlugsGuard(Option<Arc<dyn ThreadSlugs>>);
+
+#[cfg(test)]
+impl SlugsGuard {
+    /// Install `names` (channel, thread, name) on this thread until drop.
+    pub fn set(names: Vec<(String, String, String)>) -> Self {
+        struct Map(std::collections::HashMap<(String, String), String>);
+        impl ThreadSlugs for Map {
+            fn slug(&self, channel: &str, thread: &str) -> Option<String> {
+                self.0
+                    .get(&(channel.to_owned(), thread.to_owned()))
+                    .cloned()
+            }
+            fn stamp(&self) -> u64 {
+                self.0.len() as u64
+            }
+        }
+        let map: std::collections::HashMap<(String, String), String> = names
+            .into_iter()
+            .map(|(channel, thread, name)| ((channel, thread), name))
+            .collect();
+        Self(TEST_SLUGS.with(|cell| cell.replace(Some(Arc::new(Map(map))))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for SlugsGuard {
+    fn drop(&mut self) {
+        TEST_SLUGS.with(|cell| *cell.borrow_mut() = self.0.take());
     }
 }
 

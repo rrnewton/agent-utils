@@ -437,6 +437,9 @@ fn state_pieces_with(
         thread_names: Arc::new(crate::summarize::threads::ThreadNames::new()),
         startup_probe: Arc::new(crate::probe::StartupStatus::default()),
     };
+    crate::short_refs::set_thread_slugs(
+        Arc::clone(&state.thread_names) as Arc<dyn crate::short_refs::ThreadSlugs>
+    );
     state
         .message_cache
         .attach_summaries(crate::cache::orphans::Summaries::of(&state));
