@@ -1626,7 +1626,7 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
     closeActionMenu: () => log.push("menu closed"),
     jumpToNewest: () => log.push("newest"),
   });
-  assert.deepStrictEqual(log, ["listen load-older click", "listen left search-in-all click", "listen server-line click", "listen search-bucket-thread click", "listen search-bucket-main click", "listen search-bucket-threads click", "listen server-more click",
+  assert.deepStrictEqual(log, ["listen load-older click", "listen left search-in-all click", "listen server-line click", "listen search-bucket-thread click", "listen search-bucket-main click", "listen search-bucket-threads click", "listen search-bucket-transcripts click", "listen server-more click",
     "listen search-all-channels change", "listen search-further click", "listen load-older-turns click", "listen collapse-all click",
     "listen expand-all click", "listen todo-filter click", "listen clear-backlog click", "listen undo-dismiss click", "listen summarise click",
     "listen reader-toggle click", "listen autoplay-toggle click", "listen expand-all click", "listen collapse-all click", "listen summarise click",
