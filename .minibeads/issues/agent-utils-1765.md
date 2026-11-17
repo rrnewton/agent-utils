@@ -48,6 +48,10 @@ The differential's Python oracle reads user-manager evidence through bounded bus
 
 `rs/agentctl` chat_service idle-backstop tests (`idle_backstop_case` and its callers in `rs/agentctl/src/chat_service.rs`) assert on wall-clock time ("waited 5.52s, got 0 reads") and failed under full-host load in a local validate. Same rule-346 class: wait on a condition (or a fake clock) with a generous backstop. Taken after the current step-2 change lands; kept in this issue (no new number needed).
 
+## Step 2 follow-up: merge-queue intake window waits on timing
+
+`rust.merge-queue.test` `cli_intake_window::an_ejected_change_resubmitted_at_a_new_head_is_validated_in_the_same_run` failed in a loaded full validate ("queued" vs "landed" at `cli_intake_window.rs:428`) and passes solo in 3.2 s. Likely a timing assumption in the intake window; make it wait on a condition. Taken after the current step-2 change lands.
+
 ## Step 2 root cause: browser checks sample on wall deadlines
 
 `thread-pin-picker-browser` polled conditions on 10 s wall deadlines (11 s exit-1 failures); its waits now keep the same conditions behind 120 s backstops. `pack-still-browser` recorded frames for 900 ms of wall time, so a starved main thread produced no slide (`460.4375 -> 460.4375`); it now records until the slide condition holds (with a frame-count backstop), assertions unchanged.
