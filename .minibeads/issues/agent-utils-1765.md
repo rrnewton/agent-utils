@@ -33,3 +33,5 @@ updated_at: 2026-11-17T04:00:00-05:00
 # Notes
 
 Related: #1267 wrkslots-load-robust (the case-level quarantine this reuses), #1250 vibe-talk-timing-robust (the `disabled-optin` mechanism), #1748 standalone-wrkslots-scenario-wall-clock-budget (the scenario-only budget exemption this builds on). Step 2 starts only after step 1 has landed and been reported.
+
+Tracked for step 2 only (not fixed in step 1): `vibe-talk.check.thread-pin-picker-browser` flakes under load (failed 2 of 4 full validates on an unrelated tree, 11 s, exit 1); examine it as a vibe-talk browser check in step 2.
