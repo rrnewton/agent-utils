@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-self-contained-nested-repo-in-cache-disposable: treat a self-contained nested repository in a cache as disposable'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-17T18:00:00+00:00
-updated_at: 2026-11-17T18:00:00+00:00
+updated_at: 2026-11-17T21:05:00+00:00
+closed_at: 2026-11-17T21:05:00+00:00
 ---
 
 # Description
@@ -24,3 +25,7 @@ Deterministic tests in both editions (Python and Rust): a self-contained repo pl
 # Notes
 
 Priority normal-high. Keep the change in the cache-disposability and clean-caches code.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 79a6defe (fix 4824ad44) on main. The completed-validation nested-Git judgment in py/wrkslots/cli.py and its Rust mirror in rs/wrkslotsd/src/audit_state.rs judge containment recursively; deterministic tests in both editions cover the self-contained submodule case and the gitdir-outside, worktree-outside and alternates-outside refusals, each naming the escaping path. No persisted field was added.
