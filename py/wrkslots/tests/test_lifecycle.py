@@ -64975,7 +64975,7 @@ def test_mount_namespace_reprobe_proves_a_tearing_down_init(tmp_path: Path) -> N
 
 
 def test_mount_namespace_reprobe_refusal_names_the_window(tmp_path: Path) -> None:
-    """#906: a live-but-unreadable PID's refusal names the re-probe window."""
+    """#1769: a live-but-unreadable PID's refusal names the condition, not a window."""
     pid_dir = tmp_path / "4243"
     pid_dir.mkdir()
     (pid_dir / "wchan").write_text("0", encoding="ascii")
@@ -64987,9 +64987,22 @@ def test_mount_namespace_reprobe_refusal_names_the_window(tmp_path: Path) -> Non
     )
     (pid_dir / "fd").mkdir()
     generation = wrkslots._ProcessStat(start_ticks=12346, flags=4194560, state="S")
+    now = 0.0
 
-    with pytest.raises(wrkslots.Refusal, match="re-probes over 150 ms"):
-        wrkslots._mount_namespace_reprobed(pid_dir, generation)
+    def clock() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    with pytest.raises(
+        wrkslots.Refusal,
+        match="mount namespace is indeterminate for live PID 4243: "
+        "its mount-namespace link stayed absent",
+    ):
+        wrkslots._mount_namespace_reprobed(pid_dir, generation, clock=clock, sleep=sleep)
+    assert now == pytest.approx(wrkslots._MOUNT_NAMESPACE_EXIT_BACKSTOP_SECONDS)
 
 
 _PRIVATE_HISTORY_REMEDY = (

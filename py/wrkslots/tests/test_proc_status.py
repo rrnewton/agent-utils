@@ -1327,12 +1327,14 @@ def test_a_near_miss_of_an_exiting_namespace_init_is_still_refused(
         tmp_path: Path, near_miss: _NearMiss) -> None:
     proc_root = tmp_path / "proc"
     exiting_init_proc(proc_root, **near_miss)
+    fake = _FakeClock()
     with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991802"):
-        cli._absent_validate_process_snapshot(proc_root)
+        cli._absent_validate_process_snapshot(proc_root, clock=fake.clock, sleep=fake.sleep)
     budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=30, stdout_limit=1 << 20,
                                               stderr_limit=1 << 20)
+    fake = _FakeClock()
     with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991802"):
-        cli._same_uid_process_observations(budget, proc_root)
+        cli._same_uid_process_observations(budget, proc_root, clock=fake.clock, sleep=fake.sleep)
 
 
 
@@ -1385,12 +1387,14 @@ def test_a_near_miss_of_an_exiting_process_is_still_refused(
         tmp_path: Path, near_miss: dict[str, object]) -> None:
     proc_root = tmp_path / "proc"
     exiting_proc(proc_root, **near_miss)  # type: ignore[arg-type]
+    fake = _FakeClock()
     with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991803"):
-        cli._absent_validate_process_snapshot(proc_root)
+        cli._absent_validate_process_snapshot(proc_root, clock=fake.clock, sleep=fake.sleep)
     budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=30, stdout_limit=1 << 20,
                                               stderr_limit=1 << 20)
+    fake = _FakeClock()
     with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991803"):
-        cli._same_uid_process_observations(budget, proc_root)
+        cli._same_uid_process_observations(budget, proc_root, clock=fake.clock, sleep=fake.sleep)
 
 
 def _live_proc(proc_root: Path, pid: int = 2991804) -> Path:
@@ -1499,11 +1503,133 @@ def test_namespace_stays_live_and_unreadable_is_still_refused(
             raise cli.Refusal("mount namespace is indeterminate because ns/mnt is unreadable: simulated")
 
         monkeypatch.setattr(cli, "_mount_namespace", unreadable)
+        fake = _FakeClock()
         with pytest.raises(cli.Refusal, match="mount namespace is indeterminate"):
             if lane == "snapshot":
-                cli._absent_validate_process_snapshot(proc_root)
+                cli._absent_validate_process_snapshot(
+                    proc_root, clock=fake.clock, sleep=fake.sleep)
             else:
-                cli._same_uid_process_observations(_budget(), proc_root)
+                cli._same_uid_process_observations(
+                    _budget(), proc_root, clock=fake.clock, sleep=fake.sleep)
+
+
+def _two_thread_live_proc(proc_root: Path, pid: int = 2991804) -> Path:
+    """A live two-thread process: its context is not proven released."""
+
+    pid_dir = _live_proc(proc_root, pid)
+    uid = os.getuid()
+    (pid_dir / "status").write_text(
+        f"Name:\tlive\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+        f"NSpid:\t{pid}\nThreads:\t2\n", encoding="ascii")
+    return pid_dir
+
+
+def _stat_with_state(pid: int, state: str, start_ticks: int = 99) -> bytes:
+    return (
+        f"{pid} (live) {state} 1 {pid} {pid} 0 -1 0 0 0 0 0 "
+        f"0 0 0 0 20 0 1 0 {start_ticks}\n"
+    ).encode("ascii")
+
+
+def test_namespace_absent_then_gone_after_the_old_window_exits(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1769 (a): ns/mnt absent, then /proc/<pid> gone -- but only after
+    # more re-probes than the old 4-over-150 ms window allowed.  The exit
+    # is judged by the condition (the PID vanished), not by the window.
+    for lane in ("snapshot", "same_uid"):
+        proc_root = tmp_path / lane
+        pid_dir = _two_thread_live_proc(proc_root)
+        fake = _FakeClock()
+        calls = 0
+
+        def vanishing(_pid_dir: Path) -> str | None:
+            nonlocal calls
+            calls += 1
+            if calls >= 7:
+                (pid_dir / "stat").unlink(missing_ok=True)
+            return None
+
+        monkeypatch.setattr(cli, "_mount_namespace", vanishing)
+        if lane == "snapshot":
+            result = cli._absent_validate_process_snapshot(
+                proc_root, clock=fake.clock, sleep=fake.sleep)
+        else:
+            result = cli._same_uid_process_observations(
+                _budget(), proc_root, clock=fake.clock, sleep=fake.sleep)
+        assert result == ()
+        assert calls >= 7
+        assert fake.sleeps
+
+
+def test_namespace_absent_then_zombie_after_the_old_window_exits(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1769 (b): ns/mnt absent, then the stat state becomes Z.
+    for lane in ("snapshot", "same_uid"):
+        proc_root = tmp_path / lane
+        pid_dir = _two_thread_live_proc(proc_root)
+        fake = _FakeClock()
+        calls = 0
+
+        def zombifying(_pid_dir: Path) -> str | None:
+            nonlocal calls
+            calls += 1
+            if calls >= 7:
+                (pid_dir / "stat").write_bytes(_stat_with_state(2991804, "Z"))
+                _mark_zombie(pid_dir)
+            return None
+
+        monkeypatch.setattr(cli, "_mount_namespace", zombifying)
+        if lane == "snapshot":
+            result = cli._absent_validate_process_snapshot(
+                proc_root, clock=fake.clock, sleep=fake.sleep)
+        else:
+            result = cli._same_uid_process_observations(
+                _budget(), proc_root, clock=fake.clock, sleep=fake.sleep)
+        assert result == ()
+        assert calls >= 7
+
+
+def test_namespace_absent_live_identity_unchanged_still_refuses(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1769 (c): ns/mnt absent, process alive and identity unchanged
+    # through the backstop: still refused (fail closed).
+    for lane in ("snapshot", "same_uid"):
+        proc_root = tmp_path / lane
+        _two_thread_live_proc(proc_root)
+        fake = _FakeClock()
+        monkeypatch.setattr(cli, "_mount_namespace", lambda _pid_dir: None)
+        with pytest.raises(cli.Refusal, match="mount namespace is indeterminate for live PID 2991804"):
+            if lane == "snapshot":
+                cli._absent_validate_process_snapshot(
+                    proc_root, clock=fake.clock, sleep=fake.sleep)
+            else:
+                cli._same_uid_process_observations(
+                    _budget(), proc_root, clock=fake.clock, sleep=fake.sleep)
+        assert fake.now == pytest.approx(cli._MOUNT_NAMESPACE_EXIT_BACKSTOP_SECONDS)
+
+
+def test_namespace_unreadable_permission_on_live_process_still_refuses(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # #1769 (d): an unreadable (permission) namespace on a live process
+    # refuses as today; the exit wait never turns it into acceptance.
+    for lane in ("snapshot", "same_uid"):
+        proc_root = tmp_path / lane
+        _two_thread_live_proc(proc_root)
+        fake = _FakeClock()
+
+        def unreadable(_pid_dir: Path) -> str | None:
+            raise cli.Refusal(
+                "mount namespace is indeterminate because ns/mnt is unreadable: "
+                "[Errno 1] Operation not permitted")
+
+        monkeypatch.setattr(cli, "_mount_namespace", unreadable)
+        with pytest.raises(cli.Refusal, match="mount namespace is indeterminate"):
+            if lane == "snapshot":
+                cli._absent_validate_process_snapshot(
+                    proc_root, clock=fake.clock, sleep=fake.sleep)
+            else:
+                cli._same_uid_process_observations(
+                    _budget(), proc_root, clock=fake.clock, sleep=fake.sleep)
 
 
 def test_a_link_that_is_unreadable_rather_than_released_is_still_refused(

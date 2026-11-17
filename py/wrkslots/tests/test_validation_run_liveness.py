@@ -2112,9 +2112,12 @@ def _threaded_handoff(
             return ()
 
         def processes(
-            **kwargs: bool,
+            *,
+            include_owner_cgroups: bool = True,
         ) -> tuple[wrkslots._AbsentProcessObservation, ...]:
-            table = _REAL_PROCESS_SNAPSHOT(proc_root, **kwargs)
+            table = _REAL_PROCESS_SNAPSHOT(
+                proc_root, include_owner_cgroups=include_owner_cgroups
+            )
             tables.append(table)
             return table
 
@@ -2362,7 +2365,7 @@ def _end_run(host: _RealHost, run: _RunProcess) -> None:
 # An unrelated process the strict real-/proc snapshot met mid-exit (#1120):
 # its mount-namespace link was already gone, but it was not yet proven exited.
 _MOUNT_NAMESPACE_TRANSIENT = re.compile(
-    r"mount namespace is indeterminate for live PID (?P<pid>[0-9]+) after [0-9]+ re-probes"
+    r"mount namespace is indeterminate for live PID (?P<pid>[0-9]+):"
 )
 
 
@@ -2441,9 +2444,8 @@ def test_only_named_teardown_transients_of_other_processes_are_retried() -> None
 
     mount = (
         "REFUSED: validation-run authority is unverifiable for slot slot01: validation-run "
-        "evidence is unverifiable: mount namespace is indeterminate for live PID {pid} after "
-        "4 re-probes over 150 ms: its mount-namespace link stayed absent but the process was "
-        "not proven exited in that window"
+        "evidence is unverifiable: mount namespace is indeterminate for live PID {pid}: "
+        "its mount-namespace link stayed absent but the process was not proven exited"
     )
     assert _teardown_transient(mount.format(pid=4242), run_pid=1000)
     assert _teardown_transient(mount.format(pid=4242), run_pid=None)

@@ -81665,8 +81665,17 @@ def _surviving_thread_entries(
     return [(thread, leader) for thread in threads]
 
 
-_MOUNT_NAMESPACE_REPROBE_ATTEMPTS = 3
-_MOUNT_NAMESPACE_REPROBE_DELAY_SECONDS = 0.05
+#: Backstop for the mount-namespace exit wait (#1769): the verdict is the
+#: condition (exited, or a namespace), never the clock; this only bounds a
+#: process that stays alive with no namespace.  It is generous because a
+#: large process on a loaded host can spend seconds in exit teardown
+#: before it turns Z or disappears, and with a pidfd a real exit ends the
+#: wait at once, so only a truly stuck process pays it.  Each census pass
+#: shares one such deadline, capped by its operation budget where it has
+#: one, so many slow exiters cannot stack their waits.
+_MOUNT_NAMESPACE_EXIT_BACKSTOP_SECONDS = 30.0
+_MOUNT_NAMESPACE_FIRST_POLL_SECONDS = 0.005
+_MOUNT_NAMESPACE_POLL_SECONDS = 0.05
 
 
 def _proven_exited_thread_entries(
@@ -81686,6 +81695,12 @@ def _proven_exited_thread_entries(
         return None
     if current is None or current.start_ticks != generation.start_ticks:
         return []
+    # Stat state Z/X is dead (#1736, reused here): it needs no status read.
+    if current.state in _ZOMBIE_STATES:
+        try:
+            return _surviving_thread_entries(pid_dir, generation)
+        except _ProcessEvidenceChanged:
+            return []
     try:
         if _process_generation_is_terminal(pid_dir, generation):
             return _surviving_thread_entries(pid_dir, generation)
@@ -81702,24 +81717,79 @@ def _proven_exited_thread_entries(
     return None
 
 
-def _mount_namespace_reprobed(
-    pid_dir: Path, generation: _ProcessStat,
-) -> tuple[str | None, list[tuple[Path, tuple[int, int]]] | None]:
-    """Read a mount namespace, re-probing a PID that may be exiting (#875).
+def _wait_for_namespace_exit(
+    pid_dir: Path, generation: _ProcessStat, timeout: float
+) -> None:
+    """Wait up to ``timeout`` for ``pid_dir``'s exit, by condition (#1769).
 
-    Returns ``(namespace, None)`` for a live process, or ``(None, threads)``
-    when a re-probe proves the PID exited (gone, generation changed,
-    terminal, or context released); ``threads`` are its surviving-thread
-    entries to walk in its place.  Raises Refusal only when the PID is
-    still live and still indeterminate after the bounded re-probes, so a
-    genuinely live unreadable namespace (permission or a foreign user
-    namespace) is still refused, never accepted.
+    A real /proc process is waited on with a pidfd, which becomes readable
+    exactly when it exits; anything else (a fake snapshot, a kernel without
+    pidfd) falls back to a plain sleep of the same interval, after which the
+    caller re-probes the condition itself.
     """
 
+    if timeout <= 0:
+        return
+    if not pid_dir.name.isdigit():
+        time.sleep(timeout)
+        return
+    proc_pid_dir = pid_dir.parent.parent if pid_dir.parent.name == "task" else pid_dir
+    if proc_pid_dir.parent != Path("/proc"):
+        time.sleep(timeout)
+        return
+    try:
+        descriptor = _open_exit_pidfd(int(pid_dir.name))
+    except OSError:
+        time.sleep(timeout)
+        return
+    try:
+        try:
+            current = _read_process_stat(pid_dir)
+        except Refusal:
+            return
+        if current is None or current.start_ticks != generation.start_ticks:
+            return
+        with selectors.DefaultSelector() as watcher:
+            watcher.register(descriptor, selectors.EVENT_READ)
+            watcher.select(timeout)
+    except OSError:
+        return
+    finally:
+        os.close(descriptor)
+
+
+def _mount_namespace_reprobed(
+    pid_dir: Path,
+    generation: _ProcessStat,
+    *,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    wait_deadline: float | None = None,
+) -> tuple[str | None, list[tuple[Path, tuple[int, int]]] | None]:
+    """Read a mount namespace, waiting out a PID that may be exiting.
+
+    Returns ``(namespace, None)`` for a live process, or ``(None, threads)``
+    when a re-probe proves the PID exited (gone, generation changed, stat
+    state Z/X, terminal, or context released); ``threads`` are its
+    surviving-thread entries to walk in its place.  An absent link is the
+    exiting signal (#875, #906): the wait is on the exit condition itself
+    (a pidfd where available, otherwise re-probes), never on a fixed
+    window, with `_MOUNT_NAMESPACE_EXIT_BACKSTOP_SECONDS` as the backstop,
+    capped at ``wait_deadline`` (the census pass's shared deadline, itself
+    capped by its operation budget) where the caller supplies one.
+    Raises Refusal only when the PID is still live, with its identity
+    unchanged and still no namespace, at the backstop -- re-checked after
+    the last re-probe -- so a genuinely live unreadable namespace
+    (permission or a foreign user namespace) is still refused, never
+    accepted (#1769).
+    """
+
+    now = time.monotonic if clock is None else clock
+    deadline: float | None = None
+    poll = _MOUNT_NAMESPACE_FIRST_POLL_SECONDS
     last_refusal: Refusal | None = None
-    for attempt in range(_MOUNT_NAMESPACE_REPROBE_ATTEMPTS + 1):
-        if attempt:
-            time.sleep(_MOUNT_NAMESPACE_REPROBE_DELAY_SECONDS)
+    absent = False
+    while True:
         try:
             namespace = _mount_namespace(pid_dir)
         except Refusal as exc:
@@ -81727,35 +81797,56 @@ def _mount_namespace_reprobed(
             exited = _proven_exited_thread_entries(pid_dir, generation)
             if exited is not None:
                 return None, exited
-            continue
-        if namespace is not None:
-            return namespace, None
-        # A tearing-down namespace init proves itself directly from /proc,
-        # without the generation stat that a concurrent exit can race (#906).
-        if _process_is_exiting_namespace_init(pid_dir):
-            return None, []
-        exited = _proven_exited_thread_entries(pid_dir, generation, released_context=True)
-        if exited is not None:
-            return None, exited
-        window_ms = round(
-            _MOUNT_NAMESPACE_REPROBE_ATTEMPTS
-            * _MOUNT_NAMESPACE_REPROBE_DELAY_SECONDS
-            * 1000
-        )
-        last_refusal = Refusal(
-            f"mount namespace is indeterminate for live PID {pid_dir.name} "
-            f"after {_MOUNT_NAMESPACE_REPROBE_ATTEMPTS + 1} re-probes over "
-            f"{window_ms} ms: its mount-namespace link stayed absent but the "
-            "process was not proven exited in that window"
-        )
-    assert last_refusal is not None
-    raise last_refusal
+        else:
+            if namespace is not None:
+                return namespace, None
+            # A tearing-down namespace init proves itself directly from
+            # /proc, without the generation stat that a concurrent exit
+            # can race (#906).
+            if _process_is_exiting_namespace_init(pid_dir):
+                return None, []
+            exited = _proven_exited_thread_entries(
+                pid_dir, generation, released_context=True
+            )
+            if exited is not None:
+                return None, exited
+            absent = True
+            last_refusal = Refusal(
+                f"mount namespace is indeterminate for live PID {pid_dir.name}: "
+                "its mount-namespace link stayed absent but the process was "
+                "not proven exited"
+            )
+        if deadline is None:
+            deadline = now() + _MOUNT_NAMESPACE_EXIT_BACKSTOP_SECONDS
+            if wait_deadline is not None:
+                deadline = min(deadline, wait_deadline)
+        remaining = deadline - now()
+        if remaining <= 0:
+            # Re-check the exit conditions after the last re-probe, before
+            # refusing: the process may have exited during the final wait.
+            if absent and _process_is_exiting_namespace_init(pid_dir):
+                return None, []
+            exited = _proven_exited_thread_entries(
+                pid_dir, generation, released_context=absent
+            )
+            if exited is not None:
+                return None, exited
+            assert last_refusal is not None
+            raise last_refusal
+        wait = min(poll, remaining)
+        if sleep is not None:
+            sleep(wait)
+        else:
+            _wait_for_namespace_exit(pid_dir, generation, wait)
+        poll = min(poll * 2, _MOUNT_NAMESPACE_POLL_SECONDS)
 
 
 def _absent_validate_process_snapshot(
     proc_root: Path = Path("/proc"),
     *,
     include_owner_cgroups: bool = True,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[_AbsentProcessObservation, ...]:
     try:
         pid_dirs = sorted(
@@ -81765,6 +81856,11 @@ def _absent_validate_process_snapshot(
     except OSError as exc:
         raise Refusal(f"cannot enumerate live processes: {exc}") from exc
     observations: list[_AbsentProcessObservation] = []
+    # One exit-wait deadline for the whole pass (#1769): many slow exiters
+    # share it instead of each paying the backstop.
+    namespace_wait_deadline = (
+        time.monotonic if clock is None else clock
+    )() + _MOUNT_NAMESPACE_EXIT_BACKSTOP_SECONDS
     # Popped from the end, so the surviving threads of a zombie leader, pushed
     # back on top with that leader's identity, are observed next, in its place.
     pending: list[tuple[Path, tuple[int, int] | None]] = [
@@ -81786,7 +81882,10 @@ def _absent_validate_process_snapshot(
             if _process_start_ticks(pid_dir) is None:
                 continue
             raise
-        mount_namespace, exited_threads = _mount_namespace_reprobed(pid_dir, generation)
+        mount_namespace, exited_threads = _mount_namespace_reprobed(
+            pid_dir, generation, clock=clock, sleep=sleep,
+            wait_deadline=namespace_wait_deadline,
+        )
         if mount_namespace is None:
             assert exited_threads is not None
             pending.extend(reversed(exited_threads))
@@ -83391,6 +83490,9 @@ def _absent_validate_privileged_path_match(
 def _same_uid_process_observations(
     budget: _ReadOnlyCommandBudget,
     proc_root: Path = Path("/proc"),
+    *,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> tuple[_AbsentProcessObservation, ...]:
     """Snapshot processes whose filesystem UID can traverse a private fence."""
 
@@ -83403,6 +83505,14 @@ def _same_uid_process_observations(
     except OSError as exc:
         raise Refusal(f"cannot enumerate live processes: {exc}") from exc
     observations: list[_AbsentProcessObservation] = []
+    # One exit-wait deadline for the whole pass (#1769), capped by the
+    # operation budget: many slow exiters share it, and the budget's own
+    # remaining-seconds check still governs the pass.
+    namespace_wait_deadline = min(
+        (time.monotonic if clock is None else clock)()
+        + _MOUNT_NAMESPACE_EXIT_BACKSTOP_SECONDS,
+        budget.deadline,
+    )
     # As in _absent_validate_process_snapshot: a zombie leader's surviving
     # threads are observed next, in its place, with its identity.
     pending: list[tuple[Path, tuple[int, int] | None]] = [
@@ -83423,7 +83533,10 @@ def _same_uid_process_observations(
         # Validation-batch final checks pass record=None and need path and
         # mount evidence, never owner-cgroup membership. Avoid rereading an
         # unused cgroup file for every same-filesystem-UID PID and target.
-        mount_namespace, exited_threads = _mount_namespace_reprobed(pid_dir, generation)
+        mount_namespace, exited_threads = _mount_namespace_reprobed(
+            pid_dir, generation, clock=clock, sleep=sleep,
+            wait_deadline=namespace_wait_deadline,
+        )
         if mount_namespace is None:
             assert exited_threads is not None
             pending.extend(reversed(exited_threads))
