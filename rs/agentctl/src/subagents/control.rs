@@ -1776,6 +1776,75 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }))
     }
 
+    /// Promote a `launch_failed` record to `running` (#1793): the healer
+    /// calls this only when the pinned process is proven live as its pane's
+    /// foreground process, so a launch that errored after its harness came
+    /// up stops reporting failure forever. Any other state is untouched.
+    pub fn promote_launch_failed(&self, agent_name: &str) -> Result<bool> {
+        let _lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        if record.lifecycle != "launch_failed" {
+            return Ok(false);
+        }
+        record.lifecycle = "running".to_owned();
+        record.error = None;
+        self.save(&record)?;
+        Ok(true)
+    }
+
+    /// The workspace a headless agent's viewer tab belongs in (#1793): the
+    /// configured project workspace label resolved to an ID, else the
+    /// designated coordinator's workspace, else this client's own workspace.
+    pub fn viewer_workspace(&self) -> Option<String> {
+        if let Ok(Some(label)) = crate::profiles::workspace_for_registry(&self.registry) {
+            if let Ok(Some(id)) = self.client.workspace_id_for_label(&label) {
+                return Some(id);
+            }
+        }
+        let designated = fs::read_to_string(self.registry.join(DESIGNATION_FILE))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| value["name"].as_str().map(str::to_owned));
+        if let Some(name) = designated {
+            if let Ok(record) = self.load(&name) {
+                if let Some(workspace) = record.workspace_id.clone().or_else(|| {
+                    record
+                        .viewer_tab()
+                        .and_then(|tab| tab.split(':').next().map(str::to_owned))
+                }) {
+                    return Some(workspace);
+                }
+            }
+        }
+        self.client.inherited_workspace()
+    }
+
+    /// Create the viewer tab of a headless agent (#1793): a fresh tab in
+    /// `workspace` running `agentctl tail --follow NAME`, recorded as the
+    /// agent's `viewer_tab_id`. The viewer is a view only; the agent's pane
+    /// (it has none) and process are never touched. A console needs the
+    /// owner's foreground terminal, so automated creation always uses the
+    /// tail; an owner can point `--viewer-tab` at a console tab instead.
+    pub fn ensure_headless_viewer(&self, agent_name: &str, workspace: &str) -> Result<String> {
+        let record = self.load(agent_name)?;
+        let (tab, pane) =
+            self.client
+                .create_tab_with_pane(workspace, agent_name, &record.cwd, &[])?;
+        let executable = std::env::current_exe()
+            .map_err(|error| fail(format!("locate this agentctl: {error}")))?;
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        let command = format!(
+            "exec {} --registry {} tail --follow {}",
+            quote(&executable.display().to_string()),
+            quote(&self.registry.display().to_string()),
+            agent_name,
+        );
+        self.client.send_text(&pane, &command)?;
+        self.client.send_keys(&pane, "Enter")?;
+        self.set_viewer_tab(agent_name, Some(tab.clone()))?;
+        Ok(tab)
+    }
+
     /// Read, set, or clear what `agent_name` is for (#1342 agent-purpose-line).
     /// With neither `text` nor `clear` this only reads. Setting or clearing
     /// writes the record once and never prompts the agent; `goal` is untouched.

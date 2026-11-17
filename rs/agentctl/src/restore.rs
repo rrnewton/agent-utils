@@ -4568,6 +4568,92 @@ fn profile_roles(registry: &Path) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// The `agentctl tabs` listing (#1793): every tab of every managed
+/// workspace with its owner record, foreground process, idle time, and
+/// verdict. Read-only; with `dry_run` it also names the actions a hygiene
+/// pass would take (grace judged from now, so an idle shell shows its grace
+/// verdict rather than a close).
+pub fn tabs_listing<A: ManagedApi + ?Sized>(
+    client: &A,
+    registry: &Path,
+    config: &RestoreConfig,
+) -> Result<Value> {
+    let manager = crate::subagents::ManagedAgents::new(client, registry)
+        .map_err(|error| fail(error.to_string()))?;
+    let names = registered_names(registry).unwrap_or_default();
+    let panes = client.panes().map_err(|error| fail(error.to_string()))?;
+    let mut labels_by_tab: BTreeMap<String, String> = BTreeMap::new();
+    let mut workspaces: Vec<&str> = panes.iter().map(|p| p.workspace_id.as_str()).collect();
+    workspaces.sort_unstable();
+    workspaces.dedup();
+    for workspace in &workspaces {
+        if let Ok(found) = client.tab_labels(workspace) {
+            labels_by_tab.extend(found);
+        }
+    }
+    let pane_facts: Vec<crate::tabs::PaneFacts> = panes
+        .iter()
+        .map(|pane| crate::tabs::PaneFacts {
+            pane_id: pane.pane_id.clone(),
+            tab_id: pane.tab_id.clone(),
+            workspace_id: pane.workspace_id.clone(),
+            label: labels_by_tab.get(&pane.tab_id).cloned(),
+            idle_shell: client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false),
+            composer_text: true,
+            foreground: client
+                .pane_info(&pane.pane_id)
+                .map(|info| info.agent.unwrap_or(info.status))
+                .unwrap_or_else(|_| "unknown".to_owned()),
+        })
+        .collect();
+    let agent_facts: Vec<crate::tabs::AgentFacts> = names
+        .iter()
+        .filter_map(|name| {
+            let status = manager.status(name).ok()?;
+            Some(crate::tabs::AgentFacts {
+                name: name.clone(),
+                pane_id: status["pane_id"].as_str().map(str::to_owned),
+                viewer_tab_id: status["viewer_tab_id"].as_str().map(str::to_owned),
+                lifecycle: status["lifecycle"].as_str().unwrap_or_default().to_owned(),
+                headless: status["mode"].as_str() == Some("headless"),
+                live_proven: false,
+            })
+        })
+        .collect();
+    let order_tabs: Vec<(String, String)> = workspaces
+        .iter()
+        .filter_map(|workspace| {
+            crate::tab_order::socket_path()
+                .filter(|path| path.exists())
+                .and_then(|socket| crate::tab_order::list_tabs(&socket, workspace).ok())
+                .map(|tabs| {
+                    tabs.into_iter()
+                        .map(|tab| (workspace.to_string(), tab))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .flatten()
+        .collect();
+    let (rows, actions) = crate::tabs::plan(
+        &pane_facts,
+        &order_tabs,
+        &agent_facts,
+        &BTreeMap::new(),
+        0.0,
+        config.bare_shell_grace_seconds as f64,
+        workspaces.first().map(|workspace| *workspace),
+    );
+    Ok(json!({
+        "tabs": rows.iter().map(|row| json!({
+            "workspace_id": row.workspace_id, "tab_id": row.tab_id,
+            "label": row.label, "owner": row.owner,
+            "foreground": row.foreground, "idle_seconds": row.idle_seconds,
+            "verdict": row.verdict,
+        })).collect::<Vec<_>>(),
+        "would_do": actions.iter().map(|action| format!("{action:?}")).collect::<Vec<_>>(),
+    }))
+}
+
 /// One hygiene pass: canonical tab order in managed workspaces, and
 /// closing unclaimed bare shells idle past the grace period. Returns
 /// findings; every close is logged with pane, tab, cwd, and why.
@@ -4639,13 +4725,46 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
     let Ok(panes) = client.panes() else {
         return findings;
     };
-    let managed_workspaces: std::collections::BTreeSet<String> = panes
+    // #1793: a workspace is also managed when a pane's tab label names a
+    // registered agent (a duplicate tab in a second workspace), so its bare
+    // shells and order are cultivated instead of invisible.
+    let labels_by_tab: BTreeMap<String, String> = {
+        let mut labels = BTreeMap::new();
+        let mut workspaces: Vec<&str> = panes.iter().map(|p| p.workspace_id.as_str()).collect();
+        workspaces.sort_unstable();
+        workspaces.dedup();
+        for workspace in workspaces {
+            if let Ok(found) = client.tab_labels(workspace) {
+                labels.extend(found);
+            }
+        }
+        labels
+    };
+    let name_set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+    let claimed_set: std::collections::BTreeSet<String> = claimed.keys().cloned().collect();
+    let viewer_set: std::collections::BTreeSet<String> = viewer_tabs.keys().cloned().collect();
+    let pane_facts: Vec<crate::tabs::PaneFacts> = panes
         .iter()
-        .filter(|pane| {
-            claimed.contains_key(&pane.pane_id) || viewer_tabs.contains_key(&pane.tab_id)
+        .map(|pane| crate::tabs::PaneFacts {
+            pane_id: pane.pane_id.clone(),
+            tab_id: pane.tab_id.clone(),
+            workspace_id: pane.workspace_id.clone(),
+            label: labels_by_tab.get(&pane.tab_id).cloned(),
+            idle_shell: client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false),
+            composer_text: match client
+                .read_screen_with_runtime(&pane.pane_id, &crate::agent::SystemRuntime::default())
+            {
+                Ok(screen) => crate::tabs::composer_holds_text(&screen),
+                Err(_) => true,
+            },
+            foreground: client
+                .pane_info(&pane.pane_id)
+                .map(|info| info.agent.unwrap_or(info.status))
+                .unwrap_or_else(|_| "unknown".to_owned()),
         })
-        .map(|pane| pane.workspace_id.clone())
         .collect();
+    let managed_workspaces =
+        crate::tabs::managed_workspaces(&pane_facts, &claimed_set, &viewer_set, &name_set);
     // Canonical tab order, through the Herdr socket when reachable.
     if let Some(socket) = crate::tab_order::socket_path().filter(|path| path.exists()) {
         for workspace in &managed_workspaces {
@@ -4679,42 +4798,125 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
             }
         }
     }
-    // Bare shells: only in managed workspaces, only when unclaimed.
+    // Cultivation (#1793): the pure planner decides; this pass only executes.
     let now = host.now();
     let mut seen: std::collections::BTreeSet<String> = Default::default();
-    for pane in &panes {
-        if claimed.contains_key(&pane.pane_id)
-            || viewer_tabs.contains_key(&pane.tab_id)
-            || !managed_workspaces.contains(&pane.workspace_id)
-        {
-            continue;
-        }
-        if !client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false) {
-            continue;
-        }
-        seen.insert(pane.pane_id.clone());
-        let since = *bare_since.entry(pane.pane_id.clone()).or_insert(now);
-        if config.close_bare_shells && now - since >= config.bare_shell_grace_seconds as f64 {
-            let info = client.pane_info(&pane.pane_id).ok();
-            if client.close_pane(&pane.pane_id).is_ok() {
-                let row = json!({
-                    "pane_id": pane.pane_id,
-                    "tab_id": pane.tab_id,
-                    "cwd": info.as_ref().map(|info| info.cwd.clone()),
-                    "why": format!("bare shell idle {}s past {}s grace with no registered agent",
-                                   now - since, config.bare_shell_grace_seconds),
-                    "closed_at": now,
-                });
-                eprintln!(
-                    "agentctl watch: closed bare shell {} ({})",
-                    pane.pane_id, row["why"]
-                );
-                closed.push(row);
-                bare_since.remove(&pane.pane_id);
-            }
+    for fact in &pane_facts {
+        if fact.idle_shell && !claimed.contains_key(&fact.pane_id) {
+            seen.insert(fact.pane_id.clone());
+            bare_since.entry(fact.pane_id.clone()).or_insert(now);
         }
     }
     bare_since.retain(|pane, _| seen.contains(pane));
+    let agent_facts: Vec<crate::tabs::AgentFacts> = names
+        .iter()
+        .filter_map(|name| {
+            let status = manager.status(name).ok()?;
+            let identity = ["harness_identity", "custom_process_identity"]
+                .iter()
+                .find_map(|key| {
+                    serde_json::from_value::<crate::client::CustomProcessIdentity>(
+                        status[*key].clone(),
+                    )
+                    .ok()
+                });
+            let live_proven = status["pane_id"]
+                .as_str()
+                .is_some_and(|pane| panes.iter().any(|candidate| candidate.pane_id == pane))
+                && identity.as_ref().is_some_and(|identity| {
+                    client.process_liveness(identity) == crate::client::ProcessLiveness::Alive
+                });
+            Some(crate::tabs::AgentFacts {
+                name: name.clone(),
+                pane_id: status["pane_id"].as_str().map(str::to_owned),
+                viewer_tab_id: status["viewer_tab_id"].as_str().map(str::to_owned),
+                lifecycle: status["lifecycle"].as_str().unwrap_or_default().to_owned(),
+                headless: status["mode"].as_str() == Some("headless"),
+                live_proven,
+            })
+        })
+        .collect();
+    let order_tabs: Vec<(String, String)> = managed_workspaces
+        .iter()
+        .filter_map(|workspace| {
+            crate::tab_order::socket_path()
+                .filter(|path| path.exists())
+                .and_then(|socket| crate::tab_order::list_tabs(&socket, workspace).ok())
+                .map(|tabs| {
+                    tabs.into_iter()
+                        .map(|tab| (workspace.clone(), tab))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .flatten()
+        .collect();
+    let viewer_workspace = config
+        .coordinator
+        .as_deref()
+        .and_then(|name| agent_facts.iter().find(|agent| agent.name == name))
+        .and_then(|agent| {
+            agent
+                .viewer_tab_id
+                .as_deref()
+                .and_then(|tab| tab.split(':').next().map(str::to_owned))
+                .or_else(|| {
+                    agent.pane_id.as_deref().and_then(|pane| {
+                        panes
+                            .iter()
+                            .find(|candidate| candidate.pane_id == pane)
+                            .map(|candidate| candidate.workspace_id.clone())
+                    })
+                })
+        })
+        .or_else(|| managed_workspaces.iter().next().cloned());
+    let (_, actions) = crate::tabs::plan(
+        &pane_facts,
+        &order_tabs,
+        &agent_facts,
+        bare_since,
+        now,
+        config.bare_shell_grace_seconds as f64,
+        viewer_workspace.as_deref(),
+    );
+    for action in actions {
+        match action {
+            crate::tabs::TabAction::ClosePane {
+                pane_id,
+                tab_id,
+                why,
+            } => {
+                if !config.close_bare_shells {
+                    continue;
+                }
+                let info = client.pane_info(&pane_id).ok();
+                if client.close_pane(&pane_id).is_ok() {
+                    closed.push(json!({
+                        "pane_id": pane_id, "tab_id": tab_id,
+                        "cwd": info.as_ref().map(|info| info.cwd.clone()),
+                        "why": why, "closed_at": now,
+                    }));
+                    bare_since.remove(&pane_id);
+                }
+            }
+            crate::tabs::TabAction::CloseTab { tab_id, why } => {
+                if config.close_bare_shells && client.close_tab(&tab_id).is_ok() {
+                    closed.push(json!({"tab_id": tab_id, "why": why, "closed_at": now}));
+                }
+            }
+            crate::tabs::TabAction::RenameTab { tab_id, to } => {
+                let _ = client.rename_tab(&tab_id, &to);
+            }
+            crate::tabs::TabAction::Promote { agent } => {
+                let _ = manager.promote_launch_failed(&agent);
+            }
+            crate::tabs::TabAction::CreateViewer {
+                agent,
+                workspace_id,
+            } => {
+                let _ = manager.ensure_headless_viewer(&agent, &workspace_id);
+            }
+        }
+    }
     findings
 }
 
@@ -5093,6 +5295,72 @@ mod tests {
             BootReportState::Completed(_)
         ));
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn the_layout_sentinel_is_never_an_agent() {
+        // #1793: agents/agent.json is the layout-2 sentinel, not an agent;
+        // registered_names must list only real agents/<name>/agent.json.
+        let directory =
+            std::env::temp_dir().join(format!("restore-sentinel-{}", std::process::id()));
+        let registry = directory.join("registry");
+        let agents = registry.join("agents");
+        fs::create_dir_all(agents.join("real-one")).unwrap();
+        fs::write(agents.join("agent.json"), "\"sentinel\"").unwrap();
+        fs::write(agents.join("real-one/agent.json"), "{}").unwrap();
+        assert_eq!(
+            registered_names(&registry).unwrap(),
+            vec!["real-one".to_owned()]
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn liaison_first_then_the_coordinators_viewer_then_lanes() {
+        // #1793 owner ruling: liaison first, the designated coordinator's
+        // viewer second, then lanes by name, unmanaged last.
+        let order = vec![
+            "w1:lane".to_owned(),
+            "w1:coord-view".to_owned(),
+            "w1:liaison".to_owned(),
+            "w1:other".to_owned(),
+        ];
+        let mut claimed: BTreeMap<String, ClaimedTab> = BTreeMap::new();
+        claimed.insert(
+            "w1:p1".to_owned(),
+            ("lane-a".to_owned(), Some("w1:lane".to_owned()), None, None),
+        );
+        claimed.insert(
+            "w1:p2".to_owned(),
+            (
+                "liaison".to_owned(),
+                Some("w1:liaison".to_owned()),
+                None,
+                None,
+            ),
+        );
+        let mut viewer_tabs: BTreeMap<String, ViewerTab> = BTreeMap::new();
+        viewer_tabs.insert("w1:coord-view".to_owned(), ("coord".to_owned(), None, None));
+        let labels: BTreeMap<String, String> = BTreeMap::new();
+        let roles: BTreeMap<String, String> = BTreeMap::new();
+        let entries = ranked_entries(
+            &order,
+            &claimed,
+            &viewer_tabs,
+            &labels,
+            &roles,
+            &std::collections::BTreeSet::from(["liaison".to_owned()]),
+            Some("coord"),
+        );
+        assert_eq!(
+            crate::tab_order::canonical_tabs(&entries),
+            vec![
+                "w1:liaison".to_owned(),
+                "w1:coord-view".to_owned(),
+                "w1:lane".to_owned(),
+                "w1:other".to_owned()
+            ]
+        );
     }
 
     #[test]

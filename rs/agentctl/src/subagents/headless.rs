@@ -447,6 +447,23 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         } else {
             None
         };
+        // #1793: a headless agent always shows in a Herdr tab. Best-effort:
+        // viewer creation never fails the start, and the watch healer
+        // recreates a viewer that is later closed or dies.
+        if options.launch
+            && self
+                .load(agent_name)
+                .is_ok_and(|r| r.viewer_tab().is_none())
+        {
+            if let Some(workspace) = self.viewer_workspace() {
+                match self.ensure_headless_viewer(agent_name, &workspace) {
+                    Ok(tab) => eprintln!("agentctl: viewer tab {tab} opened for {agent_name}"),
+                    Err(error) => {
+                        eprintln!("agentctl: warning: no viewer tab for {agent_name}: {error}")
+                    }
+                }
+            }
+        }
         let mut result = self.status(agent_name)?;
         result["brief_message_id"] = json!(brief_id);
         result["wrapper_launched_pid"] = json!(launched);
@@ -617,6 +634,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 marker["tab"].as_str().unwrap_or("?")
             );
             return Ok(0);
+        }
+        // #1793: starting the wrapper (install-units --headless path) also
+        // ensures the viewer tab exists; best-effort, healed by watch.
+        if record.viewer_tab().is_none() {
+            if let Some(workspace) = self.viewer_workspace() {
+                let _ = self.ensure_headless_viewer(agent_name, &workspace);
+            }
         }
         let session = record.headless_session()?;
         let directory = self.directory(agent_name)?;

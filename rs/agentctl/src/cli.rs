@@ -179,6 +179,7 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch --once\n  agentctl --registry ~/project/.agentctl watch --interval 60\n  agentctl --registry ~/project/.agentctl watch --duty unit_repair=off\n\nWatch reads REGISTRY/watch.json (schema agentctl-watch/v1: duties, herdr_unit, timers,\nbare_shell_grace_seconds, close_bare_shells) on every run; the same keys in REGISTRY/restore.json\nstill work as fallback with a warning, and a key in both files is refused. restore.json gives\nwatch its coordinator and units, and is read once per boot by restore, which ignores watch.json.\nTimers entries take {unit, max_age_seconds, repair_stopped}; repair_stopped defaults false:\nan operator-stopped timer is reported once and never started unless it is set true.\nDuties (each default on) are notify, status_requests, tab_hygiene, unit_repair, herdr,\nslot_images, restore_check, queue_drain; an off duty is skipped-by-config in every pass.\nstatus_requests is owned by the notifier (watch-agents) in this phase. Example:\n--duty unit_repair=off keeps hygiene and notices while never restarting an owner-managed\nbridge unit. health.json goes to --state-dir (default $XDG_STATE_HOME/agentctl/watch) and\nincludes the effective duties. With --once, exit 0 when every check passed and 1 otherwise.\nWithout it the watch runs until stopped."
     )]
     Watch(Watch),
+    Tabs(TabsArgs),
     /// Watch every registered agent and tell its manager, else the coordinator, when one finished its turn with a verdict or needs a human: at a harness approval or permission prompt, idle without a verdict, stalled, blocked or silent while working, inside a long turn with input queued behind it, without progress on a declared metric, looping, or dead. One notice per episode, queued durably for its recipient; never answers a prompt and types into another agent only to interrupt a stuck turn with input queued behind it (the auto-interrupt policy, --auto-deliver-after); opt-in --auto-recover retries verified transient capacity/rate-limit stops
     #[command(
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --once --check-only\n  agentctl --registry ~/project/.agentctl watch-agents --coordinator coordinator --approval-minutes 5 --idle-minutes 5 --stall-minutes 30\n\nEach pass lists the registry, reads every running or starting agent except the coordinator (paused, mid-move, and agentcloud\nagents are skipped; an unreadable record is watched as unreachable), and classifies it. A condition that holds past its\nthreshold is reported once, as one message queued through the same durable path as `agentctl send`, so a busy recipient\nloses nothing; it counts as reported only once queued, and a failed send is retried on its own doubling backoff without\nholding up any other notice. The recipient is the nearest reachable agent up the agent's managed_by chain that can act on\nit (not one itself reported at a prompt, dead, or with a stuck turn), else the coordinator (`agentctl tree` shows the\nchain). A blocked agent (an approval or permission prompt, or a guardrail refusal) is reported in the pass\nthat sees it, past --min-notice-interval, and between passes a quick look every --blocked-check-seconds reads only visible\nrows for one. Log lines on standard error open with the UTC time. A verdict is a prose line (not tool output) of the agent's last reply (from its first block after the last user turn\non screen) that starts with one of --done-marker once any reply bullet is stripped (--done-marker replaces the DONE:/BLOCKED:\ndefaults). An idle agent with a verdict is reported as child-done after --child-done-seconds (default 0: the pass that sees it),\nin a message of its own that names the verdict line, once per turn, never held by --min-notice-interval; when the registry's\nlanding queue (`agentctl hold`) has agents waiting on it, the same message says who is next. An agent that was never sent\nwork, or still has prompts queued, is never reported idle, and a Claude Code view scrolled up (`N new messages (ctrl+End) ↓`\nabove the input box) is never judged stalled, idle, or finished until it is back at the bottom. Episode memory lives in\n--state-dir (default $XDG_STATE_HOME/agentctl/agent-watch); a message's queue ID is derived from its notices, so a restart\nrecognises a message that is already queued instead of sending it twice, and one watcher runs per state directory. With\n--once, exit 0 only when the team could be probed, no episode other than child-done is reported or due, and no view is\nscrolled up, 1 otherwise.\n\n\"Working\" is classified too (#570). The harness's turn timer is masked before screens are compared, and the tool\ncommands and gate steps under the agent's pinned harness process are read from /proc each pass: one that used CPU or moved\nbytes is progressing; one that did not for --stall-minutes is tool-blocked, named with what it waits on (a file lock and\nits holder, terminal input, a network socket, a pipe, an idle child); no tool and no output or token movement is\nstream-silent. The harness's own transcript (#574: Claude Code's session JSONL, Codex's rollout, Muse's journal, found\nby the record's session id or the files the harness holds open) adds the last event, the last model output, an open model\nrequest, and the tool call in flight with its command and timeout: a call no process runs for (an MCP tool, a sub-agent)\nis tool-blocked once nothing moves; untimed-tool: a call with no timeout running past --untimed-tool-minutes. The report's\n`activity` lists what each transcript says. turn-queued: inside one turn past --turn-minutes with input queued behind it.\nauto-interrupt: a stuck turn with input queued is interrupted and the input delivered (--auto-deliver-after). no-progress: a metric declared with `agentctl progress` unchanged for its hours while working.\nover-expected: a gate step past the p95 of --step-history. looping: the same command or error --loop-repeats times, or a\nretry banner, for --loop-minutes. background-wait: idle on background shells that are gone or idle.\n\nDelivery is watched too (#720): an owner (chat-bridge) request waiting undelivered in any agent's queue past\n--owner-stuck-minutes is reported with the reason its last attempt recorded, with a backoff until delivered, one live copy\nat a time, and each prompt quarantined as a PROBABLE MISROUTE in the last 6 hours is reported once with what to do next (an uncertain quarantine says to read the target pane before resending);\nboth are priority notices. A notice about an agent's own queue or composer (owner requests, a delivery jam, a held\nqueue, a draft, a misroute) is never queued to that agent or to one whose queue is stuck: it goes to the coordinator, else\na --notice-fallback, else it is logged and one owner alarm is posted through --owner-alarm-bridge (#844).\n\nQueues are drained too (#804): each pass types every interactive agent's queued prompts (at once when idle, at the next tool boundary for a working Muse or Claude Code agent), so a `send --queue-only` prompt is delivered here, never parked; one still pending past --queue-stale-minutes is a queue_drains row naming the agent and the oldest prompt's age, and keeps the pass not ok. --check-only reports without typing.\nWithout it the watch runs until stopped; see the sample user unit in `agentctl userguide`."
@@ -1122,6 +1123,14 @@ struct RunHeadless {
     /// Accept answers from processes in the harness's own control group (by default refused, so a tool call that left the harness's process tree still cannot answer); for a wrapper that is not run as its own systemd unit
     #[arg(long)]
     approval_shared_cgroup: bool,
+}
+
+/// `agentctl tabs` (#1793 agentctl-workspace-cultivation).
+#[derive(Args)]
+struct TabsArgs {
+    /// Name the actions a hygiene pass would take, and take none (the listing itself never changes anything)
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -4391,6 +4400,18 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 1
             });
         }
+        Commands::Tabs(value) => {
+            let client = HerdrClient::with_executable("direct", &args.herdr_bin)
+                .map_err(AgentError::from)?;
+            let config = crate::restore::RestoreConfig::load(&args.registry)?;
+            let mut listing = crate::restore::tabs_listing(&client, &args.registry, &config)?;
+            listing["dry_run"] = json!(value.dry_run);
+            if !value.dry_run {
+                listing["would_do"] = json!([]);
+            }
+            write_json(&listing).map_err(Failure::Output)?;
+            return Ok(0);
+        }
         Commands::WatchAgents(value) => {
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
                 .map_err(AgentError::from)?;
@@ -5786,6 +5807,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Services(_)
         | Commands::Watch(_)
         | Commands::WatchAgents(_)
+        | Commands::Tabs(_)
         | Commands::Health(_)
         | Commands::Hold(_)
         | Commands::Tail(_)

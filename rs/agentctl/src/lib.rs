@@ -60,6 +60,7 @@ pub mod stuck;
 pub mod subagents;
 pub mod submission;
 pub(crate) mod tab_order;
+pub mod tabs;
 pub mod team_driver;
 pub mod team_escalate;
 pub mod team_model;
