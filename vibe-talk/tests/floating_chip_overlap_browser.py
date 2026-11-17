@@ -81,8 +81,19 @@ FOOT_CLEAR_JS = """() => {
     const strips = [...document.querySelectorAll('#discord-log .reactions')]
         .filter((e) => { const r = e.getBoundingClientRect(); return r.bottom > area.top && r.top < area.bottom; });
     if (!strips.length) return false;
-    const last = strips[strips.length - 1].getBoundingClientRect();
-    return last.bottom <= toast.getBoundingClientRect().top + 0.5;
+    const t = toast.getBoundingClientRect();
+    // Clear is the condition the walk asserts below -- no reaction chip of the last card
+    // intersects the toast -- not the strip ending above the toast's top. On a loaded host
+    // the pill's rise over the composer (`placeChipsOverComposer`, driven by resize
+    // observers a starved main thread delivers late) lands after the scroll: the strip
+    // then stands wholly below the pill, clear of it, while its bottom is still below
+    // the pill's top, so the old proxy never held and the wait ran out its deadline
+    // against a state that was already good (#1765).
+    return [...strips[strips.length - 1].querySelectorAll('.reaction')].every((chip) => {
+        const r = chip.getBoundingClientRect();
+        return !(r.left < t.right - 0.5 && t.left < r.right - 0.5
+                 && r.top < t.bottom - 0.5 && t.top < r.bottom - 0.5);
+    });
 }"""
 
 
