@@ -1,12 +1,12 @@
 ---
 title: 'wrkslots-validate-deleted-subvolume-binds: remove validate rows whose subvolume was deleted under a live bind'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - wrkslots
 created_at: 2026-11-17T08:03:44-05:00
-updated_at: 2026-11-17T08:03:44-05:00
+updated_at: 2026-11-17T10:10:41-05:00
 ---
 
 # Description
@@ -64,3 +64,24 @@ themselves; do not touch their rows.
 (#1766), mu-censusbound (#1747) and mu-censusexit (#1769) are changing
 remove/recover/census code in py/wrkslots/cli.py concurrently; keep
 this change small and local and rebase right before the gate.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 726d39b9 + 220b03b9
+(gate pass on the rebased tree, 19498087).
+
+Defect 5 is fixed: a deleted-subvolume bind (mountinfo root ending in
+//deleted, and/or st_dev 0 on the row's own path) is absent storage.
+No 0 identity is ever sealed or journaled; the existing census runs
+first and fails closed on live use; wrkslots unmounts only its own
+stale binds through worktreesimage.unmount_bind (peer mirror views
+included, foreign binds untouched); the row is then reconciled
+exactly like recover-absent-validate-rows, including from
+`remove --validate-complete`. The Rust recover writer refuses such
+rows and names the Python edition instead of dropping them.
+
+Defect 6 was already handled: recover-absent-validate-rows already
+retires validate rows whose directories are gone, proven by
+test_recover_absent_validate_rows_handles_a_missing_directory (and
+the pre-existing test_recover_absent_validate_rows_handles_terminal_and_recordless_rows),
+which passed before any fix. No consumer rows were touched.
