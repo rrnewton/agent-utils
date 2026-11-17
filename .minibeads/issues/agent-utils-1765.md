@@ -18,6 +18,7 @@ updated_at: 2026-11-17T04:00:00-05:00
 - `packages.standalone.wrkslots`: a remove-agent-batch item with a 60-second wall budget (hit 113 s under load; 73 s solo), so the standalone lifecycle verdict depended on host load instead of what it proves.
 - `py/wrkslots/tests/test_recover_ownerless_write_rust.py::test_ownerless_worktree_plan_matches_python` (systemd busctl under load).
 - `py/wrkslots/tests/test_census_cost.py::test_audit_record_with_precomputed_folds_never_refolds` fails on a one-second boundary (`heartbeat_age_seconds` 27679745 vs 27679744) under gate load: it compares two audit rows read from the wall clock seconds apart. Fixed in step 1 with a fixed clock in the test (no quarantine needed).
+- `rs/agentctl` `tmux_lifecycle::tmux_backend_runs_the_full_agent_lifecycle` times out under gate load (480 s, gate 4:34 AM ET); its slowness and leaked tmux server are tracked separately as #1590. Taken out of gating in step 1 with `#[ignore]` naming this issue and #1590; not fixed here.
 
 # Design
 

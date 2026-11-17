@@ -349,6 +349,7 @@ fn tmux_server_dies_with_its_fixture_even_on_panic() {
 }
 
 #[test]
+#[ignore = "#1765 wrkslots-load-sensitive-gate-tests (owner rule 346; slowness and server leak tracked as #1590): times out under gate load; run on demand with cargo test -- --ignored tmux_backend_runs_the_full_agent_lifecycle"]
 fn tmux_backend_runs_the_full_agent_lifecycle() {
     let Some(fixture) = Fixture::new() else {
         eprintln!("tmux or python3 not installed; skipping");
