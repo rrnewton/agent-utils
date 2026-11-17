@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-muse-placeholder-hint-as-draft: Muse placeholder hint read as a foreign draft holds every queued message'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-17T08:45:08-05:00
-updated_at: 2026-11-17T08:45:08-05:00
+updated_at: 2026-11-17T14:14:41-05:00
+closed_at: 2026-11-17T14:14:41-05:00
 ---
 
 # Description
@@ -81,3 +82,15 @@ be blamed on a lock wait; the follow-up should name the real wait
 ("composer holds a draft agentctl did not type: <first 40 chars>")
 and count `inbox/` items as pending in status. The hint fix removes
 the staged wait itself; the labelling fix is separate.
+
+## Resolution
+
+[watermelon-full-preview] Landed e977291a on github/main (gated
+bd87040b, owner-priority gate, validate OK). The Muse editor reader
+treats an exact, wrapped or edge-truncated Muse 1.4.23 hint (one
+versioned table, Rust and Python pinned identical), or grey/faint
+ANSI text, as an empty composer; the watcher sweep shares the
+reader. Tests cover both reported hints idle and mid-run, narrow
+40/60-column wrap/cut, the live truecolor sequence, a real draft
+and a staged paste. The lock-labelling symptom is #1775
+agentctl-drain-composer-wait-labelled-lock-wait.
