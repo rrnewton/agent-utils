@@ -89,7 +89,9 @@ def test_newer_handoff_keys_survive_a_load_write_round_trip(tmp_path: Path) -> N
     record = state.slots[0]
     assert record.handoff is not None
     written = cli._record_to_obj(record)
-    assert written["handoff"][FUTURE_KEY] == FUTURE_VALUE
+    handoff_obj = written["handoff"]
+    assert isinstance(handoff_obj, dict)
+    assert handoff_obj[FUTURE_KEY] == FUTURE_VALUE
 
 
 def test_ignored_summary_in_active_record_is_tolerated_then_refused_at_remove(
@@ -116,10 +118,9 @@ def test_ignored_summary_in_active_record_is_tolerated_then_refused_at_remove(
     assert admitted.returncode == 0, admitted.stderr
     config = cli._load_config(str(project), "testhost")
     record = cli._load_active_snapshot(config).slots[0]
-    assert cli._record_to_obj(record)["handoff"]["ignored_summary"] == {
-        "count": 1,
-        "bytes": 3,
-    }
+    handoff_obj = cli._record_to_obj(record)["handoff"]
+    assert isinstance(handoff_obj, dict)
+    assert handoff_obj["ignored_summary"] == {"count": 1, "bytes": 3}
     with pytest.raises(cli.SchemaSkewRefusal):
         cli._assert_record_actable(record, "remove")
 

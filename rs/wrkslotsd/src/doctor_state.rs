@@ -310,6 +310,7 @@ fn doctor_quick(
 ) -> Result<String> {
     let started = std::time::Instant::now();
     let (cfg, _selected) = load_cfg(root, machine_override)?;
+    let config = load_config(root, machine_override)?;
     let envelope = parse_doctor(root, machine_override, all_machines)?;
     let mut findings = envelope
         .get("findings")
@@ -388,6 +389,8 @@ fn doctor_quick(
             "machines": envelope.get("machines").cloned().unwrap_or(json!([])),
             "active": envelope.get("active").cloned().unwrap_or(json!([])),
             "max_active_slots": envelope.get("max_active_slots").cloned().unwrap_or(Value::Null),
+            "reader_floor": config.get("reader_floor").cloned().unwrap_or(json!(1)),
+            "writer_ceiling": config.get("writer_ceiling").cloned().unwrap_or(json!(2)),
             "findings": findings,
             "counts_by_kind": counts,
             "interrupted_journals": reports,

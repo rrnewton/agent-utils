@@ -748,7 +748,8 @@ fn assert_import_matches(record: &RecordRec, source: &ImportRec, label: &str) ->
 
 pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
     let raw = as_mapping(value, label)?;
-    let mut unknown_fields = tolerant_keys(raw, ACTIVE_RECORD_REQUIRED, ACTIVE_RECORD_OPTIONAL, label)?;
+    let mut unknown_fields =
+        tolerant_keys(raw, ACTIVE_RECORD_REQUIRED, ACTIVE_RECORD_OPTIONAL, label)?;
     if let Some(value) = raw.get("harness_checkout_reason") {
         if !matches!(value, Value::Null) {
             let reason = as_str(value, &format!("{label}.harness_checkout_reason"))?;
@@ -798,7 +799,10 @@ pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
         Value::Null => None,
         value => Some(as_str(value, &format!("{label}.coordinator_recovery_note"))?.to_owned()),
     };
-    unknown_fields.extend(handoff_from_obj(&raw["handoff"], &format!("{label}.handoff"))?);
+    unknown_fields.extend(handoff_from_obj(
+        &raw["handoff"],
+        &format!("{label}.handoff"),
+    )?);
     for checkout in &checkouts {
         unknown_fields.extend(checkout.unknown_fields.iter().cloned());
     }

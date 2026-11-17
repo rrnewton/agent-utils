@@ -165,7 +165,12 @@ pub(crate) fn validate_active_record(
     label: &str,
 ) -> Result<ValidatedActiveRecord, ObserverError> {
     let record = object(value, label)?;
-    tolerant_keys_optional(record, ACTIVE_RECORD_REQUIRED, ACTIVE_RECORD_OPTIONAL, label)?;
+    tolerant_keys_optional(
+        record,
+        ACTIVE_RECORD_REQUIRED,
+        ACTIVE_RECORD_OPTIONAL,
+        label,
+    )?;
     let slot = named_string(&record["slot"], &format!("{label}.slot"))?;
     let agent = named_string(&record["agent"], &format!("{label}.agent"))?;
     nonempty_string(&record["task"], &format!("{label}.task"))?;

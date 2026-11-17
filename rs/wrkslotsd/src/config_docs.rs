@@ -6,6 +6,8 @@ pub(crate) const TOP_DOCS: &[(&str, &str)] = &[
     ("schema", "Configuration schema version (2). Written by init; do not edit."),
     ("min_wrkslots_version", "Oldest wrkslots version (MAJOR.MINOR.PATCH) that may read this file. Raise it only when a key this file relies on for correctness is newer than some reader; an older reader then refuses, naming the version. Absent means any version that knows every key."),
     ("ignorable_keys", "Optional keys a wrkslots that does not know them may ignore, with a warning, instead of refusing the file. List a new key here when it only adds behaviour; a key that is not listed (a typo, for example) still refuses."),
+    ("reader_floor", "Oldest record schema level (integer) this project's readers must keep reading. Writers never emit fields above writer_ceiling, and never fall back to a less safe older format to satisfy the ceiling: an operation that cannot be written equally safely at the ceiling refuses instead. Absent means level 1."),
+    ("writer_ceiling", "Highest record schema level (integer) writers in this project may emit. Raise it (with reader_floor) only deliberately, via init --repair, once every reader that must keep working understands the new level. Absent means this build's level."),
     ("machine", "Machine shard name: state files are ACTIVE.<machine>.json and EVENTS.<machine>. Init writes the short host name. Absent, or the literal auto, resolves to the short host name at load, so a tracked file can be shared by every host; WRKSLOTS_MACHINE or --machine still overrides any of these."),
     ("worktrees_dir", "Where slot directories live, relative to the project root. It says where live state is: never change it while slots exist."),
     ("layout", "nested (default when absent): <worktrees_dir>/<slot>/<repo>/. flat: each slot directory is its single checkout."),
@@ -123,6 +125,8 @@ pub(crate) const OPTIONAL_KEYS: &[&str] = &[
     "worktrees_image",
     "min_wrkslots_version",
     "ignorable_keys",
+    "reader_floor",
+    "writer_ceiling",
 ];
 
 pub(crate) const HEADER_TEMPLATE: &str = "wrkslots project configuration ({name}): where this project's agent and validation slots live and how they are stored and boxed. The format is a strict YAML subset (`wrkslots --userguide`, section \"Configuration file\"); a file whose first character is {{ is read as JSON.\nwrkslots rewrites this file with these comments regenerated (init --repair, sandbox write-defaults, image set-default); hand-written comments are not kept, and the previous bytes are saved to {name}.bak. Regenerate it with `wrkslots config convert --to yaml`.";

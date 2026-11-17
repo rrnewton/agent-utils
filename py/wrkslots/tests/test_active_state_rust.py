@@ -225,7 +225,7 @@ def _checkout0(state: dict[str, object]) -> dict[str, object]:
     ("mutate", "fragment"),
     [
         (lambda state: state.update(schema=3), "unsupported active state schema in"),
-        (lambda state: _slots(state)[0].update(bogus=1), "has invalid fields"),
+        (lambda state: _slots(state)[0].pop("task"), "has invalid fields"),
         (lambda state: _slots(state).append(_slots(state)[0]), "duplicate slot in"),
         (lambda state: _slots(state)[0].update(machine="node-b"), "expected shard"),
         (lambda state: _slots(state)[0].update(coordinator_lease=None), "has no coordinator lease"),
