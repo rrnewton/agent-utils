@@ -286,13 +286,18 @@ def test_slice_limits_permanent_manager_error_fails_at_once(
 def test_slice_limits_transient_until_the_backstop_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake = _FakeSystemctl(["org.freedesktop.DBus.Error.NoReply"] * 100)
+    fake = _FakeSystemctl(["org.freedesktop.DBus.Error.NoReply"] * 100000)
     monkeypatch.setattr(sandbox, "subprocess", fake)
-    monkeypatch.setattr(sandbox, "_SLICE_LIMIT_BACKSTOP_SECONDS", 0.6)
-    monkeypatch.setattr(sandbox, "_SLICE_LIMIT_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(sandbox, "_SLICE_LIMIT_BACKSTOP_SECONDS", 2.0)
+    sleeps: list[float] = []
+    monkeypatch.setattr(sandbox.time, "sleep", sleeps.append)
+    monkeypatch.setattr(sandbox.random, "uniform", lambda _a, _b: 0.0)
     with pytest.raises(sandbox.SandboxError, match=r"after \d+ tries: .*NoReply"):
         sandbox.apply_slice_limits(_view(tmp_path), sandbox.SandboxLimits(tasks_max=256))
     assert fake.set_property_calls > 1
+    # Backoff via the fake clock: 0.25 s doubling to the 5 s cap (#1765).
+    assert sleeps[:5] == [0.25, 0.5, 1.0, 2.0, 4.0]
+    assert max(sleeps) <= 5.0
 
 
 def test_build_spec_layers_home_and_binds_blessed_paths(tmp_path: Path) -> None:

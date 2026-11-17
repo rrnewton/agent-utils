@@ -61,6 +61,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import random
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -786,7 +787,10 @@ def _set_slice_limits(unit: str, properties: list[str], deadline_ns: int | None)
             f"wrkslots: retrying limits on {unit} (try {tries + 1}): {last_error}",
             file=sys.stderr,
         )
-        time.sleep(_SLICE_LIMIT_POLL_SECONDS)
+        # Back off (0.25 s doubling to a 5 s cap, plus jitter) so many
+        # steps do not hammer a contended manager in lockstep (#1765).
+        delay = min(5.0, _SLICE_LIMIT_POLL_SECONDS * float(2 ** min(tries - 1, 5)))
+        time.sleep(delay + random.uniform(0.0, delay * 0.25))
 
 
 def apply_slice_limits(
