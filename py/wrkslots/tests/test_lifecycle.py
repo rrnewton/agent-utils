@@ -20082,6 +20082,193 @@ def test_validate_batch_shares_one_census_and_retains_each_refusal(
     assert in_use.is_dir()
 
 
+def test_validate_batch_runs_one_grouped_same_uid_census(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # #1747: every slot is fenced first, then ONE same-UID census covers
+    # all fenced paths; the privileged census still runs before the fence.
+    project, _repository, _remote = make_project(tmp_path)
+    slots = ("slot01", "slot02", "slot03")
+    slot_paths = prepare_dead_validate_slots(project, slots)
+    order: list[str] = []
+    same_uid_calls: list[tuple[Path, ...]] = []
+
+    def privileged(
+        paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget | None = None,
+        include_owner_cgroups: bool = True,
+    ) -> wrkslots._ProcessPathCensus:
+        del budget, include_owner_cgroups
+        order.append("privileged")
+        return wrkslots._ProcessPathCensus((), ())
+
+    def same_uid(
+        paths: Sequence[Path],
+        *,
+        budget: wrkslots._ReadOnlyCommandBudget,
+    ) -> wrkslots._ProcessPathCensus:
+        del budget
+        order.append("same-uid")
+        same_uid_calls.append(tuple(paths))
+        return wrkslots._ProcessPathCensus((), ())
+
+    monkeypatch.setattr(wrkslots, "_capture_process_path_census", privileged)
+    monkeypatch.setattr(wrkslots, "_capture_same_uid_process_path_census", same_uid)
+
+    arguments = [
+        "--project-root",
+        str(project),
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    for slot in slots:
+        arguments.extend(("--slot", f"{slot}=1"))
+    arguments.extend(("--format", "json"))
+
+    assert wrkslots.main(arguments) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert order[0] == "privileged"
+    assert len(same_uid_calls) == 1
+    fenced = same_uid_calls[0]
+    assert len(fenced) == 3
+    assert all(".fenced." in path.name for path in fenced)
+    assert {path.name.split(".")[1] for path in fenced} == set(slots)
+    assert report["same_uid_process_censuses"] == 1
+    assert report["shared_process_censuses"] == 1
+    assert {row["slot"] for row in report["removed"]} == set(slots)
+    assert report["retained"] == []
+    assert all(not slot_paths[slot].exists() for slot in slots)
+
+
+def _kill_grouped_batch_after_prepare(
+    project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slots: Sequence[str],
+) -> None:
+    """Run a grouped batch that dies right after its grouped census."""
+
+    class Interrupted(RuntimeError):
+        pass
+
+    def interrupt(point: str) -> None:
+        if point == "after-validate-batch-grouped-census":
+            raise Interrupted
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+    arguments = [
+        "--project-root",
+        str(project),
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+    ]
+    for slot in slots:
+        arguments.extend(("--slot", f"{slot}=1"))
+    arguments.extend(("--format", "json"))
+    with pytest.raises(Interrupted):
+        wrkslots.main(arguments)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+
+def test_grouped_batch_killed_after_prepare_recovers_every_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Kill after prepare-all: N paired finishes plus the seal are
+    # outstanding; plain recover finishes every one and retires the seal.
+    project, _repository, _remote = make_project(tmp_path)
+    slots = ("slot01", "slot02", "slot03")
+    slot_paths = prepare_dead_validate_slots(project, slots)
+    stub_validate_batch_censuses(monkeypatch)
+    _kill_grouped_batch_after_prepare(project, monkeypatch, slots)
+    config = wrkslots._load_config(str(project), "testhost")
+    assert wrkslots._validate_batch_seal_journal_path(config).is_file()
+    for slot in slots:
+        assert wrkslots._finish_journal_path(config, slot).is_file()
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert all(not slot_paths[slot].exists() for slot in slots)
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    for slot in slots:
+        assert not wrkslots._finish_journal_path(config, slot).exists()
+    assert active_slots(project) == []
+
+
+def test_create_proceeds_beside_killed_grouped_batch_then_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Create's seal handling excludes every paired finish and proceeds
+    # beside them; plain recover afterwards finishes them all.
+    project, _repository, _remote = make_project(tmp_path)
+    slots = ("slot01", "slot02")
+    slot_paths = prepare_dead_validate_slots(project, slots)
+    stub_validate_batch_censuses(monkeypatch)
+    _kill_grouped_batch_after_prepare(project, monkeypatch, slots)
+
+    made = create(project, slot="newslot", slot_type="validate", branch=None)
+    assert made.returncode == 0, made.stderr
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "recover",
+                "--coordinator-pid",
+                str(os.getpid()),
+            ]
+        )
+        == 0
+    )
+    assert all(not slot_paths[slot].exists() for slot in slots)
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+    assert {row["slot"] for row in active_slots(project) if isinstance(row, dict)} == {
+        "newslot"
+    }
+
+
+def test_paired_finish_for_unsealed_target_refuses_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A finish that pairs no sealed target (here: a duplicate pairing of
+    # the same target under another slot's journal name) refuses, as today.
+    project, _repository, _remote = make_project(tmp_path)
+    slots = ("slot01", "slot02")
+    slot_paths = prepare_dead_validate_slots(project, slots)
+    stub_validate_batch_censuses(monkeypatch)
+    _kill_grouped_batch_after_prepare(project, monkeypatch, slots)
+    config = wrkslots._load_config(str(project), "testhost")
+    first_journal = wrkslots._finish_journal_path(config, "slot01")
+    second_journal = wrkslots._finish_journal_path(config, "slot02")
+    second_journal.write_bytes(first_journal.read_bytes())
+
+    _loaded = wrkslots._load_validate_batch_seal_journal(config)
+    assert _loaded is not None
+    _path, _raw, targets = _loaded
+    with pytest.raises(wrkslots.StateError):
+        wrkslots._validate_batch_seal_paired_finishes(config, targets)
+    # Nothing was deleted: both trees survive under their fences.
+    for slot in slots:
+        assert list(slot_paths[slot].parent.glob(f".{slot}.fenced.*"))
+
+
 def test_validate_batch_that_retains_every_item_exits_nonzero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -20922,20 +21109,22 @@ def test_validate_batch_deadline_between_targets_never_enters_later_removals(
     assert wrkslots.main(arguments) == 1
 
     report = json.loads(capsys.readouterr().out)
+    # Grouped flow (#1747): the deadline expires after the first slot is
+    # fenced, before the grouped census can run, so the prepared fence is
+    # rolled back and nothing is removed; every slot is retained.
     assert entered == [slots[0]]
     assert fenced == [slots[0]]
     assert len(fresh_scans) == 1
-    assert report["removed"] == [{"generation": 1, "slot": slots[0]}]
-    assert {row["slot"] for row in report["retained"]} == set(slots[1:])
+    assert report["removed"] == []
+    assert {row["slot"] for row in report["retained"]} == set(slots)
     assert all(
         "operation-wide time bound" in row["reason"] for row in report["retained"]
     )
     assert report["same_uid_process_censuses"] == 1
-    assert not slot_paths[slots[0]].exists()
-    assert all(slot_paths[slot].is_dir() for slot in slots[1:])
+    assert all(slot_paths[slot].is_dir() for slot in slots)
     assert {
-        slot: stat.S_IMODE(slot_paths[slot].stat().st_mode) for slot in slots[1:]
-    } == {slot: original_modes[slot] for slot in slots[1:]}
+        slot: stat.S_IMODE(slot_paths[slot].stat().st_mode) for slot in slots
+    } == original_modes
     config = wrkslots._load_config(str(project), "testhost")
     assert not wrkslots._journal_path(config).exists()
     assert not wrkslots._validate_batch_seal_journal_path(config).exists()
@@ -21546,16 +21735,18 @@ def test_validate_batch_rechecks_later_slot_use_after_shared_census(
     ) -> wrkslots._ProcessPathCensus:
         nonlocal fenced_scans
         del budget
-        assert len(slot_paths) == 1
-        slot_path = slot_paths[0]
-        if slot_path.name.startswith(".") and ".fenced." in slot_path.name:
+        if any(
+            path.name.startswith(".") and ".fenced." in path.name
+            for path in slot_paths
+        ):
             fenced_scans += 1
         if late_user is not None:
             observed = Path(os.readlink(f"/proc/{late_user.pid}/cwd"))
-            if observed == slot_path or slot_path in observed.parents:
-                return wrkslots._ProcessPathCensus(
-                    (), ((late_user.pid, str(slot_path), "cwd", str(observed)),)
-                )
+            for slot_path in slot_paths:
+                if observed == slot_path or slot_path in observed.parents:
+                    return wrkslots._ProcessPathCensus(
+                        (), ((late_user.pid, str(slot_path), "cwd", str(observed)),)
+                    )
         return wrkslots._ProcessPathCensus((), ())
 
     def enter_at_final_path_fence(source: os.PathLike[str], target: os.PathLike[str]) -> None:
@@ -21596,7 +21787,7 @@ def test_validate_batch_rechecks_later_slot_use_after_shared_census(
     )
     assert len(report["retained"]) == 1
     assert "live process" in report["retained"][0]["reason"]
-    assert fenced_scans == 2
+    assert fenced_scans == 1
     assert len(recheck_budgets) == 2
     assert recheck_budgets[0] is recheck_budgets[1]
     assert not paths["first"].exists()
@@ -22900,7 +23091,7 @@ def test_validate_batch_finish_recovery_resumes_after_prior_target_completed(
     )
     config = wrkslots._load_config(str(project), "testhost")
     assert not paths["first"].exists()
-    assert wrkslots._journal_path(config).is_file()
+    assert wrkslots._finish_journal_path(config, "second").is_file()
     assert wrkslots._validate_batch_seal_journal_path(config).is_file()
     assert {row["slot"] for row in active_slots(project) if isinstance(row, dict)} == {
         "second"
@@ -22919,7 +23110,7 @@ def test_validate_batch_finish_recovery_resumes_after_prior_target_completed(
         == 0
     )
     assert not paths["second"].exists()
-    assert not wrkslots._journal_path(config).exists()
+    assert not wrkslots._finish_journal_path(config, "second").exists()
     assert not wrkslots._validate_batch_seal_journal_path(config).exists()
     assert active_slots(project) == []
 
@@ -22971,7 +23162,7 @@ def test_validate_batch_refused_finish_retains_all_sidecar_targets(
         json.loads(seal_path.read_text(encoding="utf-8")),
     )
     assert {slot for slot, _generation, _target in targets} == {"first", "second"}
-    assert wrkslots._journal_path(config).is_file()
+    assert wrkslots._finish_journal_path(config, "first").is_file()
     assert first_path.is_dir()
 
     second_path.rmdir()

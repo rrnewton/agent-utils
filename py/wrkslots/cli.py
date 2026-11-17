@@ -41813,12 +41813,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 _validate_global_state_beside_absent_batch(config)
             )
             _assert_not_in_absent_batch(args.slot, absent_batch_slots)
-            paired_finish_path = _validate_batch_paired_finish_path(config)
-            cleanup_exclusions = (
-                frozenset({paired_finish_path})
-                if paired_finish_path is not None
-                else frozenset()
-            ) | absent_batch_paths
+            paired_finish_paths = _validate_batch_paired_finish_paths(config)
+            cleanup_exclusions = paired_finish_paths | absent_batch_paths
             interrupted_creates = _classify_create_journals(
                 config,
                 states,
@@ -42087,7 +42083,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 requested_slot=args.slot,
                 requested_slot_type=args.slot_type,
             )
-            if _validate_batch_paired_finish_path(config) != paired_finish_path:
+            if _validate_batch_paired_finish_paths(config) != paired_finish_paths:
                 raise Refusal(
                     "private validation finish changed while create was prepared"
                 )
@@ -57366,11 +57362,10 @@ def _assert_validate_cleanup_journals_disjoint_from_record(
         _assert_no_journal(config, target_slot=record.slot)
         return
     _seal_path, _seal_raw, targets = loaded
-    paired = _validate_batch_seal_paired_finish(config, targets)
-    excluded = (
-        frozenset({_journal_path_for_slot(config, paired.slot)})
-        if paired is not None
-        else frozenset()
+    paired = _validate_batch_seal_paired_finishes(config, targets)
+    excluded = frozenset(
+        _journal_path_for_slot(config, paired_record.slot)
+        for paired_record, _paired_path in paired
     )
     create_rows = _classify_disjoint_create_journals_for_record(
         config,
@@ -57387,15 +57382,17 @@ def _assert_validate_cleanup_journals_disjoint_from_record(
         record,
         excluded_paths=excluded,
     )
-    if paired is not None:
-        paired_path = _slot_directory(config, paired.slot, paired.slot_type)
-        record_path = _slot_directory(config, record.slot, record.slot_type)
-        if paired.slot == record.slot or _path_is_within(
+    record_path = _slot_directory(config, record.slot, record.slot_type)
+    for paired_record, _paired_path in paired:
+        paired_path = _slot_directory(
+            config, paired_record.slot, paired_record.slot_type
+        )
+        if paired_record.slot == record.slot or _path_is_within(
             paired_path, record_path
         ) or _path_is_within(record_path, paired_path):
             raise Refusal(
                 f"{action} target {record.slot!r} overlaps private validation "
-                f"finish for {paired.slot!r}"
+                f"finish for {paired_record.slot!r}"
             )
 
 
@@ -57429,7 +57426,7 @@ def _upgrade_legacy_validate_batch_seal_targets(
     raw: Mapping[str, object],
     targets: Sequence[tuple[str, int, _PrivateCleanupTarget]],
     records: Mapping[str, ActiveRecord],
-    paired_finish: ActiveRecord | None,
+    paired_finishes: Sequence[ActiveRecord],
 ) -> tuple[Mapping[str, object], tuple[tuple[str, int, _PrivateCleanupTarget], ...]]:
     """Replace recoverable mount-id identities before restoring any target."""
 
@@ -57453,9 +57450,10 @@ def _upgrade_legacy_validate_batch_seal_targets(
                 target.identity,
                 recovery_kind=(
                     _ValidateBatchSealRecoveryKind.PAIRED_FINISH
-                    if paired_finish is not None
-                    and paired_finish.slot == slot
-                    and paired_finish.generation == generation
+                    if any(
+                        item.slot == slot and item.generation == generation
+                        for item in paired_finishes
+                    )
                     else _ValidateBatchSealRecoveryKind.SEAL_ONLY
                 ),
             )
@@ -57482,11 +57480,13 @@ def _upgrade_legacy_finish_seal_identity(
 ) -> Mapping[str, object]:
     """Upgrade a paired finish/seal identity before destructive recovery resumes."""
 
-    paired_finish = _assert_validate_batch_seal_recovery_kind(
+    paired_finishes = _assert_validate_batch_seal_recovery_kind(
         config, _ValidateBatchSealRecoveryKind.PAIRED_FINISH
     )
-    assert paired_finish is not None
-    if _record_to_obj(paired_finish) != _record_to_obj(record):
+    paired_finish = next(
+        (item for item in paired_finishes if item.slot == record.slot), None
+    )
+    if paired_finish is None or _record_to_obj(paired_finish) != _record_to_obj(record):
         raise StateError("paired finish journal record changed during recovery")
 
     finish_identity = _finish_private_census_identity(raw)
@@ -57605,21 +57605,24 @@ def _finish_journal_record_is_archived(
     return True
 
 
-def _validate_batch_seal_paired_finish(
+def _validate_batch_seal_paired_finishes(
     config: Config,
     targets: Sequence[tuple[str, int, _PrivateCleanupTarget]],
-) -> ActiveRecord | None:
-    """Classify the only mutation state allowed beside a private seal.
+) -> list[tuple[ActiveRecord, Path]]:
+    """Classify the mutation state allowed beside a private seal.
 
-    A single finish can pair with one exact sealed slot.  Every other durable
+    Each outstanding finish must pair with one exact sealed slot, and no
+    two finishes may pair the same slot: a grouped validation batch
+    (#1747) leaves one paired finish per sealed slot.  Every other durable
     mutation must be a stable create proven disjoint from every still-sealed
     path.  Merely counting journals would make an unrelated create either look
-    like the paired finish or strand the private directory forever.
+    like a paired finish or strand the private directory forever.
     """
 
     finish_paths: list[Path] = []
-    paired: ActiveRecord | None = None
-    paired_raw: Mapping[str, object] | None = None
+    paired: list[tuple[ActiveRecord, Path]] = []
+    paired_raws: list[Mapping[str, object]] = []
+    paired_slots: set[str] = set()
     for journal_path in _outstanding_journals(config):
         _loaded_path, journal = _load_journal(
             config, selected_path=journal_path
@@ -57659,26 +57662,29 @@ def _validate_batch_seal_paired_finish(
                 "finish journal does not exactly pair with one validation-batch "
                 "seal target"
             )
-        if paired is not None:
+        if record.slot in paired_slots:
             raise StateError(
                 "validation-batch seal has multiple paired finish journals"
             )
-        paired = record
-        paired_raw = journal
+        paired_slots.add(record.slot)
+        paired.append((record, journal_path))
+        paired_raws.append(journal)
 
     excluded = frozenset(finish_paths)
-    if paired_raw is None:
+    if not paired_raws:
         states, archives = _validate_global_state(
             config, require_repository=False
         )
     else:
         states, archives = _validate_global_state_for_finish_recovery(
-            config, paired_raw
+            config, paired_raws[0]
         )
-        assert paired is not None
-        _finish_journal_record_is_archived(
-            config, paired_raw, paired, states, archives
-        )
+        for (paired_record, _paired_path), raw_for_record in zip(
+            paired, paired_raws, strict=True
+        ):
+            _finish_journal_record_is_archived(
+                config, raw_for_record, paired_record, states, archives
+            )
     create_rows = _classify_create_journals(
         config, states, archives, excluded_paths=excluded
     )
@@ -57707,22 +57713,44 @@ def _validate_batch_seal_paired_finish(
     return paired
 
 
-def _validate_batch_paired_finish_path(config: Config) -> Path | None:
-    """Return the exact finish paired with the current seal, if one exists."""
+def _validate_batch_seal_paired_finish(
+    config: Config,
+    targets: Sequence[tuple[str, int, _PrivateCleanupTarget]],
+) -> ActiveRecord | None:
+    """The single paired finish, or None; multiple distinct pairings give the first.
+
+    Kept for callers that only test existence.  Callers that act on a paired
+    finish use ``_validate_batch_seal_paired_finishes`` so a grouped batch's
+    several pairings are each handled.
+    """
+
+    paired = _validate_batch_seal_paired_finishes(config, targets)
+    return paired[0][0] if paired else None
+
+
+def _validate_batch_paired_finish_paths(config: Config) -> frozenset[Path]:
+    """Return every finish paired with the current seal (possibly none)."""
 
     loaded = _load_validate_batch_seal_journal(config)
     if loaded is None:
-        return None
+        return frozenset()
     _seal_path, _seal_raw, targets = loaded
-    paired = _validate_batch_seal_paired_finish(config, targets)
-    if paired is None:
-        return None
-    return _journal_path_for_slot(config, paired.slot)
+    return frozenset(
+        _journal_path_for_slot(config, record.slot)
+        for record, _path in _validate_batch_seal_paired_finishes(config, targets)
+    )
+
+
+def _validate_batch_paired_finish_path(config: Config) -> Path | None:
+    """Return one finish paired with the current seal, if any exists."""
+
+    paths = _validate_batch_paired_finish_paths(config)
+    return next(iter(sorted(paths)), None)
 
 
 def _assert_validate_batch_seal_recovery_kind(
     config: Config, recovery_kind: _ValidateBatchSealRecoveryKind
-) -> ActiveRecord | None:
+) -> list[ActiveRecord]:
     """Require the named recovery boundary to match typed durable state."""
 
     loaded = _load_validate_batch_seal_journal(config)
@@ -57731,22 +57759,22 @@ def _assert_validate_batch_seal_recovery_kind(
             raise StateError(
                 "paired-finish validation-batch recovery has no seal journal"
             )
-        return None
+        return []
     _path, _raw, targets = loaded
-    paired = _validate_batch_seal_paired_finish(config, targets)
+    paired = _validate_batch_seal_paired_finishes(config, targets)
     if recovery_kind is _ValidateBatchSealRecoveryKind.SEAL_ONLY:
-        if paired is not None:
+        if paired:
             raise StateError(
                 "seal-only validation-batch recovery cannot run with a paired "
                 "mutation journal"
             )
-        return None
-    if paired is None:
+        return []
+    if not paired:
         raise StateError(
             "paired-finish validation-batch recovery requires one mutation journal "
             "that exactly matches a sealed target"
         )
-    return paired
+    return [record for record, _path in paired]
 
 
 def _recover_validate_batch_seal_journal(
@@ -57761,10 +57789,11 @@ def _recover_validate_batch_seal_journal(
         return False
     path, raw, targets = loaded
     states, archives = _validate_global_state(config, require_repository=False)
-    paired_finish = _assert_validate_batch_seal_recovery_kind(config, recovery_kind)
+    paired_finishes = _assert_validate_batch_seal_recovery_kind(config, recovery_kind)
+    paired_slots = {item.slot for item in paired_finishes}
     records = {record.slot: record for state in states for record in state.slots}
     raw, targets = _upgrade_legacy_validate_batch_seal_targets(
-        config, raw, targets, records, paired_finish
+        config, raw, targets, records, paired_finishes
     )
     unresolved: list[dict[str, object]] = []
     errors: list[str] = []
@@ -57826,7 +57855,7 @@ def _recover_validate_batch_seal_journal(
             )
             continue
         if not path_present:
-            if paired_finish is None and (actor_state == "dead" or no_wrkslots_operator):
+            if slot not in paired_slots and (actor_state == "dead" or no_wrkslots_operator):
                 absent_rows.append(slot)
                 continue
             errors.append(
@@ -59528,7 +59557,9 @@ def _load_prepared_private_finish(
     paired = _assert_validate_batch_seal_recovery_kind(
         config, _ValidateBatchSealRecoveryKind.PAIRED_FINISH
     )
-    if paired is None or _record_to_obj(paired) != _record_to_obj(prepared.record):
+    if not any(
+        _record_to_obj(item) == _record_to_obj(prepared.record) for item in paired
+    ):
         raise StateError("private finish no longer pairs with its exact seal target")
     return journal
 
@@ -62126,6 +62157,11 @@ def _cmd_remove_in_scope(
     if prepared_private_finish is not None:
         assert private_cleanup is not None
         assert finish_context is not None
+        if private_cleanup.defer_completion:
+            # Batch first pass (#1747): the fence is durable; the grouped
+            # same-UID census and completion run in the batch's second pass.
+            private_cleanup.prepared_finish = prepared_private_finish
+            return 0
         fenced_slot = _finish_fenced_slot(
             config,
             prepared_private_finish.record,
@@ -62605,6 +62641,161 @@ def _validate_remove_batch_census_stderr_bytes(sealed_slots: int) -> int:
     return _VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES * max(1, sealed_slots)
 
 
+def _remove_validate_batch_grouped(
+    args: argparse.Namespace,
+    *,
+    config: Config,
+    eligible: Sequence[tuple[str, int]],
+    private_targets: Mapping[str, _PrivateCleanupTarget],
+    removal_proofs: Mapping[str, _ValidationRemovalProof],
+    privileged_census: _ProcessPathCensus,
+    census_budget: _ReadOnlyCommandBudget,
+    processes: tuple[ProcessIdentity, ProcessIdentity, ProcessIdentity | None, int | None],
+    live_use_recheck: _LiveUseRecheckBudget,
+    removed: list[dict[str, object]],
+    retained: list[dict[str, object]],
+) -> int:
+    """Two-pass multi-slot validation removal with one grouped census (#1747).
+
+    First fence every eligible slot (each item's ordinary prepare), then
+    run ONE same-UID census over every fenced path, then complete each
+    prepared finish.  Returns the same-UID census count (1 when the
+    grouped census ran).  The privileged census already ran before any
+    fence, exactly as in the serial path; nothing here skips a census.
+    """
+
+    coordinator, runner, handoff_writer, proof_fd = processes
+    contexts: dict[str, _PrivateCleanupContext] = {}
+    prepared_slots: list[tuple[str, int]] = []
+    for slot, generation in eligible:
+        try:
+            census_budget.remaining_seconds()
+        except Refusal as deadline:
+            retained.extend(
+                {
+                    "slot": remaining_slot,
+                    "generation": remaining_generation,
+                    "reason": str(deadline),
+                }
+                for remaining_slot, remaining_generation in eligible
+                if remaining_slot not in contexts
+            )
+            break
+        item_args = argparse.Namespace(**vars(args))
+        item_args.command = "remove"
+        item_args.slot = slot
+        item_args.expected_generation = generation
+        item_args.validate_complete = True
+        item_args.validation_proof_manifest = None
+        item_args.completed_record = None
+        private_cleanup = _PrivateCleanupContext(
+            private_targets[slot],
+            privileged_census,
+            census_budget,
+            # Scoped (per-slot) finish journals let every fence of the
+            # batch stay durable at once; the shared journal path would
+            # collide between prepared items.
+            scoped_finish=True,
+            live_use_recheck=live_use_recheck,
+            defer_completion=True,
+        )
+        contexts[slot] = private_cleanup
+        try:
+            _cmd_remove(
+                item_args,
+                private_cleanup=private_cleanup,
+                validation_removal_proof=removal_proofs.get(slot),
+                emit=False,
+            )
+        except (Refusal, StateError) as exc:
+            retained.append(
+                {"slot": slot, "generation": generation, "reason": str(exc)}
+            )
+        else:
+            if private_cleanup.prepared_finish is None:
+                raise StateError(
+                    f"validate batch prepare produced no fence for {slot}"
+                )
+            prepared_slots.append((slot, generation))
+    if not prepared_slots:
+        return 0
+    fenced_paths: list[Path] = []
+    for slot, _generation in prepared_slots:
+        prepared = contexts[slot].prepared_finish
+        assert prepared is not None
+        fenced_paths.append(
+            _finish_fenced_slot(config, prepared.record, prepared.journal)
+        )
+    try:
+        grouped_census = _capture_same_uid_process_path_census(
+            tuple(fenced_paths), budget=census_budget
+        )
+        census_budget.remaining_seconds()
+    except Refusal as exc:
+        with _mutation_locks(config, args.wait_lock):
+            for slot, generation in prepared_slots:
+                prepared = contexts[slot].prepared_finish
+                assert prepared is not None
+                try:
+                    _rollback_prepared_private_finish(config, prepared, exc)
+                except Refusal as rollback:
+                    retained.append(
+                        {
+                            "slot": slot,
+                            "generation": generation,
+                            "reason": str(rollback),
+                        }
+                    )
+                else:
+                    retained.append(
+                        {
+                            "slot": slot,
+                            "generation": generation,
+                            "reason": str(exc),
+                        }
+                    )
+        return 1
+    _interrupt_for_test("after-validate-batch-grouped-census")
+    for slot, _generation in prepared_slots:
+        contexts[slot].fresh_census = grouped_census
+    for slot, generation in prepared_slots:
+        private_cleanup = contexts[slot]
+        prepared = private_cleanup.prepared_finish
+        assert prepared is not None
+        finish = _FinishContext(
+            mode="remove",
+            actor="coordinator",
+            validate_complete=True,
+            private_cleanup=private_cleanup,
+            validation_removal_proof=removal_proofs.get(slot),
+            live_use_recheck=live_use_recheck,
+        )
+        try:
+            census_budget.remaining_seconds()
+            with _mutation_locks(config, args.wait_lock):
+                try:
+                    _complete_prepared_private_finish(
+                        config,
+                        prepared,
+                        finish,
+                        coordinator=coordinator,
+                        runner=runner,
+                        handoff_writer=handoff_writer,
+                        proof_fd=proof_fd,
+                    )
+                except Refusal as exc:
+                    if prepared.journal_path.exists():
+                        _rollback_prepared_private_finish(config, prepared, exc)
+                    raise
+        except (Refusal, StateError) as exc:
+            retained.append(
+                {"slot": slot, "generation": generation, "reason": str(exc)}
+            )
+        else:
+            removed.append({"slot": slot, "generation": generation})
+    return 1
+
+
 def _remove_validate_batch(
     args: argparse.Namespace, *, single_validate_complete: bool = False
 ) -> dict[str, object]:
@@ -62752,7 +62943,28 @@ def _remove_validate_batch(
                 _interrupt_for_test("after-validate-batch-shared-census")
         else:
             privileged_census = _ProcessPathCensus((), ())
-        for request_index, (slot, generation) in enumerate(requested):
+        eligible = [
+            (slot, generation)
+            for slot, generation in requested
+            if slot in private_targets and shared_census_refusal is None
+        ]
+        serial_slots: Sequence[tuple[str, int]] = requested
+        if len(eligible) > 1 and not removal_proofs:
+            same_uid_census_count += _remove_validate_batch_grouped(
+                args,
+                config=config,
+                eligible=eligible,
+                private_targets=private_targets,
+                removal_proofs=removal_proofs,
+                privileged_census=privileged_census,
+                census_budget=census_budget,
+                processes=(coordinator, runner, handoff_writer, proof_fd),
+                live_use_recheck=live_use_recheck,
+                removed=removed,
+                retained=retained,
+            )
+            serial_slots = ()
+        for request_index, (slot, generation) in enumerate(serial_slots):
             target = private_targets.get(slot)
             if target is None or shared_census_refusal is not None:
                 continue
@@ -85343,6 +85555,11 @@ class _PrivateCleanupContext:
     scoped_finish: bool = False
     fresh_census: _ProcessPathCensus | None = None
     same_uid_census_performed: bool = False
+    # Set only by remove-validate-batch for a multi-slot batch (#1747): the
+    # item's fence is prepared in a first pass, one grouped same-UID census
+    # covers every fenced slot, and completion runs in a second pass.
+    defer_completion: bool = False
+    prepared_finish: _PreparedPrivateFinish | None = None
     live_use_recheck: _LiveUseRecheckBudget = dataclasses.field(
         default_factory=_LiveUseRecheckBudget
     )
@@ -88744,6 +88961,55 @@ def _cmd_recover(
         else _LiveUseRecheckBudget()
     )
     processes = _RecoveryProcesses(coordinator, runner, handoff_writer, proof_fd)
+    if (
+        ownerless_batch_cleanup is None
+        and getattr(args, "slot", None) is None
+        and not any(
+            getattr(args, name, None) is not None
+            for name in (
+                "legacy_validate_checkout",
+                "ownerless_validate_checkout",
+                "ownerless_validate_cargo_home",
+                "frozen_validate_checkout",
+                "completed_record",
+                "repository",
+                "recovery_note",
+                "validation_proof_manifest",
+            )
+        )
+        and not getattr(args, "abort_create", False)
+        and not getattr(args, "abort_import", False)
+        and not getattr(args, "discard_stale_image_copy", False)
+    ):
+        # A grouped validation batch (#1747) can leave one paired finish
+        # per sealed slot.  Plain recover finishes every one of them, per
+        # slot, and the last one's tail retires the seal: no hand steps.
+        try:
+            _seal = _load_validate_batch_seal_journal(config)
+            _paired_slots = (
+                [
+                    record.slot
+                    for record, _path in _validate_batch_seal_paired_finishes(
+                        config, _seal[2]
+                    )
+                ]
+                if _seal is not None
+                else []
+            )
+        except (Refusal, StateError):
+            _paired_slots = []
+        if len(_paired_slots) > 1:
+            for _slot in _paired_slots:
+                _item_args = argparse.Namespace(**vars(args))
+                _item_args.slot = _slot
+                _rc = _cmd_recover(_item_args, emit=emit)
+                if _rc != 0:
+                    return _rc
+            _seal_after = _load_validate_batch_seal_journal(config)
+            if _seal_after is None or not _validate_batch_seal_paired_finishes(
+                config, _seal_after[2]
+            ):
+                return 0
     exact_create_before_seal = False
     with _mutation_locks(config, args.wait_lock):
         _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
@@ -88989,11 +89255,14 @@ def _cmd_recover(
                                     exact_create_path = candidate
                             except (Refusal, StateError, KeyError, TypeError, ValueError):
                                 exact_create_path = None
-                paired_finish = (
-                    None
+                paired_finishes = (
+                    []
                     if exact_create_path is not None
-                    else _validate_batch_seal_paired_finish(config, sealed_targets)
+                    else _validate_batch_seal_paired_finishes(
+                        config, sealed_targets
+                    )
                 )
+                paired_finish = paired_finishes[0][0] if paired_finishes else None
                 if exact_create_path is not None:
                     # Recover the exact create first; the seal is still
                     # recovered after its dispatch (this command's tail).
@@ -89023,14 +89292,18 @@ def _cmd_recover(
                     )
                     return 0
                 elif paired_finish is not None:
-                    if selected_slot is not None and selected_slot != paired_finish.slot:
+                    paired_slots = {
+                        record.slot for record, _path in paired_finishes
+                    }
+                    if selected_slot is not None and selected_slot not in paired_slots:
                         raise Refusal(
                             "a private validation finish must be recovered before the "
                             f"unrelated mutation for slot {selected_slot!r}; rerun with "
                             f"--slot {paired_finish.slot}"
                         )
                     selected_path = _journal_path_for_slot(
-                        config, paired_finish.slot
+                        config,
+                        selected_slot if selected_slot is not None else paired_finish.slot,
                     )
             else:
                 selected_path = (
@@ -89293,10 +89566,14 @@ def _cmd_recover(
         else:
             raise StateError(f"unknown recovery journal kind {kind!r}")
         if seal_journals:
-            _recover_validate_batch_seal_journal(
-                config,
-                recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
-            )
+            _loaded_seal = _load_validate_batch_seal_journal(config)
+            if _loaded_seal is None or not _validate_batch_seal_paired_finishes(
+                config, _loaded_seal[2]
+            ):
+                _recover_validate_batch_seal_journal(
+                    config,
+                    recovery_kind=_ValidateBatchSealRecoveryKind.SEAL_ONLY,
+                )
         after_states, after_archives = _validate_global_state(
             config, require_repository=kind != "finish"
         )
