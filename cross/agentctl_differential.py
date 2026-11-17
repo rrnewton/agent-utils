@@ -4002,7 +4002,7 @@ def _rename_alias(harness: Harness, report: Report) -> None:
                            for root in (case.python_root, case.rust_root)),
                    f"send by the old name disagreed: python={python!r} rust={rust!r}")
     _pair(harness, report, case, "alias/list", ("alias", "list", *common))
-    outcomes = harness.invoke(case, ("start", "worker", "--harness", "claude", *common))
+    outcomes = harness.invoke(case, ("start", "worker", "--effort", "medium", "--harness", "claude", *common))
     report.require("alias/register-refused", all(
         outcome.returncode != 0 and "alias of 'reviewer'" in outcome.stderr
         for outcome in outcomes), f"registering the old name was not refused: {outcomes!r}")
