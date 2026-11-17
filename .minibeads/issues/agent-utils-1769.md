@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-census-exiting-process-indeterminate: an exiting process with an absent mount-namespace link is judged exited by condition, not by a timed window'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-17T07:38:00-05:00
-updated_at: 2026-11-17T07:38:00-05:00
+updated_at: 2026-11-17T13:00:00-05:00
+closed_at: 2026-11-17T13:00:00-05:00
 ---
 
 # Description
@@ -63,3 +64,24 @@ takes longer than the window to reach a provable state.
 [watermelon-full-preview] Filed by mu-censusexit. Prior work: #875
 added the bounded re-probe this issue replaces; #1736 made stat
 state Z/X dead in seal liveness in both editions.
+
+## Resolution
+
+[watermelon-full-preview] Delivered on main by
+096a8d745d063ae798470d48ef24f14abf789557:
+`_mount_namespace_reprobed` in `py/wrkslots/cli.py` no longer refuses
+after 4 re-probes over 150 ms. An absent mount-namespace link waits on
+the exit condition itself (pidfd poll where available, otherwise
+re-probes with backoff) under a 30 s backstop shared by each census
+pass and capped by its operation budget; exited is `/proc/<pid>`
+gone, stat state Z/X (the #1736 parsing), terminal, generation
+changed, or context released, re-checked after the last re-probe.
+A live process with an unchanged identity and no namespace at the
+backstop, and a live process whose namespace is unreadable, still
+refuse. The Rust edition has no mount-namespace census (its snapshot
+walks cwd/root/exe/fd/maps only), so it is unchanged. Deterministic
+fake-/proc tests with a fake clock cover gone-after-the-old-window,
+zombie-after-the-old-window, alive-through-the-backstop, and
+permission-unreadable cases; the full gate passed except one
+unrelated binding-deadline load flake that passed solo 5/5 on both
+trees and on its solo rerun.
