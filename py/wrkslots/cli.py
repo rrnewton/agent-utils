@@ -11876,14 +11876,20 @@ def _handoff_write_publication(
 def _handoff_write_publications(
     records: Sequence[ActiveRecord],
     events: Iterable[Mapping[str, object]],
-) -> dict[tuple[str, int], tuple[int, Mapping[str, object], bool] | None]:
+) -> tuple[
+    dict[tuple[str, int], tuple[int, Mapping[str, object], bool] | None],
+    dict[tuple[str, int], StateError],
+]:
     """Every record's publication from one pass over the log (#1794).
 
     ``_handoff_write_publication`` per record rescans the whole log per
     row; an audit judging dozens of rows pays that per row. This keeps
     the same per-record state (intents, completions, the running owner
-    each intent must match) for every wanted generation at once and
-    raises the same refusals in the same order.
+    each intent must match) for every wanted generation at once. A
+    generation whose intent history is malformed is reported in the
+    second result, never raised here: the caller re-raises it inside
+    that row's own judgment, where the per-record fold raised it
+    before (#1794 review F3).
     """
 
     wanted: dict[tuple[str, int], ActiveRecord] = {
@@ -11896,6 +11902,7 @@ def _handoff_write_publications(
     owners: dict[tuple[str, int], ProcessIdentity | None] = {
         key: None for key in wanted
     }
+    errors: dict[tuple[str, int], StateError] = {}
     for event in events:
         kind = event.get("kind")
         payload = _as_mapping(event["payload"], f"{kind} event payload")
@@ -11913,31 +11920,34 @@ def _handoff_write_publications(
                 matched = key in wanted
             except TypeError:
                 continue
-            if not matched:
+            if not matched or key in errors:
                 continue
             record = wanted[key]
-            artifact = _as_mapping(payload.get("artifact"), "handoff write intent artifact")
-            if (
-                artifact.get("schema") != HANDOFF_SIDECAR_SCHEMA
-                or artifact.get("machine") != record.machine
-                or artifact.get("slot") != record.slot
-                or artifact.get("generation") != record.generation
-                or artifact.get("source") != "write-handoff"
-            ):
-                raise StateError("handoff write intent has an invalid artifact identity")
-            writer = _identity_from_obj(
-                payload.get("writer"), "handoff write intent writer"
-            )
-            if writer is None:
-                raise StateError("handoff write intent lacks an owner identity")
-            intent_sequence = _as_int(
-                event["sequence"], "handoff write intent sequence", minimum=1
-            )
-            if owners[key] is None or writer != owners[key]:
-                raise StateError(
-                    "handoff write intent writer does not match the recorded slot owner"
+            try:
+                artifact = _as_mapping(payload.get("artifact"), "handoff write intent artifact")
+                if (
+                    artifact.get("schema") != HANDOFF_SIDECAR_SCHEMA
+                    or artifact.get("machine") != record.machine
+                    or artifact.get("slot") != record.slot
+                    or artifact.get("generation") != record.generation
+                    or artifact.get("source") != "write-handoff"
+                ):
+                    raise StateError("handoff write intent has an invalid artifact identity")
+                writer = _identity_from_obj(
+                    payload.get("writer"), "handoff write intent writer"
                 )
-            intents[key][intent_sequence] = artifact
+                if writer is None:
+                    raise StateError("handoff write intent lacks an owner identity")
+                intent_sequence = _as_int(
+                    event["sequence"], "handoff write intent sequence", minimum=1
+                )
+                if owners[key] is None or writer != owners[key]:
+                    raise StateError(
+                        "handoff write intent writer does not match the recorded slot owner"
+                    )
+                intents[key][intent_sequence] = artifact
+            except StateError as exc:
+                errors[key] = exc
         elif kind == "handoff-write-completed":
             slot_value = payload.get("slot")
             if not isinstance(slot_value, str):
@@ -11949,25 +11959,30 @@ def _handoff_write_publications(
                 matched = key in wanted
             except TypeError:
                 continue
-            if not matched:
+            if not matched or key in errors:
                 continue
-            sequence = _as_int(
-                payload.get("intent_sequence"),
-                "handoff write completion intent_sequence",
-                minimum=1,
-            )
-            intended_artifact = intents[key].get(sequence)
-            if intended_artifact is None:
-                raise StateError("handoff write completion references an unknown intent")
-            digest = _as_str(
-                payload.get("artifact_sha256"),
-                "handoff write completion artifact_sha256",
-            )
-            if digest != _event_digest(intended_artifact):
-                raise StateError("handoff write completion digest does not match its intent")
-            completed[key].add(sequence)
+            try:
+                sequence = _as_int(
+                    payload.get("intent_sequence"),
+                    "handoff write completion intent_sequence",
+                    minimum=1,
+                )
+                intended_artifact = intents[key].get(sequence)
+                if intended_artifact is None:
+                    raise StateError("handoff write completion references an unknown intent")
+                digest = _as_str(
+                    payload.get("artifact_sha256"),
+                    "handoff write completion artifact_sha256",
+                )
+                if digest != _event_digest(intended_artifact):
+                    raise StateError("handoff write completion digest does not match its intent")
+                completed[key].add(sequence)
+            except StateError as exc:
+                errors[key] = exc
     results: dict[tuple[str, int], tuple[int, Mapping[str, object], bool] | None] = {}
     for key in wanted:
+        if key in errors:
+            continue
         record_intents = intents[key]
         if not record_intents:
             results[key] = None
@@ -11978,7 +11993,7 @@ def _handoff_write_publications(
             record_intents[sequence],
             sequence in completed[key],
         )
-    return results
+    return results, errors
 
 
 def _legacy_projection_read(
@@ -25000,10 +25015,15 @@ class _AuditGitVcs(_GitVcs):
         return self._remote_authorities[key]
 
     def durable_ref_tips(self, repository: Path) -> frozenset[str]:
-        common = self.common_directory(repository)
-        if common not in self._durable_ref_tips:
-            self._durable_ref_tips[common] = super().durable_ref_tips(repository)
-        return self._durable_ref_tips[common]
+        # Keyed by the repository as named, never by its common
+        # directory: for-each-ref in a linked worktree also lists that
+        # worktree's own refs/worktree/*, refs/bisect/* and
+        # refs/rewritten/*, so one worktree's listing must never stand
+        # in for another's (#1794 review F1).
+        key = repository.absolute()
+        if key not in self._durable_ref_tips:
+            self._durable_ref_tips[key] = super().durable_ref_tips(repository)
+        return self._durable_ref_tips[key]
 
     def commit_object_ids(self, path: Path) -> tuple[str, ...]:
         common = self.common_directory(path)
@@ -56287,9 +56307,16 @@ def _audit_private_history_absent(
             sha, _sp, _refname = line.partition(" ")
             if sha:
                 positives.add(sha)
-        return not _commit_tips(
-            vcs, path, positives, negatives, env_overrides=environment
-        )
+        try:
+            return not _commit_tips(
+                vcs, path, positives, negatives, env_overrides=environment
+            )
+        except Refusal:
+            # A root the full scan never walks (an old remote-tracking
+            # reflog endpoint, a salvage commit) can name a missing
+            # object and make rev-list refuse; the full scan decides
+            # that case with its own refusal (#1794 review F2).
+            return False
     reflog_by_ref = _reflog_entries_by_ref((common, git_directory))
     endpoints: set[str] = set()
     for entries in reflog_by_ref.values():
@@ -56310,18 +56337,22 @@ def _audit_private_history_absent(
         if len(fields) == 3 and fields[0]:
             positives.add(fields[0])
     positives.add(kept)
-    if _commit_tips(vcs, path, positives, negatives, env_overrides=environment):
+    try:
+        if _commit_tips(vcs, path, positives, negatives, env_overrides=environment):
+            return False
+        every_commit = vcs.commit_object_ids(path)
+        if not every_commit:
+            return True
+        return not _commit_tips(
+            vcs,
+            path,
+            set(every_commit) | positives,
+            negatives,
+            env_overrides=environment,
+        )
+    except Refusal:
+        # See the shared-store branch above (#1794 review F2).
         return False
-    every_commit = vcs.commit_object_ids(path)
-    if not every_commit:
-        return True
-    return not _commit_tips(
-        vcs,
-        path,
-        set(every_commit) | positives,
-        negatives,
-        env_overrides=environment,
-    )
 
 
 def _audit_submodule_private_history(
@@ -57363,6 +57394,7 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
     audit_publications: dict[
         tuple[str, str, int], tuple[int, Mapping[str, object], bool] | None
     ] = {}
+    audit_publication_errors: set[tuple[str, str, int]] = set()
     for machine, machine_events in event_logs.items():
         agent_records = [
             record
@@ -57371,10 +57403,15 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
         ]
         if not agent_records:
             continue
-        for (slot, generation), publication in _handoff_write_publications(
+        machine_publications, machine_errors = _handoff_write_publications(
             agent_records, machine_events
-        ).items():
+        )
+        for (slot, generation), publication in machine_publications.items():
             audit_publications[(machine, slot, generation)] = publication
+        for slot, generation in machine_errors:
+            # Judged per record below (publication_computed=False), so
+            # the row raises exactly where the per-record fold did.
+            audit_publication_errors.add((machine, slot, generation))
     _check_scan_deadline(scan_deadline)
     liveness_started = metrics.start()
     # Validation rows are answered by their runs, agent rows by the
@@ -57425,7 +57462,10 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
             publication=audit_publications.get(
                 (record.machine, record.slot, record.generation)
             ),
-            publication_computed=True,
+            publication_computed=(
+                (record.machine, record.slot, record.generation)
+                not in audit_publication_errors
+            ),
         )
         release_honoured = (
             release is not None
@@ -57616,7 +57656,10 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
             publication=audit_publications.get(
                 (record.machine, record.slot, record.generation)
             ),
-            publication_computed=True,
+            publication_computed=(
+                (record.machine, record.slot, record.generation)
+                not in audit_publication_errors
+            ),
         )
 
     # Rows are judged independently from the same snapshot, census and cache measurements, so

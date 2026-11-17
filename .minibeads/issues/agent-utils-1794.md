@@ -24,3 +24,5 @@ Audit findings are byte-identical to the old implementation on fixtures (differe
 # Notes
 
 [watermelon-full-preview] Filed by mu-auditcost. Overlap: mu-rescuetips (#1785 wrkslots-remove-silently-skips-unresolvable-rescue-tips) is batching git calls in the private-history scan; reuse its batching helpers. Rebase right before the gate.
+
+[watermelon-full-preview] Review note (F4, accepted): when two failures are present at once, the audit pre-check reads durable repositories before the full scan's reflog/pseudoref refusals, so the first refusal an audit row reports can differ from the pre-change order. Verdicts do not change; only which refusal is named first when several apply.

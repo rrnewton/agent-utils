@@ -3627,8 +3627,14 @@ fn submodule_private_history(
     // and the committer filter, classification and remote ask below
     // are all skipped.
     {
-        let (ref_tips, _) = compute(&positives, &negatives)?;
-        if ref_tips.is_empty() {
+        // A root the full scan never walks can name a missing object
+        // and make rev-list refuse; that error falls through to the
+        // full scan's own refusal, never an early exit (#1794 F2).
+        let ref_empty = match compute(&positives, &negatives) {
+            Ok((ref_tips, _)) => ref_tips.is_empty(),
+            Err(_) => false,
+        };
+        if ref_empty {
             if commit_list.is_empty() {
                 return Ok(None);
             }
@@ -3636,9 +3642,10 @@ fn submodule_private_history(
             for commit in &commit_list {
                 all_positives.insert(commit.trim().to_string());
             }
-            let (all_tips, _) = compute(&all_positives, &negatives)?;
-            if all_tips.is_empty() {
-                return Ok(None);
+            if let Ok((all_tips, _)) = compute(&all_positives, &negatives) {
+                if all_tips.is_empty() {
+                    return Ok(None);
+                }
             }
         }
     }
