@@ -1603,7 +1603,11 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     let resuming: Promise<void> | null = null;
     const pump = () => {
       if (over || !wanted) return;
-      if (context.state === "suspended" && typeof context.resume === "function") {
+      // A held read's clock stays stopped: only `resumeReading` starts it again, and this
+      // player is scheduled by the `play()` that follows. An idle (not held) suspension is
+      // the cold start the pre-roll exists for, and is resumed here.
+      const held = nowPlaying !== null && nowPlaying.paused === true;
+      if (!held && context.state === "suspended" && typeof context.resume === "function") {
         if (resuming === null) {
           resuming = Promise.resolve(context.resume()).catch(() => {}).then(() => {
             resuming = null;
