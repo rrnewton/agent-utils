@@ -56,6 +56,10 @@ The differential's Python oracle reads user-manager evidence through bounded bus
 
 `py/wrkslots/tests/test_census_binding_deadline.py::test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline` asserts every audit-cache open started before a wall-clock 5 s deadline; it failed in a loaded gate and passes 5/5 solo on two trees. Same rule-346 class; taken after the current step-2 change lands.
 
+## Step 2 follow-up: validation-exclusion fixture asserts on a census bound
+
+`test_validation_exclusion_fixture_preserves_host_root_boundary` (a 5 s census bound) fails identically on unmodified `github/main` under load. Same rule-346 class: wait on a condition or use a fake clock. Taken after the current step-2 change lands.
+
 ## Step 2 root cause: browser checks sample on wall deadlines
 
 `thread-pin-picker-browser` polled conditions on 10 s wall deadlines (11 s exit-1 failures); its waits now keep the same conditions behind 120 s backstops. `pack-still-browser` recorded frames for 900 ms of wall time, so a starved main thread produced no slide (`460.4375 -> 460.4375`); it now records until the slide condition holds (with a frame-count backstop), assertions unchanged.
