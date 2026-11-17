@@ -456,6 +456,14 @@ def parse_alias_duration(value: str) -> float:
     return float(int(value[:-1]) * factors[value[-1]])
 
 
+def _alias_time(alias: dict[str, object], key: str) -> float:
+    """One validated numeric time field of an alias record."""
+    value = alias[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AgentDeliveryError(f"invalid alias record: {key} is not a time")
+    return float(value)
+
+
 def format_et(unix: float) -> str:
     """``2026-12-01 09:30 ET`` for a unix time (America/New_York wall time)."""
     from datetime import datetime, timezone
@@ -2557,7 +2565,7 @@ class ManagedAgents:
             or not document.get("token")
             or not isinstance(document.get("created"), (int, float))
             or not isinstance(document.get("expires"), (int, float))
-            or not float(document["expires"]) > float(document["created"])
+            or not _alias_time(document, "expires") > _alias_time(document, "created")
         ):
             raise AgentDeliveryError(f"invalid alias record: {path}")
         return document
@@ -2588,12 +2596,12 @@ class ManagedAgents:
             alias = self._read_alias(current)
             if alias is None:
                 break
-            if now >= float(alias["expires"]):
+            if now >= _alias_time(alias, "expires"):
                 target = str(alias["new"])
                 self._prune_alias(str(alias["old"]))
                 raise AgentDeliveryError(
                     f"{requested!r} was an alias of {target!r} until "
-                    f"{format_et(float(alias['expires']))}; the alias has expired — use {target}"
+                    f"{format_et(_alias_time(alias, 'expires'))}; the alias has expired — use {target}"
                 )
             if first is None:
                 first = alias
@@ -2630,13 +2638,13 @@ class ManagedAgents:
             "old": alias["old"],
             "new": alias["new"],
             "until": alias["expires"],
-            "until_et": format_et(float(alias["expires"])),
+            "until_et": format_et(_alias_time(alias, "expires")),
         }
         if not self._alias_noted:
             self._alias_noted = True
             print(
                 f"agentctl: {requested!r} is an alias of {alias['new']!r} until "
-                f"{format_et(float(alias['expires']))}; use {alias['new']}",
+                f"{format_et(_alias_time(alias, 'expires'))}; use {alias['new']}",
                 file=sys.stderr,
             )
 
@@ -2645,12 +2653,12 @@ class ManagedAgents:
         alias = self._read_alias(name)
         if alias is None:
             return
-        if time.time() >= float(alias["expires"]):
+        if time.time() >= _alias_time(alias, "expires"):
             self._prune_alias(name)
             return
         raise AgentDeliveryError(
             f"{name!r} is an alias of {alias['new']!r} until "
-            f"{format_et(float(alias['expires']))}; registering a new agent as {name!r} "
+            f"{format_et(_alias_time(alias, 'expires'))}; registering a new agent as {name!r} "
             f"is refused while the alias lives — use {alias['new']}, or remove the "
             f"alias with `agentctl alias rm {name}`"
         )
@@ -2684,13 +2692,13 @@ class ManagedAgents:
             alias = self._read_alias(entry[: -len(".json")])
             if alias is None:
                 continue
-            if time.time() >= float(alias["expires"]):
+            if time.time() >= _alias_time(alias, "expires"):
                 self._prune_alias(str(alias["old"]))
                 continue
             aliases.append({
                 "old": alias["old"], "new": alias["new"], "token": alias["token"],
                 "created": alias["created"], "expires": alias["expires"],
-                "until_et": format_et(float(alias["expires"])),
+                "until_et": format_et(_alias_time(alias, "expires")),
             })
         return aliases
 
@@ -7079,12 +7087,12 @@ class ManagedAgents:
                     return self._finish_rename(found, recovered=True)
                 alias = self._read_alias(old)
                 if alias is not None:
-                    if time.time() >= float(alias["expires"]):
+                    if time.time() >= _alias_time(alias, "expires"):
                         self._prune_alias(old)
                     else:
                         raise AgentDeliveryError(
                             f"{old!r} is an alias of {alias['new']!r} until "
-                            f"{format_et(float(alias['expires']))}; rename {alias['new']} instead"
+                            f"{format_et(_alias_time(alias, 'expires'))}; rename {alias['new']} instead"
                         )
                 self._refuse_live_alias(new)
                 record = self._load(old)
@@ -7260,7 +7268,7 @@ class ManagedAgents:
         if alias is not None:
             result["alias"] = {
                 "old": old, "new": new, "until": alias["expires"],
-                "until_et": format_et(float(alias["expires"])),
+                "until_et": format_et(_alias_time(alias, "expires")),
             }
         return result
 

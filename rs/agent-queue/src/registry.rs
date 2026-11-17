@@ -76,8 +76,8 @@ builds older than layout 2 stop at this file; upgrade agentctl. Readers of renam
 /// The directory holding the registry's chat bridges, one entry each.
 pub const BRIDGES: &str = "bridges";
 /// The directory holding rename aliases, one `aliases/<old>.json` per kept old name
-/// (#1777 agentctl-rename-keep-alias). A collection of its own, like `agents/` and
-/// `locks/`, so no number of aliases buries the registry's fixed items.
+/// (#1777). A collection of its own, like `agents/` and `locks/`, so no number of
+/// aliases buries the registry's fixed items.
 pub const ALIASES: &str = "aliases";
 /// Names no agent may take: each is a directory of the registry itself.
 /// `turnover-pins` holds services-turnover pin files (#1220), not an agent.

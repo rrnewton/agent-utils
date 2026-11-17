@@ -237,8 +237,14 @@ def parser() -> argparse.ArgumentParser:
     alias = command("alias", "Show or remove the old names kept by `rename --keep-alias`.",
         "agentctl alias list")
     alias_commands = alias.add_subparsers(dest="alias_command", required=True, metavar="COMMAND")
-    alias_commands.add_parser("list", help="list the live rename aliases as JSON (expired ones are removed)")
-    alias_rm = alias_commands.add_parser("rm", help="remove one alias now; the old name is unknown afterwards")
+    alias_list = alias_commands.add_parser("list", help="list the live rename aliases as JSON (expired ones are removed)",
+        allow_abbrev=False)
+    root.share_stop_context(alias_list)
+    _common(alias_list, inherited=True)
+    alias_rm = alias_commands.add_parser("rm", help="remove one alias now; the old name is unknown afterwards",
+        allow_abbrev=False)
+    root.share_stop_context(alias_rm)
+    _common(alias_rm, inherited=True)
     alias_rm.add_argument("name", metavar="NAME", help="registered session name (lowercase letters, digits, hyphens)")
     anchor = command("anchor", "Pin the terminal and foreground harness process of an agent whose record pins no "
         "harness process, after checking that its pane runs the intended agent. Input to an agent with no pinned harness "

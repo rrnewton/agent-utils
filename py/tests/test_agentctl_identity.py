@@ -282,7 +282,8 @@ def test_rename_with_alias_keeps_the_old_name_reaching_the_agent(
 ) -> None:
     manager, fake, pane = _started(tmp_path, monkeypatch, "old")
     result = manager.rename("old", "new", keep_alias="14d")
-    assert result["alias"]["old"] == "old" and result["alias"]["new"] == "new"
+    kept = result["alias"]
+    assert isinstance(kept, dict) and kept["old"] == "old" and kept["new"] == "new"
     alias = json.loads((manager.registry / "aliases" / "old.json").read_text())
     assert alias["schema"] == "agentctl-alias/v1"
     assert alias["token"] == manager.get("new").token

@@ -3403,7 +3403,7 @@ def _registry_layout_migration(harness: Harness, report: Report) -> None:
         and applied_reports[0].get("moved") == ["alpha", "beta"]
         and applied_reports[0].get("removed_lock_files") == 5
         and applied_reports[0].get("layout") == "2"
-        and all(_top_level(root) == [".coordinator.lock", ".identity.lock", ".renames", "agents", "locks"]
+        and all(_top_level(root) == [".coordinator.lock", ".identity.lock", ".renames", "agents", "aliases", "locks"]
                 for root in roots)
         and (case.python_root / "registry/.renames/upgrade-agentctl-registry-layout-2").read_bytes()
         == (case.rust_root / "registry/.renames/upgrade-agentctl-registry-layout-2").read_bytes()
@@ -3990,8 +3990,8 @@ def _rename_alias(harness: Harness, report: Report) -> None:
     report.require("alias/status-by-old", python.returncode == rust.returncode == 0
                    and _json(python) == _json(rust)
                    and isinstance(_json(python), dict)
-                   and cast(dict, _json(python)).get("name") == "reviewer"
-                   and cast(dict, _json(python)).get("alias", {}).get("old") == "worker"
+                   and cast("dict[str, object]", _json(python)).get("name") == "reviewer"
+                   and cast("dict[str, object]", cast("dict[str, object]", _json(python)).get("alias", {})).get("old") == "worker"
                    and all("is an alias of 'reviewer'" in outcome.stderr
                            for outcome in (python, rust)),
                    f"status by the old name disagreed: python={python!r} rust={rust!r}")

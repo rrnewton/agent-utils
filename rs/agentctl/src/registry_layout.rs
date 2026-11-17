@@ -713,6 +713,7 @@ mod tests {
                 ".identity.lock",
                 ".renames",
                 "agents",
+                "aliases",
                 "locks",
                 "profiles.json"
             ]
