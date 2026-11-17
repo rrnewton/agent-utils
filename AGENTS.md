@@ -27,6 +27,14 @@ all-slots-memory-high option as a separate small PR. This supersedes direct-to-m
 publication and the one-exceptional-PR limit for those two assigned changes only.
 Memory pilots stay on the approved single lane; other live lanes are never migrated.
 
+Coordinator approval, November 16, 2026, 8:45pm ET: refresh the aggregate-high
+PR onto current main and publish only this lane's feature branch with an exact
+expected-SHA lease. Keep it draft until CI is green apart from documented
+#336 validation-host-contract cases and the consumer proves one natural-restart
+launch. The next launch uses 30G/34G per lane, 52G/58G aggregate and swap zero.
+Focused tests precede this publication checkpoint; full CI remains asynchronous.
+This supersedes the generic no-force rule only for this owned-branch refresh.
+
 
 ## Publication Policy
 
