@@ -297,6 +297,29 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
                    f"the hours box clips a 5-digit value: text {hours_fit['text']:.1f}px"
                    f" in {hours_fit['inner']:.1f}px (box {hours_fit['width']:.1f}px)")
         walk.shot("hours-five-digits")
+        # The same pill carrying a channel fetch's words (`setStatus("fetching
+        # the channel…")`, the resummarizing state coordb added to #1779): it
+        # must stand clear of the pane — and so of the "Earlier summary"
+        # disclosure row inside it — exactly as the dealt-with toast does.
+        page.evaluate("""() => {
+            const status = document.getElementById('status');
+            status.textContent = 'fetching the channel…';
+            document.getElementById('status-line').hidden = false;
+        }""")
+        walk.until("() => document.getElementById('status').textContent === 'fetching the channel…'",
+                   "the status pill did not take the fetching words")
+        walk.settled()
+        fetching = page.evaluate(TOAST_CLEAR_JS)
+        walk.check(fetching is not None, f"fetching pill or Discuss pane not drawn: {fetching}")
+        if fetching is not None:
+            toast, panel = fetching["toast"], fetching["panel"]
+            overlap = (toast["left"] < panel["right"] - 0.5 and panel["left"] < toast["right"] - 0.5
+                       and toast["top"] < panel["bottom"] - 0.5 and panel["top"] < toast["bottom"] - 0.5)
+            walk.check(not overlap,
+                       f"the fetching status pill covers the docked Discuss pane: toast={toast} panel={panel}")
+            walk.check(bool(fetching["dismissHit"]),
+                       f"the fetching pill's dismiss control is covered at its centre: {fetching}")
+        walk.shot("fetching-discuss-clear")
         page.evaluate("() => { document.getElementById('status-line').hidden = true; }")
         walk.settled()
     walk.shot("before-search")
