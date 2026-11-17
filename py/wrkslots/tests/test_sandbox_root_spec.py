@@ -124,14 +124,11 @@ def test_paths_outside_trusted_roots_are_refused(tmp_path: Path) -> None:
         bad = {**view, "binds": [[str(home), target]]}
         with pytest.raises(sandbox.SandboxError, match="refusing"):
             sandbox._check_root_paths(bad, trusted, os.getuid())
-    link = home / ".boxedlane-test-link"
+    link = tmp_path / "link"
     link.symlink_to("/etc")
-    try:
-        bad = {**view, "binds": [[str(home), str(link / "passwd")]]}
-        with pytest.raises(sandbox.SandboxError, match="refusing"):
-            sandbox._check_root_paths(bad, trusted, os.getuid())
-    finally:
-        link.unlink()
+    bad = {**view, "binds": [[str(home), str(link / "passwd")]]}
+    with pytest.raises(sandbox.SandboxError, match="refusing"):
+        sandbox._check_root_paths(bad, trusted, os.getuid())
 
 
 def test_enter_refuses_root_and_sudo_env(monkeypatch: pytest.MonkeyPatch) -> None:

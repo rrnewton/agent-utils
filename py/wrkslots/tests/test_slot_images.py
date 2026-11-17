@@ -700,15 +700,20 @@ def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
             json.dumps({"slots": [{"slot": slot, "agent": "worker", "checkouts": [{"path": "slot"}]}]}),
             encoding="utf-8",
         )
+    # Root live tests never share the real home's config: no shared
+    # binds at all, so the probe's shared write lands in the layer (#1583 L1).
+    shared = "home_shared=(), " if isolation == "root" else ""
     script = (
         "import sys\n"
         "from pathlib import Path\n"
         "from wrkslots import sandbox\n"
         "base = Path(sys.argv[1])\n"
         f"view = sandbox.SlotView({slot!r}, 'agent', base / 'slot', base / 'control' / 'slot-state' / 'agent' / 's1', (), base / 'control', 'worktree', base / 'project')\n"
-        f"settings = sandbox.SandboxSettings(isolation={isolation!r}, tmp_size='64M', limits=sandbox.SandboxLimits(tasks_max=256))\n"
+        f"settings = sandbox.SandboxSettings(isolation={isolation!r}, {shared}tmp_size='64M', limits=sandbox.SandboxLimits(tasks_max=256))\n"
         "sandbox.run(view, settings, sys.argv[2:])\n"
     )
+    real_shared = Path.home() / ".config/muse/shared"
+    real_shared_before = real_shared.read_bytes() if real_shared.exists() else None
     # Root mode takes the passwd home only (#1583): run it against the
     # real home (writes land in the layer; the host home stays untouched).
     run_home = Path.home() if isolation == "root" else home
@@ -741,6 +746,9 @@ def test_sandbox_view_confines_writes(box_base: Path, isolation: str) -> None:
     expected = {**_EXPECTED, "local_bin_runs": False} if isolation == "root" else _EXPECTED
     assert _probe_results(result.stdout) == expected, result.stdout + result.stderr
     if isolation == "root":
+        # Nothing under the real home changed (L1).
+        real_shared_after = real_shared.read_bytes() if real_shared.exists() else None
+        assert real_shared_after == real_shared_before
         state = box_base / "control" / "slot-state" / "agent" / "s1"
         assert not (run_home / "new-top-level").exists()
         assert (state / "home/new-top-level").exists()
