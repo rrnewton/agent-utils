@@ -50677,12 +50677,12 @@ def _judge_nested_git_repository_unchecked(
     # (recursively), linked-worktree registration, worktree and alternates
     # target resolves inside the roots this removal deletes, and no pointer
     # reaches outside.  Every escape refuses and names the escaping path.
-    resolved_roots = tuple(Path(root).resolve(strict=False) for root in removed_roots)
+    containment_roots = tuple(Path(root).resolve(strict=False) for root in removed_roots)
 
     def inside(path: Path) -> bool:
         resolved = Path(path).resolve(strict=False)
         return any(
-            resolved == root or resolved.is_relative_to(root) for root in resolved_roots
+            resolved == root or resolved.is_relative_to(root) for root in containment_roots
         )
 
     def read_pointer(path: Path) -> Path | None:
@@ -50779,16 +50779,16 @@ def _judge_nested_git_repository_unchecked(
             pointer = gitdir / pointer_name
             if not pointer.exists():
                 continue
-            target = read_pointer(pointer)
-            if target is None:
+            pointer_target = read_pointer(pointer)
+            if pointer_target is None:
                 raise refuse(f"cannot inspect .git/{pointer_name} in {gitdir}")
-            if not inside(target):
+            if not inside(pointer_target):
                 raise refuse(
                     f"repository has a worktree registration outside the cache: "
-                    f"{target.resolve(strict=False)}"
+                    f"{pointer_target.resolve(strict=False)}"
                 )
-            if pointer_name == "gitdir" and target.is_file():
-                back = read_pointer(target)
+            if pointer_name == "gitdir" and pointer_target.is_file():
+                back = read_pointer(pointer_target)
                 if back is not None and not inside(back):
                     raise refuse(
                         ".git file points to a repository directory outside "

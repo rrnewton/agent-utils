@@ -1741,7 +1741,10 @@ fn nested_module_gitdirs_inner(
     let mut names: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if entry.file_type().map(|kind| kind.is_symlink()).unwrap_or(false)
+        if entry
+            .file_type()
+            .map(|kind| kind.is_symlink())
+            .unwrap_or(false)
             && !nested_inside(&path, root)
         {
             return Err(nested_refuse(
@@ -1754,8 +1757,8 @@ fn nested_module_gitdirs_inner(
         }
         names.push(path);
     }
-    let is_gitdir = dir.join("HEAD").exists()
-        && (dir.join("config").exists() || dir.join("gitdir").exists());
+    let is_gitdir =
+        dir.join("HEAD").exists() && (dir.join("config").exists() || dir.join("gitdir").exists());
     if is_gitdir && !is_root {
         out.push(dir.to_path_buf());
         return Ok(());
@@ -1783,7 +1786,10 @@ fn nested_check_contained(
     if !nested_inside(gitdir, root) {
         return Err(nested_refuse(
             top,
-            format!("Git directory reaches outside the cache: {}", resolved.display()),
+            format!(
+                "Git directory reaches outside the cache: {}",
+                resolved.display()
+            ),
         ));
     }
     let config_path = gitdir.join("config");
@@ -1791,10 +1797,13 @@ fn nested_check_contained(
         let mut config_args = os_args(&["config", "--file"]);
         config_args.push(config_path.clone().into_os_string());
         config_args.extend(os_args(&["--null", "--list", "--name-only"]));
-        let names = nested_git_output(gitdir, &config_args, budget)
-            .map_err(|error| error.replacen(&gitdir.display().to_string(), &top.display().to_string(), 1))?;
+        let names = nested_git_output(gitdir, &config_args, budget).map_err(|error| {
+            error.replacen(&gitdir.display().to_string(), &top.display().to_string(), 1)
+        })?;
         for key in names.split('\0').filter(|item| !item.is_empty()) {
-            if key.to_lowercase().starts_with("include.") || key.to_lowercase().starts_with("includeif.") {
+            if key.to_lowercase().starts_with("include.")
+                || key.to_lowercase().starts_with("includeif.")
+            {
                 return Err(nested_refuse(
                     top,
                     format!("repository config sets {key}, which could load configuration this check does not inspect"),
@@ -1808,15 +1817,28 @@ fn nested_check_contained(
         if worktree.success {
             let raw = String::from_utf8_lossy(&worktree.stdout).trim().to_string();
             let raw_path = PathBuf::from(&raw);
-            let target = if raw_path.is_absolute() { raw_path } else { gitdir.join(raw_path) };
+            let target = if raw_path.is_absolute() {
+                raw_path
+            } else {
+                gitdir.join(raw_path)
+            };
             if !nested_inside(&target, root) {
                 return Err(nested_refuse(
                     top,
-                    format!("repository sets core.worktree outside the cache: {}", nested_resolve(&target).display()),
+                    format!(
+                        "repository sets core.worktree outside the cache: {}",
+                        nested_resolve(&target).display()
+                    ),
                 ));
             }
         } else if worktree.code != 1 {
-            return Err(nested_refuse(top, format!("cannot read core.worktree: {}", nested_git_detail(&worktree))));
+            return Err(nested_refuse(
+                top,
+                format!(
+                    "cannot read core.worktree: {}",
+                    nested_git_detail(&worktree)
+                ),
+            ));
         }
     }
     for pointer_name in ["gitdir", "commondir"] {
@@ -1827,13 +1849,19 @@ fn nested_check_contained(
         let target = match nested_read_pointer(&pointer) {
             Some(target) => target,
             None => {
-                return Err(nested_refuse(top, format!("cannot inspect .git/{pointer_name} in {}", gitdir.display())));
+                return Err(nested_refuse(
+                    top,
+                    format!("cannot inspect .git/{pointer_name} in {}", gitdir.display()),
+                ));
             }
         };
         if !nested_inside(&target, root) {
             return Err(nested_refuse(
                 top,
-                format!("repository has a worktree registration outside the cache: {}", nested_resolve(&target).display()),
+                format!(
+                    "repository has a worktree registration outside the cache: {}",
+                    nested_resolve(&target).display()
+                ),
             ));
         }
         if pointer_name == "gitdir" && target.is_file() {
@@ -1841,7 +1869,10 @@ fn nested_check_contained(
                 if !nested_inside(&back, root) {
                     return Err(nested_refuse(
                         top,
-                        format!(".git file points to a repository directory outside the cache: {}", nested_resolve(&back).display()),
+                        format!(
+                            ".git file points to a repository directory outside the cache: {}",
+                            nested_resolve(&back).display()
+                        ),
                     ));
                 }
             }
@@ -1853,14 +1884,20 @@ fn nested_check_contained(
         let entries: Vec<PathBuf> = match std::fs::read_dir(&modules_root) {
             Ok(listing) => listing.flatten().map(|entry| entry.path()).collect(),
             Err(error) => {
-                return Err(nested_refuse(top, format!("cannot inspect .git/modules: {error}")));
+                return Err(nested_refuse(
+                    top,
+                    format!("cannot inspect .git/modules: {error}"),
+                ));
             }
         };
         if !entries.is_empty() {
             let mut gitdirs: Vec<PathBuf> = Vec::new();
             nested_module_gitdirs(top, &modules_root, root, &mut gitdirs)?;
             if gitdirs.is_empty() {
-                let first = entries[0].file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                let first = entries[0]
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 return Err(nested_refuse(
                     top,
                     format!("submodule repositories under .git/modules are not self-contained: {first} is not a well-formed repository directory"),
@@ -2130,18 +2167,34 @@ mod nested_git_tests {
 
     fn git(cwd: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
-            .arg("-c").arg("protocol.file.allow=always")
-            .arg("-C").arg(cwd).args(args)
+            .arg("-c")
+            .arg("protocol.file.allow=always")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .status().expect("git");
+            .status()
+            .expect("git");
         assert!(status.success(), "git {args:?} in {cwd:?}");
     }
 
     fn commit(cwd: &Path, file: &str) {
         std::fs::write(cwd.join(file), "x\n").unwrap();
         git(cwd, &["add", file]);
-        git(cwd, &["-c", "user.email=t@e.invalid", "-c", "user.name=T", "commit", "-q", "-m", "c"]);
+        git(
+            cwd,
+            &[
+                "-c",
+                "user.email=t@e.invalid",
+                "-c",
+                "user.name=T",
+                "commit",
+                "-q",
+                "-m",
+                "c",
+            ],
+        );
     }
 
     fn fixture(base: &Path) -> (PathBuf, PathBuf) {
@@ -2155,21 +2208,49 @@ mod nested_git_tests {
         std::fs::create_dir_all(&lib).unwrap();
         git(&lib, &["init", "-q", "-b", "main"]);
         commit(&lib, "lib.txt");
-        git(&lib, &["submodule", "add", "-q", leaf.to_str().unwrap(), "third_party"]);
-        git(&lib, &["-c", "user.email=t@e.invalid", "-c", "user.name=T", "commit", "-q", "-m", "sub"]);
+        git(
+            &lib,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                leaf.to_str().unwrap(),
+                "third_party",
+            ],
+        );
+        git(
+            &lib,
+            &[
+                "-c",
+                "user.email=t@e.invalid",
+                "-c",
+                "user.name=T",
+                "commit",
+                "-q",
+                "-m",
+                "sub",
+            ],
+        );
         let repo = cache.join("fixture");
-        git(base, &["clone", "-q", lib.to_str().unwrap(), repo.to_str().unwrap()]);
+        git(
+            base,
+            &["clone", "-q", lib.to_str().unwrap(), repo.to_str().unwrap()],
+        );
         git(&repo, &["submodule", "update", "-q", "--init"]);
         (cache, repo)
     }
 
     fn judge(repo: &Path, cache: &Path) -> Result<(), String> {
-        let mut budget = NestedGitBudget { total_seconds: 60.0, spent_seconds: 0.0 };
+        let mut budget = NestedGitBudget {
+            total_seconds: 60.0,
+            spent_seconds: 0.0,
+        };
         judge_nested_git(&repo.join(".git"), cache, &mut budget)
     }
 
     fn temp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("wrkslots-nested-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("wrkslots-nested-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2181,7 +2262,10 @@ mod nested_git_tests {
         let (cache, repo) = fixture(&base);
         assert!(repo.join(".git/modules/third_party").is_dir());
         assert!(judge(&repo, &cache).is_ok());
-        let mut budget = NestedGitBudget { total_seconds: 60.0, spent_seconds: 0.0 };
+        let mut budget = NestedGitBudget {
+            total_seconds: 60.0,
+            spent_seconds: 0.0,
+        };
         assert!(judge_nested_git(&repo.join("third_party/.git"), &cache, &mut budget).is_ok());
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -2203,7 +2287,17 @@ mod nested_git_tests {
         let base = temp("worktree-out");
         let (cache, repo) = fixture(&base);
         let outside = base.join("outside-worktree");
-        git(&repo, &["worktree", "add", "-q", "-b", "linked", outside.to_str().unwrap()]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                outside.to_str().unwrap(),
+            ],
+        );
         let error = judge(&repo, &cache).unwrap_err();
         assert!(error.contains(&outside.display().to_string()), "{error}");
         let _ = std::fs::remove_dir_all(&base);
@@ -2215,7 +2309,11 @@ mod nested_git_tests {
         let (cache, repo) = fixture(&base);
         let outside = base.join("outside-objects");
         std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(repo.join(".git/objects/info/alternates"), format!("{}\n", outside.display())).unwrap();
+        std::fs::write(
+            repo.join(".git/objects/info/alternates"),
+            format!("{}\n", outside.display()),
+        )
+        .unwrap();
         let error = judge(&repo, &cache).unwrap_err();
         assert!(error.contains(&outside.display().to_string()), "{error}");
         let _ = std::fs::remove_dir_all(&base);
