@@ -610,6 +610,51 @@ def test_create_hooks_see_the_slot_type_in_both_editions(tmp_path: Path) -> None
         assert (root / "worktrees" / "slot-b" / "repo" / "slot-type").read_text() == "agent"
 
 
+def test_create_hook_ignores_the_callers_git_directory_in_both_editions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1768 parity: a submodule hook runs in its checkout even when the
+    caller exports GIT_DIR (a bare mirror) and GIT_WORK_TREE (another tree)."""
+
+    roots: dict[str, Path] = {}
+    for edition in ("rust", "python"):
+        base = tmp_path / edition
+        root = _empty_fixture(base)
+        upstream = base / "upstream-repo"
+        leaf = base / "leaf-repo"
+        _repo(leaf)
+        _git(
+            upstream, "-c", "protocol.file.allow=always",
+            "submodule", "add", str(leaf), "leaf",
+        )
+        _git(upstream, "add", ".gitmodules", "leaf")
+        _git(upstream, "commit", "-q", "-m", "add leaf")
+        config = root / ".wrkslots.yml"
+        config.write_text(
+            config.read_text()
+            + "post_provision_hooks:\n"
+            + "  - 'git -c protocol.file.allow=always submodule update --init --recursive'\n"
+        )
+        roots[edition] = root
+    for edition, root in roots.items():
+        base = tmp_path / edition
+        monkeypatch.setenv("GIT_WORK_TREE", str(base / "leaf-repo"))
+        # GIT_DIR must name a bare repository for the reported failure; the
+        # upstream's own .git is not bare, so point at a bare clone instead.
+        mirror = base / "mirror.git"
+        _git(base, "clone", "-q", "--bare", str(base / "upstream-repo"), str(mirror))
+        monkeypatch.setenv("GIT_DIR", str(mirror))
+        if edition == "python":
+            assert _python_create(root) == 0
+        else:
+            result = _rust_create(root)
+            assert result.returncode == 0, result.stderr
+    assert _active_doc(roots["rust"]) == _active_doc(roots["python"])
+    for root in roots.values():
+        checkout = root / "worktrees" / "slot-b" / "repo"
+        assert (checkout / "leaf" / "file.txt").read_text() == "one\n"
+
+
 def test_create_hook_slot_types_entry_matches_python(tmp_path: Path) -> None:
     """#1122 parity: both editions run an agent-scoped mapping hook for an agent slot."""
 

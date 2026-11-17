@@ -33506,6 +33506,90 @@ def test_post_provision_hooks_run_in_order_before_registration(
     assert len(row["checkouts"]) == 2
 
 
+def test_create_hook_ignores_the_callers_git_directory(tmp_path: Path) -> None:
+    """#1768: a hook's Git runs in its checkout, not wherever the caller's
+    GIT_DIR/GIT_WORK_TREE point (a bare mirror and another tree here)."""
+
+    project, repository, _remote = make_project(tmp_path)
+    leaf_remote = tmp_path / "leaf.git"
+    leaf_source = tmp_path / "leaf-source"
+    secondary_remote = tmp_path / "secondary.git"
+    for remote, source in ((leaf_remote, leaf_source), (secondary_remote, None)):
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if source is not None:
+            subprocess.run(
+                ["git", "clone", str(remote), str(source)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            git(source, "config", "user.name", "Wrkslots Test")
+            git(source, "config", "user.email", "wrkslots@example.invalid")
+    assert leaf_source is not None
+    (leaf_source / "leaf.txt").write_text("leaf sentinel\n", encoding="utf-8")
+    git(leaf_source, "add", "leaf.txt")
+    git(leaf_source, "commit", "-m", "leaf base")
+    git(leaf_source, "push", "-u", "origin", "main")
+    secondary = project / "lib"
+    subprocess.run(
+        ["git", "clone", str(secondary_remote), str(secondary)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(secondary, "config", "user.name", "Wrkslots Test")
+    git(secondary, "config", "user.email", "wrkslots@example.invalid")
+    (secondary / "lib.txt").write_text("lib\n", encoding="utf-8")
+    git(secondary, "add", "lib.txt")
+    git(secondary, "commit", "-m", "lib base")
+    git(
+        secondary,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(leaf_remote),
+        "leaf",
+    )
+    git(secondary, "add", ".gitmodules", "leaf")
+    git(secondary, "commit", "-m", "lib with leaf")
+    git(secondary, "push", "-u", "origin", "main")
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --recursive"
+        ],
+    )
+
+    # The slot names only the secondary repository; the caller exports a
+    # bare mirror as GIT_DIR and the primary tree as GIT_WORK_TREE.
+    made = create(
+        project,
+        slot="slot01",
+        agent="codex-1",
+        branch="codex/lib-task",
+        repository_name="lib",
+        checkout_name="lib",
+        env={
+            "GIT_DIR": str(secondary_remote),
+            "GIT_WORK_TREE": str(repository),
+        },
+    )
+
+    assert made.returncode == 0, made.stderr
+    slot_checkout = checkout(project, name="lib")
+    assert (slot_checkout / "leaf" / "leaf.txt").read_text(encoding="utf-8") == (
+        "leaf sentinel\n"
+    )
+    status = git(slot_checkout, "submodule", "status").stdout
+    assert status.strip() and not status.lstrip().startswith("-")
+
+
 def _set_post_provision_hooks(project: Path, hooks: list[object]) -> None:
     config_path = project / ".wrkslots.yml"
     document = dict(wrkslots._read_config(config_path))
