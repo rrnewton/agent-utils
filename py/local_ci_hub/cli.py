@@ -186,12 +186,25 @@ def main(argv: list[str] | None = None) -> int:
         if args.op == "era-list":
             import hashlib as _hl
             from .ledger import Ledger as _Led, canonical_bytes as _canon
-            out_rows = []
+            if cfg.era_records:
+                print("era_records is already set; refusing to regenerate the frozen era list", file=sys.stderr)
+                return 2
+            entries: list[str] = []
             for row in _Led(cfg).rows():
+                ver = row.get("schema_version")
+                if isinstance(ver, int) and not isinstance(ver, bool) and ver >= 6:
+                    continue  # only below-schema-6 rows can be era records
                 body = {k: v for k, v in row.items() if not str(k).startswith("_") and k != "digest"}
-                out_rows.append({"record_id": row.get("record_id"), "run_id": row.get("run_id"),
-                                 "sha256": _hl.sha256(_canon(body)).hexdigest()})
-            _out({"schema": "local-ci-hub/era-list/v1", "records": out_rows}, args.json)
+                ident = row.get("record_id") or row.get("run_id")
+                if not isinstance(ident, str) or not ident:
+                    continue
+                entries.append(f"{ident}:{_hl.sha256(_canon(body)).hexdigest()}")
+                if args.commit and ident == args.commit:
+                    break  # bounded by the explicit cutoff record
+            if args.json:
+                _out({"schema": "local-ci-hub/era-list/v1", "era_records": entries}, True)
+            else:
+                print("era_records = [" + ", ".join(f'"{e}"' for e in entries) + "]")
             return 0
         res = receipt_mod.show(cfg, args.commit)
         _out(res, args.json)

@@ -113,26 +113,54 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
                     out[key] = totals[key]
         return out
 
-    def _era_listed(r: dict[str, object]) -> bool:
-        # Frozen era set: only records whose identity the consumer
-        # committed at cutover may use era rules. A record's
-        # identity is its record_id, its run_id, or the sha256 of
-        # its canonical row (see `receipt era-list`).
-        listed = set(cfg.era_records)
-        for key in ("record_id", "run_id"):
-            value = r.get(key)
-            if isinstance(value, str) and value in listed:
-                return True
+    def _era_hash(r: dict[str, object]) -> str:
         from .ledger import canonical_bytes as _canon
         import hashlib as _hl
         body = {k: v for k, v in r.items()
                 if not str(k).startswith("_") and k != "digest"}
-        return _hl.sha256(_canon(body)).hexdigest() in listed
+        return _hl.sha256(_canon(body)).hexdigest()
+
+    def _floor_ok(floor: object) -> bool:
+        # Complete floor evidence for every kind: hex floor and
+        # tree, an authority binding, 64-hex plan digests, and pin
+        # bindings; current-main also needs commit equality.
+        if not isinstance(floor, dict) or floor.get("floor_kind") not in _FLOOR_KINDS:
+            return False
+        for key in ("floor_sha", "floor_tree"):
+            value = floor.get(key)
+            if not isinstance(value, str) or _HEX40.fullmatch(value) is None:
+                return False
+        if not isinstance(floor.get("authority"), str) or not floor.get("authority"):
+            return False
+        plans = floor.get("plan_sha256s")
+        if not isinstance(plans, list) or not plans:
+            return False
+        if any(not isinstance(v, str) or len(v) != 64 for v in plans):
+            return False
+        if not isinstance(floor.get("pin_bindings"), (dict, list)):
+            return False
+        if floor.get("floor_kind") == "current-main":
+            # floor_sha is already hex-checked above, so equality
+            # with it also proves the observed SHA is hex.
+            if floor.get("floor_sha") != floor.get("observed_main_sha"):
+                return False
+        return True
+
+    def _era_listed(r: dict[str, object]) -> bool:
+        # Frozen era set: an entry is the pair "id:sha256" — the
+        # record's id (record_id, else run_id) AND the sha256 of
+        # that exact canonical row, matched together. Copying a
+        # listed id onto a different row never matches, and any
+        # later event that alters the row changes its hash, so
+        # corrections and enrichments never inherit era status.
+        listed = set(cfg.era_records)
+        ident = r.get("record_id") or r.get("run_id")
+        return isinstance(ident, str) and bool(ident) and f"{ident}:{_era_hash(r)}" in listed
 
     def _repo_allowed(r: dict[str, object], version: int) -> bool:
         # A foreign repository never qualifies at any version. A
-        # missing repository refuses schema 5+ records and any
-        # record when this configuration names repositories at all.
+        # missing repository refuses schema 5+ records; below that
+        # only frozen-era records may omit it.
         allowed = set(cfg.counted_repos) | set(cfg.repo_aliases)
         if cfg.repo:
             allowed.add(cfg.repo)
@@ -150,8 +178,8 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
         version = _version_of(r)
         if version is None:
             return False  # malformed or future schema version: refused
-        if version < 5 and not _era_listed(r):
-            return False  # below schema 5: frozen era set only
+        if version < 6 and not _era_listed(r):
+            return False  # unlisted: schema 6 with every clause, or nothing
         if not _repo_allowed(r, version):
             return False
         if not _release_identity_ok(cfg, r):
@@ -176,26 +204,8 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             kinds = cfg.admission_kinds or ["host-limits-live"]
             if r.get("admission") not in kinds:
                 return False  # missing or unknown admission kind
-            floor = r.get("admission_floor_evidence")
-            if not isinstance(floor, dict) or floor.get("floor_kind") not in _FLOOR_KINDS:
+            if not _floor_ok(r.get("admission_floor_evidence")):
                 return False
-            floor_sha = floor.get("floor_sha")
-            floor_tree = floor.get("floor_tree")
-            if not isinstance(floor_tree, str) or _HEX40.fullmatch(floor_tree) is None:
-                return False
-            if not isinstance(floor.get("authority"), str) or not floor.get("authority"):
-                return False
-            plans = floor.get("plan_sha256s")
-            if not isinstance(plans, list) or not plans:
-                return False
-            if not isinstance(floor.get("pin_bindings"), (dict, list)):
-                return False
-            if floor.get("floor_kind") == "current-main":
-                observed = floor.get("observed_main_sha")
-                if not isinstance(observed, str) or _HEX40.fullmatch(observed) is None:
-                    return False
-                if floor_sha != observed:
-                    return False
             tooling = r.get("tooling_sha")
             if not isinstance(tooling, str) or _HEX40.fullmatch(tooling) is None:
                 return False  # unknown tooling never qualifies
@@ -226,22 +236,16 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
             tooling5 = r.get("tooling_sha")
             if not isinstance(tooling5, str) or _HEX40.fullmatch(tooling5) is None:
                 return False
-            floor5 = r.get("admission_floor_evidence")
-            if not isinstance(floor5, dict) or floor5.get("floor_kind") not in _FLOOR_KINDS:
-                return False
-            _sha5 = floor5.get("floor_sha")
-            if not isinstance(_sha5, str) or _HEX40.fullmatch(_sha5) is None:
-                return False
-            if floor5.get("floor_kind") == "current-main" and _sha5 != floor5.get("observed_main_sha"):
+            if not _floor_ok(r.get("admission_floor_evidence")):
                 return False
         if version >= 5:
-            if r.get("failures") != 0:
+            if not _is_int(r.get("failures")) or r.get("failures") != 0:
                 return False  # any failure refuses, at schema 5 and 6
             # Gate accounting closes; named skip lists are lists.
             ran = _count_of(r.get("gates_run"))
             expected = _count_of(r.get("gates_expected"))
             skipped = _count_of(r.get("intentional_skipped_nodes", 0))
-            if ran is None or expected is None or skipped is None or ran < 0 or expected < 0 or skipped < 0 or ran + skipped != expected:
+            if ran is None or expected is None or skipped is None or ran < 0 or expected <= 0 or skipped < 0 or ran + skipped != expected:
                 return False
             for key in ("skipped_nodes", "dependency_skipped_nodes", "unaccounted_nodes"):
                 value = r.get(key)
@@ -317,18 +321,18 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
     # at least as new as the newest qualifying PASS.
     fail_veto = False
     if genuine_fails and strict_passes:
-        def _when(r: dict[str, object]) -> str:
+        def _when(r: dict[str, object], *, fail: bool) -> str:
             import datetime as _dt
             raw = str(r.get("finished_at") or "")
             try:
                 parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
             except ValueError:
-                return ""
+                return "9999" if fail else ""  # fail closed both ways
             if parsed.tzinfo is None:
-                return ""  # zone-less counts as oldest, never newest
+                return "9999" if fail else ""
             return parsed.astimezone(_dt.timezone.utc).isoformat()
-        newest_pass = max(_when(r) for r in strict_passes)
-        newest_fail = max(_when(r) for r in genuine_fails)
+        newest_pass = max(_when(r, fail=False) for r in strict_passes)
+        newest_fail = max(_when(r, fail=True) for r in genuine_fails)
         fail_veto = newest_fail >= newest_pass
     elif genuine_fails:
         fail_veto = True

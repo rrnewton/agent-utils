@@ -43,6 +43,8 @@ class Config:
     probes: list[dict[str, object]] = field(default_factory=list)
     state_dir: Path = Path("ignored/local-ci-hub")
     evidence_root: Path | None = None
+    # Legacy switch: the receipt predicate no longer weakens any
+    # clause for it; kept so existing configurations still load.
     require_full_evidence: bool = True
     release_payload: dict[str, object] | None = None
     digest_command: list[str] | None = None

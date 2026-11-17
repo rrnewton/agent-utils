@@ -22,10 +22,10 @@ def _cfg(tmp_path: Path) -> Config:
                   ledger_dir=tmp_path / "ledger", state_dir=tmp_path / "state",
                   require_full_evidence=True, repo="repo-a",
                   counted_repos=["repo-a", "repo-b"], known_gaps=["gap-1", "gap-2"],
-                  era_records=["r1"])
+                  era_records=[])
 
 
-def _verdict(tmp_path: Path, row: dict[str, object]) -> str:
+def _verdict(tmp_path: Path, row: dict[str, object], *, era: bool = False) -> str:
     cfg = _cfg(tmp_path)
     cfg.ledger_dir.mkdir(parents=True, exist_ok=True)
     event = {"schema": "validate-ledger/v1", "event_type": "run.result",
@@ -33,6 +33,13 @@ def _verdict(tmp_path: Path, row: dict[str, object]) -> str:
              "commit": SHA, "outcome": str(row.get("result", "pass")).lower(),
              "legacy_row": row}
     (cfg.ledger_dir / "ledger.jsonl").write_text(json.dumps(event) + "\n")
+    if era:
+        from local_ci_hub.ledger import Ledger, canonical_bytes
+        import hashlib
+        folded = Ledger(cfg).rows()[0]
+        body = {k: v for k, v in folded.items() if not str(k).startswith("_") and k != "digest"}
+        ident = folded.get("record_id") or folded.get("run_id")
+        cfg.era_records = [f"{ident}:{hashlib.sha256(canonical_bytes(body)).hexdigest()}"]
     return str(show(cfg, SHA)["verdict"])
 
 
@@ -71,13 +78,12 @@ def test_schema6_requires_full_profile_and_result_set(tmp_path: Path) -> None:
 def test_schema_versions_gate_and_coverage_thresholds(tmp_path: Path) -> None:
     legacy = {k: v for k, v in _good_v6().items()
               if k not in ("schema_version", "repo", "gates_run", "gates_expected", "coverage")}
-    legacy["finished_at"] = "2026-11-16T00:00:00Z"  # era evidence predates the cutover
-    assert _verdict(tmp_path / "a", legacy) == "qualified"  # era rules, not vacuous clauses
+    assert _verdict(tmp_path / "a", legacy, era=True) == "qualified"  # frozen era list only
     v5 = dict(legacy, schema_version=5, repo="repo-a")
     assert _verdict(tmp_path / "b", v5) != "qualified"  # schema 5 requires gates+coverage
     v5_full = dict(v5, gates_run=1, gates_expected=1,
                    coverage={"planned_test_nodes": 1, "zero_executed_nodes": [], "absent_nodes": []})
-    assert _verdict(tmp_path / "c", v5_full) == "qualified"
+    assert _verdict(tmp_path / "c", v5_full, era=True) == "qualified"
     over = dict(v5_full, gates_run=2)
     assert _verdict(tmp_path / "d", over) != "qualified"  # accounting must close
 
@@ -121,7 +127,7 @@ def test_schema4_era_and_gap_names(tmp_path: Path) -> None:
                        "admission", "admission_floor_evidence", "tooling_sha",
                        "producer", "record_id", "log_identity", "cell_results")}
     v4["schema_version"] = 4
-    assert _verdict(tmp_path / "a", v4) == "qualified"  # era rules only
+    assert _verdict(tmp_path / "a", v4, era=True) == "qualified"  # era rules only
     gap = dict(_good_v6(), passed_tests=8, known_gaps=["gap-1", "gap-2"])
     assert _verdict(tmp_path / "b", gap) == "qualified"  # named, ledgered gaps
     skip = dict(_good_v6(), gates_run=1, gates_expected=2, intentional_skipped_nodes=["n"])
@@ -133,11 +139,11 @@ def test_era_frozen_set_both_sides(tmp_path: Path) -> None:
               if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
                            "admission", "admission_floor_evidence", "tooling_sha",
                            "producer", "record_id", "log_identity", "cell_results")}
-    assert _verdict(tmp_path / "a", legacy) == "qualified"  # run r1 is on the frozen era list
+    assert _verdict(tmp_path / "a", legacy, era=True) == "qualified"  # on the frozen era list
     unlisted = dict(legacy, run_id="r-new", finished_at="2020-01-01T00:00:00Z")
     assert _verdict(tmp_path / "b", unlisted) != "qualified"  # backdating cannot join the era
     v4 = dict(legacy, schema_version=4)
-    assert _verdict(tmp_path / "c", v4) == "qualified"
+    assert _verdict(tmp_path / "c", v4, era=True) == "qualified"
     v4_unlisted = dict(v4, run_id="r-new")
     assert _verdict(tmp_path / "d", v4_unlisted) != "qualified"
     neg = dict(legacy, schema_version=-1)
@@ -192,7 +198,7 @@ def test_single_clause_isolations(tmp_path: Path) -> None:
         dict(_good_v6(), admission_floor_evidence=_floor(observed_main_sha="b" * 40)),
     ]
     for index, row in enumerate(cases):
-        assert _verdict(tmp_path / f"s{index}", row) != "qualified", row
+        assert _verdict(tmp_path / f"s{index}", row, era=True) != "qualified", row
 
 
 def test_era_and_v5_isolations(tmp_path: Path) -> None:
@@ -216,7 +222,7 @@ def test_era_and_v5_isolations(tmp_path: Path) -> None:
     # repo=None above is a present-but-null repo; drop the key instead:
     cases[0] = {k: v for k, v in v5.items() if k != "repo"}
     for index, row in enumerate(cases):
-        assert _verdict(tmp_path / f"e{index}", row) != "qualified", row
+        assert _verdict(tmp_path / f"e{index}", row, era=True) != "qualified", row
 
 
 def test_release_identity_at_schema6(tmp_path: Path) -> None:
@@ -237,6 +243,11 @@ def test_release_identity_at_schema6(tmp_path: Path) -> None:
               "event_id": "e2", "run_id": "r1", "commit": SHA,
               "outcome": "pass", "legacy_row": era_row}
     (cfg2.ledger_dir / "ledger.jsonl").write_text(json.dumps(event2) + "\n")
+    from local_ci_hub.ledger import Ledger as _Led2, canonical_bytes as _can2
+    import hashlib as _hl2
+    _folded = _Led2(cfg2).rows()[0]
+    _body = {k: v for k, v in _folded.items() if not str(k).startswith("_") and k != "digest"}
+    cfg2.era_records = [f"r1:{_hl2.sha256(_can2(_body)).hexdigest()}"]
     assert str(show(cfg2, SHA)["verdict"]) != "qualified"  # superseded payload, era record
     row = dict(_good_v6(), release_builder="builder-a",
                e2e_payload={"path": "target/debug/primary", "profile": "debug",
@@ -247,6 +258,36 @@ def test_release_identity_at_schema6(tmp_path: Path) -> None:
              "outcome": "pass", "legacy_row": row}
     (cfg.ledger_dir / "ledger.jsonl").write_text(json.dumps(event) + "\n")
     assert str(show(cfg, SHA)["verdict"]) != "qualified"  # superseded payload at v6
+
+
+def test_condition_boundaries(tmp_path: Path) -> None:
+    era = {k: v for k, v in _good_v6().items()
+           if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
+                        "admission", "admission_floor_evidence", "tooling_sha",
+                        "producer", "record_id", "log_identity", "cell_results")}
+    cases = [
+        dict(_good_v6(), gates_run=-1, intentional_skipped_nodes=2, gates_expected=1),
+        dict(_good_v6(), schema_version=True), dict(_good_v6(), gates_run=True),
+        dict(_good_v6(), passed_tests=True), dict(_good_v6(), failures=False),
+        dict(_good_v6(), failures=0.0), dict(_good_v6(), gates_run=0, gates_expected=0),
+        dict(era, coverage={"planned_test_nodes": 0, "zero_executed_nodes": [], "absent_nodes": []}),
+    ]
+    for index, row in enumerate(cases):
+        assert _verdict(tmp_path / f"b{index}", row, era=True) != "qualified", row
+
+
+def test_era_pair_forgery_refused(tmp_path: Path) -> None:
+    legacy = {k: v for k, v in _good_v6().items()
+              if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
+                           "admission", "admission_floor_evidence", "tooling_sha",
+                           "producer", "record_id", "log_identity", "cell_results")}
+    # An unlisted mutated row refuses (pair matches the exact row only).
+    other = dict(legacy, executed_tests=1, passed_tests=1)
+    assert _verdict(tmp_path / "b", other) != "qualified"  # unlisted mutated row
+    v5_unlisted = dict(_good_v6(), schema_version=5)
+    assert _verdict(tmp_path / "c", v5_unlisted) != "qualified"  # unlisted v5: nothing
+    plans_bad = dict(_good_v6(), admission_floor_evidence=_floor(plan_sha256s=["x", 3]))
+    assert _verdict(tmp_path / "d", plans_bad) != "qualified"
 
 
 def test_adapter_maps_and_drops(tmp_path: Path) -> None:

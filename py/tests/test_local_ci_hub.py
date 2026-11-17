@@ -134,7 +134,7 @@ def _row_ref_repo(tmp_path: Path) -> tuple[Path, Path]:
         '[project]\nname="toy"\n[validate]\ncommand=["/bin/true"]\n'
         'admission_slots=2\n[ledger]\nteam="toy"\npublish="none"\ncounted_repos=["primary","owner/primary"]\n'
         f'evidence_root="{evidence}"\nlocation={{path="ci-ledger"}}\n'
-        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=true\nera_records=["r1","r2","r-full","r-partial-fail","r-partial-pass","r-full-fail"]\n'
+        '[remote]\nprovider="none"\n[receipt]\nqualifying=["local-ledger-pass"]\nrequire_full_evidence=true\n'
         '[receipt.release_payload]\npath="target/validate/primary"\nprofile="validate"\ndebug_assertions=true\noverflow_checks=true\n'
         '[land]\nstate_dir="ignored/local-ci-hub"\n')
     subprocess.run(["git", "add", "-A"], cwd=repo, timeout=15)
@@ -173,6 +173,16 @@ def _write_ledger(repo: Path, events: list[dict[str, object]]) -> None:
     led = repo / "ci-ledger"
     led.mkdir(exist_ok=True)
     (led / "ledger.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+    # Freeze the era list from the rows as written, in config form.
+    config = repo / "local-ci-hub.toml"
+    stripped = "\n".join(ln for ln in config.read_text().splitlines()
+                         if not ln.startswith("era_records=")) + "\n"
+    config.write_text(stripped)  # regenerate from scratch on every write
+    out = run_cli(repo, "--json", "receipt", "era-list")
+    entries = json.loads(out.stdout)["era_records"]
+    config.write_text(config.read_text().replace(
+        "require_full_evidence=true\n",
+        "require_full_evidence=true\nera_records=" + json.dumps(entries) + "\n"))
 
 
 def test_row_ref_valid_evidence_qualifies(tmp_path: Path) -> None:
