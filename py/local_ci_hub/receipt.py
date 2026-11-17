@@ -135,7 +135,8 @@ def show(cfg: Config, commit: str, remote: dict[str, object] | None = None) -> d
         plans = floor.get("plan_sha256s")
         if not isinstance(plans, list) or not plans:
             return False
-        if any(not isinstance(v, str) or len(v) != 64 for v in plans):
+        _hex64 = __import__("re").compile(r"[0-9a-f]{64}")
+        if any(not isinstance(v, str) or _hex64.fullmatch(v) is None for v in plans):
             return False
         if not isinstance(floor.get("pin_bindings"), (dict, list)):
             return False

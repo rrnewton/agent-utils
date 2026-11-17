@@ -178,7 +178,7 @@ def _write_ledger(repo: Path, events: list[dict[str, object]]) -> None:
     stripped = "\n".join(ln for ln in config.read_text().splitlines()
                          if not ln.startswith("era_records=")) + "\n"
     config.write_text(stripped)  # regenerate from scratch on every write
-    out = run_cli(repo, "--json", "receipt", "era-list")
+    out = run_cli(repo, "--json", "receipt", "era-list", str(events[-1].get("run_id", "")))
     entries = json.loads(out.stdout)["era_records"]
     config.write_text(config.read_text().replace(
         "require_full_evidence=true\n",

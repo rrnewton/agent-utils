@@ -189,18 +189,68 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.era_records:
                 print("era_records is already set; refusing to regenerate the frozen era list", file=sys.stderr)
                 return 2
+            if not args.commit:
+                print("receipt era-list needs a cutoff record id: receipt era-list <run-id>", file=sys.stderr)
+                return 2
+            # Generation sees every row, including foreign ones the
+            # receipt fold would drop: the frozen list is about
+            # what exists, not what counts.
+            import dataclasses as _dc
+            _repos = set(cfg.counted_repos)
+            _led0 = _Led(cfg)
+            for _e in _led0.events():
+                _candidates = [_e, _e.get("legacy_row")]
+                _codec = _e.get("legacy_row_codec")
+                if isinstance(_codec, dict) and _codec.get("codec") == "row-ref/v1":
+                    _resolved, _ok = _led0._resolve_ref(_codec, host=None)
+                    if _ok:
+                        _candidates.append(_resolved)
+                for _src in _candidates:
+                    if isinstance(_src, dict) and isinstance(_src.get("repo"), str):
+                        _repos.add(str(_src["repo"]))
+            _gen_cfg = _dc.replace(cfg, counted_repos=list(_repos))
+            all_rows = _Led(_gen_cfg).rows()
+            cutoff = None
+            for row in all_rows:
+                if (row.get("record_id") or row.get("run_id")) == args.commit:
+                    cutoff = row
+                    break
+            if cutoff is None:
+                # The cutoff may name a row whose evidence does not
+                # resolve; its envelope still bounds generation.
+                for _e in _Led(cfg).events():
+                    if (_e.get("record_id") or _e.get("run_id")) == args.commit:
+                        cutoff = _e
+                        break
+            if cutoff is None:
+                print(f"cutoff record {args.commit} not found in the ledger", file=sys.stderr)
+                return 2
+            import datetime as _dt
+            def _stamp(row: dict[str, object]) -> _dt.datetime | None:
+                raw = row.get("finished_at")
+                if not isinstance(raw, str):
+                    return None
+                try:
+                    parsed = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+                return parsed if parsed.tzinfo is not None else None
+            bound = _stamp(cutoff)
+            # A timeless cutoff (unresolvable evidence) bounds at
+            # the ledger end: it was found, so it is not unknown.
             entries: list[str] = []
-            for row in _Led(cfg).rows():
+            for row in all_rows:
                 ver = row.get("schema_version")
                 if isinstance(ver, int) and not isinstance(ver, bool) and ver >= 6:
                     continue  # only below-schema-6 rows can be era records
+                when = _stamp(row)
+                if bound is not None and (when is None or when > bound):
+                    continue  # bounded by record time, never shard path order
                 body = {k: v for k, v in row.items() if not str(k).startswith("_") and k != "digest"}
                 ident = row.get("record_id") or row.get("run_id")
                 if not isinstance(ident, str) or not ident:
                     continue
                 entries.append(f"{ident}:{_hl.sha256(_canon(body)).hexdigest()}")
-                if args.commit and ident == args.commit:
-                    break  # bounded by the explicit cutoff record
             if args.json:
                 _out({"schema": "local-ci-hub/era-list/v1", "era_records": entries}, True)
             else:

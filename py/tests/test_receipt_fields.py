@@ -276,18 +276,109 @@ def test_condition_boundaries(tmp_path: Path) -> None:
         assert _verdict(tmp_path / f"b{index}", row, era=True) != "qualified", row
 
 
+def _pair_of(cfg: object, row_path: Path) -> str:
+    from local_ci_hub.ledger import Ledger, canonical_bytes
+    import hashlib
+    folded = Ledger(cfg).rows()[0]  # type: ignore[arg-type]
+    body = {k: v for k, v in folded.items() if not str(k).startswith("_") and k != "digest"}
+    ident = folded.get("record_id") or folded.get("run_id")
+    return f"{ident}:{hashlib.sha256(canonical_bytes(body)).hexdigest()}"
+
+
+def _judge(tmp_path: Path, listed: list[dict[str, object]],
+           judged: dict[str, object], era_entries: list[str] | None = None) -> str:
+    cfg = _cfg(tmp_path)
+    cfg.ledger_dir.mkdir(parents=True, exist_ok=True)
+    def _write(rows: list[dict[str, object]]) -> None:
+        lines = []
+        for i, row in enumerate(rows):
+            lines.append(json.dumps(
+                {"schema": "validate-ledger/v1", "event_type": "run.result",
+                 "event_id": f"e{i}", "run_id": str(row.get("run_id", "r1")),
+                 "commit": SHA, "outcome": str(row.get("result", "pass")).lower(),
+                 "legacy_row": row}))
+        (cfg.ledger_dir / "ledger.jsonl").write_text("\n".join(lines) + "\n")
+    _write(listed)
+    cfg.era_records = era_entries if era_entries is not None else [_pair_of(cfg, tmp_path)]
+    _write([judged])
+    return str(show(cfg, SHA)["verdict"])
+
+
 def test_era_pair_forgery_refused(tmp_path: Path) -> None:
     legacy = {k: v for k, v in _good_v6().items()
               if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
                            "admission", "admission_floor_evidence", "tooling_sha",
                            "producer", "record_id", "log_identity", "cell_results")}
-    # An unlisted mutated row refuses (pair matches the exact row only).
-    other = dict(legacy, executed_tests=1, passed_tests=1)
-    assert _verdict(tmp_path / "b", other) != "qualified"  # unlisted mutated row
-    v5_unlisted = dict(_good_v6(), schema_version=5)
-    assert _verdict(tmp_path / "c", v5_unlisted) != "qualified"  # unlisted v5: nothing
-    plans_bad = dict(_good_v6(), admission_floor_evidence=_floor(plan_sha256s=["x", 3]))
-    assert _verdict(tmp_path / "d", plans_bad) != "qualified"
+    # (unchanged) A unchanged qualifies on its own pair.
+    assert _judge(tmp_path / "a", [legacy], dict(legacy)) == "qualified"
+    # (a) A changed row carrying A's id is refused.
+    changed = dict(legacy, executed_tests=1, passed_tests=1)
+    assert _judge(tmp_path / "b", [legacy], changed) != "qualified"
+    # (b) A's hash under another id is refused: list only A's pair,
+    # then present the same row under a different run id.
+    renamed = dict(legacy, run_id="r-other")
+    assert _judge(tmp_path / "c", [legacy], renamed) != "qualified"
+    # Crossed entries: id of A with hash of C (and vice versa) refuse A.
+    other = dict(legacy, run_id="r-c", executed_tests=3, passed_tests=3)
+    cfg = _cfg(tmp_path / "d")
+    cfg.ledger_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.ledger_dir / "ledger.jsonl").write_text(json.dumps(
+        {"schema": "validate-ledger/v1", "event_type": "run.result", "event_id": "e0",
+         "run_id": "r1", "commit": SHA, "outcome": "pass", "legacy_row": legacy}) + "\n")
+    pair_a = _pair_of(cfg, tmp_path / "d")
+    (cfg.ledger_dir / "ledger.jsonl").write_text(json.dumps(
+        {"schema": "validate-ledger/v1", "event_type": "run.result", "event_id": "e0",
+         "run_id": "r-c", "commit": SHA, "outcome": "pass", "legacy_row": other}) + "\n")
+    pair_c = _pair_of(cfg, tmp_path / "d")
+    crossed = [f"r1:{pair_c.split(':', 1)[1]}", f"r-c:{pair_a.split(':', 1)[1]}"]
+    assert _judge(tmp_path / "e", [legacy], dict(legacy), era_entries=crossed) != "qualified"
+
+
+def _era_list_via_cli(tmp_path: Path, cfg: Config, cutoff: str) -> str | None:
+    (tmp_path / "local-ci-hub.toml").write_text(
+        '[project]\nname="toy"\n[ledger]\nteam="toy"\npublish="none"\n'
+        f'location={{path="{cfg.ledger_dir}"}}\n[receipt]\nqualifying=["local-ledger-pass"]\n')
+    import os
+    env = dict(os.environ)
+    args = [sys.executable, str(BIN), "--json", "receipt", "era-list"] + ([cutoff] if cutoff else [])
+    done = subprocess.run(args, cwd=tmp_path, capture_output=True, text=True, timeout=60, env=env)
+    if done.returncode != 0:
+        return None
+    return str(json.loads(done.stdout)["era_records"])
+
+
+
+def test_digest_hex_and_fail_veto_and_era_absent(tmp_path: Path) -> None:
+    bad_digest = dict(_good_v6(), admission_floor_evidence=_floor(plan_sha256s=["z" * 64]))
+    assert _verdict(tmp_path / "a", bad_digest) != "qualified"  # 64 non-hex chars
+    era = {k: v for k, v in _good_v6().items()
+           if k not in ("schema_version", "gates_run", "gates_expected", "coverage",
+                        "admission", "admission_floor_evidence", "tooling_sha",
+                        "producer", "record_id", "log_identity", "cell_results",
+                        "executed_tests", "passed_tests")}
+    assert _verdict(tmp_path / "b", era, era=True) != "qualified"  # no totals at era
+    neg = dict(era, schema_version=-1, executed_tests=10, passed_tests=10)
+    assert _verdict(tmp_path / "c", neg, era=True) != "qualified"  # negative version
+
+
+def test_era_list_time_bound_and_unknown_cutoff(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    (cfg.ledger_dir / "a").mkdir(parents=True)
+    (cfg.ledger_dir / "b").mkdir(parents=True)
+    def _row(run_id: str, finished: str) -> dict[str, object]:
+        return {"schema": "validate-ledger/v1", "event_type": "run.result",
+                "event_id": run_id, "run_id": run_id, "commit": SHA,
+                "outcome": "pass", "finished_at": finished,
+                "legacy_row": {"run_id": run_id, "commit": SHA, "result": "pass",
+                               "commit_anchored": True, "executed_tests": 1,
+                               "passed_tests": 1, "failures": 0, "finished_at": finished}}
+    # Shard a/ holds the LATER record; path order must not decide.
+    (cfg.ledger_dir / "a" / "x.jsonl").write_text(json.dumps(_row("r-late", "2026-11-20T00:00:00Z")) + "\n")
+    (cfg.ledger_dir / "b" / "x.jsonl").write_text(json.dumps(_row("r-early", "2026-11-01T00:00:00Z")) + "\n")
+    entries_rc = _era_list_via_cli(tmp_path, cfg, "r-early")
+    assert entries_rc is not None and "r-early" in entries_rc and "r-late" not in entries_rc
+    assert _era_list_via_cli(tmp_path, cfg, "r-missing") is None  # unknown cutoff refuses
+    assert _era_list_via_cli(tmp_path, cfg, "") is None  # missing cutoff refuses
 
 
 def test_adapter_maps_and_drops(tmp_path: Path) -> None:
