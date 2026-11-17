@@ -348,7 +348,7 @@ def test_run_handles_match_registered_schema() -> None:
     assert schema["title"] == "RunHandle"
     for required in ("schema", "run_id", "commit", "state"):
         assert required in schema["required"]
-    samples = [
+    samples: list[dict[str, object]] = [
         {"schema": "local-ci-hub/run/v1", "run_id": "run-1", "commit": "a" * 40,
          "cell": "", "state": "running"},
         {"schema": "local-ci-hub/run/v1", "run_id": "run-2", "commit": "b" * 40,
@@ -360,7 +360,7 @@ def test_run_handles_match_registered_schema() -> None:
          "cell": "", "state": "finished"},  # legacy spelling stays valid
     ]
     for handle in samples:
-        assert handle["state"] in states and handle.get("cleanup", "none") in cleanups
+        assert str(handle["state"]) in states and str(handle.get("cleanup", "none")) in cleanups
         assert handle["schema"] == "local-ci-hub/run/v1"
 
 
