@@ -80,6 +80,8 @@ export interface OlderWalksDependencies {
   preservingScroll(mutate: () => void): void;
   /** Put `area` at a measured scroll position through the scroll owner (`#1251`). */
   toPosition(area: HTMLElement, top: number): void;
+  /** Bring `element` into view through the scroll owner (`#1251`). */
+  intoView?(element: Element, block: string): void;
   setStatus(text: string): void;
   walkCursorOwed(): boolean;
   loadOlder(signal?: CancelSignal): Promise<void> | null;
@@ -948,11 +950,11 @@ function toggleOutsideHits(): void {
   renderServerSearch();
   if (!outsideShown) return;
   // The reader asked to see them: bring the first quoted hit into view (it
-  // usually stands far above, with this scope's own older card beside it).
+  // usually stands far above, with this scope's own older card beside it),
+  // through the scroll owner (`#1251 scroll-single-owner`).
   for (const row of el("discord-log").children) {
     if (row.getAttribute(SERVER_HIT_MARK) !== "quote") continue;
-    const node = row as HTMLElement;
-    if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "nearest" });
+    if (deps.intoView) deps.intoView(row, "nearest");
     break;
   }
 }

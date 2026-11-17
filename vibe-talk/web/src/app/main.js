@@ -7025,7 +7025,7 @@ const olderWalks = mountOlderWalks({
   jumpToMessageLink, messageBody, markSearchHits, searchParsed, heldMessagesById,
   serverCardNode: (hit) => discordNode(/** @type {any} */ ([hit])),
   keepingCardPlace, walkCursorOwed: timelineView.walkCursorOwed, loadOlder: timelineView.loadOlder,
-  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, preservingScroll, toPosition: (area, top) => scrollKeeping.toPosition(area, top), setStatus,
+  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, preservingScroll, toPosition: (area, top) => scrollKeeping.toPosition(area, top), intoView: (element, block) => scrollKeeping.intoView(element, block), setStatus,
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
