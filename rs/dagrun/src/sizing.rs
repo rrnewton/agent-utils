@@ -25,6 +25,52 @@ fn scaled_between_widths_i64(cap: i64, inner_jobs: i64, baseline_jobs: i64) -> i
     scaled.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
+/// Absolute headroom a LEARNED memory cap keeps above its learned peak, in bytes (#1763).
+pub const MIN_LEARNED_CAP_HEADROOM_BYTES: i64 = 536_870_912;
+
+/// Percentage headroom a learned memory cap keeps above its learned peak (#1763).
+pub const LEARNED_CAP_MARGIN_PCT: i64 = 25;
+
+/// Cap for a step whose memory demand was LEARNED from a recorded peak (#1763):
+/// `peak + max(25% of peak, 512 MiB)`, saturated to i64. Mirrors
+/// `learned_mem_cap_bytes` in the Python edition.
+pub fn learned_mem_cap_bytes(peak_bytes: i64) -> i64 {
+    let peak = peak_bytes.max(0) as i128;
+    let pct = peak * LEARNED_CAP_MARGIN_PCT as i128 / 100;
+    let headroom = pct.max(MIN_LEARNED_CAP_HEADROOM_BYTES as i128);
+    (peak + headroom).min(i64::MAX as i128) as i64
+}
+
+/// What a step's cgroup OOM evidence means for its run verdict (#1763).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapOomVerdict {
+    /// No kernel OOM counter fired.
+    NotOom,
+    /// OOM-killed at a LEARNED cap: owner rule 346 — `no_result`, never a failure.
+    NoResult,
+    /// OOM at an authored hard cap: a genuine failure.
+    Fail,
+}
+
+/// Map cgroup `memory.events` OOM counters to a verdict (#1763). Pure and
+/// deterministic; tests drive it with fake counters. Mirrors
+/// `classify_memory_cap_oom` in the Python edition.
+pub fn classify_memory_cap_oom(
+    oom: i64,
+    oom_kill: i64,
+    oom_group_kill: i64,
+    cap_is_learned: bool,
+) -> CapOomVerdict {
+    if oom.max(oom_kill).max(oom_group_kill) <= 0 {
+        return CapOomVerdict::NotOom;
+    }
+    if cap_is_learned {
+        CapOomVerdict::NoResult
+    } else {
+        CapOomVerdict::Fail
+    }
+}
+
 /// Resolve the inner-cgroup memory cap for a step.
 ///
 /// An explicit hard cap wins. Otherwise the RSS baseline is multiplied by `mem_cap_factor`; a step
@@ -1300,6 +1346,28 @@ mod tests {
         assert!(said.contains("honouring CARGO_BUILD_JOBS=200"), "{said}");
         assert!(said.contains("would have chosen 8"), "{said}");
         assert!(said.contains("can still OOM"), "{said}");
+    }
+
+    #[test]
+    fn learned_mem_cap_bytes_floors_light_peaks() {
+        // #1763: cap = learned peak + max(25%, 512 MiB), mirroring the Python tests.
+        const MIB: i64 = 1024 * 1024;
+        assert_eq!(learned_mem_cap_bytes(55 * MIB), 55 * MIB + 512 * MIB);
+        assert_eq!(learned_mem_cap_bytes(153 * MIB), 153 * MIB + 512 * MIB);
+        assert_eq!(learned_mem_cap_bytes(4 * GIB), 4 * GIB + GIB);
+        assert_eq!(learned_mem_cap_bytes(0), MIN_LEARNED_CAP_HEADROOM_BYTES);
+        assert_eq!(learned_mem_cap_bytes(-1), MIN_LEARNED_CAP_HEADROOM_BYTES);
+        assert_eq!(learned_mem_cap_bytes(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn classify_memory_cap_oom_fake_cgroup_events() {
+        // #1763 / rule 346: OOM at a learned cap is no_result; at a hard cap, fail.
+        assert_eq!(classify_memory_cap_oom(1, 3, 0, true), CapOomVerdict::NoResult);
+        assert_eq!(classify_memory_cap_oom(1, 3, 0, false), CapOomVerdict::Fail);
+        assert_eq!(classify_memory_cap_oom(2, 0, 0, true), CapOomVerdict::NoResult);
+        assert_eq!(classify_memory_cap_oom(0, 0, 0, true), CapOomVerdict::NotOom);
+        assert_eq!(classify_memory_cap_oom(0, 0, 0, false), CapOomVerdict::NotOom);
     }
 
     #[test]

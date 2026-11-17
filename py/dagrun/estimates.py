@@ -28,6 +28,7 @@ from dagrun.model import (
 from dagrun.sizing import (
     _memory_footprint_fits,
     _outer_mem_footprint_bytes,
+    learned_mem_cap_bytes,
     schedulable_peak_mem_bytes,
 )
 
@@ -1073,7 +1074,10 @@ def _resolved_estimate(
             or samples.rss_estimate_bytes > step.hint.rss_baseline_bytes
         )
     ):
-        rss, rss_source = samples.rss_estimate_bytes, "store"
+        # A LEARNED baseline carries the #1763 headroom floor: the store's p90 peak
+        # plus max(25%, 512 MiB). Without it the enforced cap (factor x baseline)
+        # sits a few MiB above a quiet-run peak and OOMs under gate contention.
+        rss, rss_source = learned_mem_cap_bytes(samples.rss_estimate_bytes), "store"
     elif step.hint.rss_baseline_bytes is not None:
         rss, rss_source = step.hint.rss_baseline_bytes, "hint"
     else:

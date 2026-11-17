@@ -297,14 +297,15 @@ def test_store_wins_over_hint_and_feeds_config(tmp_path: Path) -> None:
     assert by_tag["g.heavy"].est_source == "store"
     assert by_tag["g.heavy"].est_duration_s == 8.0
     assert by_tag["g.heavy"].rss_source == "store"
-    assert by_tag["g.heavy"].rss_estimate_bytes == 6000
+    # #1763: a learned baseline is floored at peak + max(25%, 512 MiB).
+    assert by_tag["g.heavy"].rss_estimate_bytes == 6000 + 536_870_912
     assert by_tag["g.solo"].est_source == "hint"
     assert by_tag["g.prep"].rss_source == "none"
     # apply_plan_to_config threads the learned values into the cfg hints (feeds sizing + ordering).
     applied = apply_plan_to_config(cfg, plan)
     heavy = applied.by_tag()["g.heavy"]
     assert heavy.hint.est_duration_s == 8.0
-    assert heavy.hint.rss_baseline_bytes == 6000
+    assert heavy.hint.rss_baseline_bytes == 6000 + 536_870_912
 
 
 def test_authored_rss_is_the_floor_for_ordinary_profile_feedback() -> None:
@@ -333,8 +334,8 @@ def test_authored_rss_is_the_floor_for_ordinary_profile_feedback() -> None:
     high = {"g.variable": StepSamples("g.variable", 1, 3.0, 12_000)}
     high_plan = build_plan(cfg, high)
     assert high_plan.entries[0].rss_source == "store"
-    assert high_plan.entries[0].rss_estimate_bytes == 12_000
-    assert apply_plan_to_config(cfg, high_plan).steps[0].hint.rss_baseline_bytes == 12_000
+    assert high_plan.entries[0].rss_estimate_bytes == 12_000 + 536_870_912
+    assert apply_plan_to_config(cfg, high_plan).steps[0].hint.rss_baseline_bytes == 12_000 + 536_870_912
 
 
 def test_apply_plan_preserves_all_non_hint_step_fields() -> None:
@@ -1045,7 +1046,8 @@ def test_cpa_memory_uses_learned_rss_before_allocating(tmp_path: Path) -> None:
     assert plan.allocation.stop_reason == "infeasible-memory"
     assert plan.allocation.modeled_makespan_s == float("inf")
     assert plan.entries[0].rss_source == "store"
-    assert plan.entries[0].rss_estimate_bytes == 8 * GIB
+    # #1763: learned 8 GiB peak + 25% (which beats the 512 MiB floor) = 10 GiB.
+    assert plan.entries[0].rss_estimate_bytes == 10 * GIB
     assert plan.entries[0].alloc_inner_jobs is None
     assert apply_plan_to_config(cfg, plan) is cfg
 

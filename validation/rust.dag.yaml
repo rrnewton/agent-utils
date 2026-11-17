@@ -179,9 +179,11 @@ steps:
     hint:
       est_duration_s: 5
       classification: light
-      # cargo metadata peaks ~57 MiB on a good run; the learned ~70 MiB cap
-      # OOMs under gate concurrency (#1704). Real headroom, still small.
-      hard_mem_max_bytes: 268435456
+      # cargo metadata peaks ~57 MiB quiet, 153 MiB under gate contention; the
+      # learned ~83 MiB cap OOMs there (#1704, #1763). Hard cap = contended peak
+      # + the 512 MiB learned-cap floor, rounded: 768 MiB. A genuine runaway is
+      # still OOM-killed at this finite cap.
+      hard_mem_max_bytes: 805306368
 
   - group: dagrun
     job: testrun-core-deps
@@ -194,8 +196,8 @@ steps:
     hint:
       est_duration_s: 5
       classification: light
-      # Same cargo-metadata cap problem as dagrun-model-deps above (#1704).
-      hard_mem_max_bytes: 268435456
+      # Same cargo-metadata cap problem as dagrun-model-deps above (#1763).
+      hard_mem_max_bytes: 805306368
 
   - group: herdr-run
     job: test

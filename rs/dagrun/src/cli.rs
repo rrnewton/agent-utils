@@ -4907,18 +4907,27 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let failed = result
         .outcomes
         .iter()
-        .filter(|o| !o.ok && !o.aborted)
+        .filter(|o| !o.ok && !o.aborted && !o.no_result)
         .count();
+    let no_result = result.outcomes.iter().filter(|o| o.no_result).count();
     let aborted = result.outcomes.iter().filter(|o| o.aborted).count();
     let verdict = if !result.ok {
         c.red("FAIL")
+    } else if no_result > 0 {
+        // Learned-cap OOMs produced no result (#1763): not a pass, not a failure.
+        c.yellow("PARTIAL")
     } else if !result.runtime_skips.is_empty() {
         c.yellow("PARTIAL")
     } else {
         c.green("PASS")
     };
+    let no_result_segment = if no_result > 0 {
+        format!("{no_result} no-result, ")
+    } else {
+        String::new()
+    };
     eprintln!(
-        "{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, {} intentionally skipped, {} runtime-skipped, {} dependency-skipped, {} not launched in {:.1}s",
+        "{PROG}: {verdict} - {passed} passed, {failed} failed, {no_result_segment}{aborted} aborted, {} intentionally skipped, {} runtime-skipped, {} dependency-skipped, {} not launched in {:.1}s",
         result.intentional_skips.len(),
         result.runtime_skips.len(),
         result.skipped.len(),

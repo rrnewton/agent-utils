@@ -12,6 +12,7 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from dagrun.model import (
@@ -67,6 +68,70 @@ def _scaled_between_widths_i64(cap: int, inner_jobs: int, baseline_jobs: int) ->
     product = cap * inner_jobs
     scaled = product // baseline_jobs if product >= 0 else -((-product) // baseline_jobs)
     return _clamp_i64(scaled)
+
+
+#: Absolute headroom a LEARNED memory cap keeps above its learned peak, in bytes (#1763).
+#: A light step's 25% alone is a few MiB, while gate contention (parallel cargo children,
+#: page cache charged to the same cgroup) moves its peak by tens of MiB between runs, so
+#: the margin is ``max(25%, 512 MiB)`` — the #818 floor, applied to every learned cap.
+MIN_LEARNED_CAP_HEADROOM_BYTES = 536_870_912
+
+#: Percentage headroom a learned memory cap keeps above its learned peak (#1763).
+LEARNED_CAP_MARGIN_PCT = 25
+
+
+def learned_mem_cap_bytes(peak_bytes: int) -> int:
+    """Cap for a step whose memory demand was LEARNED from a recorded peak (#1763).
+
+    ``peak + max(25% of peak, 512 MiB)``, saturated to the shared i64 domain. A step
+    whose cap is learned is never capped below this value for its learned peak: the
+    percentage covers ordinary variance and the absolute floor covers the contention
+    swing a light cargo-driving step shows under a gate. An authored
+    ``hard_mem_max_bytes`` is an instruction, not a learned cap, and is never routed
+    through here. A non-positive peak still yields the floor alone, so a learned cap
+    is always finite and positive.
+    """
+    peak = max(0, _clamp_i64(peak_bytes))
+    headroom = max((peak * LEARNED_CAP_MARGIN_PCT) // 100, MIN_LEARNED_CAP_HEADROOM_BYTES)
+    return _clamp_i64(peak + headroom)
+
+
+class CapOomVerdict(Enum):
+    """What a step's cgroup OOM evidence means for its run verdict (#1763)."""
+
+    #: No kernel OOM counter fired; the OOM mapping does not apply.
+    NOT_OOM = "not_oom"
+    #: OOM-killed at a LEARNED cap: owner rule 346 — a cap breach under contention is
+    #: ``no_result``, never a failure. The step did not pass; it was not measured.
+    NO_RESULT = "no_result"
+    #: OOM at an authored hard cap (or otherwise not learned): a genuine failure. The
+    #: kernel still stopped the step at its cap; the run reports it red.
+    FAIL = "fail"
+
+
+def classify_memory_cap_oom(
+    memory_events: Mapping[str, int] | None, *, cap_is_learned: bool
+) -> CapOomVerdict:
+    """Map fake-or-real cgroup ``memory.events`` counters to a verdict (#1763).
+
+    Pure and deterministic: no cgroup is read here, so tests drive it with fake event
+    maps. Any positive ``oom``, ``oom_kill`` or ``oom_group_kill`` counter is an OOM
+    (the counters are overlapping facets, so the maximum, never the sum). An OOM at a
+    learned cap is :attr:`CapOomVerdict.NO_RESULT`; an OOM at an authored hard cap is
+    :attr:`CapOomVerdict.FAIL`; no OOM evidence is :attr:`CapOomVerdict.NOT_OOM`
+    regardless of the cap kind, so a plain non-zero exit can never be laundered into
+    ``no_result`` by this mapping.
+    """
+    if not memory_events:
+        return CapOomVerdict.NOT_OOM
+    oom_events = max(
+        int(memory_events.get("oom", 0) or 0),
+        int(memory_events.get("oom_kill", 0) or 0),
+        int(memory_events.get("oom_group_kill", 0) or 0),
+    )
+    if oom_events <= 0:
+        return CapOomVerdict.NOT_OOM
+    return CapOomVerdict.NO_RESULT if cap_is_learned else CapOomVerdict.FAIL
 
 
 def step_mem_cap_bytes(

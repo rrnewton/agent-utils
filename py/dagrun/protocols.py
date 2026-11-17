@@ -329,6 +329,11 @@ class StepOutcome:
     #: True when eager-exit killed this in-flight step after ANOTHER step failed — a
     #: cancellation, reported distinctly from a genuine FAIL.
     aborted: bool = False
+    #: True when the step was OOM-killed at a LEARNED memory cap (#1763, owner rule
+    #: 346): ``no_result``, never a failure. The step did not pass — it was not
+    #: measured — so ``ok`` stays False and dependents stay skipped, but the run is
+    #: not failed by it and the step is reported as NO_RESULT, not FAIL.
+    no_result: bool = False
     #: Count of ``fork``/``clone`` calls the kernel denied at the step's inner ``pids.max``
     #: (the fork-bomb / PID-exhaustion signal), or 0. Carried IN MEMORY only — deliberately NOT
     #: written to the CSV profile store, so the Python/Rust CSV-header differential stays

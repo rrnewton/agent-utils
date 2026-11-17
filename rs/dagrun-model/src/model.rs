@@ -1957,6 +1957,9 @@ pub struct StepOutcome {
     pub reason: String,
     /// True when eager-exit killed this in-flight step after ANOTHER step failed.
     pub aborted: bool,
+    /// True when OOM-killed at a LEARNED memory cap (#1763, owner rule 346):
+    /// `no_result`, never a failure. `ok` stays false; the run is not failed by it.
+    pub no_result: bool,
 }
 
 impl StepOutcome {
@@ -1986,6 +1989,7 @@ impl StepOutcome {
             cpu_timed_out: false,
             reason: String::new(),
             aborted: false,
+            no_result: false,
         }
     }
 
@@ -2043,6 +2047,7 @@ impl StepOutcome {
             cpu_timed_out,
             reason,
             aborted,
+            no_result: false,
         }
     }
 
@@ -2083,6 +2088,7 @@ impl StepOutcome {
                 ABORTED_BY_PEER_FAILURE_REASON.to_string()
             },
             aborted: true,
+            no_result: false,
         }
     }
 }

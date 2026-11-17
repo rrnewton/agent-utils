@@ -86,7 +86,7 @@ from dagrun.protocols import (
     RunWindow,
     StepOutcome,
 )
-from dagrun.sizing import _step_mem_cap_for_inner_jobs
+from dagrun.sizing import CapOomVerdict, _step_mem_cap_for_inner_jobs, classify_memory_cap_oom
 from dagrun.teardown import (
     STEP_NONCE_ENV,
     mint_step_nonce,
@@ -2315,6 +2315,35 @@ class Runner:
                     cpu_timeout_platform=self.cfg.cpu_timeout_platform,
                     detail_write_failure=(),
                 )
+                # Owner rule 346 (#1763): an OOM kill at a LEARNED cap (derived from
+                # a profile/authored RSS baseline, not an authored hard cap) under
+                # contention is no_result, never a failure. No retry: the scheduler
+                # has no per-step retry, and a blind retry under the same contention
+                # would mint the same kill. The profile row above stays ok=False, so
+                # the sample stays censored and the next learned cap rises. An OOM
+                # at an authored hard cap still fails through the normal path.
+                cap_is_learned = not (
+                    step.hint.hard_mem_max_bytes is not None
+                    and step.hint.hard_mem_max_bytes > 0
+                ) and (
+                    step.hint.rss_baseline_bytes is not None
+                    and step.hint.rss_baseline_bytes > 0
+                )
+                if (
+                    classify_memory_cap_oom(memory_events, cap_is_learned=cap_is_learned)
+                    is CapOomVerdict.NO_RESULT
+                ):
+                    outcome = replace(
+                        outcome,
+                        no_result=True,
+                        reason=(
+                            f"NO_RESULT: {outcome.reason} at a learned memory cap "
+                            f"(cap≈{_fmt_bytes(mem_max)}, peak≈{_fmt_bytes(peak)}); "
+                            "a learned-cap breach under contention is not a failure "
+                            "(owner rule 346, #1763) — re-profile so the learned cap "
+                            "rises; the step was not measured and did not pass"
+                        ),
+                    )
             # Artifact-ready contract, judged at producer exit with a
             # final filesystem scan (the poll may not have swept since
             # the signal).
@@ -2344,7 +2373,7 @@ class Runner:
                 # A failed producer invalidates everything released on
                 # its signal, even under keep_going.
                 self._cancel_artifact_dependents(step.tag)
-            if not was_aborted and (not ok or missing_signal_failure):
+            if not was_aborted and (not ok or missing_signal_failure) and not outcome.no_result:
                 # A REAL failure. The run is failed either way; what differs is COVERAGE.
                 #
                 # EAGER-EXIT (default): stop launching NEW steps AND reap every step still running
@@ -2378,6 +2407,8 @@ class Runner:
                 f"[{step.tag}] ⊘ ABORT  {step.desc} "
                 f"({dur}s — eager-exit after another step failed; --keep-going would continue independent work)"
             )
+        elif outcome.no_result:
+            self._emit(f"[{step.tag}] ◌ NO_RESULT   {step.desc} ({dur}s, {outcome.reason})")
         elif outcome.ok:
             extra = f"  [{summary}]" if (summary and self.verbosity >= 1) else ""
             self._emit(f"[{step.tag}] ✓ PASS   {step.desc} ({dur}s){extra}")

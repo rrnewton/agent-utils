@@ -1410,6 +1410,7 @@ fn publish_supervisor_failure(
                 cpu_timed_out: false,
                 reason: reason.clone(),
                 aborted: false,
+                no_result: false,
             },
         );
         // `running` is the supervisor-lifecycle guard as well as an admission count. Keep it set
@@ -4571,7 +4572,7 @@ fn run_step(ctx: StepCtx) {
             .filter(|result| result.is_diagnostic_failure())
             .count()
     });
-    let (abort_cause, reason, outcome_ok) = {
+    let (abort_cause, reason, outcome_ok, outcome_no_result) = {
         let mut sh = lock_shared(&shared);
         retire(&mut sh, &step);
         sh.step_profile_rows.push(row);
@@ -4649,6 +4650,37 @@ fn run_step(ctx: StepCtx) {
         ) {
             outcome.reason = reason;
         }
+        // Owner rule 346 (#1763): an OOM kill at a LEARNED cap (derived from a
+        // profile/authored RSS baseline, not an authored hard cap) is no_result,
+        // never a failure. No retry; the profile row stays ok=false (censored), so
+        // the next learned cap rises. Mirrors the Python scheduler.
+        {
+            let cap_is_learned = !matches!(step.hint.hard_mem_max_bytes, Some(hard) if hard > 0)
+                && matches!(step.hint.rss_baseline_bytes, Some(base) if base > 0);
+            let (ev_oom, ev_kill, ev_group) = match &memory_events {
+                Some(events) => (
+                    events.get("oom").copied().unwrap_or(0),
+                    events.get("oom_kill").copied().unwrap_or(0),
+                    events.get("oom_group_kill").copied().unwrap_or(0),
+                ),
+                None => (0, 0, 0),
+            };
+            if abort_cause.is_none()
+                && crate::sizing::classify_memory_cap_oom(ev_oom, ev_kill, ev_group, cap_is_learned)
+                    == crate::sizing::CapOomVerdict::NoResult
+            {
+                outcome.no_result = true;
+                outcome.reason = format!(
+                    "NO_RESULT: {} at a learned memory cap (cap\u{2248}{}, peak\u{2248}{}); \
+                     a learned-cap breach under contention is not a failure \
+                     (owner rule 346, #1763) \u{2014} re-profile so the learned cap \
+                     rises; the step was not measured and did not pass",
+                    outcome.reason,
+                    fmt_bytes(mem_max),
+                    fmt_bytes(peak)
+                );
+            }
+        }
         outcome.test_results = test_counts.results;
         // Artifact-ready contract, judged at producer exit with a final
         // filesystem scan (the poll may not have swept since the signal).
@@ -4679,6 +4711,7 @@ fn run_step(ctx: StepCtx) {
         }
         let reason = outcome.reason.clone();
         let outcome_ok = outcome.ok;
+        let outcome_no_result = outcome.no_result;
         sh.done.insert(tag.clone(), outcome);
         sh.running.remove(&tag);
         if !was_aborted && !outcome_ok && !step.publishes.is_empty() {
@@ -4687,14 +4720,14 @@ fn run_step(ctx: StepCtx) {
             // and finished dependents keep no credit.
             cancel_artifact_dependents(&mut sh, &cgroups, &tag, &artifact_dependents);
         }
-        if !was_aborted && (!ok || missing_signal_failure) {
+        if !was_aborted && (!ok || missing_signal_failure) && !outcome_no_result {
             // A REAL failure. Eager-exit (default) stops launching NEW steps and reaps every
             // step still running so a fast failure does not wait for a slow in-flight build.
             // keep_going records the failure but leaves scheduling open: independent ready steps
             // continue, while dependency-failure closure skips only true dependents.
             trip_fail_fast(&mut sh, &cgroups, keep_going, &tag);
         }
-        (abort_cause, reason, outcome_ok)
+        (abort_cause, reason, outcome_ok, outcome_no_result)
     };
     let was_aborted = abort_cause.is_some();
     // The terminal verdict follows the published outcome, so a producer
@@ -4718,6 +4751,11 @@ fn run_step(ctx: StepCtx) {
     } else if was_aborted {
         emit(&format!(
             "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} eager-exit after another step failed; --keep-going would continue independent work)",
+            step.desc
+        ));
+    } else if outcome_no_result {
+        emit(&format!(
+            "[{tag}] \u{25cc} NO_RESULT   {} ({dur}s, {reason})",
             step.desc
         ));
     } else if ok {

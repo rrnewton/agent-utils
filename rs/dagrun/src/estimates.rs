@@ -24,7 +24,8 @@ use crate::io::json_str;
 use crate::model::{effective_cpu_count, step_width_is_resizable, DagConfig, ResourceHint, Step};
 use crate::perflog::{container_class, machine_id, parse_csv_records};
 use crate::sizing::{
-    memory_footprint_fits, outer_mem_footprint_bytes, schedulable_peak_mem_bytes_widths,
+    learned_mem_cap_bytes, memory_footprint_fits, outer_mem_footprint_bytes,
+    schedulable_peak_mem_bytes_widths,
 };
 
 /// Environment variable that overrides the machine component of the feedback identity.
@@ -1102,7 +1103,8 @@ fn resolved_estimate(step: &Step, samples: Option<&StepSamples>, min_samples: i6
                 && (step.hint.rss_baseline_bytes.is_none()
                     || s.rss_estimate_bytes > step.hint.rss_baseline_bytes) =>
         {
-            (s.rss_estimate_bytes, "store")
+            // #1763: a learned baseline is floored at peak + max(25%, 512 MiB).
+            (s.rss_estimate_bytes.map(learned_mem_cap_bytes), "store")
         }
         _ if step.hint.rss_baseline_bytes.is_some() => (step.hint.rss_baseline_bytes, "hint"),
         _ => (None, "none"),
@@ -2997,12 +2999,12 @@ mod tests {
             None,
         );
         assert_eq!(high_plan.entries[0].rss_source, "store");
-        assert_eq!(high_plan.entries[0].rss_estimate_bytes, Some(12_000));
+        assert_eq!(high_plan.entries[0].rss_estimate_bytes, Some(12_000 + 536_870_912));
         assert_eq!(
             apply_plan_to_config(&cfg, &high_plan).steps[0]
                 .hint
                 .rss_baseline_bytes,
-            Some(12_000)
+            Some(12_000 + 536_870_912)
         );
     }
 
@@ -4411,7 +4413,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
         assert_eq!(allocation.stop_reason, CPA_INFEASIBLE_MEMORY);
         assert!(allocation.modeled_makespan_s.is_infinite());
         assert_eq!(plan.entries[0].rss_source, "store");
-        assert_eq!(plan.entries[0].rss_estimate_bytes, Some(8 * GIB));
+        assert_eq!(plan.entries[0].rss_estimate_bytes, Some(10 * GIB));
         assert_eq!(plan.entries[0].alloc_inner_jobs, None);
         assert_eq!(
             crate::io::dag_to_json(&apply_plan_to_config(&cfg, &plan)),

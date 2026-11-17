@@ -6,8 +6,12 @@ from unittest.mock import patch
 
 from dagrun.model import ArtifactDep, DagConfig, ResourceHint, Step, StepClass
 from dagrun.sizing import (
+    MIN_LEARNED_CAP_HEADROOM_BYTES,
     PER_BUILD_JOB_MEM_BYTES,
+    CapOomVerdict,
+    classify_memory_cap_oom,
     derive_build_jobs,
+    learned_mem_cap_bytes,
     jobs_footprint_bytes,
     jobs_for_budget,
     parse_size,
@@ -394,6 +398,42 @@ def test_width_one_sizing_skips_closure_on_5000_node_reverse_chain() -> None:
         for index in reversed(range(5000))
     )
     assert schedulable_peak_mem_bytes(DagConfig(steps=steps), 1) == (2, ("wide.s4999",))
+
+
+MIB = 1024**2
+
+
+def test_learned_mem_cap_bytes_floors_light_peaks() -> None:
+    """#1763: cap = learned peak + max(25%, 512 MiB), never below peak + floor."""
+    # The reported gate case: a ~55 MiB quiet peak must not yield an ~83 MiB cap.
+    assert learned_mem_cap_bytes(55 * MIB) == 55 * MIB + 512 * MIB
+    # The contended 153 MiB peak still fits with the full floor above it.
+    assert learned_mem_cap_bytes(153 * MIB) == 153 * MIB + 512 * MIB
+    # Above 2 GiB the 25% term wins over the floor.
+    assert learned_mem_cap_bytes(4 * GIB) == 4 * GIB + GIB
+    # Degenerate peaks stay finite and positive; huge peaks saturate, never wrap.
+    assert learned_mem_cap_bytes(0) == MIN_LEARNED_CAP_HEADROOM_BYTES
+    assert learned_mem_cap_bytes(-1) == MIN_LEARNED_CAP_HEADROOM_BYTES
+    assert learned_mem_cap_bytes(2**62) == 2**62 + 2**60
+    assert learned_mem_cap_bytes(2**63 - 1) == 2**63 - 1
+
+
+def test_classify_memory_cap_oom_fake_cgroup_events() -> None:
+    """#1763 / rule 346: OOM at a learned cap is no_result; at a hard cap, fail."""
+    fake_oom = {"oom": 1, "oom_kill": 3, "oom_group_kill": 0, "max": 7}
+    assert classify_memory_cap_oom(fake_oom, cap_is_learned=True) is CapOomVerdict.NO_RESULT
+    assert classify_memory_cap_oom(fake_oom, cap_is_learned=False) is CapOomVerdict.FAIL
+    # Any single OOM facet suffices (delegated victims record oom without oom_kill).
+    assert (
+        classify_memory_cap_oom({"oom": 2}, cap_is_learned=True) is CapOomVerdict.NO_RESULT
+    )
+    # No OOM evidence never becomes no_result, whatever the cap kind: a plain
+    # non-zero exit cannot be laundered through this mapping.
+    quiet = {"oom": 0, "oom_kill": 0, "oom_group_kill": 0, "max": 0}
+    assert classify_memory_cap_oom(quiet, cap_is_learned=True) is CapOomVerdict.NOT_OOM
+    assert classify_memory_cap_oom(quiet, cap_is_learned=False) is CapOomVerdict.NOT_OOM
+    assert classify_memory_cap_oom(None, cap_is_learned=True) is CapOomVerdict.NOT_OOM
+    assert classify_memory_cap_oom({}, cap_is_learned=True) is CapOomVerdict.NOT_OOM
 
 
 def test_box_mem_budget_is_min_of_readable_signals() -> None:

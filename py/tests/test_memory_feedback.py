@@ -644,10 +644,11 @@ def test_the_derived_baseline_reaches_max_mem_admission(tmp_path: Path) -> None:
     One step, so the modeled worst case is that step's own cap and is independent of this host's
     CPU count. Its six uncensored samples peaked at 21474836480 B under a 107374182400 B cap.
 
-    * Without the flag, the ordinary feedback takes the peak at face value: 21474836480 B, and
-      ``--max-mem`` models a worst case of 26843545600 B.
-    * With it, the censoring-aware estimate adds the #818 margin (peak + max(25%, 512 MiB) =
-      26843545600 B) and the modeled worst case rises to 33554432000 B.
+    * Without the flag, the ordinary feedback floors the learned baseline at the #1763
+      value (peak + max(25%, 512 MiB) = 26843545600 B), so ``--max-mem`` also models a
+      worst case of 33554432000 B.
+    * With it, the censoring-aware estimate derives the same 26843545600 B baseline
+      and the modeled worst case is likewise 33554432000 B.
 
     Both numbers are named literally. A wiring change that applied the estimate AFTER admission
     had already read the config would leave the second equal to the first.
@@ -675,7 +676,7 @@ def test_the_derived_baseline_reaches_max_mem_admission(tmp_path: Path) -> None:
 
     assert off_rc == 0, off_err
     assert on_rc == 0, on_err
-    assert "worst-case 26843545600 bytes" in off_err, off_err
+    assert "worst-case 33554432000 bytes" in off_err, off_err
     assert "rss_baseline_bytes=26843545600" in on_err, on_err
     assert "worst-case 33554432000 bytes" in on_err, on_err
 
@@ -767,7 +768,8 @@ def test_a_proven_floor_reaches_max_mem_admission_even_though_the_step_is_declin
 
     assert off_rc == 0, off_err
     assert on_rc == 0, on_err
-    assert "worst-case 10737418240 bytes" in off_err, off_err
+    # #1763: the ordinary learned baseline is floored (8 GiB + 25% = 10 GiB; x1.25 cap).
+    assert "worst-case 13421772800 bytes" in off_err, off_err
     assert (
         "g.pinned: no estimate; rss_baseline_bytes=34359738368, the proven floor" in on_err
     ), on_err

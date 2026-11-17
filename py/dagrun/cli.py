@@ -4562,17 +4562,22 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         runtime_skips=runtime_skips or None,
     )
     passed = sum(1 for o in result.outcomes if o.ok)
-    failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted)
+    failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted and not o.no_result)
+    no_result = sum(1 for o in result.outcomes if o.no_result)
     aborted = sum(1 for o in result.outcomes if o.aborted)
     if not result.ok:
         verdict = c.red("FAIL")
+    elif no_result:
+        # Learned-cap OOMs produced no result (#1763): not a pass, not a failure.
+        verdict = c.yellow("PARTIAL")
     elif result.runtime_skips:
         # A run with runtime skips is never a plain clean pass (#867).
         verdict = c.yellow("PARTIAL")
     else:
         verdict = c.green("PASS")
     print(
-        f"{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, "
+        f"{PROG}: {verdict} - {passed} passed, {failed} failed, "
+        f"{f'{no_result} no-result, ' if no_result else ''}{aborted} aborted, "
         f"{len(result.intentional_skips)} intentionally skipped, "
         f"{len(result.runtime_skips)} runtime-skipped, "
         f"{len(result.skipped)} dependency-skipped, "
