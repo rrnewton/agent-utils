@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         head = host_limits.sample_headroom()
         handles = eff.state_root / "runs"
         handles.mkdir(parents=True, exist_ok=True)
-        v, y, p = runner.count_live(handles, _time.time())
+        v, y, pending = runner.count_live(handles, _time.time())
         free_bytes, free_components = host_limits.measure_free_bytes(cfg.root)
         gate_g, gate_cap, gate_note = host_limits.count_gate_runs()
         deferred, defer_sources = host_limits.sweep_deferral(_time.time())
@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
             other_handles = sum(1 for _ in other_root.glob("*.json"))
         host_section: dict[str, object] = {
             "limits": eff.as_dict(), "headroom": head.as_dict(),
-            "live": {"v": v, "y": y, "p": p, "cleanup_pending_max": eff.cleanup_pending_max},
+            "live": {"v": v, "y": y, "p": pending, "cleanup_pending_max": eff.cleanup_pending_max},
             "free": {"bytes": free_bytes, "floor": eff.slot_fs_min_free_bytes,
                      "components": free_components},
             "gate": {"g": gate_g, "g_cap": gate_cap, "note": gate_note,

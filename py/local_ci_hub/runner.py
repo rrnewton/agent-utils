@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import fcntl
+from collections.abc import Callable, Mapping
 import json
 import os
 import subprocess
@@ -17,12 +18,12 @@ from .config import Config
 from .ledger import Ledger
 
 
-def _state_root(cfg: Config, environ: dict[str, str] | None = None) -> Path:
+def _state_root(cfg: Config, environ: Mapping[str, str] | None = None) -> Path:
     eff = host_limits.load_effective(reader="run", environ=environ)
     return eff.state_root
 
 
-def _handles(cfg: Config, environ: dict[str, str] | None = None) -> Path:
+def _handles(cfg: Config, environ: Mapping[str, str] | None = None) -> Path:
     d = host_limits.load_effective(reader="run", environ=environ).state_root / "runs"
     d.mkdir(parents=True, exist_ok=True)
     try:
@@ -97,9 +98,11 @@ def count_live(handles: Path, now_ts: float) -> tuple[int, int, int]:
 
 
 def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "",
-          admission_wait_s: float = 0.0, environ: dict[str, str] | None = None,
-          sampler: object = None, free_fn: object = None,
-          now_fn: object = None, event_wait_fn: object = None,
+          admission_wait_s: float = 0.0, environ: Mapping[str, str] | None = None,
+          sampler: Callable[[], host_limits.Headroom] | None = None,
+          free_fn: Callable[[], tuple[int, dict[str, object]]] | None = None,
+          now_fn: Callable[[], float] | None = None,
+          event_wait_fn: Callable[[float], None] | None = None,
           box_events: tuple[str | None, str | None] | None = None,
           wall_breached: bool = False, cpu_breached: bool = False) -> dict[str, object]:
     """Admit and run the validate command, recording its ledger result.
@@ -130,12 +133,12 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "",
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             v, y, p = count_live(handles, float(now()))
-            if callable(sampler):
-                head = sampler()  # type: ignore[operator]
+            if sampler is not None:
+                head = sampler()
             else:
                 head = host_limits.sample_headroom(environ=environ)
-            if callable(free_fn):
-                free_bytes, components = free_fn()  # type: ignore[operator]
+            if free_fn is not None:
+                free_bytes, components = free_fn()
             else:
                 free_bytes, components = host_limits.measure_free_bytes(cfg.root)
             inputs = host_limits.AdmissionInputs(v=v, y=y, p=p, f=int(free_bytes), headroom=head)
@@ -228,8 +231,8 @@ def start(cfg: Config, *, wait: bool = True, commit: str = "", cell: str = "",
     return dict(handle)
 
 
-def sweep(cfg: Config, *, environ: dict[str, str] | None = None,
-          now_ts: float | None = None, quiet_runner: object = None) -> dict[str, object]:
+def sweep(cfg: Config, *, environ: Mapping[str, str] | None = None,
+          now_ts: float | None = None, quiet_runner: Callable[[str], int] | None = None) -> dict[str, object]:
     """Clear cleanup-pending handles, deferring under holds/quiet.
 
     Deletions defer while a measurement hold or host quiet is active
@@ -261,7 +264,7 @@ def sweep(cfg: Config, *, environ: dict[str, str] | None = None,
             "pending": 0, "sources": [], "host_limits_path": str(eff.path)}
 
 
-def list_runs(cfg: Config, environ: dict[str, str] | None = None) -> list[dict[str, object]]:
+def list_runs(cfg: Config, environ: Mapping[str, str] | None = None) -> list[dict[str, object]]:
     """List retained run handles on this machine."""
     out = []
     for h in sorted(_handles(cfg, environ).glob("*.json")):
@@ -273,7 +276,7 @@ def list_runs(cfg: Config, environ: dict[str, str] | None = None) -> list[dict[s
     return out
 
 
-def stop(cfg: Config, run_id: str, environ: dict[str, str] | None = None) -> dict[str, object]:
+def stop(cfg: Config, run_id: str, environ: Mapping[str, str] | None = None) -> dict[str, object]:
     """Stop one running validation by run id."""
     hp = _handles(cfg, environ) / f"{run_id}.json"
     if not hp.exists():

@@ -1,8 +1,8 @@
 """Host-limits file: parsing, live admission sampling and decisions.
 
 One module owns the host-limits file. The parser, sampler and
-effective-value logic live here; nothing under ``scripts/`` parses
-this file. No code in this module writes the host file: a host admin
+effective-value logic live here; no other part of the suite
+parses this file. No code in this module writes the host file: a host admin
 installs one by hand, and readers only ever read it.
 
 The file names host-wide ceilings and floors. A missing file is limp
@@ -22,7 +22,9 @@ import stat as statmod
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from typing import TypeGuard
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -71,11 +73,11 @@ _READER_KEYS = {
 }
 
 
-def _is_int(value: object) -> bool:
+def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def host_limits_path(environ: dict[str, str] | None = None) -> Path:
+def host_limits_path(environ: Mapping[str, str] | None = None) -> Path:
     """The consulted host-limits path; the env hook selects a path only."""
     env = os.environ if environ is None else environ
     raw = env.get(ENV_HOST_LIMITS_CONFIG)
@@ -224,7 +226,7 @@ def load_effective(
     path: Path | None = None,
     *,
     reader: str = "run",
-    environ: dict[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
     mem_total: int | None = None,
     slot_total_bytes: int | None = None,
 ) -> EffectiveLimits:
@@ -240,7 +242,8 @@ def load_effective(
     total = mem_total_bytes() if mem_total is None else mem_total
     builtins = _builtins(total)
     eff = EffectiveLimits(path=consulted, file_present=False)
-    eff.memory_max_bytes = int(builtins["run_scope.memory_max_bytes"])
+    _mem = builtins["run_scope.memory_max_bytes"]
+    eff.memory_max_bytes = _mem if isinstance(_mem, int) else 0
     for key in _KNOWN_KEYS:
         eff.sources[key] = "built-in"
     wanted = _READER_KEYS.get(reader, _KNOWN_KEYS)
@@ -287,14 +290,15 @@ def load_effective(
         return eff
 
     def take_int(key: str, minimum: int) -> None:
-        default = int(builtins[key])  # type: ignore[arg-type]
+        _default = builtins[key]
+        default = _default if isinstance(_default, int) else 0
         if key not in wanted:
             return
         value = flat.get(key)
         if value is None and key not in flat:
             setattr(eff, _attr(key), default)
             return
-        if not _is_int(value) or int(value) < minimum:  # type: ignore[arg-type]
+        if not _is_int(value) or value < minimum:
             eff.warnings.append(
                 f"host-limits key {key} malformed ({value!r}) in {consulted}; "
                 f"built-in {default} applies")
@@ -302,7 +306,7 @@ def load_effective(
             setattr(eff, _attr(key), default)
             eff.sources[key] = "built-in (malformed fallback)"
             return
-        setattr(eff, _attr(key), int(value))  # type: ignore[arg-type]
+        setattr(eff, _attr(key), value)
         eff.sources[key] = "file"
 
     take_int("admission.max_concurrent_validation_runs", 1)
@@ -314,7 +318,7 @@ def load_effective(
     if "admission.slot_fs_min_free_bytes" in wanted:
         value = flat.get("admission.slot_fs_min_free_bytes")
         if value is not None or "admission.slot_fs_min_free_bytes" in flat:
-            if not _is_int(value) or int(value) < 0:  # type: ignore[arg-type]
+            if not _is_int(value) or value < 0:
                 fallback = _stricter_floor(slot_total_bytes)
                 eff.warnings.append(
                     f"host-limits key admission.slot_fs_min_free_bytes malformed "
@@ -325,7 +329,7 @@ def load_effective(
                 eff.slot_fs_min_free_bytes = fallback
                 eff.sources["admission.slot_fs_min_free_bytes"] = "built-in (stricter fallback)"
             else:
-                eff.slot_fs_min_free_bytes = int(value)  # type: ignore[arg-type]
+                eff.slot_fs_min_free_bytes = value
                 eff.sources["admission.slot_fs_min_free_bytes"] = "file"
 
     if "paths.state_root" in wanted:
@@ -372,7 +376,7 @@ def _attr(key: str) -> str:
 def affinity_set() -> set[int]:
     """CPUs this process may run on; the set that gives N."""
     try:
-        cpus = os.sched_getaffinity(0)  # type: ignore[attr-defined]
+        cpus = os.sched_getaffinity(0)
         if cpus:
             return set(cpus)
     except (AttributeError, OSError):
@@ -457,9 +461,9 @@ def sample_headroom(
     snapshots: tuple[str, str] | None = None,
     meminfo_text: str | None = None,
     loadavg_1min: float | None = None,
-    sleep_fn: object = None,
+    sleep_fn: Callable[[float], None] | None = None,
     stat_texts: tuple[str | None, str | None] | None = None,
-    environ: dict[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> Headroom:
     """Sample headroom. Injected snapshots never sleep.
 
@@ -491,7 +495,7 @@ def sample_headroom(
         if texts is None:
             first = _read_text("/proc/stat")
             sleeper = sleep_fn if callable(sleep_fn) else time.sleep
-            sleeper(SAMPLE_WINDOW_S)  # type: ignore[operator]
+            sleeper(SAMPLE_WINDOW_S)
             second = _read_text("/proc/stat")
             texts = (first, second)
         if texts[0] is not None and texts[1] is not None:
@@ -531,7 +535,7 @@ def measure_free_bytes(
     wrkslots_free: int | None = None,
     backing_free: int | None = None,
     qgroup_room: int | None = None,
-    statvfs_fn: object = None,
+    statvfs_fn: Callable[[Path], tuple[int, int] | None] | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Free bytes F on the pre-slot path, with each component.
 
@@ -549,8 +553,8 @@ def measure_free_bytes(
         values.append(wrkslots_free)
     else:
         measured = None
-        if callable(statvfs_fn):
-            measured = statvfs_fn(slot_root)  # type: ignore[operator]
+        if statvfs_fn is not None:
+            measured = statvfs_fn(slot_root)
         elif statvfs_free(slot_root) is not None:
             measured = statvfs_free(slot_root)
         if measured is not None:
@@ -573,7 +577,7 @@ def slot_total_bytes(slot_root: Path) -> int | None:
 
 # ------------------------------------------------------------- gate count
 
-def gate_slots_path(environ: dict[str, str] | None = None) -> Path:
+def gate_slots_path(environ: Mapping[str, str] | None = None) -> Path:
     env = os.environ if environ is None else environ
     raw = env.get("GATE_SLOTS_CONFIG")
     return Path(raw).expanduser() if raw else Path(
@@ -581,7 +585,7 @@ def gate_slots_path(environ: dict[str, str] | None = None) -> Path:
 
 
 def count_gate_runs(
-    environ: dict[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> tuple[int | str, int | None, str]:
     """Live gate runs and cap, read-only. Returns (G, G_cap, note).
 
@@ -594,8 +598,8 @@ def count_gate_runs(
     try:
         raw = tomllib.loads(gate_slots_path(env).read_text(encoding="utf-8"))
         value = raw.get("slots")
-        if _is_int(value) and int(value) >= 1:  # type: ignore[arg-type]
-            cap = int(value)  # type: ignore[arg-type]
+        if _is_int(value) and value >= 1:
+            cap = value
     except Exception:
         cap = None
     raw_dir = env.get("GATE_ADMISSION_DIR")
@@ -674,14 +678,14 @@ def clamp_request(requested: int | None, ceiling: int) -> tuple[int, str]:
 # command it names. No consumer path or tool name appears here; a
 # deployment points the generic keys at its own surface.
 
-def defer_config_path(environ: dict[str, str] | None = None) -> Path:
+def defer_config_path(environ: Mapping[str, str] | None = None) -> Path:
     env = os.environ if environ is None else environ
     raw = env.get("GATE_DEFER_CONFIG")
     return Path(raw).expanduser() if raw else Path(
         "~/.local/etc/agent-utils/gate-defer.toml").expanduser()
 
 
-def defer_settings(environ: dict[str, str] | None = None) -> dict[str, str]:
+def defer_settings(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     """Holds directories and quiet command from the defer file.
 
     An absent file means no deferral signals. The same keys in the
@@ -739,7 +743,7 @@ def _hold_active(declaration: Path, now_ts: float, shared: bool,
         cap_raw = raw.get("max_hold_seconds")
         if not _is_int(cap_raw) and not isinstance(cap_raw, float):
             raise ValueError("max_hold_seconds must be positive")
-        cap = float(cap_raw)  # type: ignore[arg-type]
+        cap = float(cap_raw)
         if isinstance(cap_raw, bool) or cap <= 0:
             raise ValueError("max_hold_seconds must be positive")
         started: _dt.datetime | None = None
@@ -796,7 +800,7 @@ def _hold_active(declaration: Path, now_ts: float, shared: bool,
     return f"hold {declaration.stem} until {expiry:%Y-%m-%dT%H:%M:%SZ}"
 
 
-def hold_blockers(now_ts: float, environ: dict[str, str] | None = None,
+def hold_blockers(now_ts: float, environ: Mapping[str, str] | None = None,
                   settings: dict[str, str] | None = None) -> list[str]:
     """Active measurement-hold blockers on the generic defer surface."""
     cfg = settings if settings is not None else defer_settings(environ)
@@ -816,7 +820,7 @@ def hold_blockers(now_ts: float, environ: dict[str, str] | None = None,
     return blockers
 
 
-def quiet_blocker(command: str, runner_fn: object = None) -> str | None:
+def quiet_blocker(command: str, runner_fn: Callable[[str], int] | None = None) -> str | None:
     """Quiet-command blocker, or None when the host is quiet.
 
     Exit 0 means quiet. Any other exit, or a command that cannot
@@ -824,8 +828,8 @@ def quiet_blocker(command: str, runner_fn: object = None) -> str | None:
     """
     if not command:
         return None
-    if callable(runner_fn):
-        code = runner_fn(command)  # type: ignore[operator]
+    if runner_fn is not None:
+        code = runner_fn(command)
         return None if code == 0 else f"quiet command exited {code}"
     try:
         done = subprocess.run(["/bin/sh", "-c", command],
@@ -835,8 +839,8 @@ def quiet_blocker(command: str, runner_fn: object = None) -> str | None:
     return None if done.returncode == 0 else f"quiet command exited {done.returncode}"
 
 
-def sweep_deferral(now_ts: float, environ: dict[str, str] | None = None,
-                   quiet_runner: object = None) -> tuple[bool, list[str]]:
+def sweep_deferral(now_ts: float, environ: Mapping[str, str] | None = None,
+                   quiet_runner: Callable[[str], int] | None = None) -> tuple[bool, list[str]]:
     """Whether sweep deletions must defer, and the sources saying so."""
     cfg = defer_settings(environ)
     sources = hold_blockers(now_ts, environ, cfg)
@@ -915,13 +919,13 @@ def classify_outcome(*, validator_exit: int, breach: str | None,
 # ------------------------------------------------------------ event wait
 
 def wait_for_admission(
-    decide_fn: object,
+    decide_fn: Callable[[], Decision],
     *,
     bound_s: float,
-    now_fn: object = None,
-    wait_event_fn: object = None,
-    jitter_fn: object = None,
-) -> tuple[object, bool]:
+    now_fn: Callable[[], float] | None = None,
+    wait_event_fn: Callable[[float], None] | None = None,
+    jitter_fn: Callable[[], float] | None = None,
+) -> tuple[Decision, bool]:
     """Wait on events to a caller-set bound; never sleep-poll.
 
     `decide_fn` re-samples and re-decides from scratch on each wake;
@@ -930,30 +934,30 @@ def wait_for_admission(
     bound this is a single attempt. Returns (decision, admitted).
     All clocks and waits are injectable so tests use fake time.
     """
-    now = now_fn if callable(now_fn) else time.monotonic
-    jitter = jitter_fn if callable(jitter_fn) else (
+    now = now_fn if now_fn is not None else time.monotonic
+    jitter = jitter_fn if jitter_fn is not None else (
         lambda: random.uniform(0.0, 0.25))
-    decision = decide_fn()  # type: ignore[operator]
-    if decision.admit or bound_s <= 0:  # type: ignore[attr-defined]
-        return decision, bool(decision.admit)  # type: ignore[attr-defined]
-    deadline = now() + bound_s  # type: ignore[operator]
+    decision = decide_fn()
+    if decision.admit or bound_s <= 0:
+        return decision, bool(decision.admit)
+    deadline = now() + bound_s
     while True:
-        remaining = deadline - now()  # type: ignore[operator]
+        remaining = deadline - now()
         if remaining <= 0:
             return decision, False
-        if callable(wait_event_fn):
-            wait_event_fn(remaining)  # type: ignore[operator]
+        if wait_event_fn is not None:
+            wait_event_fn(remaining)
         else:
             time.sleep(min(remaining, 0.05))
-        pause = jitter()  # type: ignore[operator]
+        pause = jitter()
         if pause > 0:
-            if callable(wait_event_fn):
-                wait_event_fn(pause)  # type: ignore[operator]
+            if wait_event_fn is not None:
+                wait_event_fn(pause)
             else:
                 time.sleep(pause)
-        decision = decide_fn()  # type: ignore[operator]
-        if decision.admit:  # type: ignore[attr-defined]
+        decision = decide_fn()
+        if decision.admit:
             return decision, True
-        if now() >= deadline:  # type: ignore[operator]
+        if now() >= deadline:
             return decision, False
 
