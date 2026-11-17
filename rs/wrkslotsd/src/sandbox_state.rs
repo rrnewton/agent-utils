@@ -474,12 +474,58 @@ fn relative_list(
     Ok(out)
 }
 
+fn host_memory_bytes() -> u128 {
+    // Mirror Python `_host_memory_bytes`: MemTotal, else 0 (a percent
+    // size with unknown memory is over the cap by construction).
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("MemTotal:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u128>()
+                    .ok()
+            })
+        })
+        .map(|kib| kib * 1024)
+        .unwrap_or(0)
+}
+
+fn tmp_size_within_cap(value: &str, host_memory_bytes: u128) -> bool {
+    // Mirror Python `_tmp_size_within_cap`: grammar plus the 64 GiB
+    // cap on both the absolute and percent forms (#1792).
+    let (digits, suffix) = match value.strip_suffix('%') {
+        Some(number) => (number, "%"),
+        None => match value.strip_suffix(['K', 'M', 'G', 'T']) {
+            Some(_) => (&value[..value.len() - 1], &value[value.len() - 1..]),
+            None => (value, ""),
+        },
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(amount) = digits.parse::<u128>() else {
+        return false;
+    };
+    let cap = 64u128 << 30;
+    if suffix == "%" {
+        (1..=100).contains(&amount) && amount * host_memory_bytes / 100 > 0 && amount * host_memory_bytes / 100 <= cap
+    } else {
+        let multiplier = match suffix {
+            "" => 1u128,
+            "K" => 1 << 10,
+            "M" => 1 << 20,
+            "G" => 1 << 30,
+            "T" => 1 << 40,
+            _ => return false,
+        };
+        amount > 0 && amount * multiplier <= cap
+    }
+}
+
 fn tmp_size_ok(value: &str) -> bool {
-    // Python `_TMP_SIZE_RE`: ^(\d+[KMGT]?|\d+%)$
-    let number = value
-        .strip_suffix('%')
-        .unwrap_or_else(|| value.strip_suffix(['K', 'M', 'G', 'T']).unwrap_or(value));
-    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    tmp_size_within_cap(value, host_memory_bytes())
 }
 
 /// Validate a `configuration.sandbox` mapping, mirroring Python
@@ -2063,6 +2109,17 @@ sys.stdout.write("0\n" + json.dumps(sandbox.settings_to_obj(settings), indent=2)
         );
         assert!(limits_from_obj(&json!({"bogus": 1})).is_err());
         assert!(limits_from_obj(&json!({"memory_max": "lots"})).is_err());
+    }
+
+    #[test]
+    fn tmp_size_cap_matches_python() {
+        let host = 128u128 << 30;
+        assert!(tmp_size_within_cap("16G", host));
+        assert!(tmp_size_within_cap("50%", host));
+        assert!(!tmp_size_within_cap("100%", host));
+        assert!(!tmp_size_within_cap("1T", host));
+        assert!(!tmp_size_within_cap("0", host));
+        assert!(settings_from_obj(&json!({"tmp_size": "1T"})).is_err());
     }
 
     #[test]

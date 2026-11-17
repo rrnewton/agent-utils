@@ -440,7 +440,7 @@ def settings_from_obj(raw: Mapping[str, object]) -> SandboxSettings:
     if not isinstance(protect, bool):
         raise SandboxError("configuration.sandbox.protect_system must be true or false")
     tmp_size = raw.get("tmp_size", defaults.tmp_size)
-    if not isinstance(tmp_size, str) or not _TMP_SIZE_RE.match(tmp_size):
+    if not isinstance(tmp_size, str) or not _tmp_size_within_cap(tmp_size):
         raise SandboxError(f"configuration.sandbox.tmp_size must look like 16G or 50%, not {tmp_size!r}")
     scope = raw.get("coordinator_writable", defaults.coordinator_writable)
     if scope not in COORDINATOR_SCOPES:
@@ -1555,12 +1555,20 @@ def _remount_tree_read_only(
                 _remount_read_only_strict(point, flags, strict_roots)
             else:
                 _remount_read_only(point, flags)
-        except MountError as exc:
+        except (MountError, SandboxError) as exc:
+            if strict_fd:
+                # Strict mode refuses every failure except a proven
+                # shadowed mount: the resolved fd names another mount
+                # than the topmost mount-table row for this point.
+                if _is_proven_shadowed_mount(point, strict_roots):
+                    continue
+                failures.append(str(exc))
+                continue
             # EINVAL: the path no longer names that mount's root because a
             # layer above shadows it; unreachable. Other failures (another
             # user's FUSE mount, for example) are harmless when this user
             # could not write there anyway.
-            if exc.errno == _errno.EINVAL or not os.access(point, os.W_OK):
+            if isinstance(exc, MountError) and (exc.errno == _errno.EINVAL or not os.access(point, os.W_OK)):
                 continue
             failures.append(str(exc))
     return failures
@@ -1801,6 +1809,7 @@ _SYS_FSOPEN = 430
 _SYS_FSCONFIG = 431
 _SYS_FSMOUNT = 432
 _SYS_MOUNT_SETATTR = 442
+_SYS_STATX = 332
 _AT_EMPTY_PATH = 0x1000
 _MOVE_MOUNT_T_EMPTY_PATH = 0x40
 _RESOLVE_BENEATH = 0x08
@@ -1810,9 +1819,7 @@ _ATTR_RDONLY = 1
 _ATTR_NOSUID = 2
 _ATTR_NODEV = 4
 _ATTR_NOEXEC = 8
-_ATTR_NOATIME = 0x10
-_ATTR_STRICTATIME = 0x20
-_ATTR_NODIRATIME = 0x80
+
 
 
 def _fd_syscall(number: int, *args: object) -> int:
@@ -1888,39 +1895,134 @@ def _openat2_fd(dfd: int, relative: str) -> int:
         error = ctypes.get_errno()
         if error == 38:  # ENOSYS
             raise SandboxError("root view needs openat2 (unavailable); refusing")
-        raise SandboxError(
+        raise MountError(
             f"root view path component {relative!r} does not resolve without symlinks "
-            f"({os.strerror(error)}); refusing"
+            f"({os.strerror(error)}); refusing",
+            error,
         )
     return int(result)
 
 
-#: Root fds opened before the strict build covers /tmp (#1792): a
-#: scratch root under /tmp is unreachable by name afterwards, but
-#: lookups through its kept fd still cross the mounts built on it.
-#: Filled by `build_view` in strict mode; every fd is O_CLOEXEC, so
-#: leftovers close at exec or process exit.
+#: Trusted-root fds for the strict build (#1792). Every root is opened
+#: once, after the root-path ownership checks, and its owner is verified
+#: with fstat before it is cached. The cache lets later resolutions
+#: start from the verified root instead of reopening it by name. Every
+#: fd is O_CLOEXEC, so leftovers close at exec or process exit.
 _STRICT_ROOT_FDS: dict[str, int] = {}
 
+#: After the strict build mounts its fresh tmpfs, target resolutions
+#: under /tmp start from this fd (the box's tmpfs), not the host /tmp
+#: fd used to pin sources before the cover.
+_STRICT_BOX_TMP_FD: int | None = None
 
-def _resolve_fd(path: str, roots: Sequence[str] = (), *, create: str | None = None) -> int:
+#: Bind and mask identities recorded during the strict build. They let
+#: the final verification compare a target with the fd that was pinned
+#: before the mount, rather than trusting a path name after the build.
+_STRICT_BIND_RECORDS: list[dict[str, object]] = []
+_STRICT_MASK_RECORDS: list[tuple[str, str, int]] = []
+
+
+def _cache_strict_roots(roots: Sequence[str]) -> None:
+    for root in roots:
+        real = os.path.realpath(root)
+        if real in _STRICT_ROOT_FDS or not os.path.isdir(real):
+            continue
+        descriptor = _openat2_strict(real)
+        info = os.fstat(descriptor)
+        # Root-owned roots are trusted; 65534 is how root ownership
+        # appears through a one-id user-namespace map in tests.
+        if info.st_uid not in (os.getuid(), 0, 65534):
+            os.close(descriptor)
+            raise SandboxError(f"trusted root {real!r} is owned by uid {info.st_uid}; refusing")
+        _STRICT_ROOT_FDS[real] = descriptor
+
+
+def _refresh_cached_root(target: str) -> None:
+    cached = _STRICT_ROOT_FDS.pop(target, None)
+    if cached is None:
+        return
+    try:
+        _STRICT_ROOT_FDS[target] = _openat2_strict(target)
+    finally:
+        os.close(cached)
+
+
+def _fd_mount_id(descriptor: int) -> int:
+    import struct
+
+    buffer = ctypes.create_string_buffer(256)
+    _fd_syscall(_SYS_STATX, descriptor, b"", _AT_EMPTY_PATH, 0x1000, ctypes.byref(buffer))
+    return int(struct.unpack_from("Q", buffer, 144)[0])
+
+
+def _create_relative(root_fd: int, relative: str, create: str) -> int:
+    current = root_fd
+    owned = False
+    try:
+        parts = relative.split("/")
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            try:
+                child = _openat2_fd(current, part)
+            except MountError as exc:
+                if exc.errno != _errno.ENOENT:
+                    raise
+                if not last or create == "dir":
+                    os.mkdir(part, 0o755, dir_fd=current)
+                elif create == "file":
+                    created = os.open(
+                        part, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=current
+                    )
+                    os.close(created)
+                else:
+                    raise SandboxError(f"unknown mount-point creation {create!r}; refusing") from exc
+                child = _openat2_fd(current, part)
+            if owned:
+                os.close(current)
+            current = child
+            owned = True
+        return current
+    except BaseException:
+        if owned:
+            os.close(current)
+        raise
+
+
+def _resolve_fd(
+    path: str,
+    roots: Sequence[str] = (),
+    *,
+    create: str | None = None,
+    allow_unrooted: bool = False,
+    target: bool = False,
+) -> int:
     """Resolve `path` once to an O_PATH fd beneath its trusted root.
 
-    The root is the longest of `roots` containing the path (else `/`
-    itself), opened symlink-free and kept only for this resolution;
-    the returned fd is the caller's. A missing leaf is created through
-    its resolved parent fd when `create` is "dir" or "file" (#1792).
+    No trusted root, no resolution (the only unrooted spellings are
+    `/` itself and calls that pass `allow_unrooted` for `/dev/null`,
+    masks, or mount-table points). With `target` set, a path under
+    /tmp resolves through the box's fresh tmpfs once it exists. A
+    missing path is created through its resolved parents when
+    `create` is "dir" or "file" (#1792).
     """
 
     if not os.path.isabs(path):
         raise SandboxError(f"root view path {path!r} is not absolute; refusing")
-    base = "/"
-    for root in sorted((os.path.realpath(item) for item in roots), key=len, reverse=True):
-        if path == root or path.startswith(root + "/"):
-            base = root
-            break
-    cached = _STRICT_ROOT_FDS.get(base)
-    root_fd = os.dup(cached) if cached is not None else _openat2_strict(base)
+    if target and _STRICT_BOX_TMP_FD is not None and (path == "/tmp" or path.startswith("/tmp/")):
+        base = "/tmp"
+        root_fd = os.dup(_STRICT_BOX_TMP_FD)
+    else:
+        base = ""
+        for root in sorted((os.path.realpath(item) for item in roots), key=len, reverse=True):
+            if path == root or path.startswith(root + "/"):
+                base = root
+                break
+        if not base:
+            if path != "/" and not allow_unrooted:
+                raise SandboxError(f"root view path {path!r} is outside every trusted root; refusing")
+            base = "/"
+        cached = _STRICT_ROOT_FDS.get(base)
+        root_fd = os.dup(cached) if cached is not None else _openat2_strict(base)
     try:
         relative = os.path.relpath(path, base)
         if relative == ".":
@@ -1928,23 +2030,10 @@ def _resolve_fd(path: str, roots: Sequence[str] = (), *, create: str | None = No
             return owned
         try:
             return _openat2_fd(root_fd, relative)
-        except SandboxError:
-            if create is None:
+        except MountError as exc:
+            if create is None or exc.errno != _errno.ENOENT:
                 raise
-        parent_relative, leaf = os.path.split(relative)
-        parent_fd = root_fd if parent_relative in ("", ".") else _openat2_fd(root_fd, parent_relative)
-        try:
-            if create == "dir":
-                os.mkdir(leaf, 0o755, dir_fd=parent_fd)
-            elif create == "file":
-                created = os.open(leaf, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=parent_fd)
-                os.close(created)
-            else:
-                raise SandboxError(f"unknown mount-point creation {create!r}; refusing")
-            return _openat2_fd(parent_fd, leaf)
-        finally:
-            if parent_fd != root_fd:
-                os.close(parent_fd)
+        return _create_relative(root_fd, relative, create)
     finally:
         if root_fd >= 0:
             os.close(root_fd)
@@ -1959,33 +2048,34 @@ def _move_mount_fd(tree_fd: int, target_fd: int) -> None:
     _fd_syscall(_SYS_MOVE_MOUNT, tree_fd, b"", target_fd, b"", _MOVE_MOUNT_F_EMPTY_PATH | _MOVE_MOUNT_T_EMPTY_PATH)
 
 
-def _attr_set_from_flags(flags: int) -> int:
-    """Translate preserved MS_* mount flags to mount_setattr attributes."""
-
-    attributes = flags & (_ATTR_RDONLY | _ATTR_NOSUID | _ATTR_NODEV | _ATTR_NOEXEC)
-    if flags & _MS_STRICTATIME:
-        attributes |= _ATTR_STRICTATIME
-    elif flags & _MS_NOATIME:
-        attributes |= _ATTR_NOATIME
-    if flags & _MS_NODIRATIME:
-        attributes |= _ATTR_NODIRATIME
-    return attributes
-
-
-def _mount_setattr_fd(descriptor: int, *, attr_set: int = 0, propagation: int = 0, recursive: bool = False) -> None:
+def _mount_setattr_fd(
+    descriptor: int,
+    *,
+    attr_set: int = 0,
+    attr_clr: int = 0,
+    propagation: int = 0,
+    recursive: bool = False,
+) -> None:
     import struct
 
-    buffer = ctypes.create_string_buffer(struct.pack("QQQQ", attr_set, 0, propagation, 0), 32)
+    buffer = ctypes.create_string_buffer(struct.pack("QQQQ", attr_set, attr_clr, propagation, 0), 32)
     flags = _AT_EMPTY_PATH | (_AT_RECURSIVE if recursive else 0)
     _fd_syscall(_SYS_MOUNT_SETATTR, descriptor, b"", flags, ctypes.byref(buffer), 32)
 
 
-def _bind_resolved_fd(source_fd: int, target_fd: int, *, recursive: bool = True) -> None:
-    """Bind the pinned source fd onto the resolved target fd (#1792)."""
+def _bind_resolved_fd(source_fd: int, target_fd: int, *, recursive: bool = True) -> int:
+    """Bind the pinned source fd onto the resolved target fd (#1792).
+
+    Returns the cloned mount's id, captured from the open_tree fd
+    before the move so the final verification can compare it with
+    the mount that is actually at the target after the build.
+    """
 
     tree = _open_tree_fd(source_fd, recursive=recursive)
     try:
+        mount_id = _fd_mount_id(tree)
         _move_mount_fd(tree, target_fd)
+        return mount_id
     finally:
         os.close(tree)
 
@@ -2009,11 +2099,12 @@ def _mount_ids_by_point() -> dict[str, list[int]]:
 
 
 def _bind_fd_strict(source_fd: int, target: str, roots: Sequence[str] = ()) -> None:
-    is_directory = stat.S_ISDIR(os.fstat(source_fd).st_mode)
+    source_info = os.fstat(source_fd)
+    is_directory = stat.S_ISDIR(source_info.st_mode)
     before = _mount_ids_by_point().get(target, [])
-    target_fd = _resolve_fd(target, roots, create="dir" if is_directory else "file")
+    target_fd = _resolve_fd(target, roots, create="dir" if is_directory else "file", target=True)
     try:
-        _bind_resolved_fd(source_fd, target_fd)
+        mount_id = _bind_resolved_fd(source_fd, target_fd)
     finally:
         os.close(target_fd)
     # The tree we moved was cloned from the pinned source fd, so a
@@ -2022,6 +2113,10 @@ def _bind_fd_strict(source_fd: int, target: str, roots: Sequence[str] = ()) -> N
     # is why this reads the mount table, not the path.
     if not any(identifier not in before for identifier in _mount_ids_by_point().get(target, [])):
         raise SandboxError(f"built view mounts do not match: bind {target} did not land; refusing")
+    _STRICT_BIND_RECORDS.append(
+        {"target": target, "dev": source_info.st_dev, "ino": source_info.st_ino, "mount_id": mount_id}
+    )
+    _refresh_cached_root(target)
 
 
 def _mount_tmpfs_fd(target_fd: int, data: str | None, flags: int) -> None:
@@ -2045,22 +2140,44 @@ def _mount_tmpfs_fd(target_fd: int, data: str | None, flags: int) -> None:
 def _mount_tmpfs_strict(target: str, data: str | None, flags: int, roots: Sequence[str] = ()) -> None:
     """A fresh tmpfs on `target`, created and mounted only through fds."""
 
-    target_fd = _resolve_fd(target, roots)
+    global _STRICT_BOX_TMP_FD
+    # /tmp is the helper's own mount (step 1 of every view), not a
+    # spec-chosen target, so it may resolve from "/" itself.
+    target_fd = _resolve_fd(target, roots, allow_unrooted=target == "/tmp", target=True)
     try:
         _mount_tmpfs_fd(target_fd, data, flags)
     finally:
         os.close(target_fd)
+    if target == "/tmp":
+        # By name, not through the cached host fd: this must name the
+        # tmpfs just mounted, not the covered host /tmp beneath it.
+        _STRICT_BOX_TMP_FD = _openat2_strict("/tmp")
+    _refresh_cached_root(target)
+
+
+def _is_proven_shadowed_mount(point: str, roots: Sequence[str]) -> bool:
+    """The resolved fd names a different mount than the topmost table row."""
+
+    try:
+        descriptor = _resolve_fd(point, roots, allow_unrooted=True, target=True)
+    except (SandboxError, OSError):
+        return False
+    try:
+        identifiers = _mount_ids_by_point().get(point, [])
+        return bool(identifiers and _fd_mount_id(descriptor) != identifiers[-1])
+    except (SandboxError, OSError):
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def _remount_read_only_strict(point: str, flags: int | None, roots: Sequence[str] = ()) -> None:
-    if flags is None:
-        flags = next((value for mount_point, value in reversed(_mounts()) if mount_point == point), 0)
+    # attr_set carries only RDONLY on purpose: naming an atime mode
+    # here makes mount_setattr refuse (EINVAL) on noatime mounts, and
+    # the sweep used to skip that silently, leaving them writable.
+    descriptor = _resolve_fd(point, roots, allow_unrooted=True, target=True)
     try:
-        descriptor = _resolve_fd(point, roots)
-    except SandboxError as exc:
-        raise MountError(str(exc), _errno.EINVAL) from exc
-    try:
-        _mount_setattr_fd(descriptor, attr_set=_attr_set_from_flags(flags) | _ATTR_RDONLY)
+        _mount_setattr_fd(descriptor, attr_set=_ATTR_RDONLY)
     finally:
         os.close(descriptor)
 
@@ -2073,8 +2190,8 @@ def _mount_at_fd_strict(
         return
     if fstype is not None or source is None:
         raise SandboxError(f"root view cannot fd-mount {fstype or source} on {target}; refusing")
-    source_fd = _resolve_fd(source, roots)
-    target_fd = _resolve_fd(target, roots)
+    source_fd = _resolve_fd(source, roots, allow_unrooted=source == "/dev/null")
+    target_fd = _resolve_fd(target, roots, target=True)
     try:
         _bind_resolved_fd(source_fd, target_fd, recursive=False)
     finally:
@@ -2082,29 +2199,81 @@ def _mount_at_fd_strict(
         os.close(target_fd)
 
 
-def _mask_strict(path: str, roots: Sequence[str] = ()) -> None:
-    """Mask by resolved fd in root mode: no realpath, no name mount."""
+def _mask_strict(path: str, roots: Sequence[str] = ()) -> tuple[str, str, int] | None:
+    """Mask by resolved fd in root mode: no realpath, no name mount.
 
-    if not os.path.lexists(path):
-        return
-    descriptor = _resolve_fd(path, roots)
+    Resolution comes first: only an ENOENT from openat2 skips (the
+    path is genuinely absent); a symlink or any other failure
+    refuses. Returns the mask record the final confirmation checks,
+    or None when skipped.
+    """
+
     try:
-        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        descriptor = _resolve_fd(path, roots, allow_unrooted=True, target=True)
+    except MountError as exc:
+        if exc.errno == _errno.ENOENT:
+            return None
+        raise
+    is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+    try:
+        if is_directory:
             _mount_tmpfs_fd(
                 descriptor,
                 f"mode=0700,uid={os.getuid()},gid={os.getgid()},size=4k",
                 _MS_NOSUID | _MS_NODEV | _MS_NOEXEC | _MS_RDONLY,
             )
         else:
-            source_fd = _resolve_fd("/dev/null", roots)
+            source_fd = _resolve_fd("/dev/null", roots, allow_unrooted=True)
             try:
                 _bind_resolved_fd(source_fd, descriptor, recursive=False)
             finally:
                 os.close(source_fd)
     finally:
         os.close(descriptor)
-    if not stat.S_ISDIR(os.stat(path).st_mode):
+    if not is_directory:
         _remount_read_only_strict(path, None, roots)
+    confirm_fd = _resolve_fd(path, roots, allow_unrooted=True, target=True)
+    try:
+        return (path, "directory" if is_directory else "file", _fd_mount_id(confirm_fd))
+    finally:
+        os.close(confirm_fd)
+
+
+def _mount_fstype(point: str) -> str:
+    """Filesystem type of the topmost mount at `point`, from mountinfo."""
+
+    fstype = ""
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        before, separator, after = line.partition(" - ")
+        fields = before.split()
+        if separator and len(fields) >= 5 and _unescape(fields[4]) == point:
+            parts = after.split()
+            if parts:
+                fstype = parts[0]
+    return fstype
+
+
+def _confirm_strict_masks(records: Sequence[tuple[str, str, int]], roots: Sequence[str] = ()) -> None:
+    """Every recorded mask is still the mount that was made for it."""
+
+    null_info = os.stat("/dev/null")
+    for path, kind, mount_id in records:
+        descriptor = _resolve_fd(path, roots, allow_unrooted=True, target=True)
+        try:
+            if _fd_mount_id(descriptor) != mount_id:
+                raise SandboxError(f"mask {path} is not the mount made for it; refusing")
+            info = os.fstat(descriptor)
+            if kind == "file":
+                if not stat.S_ISCHR(info.st_mode) or info.st_rdev != null_info.st_rdev:
+                    raise SandboxError(f"mask {path} is not the /dev/null cover made for it; refusing")
+            elif _mount_fstype(point=path) != "tmpfs":
+                raise SandboxError(f"mask {path} is not the tmpfs cover made for it; refusing")
+        finally:
+            os.close(descriptor)
 
 
 def _bind_dispatch(descriptor: int, target: str, strict_fd: bool, roots: Sequence[str]) -> None:
@@ -2129,11 +2298,13 @@ def _mount_at_dispatch(
         _mount_at_fd(source, target, fstype, flags, data)
 
 
-def _mask_dispatch(path: str, strict_fd: bool, roots: Sequence[str]) -> None:
+def _mask_dispatch(
+    path: str, strict_fd: bool, roots: Sequence[str]
+) -> tuple[str, str, int] | None:
     if strict_fd:
-        _mask_strict(path, roots)
-    else:
-        _mask(path)
+        return _mask_strict(path, roots)
+    _mask(path)
+    return None
 
 
 def _remount_read_only_dispatch(point: str, strict_fd: bool, roots: Sequence[str]) -> None:
@@ -2305,11 +2476,10 @@ def build_view(spec: Mapping[str, object], *, strict_fd: bool = False, strict_ro
     # sees image slots mounted after it started) while nothing mounted in the
     # box ever reaches the host. Without roots to propagate, everything is private.
     if strict_fd:
+        _STRICT_BIND_RECORDS.clear()
+        _STRICT_MASK_RECORDS.clear()
         _require_fd_mount_syscalls()
-        for root in strict_roots:
-            real = os.path.realpath(root)
-            if (real == "/tmp" or real.startswith("/tmp/")) and real not in _STRICT_ROOT_FDS and os.path.isdir(real):
-                _STRICT_ROOT_FDS[real] = _openat2_strict(real)
+        _cache_strict_roots(strict_roots)
         slash_fd = _resolve_fd("/", strict_roots)
         try:
             _mount_setattr_fd(
@@ -2416,7 +2586,9 @@ def build_view(spec: Mapping[str, object], *, strict_fd: bool = False, strict_ro
         elif path == spec.get("eden_backing"):
             _mask_eden_backing(path)
         else:
-            _mask_dispatch(path, strict_fd, strict_roots)
+            mask_record = _mask_dispatch(path, strict_fd, strict_roots)
+            if mask_record is not None:
+                _STRICT_MASK_RECORDS.append(mask_record)
     if sorted(path for path, _outcome in git_config_outcomes) != sorted(git_config_masks):
         raise SandboxError("git-config-policy isolated: a policy path is missing from the view's masks")
     if mode == "hidden":
@@ -2446,6 +2618,8 @@ def build_view(spec: Mapping[str, object], *, strict_fd: bool = False, strict_ro
         _limit_propagation(propagate, strict_fd=strict_fd, strict_roots=strict_roots)
     if git_config_masks:
         _confirm_git_config_masks(git_config_outcomes)
+    if strict_fd:
+        _confirm_strict_masks(_STRICT_MASK_RECORDS, strict_roots)
     for descriptor in pinned.values():
         os.close(descriptor)
     os.chdir(str(spec.get("cwd", "/")))
@@ -2472,7 +2646,7 @@ def _limit_propagation(roots: Sequence[str], *, strict_fd: bool = False, strict_
             continue
         try:
             if strict_fd:
-                descriptor = _resolve_fd(point, strict_roots)
+                descriptor = _resolve_fd(point, strict_roots, allow_unrooted=True, target=True)
                 try:
                     _mount_setattr_fd(descriptor, propagation=_MS_PRIVATE)
                 finally:
@@ -2480,6 +2654,8 @@ def _limit_propagation(roots: Sequence[str], *, strict_fd: bool = False, strict_
             else:
                 _mount(None, point, None, _MS_PRIVATE)
         except (MountError, SandboxError):
+            if strict_fd:
+                raise
             continue  # shadowed by a mount above it: unreachable
 
 
@@ -2586,47 +2762,61 @@ def _set_capabilities_split(
     _check(_libc().capset(ctypes.byref(header), data), "capset")
 
 
-def _verify_mount_points(view: Mapping[str, object]) -> None:
+def _verify_mount_points(
+    view: Mapping[str, object],
+    *,
+    records: Sequence[Mapping[str, object]] | None = None,
+    roots: Sequence[str] = (),
+) -> None:
     """The built view's mounts are where they should be (#1792).
 
-    Topmost mount per point wins. Every bind point (unless a mask
-    covers it, since masks win by design) must show its source itself
-    (device+inode, since mount-table device strings and a file's
-    ``st_dev`` disagree on btrfs), so a bind that landed somewhere
-    else refuses before exec. The home point and ``/tmp`` need only
-    be mounts: layered covers legitimately change what they show.
+    When bind records are present (the strict root build), each
+    target is re-resolved with openat2 and compared with the
+    identity recorded before its mount: the pinned source fd's
+    device+inode and the open_tree fd's mount id. Comparing a source
+    and target by name after the build proves nothing (most binds
+    are path onto itself), so names are never compared here. A
+    masked target is skipped (masks win by design and are confirmed
+    separately). Without records, this falls back to checking that
+    the expected points are mounts at all.
     """
 
+    bind_records = _STRICT_BIND_RECORDS if records is None else records
+    if bind_records:
+        masks = view.get("masks", [])
+        masked = {str(item) for item in masks} if isinstance(masks, list) else set()
+        latest: dict[str, Mapping[str, object]] = {}
+        for record in bind_records:
+            latest[str(record["target"])] = record
+        for target, record in latest.items():
+            if target in masked:
+                continue
+            descriptor = _resolve_fd(target, roots, target=True)
+            try:
+                landed = os.fstat(descriptor)
+                if (landed.st_dev, landed.st_ino) != (record["dev"], record["ino"]):
+                    raise SandboxError(
+                        f"built view mounts do not match: bind {target} does not show its pinned source; refusing"
+                    )
+                if _fd_mount_id(descriptor) != record["mount_id"]:
+                    raise SandboxError(
+                        f"built view mounts do not match: bind {target} is not its recorded mount; refusing"
+                    )
+            finally:
+                os.close(descriptor)
+        return
     topmost: dict[str, str] = {}
     for device, _root, point in _mount_rows():
         topmost[str(point)] = device
     expected = {"/tmp", str(view["home"])}
-    masks = view.get("masks", [])
-    masked = {str(item) for item in masks} if isinstance(masks, list) else set()
     raw_binds = view.get("binds", [])
-    wrong: list[str] = []
     if isinstance(raw_binds, list):
         for pair in raw_binds:
             if isinstance(pair, list) and len(pair) == 2:
-                source, target = str(pair[0]), str(pair[1])
-                expected.add(target)
-                if target in masked or target in ("/tmp", str(view["home"])):
-                    continue
-                if target not in topmost:
-                    continue  # reported as missing below
-                try:
-                    landed = os.stat(target)
-                    origin = os.stat(source)
-                except OSError:
-                    # Covered by a later mount (a scratch root under
-                    # /tmp): its landing was proven at bind time.
-                    continue
-                if (landed.st_dev, landed.st_ino) != (origin.st_dev, origin.st_ino):
-                    wrong.append(f"{target} does not show its source")
+                expected.add(str(pair[1]))
     missing = sorted(point for point in expected if point not in topmost)
-    if missing or wrong:
-        details = "; ".join([*(f"missing {missing}" if missing else []), *wrong])
-        raise SandboxError(f"built view mounts do not match: {details}; refusing")
+    if missing:
+        raise SandboxError(f"built view mounts do not match: missing {missing}; refusing")
 
 
 def _prctl(option: int, value: int) -> None:
@@ -2740,6 +2930,26 @@ def _host_memory_bytes() -> int:
         return 0
 
 
+def _tmp_size_within_cap(value: object, host_memory_bytes: int | None = None) -> bool:
+    """The tmp_size grammar plus the shared 64 GiB cap (#1792).
+
+    One owner for the settings model, the root schema, and (mirrored)
+    the Rust config validation: an absolute size with an optional
+    K/M/G/T suffix, or "N%" (1-100) of host memory; both forms must
+    land at or below 64 GiB.
+    """
+
+    match = _TMP_SIZE.fullmatch(str(value)) if isinstance(value, (str, int)) and not isinstance(value, bool) else None
+    if match is None:
+        return False
+    amount, suffix = int(match.group(1)), match.group(2)
+    if suffix == "%":
+        memory = _host_memory_bytes() if host_memory_bytes is None else host_memory_bytes
+        return 1 <= amount <= 100 and 0 < amount * memory // 100 <= 64 * (1 << 30)
+    multiplier = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    return 0 < amount * multiplier[suffix] <= 64 * (1 << 30)
+
+
 def _check_root_schema(
     document: Mapping[str, object], *, host_memory_bytes: int | None = None
 ) -> dict[str, object]:
@@ -2782,21 +2992,7 @@ def _check_root_schema(
         if key in view and view[key] is not None and not isinstance(view[key], str):
             raise SandboxError(f"root view {key} must be a string or null; refusing")
     tmp_size = view.get("tmp_size", DEFAULT_TMP_SIZE)
-    match = _TMP_SIZE.fullmatch(str(tmp_size)) if isinstance(tmp_size, (str, int)) else None
-    # Same grammar as the settings model: an absolute size with an
-    # optional K/M/G/T suffix, or "N%" (1-100) of host memory. Both
-    # forms are capped at 64 GiB (#1792): the percent form is computed
-    # against host memory, so "100%" of a large host cannot bypass it.
-    valid = False
-    if match is not None:
-        value, suffix = int(match.group(1)), match.group(2)
-        if suffix == "%":
-            memory = _host_memory_bytes() if host_memory_bytes is None else host_memory_bytes
-            valid = 1 <= value <= 100 and 0 < value * memory // 100 <= 64 * (1 << 30)
-        else:
-            multiplier = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
-            valid = 0 < value * multiplier[suffix] <= 64 * (1 << 30)
-    if not valid:
+    if not _tmp_size_within_cap(tmp_size, host_memory_bytes):
         raise SandboxError(f"root view tmp_size {tmp_size!r} is invalid; refusing")
     return view
 
@@ -3005,7 +3201,10 @@ def _openat2_strict(path: str) -> int:
         error = ctypes.get_errno()
         if error == 38:  # ENOSYS
             raise SandboxError("root launch needs openat2 (unavailable); refusing")
-        raise SandboxError(f"root view path {path!r} does not resolve without symlinks ({os.strerror(error)}); refusing")
+        raise MountError(
+            f"root view path {path!r} does not resolve without symlinks ({os.strerror(error)}); refusing",
+            error,
+        )
     return int(result)
 
 
@@ -3162,9 +3361,13 @@ def _remount_nosuid_nodev(target: str, *, strict_fd: bool = False, strict_roots:
     if "noexec" in options:
         flags |= _MS_NOEXEC
     if strict_fd:
-        descriptor = _resolve_fd(target, strict_roots)
+        descriptor = _resolve_fd(target, strict_roots, target=True)
         try:
-            _mount_setattr_fd(descriptor, attr_set=_attr_set_from_flags(flags))
+            # Only NOSUID|NODEV, recursively: naming other attributes
+            # (an atime mode above all) can make mount_setattr refuse.
+            _mount_setattr_fd(
+                descriptor, attr_set=_ATTR_NOSUID | _ATTR_NODEV, recursive=True
+            )
         finally:
             os.close(descriptor)
     else:
@@ -3258,7 +3461,7 @@ def enter_root() -> None:
     _set_capabilities([_CAP_SYS_ADMIN])
     try:
         build_view(view, strict_fd=True, strict_roots=checked_roots)
-        _verify_mount_points(view)
+        _verify_mount_points(view, records=_STRICT_BIND_RECORDS, roots=checked_roots)
         raw_binds = view.get("binds", [])
         if isinstance(raw_binds, list):
             for pair in raw_binds:

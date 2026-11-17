@@ -8,6 +8,7 @@ roots only, resolve-strict paths, spec policy refused, the seal.
 import inspect
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -193,27 +194,61 @@ def test_root_schema_type_checks_every_view_value(tmp_path: Path) -> None:
             sandbox._check_root_schema({**document, "view": {**view, key: bad}})
 
 
-def test_verify_mount_points_checks_the_source_device(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # I2: a bind whose point shows some other inode refuses, even
-    # though something is mounted at its point.
-    source = tmp_path / "source"
-    other = tmp_path / "other"
-    source.mkdir()
-    other.mkdir()
-    view: dict[str, object] = {
-        "home": str(tmp_path),
-        "binds": [[str(source), str(other)]],
-        "masks": [],
-    }
-    rows = [("1:1", "/", tmp_path), ("2:2", "/", other), ("3:3", "/", Path("/tmp"))]
-    monkeypatch.setattr(sandbox, "_mount_rows", lambda: rows)
-    with pytest.raises(sandbox.SandboxError, match="do not match"):
-        sandbox._verify_mount_points(view)
-    view["binds"] = [[str(source), str(source)]]  # its own point shows it
-    rows.append(("2:2", "/", source))
-    sandbox._verify_mount_points(view)
+def test_strict_verification_uses_pinned_bind_records(tmp_path: Path) -> None:
+    # Review finding 3: verification compares the post-build target fd
+    # with the identity recorded from the pinned source/open_tree fds,
+    # including when source and target are different paths.
+    import subprocess
+    import sys
+
+    py = str(Path(__file__).resolve().parents[2])
+    script = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import sandbox
+base = sys.argv[2]
+uid, gid = os.getuid(), os.getgid()
+sandbox._check(sandbox._libc().unshare(sandbox._CLONE_NEWUSER | sandbox._CLONE_NEWNS), "unshare")
+sandbox._write("/proc/self/setgroups", "deny")
+sandbox._write("/proc/self/uid_map", f"{uid} {uid} 1\n")
+sandbox._write("/proc/self/gid_map", f"{gid} {gid} 1\n")
+source = os.path.join(base, "source")
+target = os.path.join(base, "target")
+other = os.path.join(base, "other")
+os.makedirs(source); os.makedirs(target); os.makedirs(other)
+fd = sandbox._resolve_fd(source, [base])
+sandbox._bind_fd_strict(fd, target, [base])
+os.close(fd)
+record = sandbox._STRICT_BIND_RECORDS[-1]
+assert record["target"] == target
+sandbox._verify_mount_points({}, records=sandbox._STRICT_BIND_RECORDS, roots=[base])
+bad = dict(record, ino=record["ino"] + 1)
+try:
+    sandbox._verify_mount_points({}, records=[bad], roots=[base])
+except sandbox.SandboxError:
+    pass
+else:
+    raise AssertionError("a record for another inode was accepted")
+wrong_target = dict(record, target=other)
+try:
+    sandbox._verify_mount_points({}, records=[wrong_target], roots=[base])
+except sandbox.SandboxError:
+    pass
+else:
+    raise AssertionError("a bind record was accepted at another target")
+print("VERIFY-RECORDS-OK")
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script, py, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if completed.returncode != 0 and "unshare" in completed.stderr:
+        pytest.skip("user namespaces unavailable on this host")
+    assert completed.returncode == 0, completed.stderr
+    assert "VERIFY-RECORDS-OK" in completed.stdout
 
 
 def test_resolve_fd_stays_beneath_its_root(tmp_path: Path) -> None:
@@ -230,6 +265,32 @@ def test_resolve_fd_stays_beneath_its_root(tmp_path: Path) -> None:
     created = sandbox._resolve_fd(str(tmp_path / "made"), [str(tmp_path)], create="dir")
     os.close(created)
     assert (tmp_path / "made").is_dir()
+
+
+def test_resolve_fd_refuses_paths_outside_trusted_roots(tmp_path: Path) -> None:
+    with pytest.raises(sandbox.SandboxError, match="trusted root"):
+        sandbox._resolve_fd("/etc/passwd", [str(tmp_path)])
+
+
+def test_config_tmp_size_is_capped() -> None:
+    with pytest.raises(sandbox.SandboxError, match="tmp_size"):
+        sandbox.settings_from_obj({"tmp_size": "1T"})
+    with pytest.raises(sandbox.SandboxError, match="tmp_size"):
+        sandbox.settings_from_obj({"tmp_size": "0"})
+
+
+def test_strict_limit_propagation_refuses_resolution_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    point = str(tmp_path)
+    monkeypatch.setattr(sandbox, "_mounts", lambda: [(point, 0)])
+
+    def missing(point: str, roots: object, **kwargs: object) -> int:
+        raise sandbox.SandboxError("cannot resolve; refusing")
+
+    monkeypatch.setattr(sandbox, "_resolve_fd", missing)
+    with pytest.raises(sandbox.SandboxError, match="cannot resolve"):
+        sandbox._limit_propagation([], strict_fd=True, strict_roots=[point])
 
 
 def test_fd_mounts_survive_source_and_target_swaps(tmp_path: Path) -> None:
@@ -331,7 +392,7 @@ assert not os.path.exists(ssh) or os.listdir(ssh) == []
 assert os.listdir("/tmp") == []
 with open("/tmp/probe", "w", encoding="utf-8") as handle:
     handle.write("x")
-sandbox._verify_mount_points({**spec, "home": home})
+sandbox._verify_mount_points({**spec, "home": home}, roots=[base])
 print("STRICT-VIEW-OK")
 '''
     # Scratch under /var/tmp, not /tmp: the built view covers /tmp.
@@ -355,6 +416,156 @@ print("STRICT-VIEW-OK")
         pytest.skip("user namespaces unavailable on this host")
     assert completed.returncode == 0, completed.stderr
     assert "STRICT-VIEW-OK" in completed.stdout
+
+
+def _userns_completed(script: str, py: str, *args: str) -> subprocess.CompletedProcess[str]:
+    import subprocess
+    import sys
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, py, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if completed.returncode != 0 and "unshare" in completed.stderr:
+        pytest.skip("user namespaces unavailable on this host")
+    return completed
+
+
+def test_strict_noatime_remount_and_recursive_nosuid_in_a_user_namespace(tmp_path: Path) -> None:
+    py = str(Path(__file__).resolve().parents[2])
+    script = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import sandbox as s
+base = sys.argv[2]
+uid, gid = os.getuid(), os.getgid()
+s._check(s._libc().unshare(s._CLONE_NEWUSER | s._CLONE_NEWNS), "unshare")
+s._write("/proc/self/setgroups", "deny")
+s._write("/proc/self/uid_map", f"{uid} {uid} 1\n")
+s._write("/proc/self/gid_map", f"{gid} {gid} 1\n")
+point = os.path.join(base, "noatime")
+os.makedirs(point)
+s._mount("tmpfs", point, "tmpfs", s._MS_NOATIME, "size=1m")
+flags = next(value for candidate, value in reversed(s._mounts()) if candidate == point)
+failures = s._remount_tree_read_only(point, strict_fd=True, strict_roots=[base])
+assert failures == [], failures
+try:
+    open(os.path.join(point, "still-writable"), "w", encoding="utf-8").write("x")
+except OSError:
+    pass
+else:
+    raise AssertionError("a noatime mount stayed writable after the strict sweep")
+
+source = os.path.join(base, "tree")
+child = os.path.join(source, "child")
+other = os.path.join(base, "other")
+mountpoint = os.path.join(base, "mountpoint")
+os.makedirs(child); os.makedirs(other); os.makedirs(mountpoint)
+s._mount(source, mountpoint, None, s._MS_BIND)
+source = mountpoint
+child = os.path.join(source, "child")
+s._mount(other, child, None, s._MS_BIND)
+s._remount_nosuid_nodev(source, strict_fd=True, strict_roots=[base])
+rows = {}
+for line in open("/proc/self/mountinfo", encoding="utf-8"):
+    fields = line.split(" - ", 1)[0].split()
+    rows.setdefault(fields[4], []).append(fields[5])
+assert "nosuid" in rows[source][-1] and "nosuid" in rows[child][-1], rows
+print("NOATIME-NOSUID-OK")
+'''
+    completed = _userns_completed(script, py, str(tmp_path))
+    assert completed.returncode == 0, completed.stderr
+    assert "NOATIME-NOSUID-OK" in completed.stdout
+
+
+def test_strict_build_binds_under_box_tmp_and_confirms_masks(tmp_path: Path) -> None:
+    import shutil
+    import tempfile
+
+    py = str(Path(__file__).resolve().parents[2])
+    script = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import sandbox
+base, gate = sys.argv[2], sys.argv[3]
+uid, gid = os.getuid(), os.getgid()
+sandbox._check(sandbox._libc().unshare(sandbox._CLONE_NEWUSER | sandbox._CLONE_NEWNS), "unshare")
+sandbox._write("/proc/self/setgroups", "deny")
+sandbox._write("/proc/self/uid_map", f"{uid} {uid} 1\n")
+sandbox._write("/proc/self/gid_map", f"{gid} {gid} 1\n")
+spec = {
+    "home": os.path.join(base, "home"), "home_layer": os.path.join(base, "layer"),
+    "home_mode": "ro", "home_aliases": [], "home_binds": [], "read_only": [],
+    "binds": [[gate, gate], [os.path.join(base, "slot"), os.path.join(base, "slot")]],
+    "masks": [os.path.join(base, "secret-dir"), os.path.join(base, "secret-file")],
+    "tmp_size": "64M", "protect_system": False, "propagate": [], "cwd": base,
+}
+sandbox.build_view(spec, strict_fd=True, strict_roots=[base, "/tmp"])
+assert open(os.path.join(gate, "queue"), encoding="utf-8").read() == "queued"
+assert os.listdir(os.path.join(base, "secret-dir")) == []
+assert open(os.path.join(base, "secret-file"), encoding="utf-8").read() == ""
+print("TMP-MASKS-OK")
+'''
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    (gate / "queue").write_text("queued", encoding="utf-8")
+    base = Path(tempfile.mkdtemp(prefix="wrkslots-strict-", dir="/var/tmp"))
+    try:
+        (base / "home").mkdir()
+        (base / "layer").mkdir()
+        (base / "slot").mkdir()
+        (base / "secret-dir").mkdir()
+        (base / "secret-dir" / "secret").write_text("hidden", encoding="utf-8")
+        (base / "secret-file").write_text("hidden", encoding="utf-8")
+        completed = _userns_completed(script, py, str(base), str(gate))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "TMP-MASKS-OK" in completed.stdout
+
+
+def test_strict_mask_symlink_is_refused() -> None:
+    import shutil
+    import tempfile
+
+    py = str(Path(__file__).resolve().parents[2])
+    script = r'''
+import os, sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import sandbox
+base = sys.argv[2]
+uid, gid = os.getuid(), os.getgid()
+sandbox._check(sandbox._libc().unshare(sandbox._CLONE_NEWUSER | sandbox._CLONE_NEWNS), "unshare")
+sandbox._write("/proc/self/setgroups", "deny")
+sandbox._write("/proc/self/uid_map", f"{uid} {uid} 1\n")
+sandbox._write("/proc/self/gid_map", f"{gid} {gid} 1\n")
+spec = {
+    "home": os.path.join(base, "home"), "home_layer": os.path.join(base, "layer"),
+    "home_mode": "ro", "home_aliases": [], "home_binds": [], "read_only": [],
+    "binds": [], "masks": [os.path.join(base, "link")], "tmp_size": "64M",
+    "protect_system": False, "propagate": [], "cwd": base,
+}
+try:
+    sandbox.build_view(spec, strict_fd=True, strict_roots=[base])
+except sandbox.SandboxError:
+    print("MASK-SYMLINK-REFUSED")
+else:
+    raise AssertionError("a symlinked mask was resolved and mounted")
+'''
+    base = Path(tempfile.mkdtemp(prefix="wrkslots-strict-", dir="/var/tmp"))
+    try:
+        (base / "home").mkdir()
+        (base / "layer").mkdir()
+        (base / "secret").mkdir()
+        (base / "link").symlink_to(base / "secret", target_is_directory=True)
+        completed = _userns_completed(script, py, str(base))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "MASK-SYMLINK-REFUSED" in completed.stdout
 
 
 def test_strict_mount_syscalls_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:

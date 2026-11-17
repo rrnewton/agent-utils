@@ -1025,6 +1025,55 @@ fn slot_cpu_quotas(value: &Value) -> Result<Value> {
     Ok(Value::Array(out))
 }
 
+fn host_memory_bytes() -> u128 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("MemTotal:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u128>()
+                    .ok()
+            })
+        })
+        .map(|kib| kib * 1024)
+        .unwrap_or(0)
+}
+
+fn tmp_size_within_cap(value: &str, host_memory_bytes: u128) -> bool {
+    // Mirror Python `_tmp_size_within_cap` (#1792).
+    let (digits, suffix) = match value.strip_suffix('%') {
+        Some(number) => (number, "%"),
+        None => match value.strip_suffix(['K', 'M', 'G', 'T']) {
+            Some(_) => (&value[..value.len() - 1], &value[value.len() - 1..]),
+            None => (value, ""),
+        },
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(amount) = digits.parse::<u128>() else {
+        return false;
+    };
+    let cap = 64u128 << 30;
+    if suffix == "%" {
+        (1..=100).contains(&amount)
+            && amount * host_memory_bytes / 100 > 0
+            && amount * host_memory_bytes / 100 <= cap
+    } else {
+        let multiplier = match suffix {
+            "" => 1u128,
+            "K" => 1 << 10,
+            "M" => 1 << 20,
+            "G" => 1 << 30,
+            "T" => 1 << 40,
+            _ => return false,
+        };
+        amount > 0 && amount * multiplier <= cap
+    }
+}
+
 fn sandbox_settings(raw: &Map<String, Value>) -> Result<Value> {
     let section = match raw.get("sandbox") {
         None => Map::new(),
@@ -1087,12 +1136,7 @@ fn sandbox_settings(raw: &Map<String, Value>) -> Result<Value> {
         }
     };
     let tmp_size = text("tmp_size", "16G");
-    let tmp_ok = {
-        let digits = tmp_size.trim_end_matches(['K', 'M', 'G', 'T', '%']);
-        !digits.is_empty()
-            && digits.bytes().all(|b| b.is_ascii_digit())
-            && tmp_size[digits.len()..].len() <= 1
-    };
+    let tmp_ok = tmp_size_within_cap(&tmp_size, host_memory_bytes());
     if !tmp_ok {
         return Err(format!(
             "configuration.sandbox.tmp_size must look like 16G or 50%, not {tmp_size:?}"
