@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-muse-midturn-typed-not-submitted: a mid-turn Muse delivery leaves typed text unsubmitted and the watcher calls it foreign'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-16T19:10:00.000000000+00:00
-updated_at: 2026-11-16T19:10:00.000000000+00:00
+updated_at: 2026-11-17T05:02:00.000000000+00:00
+closed_at: 2026-11-17T05:02:00.000000000+00:00
 ---
 
 # Description
@@ -101,3 +102,7 @@ harness-agnostic-stuck-paste-backstop, #1683
 pane-lock-held-by-stuck-sender, #1690 pane-queue-linearize
 (cross-registry ordering; out of scope here), #1691
 agentctl-second-enter.
+
+## Resolution
+
+Landed c3ff6fac on github/main (replayed from gated c8864aa7; owner-priority gate pass on base a6729b3b). Unique-size placeholder attribution in `stale_draft::find` and a delayed re-check after every verified Muse steer (`recheck_muse_submitted`), with the harness support matrix updated in the same commit. Five fake-screen tests cover the dropped-Enter placeholder, post-settle return, next-delivery recovery, watcher flush, and shared-size refusal; the live reproduction on Muse 1.4.23 in a throwaway pane is recorded in the issue text. Stacked below #1732, #1750 landed first as 26bd34a7.

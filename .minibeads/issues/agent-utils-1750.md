@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-tests-load-sensitive: runner and chat-stop tests fail under host load on wall-clock budgets'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-16T22:50:00.000000000+00:00
-updated_at: 2026-11-16T22:50:00.000000000+00:00
+updated_at: 2026-11-17T05:02:00.000000000+00:00
+closed_at: 2026-11-17T05:02:00.000000000+00:00
 ---
 
 # Description
@@ -64,3 +65,7 @@ distinguish a regression from a busy host.
 
 Related: #870 agentctl-service-slow-stop, #1732
 agentctl-muse-midturn-typed-not-submitted (the stack this unblocks).
+
+## Resolution
+
+Landed 26bd34a7 on github/main (below #1732's c3ff6fac). The foreign runner tests wait on their state-file and process conditions with generous hang-report bounds, and the chat stop is split from the clock: test-only `AGENTCTL_CHAT_STOP_GRACE_S` (default still the product's 4 s) lets the clean-stop test assert its route by log event and a new blocked-driver test assert the abandonment line by event. Proof: the old packaged-runner test failed in 1 round at 2 cores with 12 CPU spinners; after the fix all 9 test instances passed 5/5 rounds under the same load, unloaded, and in the gated validate.
