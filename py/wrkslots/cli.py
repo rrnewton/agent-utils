@@ -57320,6 +57320,15 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
                 "validation_seals": len(seal_targets),
             },
         )
+    # The registry snapshot is taken; nothing below reloads an event
+    # log (rows judge from the retained kinds and the folds), so the
+    # memo's parsed events — the audit's peak on a long log — are
+    # released before the census and row phases allocate theirs.
+    if _ACTIVE_EVENT_MEMO:
+        _memo = _ACTIVE_EVENT_MEMO[-1]
+        _memo.files.clear()
+        _memo.chains.clear()
+        _memo.file_bytes = 0
     # Holds and owner releases are folds over a machine's whole event log,
     # so they are replayed once per machine here and handed to every row.
     # Replaying them per row made registered-rows quadratic in the fleet:
