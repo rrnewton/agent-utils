@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-scope-server-hits: in-scope server hits as cards, outside hits behind a chip under the search bar'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -34,3 +34,7 @@ Today (#1762, landed e27051df) every fresh server hit — in-scope and out-of-sc
 - Screenshot matrix per the standing acceptance (light/dark x keyboard open/closed x phone/desktop, Discuss half-pane open in at least the phone shots, before and after the targeted state), reviewed image by image, folder path and one line per image in the report to coordb; the liaison reviews before anything is announced.
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as a84def0b (from gated bf85487f), highlight follow-up 10baac8c. In-scope server hits stand as cards in the chronological timeline; outside hits behind a chip under the search bar (superseded in form by #1797's bucket row, same behaviour per bucket); quoted headers say "in thread <slug>" when known. Screenshot matrix in /tmp/mu-searchscope-shots (before: 48, after: 68) plus /tmp/mu-searchscope-shots/after2 (review fixes), all inspected; tests server_hits_browser 8/8, search_unmatched_browser phone+desk, JS search suite green.

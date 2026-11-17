@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-bucket-toggles: search hits bucketed by scope behind toggle chips under the search bar'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -38,3 +38,7 @@ Outside a thread view the bucket is "threads" (not "other threads").
 - Screenshot matrix per the standing acceptance PLUS one set per starting screen (thread, Main, All; Transcripts with a fixture until #1608) and the toggle combinations (only this-thread; this-thread + main; main + other threads; all on; this-thread off), reviewed image by image, folder path and one line per image in the report to coordb.
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as dd5bd40a (bucket commit 8146d682 replayed from gated e8d95b6a, plus ids regeneration). Bucket toggle chips under the search bar with owner-146 defaults, roots counted once in main, chronological interleave (home as cards, rest quoted), searchBuckets.register exported for the Agent Transcripts bucket (#1608, interface agreed with mu-transcripts). Screenshot matrix in /tmp/mu-searchscope-shots1797 (All matrix 48 + thread combos 7b1-7b4 phone/desk, light and dark); gate full pass apart from a fold-steps flake (4/4 mine, 3/3 base, solo exclusive rerun passed) and two load flakes triaged with base evidence.
