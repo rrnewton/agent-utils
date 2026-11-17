@@ -12,6 +12,12 @@ BIN = Path(__file__).resolve().parents[2] / "py" / "bin" / "local-ci-hub"
 
 def run_cli(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
+    # Isolate the generic defer surface: no host hold or quiet signal
+    # may leak into these tests from the machine running them.
+    env["GATE_DEFER_CONFIG"] = str(cwd / "no-defer.toml")
+    env["GATE_DEFER_HOLDS_DIR"] = ""
+    env["GATE_DEFER_SHARED_HOLDS_DIR"] = ""
+    env["GATE_DEFER_QUIET_COMMAND"] = ""
     host_file = cwd / "host-limits.toml"
     if host_file.exists():
         env["AGENT_UTILS_HOST_LIMITS_CONFIG"] = str(host_file)
