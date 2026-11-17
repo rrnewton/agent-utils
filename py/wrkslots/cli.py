@@ -57879,6 +57879,31 @@ def _recover_validate_batch_seal_journal(
     for slot, generation, target in targets:
         current = records.get(slot)
         path_present = target.path.exists() or target.path.is_symlink()
+        effective_path = target.path
+        if (
+            not path_present
+            and current is not None
+            and any(
+                item.slot == slot and item.generation == generation
+                for item in paired_finishes
+            )
+        ):
+            # #1766: a paired finish that died in phase=fenced moved the
+            # sealed directory to its fenced path; that path is the
+            # target's current location, not an absent target.
+            try:
+                _finish_journal_path, finish_raw = _load_journal(
+                    config,
+                    selected_path=_journal_path_for_slot(config, slot),
+                )
+                if finish_raw.get("phase") != "fenced":
+                    raise Refusal("paired finish journal is not in phase=fenced")
+                fenced = _finish_fenced_slot(config, current, finish_raw)
+            except Exception:  # noqa: BLE001 -- absent target, judged below
+                fenced = None
+            if fenced is not None and fenced.is_dir() and not fenced.is_symlink():
+                effective_path = fenced
+                path_present = True
         if current is None:
             archived = any(
                 archived.get("slot") == slot
@@ -57920,7 +57945,7 @@ def _recover_validate_batch_seal_journal(
             continue
         try:
             _restore_private_cleanup_path(
-                target.path,
+                effective_path,
                 target.original_mode,
                 target.identity,
                 allow_missing=False,
@@ -58451,6 +58476,170 @@ def _record_is_eden(record: ActiveRecord) -> bool:
     return bool(checkouts) and all(item.vcs == "eden" for item in checkouts)
 
 
+def _registration_repositories(
+    config: Config, checkout: Checkout, vcs: _GitVcs | None = None
+) -> list[Path]:
+    """Every git repository that may register ``checkout`` (#1766).
+
+    The checkout's recorded repository first, then every other
+    repository named by a readable active record, mirroring the
+    registration inspection ``status`` performs.  Eden checkouts and
+    directories Git does not recognise as repositories are skipped:
+    pruning or listing them would refuse after the irreversible
+    delete.  An unreadable registry falls back to the recorded
+    repository alone; the removal's own state validation refuses
+    separately in that case.
+    """
+
+    probe = vcs if vcs is not None else _GitVcs()
+    repositories: list[Path] = []
+
+    def add(repository: Path) -> None:
+        if not repository.is_dir() or repository.absolute() in repositories:
+            return
+        if getattr(probe, "worktree_lock_state", None) is None:
+            # A test double without the lock API cannot be probed;
+            # treat its repositories as recognised, as before.
+            repositories.append(repository.absolute())
+            return
+        try:
+            recognised = (
+                probe._run(
+                    repository,
+                    ["rev-parse", "--git-dir"],
+                    check=False,
+                ).returncode
+                == 0
+            )
+        except Exception:  # noqa: BLE001 -- unrecognised, skipped below
+            recognised = False
+        if recognised:
+            repositories.append(repository.absolute())
+
+    if getattr(checkout, "vcs", "git") != "eden":
+        add(_stored_repository_path(config, checkout.repository)[1])
+    try:
+        states, _archives = _validate_global_state(
+            config, require_repository=False
+        )
+    except Exception:  # noqa: BLE001 -- recorded repository alone, see above
+        return repositories
+    for state in states:
+        for other in state.slots:
+            for other_checkout in other.checkouts:
+                if getattr(other_checkout, "vcs", "git") == "eden":
+                    continue
+                try:
+                    add(
+                        _stored_repository_path(
+                            config, other_checkout.repository
+                        )[1]
+                    )
+                except Exception:  # noqa: BLE001 -- one unreadable row names no repository
+                    continue
+    return repositories
+
+
+def _unlock_own_registration_locks(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    *,
+    moved_path: Path,
+    canonical: Path,
+    repositories: Sequence[Path],
+    already_deleted: bool,
+) -> None:
+    """Drop wrkslots' own lock wherever ``checkout`` is registered.
+
+    A lock with any other reason refuses: before the subvolume delete
+    that leaves everything untouched; after it, the refusal names the
+    irreversible delete instead of claiming a rollback (#1766).
+    """
+
+    lock_state = getattr(vcs, "worktree_lock_state", None)
+    if lock_state is None:
+        return
+    # Classify every registration first: a foreign lock anywhere
+    # refuses before any own lock is dropped, so a refusal before the
+    # delete really leaves every registration untouched (#1766 review).
+    own_locks: list[tuple[Path, Path]] = []
+    foreign: tuple[Path, str | None] | None = None
+    for repository in repositories:
+        for path in (moved_path, canonical):
+            try:
+                state = lock_state(repository, path)
+            except Refusal:
+                continue
+            if state is None or not state[0]:
+                continue
+            if state[1] == WORKTREES_IMAGE_LOCK_REASON:
+                own_locks.append((repository, path))
+            elif foreign is None:
+                foreign = (repository, state[1])
+    if foreign is None:
+        for repository, path in own_locks:
+            vcs.drop_own_worktree_lock(repository, path)
+        return
+    repository, reason = foreign
+    if already_deleted:
+        raise Refusal(
+            f"checkout {checkout.name} of validate slot {record.slot} "
+            f"is locked in repository {repository} "
+            f"({reason or 'no reason given'}) and the subvolume is "
+            "already deleted; preserve the repository registration "
+            "for recovery; unlock it in that repository, then run "
+            "'wrkslots recover'"
+        )
+    raise Refusal(
+        f"checkout {checkout.name} of validate slot {record.slot} "
+        f"is locked in repository {repository} "
+        f"({reason or 'no reason given'}); unlock it in that "
+        "repository first; nothing was deleted"
+    )
+
+
+def _prune_registration_repositories(
+    vcs: _GitVcs, repositories: Sequence[Path]
+) -> Refusal | None:
+    """Prune every registering repository; the first prune failure, if any.
+
+    Accepted side effect (#1766): ``git worktree prune --expire now``
+    in a registering repository also drops that repository's other
+    stale, unlocked registrations (entries whose paths are gone),
+    whoever created them.  The repositories are confined to recorded
+    or registry-named paths, and locked registrations are never
+    pruned by Git.
+    """
+
+    failure: Refusal | None = None
+    for repository in repositories:
+        pruned = vcs._run(
+            repository, ["worktree", "prune", "--expire", "now"], check=False
+        )
+        if pruned.returncode != 0 and failure is None:
+            failure = Refusal(
+                f"git worktree prune failed for {repository}: "
+                f"{(pruned.stderr or pruned.stdout).strip()}"
+            )
+    return failure
+
+
+def _still_registered_in(
+    vcs: _GitVcs,
+    repositories: Sequence[Path],
+    *,
+    moved_path: Path,
+    canonical: Path,
+) -> Path | None:
+    for repository in repositories:
+        listed = vcs.listed_worktrees(repository)
+        if moved_path.absolute() in listed or canonical.absolute() in listed:
+            return repository
+    return None
+
+
 def _validate_subvolume_delete_first(
     config: Config,
     record: ActiveRecord,
@@ -58495,6 +58684,25 @@ def _validate_subvolume_delete_first(
     for checkout in moved_checkouts:
         if vcs.initialized_submodules(moved_paths[checkout.name]):
             return False
+    # #1766: judge every repository registration of every checkout
+    # before anything irreversible.  A locked registration makes prune
+    # skip the entry, which the old order discovered only after the
+    # subvolume was gone.  Wrkslots' own image lock is dropped here;
+    # any other lock refuses with nothing changed.
+    registration_repositories: dict[str, list[Path]] = {}
+    for checkout in moved_checkouts:
+        repositories = _registration_repositories(config, checkout, vcs)
+        registration_repositories[checkout.name] = repositories
+        _unlock_own_registration_locks(
+            config,
+            record,
+            checkout,
+            vcs,
+            moved_path=moved_paths[checkout.name],
+            canonical=_stored_path(config, checkout.path, "checkout path"),
+            repositories=repositories,
+            already_deleted=False,
+        )
     mount_dir: Path | None = None
     records: dict[str, worktreesimage.BindRecord] = {}
     if bind_slot is not None:
@@ -58544,23 +58752,51 @@ def _validate_subvolume_delete_first(
     _interrupt_for_test("after-validate-subvolume-delete")
     for checkout in moved_checkouts:
         _relative, repository = _stored_repository_path(config, checkout.repository)
-        pruned = vcs._run(
-            repository, ["worktree", "prune", "--expire", "now"], check=False
-        )
-        if pruned.returncode != 0:
-            raise Refusal(
-                f"git worktree prune failed for {repository} after subvolume "
-                f"delete of validate slot {record.slot}: "
-                f"{(pruned.stderr or pruned.stdout).strip()}"
-            )
+        repositories = registration_repositories[checkout.name]
         moved_path = moved_paths[checkout.name]
         canonical = _stored_path(config, checkout.path, "checkout path")
-        listed = vcs.listed_worktrees(repository)
-        if moved_path.absolute() in listed or canonical.absolute() in listed:
+        prune_failure = _prune_registration_repositories(vcs, repositories)
+        if prune_failure is not None:
             raise Refusal(
-                f"Git still registers checkout {checkout.name} of validate slot "
-                f"{record.slot} after subvolume delete and prune; preserve the "
-                "repository registration for recovery"
+                f"{prune_failure} after subvolume delete of validate slot "
+                f"{record.slot}; the subvolume is already deleted and "
+                "cannot be restored; run 'wrkslots recover'"
+            ) from prune_failure
+        still_in = _still_registered_in(
+            vcs, repositories, moved_path=moved_path, canonical=canonical
+        )
+        if still_in is not None:
+            # A registration locked after the pre-check (or listed only
+            # in a second repository) is retried once with wrkslots' own
+            # lock dropped, so an own lock never needs a hand git
+            # command; a foreign lock refuses below (#1766).
+            _unlock_own_registration_locks(
+                config,
+                record,
+                checkout,
+                vcs,
+                moved_path=moved_path,
+                canonical=canonical,
+                repositories=repositories,
+                already_deleted=True,
+            )
+            prune_failure = _prune_registration_repositories(vcs, repositories)
+            if prune_failure is not None:
+                raise Refusal(
+                    f"{prune_failure} after subvolume delete of validate "
+                    f"slot {record.slot}; the subvolume is already deleted "
+                    "and cannot be restored; run 'wrkslots recover'"
+                ) from prune_failure
+            still_in = _still_registered_in(
+                vcs, repositories, moved_path=moved_path, canonical=canonical
+            )
+        if still_in is not None:
+            raise Refusal(
+                f"Git still registers checkout {checkout.name} of validate "
+                f"slot {record.slot} in repository {still_in} after "
+                "subvolume delete and prune; the subvolume is already "
+                "deleted and cannot be restored; preserve the repository "
+                "registration for recovery; run 'wrkslots recover'"
             )
         vcs.delete_branch_at(repository, checkout.branch, checkout.head)
         removed.add(checkout.name)
@@ -58770,10 +59006,53 @@ def _finish_remove_paths(
         _relative, repository = _stored_repository_path(config, checkout.repository)
         canonical = _stored_path(config, checkout.path, "checkout path")
         listed = vcs.listed_worktrees(repository)
-        if path.absolute() in listed or canonical.absolute() in listed:
-            raise Refusal(
-                f"interrupted checkout {checkout.name} is missing but Git still registers it"
+        # #1766 review: a leftover registration may live only in a
+        # second repository while the recorded one no longer lists the
+        # checkout; judge every registering repository, not just the
+        # recorded one.
+        all_repositories = (
+            _registration_repositories(config, checkout, vcs)
+            if record.slot_type == "validate"
+            else [repository]
+        )
+        registered_anywhere = (
+            _still_registered_in(
+                vcs, all_repositories, moved_path=path, canonical=canonical
             )
+            is not None
+        )
+        if path.absolute() in listed or canonical.absolute() in listed or registered_anywhere:
+            if record.slot_type != "validate":
+                raise Refusal(
+                    f"interrupted checkout {checkout.name} is missing but Git still registers it"
+                )
+            # #1766: a validate checkout whose subvolume is already
+            # deleted can still be registered, locked with wrkslots'
+            # own lock, in its own or a second repository.  Drop only
+            # that lock and prune every registering repository, so
+            # recovery finishes without a hand git command; a foreign
+            # lock still refuses, naming the repository.
+            repositories = _registration_repositories(config, checkout, vcs)
+            _unlock_own_registration_locks(
+                config,
+                record,
+                checkout,
+                vcs,
+                moved_path=path,
+                canonical=canonical,
+                repositories=repositories,
+                already_deleted=True,
+            )
+            _prune_registration_repositories(vcs, repositories)
+            still_in = _still_registered_in(
+                vcs, repositories, moved_path=path, canonical=canonical
+            )
+            if still_in is not None:
+                raise Refusal(
+                    f"interrupted checkout {checkout.name} is missing but "
+                    f"Git still registers it in repository {still_in}; "
+                    "preserve the repository registration for recovery"
+                )
         missing_after_remove.append(checkout)
     if missing_after_remove:
         if record.slot_type == "validate":
@@ -59118,6 +59397,20 @@ def _finish_remove_paths(
                     )
                 )
             if not removed:
+                if (
+                    record.slot_type == "validate"
+                    and journal.get("removing")
+                    and not fenced_slot.exists()
+                ):
+                    # #1766: the subvolume delete already happened; there
+                    # is no fence left to roll back, and claiming one
+                    # misleads the operator.  The journal keeps the
+                    # checkout as removing so recover can finish it.
+                    raise Refusal(
+                        f"{exc}{already}; the subvolume is already deleted, "
+                        "so the path fence cannot be rolled back; "
+                        "run 'wrkslots recover'"
+                    ) from exc
                 try:
                     _rollback_path_fence(
                         config,
@@ -59214,6 +59507,16 @@ def _finish_remove_paths(
                 _end_item_deadline()
             except Refusal as exc:
                 if not removed:
+                    if (
+                        record.slot_type == "validate"
+                        and journal.get("removing")
+                        and not fenced_slot.exists()
+                    ):
+                        raise Refusal(
+                            f"{exc}; the subvolume is already deleted, so "
+                            "the path fence cannot be rolled back; "
+                            "run 'wrkslots recover'"
+                        ) from exc
                     try:
                         _rollback_path_fence(
                             config,
@@ -59243,6 +59546,25 @@ def _finish_remove_paths(
             )
         _relative, repository = _stored_repository_path(config, checkout.repository)
         _moved, path = _checkout_at_slot(config, record, checkout, fenced_slot)
+        registration_repositories: list[Path] = []
+        if record.slot_type == "validate":
+            # #1766: a registration in a second repository, locked with
+            # wrkslots' own image lock at this fenced or canonical path,
+            # must not strand the removal; a foreign lock refuses here,
+            # before anything is deleted.
+            registration_repositories = _registration_repositories(
+                config, checkout, vcs
+            )
+            _unlock_own_registration_locks(
+                config,
+                record,
+                checkout,
+                vcs,
+                moved_path=path,
+                canonical=_stored_path(config, checkout.path, "checkout path"),
+                repositories=registration_repositories,
+                already_deleted=False,
+            )
         # Record the intent before the git call: `git worktree remove`
         # deletes the registration as part of removing the checkout, so an
         # actor that dies inside it leaves a journal that already names
@@ -59263,6 +59585,11 @@ def _finish_remove_paths(
         journal["removed"] = sorted(removed)
         journal["removing"] = sorted(removing)
         _write_journal(config, journal, journal_path=journal_path)
+        if registration_repositories:
+            # Prune the stale entry in every other registering
+            # repository; the checkout is already journaled removed,
+            # so a prune failure there is left for the next recovery.
+            _prune_registration_repositories(vcs, registration_repositories)
         _interrupt_for_test("after-remove-worktree")
     if _record_layout(config, record) == "nested" and record.slot_type == "agent":
         handoff = fenced_slot / "HANDOFF.md"
@@ -68737,6 +69064,50 @@ def _recover_finish(
     )
     print(f"recovered finish: archived and removed slot={record.slot}")
     _print_nested_git_evidence(nested_git_evidence)
+
+
+def _record_finish_recovery_refusal(
+    config: Config,
+    journal_path: Path,
+    raw: Mapping[str, object],
+    finish_refusal: Refusal,
+    seal_refusal: Refusal | StateError,
+) -> None:
+    """Record a paired finish+seal recovery failure in the finish journal.
+
+    Best effort: recording never replaces either refusal (#1766).
+    """
+
+    try:
+        # Reload: the failed recovery may have saved progress in this
+        # journal (a removing intent, a deleted subvolume) after the
+        # caller's copy was loaded; writing that copy back would roll
+        # the progress back past an irreversible step (#1766 review).
+        try:
+            _path, fresh = _load_journal(config, selected_path=journal_path)
+            journal = dict(fresh)
+        except Exception:  # noqa: BLE001 -- fall back to the caller's copy
+            journal = dict(raw)
+        # The finish journal validates its fields exactly; the
+        # forward-compatible extension slot is where a note may live.
+        # Both journal readers refuse an extension over 16 KiB, so the
+        # notes are capped: the last three, each field truncated.
+        extension = journal.get("x")
+        extension = dict(extension) if isinstance(extension, Mapping) else {}
+        notes = extension.get("recovery_notes")
+        kept = list(notes) if isinstance(notes, list) else []
+        kept.append(
+            {
+                "recorded_at": _utc_now(),
+                "finish_refusal": str(finish_refusal)[:1024],
+                "seal_refusal": str(seal_refusal)[:1024],
+            }
+        )
+        extension["recovery_notes"] = kept[-3:]
+        journal["x"] = extension
+        _write_journal(config, journal, journal_path=journal_path)
+    except Exception:  # noqa: BLE001 -- the refusals themselves are the report
+        return
 
 
 def _restore_interrupted_private_finish_after_refusal(
@@ -89738,9 +90109,15 @@ def _cmd_recover(
                             retain_evidence=True,
                         )
                     except (Refusal, StateError) as seal_exc:
+                        # #1766: the seal error never replaces the
+                        # finish refusal that caused this recovery;
+                        # report both and record both in the journal.
+                        _record_finish_recovery_refusal(
+                            config, path, raw, exc, seal_exc
+                        )
                         raise Refusal(
-                            f"{exc}; validation-batch seal recovery also "
-                            f"refused: {seal_exc}"
+                            f"{exc}; validation-batch seal recovery "
+                            f"also failed: {seal_exc}"
                         ) from exc
                 raise
         elif kind == "legacy-validate-remove":

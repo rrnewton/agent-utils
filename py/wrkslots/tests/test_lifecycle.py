@@ -21283,6 +21283,528 @@ def test_validate_subvolume_delete_first_refuses_content_underneath(
     assert removed == set()
 
 
+class _TwoRepoVcs:
+    """A checkout registered in its own repo and in a second repo (#1766)."""
+
+    def __init__(self, own: Path, foreign: Path, moved: Path) -> None:
+        self.calls: list[str] = []
+        self.listed: dict[Path, set[Path]] = {own: {moved}, foreign: {moved}}
+        self.locks: dict[tuple[Path, Path], str] = {}
+        self.non_git: set[Path] = set()
+
+    def initialized_submodules(self, _path: Path) -> list[str]:
+        return []
+
+    def worktree_lock_state(
+        self, repository: Path, checkout: Path
+    ) -> tuple[bool, str | None] | None:
+        if checkout.absolute() not in self.listed.get(repository, set()):
+            return None
+        reason = self.locks.get((repository, checkout.absolute()))
+        return (True, reason) if (repository, checkout.absolute()) in self.locks else (False, None)
+
+    def drop_own_worktree_lock(self, repository: Path, checkout: Path) -> None:
+        self.calls.append(f"unlock {repository.name}")
+        key = (repository, checkout.absolute())
+        if self.locks.get(key) == wrkslots.WORKTREES_IMAGE_LOCK_REASON:
+            del self.locks[key]
+
+    def _run(
+        self, repository: Path, args: list[str], *, check: bool = True
+    ) -> types.SimpleNamespace:
+        del check
+        self.calls.append(" ".join(args))
+        if args[:1] == ["rev-parse"]:
+            return types.SimpleNamespace(
+                returncode=1 if repository in self.non_git else 0,
+                stdout="",
+                stderr="",
+            )
+        if args[:2] == ["worktree", "prune"]:
+            locked = any(
+                repo == repository and path in self.listed.get(repository, set())
+                for (repo, path) in self.locks
+            )
+            if not locked:
+                self.listed[repository] = set()
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def listed_worktrees(self, repository: Path) -> set[Path]:
+        return set(self.listed.get(repository, set()))
+
+    def delete_branch_at(self, _repo: Path, branch: str, _head: str) -> None:
+        self.calls.append(f"delete-branch {branch}")
+
+
+def _stub_two_repo_subvolume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[dict[str, object], _TwoRepoVcs, Path, Path]:
+    state, image_calls = _stub_subvolume_finish(monkeypatch, tmp_path)
+    state["image_calls"] = image_calls
+    own = tmp_path / "repo"
+    foreign = tmp_path / "other-repo"
+    foreign.mkdir(exist_ok=True)
+    moved = cast(Path, state["fenced"]) / "checkout"
+    vcs = _TwoRepoVcs(own, foreign, moved)
+    state["vcs"] = vcs
+    monkeypatch.setattr(
+        wrkslots,
+        "_stored_repository_path",
+        lambda _c, raw: (raw, tmp_path / raw),
+    )
+    foreign_record = types.SimpleNamespace(
+        slot_type="validate",
+        slot="slot02",
+        checkouts=[
+            types.SimpleNamespace(
+                name="main", repository="other-repo", path="slot02/checkout",
+                branch="validate/slot02", head="abc123",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_validate_global_state",
+        lambda *_a, **_k: ([types.SimpleNamespace(slots=[foreign_record])], []),
+    )
+    return state, vcs, own, foreign
+
+
+def _run_subvolume_delete_first(
+    state: dict[str, object], tmp_path: Path
+) -> bool:
+    removed: set[str] = set()
+    removing: set[str] = set()
+    state["removed_for_test"] = removed
+    return wrkslots._validate_subvolume_delete_first(
+        cast(wrkslots.Config, state["config"]),
+        cast(wrkslots.ActiveRecord, state["record"]),
+        cast("dict[str, object]", state["journal"]),
+        cast(wrkslots._GitVcs, state["vcs"]),
+        fenced_slot=cast(Path, state["fenced"]),
+        moved_checkouts=[cast(wrkslots.Checkout, state["checkout"])],
+        moved_paths={"main": cast(Path, state["fenced"]) / "checkout"},
+        removed=removed, removing=removing,
+        journal_path=tmp_path / "journal.json",
+    )
+
+
+def test_subvolume_delete_first_unlocks_own_lock_in_second_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1766 (a): a second repo registers the checkout with wrkslots' own
+    # image lock; remove unlocks only that lock and leaves no registration.
+    state, vcs, _own, foreign = _stub_two_repo_subvolume(monkeypatch, tmp_path)
+    moved = cast(Path, state["fenced"]) / "checkout"
+    vcs.locks[(foreign, moved.absolute())] = wrkslots.WORKTREES_IMAGE_LOCK_REASON
+    assert _run_subvolume_delete_first(state, tmp_path) is True
+    assert vcs.listed_worktrees(foreign) == set()
+    assert "unlock other-repo" in vcs.calls
+
+
+def test_subvolume_delete_first_refuses_foreign_lock_before_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1766 (b): a foreign lock in a second repo refuses up front; the
+    # subvolume is never deleted and nothing is journaled as removing.
+    state, vcs, _own, foreign = _stub_two_repo_subvolume(monkeypatch, tmp_path)
+    moved = cast(Path, state["fenced"]) / "checkout"
+    vcs.locks[(foreign, moved.absolute())] = "operator hold"
+    with pytest.raises(wrkslots.Refusal, match="locked in repository"):
+        _run_subvolume_delete_first(state, tmp_path)
+    assert not any(
+        c.startswith("delete-subvolume")
+        for c in cast("list[str]", state["image_calls"])
+    )
+    assert cast("dict[str, object]", state["journal"]).get("removing") in (None, [])
+
+
+def test_subvolume_delete_first_recovers_own_lock_appearing_after_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1766 (c): an own lock that appears only after the subvolume delete
+    # (injected failure at the old refusal point) is dropped and pruned by
+    # the removal itself; no hand git command is needed.
+    from wrkslots import worktreesimage
+
+    state, vcs, _own, foreign = _stub_two_repo_subvolume(monkeypatch, tmp_path)
+    moved = cast(Path, state["fenced"]) / "checkout"
+    real_delete = worktreesimage.delete_slot_subvolume
+
+    def delete_then_lock(path: Path) -> None:
+        real_delete(path)
+        vcs.locks[(foreign, moved.absolute())] = (
+            wrkslots.WORKTREES_IMAGE_LOCK_REASON
+        )
+
+    monkeypatch.setattr(worktreesimage, "delete_slot_subvolume", delete_then_lock)
+    assert _run_subvolume_delete_first(state, tmp_path) is True
+    assert vcs.listed_worktrees(foreign) == set()
+
+
+def test_subvolume_delete_first_reports_irreversible_foreign_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1766: a foreign lock that appears after the delete cannot be
+    # rolled back; the refusal says so and leaves the checkout journaled
+    # as removing so recover can finish once it is unlocked there.
+    from wrkslots import worktreesimage
+
+    state, vcs, _own, foreign = _stub_two_repo_subvolume(monkeypatch, tmp_path)
+    moved = cast(Path, state["fenced"]) / "checkout"
+    real_delete = worktreesimage.delete_slot_subvolume
+
+    def delete_then_lock(path: Path) -> None:
+        real_delete(path)
+        vcs.locks[(foreign, moved.absolute())] = "operator hold"
+
+    monkeypatch.setattr(worktreesimage, "delete_slot_subvolume", delete_then_lock)
+    with pytest.raises(wrkslots.Refusal, match="already deleted"):
+        _run_subvolume_delete_first(state, tmp_path)
+    assert cast("dict[str, object]", state["journal"])["removing"] == ["main"]
+
+
+def _fenced_validate_with_foreign_registration(
+    tmp_path: Path, lock_reason: str, *, bad_seal_identity: bool = False
+) -> tuple[Path, Path, Path, Path]:
+    """The exact died-in-phase=fenced state of #1766's extension.
+
+    A validate removal interrupted after its path fence, its checkout
+    also registered (and locked) in a second repository at the fenced
+    path, plus a validation-batch seal whose target is the now-absent
+    canonical slot path.  Returns (project, fenced, foreign repo,
+    fenced checkout).
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    # A second slot names the foreign repository in the registry, as
+    # in the consumer registry where the checkout was also registered.
+    foreign = project / "other-repo"
+    git(project, "init", "-q", "other-repo")
+    git(foreign, "commit", "-q", "--allow-empty", "-m", "foreign")
+    git(foreign, "remote", "add", "origin", str(project / "repo"))
+    holder = create(
+        project,
+        slot="holder",
+        slot_type="validate",
+        branch=None,
+        repository_name="other-repo",
+    )
+    assert holder.returncode == 0, holder.stderr
+    prepare_dead_validate_slots(project, ("target",))
+    config = wrkslots._load_config(str(project), "testhost")
+    interrupted = raw_command_with_census_authority_stub(
+        project,
+        "remove-validate-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "target=1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-path-fence"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    canonical = wrkslots._slot_directory(config, "target", "validate")
+    fenced_matches = sorted(canonical.parent.glob(".target.fenced.1.*"))
+    assert len(fenced_matches) == 1
+    fenced = fenced_matches[0]
+    assert fenced.is_dir()
+    assert not canonical.exists()
+    state = wrkslots._load_active(config)
+    record = next(item for item in state.slots if item.slot == "target")
+    _moved, fenced_checkout = wrkslots._checkout_at_slot(
+        config, record, record.checkouts[0], fenced
+    )
+    admin = foreign / ".git" / "worktrees" / "foreign1"
+    admin.mkdir(parents=True)
+    (admin / "gitdir").write_text(f"{fenced_checkout}/.git\n", encoding="utf-8")
+    (admin / "locked").write_text(f"{lock_reason}\n", encoding="utf-8")
+    if bad_seal_identity:
+        # Add a holder target with a broken identity, so pairing for
+        # the target slot still holds but seal recovery fails while
+        # the finish recovery also refuses (#1766 (a)).
+        donor = project / "identity-donor"
+        donor.mkdir()
+        holder_path = wrkslots._slot_directory(config, "holder", "validate")
+        seal_path = wrkslots._validate_batch_seal_journal_path(config)
+        seal = json.loads(seal_path.read_text(encoding="utf-8"))
+        seal["targets"].append(
+            wrkslots._private_cleanup_target_to_obj(
+                config,
+                "holder",
+                1,
+                wrkslots._PrivateCleanupTarget(
+                    path=holder_path,
+                    original_mode=stat.S_IMODE(holder_path.stat().st_mode),
+                    identity=wrkslots._private_cleanup_path_identity(
+                        config, donor, allowed_modes={0o700, 0o755}
+                    ),
+                ),
+            )
+        )
+        seal_path.write_text(json.dumps(seal, indent=2) + "\n", encoding="utf-8")
+    return project, fenced, foreign, fenced_checkout
+
+
+def _recover_command(project: Path) -> subprocess.CompletedProcess[str]:
+    return raw_command_with_census_authority_stub(
+        project,
+        "recover",
+        "--slot",
+        "target",
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+
+def test_recover_fenced_validate_unlocks_own_foreign_lock_and_resolves_seal(
+    tmp_path: Path,
+) -> None:
+    # #1766 (b)+(c)+(d): recover completes the died-in-fenced removal,
+    # drops only wrkslots' own lock in the second repository, prunes
+    # that registration, and resolves the seal at the fenced path --
+    # all without a hand git command.
+    project, fenced, foreign, fenced_checkout = (
+        _fenced_validate_with_foreign_registration(
+            tmp_path, wrkslots.WORKTREES_IMAGE_LOCK_REASON
+        )
+    )
+    recovered = _recover_command(project)
+    assert recovered.returncode == 0, recovered.stderr
+    assert "is absent while its ACTIVE row remains" not in recovered.stderr
+    assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == ["holder"]
+    assert not fenced.exists()
+    listed = git(foreign, "worktree", "list", "--porcelain").stdout
+    assert str(fenced_checkout) not in listed
+    config = wrkslots._load_config(str(project), "testhost")
+    assert not wrkslots._validate_batch_seal_journal_path(config).exists()
+
+
+def test_recover_fenced_validate_refuses_foreign_lock_reporting_finish_first(
+    tmp_path: Path,
+) -> None:
+    # #1766 (a)+(c): a foreign lock refuses with the finish refusal
+    # itself, never masked by the seal's absent-target error.
+    project, fenced, _foreign, _checkout_path = (
+        _fenced_validate_with_foreign_registration(tmp_path, "operator hold")
+    )
+    recovered = _recover_command(project)
+    assert recovered.returncode != 0
+    assert "locked in repository" in recovered.stderr
+    assert fenced.is_dir()
+    assert active_slots(project) != []
+
+
+def test_recover_reports_finish_and_seal_failures_and_journals_both(
+    tmp_path: Path,
+) -> None:
+    # #1766 (a): when both the finish and the seal recovery fail, the
+    # report carries the finish refusal with the seal error appended,
+    # and the finish journal records both.
+    project, _fenced, _foreign, _checkout_path = (
+        _fenced_validate_with_foreign_registration(
+            tmp_path, "operator hold", bad_seal_identity=True
+        )
+    )
+    recovered = _recover_command(project)
+    assert recovered.returncode != 0
+    assert "locked in repository" in recovered.stderr
+    assert "seal recovery also failed" in recovered.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    journal_path = wrkslots._journal_path(config)
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    notes = journal.get("x", {}).get("recovery_notes")
+    assert isinstance(notes, list) and len(notes) == 1
+    assert "locked in repository" in str(notes[0].get("finish_refusal"))
+    assert notes[0].get("seal_refusal")
+
+
+def test_record_finish_recovery_refusal_reloads_saved_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review (1): the note write reloads the journal, so progress a
+    # failed recovery saved (removing intent past the irreversible
+    # delete) is never rolled back by the caller's stale copy.
+    config = wrkslots._load_config(str(make_project(tmp_path)[0]), "testhost")
+    written: list[dict[str, object]] = []
+    fresh: dict[str, object] = {"kind": "finish", "removing": ["main"]}
+    monkeypatch.setattr(
+        wrkslots, "_load_journal", lambda *_a, **_k: (tmp_path / "j", fresh)
+    )
+    monkeypatch.setattr(
+        wrkslots,
+        "_write_journal",
+        lambda _c, payload, **_k: written.append(dict(payload)),
+    )
+    wrkslots._record_finish_recovery_refusal(
+        config,
+        tmp_path / "j",
+        {"kind": "finish"},
+        wrkslots.Refusal("finish failed"),
+        wrkslots.Refusal("seal failed"),
+    )
+    assert written[0]["removing"] == ["main"]
+    notes = cast("dict[str, object]", written[0]["x"])["recovery_notes"]
+    assert isinstance(notes, list) and len(notes) == 1
+
+
+def test_record_finish_recovery_refusal_caps_notes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review (2): only the last three notes survive, each truncated,
+    # so the journal extension stays under the readers' 16 KiB bound.
+    config = wrkslots._load_config(str(make_project(tmp_path)[0]), "testhost")
+    current: dict[str, object] = {"kind": "finish", "x": {}}
+    monkeypatch.setattr(
+        wrkslots, "_load_journal", lambda *_a, **_k: (tmp_path / "j", current)
+    )
+
+    def write(_c: object, payload: dict[str, object], **_k: object) -> None:
+        current.clear()
+        current.update(payload)
+
+    monkeypatch.setattr(wrkslots, "_write_journal", write)
+    long_refusal = wrkslots.Refusal("x" * 3000)
+    for _index in range(5):
+        wrkslots._record_finish_recovery_refusal(
+            config,
+            tmp_path / "j",
+            {"kind": "finish"},
+            long_refusal,
+            long_refusal,
+        )
+    notes = cast("dict[str, object]", current["x"])["recovery_notes"]
+    assert isinstance(notes, list) and len(notes) == 3
+    assert all(len(str(note["finish_refusal"])) <= 1024 for note in notes)
+
+
+def test_subvolume_delete_first_skips_eden_and_non_git_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review (3): eden and non-git sibling repositories are never
+    # pruned or listed, so they cannot refuse after the delete.
+    state, vcs, own, foreign = _stub_two_repo_subvolume(monkeypatch, tmp_path)
+    eden_repo = tmp_path / "eden-repo"
+    notgit_repo = tmp_path / "notgit-repo"
+    eden_repo.mkdir()
+    notgit_repo.mkdir()
+    vcs.non_git.update({eden_repo, notgit_repo})
+    extra = types.SimpleNamespace(
+        slots=[
+            types.SimpleNamespace(
+                slot_type="validate",
+                slot="eden-slot",
+                checkouts=[
+                    types.SimpleNamespace(
+                        name="main", repository="eden-repo",
+                        path="eden-slot/checkout", branch="b", head="h",
+                        vcs="eden",
+                    )
+                ],
+            ),
+            types.SimpleNamespace(
+                slot_type="validate",
+                slot="plain-slot",
+                checkouts=[
+                    types.SimpleNamespace(
+                        name="main", repository="notgit-repo",
+                        path="plain-slot/checkout", branch="b", head="h",
+                    )
+                ],
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        wrkslots, "_validate_global_state", lambda *_a, **_k: ([extra], [])
+    )
+    repositories = wrkslots._registration_repositories(
+        cast(wrkslots.Config, state["config"]),
+        cast(wrkslots.Checkout, state["checkout"]),
+        cast(wrkslots._GitVcs, vcs),
+    )
+    assert eden_repo.absolute() not in repositories
+    assert notgit_repo.absolute() not in repositories
+    assert _run_subvolume_delete_first(state, tmp_path) is True
+
+
+def test_subvolume_precheck_refuses_foreign_before_dropping_own_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review (4): with an own lock in one repository and a foreign
+    # lock in another, the refusal leaves the own lock untouched.
+    state, vcs, own, foreign = _stub_two_repo_subvolume(monkeypatch, tmp_path)
+    moved = cast(Path, state["fenced"]) / "checkout"
+    vcs.locks[(own, moved.absolute())] = wrkslots.WORKTREES_IMAGE_LOCK_REASON
+    vcs.locks[(foreign, moved.absolute())] = "operator hold"
+    with pytest.raises(wrkslots.Refusal, match="locked in repository"):
+        _run_subvolume_delete_first(state, tmp_path)
+    assert (
+        vcs.locks[(own, moved.absolute())]
+        == wrkslots.WORKTREES_IMAGE_LOCK_REASON
+    )
+    assert "unlock repo" not in vcs.calls
+
+
+def test_recover_clears_leftover_registration_only_in_second_repo(
+    tmp_path: Path,
+) -> None:
+    # Review (5): the subvolume is gone and the recorded repository
+    # no longer lists the checkout; a locked-own leftover only in the
+    # second repository is still cleared by recover.
+    project, fenced, foreign, fenced_checkout = (
+        _fenced_validate_with_foreign_registration(
+            tmp_path, wrkslots.WORKTREES_IMAGE_LOCK_REASON
+        )
+    )
+    git_file = (fenced_checkout / ".git").read_text(encoding="utf-8")
+    admin = Path(git_file.removeprefix("gitdir:").strip())
+    shutil.rmtree(admin)
+    shutil.rmtree(fenced)
+    recovered = _recover_command(project)
+    assert recovered.returncode == 0, recovered.stderr
+    listed = git(foreign, "worktree", "list", "--porcelain").stdout
+    assert str(fenced_checkout) not in listed
+    assert [row["slot"] for row in active_slots(project) if isinstance(row, dict)] == ["holder"]
+
+
+def test_recover_fenced_seal_acceptance_with_create_journal_beside(
+    tmp_path: Path,
+) -> None:
+    # Review (6): an outstanding create journal beside the paired
+    # finish does not defeat the seal's fenced-path acceptance.
+    project, fenced, foreign, fenced_checkout = (
+        _fenced_validate_with_foreign_registration(
+            tmp_path, wrkslots.WORKTREES_IMAGE_LOCK_REASON
+        )
+    )
+    crashed_create = raw_command_with_census_authority_stub(
+        project,
+        "create",
+        "holder2",
+        "--slot-type",
+        "validate",
+        "--coordinator-authorized",
+        "--agent",
+        "codex-1",
+        "--task",
+        "task-holder2",
+        "--purpose",
+        "test holder2",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "product=other-repo",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert crashed_create.returncode == 86, crashed_create.stderr
+    recovered = _recover_command(project)
+    assert recovered.returncode == 0, recovered.stderr
+    assert not fenced.exists()
+    listed = git(foreign, "worktree", "list", "--porcelain").stdout
+    assert str(fenced_checkout) not in listed
+
+
 def test_raised_census_seconds_reaches_the_batch_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
