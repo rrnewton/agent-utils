@@ -10665,20 +10665,7 @@ def _write_journal(
         # written and fsynced by the transform, before the event and the
         # journal that reference them. The event copy shrinks identically
         # so provenance comparisons keep matching the file.
-        shrunk = json.loads(json.dumps(payload))
-        shrunk_record = shrunk.get("record")
-        if isinstance(shrunk_record, dict):
-            shrunk_checkouts = shrunk_record.get("checkouts")
-            if isinstance(shrunk_checkouts, list):
-                for checkout_obj in shrunk_checkouts:
-                    if isinstance(checkout_obj, dict):
-                        _sidecar_containing_refs(config, checkout_obj)
-        shrunk_salvage = shrunk.get("salvage")
-        if isinstance(shrunk_salvage, list):
-            for salvage_entry in shrunk_salvage:
-                if isinstance(salvage_entry, dict):
-                    _sidecar_containing_refs(config, salvage_entry)
-        payload = shrunk
+        payload = _shrink_finish_journal(config, payload)
     writer.append(
         "operation-progress-recorded",
         {
@@ -12586,22 +12573,7 @@ def _validate_journal_shape(
         # Restore sidecarred containment inventories (#1757) before any
         # reader parses the record or salvage, so every recovery reader
         # sees the original self-contained shape.
-        record_map = raw["record"]
-        if isinstance(record_map, dict):
-            record_checkouts = record_map.get("checkouts")
-            if isinstance(record_checkouts, list):
-                for checkout_obj in record_checkouts:
-                    if isinstance(checkout_obj, dict):
-                        _expand_containing_refs_sidecar(
-                            config, checkout_obj, "finish journal.record checkout"
-                        )
-        salvage_list = raw.get("salvage")
-        if isinstance(salvage_list, list):
-            for salvage_entry in salvage_list:
-                if isinstance(salvage_entry, dict):
-                    _expand_containing_refs_sidecar(
-                        config, salvage_entry, "finish journal.salvage entry"
-                    )
+        _expand_finish_sidecars(config, raw)
         record = _record_from_obj(raw["record"], "finish journal.record")
         if record.machine != machine or record.slot != slot:
             raise StateError("finish journal record does not match its shard or slot")
@@ -13038,6 +13010,7 @@ def _scoped_operation_journal_completed(
     )
     if recorded is None:
         raise StateError(f"{label} has no matching append-only progress evidence")
+    _expand_finish_sidecars(config, recorded)
     if not _json_equal(raw, recorded):
         raise StateError(f"{label} differs from append-only progress evidence")
     return completed
@@ -13068,6 +13041,9 @@ def _scoped_journal_roll_forward_target(
     )
     if recorded is None:
         raise StateError(f"{label} has no matching append-only progress evidence")
+    _expand_finish_sidecars(config, recorded)
+    if previous is not None:
+        _expand_finish_sidecars(config, previous)
     if completed or _json_equal(raw, recorded):
         return None
     if previous is not None and _json_equal(raw, previous):
@@ -13122,7 +13098,7 @@ def _roll_forward_lagging_scoped_journals(config: Config) -> None:
         )
         if target is None:
             continue
-        _atomic_write_json(path, dict(target))
+        _atomic_write_json(path, _shrink_finish_journal(config, dict(target)))
         print(
             f"rolled forward scoped {operation} journal {path.name} "
             "to latest append-only progress evidence"
@@ -13213,6 +13189,8 @@ def _validate_journal_provenance(
     machine = _as_str(raw.get("machine"), "recovery journal.machine")
     if path == _journal_path(config, machine):
         pending = _pending_journal_for_path(config, path)
+        if pending is not None:
+            _expand_finish_sidecars(config, pending)
         if pending is not None and not _json_equal(raw, pending):
             raise StateError(
                 "standalone recovery journal differs from append-only operation evidence"
@@ -55427,6 +55405,52 @@ def _expand_containing_refs_sidecar(
         )
     holder["containing_remote_refs"] = list(refs)
     del holder["containing_remote_refs_sidecar"]
+
+
+def _expand_finish_sidecars(config: Config, journal: Mapping[str, object]) -> None:
+    """Restore every sidecarred inventory in one finish journal (#1757)."""
+
+    if not isinstance(journal, dict) or journal.get("kind") != "finish":
+        return
+    record_map = journal.get("record")
+    if isinstance(record_map, dict):
+        checkouts = record_map.get("checkouts")
+        if isinstance(checkouts, list):
+            for checkout_obj in checkouts:
+                if isinstance(checkout_obj, dict):
+                    _expand_containing_refs_sidecar(
+                        config, checkout_obj, "finish journal.record checkout"
+                    )
+    salvage_list = journal.get("salvage")
+    if isinstance(salvage_list, list):
+        for salvage_entry in salvage_list:
+            if isinstance(salvage_entry, dict):
+                _expand_containing_refs_sidecar(
+                    config, salvage_entry, "finish journal.salvage entry"
+                )
+
+
+def _shrink_finish_journal(
+    config: Config, payload: Mapping[str, object]
+) -> dict[str, object]:
+    """The on-disk form of one finish journal (#1757): side files first."""
+
+    if payload.get("kind") != "finish":
+        return dict(payload)
+    shrunk = json.loads(json.dumps(payload))
+    record_obj = shrunk.get("record")
+    if isinstance(record_obj, dict):
+        checkouts_obj = record_obj.get("checkouts")
+        if isinstance(checkouts_obj, list):
+            for checkout_obj in checkouts_obj:
+                if isinstance(checkout_obj, dict):
+                    _sidecar_containing_refs(config, checkout_obj)
+    salvage_obj = shrunk.get("salvage")
+    if isinstance(salvage_obj, list):
+        for salvage_entry in salvage_obj:
+            if isinstance(salvage_entry, dict):
+                _sidecar_containing_refs(config, salvage_entry)
+    return shrunk
 
 
 def _finish_journal_payload(
