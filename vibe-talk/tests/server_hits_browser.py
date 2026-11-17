@@ -231,7 +231,8 @@ NEWEST_CLEAR_JS = """() => {
     const box = (e) => { const r = e.getBoundingClientRect();
         return {left: r.left, top: r.top, right: r.right, bottom: r.bottom}; };
     const chip = document.getElementById('jump-newest');
-    const hit = document.querySelector('#server-hits .server-hit');
+    const hit = document.querySelector('#discord-log > li[data-server-hit="card"]')
+        || document.querySelector('#server-hits .server-hit');
     const area = document.getElementById('scroll-area');
     if (!drawn(chip) || chip.hidden || !drawn(hit) || !drawn(area)) return null;
     return {chip: box(chip), hit: box(hit), area: box(area)};
@@ -367,19 +368,26 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     walk.check(page.is_visible("#server-more"), "More is not offered with a further page waiting")
     walk.check(page.is_visible("#search-further"), "Search further back is not offered expanded")
     walk.shot("after-expand")
-    # `#1783 vibe-talk-review-nits-1761-1762-1767` (b) (#1762 follow-up): the
-    # Newest chip must not cover the first expanded server hit. Bring that hit
-    # to the foot of the list area, where the chip floats, and measure.
+    # `#1783 vibe-talk-review-nits-1761-1762-1767` (b) (#1762 follow-up, adapted
+    # to #1786): the Newest chip must not cover the first expanded server hit.
+    # Under #1786 the in-scope hits are timeline cards (`data-server-hit`),
+    # drawn settled, and the details above are already open. Bring the first
+    # hit card to the foot of the list area, where the chip floats — the chip
+    # itself appears only once the reader is in the scrollback that this
+    # scroll creates — and measure.
+    page.evaluate("() => { const h = document.querySelector('#discord-log > li[data-server-hit=\"card\"]')"
+                  " || document.querySelector('#server-hits .server-hit');"
+                  " if (h) h.scrollIntoView({block: 'end'}); }")
     walk.until("() => { const c = document.getElementById('jump-newest');"
-               " return c && !c.hidden && c.getClientRects().length > 0"
-               " && document.querySelector('#server-hits .server-hit'); }",
+               " const h = document.querySelector('#discord-log > li[data-server-hit=\"card\"]')"
+               " || document.querySelector('#server-hits .server-hit');"
+               " return Boolean(c && !c.hidden && c.getClientRects().length > 0 && h); }",
                "the Newest chip or the first server hit is not drawn expanded")
-    page.evaluate("() => document.querySelector('#server-hits .server-hit')"
-                  ".scrollIntoView({block: 'end'})")
     # Condition wait only: the scroll may be animated, so wait until the hit
     # rests clear of the chip (its reserved scroll margin, 11-message-text.css).
     walk.until("() => { const c = document.getElementById('jump-newest');"
-               " const h = document.querySelector('#server-hits .server-hit');"
+               " const h = document.querySelector('#discord-log > li[data-server-hit=\"card\"]')"
+               " || document.querySelector('#server-hits .server-hit');"
                " if (!c || !h) return false;"
                " const a = c.getBoundingClientRect(), b = h.getBoundingClientRect();"
                " return b.bottom <= a.top + 0.5 || b.top >= a.bottom - 0.5; }",
