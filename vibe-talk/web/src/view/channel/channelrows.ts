@@ -176,14 +176,16 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
   const el = deps.byId;
 
   // `#1836`: rows first measured while their list is hidden have no layout
-  // yet; when a list gains size, measure what stands in it.
+  // yet; when a list gains size, measure what stands in it. Placement follows
+  // WIDTH changes only: a height change (the keyboard) never re-measures.
   if (typeof ResizeObserver !== "undefined") {
-    const sweep = (list: Element): void => {
-      for (const row of list.children) measureLabelRow(row as HTMLElement);
-    };
+    const widths = new Map<Element, number>();
     const watcher = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        if (entry.contentRect.width > 0) sweep(entry.target);
+        const width = entry.contentRect.width;
+        if (width <= 0 || widths.get(entry.target) === width) continue;
+        widths.set(entry.target, width);
+        for (const row of entry.target.children) measureLabelRow(row as HTMLElement);
       }
     });
     for (const listId of ["discord-log", "pinned-log"]) {
@@ -191,21 +193,6 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
         watcher.observe(el(listId));
       } catch { /* a list this page has not drawn */ }
     }
-  }
-
-  // `#1836`: label placement follows WIDTH changes only (a column resize, a
-  // window resize); a height change (the keyboard) never re-measures.
-  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
-    let lastWidth = window.innerWidth;
-    window.addEventListener("resize", () => {
-      if (window.innerWidth === lastWidth) return;
-      lastWidth = window.innerWidth;
-      for (const listId of ["discord-log", "pinned-log"]) {
-        try {
-          for (const row of el(listId).children) measureLabelRow(row as HTMLElement);
-        } catch { /* a list this page has not drawn */ }
-      }
-    });
   }
 
   function emptyMessage(message: Message | null | undefined): boolean {
