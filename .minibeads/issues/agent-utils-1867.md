@@ -1,6 +1,6 @@
 ---
 title: "vibe-talk-save-draft-chip-covers-text: the Save draft chip must never cover typed words"
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -26,3 +26,7 @@ In the #1840 screenshots (phone-light-a-draft-saved.png, dark-phone-kbopen.png) 
 # Notes
 
 Fast follow to #1840 vibe-talk-draft-sync-across-devices (landed e166ec38, deployed), from the coordinator's review of the lane's own screenshots. Owner-priority, path-selected gate.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 703b4521 on main. The channel box reserves the chip's room as end padding, so typed text wraps before the chip at any size; the new save-draft-chip browser check holds the chip's rect clear of the text area at 412x915 and 1280x800 with a long first line, and the keyboard and offline walks still pass. Gate: pass on a1a284aa (ledger 2026-11-18T22:13:06Z, no failed steps, local preflight waived with the locally verified suites recorded).
