@@ -28,12 +28,17 @@ writes files nobody opens is not evidence.
 
 What the harness guarantees, so lanes do not have to re-prove it:
 
-- **Discuss is real.** The throwaway server runs with the fake chat
-  upstream serving the timeline and a `[summaries.llm]` section pointing
-  at `model_stub.py` on loopback, so preview and Summarize answer through
-  the real server router with the page's exact requests. Only the
-  external model is stubbed. A shot showing "not served by this check", a
-  404, or an error banner for Discuss fails the state's own checks.
+- **Discuss is real.** For a Discuss run (`--only` naming the matrix
+  states) the throwaway server also gets a serving message cache, and
+  the harness seeds it with the server's own history walk; with the fake
+  chat upstream serving the timeline and a `[summaries.llm]` section
+  pointing at `model_stub.py` on loopback, preview and Summarize answer
+  through the real server router with the page's exact requests. Only
+  the external model is stubbed. A shot showing "not served by this
+  check", a 404, or an error banner for Discuss fails the state's own
+  checks. A wider walk keeps its cacheless server (the Settings and
+  Help states photograph exactly that) and skips the Discuss states by
+  name there.
 - **The keyboard really shrinks.** `76-discuss-keyboard-open` uses the
   one shared `shrink_keyboard` helper: viewport set to height − 336,
   then a condition wait until `visualViewport.height` equals it. If an

@@ -3369,7 +3369,7 @@ steps:
       # One browser slot per profile shard: the six device profiles walk in parallel steps
       # instead of one step holding every browser slot for the whole walk. Together the
       # three shards photograph every profile, exactly as the single step did.
-      # run.sh claims each shard's three ports (server, +1/+2 for the mock) before binding
+      # run.sh claims each shard's four ports (server, +1/+2 for the mock, +3 for the model stub) before binding
       # them, so shards and other checkouts' gates starting together get distinct ports; a
       # fixed port per shard collided whenever two gates photographed at once (#1037).
       resources: {browser: 1}
@@ -3394,7 +3394,7 @@ steps:
       # One browser slot per profile shard: the six device profiles walk in parallel steps
       # instead of one step holding every browser slot for the whole walk. Together the
       # three shards photograph every profile, exactly as the single step did.
-      # run.sh claims each shard's three ports (server, +1/+2 for the mock) before binding
+      # run.sh claims each shard's four ports (server, +1/+2 for the mock, +3 for the model stub) before binding
       # them, so shards and other checkouts' gates starting together get distinct ports; a
       # fixed port per shard collided whenever two gates photographed at once (#1037).
       resources: {browser: 1}
@@ -3419,7 +3419,7 @@ steps:
       # One browser slot per profile shard: the six device profiles walk in parallel steps
       # instead of one step holding every browser slot for the whole walk. Together the
       # three shards photograph every profile, exactly as the single step did.
-      # run.sh claims each shard's three ports (server, +1/+2 for the mock) before binding
+      # run.sh claims each shard's four ports (server, +1/+2 for the mock, +3 for the model stub) before binding
       # them, so shards and other checkouts' gates starting together get distinct ports; a
       # fixed port per shard collided whenever two gates photographed at once (#1037).
       resources: {browser: 1}

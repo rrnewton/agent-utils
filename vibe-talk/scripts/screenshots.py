@@ -7385,7 +7385,7 @@ def run_captures(
     # on the real server, never an interception of the page's Discuss route), then wait —
     # on the preview's own count, never a fixed sleep — until the window holds messages.
     # Only a run that photographs Discuss insists; another run proceeds without it.
-    def seed_discuss_cache() -> None:
+    def seed_discuss_cache(deadline_s: float = 60) -> bool:
         base = url.rstrip("/")
         headers = {"Authorization": f"Bearer {token}"}
         # A first write-scope read, which is what the history walk starts from.
@@ -7407,7 +7407,7 @@ def run_captures(
                 pass
         except (HTTPError, URLError):
             pass  # the poll below is the verdict either way
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + deadline_s
         while time.monotonic() < deadline:
             try:
                 preview_req = Request(
@@ -7416,18 +7416,28 @@ def run_captures(
                 with urlopen(preview_req, timeout=10) as response:  # noqa: S310
                     preview = json.loads(response.read())
                 if int(preview.get("window", {}).get("count", 0)) > 0:
-                    return
+                    return True
             except (HTTPError, URLError, ValueError):
                 pass
             time.sleep(0.25)
-        if any(scene.name.startswith(("73-", "74-", "75-", "76-")) for scene in scenes):
+        return False
+
+    # A run photographing only Discuss (the standard matrix) insists on a real window: an
+    # empty pane there is the failure the matrix exists to catch. A wider walk skips those
+    # states BY NAME instead — its server is deliberately cacheless (the Settings and Help
+    # states photograph exactly that), so Discuss has no window to show there.
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-"))]
+    discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
+    if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
+        if discuss_only:
             raise RuntimeError(
                 "the Discuss window stayed empty after the server's history walk, so the "
                 "Discuss states would photograph an empty pane. The server needs a serving "
-                "message cache (run.sh configures one); check its log."
+                "message cache (run.sh configures one for Discuss runs); check its log."
             )
-
-    seed_discuss_cache()
+        for scene in discuss_scenes:
+            print(f"  skip  {scene.name:<30} no Discuss window on a cacheless server")
+        scenes = [s for s in scenes if s not in discuss_scenes]
 
     everything: list[tuple[str, Path, Verdict]] = []
     # Two processes judge the captures while the walk goes on; see `start_capture`. Spawned rather

@@ -119,7 +119,7 @@
 #                  It starts its OWN throwaway server, native (not a container), with
 #                  --fake-discord, on port 18091 by default — never 8080, and it refuses to use it.
 #                  The mock vendor takes 18092 and 18093 beside it. When any of those is taken, or
-#                  claimed by another run, it takes three free ports the kernel picks instead.
+#                  claimed by another run, it takes four free ports the kernel picks instead.
 #                  Each run claims its three ports (lock files under
 #                  ${XDG_RUNTIME_DIR:-/tmp}/vibe-talk-shots-ports) for as long as it runs, so runs
 #                  that start together, from one checkout or several, never pick the same ones.
@@ -428,7 +428,7 @@ if [ "$SCREENSHOTS" = 1 ]; then
     [ -x "$SHOTS_SCRIPT" ] || die "the screenshot harness is missing or not executable: $SHOTS_SCRIPT"
 
     SHOTS_PORT="${PORT_OVERRIDE:-${VIBE_TALK_SHOTS_PORT:-}}"
-    # A run CLAIMS its three ports (P for the server, P+1 and P+2 for the mock) before it binds
+    # A run CLAIMS its four ports (P for the server, P+1 and P+2 for the mock, P+3 for the model stub) before it binds
     # them, and holds the claims until it ends (#1037 shots-port-collision). Proving a port free
     # and then releasing it until the server binds let two runs that start together -- two
     # checkouts' gates, or one gate's screenshot shards -- choose the same ports, and the second
@@ -444,15 +444,16 @@ if [ "$SCREENSHOTS" = 1 ]; then
     SHOTS_LOCK_DIR="${XDG_RUNTIME_DIR:-/tmp}/vibe-talk-shots-ports"
     shots_claim() {
         exec 7>"$SHOTS_LOCK_DIR/$1.lock" 8>"$SHOTS_LOCK_DIR/$(($1 + 1)).lock" \
-            9>"$SHOTS_LOCK_DIR/$(($1 + 2)).lock" || { shots_release; return 1; }
-        if flock -n 7 && flock -n 8 && flock -n 9; then
+            9>"$SHOTS_LOCK_DIR/$(($1 + 2)).lock" 6>"$SHOTS_LOCK_DIR/$(($1 + 3)).lock" \
+            || { shots_release; return 1; }
+        if flock -n 7 && flock -n 8 && flock -n 9 && flock -n 6; then
             return 0
         fi
         shots_release
         return 1
     }
     shots_release() {
-        exec 7>&- 8>&- 9>&-
+        exec 7>&- 8>&- 9>&- 6>&-
     }
     command -v flock >/dev/null 2>&1 || die "--screenshots needs flock (util-linux) to claim its
 ports, so that runs starting together never pick the same ones, and it is not on PATH."
@@ -475,7 +476,7 @@ for _ in range(64):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         first = probe.getsockname()[1]
-    run = (first, first + 1, first + 2)
+    run = (first, first + 1, first + 2, first + 3)
     if run[-1] <= 65535 and not {8080, 18081} & set(run):
         print(first)
 PY
@@ -489,7 +490,7 @@ import sys
 base = int(sys.argv[1])
 held = []
 try:
-    for port in (base, base + 1, base + 2):
+    for port in (base, base + 1, base + 2, base + 3):
         sock = socket.socket()
         held.append(sock)
         sock.bind(("127.0.0.1", port))
@@ -505,7 +506,7 @@ PY
             fi
             shots_release
         done
-        [ -n "$SHOTS_PORT" ] || die "--screenshots found no three consecutive free, unclaimed ports
+        [ -n "$SHOTS_PORT" ] || die "--screenshots found no four consecutive free, unclaimed ports
 on 127.0.0.1 in 64 tries. Pass one with --port or VIBE_TALK_SHOTS_PORT."
     fi
     # Named, not merely "in use". 8080 serves the owner's live agent and 18081 is the unrelated
@@ -556,7 +557,7 @@ choose another port with --port."
             die "--port $SHOTS_PORT puts the offline ElevenLabs mock on port $shots_extra_port,
 which is either the LIVE vibe-talk (8080) or the unrelated vibe-talk:ci container (18081). The
 mock takes the TWO PORTS ABOVE the one you chose, so choose one whose two successors are neither.
-Leave --port off to use 18091, 18092 and 18093, or three free ports when any is taken."
+Leave --port off to use 18091, 18092 and 18093, or four free ports when any is taken."
         fi
         if command -v ss >/dev/null 2>&1 &&
             ss -ltn 2>/dev/null | grep -Eq "[:.]${shots_extra_port}[[:space:]]"; then
@@ -668,16 +669,23 @@ reply_timeout_seconds = 3
 EOF
         printf 'path = "%s/state/vibe-talk.sqlite3"\n' "$SHOTS_TMP"
         # `#1855`: Discuss reads the served message cache (channel scopes are cache-only), so
-        # the throwaway server needs one that fills and serves. Beside the store, inside the
-        # 0700 throwaway directory the cache's own filesystem check requires.
-        cat <<'EOF'
+        # a run photographing Discuss needs one that fills and serves. Only then: the Settings
+        # and Help states photograph a server with NO cache, and that stays the default here.
+        # Beside the store, inside the 0700 throwaway directory the cache check requires.
+        SHOTS_DISCUSS=0
+        for shots_state in "${SHOTS_ONLY[@]}"; do
+            case "$shots_state" in 73-*|74-*|75-*|76-*) SHOTS_DISCUSS=1 ;; esac
+        done
+        if [ "$SHOTS_DISCUSS" = 1 ]; then
+            cat <<'EOF'
 
 [message_cache]
 enabled = true
 serve = true
 backfill = "full"
 EOF
-        printf 'path = "%s/state/message-cache.sqlite3"\n' "$SHOTS_TMP"
+            printf 'path = "%s/state/message-cache.sqlite3"\n' "$SHOTS_TMP"
+        fi
         # `#1855`: Discuss through the real router. Without a [summaries.llm] section the
         # catchup endpoint refuses by name; with one pointed at the loopback model stub
         # (started below), preview and Summarize really answer and only the model is invented.
