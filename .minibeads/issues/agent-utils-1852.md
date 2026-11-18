@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-whole-threads-toggle: Whole threads as a fixed-width toggle icon on the search bar'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -8,7 +8,7 @@ labels:
 - search
 - ui
 created_at: 2026-11-18T10:47:28-05:00
-updated_at: 2026-11-18T10:47:28-05:00
+updated_at: 2026-11-18T15:09:08-05:00
 ---
 
 # Description
@@ -36,3 +36,7 @@ Behaviour: unchanged matching core (`setEntireThreads`/`entireThreadHits` in the
 # Notes
 
 Prior work: #1825 vibe-talk-hashtag-labels (landed d1a87ebb) — `Message.labels`, `label:<slug>` search, and the Entire-threads chip beside the #1797 buckets (`setEntireThreads` in `web/src/view/channel/searchrows.ts`, chip in the bucket row in `web/voice.html`, wired in `web/src/view/channel/listcontrols.ts`). This issue moves and completes that control per the owner request above; the matching core is reused, not duplicated.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 55dac4d7 (gated tree 033be0bf replayed; combined tree 26b7162e verified with the whole-threads, labels, search-whose and offline phone-360 walks plus typecheck). The toggle icon stands first of the search-bar filters in `#search-float` (Links/Pinned/glass adjacency kept), greyed 🧵 off and accent-circled on, tooltip "Whole threads: if any msg matches" as `title` and `aria-label`, state in `aria-pressed`; every bar icon carries a tooltip and accessible label; the bucket-row chip is gone and the row keeps a stable one-chip height. Thread-list cards stand by `data-context-id`; word and `label:` searches widen identically in All, thread list and two columns; reading or replying never resets it (only the toggle or closing the bar, which clears every bar filter). The fourth square's width comes off the field total (96px floor in the bar checks), never off its 60px text room: the count is px-capped and leaves the visual bar under 340px. Browser proof in /tmp/mu-wholethreads-shots (26, inspected). #1853 mu-labelsdrop follows on this landing and owns swapping the test's #pinned-filter assertion to #labels-button.
