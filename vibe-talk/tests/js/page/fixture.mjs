@@ -5195,6 +5195,10 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // boundary between a judgement and a different behaviour wearing the same name.
 
 const TUNING_BANDS = {
+  // `#1840 vibe-talk-draft-sync-across-devices`. Typing idle before a draft syncs:
+  // long enough that a pause to think is one write, short enough that picking
+  // up another device a moment later finds the words there.
+  DRAFT_AUTOSYNC_IDLE_MS: [500, 30000, "typing idle before a composer draft syncs to the owner's server"],
   // `#1816 vibe-talk-search-history-up-arrow`. Search terms kept for Up and Down to recall:
   // enough for a sitting's back-and-forth, few enough that the device holds nothing much.
   SEARCH_HISTORY_LIMIT: [10, 500, "search terms kept for Up and Down in the search box"],
