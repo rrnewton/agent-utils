@@ -1351,12 +1351,18 @@ def settle_ui(driver: Driver, keep_status: bool = False) -> None:
             driver.page.keyboard.press("Escape")
     # The transient status pill ("Ready." and its kin) through its own dismiss control —
     # unless the scene is photographing that line, which its expectations then name.
+    # Best-effort: a scene whose subject covers the pill (a popout over it) must not fail
+    # here; the pill it could not dismiss is part of that scene's own picture.
     if not keep_status and bool(driver.js("window.__visible('status-line')")):
-        driver.click("dismiss-status")
-    status_part = "" if keep_status else " && !window.__visible('status-line')"
+        try:
+            driver.page.click("#dismiss-status", timeout=2_000)
+            driver.page.wait_for_function(
+                "() => !window.__visible('status-line')", timeout=2_000
+            )
+        except Exception:
+            pass
     driver.page.wait_for_function(
-        "() => !window.__visible('view-cards') && !window.__visible('docs-fetch-menu')"
-        + status_part,
+        "() => !window.__visible('view-cards') && !window.__visible('docs-fetch-menu')",
         timeout=5_000,
     )
     # The freshness pill ("Live · updated …") leaves on its own clock, like "Ready." does:

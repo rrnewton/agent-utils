@@ -689,8 +689,12 @@ EOF
         # `#1855`: Discuss through the real router. Without a [summaries.llm] section the
         # catchup endpoint refuses by name; with one pointed at the loopback model stub
         # (started below), preview and Summarize really answer and only the model is invented.
-        printf '\n[summaries.llm]\nbase_url = "http://127.0.0.1:%s"\n' "$SHOTS_MODEL_PORT"
-        printf 'model = "model-stub"\napi_key_file = "%s/model-key"\n' "$SHOTS_TMP"
+        # Discuss runs only, like the cache above: a [summaries.llm] section also replaces
+        # the message summariser, whose states photograph the vendor mock's own answers.
+        if [ "$SHOTS_DISCUSS" = 1 ]; then
+            printf '\n[summaries.llm]\nbase_url = "http://127.0.0.1:%s"\n' "$SHOTS_MODEL_PORT"
+            printf 'model = "model-stub"\napi_key_file = "%s/model-key"\n' "$SHOTS_TMP"
+        fi
     } > "$SHOTS_TMP/vibe-talk.toml"
     printf 'screenshot-run-model-key-not-a-real-credential' > "$SHOTS_TMP/model-key"
 
