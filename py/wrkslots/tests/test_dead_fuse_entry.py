@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -160,6 +161,18 @@ def _kill(
 
     monkeypatch.setattr(os, "stat", dead_stat)
     monkeypatch.setattr(os, "lstat", dead_lstat)
+    # The bounded dead-mount probe stats in a child process, which
+    # cannot see the patched functions; name the dead paths for it.
+    monkeypatch.setenv("WRKSLOTS_TEST_DEAD_MOUNT_PATHS", os.pathsep.join(deads))
+
+
+def _hold(root: Path, slot: str) -> int:
+    return cli._cmd_hold(
+        argparse.Namespace(
+            project_root=str(root), machine=None, slot=slot,
+            reason="hold for test", wait_lock=0.0,
+        )
+    )
 
 
 def _heartbeat(root: Path, slot: str, agent: str) -> int:
@@ -351,6 +364,49 @@ def test_storage_census_reports_the_dead_entry_for_its_owning_slot(
     assert [(item.slot, item.detail) for item in dead_findings] == [
         ("slot-b", f"dead FUSE entry at {dead}, owning slot slot-b")
     ]
+
+
+def test_command_exits_when_the_dead_mount_probe_hangs(
+    tmp_path: Path,
+) -> None:
+    """A probe stuck in the kernel must not stall or pin the process (#1802).
+
+    The driver runs the real `hold` command in a subprocess with the
+    probe child forced to sleep forever; the command must still
+    finish (probe abandoned at its bound) and the process must exit.
+    """
+
+    py_dir = str(Path(cli.__file__).resolve().parent.parent)
+    tests_dir = str(Path(__file__).resolve().parent)
+    driver = tmp_path / "driver.py"
+    driver.write_text(
+        "import os, sys\n"
+        f"sys.path.insert(0, {py_dir!r})\n"
+        f"sys.path.insert(0, {tests_dir!r})\n"
+        "os.environ['WRKSLOTS_TEST_DEAD_MOUNT_PROBE'] = 'hang'\n"
+        "import errno\n"
+        "from pathlib import Path\n"
+        "import test_dead_fuse_entry as harness\n"
+        "class _Patch:\n"
+        "    def setattr(self, obj, name, value):\n"
+        "        setattr(obj, name, value)\n"
+        "    def setenv(self, name, value):\n"
+        "        os.environ[name] = value\n"
+        "base = Path(sys.argv[1])\n"
+        "root = harness._fixture(base)\n"
+        "dead = root / 'worktrees' / 'slot-b' / 'repo'\n"
+        "harness._kill(_Patch(), base, [dead], errno.ENOTCONN)\n"
+        "assert harness.cli._mount_point_is_dead(dead)\n"
+        "raise SystemExit(harness._hold(root, 'slot-a'))\n",
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [sys.executable, str(driver), str(tmp_path)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "dead FUSE entry at" in completed.stderr
+    assert "owning slot slot-b" in completed.stderr
 
 
 def _interrupted_journal(root: Path) -> None:

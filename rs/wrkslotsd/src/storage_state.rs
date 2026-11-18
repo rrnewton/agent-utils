@@ -369,29 +369,93 @@ pub(crate) fn dead_mount_point(
 /// indefinitely, which no lifecycle command may wait on (#1802).
 const DEAD_MOUNT_PROBE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Which probe child to run; the hang value is a test seam.
+fn dead_mount_probe_command(path: &Path) -> std::process::Command {
+    if std::env::var_os("WRKSLOTSD_TEST_DEAD_MOUNT_PROBE").is_some_and(|value| value == "hang") {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("3600");
+        return command;
+    }
+    let mut command = std::process::Command::new("/usr/bin/stat");
+    command
+        .args(["--format=%d", "--"])
+        .arg(path)
+        .env("LC_ALL", "C");
+    command
+}
+
+enum DeadMountProbe {
+    /// The stat answered in time (Some errno on failure).
+    Answered(Option<i32>),
+    /// The probe child was abandoned at the bound.
+    TimedOut,
+    /// The probe could not run at all.
+    Unavailable,
+}
+
+fn probe_dead_mount(path: &Path) -> DeadMountProbe {
+    use std::io::Read as _;
+    let spawned = dead_mount_probe_command(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(_) => return DeadMountProbe::Unavailable,
+    };
+    let deadline = std::time::Instant::now() + DEAD_MOUNT_PROBE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                let errno = if stderr.contains("Transport endpoint is not connected") {
+                    Some(107)
+                } else if stderr.contains("Input/output error") {
+                    Some(5)
+                } else if child.id() > 0 && stderr.contains("No such file or directory") {
+                    Some(2)
+                } else {
+                    None
+                };
+                // Exit 0 carries no stderr: the stat answered.
+                return DeadMountProbe::Answered(if stderr.is_empty() { None } else { errno });
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Abandon, never wait: a child stuck in an
+                    // uninterruptible stat ignores the kill until
+                    // the kernel answers, and waiting would block.
+                    let _ = child.kill();
+                    return DeadMountProbe::TimedOut;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return DeadMountProbe::Unavailable,
+        }
+    }
+}
+
 /// The dead FUSE mount point responsible for a failed stat of
-/// `path` in this process's mount table, or None. The stat runs on
-/// a helper thread with a receive bound: a timeout counts as dead,
-/// because a mount that cannot answer within the bound is unusable
-/// storage either way, and the probe itself must never block.
+/// `path` in this process's mount table, or None. The stat runs in
+/// a short-lived child process abandoned at the bound: no thread
+/// of this process ever waits on a stat that may sit in the kernel
+/// uninterruptibly, and the process still exits on time. A timeout
+/// counts as dead, because a mount that cannot answer within the
+/// bound is unusable storage either way.
 pub(crate) fn dead_mount_at(path: &Path) -> Option<PathBuf> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let probed = path.to_path_buf();
-    std::thread::spawn(move || {
-        let errno = std::fs::symlink_metadata(&probed)
-            .err()
-            .and_then(|error| error.raw_os_error());
-        let _ = sender.send(errno);
-    });
-    let errno = match receiver.recv_timeout(DEAD_MOUNT_PROBE) {
-        Ok(errno) => {
+    let errno = match probe_dead_mount(path) {
+        DeadMountProbe::Answered(errno) => {
             if !is_dead_mount_errno(errno) {
                 return None;
             }
             errno
         }
-        // Timed out: match the table as if the stat failed dead.
-        Err(_) => Some(107),
+        DeadMountProbe::TimedOut => Some(107),
+        DeadMountProbe::Unavailable => return None,
     };
     let entries = mount_entries().ok()?;
     dead_mount_point(path, &entries, errno)
@@ -1432,6 +1496,20 @@ mod tests {
         assert_eq!(
             dead_mount_point(Path::new("/elsewhere"), &table, Some(107)),
             None
+        );
+    }
+
+    #[test]
+    fn dead_mount_probe_abandons_a_hung_child_at_the_bound() {
+        std::env::set_var("WRKSLOTSD_TEST_DEAD_MOUNT_PROBE", "hang");
+        let started = std::time::Instant::now();
+        let outcome = probe_dead_mount(Path::new("/srv/slots/slot-b/repo"));
+        std::env::remove_var("WRKSLOTSD_TEST_DEAD_MOUNT_PROBE");
+        assert!(matches!(outcome, DeadMountProbe::TimedOut));
+        assert!(
+            started.elapsed() < DEAD_MOUNT_PROBE + std::time::Duration::from_secs(5),
+            "probe exceeded its bound: {:?}",
+            started.elapsed()
         );
     }
 

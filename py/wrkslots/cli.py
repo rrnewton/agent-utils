@@ -17011,38 +17011,73 @@ def _dead_mount_owner(
 
 
 #: Bound on one dead-mount probe. A live mount answers at once; a
-#: hung FUSE server can hold a plain stat in the kernel indefinitely,
-#: which no lifecycle command may wait on (#1802).
+#: hung FUSE server can hold a plain stat in the kernel indefinitely
+#: (uninterruptible, ignoring SIGTERM), which no lifecycle command
+#: may wait on (#1802).
 _DEAD_MOUNT_PROBE_SECONDS = 5.0
+
+_DEAD_MOUNT_PROBE_PROGRAM = (
+    "import os, sys\n"
+    # Test seam: paths named here report ENOTCONN, as a dead mount does.
+    "fake = os.environ.get('WRKSLOTS_TEST_DEAD_MOUNT_PATHS', '')\n"
+    "if any(\n"
+    "    sys.argv[1] == part or sys.argv[1].startswith(part + '/')\n"
+    "    for part in fake.split(os.pathsep)\n"
+    "    if part\n"
+    "):\n"
+    "    print(107)\n"
+    "    raise SystemExit(3)\n"
+    "try:\n"
+    "    os.lstat(sys.argv[1])\n"
+    "except OSError as exc:\n"
+    "    print(exc.errno or 0)\n"
+    "    raise SystemExit(3)\n"
+)
+
+
+def _dead_mount_probe_program() -> str:
+    """The probe child's program; the hang value is a test seam."""
+
+    if os.environ.get("WRKSLOTS_TEST_DEAD_MOUNT_PROBE") == "hang":
+        return "import time\ntime.sleep(3600)\n"
+    return _DEAD_MOUNT_PROBE_PROGRAM
 
 
 def _mount_point_is_dead(point: Path) -> bool:
     """Whether ``point`` cannot be stat'ed as live storage, in bounded time.
 
-    The lstat runs on a daemon thread with a join bound: a timeout
-    counts as dead, because a mount that cannot answer within the
-    bound is unusable storage either way, and the probe itself must
-    never block the command.
+    The lstat runs in a short-lived child process abandoned at the
+    bound: no thread of this process ever waits on a stat that may
+    sit in the kernel uninterruptibly, and the process still exits
+    on time. A timeout counts as dead, because a mount that cannot
+    answer within the bound is unusable storage either way.
     """
 
-    outcome: list[bool] = []
-
-    def probe() -> None:
-        try:
-            os.lstat(point)
-        except OSError as exc:
-            outcome.append(exc.errno in _DEAD_MOUNT_ERRNOS)
-        except Exception:
-            outcome.append(False)
-        else:
-            outcome.append(False)
-
-    worker = threading.Thread(target=probe, daemon=True)
-    worker.start()
-    worker.join(_DEAD_MOUNT_PROBE_SECONDS)
-    if worker.is_alive():
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _dead_mount_probe_program(), str(point)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError:
+        return False
+    try:
+        stdout, _stderr = process.communicate(timeout=_DEAD_MOUNT_PROBE_SECONDS)
+    except subprocess.TimeoutExpired:
+        # Abandon, never wait: a child stuck in an uninterruptible
+        # stat ignores the kill until the kernel answers.
+        process.kill()
         return True
-    return bool(outcome and outcome[0])
+    if process.returncode == 0:
+        return False
+    if process.returncode == 3:
+        try:
+            return int(stdout.strip()) in _DEAD_MOUNT_ERRNOS
+        except ValueError:
+            return False
+    return False
 
 
 def _discover_dead_mounts(
