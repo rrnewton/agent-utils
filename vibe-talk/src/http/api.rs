@@ -6832,9 +6832,10 @@ pub async fn create_label_group(
 pub async fn update_label_group(
     State(state): State<AppState>,
     _scope: WriteScope,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     Json(request): Json<crate::contract::LabelGroupRequest>,
 ) -> Result<Response, ApiError> {
+    let id: i64 = id.parse().map_err(|_| ApiError::from(crate::store::StoreError::NotFound))?;
     let groups = ops::update_label_group(&state, id, &request.display, &request.spellings).await?;
     Ok(no_store(Json(crate::contract::LabelGroupsResponse {
         groups: groups.groups,
@@ -6847,8 +6848,9 @@ pub async fn update_label_group(
 pub async fn dissolve_label_group(
     State(state): State<AppState>,
     _scope: WriteScope,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
+    let id: i64 = id.parse().map_err(|_| ApiError::from(crate::store::StoreError::NotFound))?;
     let groups = ops::dissolve_label_group(&state, id).await?;
     Ok(no_store(Json(crate::contract::LabelGroupsResponse {
         groups: groups.groups,
