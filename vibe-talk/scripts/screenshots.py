@@ -3655,7 +3655,9 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
         "window.scrollTo(0, 0); return true; })()"
     )
     driver.settle(200)
-    driver.js("(() => { setStatus('Ready.'); shellNotices.holdStatus(); return true; })()")
+    # `#1859`: an idle 'Ready.' waits instead of floating; the pill this scene
+    # photographs up is an action saying, which floats as before.
+    driver.js("(() => { setStatus('Settings saved.'); shellNotices.holdStatus(); return true; })()")
     driver.page.mouse.move(1, 1)
     driver.settle(200)
     lit_layout = cast(DimLayout, driver.js(POPOUT_DIM_LAYOUT_JS))
