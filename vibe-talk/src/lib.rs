@@ -73,6 +73,7 @@ pub mod heading;
 pub mod held_replies;
 pub mod history_control;
 pub mod http;
+pub mod labels;
 pub mod link_labels;
 pub mod live;
 pub mod live_tail;

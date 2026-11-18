@@ -48,6 +48,8 @@ Build order (reviewable steps): extractor + tests; server API (`Message.labels`,
 
 # Notes
 
+Coordb amendments (2026-11-17, GO): (1) `# Heading` with a space is never a label (pinned by test); `#word` at the start of a line DOES count as a label — intended for chat. (2) A plain-text `#name` that happens to spell a channel name is still a label; only Slack's linked `<#C…|name>` form is excluded — a known, intended overlap. (3) Settings counts cover the server's message cache only and are labelled "in loaded history" in the UI; the sqlite labels table is NOT built.
+
 Open question (owner TBD, not built): "hide a label" — whether a label can be hidden from chips/Settings without deleting it, and whether hiding is per-device or server-kept. Recorded here so the TBD is not lost; no hide control ships in this issue.
 
 Auto-generated topics are out of scope; only the `auto:` prefix reservation above is made so they can land later without renaming hashtag labels.
