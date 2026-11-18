@@ -1825,6 +1825,7 @@ pub(crate) fn unbind_slot(
     slot: &str,
     slot_path: &Path,
     runner: &dyn crate::image_ops::PrivilegedRunner,
+    proc_root: &Path,
 ) -> HandlerOutcome {
     // #1733: privatise every view after the fence, then unmount with
     // a bounded busy retry; a still-busy unmount names its holders.
@@ -1887,7 +1888,7 @@ pub(crate) fn unbind_slot(
                 .ok()
                 .and_then(|when| when.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|age| age.as_secs_f64());
-            let holders_now = scan_mount_holders(Path::new("/proc"), slot_path, ctx.entries);
+            let holders_now = scan_mount_holders(proc_root, slot_path, ctx.entries);
             if let Some(holders) = &holders_now {
                 if !holders.is_empty()
                     && holders
@@ -1904,7 +1905,7 @@ pub(crate) fn unbind_slot(
                 .collect();
             for _recheck in 0..UMOUNT_RECHECKS {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                let current = scan_mount_holders(Path::new("/proc"), slot_path, ctx.entries);
+                let current = scan_mount_holders(proc_root, slot_path, ctx.entries);
                 let now: Vec<_> = current
                     .unwrap_or_default()
                     .iter()
@@ -1917,7 +1918,7 @@ pub(crate) fn unbind_slot(
         }
     }
     if !unmounted {
-        let holders = describe_mount_holders(Path::new("/proc"), slot_path, ctx.entries);
+        let holders = describe_mount_holders(proc_root, slot_path, ctx.entries);
         return wt_refusal(&format!(
             "umount {}: target is busy after {UMOUNT_ATTEMPTS} attempts; still held by {holders}",
             slot_path.display()
@@ -2408,7 +2409,15 @@ mod tests {
             entries: &[],
             skipped: None,
         };
-        let failed = unbind_slot(&ctx, "slot-a", &slot_path, &Fake { returncode: 1 });
+        let proc_root = root.join("proc");
+        std::fs::create_dir_all(&proc_root).expect("proc root");
+        let failed = unbind_slot(
+            &ctx,
+            "slot-a",
+            &slot_path,
+            &Fake { returncode: 1 },
+            &proc_root,
+        );
         assert_eq!(failed.exit, 3);
         assert!(
             load_bind_records(&control)
@@ -2416,7 +2425,13 @@ mod tests {
                 .contains_key("slot-a"),
             "failed unmount must keep the bind record"
         );
-        let done = unbind_slot(&ctx, "slot-a", &slot_path, &Fake { returncode: 0 });
+        let done = unbind_slot(
+            &ctx,
+            "slot-a",
+            &slot_path,
+            &Fake { returncode: 0 },
+            &proc_root,
+        );
         assert_eq!(done.exit, 0, "{}", done.stderr);
         assert!(
             !load_bind_records(&control)
@@ -2563,7 +2578,12 @@ mod tests {
         let busy = Busy {
             umounts: RefCell::new(0),
         };
-        let outcome = unbind_slot(&ctx, "slot-a", &slot_path, &busy);
+        // An empty fake /proc: the retry is bounded by attempts, and
+        // rescanning the host's whole process table between them made
+        // this test's duration a function of host size and load.
+        let proc_root = root.join("proc");
+        std::fs::create_dir_all(&proc_root).expect("proc root");
+        let outcome = unbind_slot(&ctx, "slot-a", &slot_path, &busy, &proc_root);
         assert_eq!(outcome.exit, 3);
         assert!(
             outcome.stderr.contains("target is busy after 3 attempts"),
