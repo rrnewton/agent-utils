@@ -648,10 +648,21 @@ fn path_within(candidate: &Path, root: &Path) -> bool {
 /// PIDs of live wrkslots removal processes for this project acting on
 /// `targets`, mirroring `_other_live_wrkslots_processes`.
 pub(crate) fn other_live_wrkslots_processes(root: &Path, targets: &[String]) -> Vec<i64> {
+    other_live_wrkslots_processes_in(root, targets, Path::new("/proc"))
+}
+
+/// The scan over a caller-chosen process table (#1778): the live
+/// path passes /proc; tests pass a fake table so the rule is judged
+/// hermetically, never against whatever the host happens to run.
+pub(crate) fn other_live_wrkslots_processes_in(
+    root: &Path,
+    targets: &[String],
+    proc_root: &Path,
+) -> Vec<i64> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let own = i64::from(std::process::id());
     let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
         return vec![-1];
     };
     for entry in entries.flatten() {
@@ -690,8 +701,14 @@ pub(crate) fn other_live_wrkslots_processes(root: &Path, targets: &[String]) -> 
         {
             continue;
         }
+        // The FIRST --project-root wins, as in `_wrkslots_project_of`:
+        // a wrapper argv embedding a whole wrkslots invocation as data
+        // must not have its last mention judge the process (#1778).
         let mut project: Option<PathBuf> = None;
         for (index, argument) in argv.iter().enumerate() {
+            if project.is_some() {
+                break;
+            }
             if argument == "--project-root" {
                 project = argv.get(index + 1).map(PathBuf::from);
             } else if let Some(value) = argument.strip_prefix("--project-root=") {
@@ -1308,5 +1325,201 @@ mod lock_wait_tests {
         };
         assert!(error.contains("another writer is waiting"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod fallback_scan_tests {
+    use super::other_live_wrkslots_processes_in;
+    use std::path::{Path, PathBuf};
+
+    fn table() -> (PathBuf, PathBuf, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("wrkslots-fallback-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("project");
+        let other = base.join("other");
+        let proc_root = base.join("proc");
+        for dir in [
+            root.clone(),
+            other.clone(),
+            proc_root.clone(),
+            root.join("sub"),
+            other.join("sub"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        let process = |pid: i64, argv: &[String], cwd: Option<&Path>| {
+            let entry = proc_root.join(pid.to_string());
+            std::fs::create_dir_all(&entry).unwrap();
+            let mut bytes: Vec<u8> = Vec::new();
+            for part in argv {
+                bytes.extend_from_slice(part.as_bytes());
+                bytes.push(0);
+            }
+            std::fs::write(entry.join("cmdline"), bytes).unwrap();
+            if let Some(cwd) = cwd {
+                std::os::unix::fs::symlink(cwd, entry.join("cwd")).unwrap();
+            }
+        };
+        let r = root.display().to_string();
+        let o = other.display().to_string();
+        let argv =
+            |parts: &[&str]| -> Vec<String> { parts.iter().map(|part| part.to_string()).collect() };
+        process(
+            4101,
+            &argv(&[
+                "python3",
+                "-m",
+                "wrkslots",
+                "--project-root",
+                &r,
+                "remove",
+                "target",
+            ]),
+            Some(&base),
+        );
+        process(
+            4102,
+            &argv(&[
+                "python3",
+                "-m",
+                "wrkslots",
+                "--project-root",
+                &o,
+                "remove",
+                "target",
+            ]),
+            Some(&base),
+        );
+        process(
+            4103,
+            &argv(&["python3", "-m", "wrkslots", "remove", "target"]),
+            Some(&root.join("sub")),
+        );
+        process(
+            4104,
+            &argv(&["python3", "-m", "wrkslots", "remove", "target"]),
+            Some(&other.join("sub")),
+        );
+        process(
+            4105,
+            &argv(&["python3", "-m", "wrkslots", "remove", "target"]),
+            None,
+        );
+        let unreadable = proc_root.join("4106");
+        std::fs::create_dir_all(unreadable.join("cmdline")).unwrap();
+        process(
+            4107,
+            &argv(&["python3", "-m", "wrkslots", "--project-root", &r, "recover"]),
+            Some(&root),
+        );
+        process(
+            4108,
+            &argv(&["/usr/bin/wrkslots", "remove", "target"]),
+            Some(&root),
+        );
+        process(
+            4109,
+            &argv(&[
+                "python3",
+                "-m",
+                "wrkslots",
+                "--project-root",
+                &r,
+                "remove",
+                "other",
+            ]),
+            Some(&base),
+        );
+        process(
+            4110,
+            &argv(&[
+                "python3",
+                "-m",
+                "wrkslots",
+                &format!("--project-root={r}"),
+                "remove-validate-batch",
+                "--slot",
+                "target=1",
+            ]),
+            Some(&base),
+        );
+        process(
+            4111,
+            &argv(&[
+                "python3",
+                "-m",
+                "wrkslots.tests.idle_validation_host",
+                "--project-root",
+                &r,
+                "remove",
+                "target",
+            ]),
+            Some(&root),
+        );
+        process(
+            4112,
+            &argv(&[
+                "python3",
+                "-m",
+                "wrkslots",
+                "--project-root",
+                &r,
+                "remove",
+                "target",
+            ]),
+            Some(&other),
+        );
+        process(
+            4113,
+            &argv(&[
+                "python3",
+                "-m",
+                "wrkslots",
+                "--project-root",
+                &o,
+                "remove",
+                "target",
+                "--project-root",
+                &r,
+            ]),
+            Some(&base),
+        );
+        process(
+            4114,
+            &argv(&[
+                "python3",
+                "-m",
+                "wrkslots",
+                "--project-root",
+                &r,
+                "remove",
+                "target",
+                "--project-root",
+                &o,
+            ]),
+            Some(&base),
+        );
+        (base, root, proc_root)
+    }
+
+    #[test]
+    fn fallback_scan_table_matches_python() {
+        let (base, root, proc_root) = table();
+        let targets = vec!["target".to_string()];
+        let mut with_targets = other_live_wrkslots_processes_in(&root, &targets, &proc_root);
+        with_targets.sort_unstable();
+        assert_eq!(
+            with_targets,
+            vec![4101, 4103, 4105, 4106, 4108, 4110, 4112, 4114]
+        );
+        let mut without_targets = other_live_wrkslots_processes_in(&root, &[], &proc_root);
+        without_targets.sort_unstable();
+        assert_eq!(
+            without_targets,
+            vec![4101, 4103, 4105, 4106, 4108, 4109, 4110, 4112, 4114]
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
