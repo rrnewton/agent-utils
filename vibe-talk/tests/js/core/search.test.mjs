@@ -303,3 +303,57 @@ test("`#624 voice-page-modularity`: the server search covers the channel on scre
   owner.chooseAllChannels("");
   assert.equal(owner.allChannels(), false);
 });
+
+test("`#1816 vibe-talk-search-history-up-arrow`: the history holds runs newest first, once each, bounded, and walks them shell-style", () => {
+  const { createSearchHistory, SEARCH_HISTORY_KEY, SEARCH_HISTORY_LIMIT } = SEARCH;
+  const store = new Map();
+  const storage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, v),
+    removeItem: (k) => store.delete(k),
+  };
+  const history = createSearchHistory({ storage });
+  assert.deepStrictEqual(history.entries(), []);
+  // No history: Up recalls nothing and Down has no walk to move.
+  assert.equal(history.older(""), null);
+  assert.equal(history.newer(), null);
+  // Blank runs are never held.
+  history.remember("   ");
+  assert.deepStrictEqual(history.entries(), []);
+  // Runs land newest first; a re-run moves to the front without duplicating.
+  history.remember("runner");
+  history.remember("mac runner");
+  history.remember("runner");
+  assert.deepStrictEqual(history.entries(), ["runner", "mac runner"]);
+  assert.deepStrictEqual(JSON.parse(store.get(SEARCH_HISTORY_KEY)), ["runner", "mac runner"]);
+  // Up from an empty box recalls the newest; further Ups walk older and stop there.
+  assert.equal(history.older(""), "runner");
+  assert.equal(history.older("runner"), "mac runner");
+  assert.equal(history.older("mac runner"), "mac runner", "Up walked past the oldest term");
+  // Down walks back newer, then past the newest returns the draft as typed.
+  assert.equal(history.newer(), "runner");
+  assert.equal(history.newer(), "", "Down past the newest did not give the draft back");
+  assert.equal(history.newer(), null, "Down kept walking after the draft came back");
+  // A typed draft is held word for word, spaces and all.
+  history.remember("alpha");
+  assert.equal(history.older("  half typed "), "alpha");
+  assert.equal(history.newer(), "  half typed ", "the draft came back altered");
+  // Typing (reset) ends the walk: the next Up starts at the newest again.
+  assert.equal(history.older("x"), "alpha");
+  history.reset();
+  assert.equal(history.newer(), null);
+  assert.equal(history.older("edited"), "alpha");
+  assert.equal(history.newer(), "edited");
+  // A fresh instance reads what the device kept; a corrupt value is ignored.
+  const reloaded = createSearchHistory({ storage });
+  assert.deepStrictEqual(reloaded.entries(), ["alpha", "runner", "mac runner"]);
+  store.set(SEARCH_HISTORY_KEY, "{not json");
+  assert.deepStrictEqual(createSearchHistory({ storage }).entries(), []);
+  store.set(SEARCH_HISTORY_KEY, JSON.stringify(["ok", 7, "  ", "ok"]));
+  assert.deepStrictEqual(createSearchHistory({ storage }).entries(), ["ok"]);
+  // Bounded: past the limit the oldest fall away.
+  const bounded = createSearchHistory({ storage, limit: 3 });
+  for (const term of ["a", "b", "c", "d"]) bounded.remember(term);
+  assert.deepStrictEqual(bounded.entries(), ["d", "c", "b"]);
+  assert.equal(SEARCH_HISTORY_LIMIT, 50);
+});

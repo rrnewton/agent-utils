@@ -2975,3 +2975,70 @@ test("`#1734 vibe-talk-search-view-scroll-default`: entering a search stays on a
   assert.ok(Math.abs(area.scrollTop - parked) <= 2, `a hit was on screen but the reader moved from ${parked} to ${area.scrollTop}`);
   assert.ok(Math.abs(anchor.getBoundingClientRect().top - anchorTop) <= 2, "the row under the reader's eye moved");
 });
+
+test("`#1816 vibe-talk-search-history-up-arrow`: Up recalls the last search, Down gives the draft back, and Escape still closes", async () => {
+  const page = newPage();
+  recorded(page, "conv", TALKED_ABOUT);
+  await signIn(page);
+  await page.settle();
+  const field = () => page.el("search-field");
+
+  // No history yet: Up is the caret's own key, not swallowed, nothing recalled.
+  await search(page, "runner");
+  let event = await press(page, field(), "ArrowUp");
+  assert.equal(event.defaulted, true, "Up with no history was swallowed");
+  assert.equal(field().value, "runner");
+
+  // Run two searches with Enter: Up at the cleared box recalls newest first, then older.
+  await press(page, field(), "Enter");
+  await page.el("search-field").setValue("mac");
+  await press(page, field(), "Enter");
+  await page.el("search-field").setValue("");
+  event = await press(page, field(), "ArrowUp");
+  assert.equal(event.defaulted, false, "a recalling Up was left to the caret");
+  assert.equal(field().value, "mac", "Up at an empty box did not recall the last term");
+  await press(page, field(), "ArrowUp");
+  assert.equal(field().value, "runner");
+  await press(page, field(), "ArrowUp");
+  assert.equal(field().value, "runner", "Up walked past the oldest term");
+  // The recalled term filters as if typed.
+  assert.deepStrictEqual(unfiltered(page, "transcript").map(said), [
+    "the mac runner stalled",
+    "which runner do you mean",
+    "a runner on the mac",
+  ]);
+  // Down walks newer, then past the newest restores the (empty) draft.
+  await press(page, field(), "ArrowDown");
+  assert.equal(field().value, "mac");
+  await press(page, field(), "ArrowDown");
+  assert.equal(field().value, "", "Down past the newest did not restore the draft");
+  event = await press(page, field(), "ArrowDown");
+  assert.equal(event.defaulted, true, "Down with no walk standing was swallowed");
+
+  // Typing then Up keeps the typed draft for Down to return to.
+  await page.el("search-field").setValue("half typed");
+  await press(page, field(), "ArrowUp");
+  assert.equal(field().value, "mac");
+  await press(page, field(), "ArrowDown");
+  assert.equal(field().value, "half typed", "Down did not return to the typed draft");
+
+  // Editing a recalled term ends the walk: the next Up starts at the newest again.
+  await press(page, field(), "ArrowUp");
+  assert.equal(field().value, "mac");
+  await page.el("search-field").setValue("mac edited");
+  await press(page, field(), "ArrowUp");
+  assert.equal(field().value, "mac", "Up after an edit did not start from the newest term");
+  await press(page, field(), "ArrowDown");
+  assert.equal(field().value, "mac edited");
+
+  // Escape closes and clears as before, and the history survives for the next opening.
+  await press(page, field(), "Escape");
+  assert.equal(field().hidden, true, "Escape did not close the search");
+  await page.el("search-toggle").click();
+  await page.settle();
+  await press(page, field(), "ArrowUp");
+  assert.equal(field().value, "mac", "the history was lost when the bar closed");
+
+  // The terms stand on the device, newest first, under their own key.
+  assert.deepStrictEqual(JSON.parse(page.storage.get("vibe-talk.search-history")), ["mac", "runner"]);
+});

@@ -54,6 +54,14 @@ export interface FilterChipsDependencies {
   /** Mark the hits once the typing pauses, or now. */
   markSearchSoon(): void;
   markSearchNow(): void;
+  /** A search ran with `term`: hold it for Up to recall (`#1816`). */
+  rememberSearch(term: string): void;
+  /** Up: the term one step older, holding `current` as the draft, or null (`#1816`). */
+  historyOlder(current: string): string | null;
+  /** Down: the term one step newer, or the draft past the newest, or null (`#1816`). */
+  historyNewer(): string | null;
+  /** The reader typed: any history walk is over (`#1816`). */
+  historyReset(): void;
   /** Search further back from the field, where the step back offers it; whether it did. */
   searchOlderFromField(): boolean;
   /** Note which rows stand on screen before a typed search filters (`#1734`). */
@@ -102,7 +110,9 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
   // change, and the reader's message stays where it is on the screen (`#243 filter-keeps-selection`).
   // `#212 link-filter`, from review: text that matches nothing takes the reader to the sentence saying
   // so, and text that matches again puts back the message they were on before it.
-  listen(el("search-field"), "input", () => {
+  // The field's text changed — typed, or a history term recalled into it (`#1816`): the one
+  // filter change both arrive as, so a recalled term filters exactly as if typed.
+  function fieldChanged(): void {
     // `#1734 vibe-talk-search-view-scroll-default`. Which rows stand on screen
     // is read before the filter moves them: "on screen" names the screen the
     // reader was looking at when they typed, not the compacted list after.
@@ -123,6 +133,12 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
     // where the most recent hits stand.
     deps.landSearchEntry();
     deps.markSearchSoon();
+  }
+  listen(el("search-field"), "input", () => {
+    // `#1816 vibe-talk-search-history-up-arrow`. Typing ends any history walk: what stands in
+    // the field now is the draft the next Up holds.
+    deps.historyReset();
+    fieldChanged();
   });
   // Escape closes AND clears, which is the same act — see `setSearchOpen`. It is the gesture a
   // desktop reader reaches for without being told, and the only one a keyboard has. `#224
@@ -134,10 +150,28 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
     // typed: the hits are marked now rather than when the pause would have.
     if (event.key === "Enter" && !event.isComposing) {
       deps.markSearchNow();
+      // `#1816 vibe-talk-search-history-up-arrow`. Enter runs the search: its words are held
+      // for Up to recall, newest first.
+      deps.rememberSearch((el("search-field") as HTMLInputElement).value);
       // `#262 search-load-older`. And it searches further back, where the step back offers that.
       if (deps.searchOlderFromField()) deps.swallow(event);
     }
+    // `#1816 vibe-talk-search-history-up-arrow`. Up and Down walk the terms run before, like
+    // shell history: Up holds what is typed as the draft, Down past the newest term gives it
+    // back. The key is swallowed only when a term (or the draft) actually lands in the field,
+    // so with nothing to recall the caret keeps its own meaning for the key. A recalled term
+    // is applied as if typed, through the one filter change.
+    if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.isComposing) {
+      const field = el("search-field") as HTMLInputElement;
+      const term = event.key === "ArrowUp" ? deps.historyOlder(field.value) : deps.historyNewer();
+      if (term !== null) {
+        field.value = term;
+        fieldChanged();
+        deps.swallow(event);
+      }
+    }
     if (event.key === "Escape" && !event.isComposing) {
+      deps.historyReset();
       deps.setSearchOpen(false);
       deps.settleFocus();
       deps.swallow(event);

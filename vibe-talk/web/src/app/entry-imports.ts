@@ -4,7 +4,7 @@
 // (`#624 voice-page-modularity`, final entry; see entryPrelude in web/build.mjs).
 
 export { createApplication, createKeyboardComposition, createServerAccess, createPageGuards } from "../app/index.ts";
-export { createGathering, createOpenedGaps, createParsedQueries, createRepliesWalk, createSearchField, createServerSearch, searchQueryMatches, searchQueryTree, searchSubject } from "../core/search/index.ts";
+export { createGathering, createOpenedGaps, createParsedQueries, createRepliesWalk, createSearchField, createSearchHistory, createServerSearch, searchQueryMatches, searchQueryTree, searchSubject } from "../core/search/index.ts";
 export { speechHoldFrom } from "../core/speech/index.ts";
 export { createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
 export { channelPostsOnce, allReachesThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createProviderFacts, createThreadPresence, createUnpackReads, exactReplyCount, heldNow, newerPage, refreshFailed, threadOf, timeOf, upsertThreadSummary } from "../core/channels/index.ts";

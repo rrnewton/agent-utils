@@ -8,6 +8,7 @@ import {createGathering,
   createParsedQueries,
   createRepliesWalk,
   createSearchField,
+  createSearchHistory,
   createServerSearch,
   searchQueryMatches,
   searchQueryTree,
@@ -2639,6 +2640,14 @@ const { refreshElisionLines, collapsedLinesChanged, stepCollapsedLines } = readi
 // (`createSearchRows`, `#624 voice-page-modularity`): the language on the page, the filter's
 // pass, the hits drawn, and the seams. The field itself stays instantiated here, where the
 // shell mounts wire its marks.
+/**
+ * The terms searched before, for Up and Down in the field (`#1816 vibe-talk-search-history-up-arrow`,
+ * web/src/core/search `createSearchHistory`): kept on the device, walked from the field's keys.
+ *
+ * @type {import("../core/search/index.ts").SearchHistory}
+ */
+const searchHistory = createSearchHistory({ storage: deviceStorageOnUse() });
+
 const searchField = createSearchField({
   clock: clockOnUse(),
   // The reader stays on what they were reading — the message the keystroke's own change held, while it
@@ -9037,6 +9046,10 @@ application.track(mountFilterChips({
   refilterSideCards: () => refilterSideCards(),
   markSearchSoon: () => markSearchSoon(),
   markSearchNow: () => markSearchNow(),
+  rememberSearch: (term) => searchHistory.remember(term),
+  historyOlder: (current) => searchHistory.older(current),
+  historyNewer: () => searchHistory.newer(),
+  historyReset: () => searchHistory.reset(),
   searchOlderFromField: () => searchOlderFromField(),
   noteSearchScreen: () => noteSearchScreen(),
   landSearchEntry: () => landSearchEntry(),
