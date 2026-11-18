@@ -7337,6 +7337,48 @@ def run_captures(
                 f"could not reach {url} to empty the transcript store: {error}"
             ) from error
 
+    # `#1855`: Discuss channel scopes read only the served message cache, which fills from
+    # server-owned history walks — a fresh throwaway server holds nothing, so its Discuss
+    # window is honestly empty. Ask the server for its own history walk (the same setup
+    # call this harness already makes when it empties the transcript store: fixture setup
+    # on the real server, never an interception of the page's Discuss route), then wait —
+    # on the preview's own count, never a fixed sleep — until the window holds messages.
+    # Only a run that photographs Discuss insists; another run proceeds without it.
+    def seed_discuss_cache() -> None:
+        base = url.rstrip("/")
+        headers = {"Authorization": f"Bearer {token}"}
+        request = Request(
+            f"{base}/api/v1/channels/{channel}/history/prioritize",
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=10):  # noqa: S310 - a loopback URL this script built
+                pass
+        except (HTTPError, URLError):
+            pass  # the poll below is the verdict either way
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            try:
+                preview_req = Request(
+                    f"{base}/api/v1/channels/{channel}/catchup/preview", headers=headers
+                )
+                with urlopen(preview_req, timeout=10) as response:  # noqa: S310
+                    preview = json.loads(response.read())
+                if int(preview.get("window", {}).get("count", 0)) > 0:
+                    return
+            except (HTTPError, URLError, ValueError):
+                pass
+            time.sleep(0.25)
+        if any(scene.name.startswith(("73-", "74-", "75-", "76-")) for scene in scenes):
+            raise RuntimeError(
+                "the Discuss window stayed empty after the server's history walk, so the "
+                "Discuss states would photograph an empty pane. The server needs a serving "
+                "message cache (run.sh configures one); check its log."
+            )
+
+    seed_discuss_cache()
+
     everything: list[tuple[str, Path, Verdict]] = []
     # Two processes judge the captures while the walk goes on; see `start_capture`. Spawned rather
     # than forked: this process is about to hold a browser driver's threads and pipes.

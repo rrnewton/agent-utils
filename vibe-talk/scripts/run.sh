@@ -667,6 +667,16 @@ reply_timeout_seconds = 3
 [storage]
 EOF
         printf 'path = "%s/state/vibe-talk.sqlite3"\n' "$SHOTS_TMP"
+        # `#1855`: Discuss reads the served message cache (channel scopes are cache-only), so
+        # the throwaway server needs one that fills and serves. Beside the store, inside the
+        # 0700 throwaway directory the cache's own filesystem check requires.
+        cat <<'EOF'
+
+[message_cache]
+enabled = true
+serve = true
+EOF
+        printf 'path = "%s/state/message-cache.sqlite3"\n' "$SHOTS_TMP"
         # `#1855`: Discuss through the real router. Without a [summaries.llm] section the
         # catchup endpoint refuses by name; with one pointed at the loopback model stub
         # (started below), preview and Summarize really answer and only the model is invented.
