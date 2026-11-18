@@ -176,7 +176,7 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
       // the next refresh demoted it back to the menu still hidden, and only a view switch's
       // call-controls render ever unhid it, which a reader who lands on the Channel (the
       // default now) may never make.
-      if (member.classList.contains("promoted-action")) continue;
+      if (member.classList && member.classList.contains("promoted-action")) continue;
       const views = PACK_VIEWS[member.id] || [];
       const unavailable = (member.id === "audio-source" && deps.readAloudAgent() === null) ||
         (member.id === "column-toggle" && !deps.columnsOffered());
