@@ -439,6 +439,38 @@ def test_audit_durable_candidates_never_cross_a_global_gitdir_include(
     )[1]
 
 
+def test_streamed_replay_refuses_a_tampered_prefix_on_resume(
+    tmp_path: Path,
+) -> None:
+    """A streamed resume verifies every prefix file, not just its tip (q4)."""
+
+    root = _fixture(tmp_path / "case")
+    config = wrkslots_cli._load_config(str(root), None)
+    active_doc = json.loads((root / "worktrees" / "ACTIVE.node-a.json").read_text())
+    archive_doc = json.loads(
+        (root / "worktrees" / "ARCHIVED.node-a.json").read_text()
+    )
+    with wrkslots_cli._event_memo_scope():
+        writer = wrkslots_cli._event_writer(config, "node-a")
+        writer.append(
+            "state-imported",
+            {"active": active_doc, "archive": archive_doc, "holds": []},
+        )
+        for index in range(3):
+            writer.append("note-recorded", {"i": index})
+    directory = wrkslots_cli._event_directory(config, "node-a")
+    first = directory / sorted(path.name for path in directory.iterdir())[0]
+    with wrkslots_cli._event_memo_scope():
+        wrkslots_cli._bound_event_retention()
+        derived = wrkslots_cli._states_from_events(config, "node-a")
+        assert derived is not None and derived[0].revision == active_doc["revision"]
+        raw = json.loads(first.read_text())
+        raw["recorded_at"] = "2001-01-01T00:00:00Z"
+        first.write_text(json.dumps(raw))
+        with pytest.raises(wrkslots_cli.StateError, match="digest does not match"):
+            wrkslots_cli._states_from_events(config, "node-a")
+
+
 def test_streamed_replay_matches_list_replay(tmp_path: Path) -> None:
     """A bounded scan's streamed fold derives the list fold's state."""
 

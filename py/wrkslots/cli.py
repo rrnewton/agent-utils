@@ -10248,9 +10248,10 @@ class _EventMemo:
         tuple[str, str],
         tuple[tuple[int, int, int, int, int], int, str, dict[str, object]],
     ] = dataclasses.field(default_factory=dict)
-    replays: dict[tuple[Config, str, bool], tuple[int, str, _ReplayFold]] = (
-        dataclasses.field(default_factory=dict)
-    )
+    replays: dict[
+        tuple[Config, str, bool],
+        tuple[int, str, _ReplayFold, tuple[_EventFileIdentity | None, ...]],
+    ] = dataclasses.field(default_factory=dict)
     pendings: dict[
         tuple[Config, str], tuple[int, str, dict[Path, Mapping[str, object]]]
     ] = dataclasses.field(default_factory=dict)
@@ -10650,7 +10651,7 @@ def _resume_replay(
     cached = _cached_replay(key)
     if cached is None:
         return 0, _ReplayFold()
-    count, tip, fold = cached
+    count, tip, fold, _identities = cached
     if count > len(events) or events[count - 1].get("sha256") != tip:
         return 0, _ReplayFold()
     _recheck_replay_repositories(config, fold)
@@ -10659,7 +10660,7 @@ def _resume_replay(
 
 def _cached_replay(
     key: tuple[Config, str, bool],
-) -> tuple[int, str, _ReplayFold] | None:
+) -> tuple[int, str, _ReplayFold, tuple[_EventFileIdentity | None, ...]] | None:
     if not _ACTIVE_EVENT_MEMO:
         return None
     return _ACTIVE_EVENT_MEMO[-1].replays.get(key)
@@ -10693,7 +10694,11 @@ def _remember_replay(
 
 
 def _remember_replay_fold(
-    key: tuple[Config, str, bool], count: int, tip: str, fold: _ReplayFold
+    key: tuple[Config, str, bool],
+    count: int,
+    tip: str,
+    fold: _ReplayFold,
+    identities: Sequence[_EventFileIdentity | None] = (),
 ) -> None:
     if not _ACTIVE_EVENT_MEMO:
         return
@@ -10701,7 +10706,7 @@ def _remember_replay_fold(
     replays.pop(key, None)
     if len(replays) >= _REPLAY_MEMO_ENTRIES_LIMIT:
         replays.pop(next(iter(replays)))
-    replays[key] = (count, tip, fold)
+    replays[key] = (count, tip, fold, tuple(identities))
 
 
 def _fold_active_record_event(
@@ -11144,31 +11149,49 @@ def _states_from_event_stream(
 
     cached = _cached_replay(memo_key)
     fold = _ReplayFold()
+    identities: list[_EventFileIdentity | None] = []
     total = 0
     tip: str | None = None
     resumed = False
     if cached is not None:
-        count, cached_tip, cached_fold = cached
+        count, cached_tip, cached_fold, cached_identities = cached
         directory = _event_directory(config, machine)
         names = _event_file_names(directory)
-        if count <= len(names):
+        if (
+            count <= len(names)
+            and len(cached_identities) == count
+            and all(identity is not None for identity in cached_identities)
+            and all(
+                _event_file_identity(directory / names[index]) == cached_identities[index]
+                for index in range(count)
+            )
+        ):
             try:
-                raw_tip = _as_str(
-                    _as_mapping(
-                        _read_json(directory / names[count - 1], "append-only event"),
-                        "append-only event",
-                    )["sha256"],
-                    "append-only event.sha256",
+                tip_mapping = _as_mapping(
+                    _read_json(directory / names[count - 1], "append-only event"),
+                    "append-only event",
                 )
+                raw_tip = _as_str(
+                    tip_mapping["sha256"], "append-only event.sha256"
+                )
+                tip_digest_ok = raw_tip == cached_tip and _event_digest(
+                    {
+                        key: value
+                        for key, value in tip_mapping.items()
+                        if key != "sha256"
+                    }
+                ) == raw_tip
             except StateError:
                 raw_tip = None
-            if raw_tip == cached_tip:
+                tip_digest_ok = False
+            if tip_digest_ok:
                 # The remembered tip still ends the prefix: the hash
                 # chain makes that digest cover every earlier event,
                 # so only what follows it is verified and folded, as
                 # _resume_replay trusts the same digest in list form.
                 _recheck_replay_repositories(config, cached_fold)
                 fold = cached_fold.copy()
+                identities = list(cached_identities)
                 previous = cached_tip
                 total = count
                 tip = cached_tip
@@ -11178,6 +11201,8 @@ def _states_from_event_stream(
                     path = directory / names[sequence - 1]
                     identity = _event_file_identity(path)
                     event = _event_from_path(path, machine, sequence, previous)
+                    after = _event_file_identity(path)
+                    identities.append(after if after == identity else None)
                     _memoize_verified_event(
                         path, machine, identity, sequence, previous, event, observed_ns
                     )
@@ -11193,6 +11218,7 @@ def _states_from_event_stream(
         # keep each verified event in the memo so a later locked load
         # of the same log reads no file again (#1247 contract).
         fold = _ReplayFold()
+        identities = []
         total = 0
         tip = None
         directory = _event_directory(config, machine)
@@ -11202,6 +11228,8 @@ def _states_from_event_stream(
             path = directory / name
             identity = _event_file_identity(path)
             event = _event_from_path(path, machine, sequence, previous)
+            after = _event_file_identity(path)
+            identities.append(after if after == identity else None)
             _memoize_verified_event(
                 path, machine, identity, sequence, previous, event, observed_ns
             )
@@ -11217,7 +11245,7 @@ def _states_from_event_stream(
         for record in fold.active_records.values():
             _assert_record_paths(config, record, require_repository=True)
     assert tip is not None
-    _remember_replay_fold(memo_key, total, tip, fold)
+    _remember_replay_fold(memo_key, total, tip, fold, identities)
     return _states_from_fold(machine, fold)
 
 
