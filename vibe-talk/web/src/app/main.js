@@ -1613,7 +1613,11 @@ const draftSync = createDraftSync({
     deleteDraft: (channel, body) => api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "DELETE", body }),
   },
   deviceId: () => draftDeviceId(deviceStorageOnUse(), () => globalThis.crypto?.randomUUID?.() ?? `device-${Date.now()}-${Math.random()}`),
-  deviceLabel: () => draftDeviceLabel(String(globalThis.navigator?.userAgent ?? "")),
+  deviceLabel: () => draftDeviceLabel(
+    globalThis.matchMedia?.("(pointer: coarse)").matches
+      ? (Math.min(globalThis.screen?.width ?? 9999, globalThis.screen?.height ?? 9999) < 600 ? "Mobile" : "Tablet")
+      : "",
+  ),
   autosync: () => deviceSettings().get(DEVICE_SETTINGS.draftAutosync) !== false,
   schedule: (run, ms) => setTimeout(run, ms),
   cancel: (handle) => clearTimeout(/** @type {any} */ (handle)),
