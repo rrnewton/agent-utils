@@ -1356,6 +1356,15 @@ def settle_ui(driver: Driver, keep_status: bool = False) -> None:
         + status_part,
         timeout=5_000,
     )
+    # The freshness pill ("Live · updated …") leaves on its own clock, like "Ready." does:
+    # wait for that condition. A pill still up after it is a warning state the page means
+    # to show, so timing out here proceeds instead of failing the capture.
+    try:
+        driver.page.wait_for_function(
+            "() => !window.__visible('channel-freshness')", timeout=10_000
+        )
+    except Exception:
+        pass
 
 
 # -- the scenes ------------------------------------------------------------------------------------
