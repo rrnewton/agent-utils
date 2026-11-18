@@ -177,7 +177,10 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     if (!row) return false;
     const area = deps.el("scroll-area");
     const target = Math.max(drill.top, deps.floatingClearance(area) + REPLY_LANDING_GAP_PX);
-    const delta = row.getBoundingClientRect().top - target;
+    // By where the row starts (`drawnTop`: its date rule above the tile included), as a landing
+    // is placed: a tile put just below the floating line leaves that rule under it
+    // (`#324 live-pill-covers-row`, live-pill-browser's thread-lands case).
+    const delta = deps.drawnTop(row) - target;
     if (Math.abs(delta) > 0.5) deps.nudge(area, delta);
     deps.renderScrollTools();
     return true;

@@ -298,7 +298,7 @@ class Walk:
     def offset(self, msg_id: str) -> float:
         found = self.page.evaluate(OFFSET_JS, msg_id)
         self.check(isinstance(found, (int, float)), f"message {msg_id} has no row on screen")
-        return float(found)  # type: ignore[arg-type]
+        return float(found)
 
     def tap_badge(self, msg_id: str) -> None:
         locator = self.page.locator(
