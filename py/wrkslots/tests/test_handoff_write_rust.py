@@ -303,6 +303,35 @@ def test_write_handoff_matches_python(tmp_path: Path) -> None:
     ]
 
 
+def test_write_handoff_after_finish_matches_python(tmp_path: Path) -> None:
+    """#1868: a recorded finish does not block publishing the sidecar once."""
+
+    rust_root, oracle_root = _pair(tmp_path)
+    finish_handoff = {
+        "recorded_at": "2026-10-26T01:30:00+00:00",
+        "validation": ["pytest"],
+        "limitations": [],
+        "continuation": "wrkslots remove slot-a",
+    }
+    for root in (rust_root, oracle_root):
+        active_path = root / "worktrees" / "ACTIVE.node-a.json"
+        doc = json.loads(active_path.read_text())
+        doc["slots"][0]["handoff"] = finish_handoff
+        active_path.write_text(json.dumps(doc))
+    rust_source = _source(tmp_path / "rust-src")
+    oracle_source = _source(tmp_path / "oracle-src")
+    assert _python_wh(oracle_root, oracle_source) == 0
+    result = _rust_wh(rust_root, rust_source)
+    assert result.returncode == 0, result.stderr
+    rust_doc = _sidecar(rust_root)
+    oracle_doc = _sidecar(oracle_root)
+    assert rust_doc is not None and oracle_doc is not None
+    # The finish record itself is never modified by the late write.
+    for root in (rust_root, oracle_root):
+        doc = json.loads((root / "worktrees" / "ACTIVE.node-a.json").read_text())
+        assert doc["slots"][0]["handoff"] == finish_handoff
+
+
 def test_write_handoff_repeat_same_bytes_matches_python(tmp_path: Path) -> None:
     rust_root, oracle_root = _pair(tmp_path)
     rust_source = _source(tmp_path / "rust-src")

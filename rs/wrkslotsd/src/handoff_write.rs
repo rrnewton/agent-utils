@@ -606,15 +606,12 @@ pub(crate) fn write_handoff(
         ));
     }
     assert_caller(&supplied)?;
-    if record
-        .get("handoff")
-        .map(|value| !value.is_null())
-        .unwrap_or(false)
-    {
-        return Err(format!(
-            "slot {slot} already has a recorded finish; its handoff is immutable"
-        ));
-    }
+    // A recorded finish (#1868) does not block publishing the sidecar:
+    // finish records its evidence in the record, while the sidecar is
+    // the owner's separate notes artifact that release and
+    // owner-consented removal consume. An existing sidecar is still
+    // refused below unless byte-identical, so published handoffs stay
+    // immutable; the finish record itself is not modified here.
     // An undeclared nested linked worktree of another repository does
     // not stop a handoff (#1400): warn loudly and record it in the
     // sidecar; remove and retire still refuse it.

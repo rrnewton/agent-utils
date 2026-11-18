@@ -25037,7 +25037,9 @@ def test_write_handoff_is_external_and_immutable_after_finish(tmp_path: Path) ->
         str(source),
     )
     assert refused.returncode == 3
-    assert "handoff is immutable" in refused.stderr
+    # #1868: the published sidecar is immutable; a different second write
+    # refuses even though a finish has been recorded since.
+    assert "immutable handoff sidecar" in refused.stderr
 
 
 def test_write_handoff_refuses_tracked_checkout_source_without_queueing(
@@ -58633,6 +58635,91 @@ def test_owner_consented_release_removes_a_live_owners_read_handoff_slot(
         (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
     )
     assert len(archive["records"]) == 1
+
+
+def test_finish_without_handoff_publishes_once_then_releases_and_removes(
+    tmp_path: Path,
+) -> None:
+    """#1868: finish with no prior write-handoff must not close every exit.
+
+    The reported chain finished a slot whose owner (this process) still
+    lives, after which remove, read-handoff, write-handoff and release all
+    refused. A late write-handoff now publishes the sidecar once; the
+    finish record is never modified, a different second write refuses,
+    and an identical re-write is idempotent.
+    """
+
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    finished = command(
+        project,
+        "finish",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--validation",
+        "pytest",
+        "--limitation",
+        "none",
+        "--discard-unaccounted",
+        "--discard-ignored",
+    )
+    assert finished.returncode == 0, finished.stderr
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    assert record.handoff is not None
+    assert wrkslots._load_handoff_sidecar(config, record) is None
+    finish_recorded_at = record.handoff.recorded_at
+
+    # Release and removal are still refused before any sidecar exists.
+    early_release = _release(project)
+    assert early_release.returncode == 3, early_release.stderr
+    early_remove = remove(project)
+    assert early_remove.returncode == 3, early_remove.stderr
+
+    # The late write publishes the handoff once.
+    digest = _write_owner_handoff(project, tmp_path)
+    sidecar = wrkslots._load_handoff_sidecar(config, record)
+    assert sidecar is not None and sidecar.sha256 == digest
+
+    # A different second write refuses; the sidecar is immutable.
+    other = tmp_path / "other-handoff.md"
+    other.write_text("different notes\n", encoding="utf-8")
+    refused = raw_command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(other),
+    )
+    assert refused.returncode == 3, refused.stderr
+    assert "immutable handoff sidecar" in refused.stderr
+
+    # An identical re-write is idempotent, and the finish record is intact.
+    _write_owner_handoff(project, tmp_path)
+    record = wrkslots._find_record(wrkslots._load_active(config), "slot01")
+    assert record.handoff is not None
+    assert record.handoff.recorded_at == finish_recorded_at
+
+    released = _release(project)
+    assert released.returncode == 0, released.stderr
+    _read_owner_handoff(project)
+    removed = remove(project)
+    assert removed.returncode == 0, removed.stderr
+    assert not checkout(project).exists()
+    assert active_slots(project) == []
 
 
 def test_owner_consented_release_requires_coordinator_authorization(

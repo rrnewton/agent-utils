@@ -651,7 +651,7 @@ pub(crate) enum Readers {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
-    /// Publish one generation-bound handoff sidecar (writer; fixture registries only until cutover)
+    /// Publish one generation-bound handoff sidecar; a slot finished without a handoff can publish its handoff once, afterwards, and the finish record never changes (writer; fixture registries only until cutover)
     WriteHandoff {
         /// Active agent slot name
         slot: String,

@@ -46379,10 +46379,14 @@ def _cmd_write_handoff(args: argparse.Namespace) -> int:
         if record.slot_type != "agent":
             raise Refusal("validation slots cannot carry agent handoffs")
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
-        if record.handoff is not None:
-            raise Refusal(
-                f"slot {record.slot} already has a recorded finish; its handoff is immutable"
-            )
+        # A recorded finish (#1868) does not block publishing the sidecar:
+        # finish records its evidence in the record, while the sidecar is
+        # the owner's separate notes artifact that release and
+        # owner-consented removal consume. Without this, a slot finished
+        # before write-handoff could never be released or removed while
+        # its owner lives. An existing sidecar is still refused below
+        # unless it is byte-identical, so published handoffs stay
+        # immutable; the finish record itself is not modified here.
         # An undeclared nested linked worktree of another repository
         # does not stop a handoff (#1400): it is warned about loudly and
         # recorded in the sidecar; remove and retire still refuse it.
@@ -94382,7 +94386,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "write-handoff",
         description=(
             "Copy one bounded UTF-8 handoff into generation-bound control storage outside "
-            "the checkout. Requires the exact live owner and refuses after finish. This "
+            "the checkout. Requires the exact live owner. A slot finished without a "
+            "handoff can publish its handoff once, afterwards; the finish record is "
+            "never modified, and any second or different sidecar refuses. This "
             "does not read, enqueue, finish, or remove the slot."
         ),
         help="write a generation-bound handoff outside the checkout",
@@ -94850,7 +94856,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "files outside the regenerable caches refuse unless --archive-ignored keeps "
             "them in a verified tar or --discard-ignored records them as discarded in the "
             "handoff for remove to delete; tracked or untracked work always refuses. Then "
-            "retain the slot and record the handoff. finish never deletes."
+            "retain the slot and record the handoff. finish never deletes. A finish "
+            "without a handoff can publish its handoff once, afterwards, with "
+            "write-handoff; the finish record itself never changes."
         ),
         formatter_class=_HelpFormatter,
     )
