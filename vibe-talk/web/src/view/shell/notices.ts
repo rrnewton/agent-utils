@@ -117,6 +117,10 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     // `voice-unresponsive-signal`: while the service is not answering, the line falls back to
     // saying so rather than to nothing. Hiding it would leave the call looking fine again.
     const unresponsive = deps.unresponsive();
+    // `#1859`: the words that stand now are no idle confirmation, whichever way
+    // they got here — the fallback below must draw, and a taken-away line keeps
+    // no mark for the next saying to inherit.
+    el("status-line").removeAttribute("data-idle");
     if (unresponsive !== null) {
       el("status").textContent = unresponsive;
       return;

@@ -90,6 +90,8 @@ test("#1855: an idle confirmation is marked to wait, action words are not", () =
   assert.equal(el("status-line").attrs["data-idle"], undefined, "action words were marked to wait");
   notices.setStatus("ready");
   assert.equal(el("status-line").attrs["data-idle"], "", "the lowercase twin was not marked");
+  notices.dismissStatus();
+  assert.equal(el("status-line").attrs["data-idle"], undefined, "a taken-away line kept the idle mark");
 });
 
 test("#1726: a status line with no words takes itself away", () => {
