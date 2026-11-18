@@ -626,6 +626,101 @@ test("catchup: a late answer for A arriving after the switch to B is dropped; an
   } finally { fx.restore(); }
 });
 
+
+test("catchup: the default bound starts where the last summary in this scope ended (#1842)", async () => {
+  const T3 = new Date(2026, 8, 20, 9, 53).getTime();
+  const withM3 = preview({ unread: [
+    { id: "m1", at_ms: T1, label: "09:51 · Ada" },
+    { id: "m2", at_ms: T2, label: "09:52 · Ben" },
+    { id: "m3", at_ms: T3, label: "09:53 · Cy" },
+  ] });
+  // Thread scope: first-ever summary starts at the thread's start; the
+  // second starts exactly where the first ended.
+  const fx = fixture({
+    selection: THREAD_T1,
+    nowMs: T2 + 90 * 60_000,
+    previewBodies: [preview(), preview(), withM3],
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    assert.deepEqual(fx.calls.posts.at(-1).body, { thread_id: "t1", view: "flat", since_ms: T1 },
+      "the first-ever thread summary did not start at the thread start");
+    // Away to main and back: the thread's next preview offers only what the
+    // first summary did not cover, from the moment it ended.
+    fx.setSelection({ view: "flat", threadId: null, thread: null });
+    view.sync();
+    await flush();
+    fx.setSelection(THREAD_T1);
+    view.sync();
+    await flush();
+    assert.equal(fx.els["discuss-since"].value, "09:52", "the second bound did not start where the first ended");
+    assert.equal(fx.els["discuss-hours"].value, "1.5", "the hours field did not restate the bound from the last summary");
+    assert.equal(fx.els["discuss-count"].value, "2");
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(fx.calls.posts.at(-1).body.since_ms, T2, "the second summary did not start exactly at the first's end");
+  } finally { fx.restore(); }
+
+  // Main scope: the same rule on the channel's own window.
+  const mainFx = fixture({ nowMs: T2 + 90 * 60_000, previewBodies: [preview(), preview(), withM3] });
+  try {
+    const view = createDiscussView(mainFx.deps);
+    view.mountControls();
+    await openAndSummarize(view, mainFx);
+    await flush();
+    assert.equal(mainFx.calls.posts.at(-1).body.since_ms, T1, "the first main summary did not cover all unread");
+    mainFx.setSelection(THREAD_T1);
+    view.sync();
+    await flush();
+    mainFx.setSelection({ view: "flat", threadId: null, thread: null });
+    view.sync();
+    await flush();
+    assert.equal(mainFx.els["discuss-title"].textContent, "Discuss: main channel");
+    assert.equal(mainFx.els["discuss-since"].value, "09:52", "main's second bound did not start where its first ended");
+    click(mainFx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(mainFx.calls.posts.at(-1).body.since_ms, T2);
+    assert.equal(mainFx.calls.posts.at(-1).body.thread_id, null);
+  } finally { mainFx.restore(); }
+});
+
+test("catchup: a scope's covered ranges survive a reload through the kept coverage (#1842)", async () => {
+  const keptCoverage = new Map();
+  const fx = fixture({ selection: THREAD_T1 });
+  try {
+    const deps = {
+      ...fx.deps,
+      storedCoverage: (key) => keptCoverage.get(key) ?? null,
+      keepCoverage: (key, coverage) => keptCoverage.set(key, coverage),
+    };
+    const view = createDiscussView(deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    const entries = [...keptCoverage.entries()];
+    assert.equal(entries.length, 1, "the summary kept no coverage for its scope");
+    assert.equal(entries[0][0], "chan-1:t1");
+    assert.deepEqual(entries[0][1], { ranges: [{ start: T1, end: T2 }] }, "the covered range was not the summary's window");
+    // A fresh view (the reload) over the same kept coverage offers the
+    // thread's next bound from the last summary's end, not all unread.
+    const reloadedFx = fixture({ selection: THREAD_T1 });
+    try {
+      const reloaded = createDiscussView({
+        ...reloadedFx.deps,
+        storedCoverage: (key) => keptCoverage.get(key) ?? null,
+        keepCoverage: (key, coverage) => keptCoverage.set(key, coverage),
+      });
+      reloaded.mountControls();
+      reloaded.open();
+      await flush();
+      assert.equal(reloadedFx.els["discuss-since"].value, "09:52", "the reloaded default did not start at the last summary's end");
+    } finally { reloadedFx.restore(); }
+  } finally { fx.restore(); }
+});
+
 test("catchup: Documents disables Discuss with its tooltip, closes the panel, and switching back restores it (#1812)", async () => {
   const fx = fixture();
   try {

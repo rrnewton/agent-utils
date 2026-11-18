@@ -169,6 +169,14 @@ export interface DiscussPanelDependencies {
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
   /**
+   * `#1842 vibe-talk-discuss-default-bound-since-last-summary`. The covered
+   * ranges kept per scope on this device (keyed by the panel's scope key),
+   * so a scope's default bound survives a refresh; absent, coverage lasts
+   * only while the panel stands.
+   */
+  storedCoverage?(key: string): DiscussCoverage | null;
+  keepCoverage?(key: string, coverage: DiscussCoverage): void;
+  /**
    * `#1821 vibe-talk-discuss-state-persists`. Openness changed through the one
    * `setOpen`, so the page can keep it on the device; absent, nothing is kept.
    */
@@ -201,6 +209,17 @@ export interface DiscussPanelDependencies {
 export interface DiscussFoldState {
   record: string;
   open: string[];
+}
+
+/** `#1842`. One covered range of one scope: message times [start, end]. */
+export interface DiscussCoverageRange {
+  start: number;
+  end: number;
+}
+
+/** `#1842`. The ranges one scope's summaries have covered, oldest first. */
+export interface DiscussCoverage {
+  ranges: DiscussCoverageRange[];
 }
 
 /**
@@ -689,6 +708,49 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (termsList) termsList.textContent = "";
     const timeline = maybe("discuss-timeline");
     if (timeline) timeline.textContent = "";
+  }
+
+  // `#1842`: the covered ranges per scope, in memory over the device's kept
+  // copy, so the next default bound starts where the last summary ended.
+  const coverageByScope = new Map<string, DiscussCoverage>();
+
+  function coverageKeyOf(scope: DiscussScope): string {
+    return `${scope.channelId}:${scope.threadId ?? "main"}`;
+  }
+
+  function coverageOf(scope: DiscussScope): DiscussCoverage {
+    const key = coverageKeyOf(scope);
+    const held = coverageByScope.get(key);
+    if (held) return held;
+    let stored: DiscussCoverage = { ranges: [] };
+    try {
+      const raw = deps.storedCoverage?.(key) ?? null;
+      if (raw && Array.isArray(raw.ranges)) {
+        stored = { ranges: raw.ranges.filter((r) => r && Number.isFinite(r.start) && Number.isFinite(r.end) && r.end >= r.start) };
+      }
+    } catch { /* a refused read is no coverage */ }
+    coverageByScope.set(key, stored);
+    return stored;
+  }
+
+  function lastCoveredEnd(scope: DiscussScope): number | null {
+    const cov = coverageOf(scope);
+    return cov.ranges.length ? Math.max(...cov.ranges.map((r) => r.end)) : null;
+  }
+
+  /** Record one summary's covered range for its scope and keep it. */
+  function recordCoverage(scope: DiscussScope, startMs: number | null, endMs: number): void {
+    if (!Number.isFinite(endMs) || endMs <= 0) return;
+    const cov = coverageOf(scope);
+    const range = { start: startMs !== null && Number.isFinite(startMs) && startMs <= endMs ? startMs : endMs, end: endMs };
+    const merged: DiscussCoverageRange[] = [];
+    for (const held of [...cov.ranges, range].sort((a, b) => a.start - b.start)) {
+      const last = merged.at(-1);
+      if (last && held.start <= last.end) last.end = Math.max(last.end, held.end);
+      else merged.push({ ...held });
+    }
+    cov.ranges = merged;
+    try { deps.keepCoverage?.(coverageKeyOf(scope), { ranges: merged }); } catch { /* storage refused: memory holds it */ }
   }
 
   /** Show `scope`'s own stashed answer, or a blank body; true when shown. */
@@ -1516,6 +1578,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           lastAnswer = shape.summary;
           readCreatedMs = shape.created_ms;
           scopeAnswers.set(scopeKeyOf(scope), { scope, answer: shape.summary, readCreatedMs });
+          // `#1842`: a saved record seeds the scope's covered end where this
+          // device kept none, so the default still starts at the last summary.
+          if (coverageOf(scope).ranges.length === 0 && shape.created_ms > 0) {
+            recordCoverage(scope, null, shape.created_ms);
+          }
           drawAnswer(shape.summary, recordKeyFor(scope, shape.created_ms));
           drawTerms(shape.summary);
           drawFooter(shape.summary, scope);
@@ -1696,6 +1763,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         boundStartMs = null;
         boundOwner = null;
         boundHours = null;
+        // `#1842`: with a prior summary in this scope, the default bound
+        // starts where it ended, so repeated Summaries are contiguous.
+        const coveredEnd = lastCoveredEnd(scope);
+        if (coveredEnd !== null && preview.unread.length > 0) {
+          boundStartMs = coveredEnd;
+          boundOwner = "since";
+        }
         // `#1761`: a thread whose older pages are still being fetched polls
         // again — each preview fetches one more page — so the held count on
         // screen grows toward the whole thread before Summarize is offered.
@@ -1760,6 +1834,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const answer = asCatchupAnswer(value);
         lastAnswer = answer;
         scopeAnswers.set(scopeKeyOf(scope), { scope, answer, readCreatedMs });
+        const coveredTimes = previewUnread.filter((ref) => answer.unread_ids.includes(ref.id) && ref.at_ms !== null).map((ref) => ref.at_ms as number);
+        recordCoverage(scope, sinceMs ?? (coveredTimes.length ? Math.min(...coveredTimes) : null), coveredTimes.length ? Math.max(...coveredTimes) : nowMs());
         const unread = answer.window?.unread_count ?? answer.unread_ids.length;
         const count = answer.window?.count ?? answer.unread_ids.length;
         // `#1761`: a window cut short of the thread's start says so, visibly —

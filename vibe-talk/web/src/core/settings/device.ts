@@ -261,6 +261,31 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (state: { record: string; open: string[] } | null) => (state === null ? null : JSON.stringify(state)),
     refused: { value: null },
   } satisfies DeviceSetting<{ record: string; open: string[] } | null>,
+  /** `#1842 vibe-talk-discuss-default-bound-since-last-summary`. The covered
+   * ranges of each Discuss scope on this device (scope key to its ranges), so
+   * a scope's default Summarize bound starts where its last summary ended,
+   * across a refresh. A damaged entry reads as no coverage. */
+  discussCoverage: {
+    key: "vibe-talk.voice.discuss-coverage",
+    read: (raw: string | null): Record<string, { ranges: { start: number; end: number }[] }> => {
+      try {
+        const held = JSON.parse(raw || "null") as Record<string, unknown> | null;
+        if (!held || typeof held !== "object") return {};
+        const out: Record<string, { ranges: { start: number; end: number }[] }> = {};
+        for (const [key, value] of Object.entries(held)) {
+          const ranges = (value as { ranges?: unknown })?.ranges;
+          if (!Array.isArray(ranges)) continue;
+          out[key] = { ranges: ranges.filter((r): r is { start: number; end: number } =>
+            !!r && typeof (r as { start?: unknown }).start === "number" && typeof (r as { end?: unknown }).end === "number") };
+        }
+        return out;
+      } catch {
+        return {};
+      }
+    },
+    write: (state: Record<string, { ranges: { start: number; end: number }[] }> | null) => (state === null ? null : JSON.stringify(state)),
+    refused: { value: {} },
+  } satisfies DeviceSetting<Record<string, { ranges: { start: number; end: number }[] }>>,
   /** `#1821 vibe-talk-discuss-state-persists`. Whether Discuss stands open and the
    * conversation it shows, so a refresh restores it (and a close stays closed). Per device;
    * a damaged entry, and a refused read, is no entry (closed). The docked size itself stays

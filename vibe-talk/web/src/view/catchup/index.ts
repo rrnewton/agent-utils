@@ -17,6 +17,8 @@ export type {
   CatchupStamp,
   CatchupUnreadRef,
   CatchupWindow,
+  DiscussCoverage,
+  DiscussCoverageRange,
   DiscussFoldState,
   DiscussLayoutMode,
   DiscussPanel,
@@ -27,7 +29,7 @@ export type {
 import { createListening } from "../dom/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
 import { DISCUSS_DOCUMENTS_HINT, DISCUSS_UNAVAILABLE_HINT, createDiscussPanel, isDiscussUnavailable } from "./panel.ts";
-import type { CatchupAnswer, CatchupRequestBody, DiscussFoldState, DiscussScope } from "./panel.ts";
+import type { CatchupAnswer, CatchupRequestBody, DiscussCoverage, DiscussFoldState, DiscussScope } from "./panel.ts";
 import {
   discussScopeKey,
   isSameDiscussScope,
@@ -166,6 +168,9 @@ export interface DiscussViewDependencies {
   /** `#1497 discuss-fold-state-persist`. The kept Discuss folds, forwarded to the panel. */
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
+  /** `#1842`. The per-scope covered ranges kept on this device, forwarded to the panel. */
+  storedCoverage?(key: string): DiscussCoverage | null;
+  keepCoverage?(key: string, coverage: DiscussCoverage): void;
   /** `#1821 vibe-talk-discuss-state-persists`. Where Discuss stands, kept on this device. */
   storedPanelState?(): DiscussPanelState | null;
   keepPanelState?(state: DiscussPanelState): void;
@@ -500,6 +505,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     keepMode: deps.keepMode,
     storedFolds: deps.storedFolds,
     keepFolds: deps.keepFolds,
+    storedCoverage: deps.storedCoverage,
+    keepCoverage: deps.keepCoverage,
     onOpenChange: (open: boolean) => persistPanelState(open),
     readDocument: deps.readDocument,
     stopSpeaking: deps.stopSpeaking,

@@ -1328,6 +1328,14 @@ const discussView = createDiscussView({
   // this device with the rest; a new summary's keep replaces the entry whole.
   storedFolds: () => deviceSettings().get(DEVICE_SETTINGS.discussFolds),
   keepFolds: (state) => deviceSettings().keep(DEVICE_SETTINGS.discussFolds, state),
+  // `#1842 vibe-talk-discuss-default-bound-since-last-summary`. Each scope's
+  // covered ranges on this device, so its next default bound starts where
+  // its last summary ended, across a refresh.
+  storedCoverage: (key) => deviceSettings().get(DEVICE_SETTINGS.discussCoverage)[key] ?? null,
+  keepCoverage: (key, coverage) => {
+    const held = deviceSettings().get(DEVICE_SETTINGS.discussCoverage);
+    deviceSettings().keep(DEVICE_SETTINGS.discussCoverage, { ...held, [key]: coverage });
+  },
   // `#1821 vibe-talk-discuss-state-persists`. Where Discuss stands, on this
   // device with the rest; a refresh restores it, a close stays closed.
   storedPanelState: () => deviceSettings().get(DEVICE_SETTINGS.discussPanel),
