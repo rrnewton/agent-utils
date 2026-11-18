@@ -768,8 +768,8 @@ test("catchup: the stamp line names chars without tokens and tokens with them", 
 
 test("catchup: a late channel answer after entering a thread is ignored; after widening too (#1811)", async () => {
   // #1811: entering a thread re-scopes Discuss, so a channel answer still
-  // in flight for the old scope no longer lands. Widening closes the
-  // panel, and a late answer for it is ignored as before.
+  // in flight for the old scope no longer lands. Returning to main
+  // re-scopes the same way, so a late thread answer is ignored too.
   const pending = deferred();
   const fx = fixture({ respond: () => pending.promise });
   try {
@@ -795,10 +795,12 @@ test("catchup: a late channel answer after entering a thread is ignored; after w
     await openAndSummarize(view, wide);
     wide.setSelection({ view: "flat", threadId: null, thread: null });
     view.sync();
-    assert.equal(view.isOpen(), false, "widening left the panel open");
+    assert.equal(view.isOpen(), true, "returning to main closed the panel");
+    assert.equal(view.boundScope().kind, "global", "returning to main did not rebind to the channel");
+    assert.equal(wide.els["discuss-title"].textContent, "Discuss: main channel");
     widePending.resolve(answer());
     await flush();
-    assert.equal(wide.els["discuss-answer"].textContent, "", "the widened answer was drawn");
+    assert.equal(wide.els["discuss-answer"].textContent, "", "the stale thread answer was drawn in the main scope");
   } finally { wide.restore(); }
 });
 
@@ -1293,6 +1295,7 @@ test("binding: the rules table names every rule and rule 5 is close", () => {
     "narrowing-rescopes-to-thread",
     "in-thread-link-jumps-in-place",
     "out-of-thread-link-returns-to-bound",
+    "widening-rescopes-to-main",
     "widen-or-sideways-closes",
     "fallback-closes-and-jumps",
     "out-of-window-cite-links-out",
@@ -1372,7 +1375,7 @@ test("binding: after entering a thread, its citations jump in place and others c
   } finally { fx.restore(); }
 });
 
-test("binding: widening closes behind a history entry; Back restores it with no model call", async () => {
+test("binding: returning to main re-scopes to the channel; no model call, no history (#1811)", async () => {
   const fx = fixture({ selection: THREAD_T1 });
   try {
     const view = createDiscussView(fx.deps);
@@ -1380,25 +1383,17 @@ test("binding: widening closes behind a history entry; Back restores it with no 
     await openAndSummarize(view, fx);
     await flush();
     const postsBefore = fx.calls.posts.length;
-    const previewsBefore = fx.calls.previews.length;
     fx.setSelection({ view: "flat", threadId: null, thread: null });
     view.sync();
-    assert.equal(view.isOpen(), false, "widening left the panel open");
-    assert.equal(fx.calls.history.length, 1, "widening pushed no history entry");
-    const entry = fx.calls.history[0];
-    assert.equal(entry.discussOpen, true);
-    assert.equal(entry.recordKey, "chan-1:thread:t1", "the entry carries no record key");
-    assert.equal(entry.scope.threadId, "t1");
-    assert.equal(entry.snapshot.answer.text, "Two things happened.");
-    // Back: the thread view again, Discuss open, same summary, zero calls.
-    fx.setSelection(THREAD_T1);
-    assert.equal(view.restoreFromHistory(entry), true);
-    assert.equal(view.isOpen(), true, "Back did not reopen the panel");
-    assert.equal(fx.els["discuss-answer"].textContent, "Two things happened.", "Back showed another summary");
-    assert.equal(fx.els["discuss-scope"].textContent, "First thread");
-    assert.equal(fx.calls.posts.length, postsBefore, "Back spent a model call");
-    assert.equal(fx.calls.previews.length, previewsBefore, "Back read a preview");
-    // Opening fresh in All binds global.
+    await flush();
+    assert.equal(view.isOpen(), true, "returning to main closed the panel");
+    assert.equal(view.boundScope().kind, "global", "returning to main did not rebind to the channel");
+    assert.equal(fx.els["discuss-scope"].textContent, "Channel chan-1");
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: main channel");
+    assert.equal(fx.calls.previews.at(-1).scope.threadId, null, "the preview did not re-read for the channel");
+    assert.equal(fx.calls.posts.length, postsBefore, "re-scoping asked the model");
+    assert.deepEqual(fx.calls.history, [], "re-scoping pushed a history entry");
+    // Opening fresh in All binds global too.
     view.close();
     fx.setSelection({ view: "flat", threadId: null, thread: null });
     view.open();
