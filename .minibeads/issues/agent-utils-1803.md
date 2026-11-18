@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-eden-cap-counts-in-image-by-state-dir: count an Eden checkout in-image by its daemon state dir'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -23,3 +23,7 @@ updated_at: 2026-11-17T15:30:00-05:00
 - An outside mount with slot state in-image counts in-image; the 3 new tests fail unpatched and pass patched; `test_eden.py` green.
 
 # Notes
+
+## Resolution
+
+Landed 7ae4408f2735f5a432ddeab9fff924a60c11eb13 on github/main (mu-edenfix). Consumer patch reviewed line by line and applied with attribution; `test_eden.py` 56 passed, the 3 new tests fail unpatched. Gate flakes (D-Bus disconnect; #1778 pid liveness) were 5/5 clean solo with a passed exclusive rerun. No new persisted field.
