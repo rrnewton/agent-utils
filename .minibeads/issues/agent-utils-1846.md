@@ -34,3 +34,7 @@ updated_at: 2026-11-18T10:40:00-05:00
 # Notes
 
 [watermelon-full-preview] Owner thread 181 verbatim direction quoted in the Description. The liaison found no prior virtualization/windowed-render work in .minibeads; ai_docs checked 2026-11-18. This lane's design note (sent to coordb 2026-11-18) is the governing document until approved; figures N and M are stated there for coordb approval.
+
+## Resolution
+
+[watermelon-full-preview] Step 1 of 6 landed on main as 4fb47546 (stack 5033cc32, b9a6b340, 4fb47546; full gate pass on 9cc2b660, replayed tree verified): incremental per-id updates to the cached channel state with per-entry versions, the two settings-backed knobs (data reach-back vs render window, default Off at S0), unit proof in the channels/settings suites and dynamic proof in incremental_refresh_browser.py. Steps 2-6 remain: height index and spacers (inert), channel-list windowing, thread-list windowing, hydration pacer with Read/search/jump pinning, accessibility pass and rollout S1 (phone On; S2 by separate approval).
