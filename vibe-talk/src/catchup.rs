@@ -1352,6 +1352,34 @@ mod tests {
     }
 
     #[test]
+    fn a_discuss_answer_links_every_configured_reference_id() {
+        // `#1823`: two ids in one Discuss answer both link; the pass does
+        // not stop after the first match.
+        use crate::render::references::{ReferenceLinkRule, ReferenceLinks, ReferenceLinksGuard};
+        let _links = ReferenceLinksGuard::set(
+            ReferenceLinks::compile(&[ReferenceLinkRule {
+                pattern: r"\bagent-utils-([0-9]+)\b".to_owned(),
+                url: "https://github.com/rrnewton/agent-utils/blob/main/.minibeads/issues/agent-utils-$1.md"
+                    .to_owned(),
+            }])
+            .expect("the minibeads-shaped rule compiles"),
+        );
+        let html = crate::render::body_html_catchup(
+            "Fixed in agent-utils-1807, see agent-utils-1823.",
+            crate::render::Markup::Discord,
+            &HashSet::new(),
+        );
+        assert!(
+            html.contains("agent-utils-1807.md\"") && html.contains(">agent-utils-1807</a>"),
+            "first id not linked: {html}"
+        );
+        assert!(
+            html.contains("agent-utils-1823.md\"") && html.contains(">agent-utils-1823</a>"),
+            "second id not linked: {html}"
+        );
+    }
+
+    #[test]
     fn an_out_of_scope_cite_renders_as_an_anchor_and_a_model_link_is_refused() {
         // `#1395` over `#1392`: the out-of-window address (with scope=out)
         // joins the same trusted set, built by the server through the same
