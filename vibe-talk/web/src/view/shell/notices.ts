@@ -92,6 +92,11 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     el("status-line").hidden = false;
     el("status").textContent = deps.redact(text);
     const idle = IDLE_STATUS_WORDS.has(deps.redact(text).trim());
+    // `#1855 vibe-talk-ready-toast-covers-text`: an idle confirmation is announced
+    // but not floated — the stylesheet waits it out, so after a load it never
+    // stands over the message text under the pill. Action words float as before.
+    if (idle) el("status-line").setAttribute("data-idle", "");
+    else el("status-line").removeAttribute("data-idle");
     statusTimer = deps.clock.setTimeout(dismissStatus, idle ? STATUS_IDLE_DISMISS_MS : STATUS_DISMISS_MS);
   }
 

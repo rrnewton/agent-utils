@@ -12,7 +12,7 @@ const SHELL = await moduleForTests("src/view/shell/index.ts");
 function makeNotices() {
   const els = new Map();
   const el = (id) => {
-    if (!els.has(id)) els.set(id, { hidden: true, textContent: "", attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
+    if (!els.has(id)) els.set(id, { hidden: true, textContent: "", attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } });
     return els.get(id);
   };
   el("error-wrap").hidden = true;
@@ -79,6 +79,17 @@ test("#1837: an idle confirmation gets the short clock, action words the full on
   assert.equal(el("status-line").hidden, false, "action words went on the idle clock");
   fire(6000);
   assert.equal(el("status-line").hidden, true, "action words outstayed the full clock");
+});
+
+test("#1855: an idle confirmation is marked to wait, action words are not", () => {
+  const { notices, el } = makeNotices();
+  notices.setStatus("Ready.");
+  assert.equal(el("status-line").attrs["data-idle"], "", "Ready. was not marked to wait");
+  assert.equal(el("status").textContent, "Ready.", "the announcement was lost");
+  notices.setStatus("1 message marked as dealt with here");
+  assert.equal(el("status-line").attrs["data-idle"], undefined, "action words were marked to wait");
+  notices.setStatus("ready");
+  assert.equal(el("status-line").attrs["data-idle"], "", "the lowercase twin was not marked");
 });
 
 test("#1726: a status line with no words takes itself away", () => {
