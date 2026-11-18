@@ -365,7 +365,7 @@ def open_main(page: Page) -> None:
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     page.wait_for_selector("#view-switch", state="visible", timeout=15_000)
-    page.click("#view-switch")
+    # Sign-in lands on the Channel (`#1781`): no switch press, it is already up.
     wait_for(page, "() => !!document.querySelector('#discord-log > li[data-id=\"201\"] .thread-badge')",
              "the channel did not open")
     page.select_option("#thread-select", "main")
@@ -546,6 +546,11 @@ def main() -> int:
                         )
                     page = context.pages[0]
                     page.add_init_script(VIEWPORT_JS)
+                    # `#1781 vibe-talk-first-run-welcome-channel-default`. This walk is not
+                    # the first run itself (that has its own walk): seed the Welcome seen.
+                    page.add_init_script(
+                        "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); "
+                        "} catch (e) {}")
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))
                     page.goto(url, wait_until="load")
