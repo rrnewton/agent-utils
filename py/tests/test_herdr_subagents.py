@@ -1448,7 +1448,7 @@ def test_interactive_muse_refuses_raw_duplicate_structured_options_before_alloca
     assert fake.environments == []
 
 
-def test_muse_ultra_start_carries_the_gate_and_status_reports_profile_drift(
+def test_muse_ultra_start_carries_the_gate_and_status_reports_only_real_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
@@ -1470,6 +1470,16 @@ def test_muse_ultra_start_carries_the_gate_and_status_reports_profile_drift(
         list[str], result["environment_names"])
     assert any("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on" in entries
                for entries in fake.environments)
+    # The gate start synthesizes is part of the launch, not drift (#1834):
+    # the Rust edition reports no drift here, and so must this one.
+    assert "profile_drift" not in manager.status("worker")
+    # A real profile change still reports drift, without the gate counted.
+    config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+        "watermelon": {"harness": "muse", "mode": "interactive", "model": "chosen",
+                       "reasoning_effort": "ultra", "argv": [],
+                       "env": {"EXTRA_MODE": "on"}},
+    }}), encoding="utf-8")
+    config.chmod(0o600)
     assert manager.status("worker").get("profile_drift") == {
         "fields": ["environment_names"],
         "fix": "agentctl restart worker --refresh-profile",

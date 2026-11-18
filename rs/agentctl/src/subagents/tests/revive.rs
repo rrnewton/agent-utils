@@ -3782,6 +3782,49 @@ fn revive_replays_the_synthesized_ultra_gate_from_the_recorded_effort() {
 }
 
 #[test]
+fn ultra_profile_status_reports_only_real_environment_drift() {
+    // #1834: the gate start synthesizes is part of the launch, not drift;
+    // only a later profile environment change reports drift.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    write_profile(
+        &fixture,
+        "muse-ultra",
+        json!({"harness": "muse", "mode": "interactive", "reasoning_effort": "ultra",
+               "env": {"RECOVERY_MODE": "on"}}),
+    );
+    fixture
+        .manager()
+        .start_with_reasoning_effort(
+            "worker",
+            &fixture.root,
+            "ultra",
+            StartOptions {
+                harness: "muse".to_owned(),
+                profile: Some("muse-ultra".to_owned()),
+                environment: vec!["RECOVERY_MODE=on".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        fixture.manager().status("worker").unwrap()["profile_drift"].is_null()
+    );
+    let path = fixture.root.join(".agentctl/profiles.json");
+    let mut config = agent::read_private_json(&path).unwrap();
+    config["profiles"]["muse-ultra"]["env"] =
+        json!({"RECOVERY_MODE": "on", "EXTRA_MODE": "on"});
+    agent::atomic_json(&path, &config).unwrap();
+    let drift = &fixture.manager().status("worker").unwrap()["profile_drift"];
+    assert_eq!(drift["fields"], json!(["environment_names"]), "{drift}");
+    assert_eq!(drift["fix"], "agentctl restart worker --refresh-profile");
+}
+
+#[test]
 fn restart_with_profile_environment_relaunches_in_a_fresh_tab_with_it() {
     // #1412: restart goes through revive; an env-carrying lane takes a fresh tab
     // that receives the recorded profile environment, never the old pane.

@@ -4203,6 +4203,11 @@ class ManagedAgents:
             argv = harness_arguments(record.harness, model=profile.model, extra=structured)
             names = sorted({entry.partition("=")[0] for entry in profile.environment
                             if "=" in entry})
+            # As start does (#1216): an ultra Muse profile carries its synthesized
+            # gate name, even when the profile's env does not declare it.
+            if (record.harness == "muse" and profile.reasoning_effort == "ultra"
+                    and "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT" not in names):
+                names = sorted([*names, "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT"])
             recorded: list[str] = []
             if record.launch_spec is not None:
                 spec_argv = record.launch_spec.get("argv")

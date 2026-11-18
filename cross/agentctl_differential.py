@@ -182,37 +182,14 @@ def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
     return (*args[: at + 2], "--effort", "medium", *args[at + 2:])
 
 
-def _drift_only_difference(python: Outcome, rust: Outcome) -> bool:
-    """Whether two status-shaped outcomes differ only by profile_drift presence.
-
-    Drift is computed from a profile read that shells out to
-    `git check-ignore`; under load either edition can fail that read and
-    omit the field, so its presence in one snapshot is a timing artifact.
-    When both editions report drift, its value is still compared.
-    """
-    left, right = _json(python), _json(rust)
-    if not isinstance(left, dict) or not isinstance(right, dict):
-        return False
-    if ("profile_drift" in left) == ("profile_drift" in right):
-        return False
-    left = {key: value for key, value in left.items() if key != "profile_drift"}
-    right = {key: value for key, value in right.items() if key != "profile_drift"}
-    return left == right
-
-
 def _pair(harness: Harness, report: Report, case: PairCase, label: str,
           arguments: Sequence[str], expected: int = 0) -> tuple[Outcome, Outcome]:
     python, rust = harness.invoke(case, _with_effort(arguments))
-    if (arguments and arguments[0] == "status"
-            and python.returncode == rust.returncode == expected
-            and _drift_only_difference(python, rust)):
-        # A read-only read: wait (as an event, bounded by the hang guard)
-        # until both editions could evaluate the profile, then compare.
-        deadline = time.monotonic() + TIMEOUT_SECONDS
-        while time.monotonic() < deadline and _drift_only_difference(python, rust):
-            time.sleep(0.05)
-            python, rust = harness.invoke(case, _with_effort(arguments))
-    agree = _json(python) == _json(rust) or _drift_only_difference(python, rust)
+    # Profile drift is deterministic: both editions read the same profile
+    # file the fixture wrote before the start, so a drift-only difference
+    # is a real disagreement and fails on this first comparison (#1834).
+    # The shared hang guard still bounds each invoke itself.
+    agree = _json(python) == _json(rust)
     report.require(label, python.returncode == rust.returncode == expected
                    and agree
                    and (python.stderr == rust.stderr if expected == 0 else True),
@@ -772,6 +749,18 @@ def _profiles(harness: Harness, report: Report) -> None:
                                "reasoning effort ultra is not available "
                                "(gate ultra_reasoning_effort is closed); using xhigh"
                            ), f"Muse downgrade was hidden or misreported: {status!r}")
+            # The synthesized ultra gate is part of the launch, not drift:
+            # both editions must agree exactly that no drift stands (#1834).
+            drift_outcomes = _pair(harness, report, case,
+                                   "primary/profile/watermelon/status", (
+                                       "status", "worker", *_COMMON,
+                                   ))
+            for edition, outcome in zip(("python", "rust"), drift_outcomes, strict=True):
+                report.require(
+                    f"primary/profile/watermelon/profile-drift/{edition}",
+                    "profile_drift" not in json.loads(outcome.stdout),
+                    f"{edition} reported drift for the synthesized ultra gate: {outcome!r}",
+                )
             for root in (case.python_root, case.rust_root):
                 executable = root / "fake-muse-runtime"
                 replacement = root / "fake-muse-runtime.new"
