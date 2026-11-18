@@ -2424,6 +2424,11 @@ test("`#1818 vibe-talk-thread-drill-in-keeps-anchor`: a drill-in anchor is resto
   assert.equal(record.threadOwed, null, "the drill-in still owed a first-unread landing");
   assert.equal(record.landing, null, "the drill-in made a first-unread landing");
   assert.deepStrictEqual(log, ["tools", "summaries"], "the anchor was not drawn after");
+  // Too near the top to stay put: kept just below the floating line (0 + the 8px gap) instead.
+  record.drill = { id: "m2", top: 0, thread: "t1" };
+  area.scrollTop = 0;
+  entry.payThreadEntry();
+  assert.equal(area.scrollTop, 82, "a drill near the top was not kept just below the floating line (90 - 8)");
   // A drill owed for another thread is spent, and the entry lands as any other.
   record.drill = { id: "m2", top: 40, thread: "other" };
   record.threadOwed = "ctx";

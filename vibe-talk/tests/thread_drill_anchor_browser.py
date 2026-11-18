@@ -10,12 +10,16 @@ It serves the checked-out page and a small fake API from one loopback origin, ov
 space whose first Main row heads a five-reply thread, with filler roots below. At a 412x915
 Android viewport by touch and a 1280x800 desk with a mouse, in the dark scheme:
 
-  in All, a reply X of the thread is scrolled to a measured offset, its Thread(5) pressed: the
-  thread opens with X's top within a few px of that offset -> a row above X grows late, as an
-  image loading above it would grow it: X is put back within a few px (the ResizeObserver
-  keeper, no timer) -> Back: All is back as it was, X on screen at its place -> in Main, the
-  thread's root at the head of the list is pressed the same way: the thread opens with the root
-  within a few px of where it stood. No page error at any step.
+  in All, a reply X of the thread is scrolled to a measured screen place, its Thread(5)
+  pressed: the thread opens with X's viewport top within a few px of that place — the
+  thread's header card above the scroller compensated, not hidden by a container-relative
+  measure -> a row above X grows late, as an image loading above it would grow it: X is put
+  back within a few px (the ResizeObserver keeper, no timer) -> Back: All is back as it was,
+  X on screen at its place -> in Main, the thread's root at the head of the list is pressed
+  the same way: too near the top to stay put, it opens fully visible just below the
+  thread's header -> a reply
+  placed near the top of All, too near to stay put under the thread's header, opens its
+  thread fully visible just below that header. No page error at any step.
 
 Pass --screenshots DIR to keep a PNG of each state for review; --web-root DIR to run the same
 walk against another copy of the page.
@@ -222,21 +226,20 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+# X's place on the screen: its viewport top, the owner's measure (`#1818`). A container-relative
+# offset hides the thread header card pushing the scroller down, and is not asserted anywhere here.
 OFFSET_JS = """(id) => {
   const row = [...document.querySelectorAll('#discord-log > li')]
     .find((li) => (li.getAttribute('data-ids') || '').split(' ').includes(id));
   if (!row) return null;
-  const area = document.getElementById('scroll-area');
-  return row.getBoundingClientRect().top - area.getBoundingClientRect().top;
+  return row.getBoundingClientRect().top;
 }"""
 
 WITHIN_JS = """(arg) => {
   const row = [...document.querySelectorAll('#discord-log > li')]
     .find((li) => (li.getAttribute('data-ids') || '').split(' ').includes(arg.id));
   if (!row) return false;
-  const area = document.getElementById('scroll-area');
-  const top = row.getBoundingClientRect().top - area.getBoundingClientRect().top;
-  return Math.abs(top - arg.before) <= arg.tolerance;
+  return Math.abs(row.getBoundingClientRect().top - arg.before) <= arg.tolerance;
 }"""
 
 PLACE_JS = """(arg) => {
@@ -244,8 +247,18 @@ PLACE_JS = """(arg) => {
   const row = [...document.querySelectorAll('#discord-log > li')]
     .find((li) => (li.getAttribute('data-ids') || '').split(' ').includes(arg.id));
   if (!row) return false;
-  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - arg.target;
+  area.scrollTop += row.getBoundingClientRect().top - arg.target;
   return true;
+}"""
+
+# A near-top X after drill-in: fully below the thread's header card, and near it.
+BELOW_HEADER_JS = """(id) => {
+  const row = [...document.querySelectorAll('#discord-log > li')]
+    .find((li) => (li.getAttribute('data-ids') || '').split(' ').includes(id));
+  const card = document.getElementById('thread-card');
+  if (!row || !card) return false;
+  const r = row.getBoundingClientRect(), c = card.getBoundingClientRect();
+  return r.top >= c.bottom - 1 && r.top <= c.bottom + 160 && r.bottom <= window.innerHeight;
 }"""
 
 GROW_JS = """(id) => {
@@ -366,14 +379,36 @@ def drill_anchor_walk(walk: Walk) -> None:
     walk.shot("5-main-before")
     walk.tap_badge(ROOT)
     walk.wait_for("() => !document.getElementById('thread-heading').hidden", "the root's thread did not open")
-    walk.wait_for(WITHIN_JS, "the root's thread opened with the root away from where it stood",
-                  {"id": ROOT, "before": root_before, "tolerance": TOLERANCE})
+    # The root at the head of Main stands above where the thread's header card ends, too near
+    # the top to stay put: it opens fully visible just below that header, as a near-top reply does.
+    walk.wait_for(BELOW_HEADER_JS, "the root was not fully visible just below the thread header", ROOT)
     walk.settled()
     root_after = walk.offset(ROOT)
-    walk.check(abs(root_after - root_before) <= TOLERANCE,
-               f"the root moved from {root_before:.1f}px to {root_after:.1f}px on drill-in")
     walk.shot("6-thread-root")
-    walk.notes.append(f"in Main, the root at {root_before:.0f}px opened its thread at {root_after:.0f}px")
+    walk.notes.append(f"in Main, the root at {root_before:.0f}px near the top opened fully visible "
+                      f"just below the thread header (at {root_after:.0f}px)")
+
+    # A reply near the top of All cannot stay put — the thread's header would cover it — and
+    # opens fully visible just below that header instead.
+    walk.page.click("#thread-back")
+    walk.wait_for("() => document.getElementById('thread-heading').hidden", "Back from the root's thread failed")
+    page.select_option("#thread-select", "flat")
+    walk.wait_for(f"() => !!document.querySelector('#discord-log > li[data-ids~=\"{ANCHOR}\"] .thread-badge')",
+                  "All did not return for the near-top case")
+    walk.check(bool(page.evaluate(PLACE_JS, {"id": ANCHOR, "target": 40})),
+               "the anchor reply could not be placed near the top of All")
+    walk.settled()
+    near_before = walk.offset(ANCHOR)
+    walk.shot("7-all-near-top")
+    walk.tap_badge(ANCHOR)
+    walk.wait_for("() => !document.getElementById('thread-heading').hidden", "the near-top thread did not open")
+    walk.wait_for(BELOW_HEADER_JS, "the near-top reply was not fully visible just below the thread header",
+                  ANCHOR)
+    walk.settled()
+    near_after = walk.offset(ANCHOR)
+    walk.shot("8-thread-near-top")
+    walk.notes.append(f"a reply at {near_before:.0f}px near the top opened fully visible just below "
+                      f"the thread header (at {near_after:.0f}px)")
 
 
 def serve(api: FakeApi, web_root: Path) -> tuple[ThreadingHTTPServer, threading.Thread, str]:

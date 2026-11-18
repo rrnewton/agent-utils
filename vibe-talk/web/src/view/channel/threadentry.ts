@@ -14,8 +14,8 @@ import type { GestureStart } from "./sidecontrols.ts";
 
 /**
  * A drill-in anchor measured on the message clicked in the channel (`#1818
- * vibe-talk-thread-drill-in-keeps-anchor`): that message's id, and its top
- * relative to the scroll container (`row top - scroll-area top`) at the click.
+ * vibe-talk-thread-drill-in-keeps-anchor`): that message's id, and its top on
+ * the screen (its viewport top) at the click.
  */
 export interface DrillAnchor {
   id: string;
@@ -128,11 +128,15 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
   // The owner (thread 158, 2026-11-17): "when I have the message X on screen and I click to the
   // thread containing it, I want X to still be on screen. IDEALLY we would be able to place X at
   // the SAME place on the screen so that what is above/below changes but not it." So a drill-in
-  // from X's Thread(n) button measures X's top against the scroll container before navigating
-  // (`drillAnchorFor` in threadlist.ts) and this entry puts X back at that offset once the thread
-  // is drawn, in place of the first-unread landing: the reader clicked that message, and keeping
-  // it still outranks landing on a different one. If X is the root, the root is the anchor, as
-  // its id is what was measured. The anchor is then kept through late layout — an image loading
+  // from X's Thread(n) button measures X's top on the screen (its viewport top) before
+  // navigating (`drillAnchorFor` in threadlist.ts) and this entry puts X back at that screen
+  // place once the thread is drawn, in place of the first-unread landing: the reader clicked
+  // that message, and keeping it still outranks landing on a different one. The measure is the
+  // screen's, not the scroll container's: entering a thread puts its header card above the
+  // scroller and pushes the whole area down, so a container-relative place lands X that much
+  // lower on screen (about 270px on a phone). If X stood too near the top to stay put — the
+  // header would cover it — it is kept fully visible just below the floating line instead. If X
+  // is the root, the root is the anchor, as its id is what was measured. The anchor is then kept through late layout — an image loading
   // above X, a summary settling above it — by a ResizeObserver (never a timer), until the reader
   // scrolls, leaves the thread, or enters another view. Back keeps what it does today: leaving
   // the thread clears the anchor and the held view restores as before.
@@ -163,12 +167,17 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     return row && !row.hidden ? row : null;
   }
 
-  /** Put the anchor message back at its measured offset. False while its row is not drawn. */
+  /**
+   * Put the anchor message back at its measured screen place: its viewport top as it stood at
+   * the click, or just below the floating line (which stands below the thread's header card)
+   * where the click's place is now under that card. False while its row is not drawn.
+   */
   function placeDrillAnchor(drill: DrillAnchor & { thread: string }): boolean {
     const row = drillRow(drill.id);
     if (!row) return false;
     const area = deps.el("scroll-area");
-    const delta = row.getBoundingClientRect().top - area.getBoundingClientRect().top - drill.top;
+    const target = Math.max(drill.top, deps.floatingClearance(area) + REPLY_LANDING_GAP_PX);
+    const delta = row.getBoundingClientRect().top - target;
     if (Math.abs(delta) > 0.5) deps.nudge(area, delta);
     deps.renderScrollTools();
     return true;
