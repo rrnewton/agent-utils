@@ -844,6 +844,7 @@ function readAloudOwner() {
     get columns() { return columns; },
     get threadForMessageId() { return threadForMessageId; },
     get renderControls() { return voiceCall().renderControls; },
+    composerHeld: () => heldComposer() !== null,
     get withThreadQuery() { return withThreadQuery; },
     get token() { return token; },
   });
@@ -1996,6 +1997,8 @@ const channelViews = createChannelViews({
   layoutShown: () => layoutShown,
   stopReading: () => readAloudOwner().stopReading(),
   setReadingMode: (on) => { readAloudOwner().readingMode = on; },
+  readerSnapshot: () => readAloudOwner().readerSnapshot(),
+  resumeReader: (snapshot) => readAloudOwner().resumeReader(/** @type {any} */ (snapshot)),
   readRunsForget: (key) => readRuns.forget(key),
   viewKey: (view, threadId) => viewKey(view, threadId),
   rememberView: (view) => uiState.remember(/** @type {any} */ (view)),

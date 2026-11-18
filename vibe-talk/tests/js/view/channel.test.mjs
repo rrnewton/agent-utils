@@ -3013,6 +3013,106 @@ test("`#624 voice-page-modularity`: a thread's count comes from its summary befo
   assert.equal(cover.cursor, null, "Main kept All's forward cursor");
 });
 
+test("`#1838 vibe-talk-reader-continues-into-thread`: a view switch into or out of a thread carries the read, and only those switches do", async () => {
+  const { createChannelViews } = CHANNEL_VIEW;
+  const el = () => ({ hidden: false, children: [], scrollTop: 0, clientHeight: 100,
+    replaceChildren: () => {}, getBoundingClientRect: () => ({ top: 0, bottom: 100, height: 100 }) });
+  const held = { messages: [], threads: [], selected: null, rows: [], cards: [], seam: [],
+    more: false, cursor: null, newest: null, position: null, top: 0, freshness: "fresh",
+    freshAt: 0, dismissed: new Set(), readMode: "show" };
+  const contexts = new Map();
+  const selection = { view: "main", threadId: null, thread: null, origin: null };
+  const entry = { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null };
+  const canon = { channel: "C1", threads: [], messages: [], views: new Map([["thread:t1", { live: true }]]), dismissed: new Set() };
+  const snapshot = { id: "m2", parts: ["m2"], part: 0, block: 3, chunk: null, paused: false };
+  const calls = { snapshots: 0, resumed: [], modes: [] };
+  let resumeResult = true;
+  const owner = createChannelViews({
+    el, leftEl: (id) => (id === "post-confirm" ? { hidden: true, getAttribute: () => null } : el()),
+    columnSide: () => false,
+    channelCanon: () => canon,
+    view: () => "discord",
+    threading: () => true,
+    entryState: () => entry,
+    selection: () => selection,
+    readMode: () => "show",
+    transcriptShown: () => false,
+    selectedChannelId: () => "C1",
+    heldMessage: () => null,
+    providerOfChannel: () => null,
+    providersSize: () => 0,
+    repliesInThreadCapability: () => false,
+    threadOf: () => null,
+    rowMessages: () => [],
+    renderSideColumn: () => {}, renderThreadSelect: () => {}, renderThreadHeading: () => {},
+    followReplyStore: () => {}, markListView: () => {}, paintAllThreadFocus: () => {},
+    pinsView: () => ({ only: false }),
+    renderOutgoingMessages: () => {}, syncCanonDismissed: () => {}, invalidateDock: () => {},
+    timelineRows: () => ({ messages: [], threads: [] }),
+    olderPages: () => ({ moreAbove: false, cursor: null }),
+    captureScroll: () => null,
+    loadState: () => ({ freshAt: 0, freshness: "fresh", generation: 0 }),
+    doneState: () => ({ archived: new Set() }),
+    idsOf: () => [], shownRowFor: () => null, atBottom: () => true,
+    noteDeepLinkReaderMove: () => {}, putDockedReplyAway: () => {},
+    replyDocked: () => false, replyColumn: () => null, activeColumn: () => null,
+    putRepliesBack: () => {}, dropReplyArrowTap: () => {}, rememberChannelDraft: () => {},
+    setPinnedOnly: () => {}, viewOnScreen: () => ({ view: selection.view, thread: selection.threadId, summary: null, origin: null }),
+    saveUiState: () => {}, scheduleBackSync: () => {}, voiceCall: () => ({ renderControls: () => {} }),
+    threadOutrunsStore: () => false, heldViewRows: () => [],
+    drawProjection: () => false, drawHeldRows: () => false,
+    setChannelFreshness: () => {}, saveChannelScope: () => {},
+    walkCursorOwed: () => false, maybeLoadOlder: () => {},
+    allReachesThread: () => false, storeLacksReplies: () => false,
+    projectView: () => null, channelReadPosition: () => ({}),
+    readFilterKeeps: () => () => true, settleAfterRead: () => {},
+    hiddenEmpty: () => false, hidingRead: () => false,
+    renderChannelLoading: () => {}, restoreChannelComposer: () => {},
+    renderOlderControl: () => {}, restoreScroll: () => {},
+    renderCachedTimeline: () => {}, syncUnreadReplies: () => {},
+    renderChannelFreshness: () => {}, payThreadEntry: () => {},
+    rowsMissDone: () => false, scrollToNewest: () => {}, renderJumpNewest: () => {},
+    nudge: () => {}, toPosition: () => {},
+    threadCards: () => [], loadDiscordTimeline: async () => {},
+    api: async () => null,
+    deviceStorage: () => ({}),
+    tokenScope: () => "read",
+    channelRecord: () => null, timeOfRecord: () => 0,
+    threadOfMessage: () => null,
+    layoutShown: () => ({ columns: () => false, threadList: () => false, restoring: () => false }),
+    stopReading: () => {},
+    setReadingMode: (on) => { calls.modes.push(on); },
+    readerSnapshot: () => { calls.snapshots += 1; return snapshot; },
+    resumeReader: (carried) => { calls.resumed.push(carried); return resumeResult; },
+    readRunsForget: () => {},
+    viewKey: (view = "main", threadId = null) => (view === "thread" && threadId ? `thread:${threadId}` : view),
+    rememberView: () => {}, forgetChosenView: () => {}, settleUiState: () => {},
+    payReadCursor: () => {}, readsBusy: () => false, readContext: () => "ctx",
+    channelContexts: () => contexts,
+    listState: () => ({ newestId: null }),
+  });
+  contexts.set(JSON.stringify(["C1", "thread", "t1"]), held);
+  await owner.changeChannelView("thread", "t1");
+  assert.equal(calls.snapshots, 1, "drilling into a thread did not capture the read");
+  assert.deepStrictEqual(calls.resumed, [snapshot], "the captured read was not resumed in the thread");
+  assert.deepStrictEqual(calls.modes, [true], "a carried read lost reading mode in the switch");
+
+  // Out of the thread by the same rule, and a failed resume turns the mode off.
+  selection.view = "thread"; selection.threadId = "t1";
+  contexts.set(JSON.stringify(["C1", "main", null]), held);
+  resumeResult = false;
+  await owner.changeChannelView("main");
+  assert.equal(calls.snapshots, 2, "leaving a thread did not capture the read");
+  assert.equal(calls.resumed.length, 2, "the captured read was not offered a resume on the way out");
+  assert.equal(calls.modes[calls.modes.length - 1], false, "a failed resume left reading mode on");
+
+  // A switch that involves no thread carries nothing.
+  selection.view = "main"; selection.threadId = null;
+  contexts.set(JSON.stringify(["C1", "flat", null]), held);
+  await owner.changeChannelView("flat");
+  assert.equal(calls.snapshots, 2, "a Main-to-All switch captured a read it must simply stop");
+});
+
 test("`#624 voice-page-modularity`: reply counts by pointer and the unanswered root, from the module alone", () => {
   const { createReplyCounts } = CHANNEL_VIEW;
   const canon = { channel: "c1", scope: null, dismissed: new Set(), views: new Map(), threads: [],

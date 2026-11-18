@@ -160,6 +160,14 @@ export interface ChannelViewsDependencies {
   layoutShown(): { columns(): boolean; threadList(): boolean; restoring(): boolean };
   stopReading(): void;
   setReadingMode(on: boolean): void;
+  /**
+   * `#1838 vibe-talk-reader-continues-into-thread`. The read in progress, captured before this
+   * switch stops it, and taking such a capture up in the view now on screen (false, with the
+   * reason said in place, where that view does not draw the message). Optional: a page or test
+   * without a reader carries nothing.
+   */
+  readerSnapshot?(): { id: string; parts: string[]; part: number; block: number | null; chunk: number | null; paused: boolean } | null;
+  resumeReader?(snapshot: { id: string; parts: string[]; part: number; block: number | null; chunk: number | null; paused: boolean }): boolean;
   readRunsForget(key: string): void;
   viewKey(view?: string, threadId?: string | null): string;
   rememberView(view: { view: string; thread: string | null; summary: unknown; origin: string | null }): void;
@@ -552,6 +560,16 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     // reader of the left column was before it (`before`, `leftColumnPlace`).
     const place = before && !deps.columnSide() ? before : readerPlace();
     const from = deps.selection().view;
+    // `#1838 vibe-talk-reader-continues-into-thread`: a read playing as the reader drills into a
+    // thread — or back out of one — is captured before the switch below stops it, and taken up
+    // again once the new view is drawn and its entry paid (`finishCarry`), at the chunk or block
+    // it was on. Any other switch, and a document read, carries nothing and stops as before.
+    const carry = deps.readerSnapshot && (view === "thread" || from === "thread")
+      ? deps.readerSnapshot() : null;
+    const finishCarry = (): void => {
+      if (carry === null) return;
+      if (!deps.resumeReader || !deps.resumeReader(carry)) deps.setReadingMode(false);
+    };
     const came = { freshAt: deps.loadState().freshAt, freshness: deps.loadState().freshness };
     // `#206 pin-message`. Choosing a view is asking to see it, and the Pinned filter shows the same
     // pins in every view — so it steps aside, as it must for a pin opened in its thread. Placed by the
@@ -586,7 +604,9 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     if (view === "thread") deps.readRunsForget(deps.viewKey());
     ++deps.loadState().generation;
     deps.stopReading();
-    deps.setReadingMode(false);
+    // `#1838`: a carried read keeps its mode through the switch; `finishCarry` either resumes
+    // it in the new view or, failing safe, turns the mode off there.
+    deps.setReadingMode(carry !== null);
     const held = deps.channelContexts().get(channelContextKey());
     deps.timelineRows().messages = held ? held.messages : [];
     deps.timelineRows().threads = held ? held.threads : [];
@@ -678,6 +698,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
           deps.readContext() !== channelContextKey())) {
         await readBehindSwitch();
       }
+      finishCarry();
       return;
     }
     // Not drawn in this page yet, but covered by the channel's store: project it, with no request.
@@ -697,6 +718,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
       if (deps.walkCursorOwed()) deps.maybeLoadOlder();
       // A thread whose saved cover lacks replies its root reports is read behind it. `#222 unread-replies`.
       if (outrun) await readBehindSwitch();
+      finishCarry();
       return;
     }
     // Covered by nothing, but the store holds some of it: up at once, and read behind it.
@@ -707,6 +729,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
       // read-modes`.
       deps.payThreadEntry();
       await readBehindSwitch();
+      finishCarry();
       return;
     }
     // Nothing to draw: the one case the loading line is for.
@@ -716,6 +739,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     if (deps.readsBusy()) deps.renderChannelLoading(true);
     deps.scrollToNewest();
     await deps.loadDiscordTimeline({ reason: "enter" });
+    finishCarry();
   }
 
   /**

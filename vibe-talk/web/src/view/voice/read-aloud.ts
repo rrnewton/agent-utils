@@ -26,7 +26,22 @@ interface PrepareReply {
 }
 type SpeechSegment = ReturnType<typeof speechSegments>[number];
 interface Point { x: number; y: number }
-interface ReadFrom { part: number; block: number | null; recovery?: number; hold?: boolean }
+interface ReadFrom { part: number; block: number | null; recovery?: number; hold?: boolean; chunk?: number }
+
+/**
+ * `#1838 vibe-talk-reader-continues-into-thread`. A read captured before a view switch, so the
+ * switch can resume it in the view it opens: the message and its parts, where it had got to at
+ * the smallest unit it is read in (the prepared block of a server read, the chunk of a device
+ * read), and whether it was held. Null fields resume from the start of the message.
+ */
+export interface ReaderSnapshot {
+  id: string;
+  parts: string[];
+  part: number;
+  block: number | null;
+  chunk: number | null;
+  paused: boolean;
+}
 interface Timeline { startsAt: number | null; endsAt: number; finished: boolean; gaps: readonly (readonly [number, number])[] }
 interface ReadPlayer {
   pause(): void;
@@ -154,6 +169,13 @@ export interface ReadAloudDependencies<Column = unknown> {
   readonly columns: { readonly side: Column };
   threadForMessageId(id: string): string | null;
   renderControls(): void;
+  /**
+   * `#1839 vibe-talk-composer-stays-in-view-while-dictating` x `#1838`: whether a composer
+   * holds the view (focused, or input within its hold). While it does, the read's follow
+   * places nothing: a read resumed across a view switch must not pull the list back to its
+   * anchor over the box being typed in. Optional: a page without the guard never holds.
+   */
+  composerHeld?(): boolean;
   withThreadQuery(path: string, threadId: string | null): string;
   token(): string;
 }
@@ -636,7 +658,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
 
   /** Speak the cached prepared row on the tap's own call stack, without a network request or await. */
   function readWithBrowserSpeech(parts: string[], id: string, ticket: number,
-      doc: { payload: DocumentPayload; from: ReadFrom | null } | null = null) {
+      doc: { payload: DocumentPayload; from: ReadFrom | null } | null = null,
+      from: ReadFrom | null = null) {
     const problem = browserSpeechProblem();
     if (problem) throw new Error(problem);
     if (deps.session.socket && !deps.session.chat) {
@@ -681,6 +704,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       }).join("\n\n");
       flat = browserSpeechChunks(text).map((chunkText) => ({ segment: 0, text: chunkText }));
       if (flat.length === 0) throw new Error("This message has no text to read.");
+      // `#1838`: a resumed read says the chunk it was on again, and no earlier one.
+      if (from !== null && typeof from.chunk === "number" && Number.isFinite(from.chunk)) {
+        startAt = Math.max(0, Math.min(flat.length - 1, Math.floor(from.chunk)));
+      }
     }
     const engine = browserSpeechEngine()!;
     const voice = browserSpeechVoice()!;
@@ -812,9 +839,11 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     };
     // An engine a stopped held read left paused must not swallow this one (see `audio.pause`).
     if (engine.paused === true && typeof engine.resume === "function") engine.resume();
-    if (docPayload !== null && doc!.from !== null && doc!.from.hold === true) {
+    if ((docPayload !== null && doc!.from !== null && doc!.from.hold === true) ||
+        (docPayload === null && from !== null && from.hold === true)) {
       // `#1039 documents-read-parity`, as a cloud jump's hold (`#434`): cued at its block, saying
-      // nothing, until Resume speaks that segment's first chunk (`resumeTransport` above).
+      // nothing, until Resume speaks that segment's first chunk (`resumeTransport` above). A
+      // message resumed held across a view switch (`#1838`) cues at its chunk the same way.
       pendingRead = null;
       setReadState("ready");
       nowPlaying = { ...nowPlaying!, paused: true, wasHeld: true };
@@ -1225,6 +1254,57 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // every stop path (toggle, Back, view switch), not only the ones that
     // pass through `setReadState`.
     deps.renderControls();
+  }
+
+  /**
+   * `#1838 vibe-talk-reader-continues-into-thread`. The read in progress, captured before a view
+   * switch stops it, for `resumeReader` to take up in the view the switch opens. A message read
+   * only: a document read belongs to its own surface and is not carried. A read still being
+   * fetched (`pendingRead`) is captured from its start. Null when nothing is playing or asked for.
+   */
+  function readerSnapshot(): ReaderSnapshot | null {
+    if (nowPlaying !== null) {
+      if (nowPlaying.kind === "document") return null;
+      const playing = nowPlaying;
+      const segment = playing.segments && typeof playing.segment === "number"
+        ? playing.segments[playing.segment] : undefined;
+      return {
+        id: String(playing.id),
+        parts: Array.isArray(playing.parts) ? playing.parts.map(String) : [String(playing.id)],
+        part: segment ? segment.part : 0,
+        block: segment ? segment.block : null,
+        chunk: typeof playing.chunk === "number" ? playing.chunk : null,
+        paused: playing.paused === true,
+      };
+    }
+    if (pendingRead !== null) {
+      return { id: String(pendingRead), parts: [String(pendingRead)], part: 0, block: null, chunk: null, paused: false };
+    }
+    return null;
+  }
+
+  /**
+   * `#1838`. Take a captured read up again in the view now on screen, at the smallest unit it
+   * was on — that one unit is said again, and the read then goes on through this view as any
+   * read started here would (autoplay included). Pace and voice are the page's own, untouched.
+   * False, with the read stopped and the reason said on the status line, when this view does
+   * not draw the message: a switch that cannot carry the read fails safe, never silently.
+   */
+  function resumeReader(snapshot: ReaderSnapshot): boolean {
+    const drawn = readingRowsOf(snapshot.id).length > 0 ||
+      listRows("discord-log").some((row) => idsOf(row as HTMLElement).includes(snapshot.id));
+    if (!drawn) {
+      readingMode = false;
+      setReadState("idle");
+      deps.setStatus("Reading stopped: that message is not in this view.");
+      return false;
+    }
+    deps.guardQuietly(() => readAloud(snapshot.parts, {
+      part: snapshot.part, block: snapshot.block,
+      ...(snapshot.chunk !== null ? { chunk: snapshot.chunk } : {}),
+      hold: snapshot.paused,
+    }))();
+    return true;
   }
 
   /** Fetch the audio for one message. Bytes, not JSON, so it cannot go through `api`. */
@@ -2062,6 +2142,9 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   function followReading(target: { getBoundingClientRect(): DOMRect } | null, centreDeadzonePx = 0) {
     const playing = nowPlaying;
     if (!playing || playing.paused || !target || typeof target.getBoundingClientRect !== "function") return;
+    // `#1839` x `#1838`: while a composer holds the view the follow stands down with the
+    // other scroll holders, so a resumed read never re-places its anchor over the box.
+    if (deps.composerHeld && deps.composerHeld()) return;
     let area: HTMLElement | null = null;
     try { area = deps.el("scroll-area"); } catch (_error) { area = null; }
     if (!area || typeof area.getBoundingClientRect !== "function") return;
@@ -3660,7 +3743,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     if (readAloudPlayback !== "audio") {
       try {
         if (readAloudPlayback !== "browser") throw new Error("This speech playback method is not supported by this page.");
-        readWithBrowserSpeech(parts, id, ticket);
+        readWithBrowserSpeech(parts, id, ticket, null, from);
       } catch (error) {
         if (ticket === readingTicket) {
           stopReading();
@@ -3879,6 +3962,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   get readState() { return readState; }, set readState(value: typeof readState) { readState = value; },
   setReadState,
   stopReading,
+  readerSnapshot,
+  resumeReader,
   readOnDevice,
   readAloudAudioContext,
   quietReadAloudContext,

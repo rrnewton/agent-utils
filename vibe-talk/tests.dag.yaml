@@ -2898,6 +2898,23 @@ steps:
       resources: {browser: 1}
       est_duration_s: 7
       classification: latency-bound
+  # `#1838 vibe-talk-reader-continues-into-thread` in the browser engine, at 412x915 by touch and
+  # 1280x800 with a mouse: Read on a long reply in All, tapped into its thread mid-chunk, resumes
+  # on that chunk at the anchor's place and goes on to the next reply; Back resumes again; a
+  # switch to a view without the message stops the read and says so in place.
+  - group: check
+    job: thread-reader-resume-browser
+    desc: read-aloud resumes at its chunk after drilling into the thread and back out, and stops with a word in place where the message is absent, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_reader_resume_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 12
+      classification: latency-bound
   # `#1819 vibe-talk-thread-button-shows-slug` in the browser engine, at 412x915 by touch (scale
   # 2.6) and 1280x800 with a mouse, light and dark, keyboard open and closed, Discuss open on the
   # phone: a slugged root's tag reads "🧵 my-thread-slug (57)" with a greyed emoji inside its row,
