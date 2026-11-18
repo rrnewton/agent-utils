@@ -44860,15 +44860,32 @@ def _cmd_relocate_repository(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclasses.dataclass(frozen=True)
+class _HeartbeatPrevalidated:
+    """What a heartbeat's lock-free validation established (#1808-A).
+
+    ``warnings`` are the #1492 nested-worktree warnings the validated state
+    earned; they print once, after the write, never per validation round.
+    """
+
+    states: tuple[ActiveState, ...]
+    archives: tuple[ArchiveState, ...]
+    warnings: tuple[str, ...]
+
+
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
     owner = _capture_caller_process(args.owner_pid, "owner")
-    with _mutation_locks(config, args.wait_lock):
-        _refuse_partial_state(config, allow_validate_batch_seals=True)
+
+    def prepare() -> _HeartbeatPrevalidated:
+        # Lock-free (#1808-A, following #1276): the fleet validation, the
+        # registry storage scan and the event-log load run here, holding no
+        # lock. A refusal raised here is reported only from a round in which
+        # the registry held still, as _run_prevalidated_mutation arranges.
         states, archives = _validate_global_state(config)
-        state = _load_active(config)
+        state = next(item for item in states if item.machine == config.machine)
         record = _find_record(state, args.slot)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         _assert_validate_batch_seals_disjoint_from_record(
@@ -44889,30 +44906,30 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         # warning while still recording the heartbeat.  Scope is strictly
         # heartbeat: remove/retire/write-handoff keep their own nested
         # handling (see #1400 nested-foreign-checkout).
-        _hb_findings = _assert_command_registry_storage(
+        findings = _assert_command_registry_storage(
             config, states, args, tolerate_target_git_registrations=True
         )
-        for _detail in _hb_findings.target_git_registrations:
+        warnings: list[str] = []
+        for detail in findings.target_git_registrations:
             # Only a PRESENT nested worktree is tolerated: a registration
             # whose path was deleted is stale bookkeeping the owner must
             # repair, and heartbeat still refuses it (the deliberate
             # own-slot half of test_status_reports_git_registration...).
-            _marker = " registers "
-            _start = _detail.find(_marker)
-            _end = _detail.find(" inside", _start) if _start >= 0 else -1
-            _registered = (
-                Path(_detail[_start + len(_marker):_end])
-                if _start >= 0 and _end > _start
+            marker = " registers "
+            start = detail.find(marker)
+            end = detail.find(" inside", start) if start >= 0 else -1
+            registered = (
+                Path(detail[start + len(marker):end])
+                if start >= 0 and end > start
                 else None
             )
-            if _registered is not None and not _registered.exists():
-                raise Refusal(_detail)
-            print(
+            if registered is not None and not registered.exists():
+                raise Refusal(detail)
+            warnings.append(
                 f"WARNING: slot {record.slot} has a nested worktree Git "
-                f"registers without a checkout row: {_detail}. "
+                f"registers without a checkout row: {detail}. "
                 "state: heartbeat recorded anyway; the nested worktree is "
-                "retained and not inspected",
-                file=sys.stderr,
+                "retained and not inspected"
             )
         release = _owner_release_in_effect(
             config, record, _load_events(config, record.machine)
@@ -44926,7 +44943,32 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
                 "this slot and leave it; if more work is needed, create a new slot with "
                 "'wrkslots create'"
             )
+        return _HeartbeatPrevalidated(
+            states=tuple(states), archives=tuple(archives), warnings=tuple(warnings)
+        )
+
+    def commit(
+        reference: _RegistryIdentity | None, prepared: _HeartbeatPrevalidated | None
+    ) -> tuple[ActiveRecord, tuple[str, ...]]:
+        # Under the locks only (#1808-A): the partial-state refusal, the
+        # touched record's own auth re-check, the one record write after the
+        # verified tip, and the post-write check that reads only the events
+        # this command appended. No fleet validation, storage scan or log
+        # load runs here; _run_prevalidated_mutation guarantees the registry
+        # identity still equals the one prepare validated (until #1808-B
+        # teaches it which changes a heartbeat may tolerate).
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        assert prepared is not None
+        states, archives = list(prepared.states), list(prepared.archives)
         before = _global_rows(states, archives)
+        local = (
+            None
+            if reference is None
+            else _verified_local_log(config, reference, states, archives)
+        )
+        state = _load_active(config) if local is None else local.active
+        record = _find_record(state, args.slot)
+        _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         updated = dataclasses.replace(record, heartbeat_at=_utc_now())
         _write_active_state(
             config,
@@ -44934,13 +44976,19 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             action="ttl-renewed",
             slot=updated.slot,
             evidence={"heartbeat_at": updated.heartbeat_at},
+            event_writer=None if local is None else local.writer(config),
+            previous=None if local is None else local.active,
         )
-        after_states, after_archives = _validate_global_state(config)
-        _assert_only_slot_changed(
-            before,
-            _global_rows(after_states, after_archives),
-            args.slot,
+        _assert_registry_change_limited_to_slot(
+            config, reference, before, args.slot, local
         )
+        return updated, prepared.warnings
+
+    updated, warnings = _run_prevalidated_mutation(
+        config, args.wait_lock, "heartbeat", prepare, commit
+    )
+    for warning in warnings:
+        print(warning, file=sys.stderr)
     print(
         f"heartbeat slot={updated.slot} generation={updated.generation} at={updated.heartbeat_at}"
     )

@@ -338,11 +338,15 @@ pub(crate) fn heartbeat(
     validate_name(agent, "agent")?;
     let supplied = read_process_identity(owner_pid)?;
     assert_caller(&supplied, "owner")?;
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
-    refuse_partial_state_allow_seals(&cfg.control)?;
+    // Lock-free prepare (#1808-A, following the Python edition): the fleet
+    // validation, the storage scan and the event-log load run here, holding
+    // no lock. Under the locks below only the touched record is re-checked
+    // and written. This edition has no registry-identity compare yet, so a
+    // change that lands between prepare and the locks is caught by the
+    // under-lock record re-check (generation, agent, owner), never trusted.
     validate_global(root, &cfg)?;
-    let active = active_document(root, &cfg, &selected)?;
-    let record = active
+    let prepared_active = active_document(root, &cfg, &selected)?;
+    let record = prepared_active
         .get("slots")
         .and_then(Value::as_array)
         .and_then(|slots| {
@@ -436,6 +440,47 @@ pub(crate) fn heartbeat(
                 "slot {slot} generation {generation} was released by its owner at {recorded_at} (event {sequence}), which stopped this generation's heartbeat. state: REFUSED -- the heartbeat was not renewed and the slot stays released for removal. remedy: stop using this slot and leave it; if more work is needed, create a new slot with 'wrkslots create'"
             ));
         }
+    }
+    // Commit (#1808-A): take the locks, refuse partial state, and re-check
+    // only the touched record before the one write.
+    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    refuse_partial_state_allow_seals(&cfg.control)?;
+    let active = active_document(root, &cfg, &selected)?;
+    let record = active
+        .get("slots")
+        .and_then(Value::as_array)
+        .and_then(|slots| {
+            slots
+                .iter()
+                .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
+        })
+        .cloned()
+        .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;
+    let generation = record
+        .get("generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if generation != expected_generation {
+        return Err(format!(
+            "stale generation for slot {slot}: expected {expected_generation}, current {generation}"
+        ));
+    }
+    let record_agent = record
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if record_agent != agent {
+        return Err(format!(
+            "ownership mismatch for slot {slot}: expected {record_agent}, got {agent}"
+        ));
+    }
+    let owner_now = record_identity(&record, "owner")
+        .ok_or_else(|| format!("slot {slot} has no bound owner process; adopt it first"))?;
+    if supplied != owner_now {
+        let (state, detail) = process_state(Some(&owner_now));
+        return Err(format!(
+            "owner process generation mismatch for slot {slot}; recorded owner is {state}: {detail}"
+        ));
     }
     ensure_event_log(root, &cfg, &selected)?;
     let previous_revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
