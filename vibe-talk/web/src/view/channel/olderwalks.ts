@@ -886,7 +886,14 @@ function serverFreshHits(): Message[] {
   const serverSearch = serverSearchNow();
   const channel = String(selectedChannelId() || "");
   const held = heldMessagesById();
-  return serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel && held.has(String(hit.id))));
+  const onScreen = onScreenMessageIds();
+  // `#1864 vibe-talk-whole-threads-no-duplicate-hits`: a hit whose real row
+  // already stands in the timeline is not fresh, even when the store does
+  // not hold it yet — the server-rendered first paint draws rows the store
+  // has not folded, and drawing the hit again beside its own row showed
+  // every hit twice.
+  return serverSearch.hits.filter((hit) => !(String(hit.channel_id) === channel &&
+    (held.has(String(hit.id)) || onScreen.has(String(hit.id)))));
 }
 
 // `#1786 vibe-talk-search-scope-server-hits`. The scope on screen: this thread in
@@ -976,6 +983,20 @@ function bucketCounts(grouped: Map<string, Message[]>): Map<string, number> {
 /** The attribute marking a row the server search placed in the timeline. */
 const SERVER_HIT_MARK = "data-server-hit";
 
+/**
+ * Every message id the timeline already stands a real row for, server-placed
+ * rows aside (`#1864`): the on-screen half of "already held", for rows the
+ * store has not folded (the server-rendered first paint).
+ */
+function onScreenMessageIds(): Set<string> {
+  const ids = new Set<string>();
+  for (const row of el("discord-log").children) {
+    if (row.hasAttribute(SERVER_HIT_MARK)) continue;
+    for (const id of idsOf(row)) ids.add(id);
+  }
+  return ids;
+}
+
 /** Take every row the server search placed out of the timeline again. */
 function clearServerHits(): void {
   const list = el("discord-log");
@@ -986,8 +1007,9 @@ function clearServerHits(): void {
 /** The Agent Transcripts bucket's fresh hits, oldest first (`#1608`). */
 function transcriptBucketHits(): Message[] {
   const held = heldMessagesById();
+  const onScreen = onScreenMessageIds();
   return [...(serverSearchNow().transcriptHits || [])]
-    .filter((hit) => !held.has(String(hit.id)))
+    .filter((hit) => !held.has(String(hit.id)) && !onScreen.has(String(hit.id)))
     .sort(byHitTime);
 }
 

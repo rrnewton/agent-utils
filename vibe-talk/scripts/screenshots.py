@@ -4441,6 +4441,35 @@ def _open_discuss(driver: Driver) -> None:
     )
 
 
+def _act_whole_threads_no_duplicates(driver: Driver) -> None:
+    """`#1864 vibe-talk-whole-threads-no-duplicate-hits`: "runner" searched,
+    Whole threads on, the server's answer settled.
+
+    The state the fix targets: every hit stands once in the list, in place.
+    The seeded backlog says "runner" several times over, and the server's
+    copy holds the same messages, so an on-screen hit drawn again by the
+    server-hit merge is exactly what this frame would show twice.
+    """
+    _act_open_channel(driver)
+    driver.click("search-toggle")
+    driver.page.wait_for_function("() => window.__visible('search-field')", timeout=5_000)
+    driver.page.fill("#search-field", "runner")
+    driver.page.wait_for_function(
+        "() => (window.__text('search-count') || '').includes('of')", timeout=10_000
+    )
+    driver.click("search-entire-threads")
+    driver.page.wait_for_function(
+        "() => document.getElementById('search-entire-threads').getAttribute('aria-pressed') === 'true'",
+        timeout=5_000,
+    )
+    # The server's answer settled: its line stops saying it is searching.
+    driver.page.wait_for_function(
+        "() => /Server search details|No more hits/.test(document.getElementById('server-line').textContent)",
+        timeout=20_000,
+    )
+    driver.settle(300)
+
+
 def _act_discuss_preview(driver: Driver) -> None:
     _open_discuss(driver)
 
@@ -7248,6 +7277,31 @@ SCENES: tuple[Scene, ...] = (
                 "return r.top >= 0 && r.bottom <= h; })()",
             ),
             ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
+    ),
+    Scene(
+        name="78-whole-threads-no-duplicates",
+        what="Whole threads on with the server search settled: every hit stands once, in place",
+        act=_act_whole_threads_no_duplicates,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            (
+                "the Whole-threads toggle is pressed on",
+                "document.getElementById('search-entire-threads').getAttribute('aria-pressed') === 'true'",
+            ),
+            (
+                "no message id stands twice in the visible list",
+                "(() => { const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                ".filter((li) => li.getClientRects().length); const seen = new Set(); "
+                "return rows.every((li) => !seen.has(li.dataset.id) && seen.add(li.dataset.id)); })()",
+            ),
+            (
+                "no server-placed row repeats an id a real row already stands for",
+                "(() => { const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                ".filter((li) => li.getClientRects().length); "
+                "return !rows.some((li) => li.hasAttribute('data-server-hit') && rows.some((other) => "
+                "other !== li && other.dataset.id === li.dataset.id && !other.hasAttribute('data-server-hit'))); })()",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
     ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,

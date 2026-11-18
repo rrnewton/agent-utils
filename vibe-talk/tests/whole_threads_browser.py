@@ -13,6 +13,13 @@ phone:
   the card shows the thread whole, filter still on), and in two columns;
   every search-bar icon carries a tooltip and an accessible label; the old
   results-area chip is gone. `--screenshots DIR` keeps one PNG per stage.
+
+  `#1864 vibe-talk-whole-threads-no-duplicate-hits`: with the toggle on, the
+  hit thread renders once — each visible message id exactly once, the hit's
+  text once, the hit marked in place, and its non-matching thread-mates
+  standing normally rather than greyed as unmatched. The real-server half
+  (the server-hit merge drawing an on-screen hit again) is
+  `tests/whole_threads_server_browser.py`.
 """
 
 from __future__ import annotations
@@ -147,6 +154,30 @@ def walk_through(walk: Walk) -> None:
                "the toggle did not press on")
     walk.check(walk.shown() == ["210", "211", "212", "215"],
                f"whole threads (word, All) show {walk.shown()}")
+    # `#1864`: the thread renders once — every visible id exactly once, the
+    # hit's text once, the hit marked in place, its thread-mates standing
+    # normally (shown, unmarked) rather than greyed as unmatched.
+    once = page.evaluate("""() => {
+      const rows = [...document.querySelectorAll('#discord-log > li[data-id]')]
+        .filter((li) => li.getClientRects().length);
+      const counts = {};
+      for (const li of rows) counts[li.dataset.id] = (counts[li.dataset.id] || 0) + 1;
+      const hit = rows.find((li) => li.dataset.id === '211');
+      const mate = rows.find((li) => li.dataset.id === '212');
+      return {
+        dupes: Object.entries(counts).filter(([, n]) => n > 1).map(([id]) => id),
+        textOnce: rows.filter((li) => li.textContent.includes('the quixotic plan is ready')).length,
+        mateShown: !!mate && !mate.classList.contains('search-hidden'),
+        mateUnmarked: !!mate && mate.querySelectorAll('mark.search-hit').length === 0,
+      }; }""")
+    walk.check(once["dupes"] == [], f"whole threads (word, All) shows ids twice: {once['dupes']}")
+    walk.check(once["textOnce"] == 1, f"the hit's text stands {once['textOnce']} times in the visible list")
+    # The marks are drawn once the typing pauses (`searchField.marked()`).
+    walk.until("""() => { const hit = document.querySelector('#discord-log > li[data-id="211"]');
+      return !!hit && [...hit.querySelectorAll('mark.search-hit')].some((m) => m.textContent === 'quixotic'); }""",
+               "the hit is not marked in place in its thread")
+    walk.check(once["mateShown"] and once["mateUnmarked"],
+               "a non-matching thread-mate is hidden, greyed as unmatched, or marked as a hit")
     if not walk.touch:
         page.hover("#search-entire-threads")
         walk.settled()
