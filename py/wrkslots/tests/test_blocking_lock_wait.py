@@ -183,3 +183,21 @@ def test_the_timeout_race_never_leaks_the_duplicate_descriptor(
         assert free, "the timed-out wait leaked its duplicate's lock"
     finally:
         os.close(probe)
+
+
+def test_parser_parsed_arguments_give_a_bounded_wait_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    """A caller that parses arguments itself never reaches main's default
+    resolution, so its wait_lock is None: the lock helpers must treat
+    that as the bounded default (#1808 gate regression)."""
+    project, _repository, _remote = make_project(tmp_path)
+    args = cli._build_parser().parse_args(
+        ["--project-root", str(project), "status"]
+    )
+    assert args.wait_lock is None
+    subject = project / "worktrees" / "ACTIVE"
+    with cli._locked(subject, exclusive=False, wait_seconds=args.wait_lock):
+        pass
+    assert cli._resolved_wait_seconds(None) == 30.0
+    assert cli._resolved_wait_seconds(0.0) == 0.0

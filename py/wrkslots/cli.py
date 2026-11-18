@@ -6663,7 +6663,7 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[
     path = _lock_path(subject)
     fd = _open_lock_file(path, "state lock")
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-    deadline = time.monotonic() + wait_seconds
+    deadline = time.monotonic() + _resolved_wait_seconds(wait_seconds)
     try:
         intent = _enter_registry_turnstile(subject, exclusive=exclusive, deadline=deadline)
         try:
@@ -6955,7 +6955,7 @@ def _locked_config(
     if not stat.S_ISDIR(mode):
         os.close(fd)
         raise Refusal(f"configuration lock is not a directory: {lock_path}")
-    deadline = time.monotonic() + wait_seconds
+    deadline = time.monotonic() + _resolved_wait_seconds(wait_seconds)
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     try:
         if not _flock_until(fd, operation, deadline):
@@ -6985,7 +6985,9 @@ def _mutation_locks(
     release_config_after_check: bool = False,
 ) -> Iterator[None]:
     effective_deadline = (
-        time.monotonic() + wait_seconds if deadline is None else deadline
+        time.monotonic() + _resolved_wait_seconds(wait_seconds)
+        if deadline is None
+        else deadline
     )
 
     def check_config() -> None:
@@ -7513,6 +7515,7 @@ def _run_prevalidated_mutation(
     clock starts at the first wait.
     """
 
+    wait_seconds = _resolved_wait_seconds(wait_seconds)
     lock_deadline: float | None = None
     change = "nothing"
     for attempt in range(1, REGISTRY_VALIDATION_ATTEMPTS + 1):
@@ -7528,7 +7531,7 @@ def _run_prevalidated_mutation(
             change = _describe_registry_change(identity, current)
             continue
         if lock_deadline is None:
-            lock_deadline = time.monotonic() + wait_seconds
+            lock_deadline = time.monotonic() + _resolved_wait_seconds(wait_seconds)
         try:
             with _mutation_locks(config, _remaining_lock_wait(lock_deadline)):
                 current = _registry_identity(config)
@@ -45212,6 +45215,18 @@ class _HeartbeatPrevalidated:
     warnings: tuple[str, ...]
 
 
+def _resolved_wait_seconds(wait_seconds: float | None) -> float:
+    """A lock wait with the #1808-C default applied.
+
+    ``--wait-lock`` defaults to None in the parser so `main` can tell an
+    unset option from an explicit 0; a caller that parsed arguments
+    itself (an in-process audit, a test) therefore hands None to the
+    lock helpers, and None means the bounded default, never a crash.
+    """
+
+    return 30.0 if wait_seconds is None else wait_seconds
+
+
 def _wait_or_default(args: argparse.Namespace, default: float) -> float:
     """A bounded command's own default wait, kept from before #1808-C.
 
@@ -45234,7 +45249,9 @@ def _heartbeat_wait_seconds(args: argparse.Namespace, ttl_seconds: float) -> flo
     to lapse a healthy lease (a 600 s TTL leaves roughly 590 s of margin).
     """
 
-    if not getattr(args, "wait_lock_defaulted", False):
+    if getattr(args, "wait_lock", None) is not None and not getattr(
+        args, "wait_lock_defaulted", False
+    ):
         return float(args.wait_lock)
     return max(1.0, min(10.0, ttl_seconds / 3.0))
 
