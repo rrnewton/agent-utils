@@ -455,7 +455,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
         except Exception:
             pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
         page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-        page.click("#view-switch")
+        # `#1781`: sign-in lands on the channel already.
         open_channel(page)
         if not mobile:
             page.mouse.move(1, 1)  # off every row, so none is drawn as hovered

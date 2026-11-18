@@ -519,7 +519,7 @@ def main() -> int:
                         page.click("#welcome-start")
                 except Exception:
                     pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
-                page.click("#view-switch")
+                # `#1781`: sign-in lands on the channel already.
                 page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=30_000)
                 page.click("#read-aloud")
                 page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=30_000)

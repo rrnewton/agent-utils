@@ -527,6 +527,11 @@ def tap(page: Page, selector: str, touch: bool) -> None:
 def tap_read_mode(page: Page, touch: bool) -> None:
     """`#1355 phone-bar-discuss-slot`: Show/Fold read through the hamburger menu."""
     tap(page, "#action-menu-open", touch)
+    # `#1781`: with the channel landed on at sign-in, the tray's items settle a frame
+    # after it opens; wait for the button's box, as the walk waits for drawn controls.
+    page.wait_for_function("() => { const b = document.getElementById('todo-filter');"
+                           " const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }",
+                           timeout=10_000)
     tap(page, "#todo-filter", touch)
 
 
@@ -600,7 +605,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     page.wait_for_function("() => document.querySelectorAll('#discord-log > li').length > 10", timeout=10_000)
     page.wait_for_function("() => document.getElementById('todo-filter').dataset.readMode === 'show'",
                            timeout=10_000)
@@ -611,6 +616,12 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(m["icons"] == ["show"], f"{size}: Show read draws icons {m['icons']}")
     dock_holds(m, "Fold read")
     tap(page, "#action-menu-open", touch)
+    # `#1781`: with the channel landed on at sign-in, the tray's label lays out a frame
+    # after it opens; wait for its own boxes, as the walk waits for drawn controls.
+    page.wait_for_function("() => { const r = document.createRange();"
+                           " r.selectNodeContents(document.getElementById('todo-filter-label'));"
+                           " return [...r.getClientRects()].some((b) => b.width > 0); }",
+                           timeout=10_000)
     check(measure(page)["labelFits"] is True and measure(page)["labelLines"] == 1, f"{size}: the words 'Fold read' touch or cross the button's sides")
     page.keyboard.press("Escape")
     m = settled_entry()
@@ -633,6 +644,12 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(m["icons"] == ["fold"], f"{size}: Fold read draws icons {m['icons']}")
     dock_holds(m, "Fold read")
     tap(page, "#action-menu-open", touch)
+    # `#1781`: with the channel landed on at sign-in, the tray's label lays out a frame
+    # after it opens; wait for its own boxes, as the walk waits for drawn controls.
+    page.wait_for_function("() => { const r = document.createRange();"
+                           " r.selectNodeContents(document.getElementById('todo-filter-label'));"
+                           " return [...r.getClientRects()].some((b) => b.width > 0); }",
+                           timeout=10_000)
     check(measure(page)["labelFits"] is True and measure(page)["labelLines"] == 1, f"{size}: the words 'Fold read' touch or cross the button's sides")
     page.keyboard.press("Escape")
     m = settled_entry()
@@ -847,7 +864,7 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     page.wait_for_function(f"() => document.querySelectorAll('#discord-log > li').length === {HELD_WINDOW}",
                            timeout=10_000)
     page.wait_for_timeout(300)

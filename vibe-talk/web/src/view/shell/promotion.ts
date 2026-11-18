@@ -241,6 +241,12 @@ export function createPromotion(deps: PromotionDependencies): Promotion {
   }
 
   function refresh(): void {
+    // `#1781 vibe-talk-first-run-welcome-channel-default`. Off the main screen the bar is
+    // not standing: every pack member is hidden by that rule, so the measured room is the
+    // whole bar and anything would "fit". Deciding then promotes menu items into a pack
+    // the next render hides by view, and demotes them back still hidden — a state only a
+    // view switch repaired. The first main render decides with real measurements.
+    if (deps.screen() !== "main") return;
     apply(decidePromotion(freeWidth(), candidates(), promoted));
   }
 

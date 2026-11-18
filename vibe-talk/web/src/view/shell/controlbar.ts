@@ -170,6 +170,13 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     // is a question something can be asked. A member with no entry is a mistake rather than a
     // default: see the loop below.
     for (const member of deps.el("bar-pack").children as unknown as HTMLCollectionOf<HTMLElement>) {
+      // `#1781 vibe-talk-first-run-welcome-channel-default`. A promoted menu item stands in
+      // the pack by promotion's leave, and its `hidden` is its own renderer's (promotion
+      // never writes it). Hiding it here by view — it has no PACK_VIEWS entry — stranded it:
+      // the next refresh demoted it back to the menu still hidden, and only a view switch's
+      // call-controls render ever unhid it, which a reader who lands on the Channel (the
+      // default now) may never make.
+      if (member.classList.contains("promoted-action")) continue;
       const views = PACK_VIEWS[member.id] || [];
       const unavailable = (member.id === "audio-source" && deps.readAloudAgent() === null) ||
         (member.id === "column-toggle" && !deps.columnsOffered());
