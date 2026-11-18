@@ -23,6 +23,7 @@ const SUITES: &[&str] = &[
     "tests/js/core/channels.test.mjs",
     "tests/js/core/navigation.test.mjs",
     "tests/js/core/outbox.test.mjs",
+    "tests/js/core/draftsync.test.mjs",
     "tests/js/core/settings.test.mjs",
     "tests/js/core/search.test.mjs",
     "tests/js/core/transcripts.test.mjs",

@@ -1943,6 +1943,7 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
             "reply_pointers",
             "discuss_records",
             "thread_class",
+            "composer_drafts",
             "message_cache"
         ]),
         "the answer has to name what it erased: {payload}"

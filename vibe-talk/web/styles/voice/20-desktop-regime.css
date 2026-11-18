@@ -750,6 +750,18 @@
     grid-column: 1 / -1;
   }
 
+  /* `#1840 vibe-talk-draft-sync-across-devices`: the continue offer spans the
+     desk's row like the state line; what it and the actions row hold is laid
+     out by them, and says so here for the same reason. */
+  #screen-main:not([data-draft]) #draft-sync-offer,
+  #screen-main:not([data-draft]) #draft-sync-offer-text,
+  #screen-main:not([data-draft]) #draft-sync-use,
+  #screen-main:not([data-draft]) #draft-sync-keep,
+  #screen-main:not([data-draft]) #draft-sync-discard,
+  #screen-main:not([data-draft]) #channel-save-draft {
+    grid-column: 1 / -1;
+  }
+
   #screen-main:not([data-draft]) #send-text {
     grid-column: 2;
   }

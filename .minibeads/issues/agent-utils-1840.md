@@ -1,5 +1,5 @@
 ---
-title: 'vibe-talk-draft-sync-across-devices: sync composer drafts across the owner's devices'
+title: "vibe-talk-draft-sync-across-devices: sync composer drafts across devices"
 status: open
 priority: 0
 issue_type: feature
