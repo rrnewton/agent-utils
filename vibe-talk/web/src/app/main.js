@@ -4251,7 +4251,7 @@ const openingViewOwner = createOpeningView({
   upsertThreadSummary: (canon, summary) => upsertThreadSummary(canon, summary),
   viewKey: (view, thread) => viewKey(view, thread), visibleList: () => visibleList(),
   windowStorage: () => windowStorage(), deepLinks: () => deepLinks, sideColumnUp: () => sideColumnUp(),
-  threadListShown: () => layoutShown.threadList(), showThreadList: () => chooseView("threads"),
+  threadListShown: () => layoutShown.threadList(),
   cardAnchorId: () => { const place = cardAnchor(); return place && place.id ? String(place.id) : null; },
   placeCardId: (id) => placeCardAnchor({ newest: false, id: String(id), offset: 0 }, true),
   documentsQueryValue: (name) => documentsQueryValue(name),

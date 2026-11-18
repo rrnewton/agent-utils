@@ -59,8 +59,6 @@ export interface OpeningViewDependencies {
   sideColumnUp(): boolean;
   /** Whether the thread list (Threads view) is the layout on screen, where one is offered (`#1849`). */
   threadListShown?(): boolean;
-  /** Show the thread list as the reader's chosen view (`#1849`). */
-  showThreadList?(): void;
   /** The top-visible thread card's id in the thread list, or null (`#1849`). */
   cardAnchorId?(): string | null;
   /** Put the thread list back on card `id`; false where it is not drawn (`#1849`). */
@@ -230,7 +228,6 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
         const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
         if (wanted.view === "main") return { view: "main", thread: null, summary: null, origin: "main" };
         if (wanted.view === "all") return { view: "flat", thread: null, summary: null, origin: "main" };
-        if (wanted.view === "threads") return { view: "threads", thread: null, summary: null, origin: "main" };
         if ((wanted.view === "thread" || (!wanted.view && thread)) && thread && deps.providerFacts.threading()) {
           // The very thread this channel already opens in — a reload standing on its own
           // address: the kept choice below says where its Back goes (the thread list it was
@@ -263,17 +260,6 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
     // `#229 desktop-two-column`. In two columns the left column is Main, whatever the channel opens in.
     // `#281 view-keys`: and behind the thread list on its own.
     const opening = deps.sideColumnUp() ? { view: "main", thread: null, summary: null, origin: "main" } : openingChannelView();
-    // `#1849 vibe-talk-reload-keeps-view-and-place`. The Threads view is a layout over Main:
-    // the left column stands on Main behind it, and the list itself is shown as chosen.
-    if (opening.view === "threads") {
-      deps.selection().view = "main";
-      deps.selection().threadId = null;
-      deps.selection().thread = null;
-      deps.selection().origin = "main";
-      if (deps.showThreadList) deps.showThreadList();
-      deps.scheduleBackSync();
-      return;
-    }
     deps.selection().view = opening.view;
     deps.selection().threadId = opening.thread;
     deps.selection().thread = opening.summary;
