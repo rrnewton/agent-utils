@@ -555,7 +555,7 @@ def open_desk(browser: Browser, api: FakeApi, storage: dict[str, str]) -> tuple[
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#view-switch", state="visible", timeout=int(STATE_S * 1000))
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     page.wait_for_selector(f'#discord-log > li[data-id="{message_id(ROOT)}"]', timeout=int(STATE_S * 1000))
     page.wait_for_function(
         f"() => document.querySelectorAll('#discord-log > li[data-collapsed]').length >= {POSTS}",

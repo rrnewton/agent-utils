@@ -79,6 +79,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.add_init_script("localStorage.setItem('vibe-talk.token', %s);" % json.dumps(TOKEN))
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
+            # `#1781`: a token-seeded first run meets the Welcome; dismiss it onto the Channel.
+            try:
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                page.click("#welcome-start")
+            except Exception:
+                pass
             page.wait_for_function("() => !document.getElementById('screen-main').hidden",
                                    timeout=15_000)
             page.click("#open-settings")

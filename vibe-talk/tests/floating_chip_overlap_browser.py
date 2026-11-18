@@ -151,13 +151,7 @@ def open_channel(desk: Desk, touch: bool) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    if touch:
-        box = page.locator("#view-switch").first.bounding_box()
-        desk.check(box is not None, "#view-switch is not drawn")
-        assert box is not None
-        page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-    else:
-        page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel, open in All.
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24",
                   "the channel did not open in All")
     desk.wait_for("() => document.getElementById('channel-freshness').textContent.startsWith('Live')",

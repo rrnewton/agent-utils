@@ -272,7 +272,7 @@ def walk(page: Page, api: FakeApi, url: str, shot: Callable[[str], None], benchm
         page.click("#welcome-start")
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     last = list(MESSAGES)[-1]
     page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=int(STATE_S * 1000))
 
