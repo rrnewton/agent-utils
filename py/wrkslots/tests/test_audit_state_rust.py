@@ -240,10 +240,15 @@ def _check(root: Path, tmp_path: Path) -> dict[str, object]:
     bus_refused = False
     for attempt in range(5):
         result = _rust(root, census_state=tmp_path / f"rust-census-{attempt}.json")
-        if result.returncode != 0 and "busctl unit listing failed" in result.stderr:
-            # A transient D-Bus drop refuses the Rust edition's unit
-            # listing before any judgment: host churn of the readable
-            # kind, not a disagreement. Retry the pair through it.
+        if result.returncode != 0 and (
+            "busctl unit listing failed" in result.stderr
+            or "busctl property read" in result.stderr
+        ):
+            # A transient D-Bus drop refuses the Rust edition's host
+            # evidence (the unit listing, or a property read on one of
+            # the host's units while judging) before any judgment: host
+            # churn of the readable kind, not a disagreement. Retry the
+            # pair through it.
             bus_refused = True
             time.sleep(1.0)
             continue
