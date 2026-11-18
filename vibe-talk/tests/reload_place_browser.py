@@ -4,7 +4,7 @@ vibe-talk-reload-keeps-view-and-place`), against the REAL server.
 
 The owner (thread 187): a refresh after reading mid-channel — most
 recently after a search — put them back at the bottom of the Main view.
-On this hermit-style channel (the fake Discord upstream has no threads,
+On this threadless channel (the fake Discord upstream has no threads,
 so Main is the whole channel) the test seeds a tall channel through the
 real reply route, reads mid-channel, filters by a search, scrolls, and
 reloads: the view stays Main on the same channel and the top-visible

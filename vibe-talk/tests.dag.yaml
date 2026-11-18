@@ -1413,7 +1413,7 @@ steps:
   # 393x852 and 1280x800, and assert the bottom bar (and, in the reader, its pane)
   # stands after every reload.
   # `#1849 vibe-talk-reload-keeps-view-and-place` against the real server binary:
-  # seed a tall hermit-style channel (no threads), read mid-channel, filter by a
+  # seed a tall threadless channel (no threads), read mid-channel, filter by a
   # search, reload at 412x915 and 1280x800, and assert the view, the channel and
   # the session scroll anchor (never in the URL) survive.
   - group: check
