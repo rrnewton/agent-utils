@@ -2670,7 +2670,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             alone = page.evaluate(GLASS_ALONE_JS)
             shot("1-call-view-glass")
             check(not alone["problems"], f"{label}, the call view: {alone['problems']}")
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             wait_rows(["200", "201", "202"], "All after sign-in")
             check(page.evaluate("() => document.getElementById('thread-select').value") == "flat",
                   f"{label}: a channel with threads did not open in All")
@@ -3133,7 +3133,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                     page.click("#welcome-start")
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             wait_rows(["200", "201", "202", "203"], "a read-scope token did not read the channel")
             def storage_state() -> str:
                 return str(page.evaluate("() => document.getElementById('storage-state').textContent"))
@@ -3279,7 +3279,7 @@ def reply_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             page.wait_for_selector('#discord-log > li[data-id="215"]', timeout=10_000)
             arrows("at the default type size")
 
@@ -3410,7 +3410,7 @@ def tile_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             page.wait_for_selector('#discord-log > li[data-id="211"]', timeout=10_000)
             page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
             # `#820 voice-page-action-menu`: Summaries is an item of the action menu now.
@@ -3901,7 +3901,7 @@ def coalesce_walk(chromium: BrowserType, args: argparse.Namespace, label: str, w
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             page.wait_for_selector('#discord-log > li[data-id="214"]', timeout=10_000)
             if not mobile:
                 # Off every control, so nothing photographed has its hover disc behind it.
@@ -4117,7 +4117,7 @@ def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 except Exception:
                     pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
                 page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-                page.click("#view-switch")
+                # `#1781`: sign-in lands on the channel already.
                 until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 3",
                       "the channel did not open")
                 until("() => { const c = document.querySelector('#discord-log > li[data-id=\"201\"] .pin-chip');"
@@ -4203,7 +4203,7 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 3", "the channel did not open")
 
             # A pin made elsewhere: read because the channel's read carried its revision.
@@ -4346,7 +4346,7 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 5", "the channel did not open")
             glass = page.evaluate("() => { const b = document.getElementById('search-toggle').getBoundingClientRect();"
                                   " return [b.width, b.height]; }")
@@ -4493,7 +4493,7 @@ def links_bar_walk(chromium: BrowserType, args: argparse.Namespace, label: str, 
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 5", "the channel did not open")
             tap("#search-toggle")
             until("() => !document.getElementById('links-filter').hidden", "the open bar has no Links filter")
@@ -4629,7 +4629,7 @@ def kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 6", "the channel did not open")
 
             # Links on: the six kinds under it, all on, numbered, every link in view — and the numbers
@@ -4810,7 +4810,7 @@ def crowded_kinds_walk(chromium: BrowserType, args: argparse.Namespace, label: s
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 6", "the channel did not open")
             tap("#search-toggle")
             until("() => !document.getElementById('links-filter').hidden", "the open bar has no Links filter")
@@ -4931,7 +4931,7 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 4", "the channel did not open")
             until("() => { const a = document.getElementById('scroll-area'); return a.scrollHeight - a.scrollTop - a.clientHeight <= 24; }",
                   "the channel did not open at its newest line")
