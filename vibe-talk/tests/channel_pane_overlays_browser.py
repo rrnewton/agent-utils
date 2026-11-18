@@ -149,7 +149,7 @@ def raise_overlays(desk: Desk) -> None:
         document.getElementById('scroll-area').scrollTop = 0;
         const status = document.getElementById('status-line');
         status.hidden = false;
-        document.getElementById('status').textContent = 'Ready.';
+        document.getElementById('status').textContent = '1 message marked as dealt with here — not in the channel';
         const pull = document.getElementById('pull-refresh');
         pull.hidden = false;
         pull.textContent = 'Updated 10:07';
