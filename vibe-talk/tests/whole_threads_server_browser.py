@@ -36,7 +36,12 @@ import time
 import urllib.request
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 from playwright.sync_api import sync_playwright
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -67,7 +72,7 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def call(base: str, method: str, path: str, token: str, body: object = None) -> dict:  # type: ignore[type-arg]
+def call(base: str, method: str, path: str, token: str, body: object = None) -> dict[str, object]:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(base + path, data=data, method=method)
     req.add_header("Authorization", f"Bearer {token}")
@@ -84,26 +89,26 @@ def check(condition: bool, why: str) -> None:
     print(f"ok: {why}", flush=True)
 
 
-def until(page: object, script: str, why: str, seconds: float = 30) -> None:  # type: ignore[type-arg]
+def until(page: Page, script: str, why: str, seconds: float = 30) -> None:
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline and not page.evaluate(script):  # type: ignore[attr-defined]
-        page.wait_for_timeout(25)  # type: ignore[attr-defined]
-    check(bool(page.evaluate(script)), why)  # type: ignore[attr-defined]
+    while time.monotonic() < deadline and not page.evaluate(script):
+        page.wait_for_timeout(25)
+    check(bool(page.evaluate(script)), why)
 
 
-def assert_once(page: object, label: str) -> None:  # type: ignore[type-arg]
-    state = page.evaluate(ONCE_JS)  # type: ignore[attr-defined]
+def assert_once(page: Page, label: str) -> None:
+    state = page.evaluate(ONCE_JS)
     check(state["dupes"] == [], f"{label}: ids shown twice: {state['dupes']}")
     check(state["serverDupes"] == [], f"{label}: server rows repeat on-screen ids: {state['serverDupes']}")
     check(state["textOnce"] == 1, f"{label}: the hit's text stands {state['textOnce']} times")
     check(state["errorHidden"] and not state["bodyHas404"], f"{label}: dirty page {state}")
 
 
-def walk(page: object, label: str, shots: Path | None) -> None:  # type: ignore[type-arg]
+def walk(page: Page, label: str, shots: Path | None) -> None:
     until(page, "() => !!document.querySelector('#discord-log li')", f"{label}: the channel opened")
-    page.click("#search-toggle")  # type: ignore[attr-defined]
+    page.click("#search-toggle")
     until(page, "() => !document.getElementById('search-field').hidden", f"{label}: the search field stood")
-    page.fill("#search-field", "quixotic")  # type: ignore[attr-defined]
+    page.fill("#search-field", "quixotic")
     until(page, "() => document.getElementById('search-count').textContent.includes('of')",
           f"{label}: the word search was counted")
     # The server's answer settles: its line stops saying it is searching.
@@ -111,15 +116,15 @@ def walk(page: object, label: str, shots: Path | None) -> None:  # type: ignore[
           f"{label}: the server search settled")
     assert_once(page, f"{label} toggle off")
     if shots is not None:
-        page.screenshot(path=str(shots / f"{label}-1-toggle-off.png"))  # type: ignore[attr-defined]
-    page.click("#search-entire-threads")  # type: ignore[attr-defined]
+        page.screenshot(path=str(shots / f"{label}-1-toggle-off.png"))
+    page.click("#search-entire-threads")
     until(page, "() => document.getElementById('search-entire-threads').getAttribute('aria-pressed') === 'true'",
           f"{label}: the Whole-threads toggle pressed on")
     assert_once(page, f"{label} toggle on")
-    state = page.evaluate(ONCE_JS)  # type: ignore[attr-defined]
+    state = page.evaluate(ONCE_JS)
     check(state["hitMarked"], f"{label} toggle on: the hit is not marked in place")
     if shots is not None:
-        page.screenshot(path=str(shots / f"{label}-2-toggle-on.png"))  # type: ignore[attr-defined]
+        page.screenshot(path=str(shots / f"{label}-2-toggle-on.png"))
 
 
 def main() -> None:
@@ -159,8 +164,9 @@ def main() -> None:
                 check(time.time() < deadline, "the server did not come up")
                 time.sleep(0.25)
         call(base, "GET", f"/api/v1/channels/{CHANNEL}/messages?limit=6", WRITE)
-        root = call(base, "POST", f"/api/v1/channels/{CHANNEL}/reply", WRITE,
-                    {"text": "Alpha thread root about deployment."})["posted"]["id"]
+        posted = call(base, "POST", f"/api/v1/channels/{CHANNEL}/reply", WRITE,
+                      {"text": "Alpha thread root about deployment."})["posted"]
+        root = posted["id"] if isinstance(posted, dict) else ""
         call(base, "POST", f"/api/v1/channels/{CHANNEL}/reply", WRITE,
              {"text": "the quixotic plan is ready", "reply_to": root})
         call(base, "POST", f"/api/v1/channels/{CHANNEL}/reply", WRITE,
@@ -174,7 +180,7 @@ def main() -> None:
                 for label, width, height, scale in (("phone", 412, 915, 2.625), ("desktop", 1280, 800, 1.0)):
                     context = browser.new_context(
                         viewport={"width": width, "height": height}, device_scale_factor=scale,
-                        color_scheme=theme, has_touch=width < 600, is_mobile=width < 600)  # type: ignore[arg-type]
+                        color_scheme=theme, has_touch=width < 600, is_mobile=width < 600)
                     page = context.new_page()
                     page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE)}); "
