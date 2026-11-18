@@ -1,13 +1,14 @@
 ---
 title: 'cross-agentctl-profile-drift-wait: editions disagree on ultra profile drift and the differential waits out the disagreement'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - agentctl
 - cross
 created_at: 2026-11-18T04:39:03-05:00
-updated_at: 2026-11-18T04:39:03-05:00
+updated_at: 2026-11-18T07:01:50-05:00
+closed_at: 2026-11-18T07:01:50-05:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ updated_at: 2026-11-18T04:39:03-05:00
 # Notes
 
 Gate speed: aim for about a 10-minute validate. Times in ET.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as `f59daa79c85905e30b809211e198c8466fbf6d1a` (gated head `b96a0bef3b03cb18bfecbda9bcc45c56d0e0445f`, gate exit 0; the gate verdict is PARTIAL only for 7 delegated-live-scope skips in the dagrun/cpuset differentials, unrelated to this change and unverified there as everywhere). Root cause: the Python status drift check computed profile environment names without the ultra gate name start synthesizes for a muse ultra launch, so it reported `environment_names` drift the Rust edition correctly omits; the differential then polled out the 300 s hang guard on every such status pair and passed anyway. The Python check now mirrors the Rust refreshed-profile comparison, status pairs compare exactly on first read (the wait and the drift-only tolerance are gone; the hang guard still bounds each invoke), and both editions plus the differential pin the agreement with regression tests, including that a real profile environment change still reports drift. The eight watermelon status pairs that each burned 300 s now take about 2.5 s each; shard `1/3` went from 4,197 s (2026-11-17 gate) to 775 s standalone and 765 s in gate, with 266 paired checks agreeing.
