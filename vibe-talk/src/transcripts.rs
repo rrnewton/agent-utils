@@ -85,7 +85,9 @@ pub const MAX_TRACE_PAYLOAD_BYTES: usize = 2_048;
 #[must_use]
 pub fn class_of_metadata(value: &serde_json::Value) -> Option<ThreadClass> {
     let metadata = value.get("metadata")?;
-    if metadata.get("event_type").and_then(serde_json::Value::as_str)
+    if metadata
+        .get("event_type")
+        .and_then(serde_json::Value::as_str)
         != Some(TRACE_EVENT_TYPE)
     {
         return None;
@@ -136,7 +138,9 @@ pub fn class_of_title(text: &str) -> Option<ThreadClass> {
     if agent.is_empty() || agent.chars().any(char::is_whitespace) {
         return None;
     }
-    let day = rest.strip_prefix("main session trace, ")?.strip_suffix(" ET")?;
+    let day = rest
+        .strip_prefix("main session trace, ")?
+        .strip_suffix(" ET")?;
     if !is_day(day) {
         return None;
     }
@@ -159,8 +163,7 @@ fn is_day(text: &str) -> bool {
             .filter(|part| part.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|part| part.parse::<u32>().ok())
     };
-    let (Some(_year), Some(month), Some(day)) = (digits(0..4), digits(5..7), digits(8..10))
-    else {
+    let (Some(_year), Some(month), Some(day)) = (digits(0..4), digits(5..7), digits(8..10)) else {
         return false;
     };
     (1..=12).contains(&month) && (1..=31).contains(&day)
@@ -172,10 +175,9 @@ fn is_day(text: &str) -> bool {
 #[must_use]
 pub fn strip_legacy_label(text: &str) -> &str {
     match text.lines().next() {
-        Some(first) if first.starts_with("— after: ") => {
-            text.get(first.len()..)
-                .map_or("", |rest| rest.strip_prefix('\n').unwrap_or(rest))
-        }
+        Some(first) if first.starts_with("— after: ") => text
+            .get(first.len()..)
+            .map_or("", |rest| rest.strip_prefix('\n').unwrap_or(rest)),
         _ => text,
     }
 }
@@ -209,8 +211,7 @@ mod tests {
     fn v2_metadata_classes_and_v1_shape_is_not_required() {
         let mut value = metadata("lane-a", "2026-11-15", "entry");
         value["metadata"]["event_payload"]["v"] = json!(2);
-        value["metadata"]["event_payload"]["sent"] =
-            json!([{"thread": ":thread:060", "msg": ":email:1846",
+        value["metadata"]["event_payload"]["sent"] = json!([{"thread": ":thread:060", "msg": ":email:1846",
                     "ts": "1794746400.000100", "chars": 812}]);
         assert!(class_of_metadata(&value).is_some());
     }
@@ -231,8 +232,7 @@ mod tests {
     #[test]
     fn an_oversize_payload_is_not_read_as_metadata() {
         let mut value = metadata("coordx", "2026-11-15", "entry");
-        value["metadata"]["event_payload"]["pad"] =
-            json!("x".repeat(MAX_TRACE_PAYLOAD_BYTES));
+        value["metadata"]["event_payload"]["pad"] = json!("x".repeat(MAX_TRACE_PAYLOAD_BYTES));
         assert_eq!(class_of_metadata(&value), None);
     }
 

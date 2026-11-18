@@ -168,33 +168,21 @@ pub async fn search(
         match state.store.transcript_threads().await {
             Ok(rows) => rows
                 .into_iter()
-                .map(|row| {
-                    (
-                        (row.channel.as_str().to_owned(), row.thread_id),
-                        row.class,
-                    )
-                })
+                .map(|row| ((row.channel.as_str().to_owned(), row.thread_id), row.class))
                 .collect(),
             Err(_) => std::collections::HashMap::new(),
         };
-    let (mut kept, mut transcript_hits): (Vec<Message>, Vec<Message>) =
-        (Vec::new(), Vec::new());
+    let (mut kept, mut transcript_hits): (Vec<Message>, Vec<Message>) = (Vec::new(), Vec::new());
     for mut hit in hits {
-        let key = hit.thread.as_ref().map(|thread| {
-            (
-                hit.channel_id.as_str().to_owned(),
-                thread.id.clone(),
-            )
-        });
+        let key = hit
+            .thread
+            .as_ref()
+            .map(|thread| (hit.channel_id.as_str().to_owned(), thread.id.clone()));
         let class = hit
             .thread
             .as_ref()
             .and_then(|thread| thread.class.clone())
-            .or_else(|| {
-                key.as_ref()
-                    .and_then(|key| classed.get(key))
-                    .cloned()
-            });
+            .or_else(|| key.as_ref().and_then(|key| classed.get(key)).cloned());
         if let Some(class) = class {
             if let Some(thread) = hit.thread.as_mut() {
                 thread.class = Some(class);

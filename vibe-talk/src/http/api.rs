@@ -2362,8 +2362,6 @@ pub async fn search_all(
     ))
 }
 
-/// `GET /api/v1/channels/{channel_id}/timeline` — all views share one allowlist boundary.
-
 /// Record the transcript classes a page carries, attach stored classes to
 /// rows that lack one, and return the classed thread ids (`#1608`).
 /// Best-effort: a store that cannot say leaves rows as they arrived.
@@ -2372,7 +2370,6 @@ async fn attach_transcript_classes(
     channel: &crate::model::ChannelId,
     page: &mut crate::threads::TimelinePage,
 ) -> std::collections::HashSet<String> {
-    use crate::store::StateStore as _;
     let mut seen: Vec<(String, crate::transcripts::ThreadClass)> = Vec::new();
     for summary in page.threads.iter().chain(page.thread.iter()) {
         if let Some(class) = &summary.class {
@@ -2387,7 +2384,10 @@ async fn attach_transcript_classes(
         }
     }
     for (thread_id, class) in &seen {
-        let _ = state.store.set_thread_class(channel, thread_id, class).await;
+        let _ = state
+            .store
+            .set_thread_class(channel, thread_id, class)
+            .await;
     }
     let stored: std::collections::HashMap<String, crate::transcripts::ThreadClass> =
         match state.store.transcript_threads().await {
@@ -2443,8 +2443,7 @@ fn exclude_transcripts(
             {
                 page.messages.clear();
                 page.thread = None;
-                page.notice =
-                    Some("transcript thread: open it in Transcripts".to_owned());
+                page.notice = Some("transcript thread: open it in Transcripts".to_owned());
             }
         }
         crate::threads::TimelineView::Main | crate::threads::TimelineView::Flat => {
@@ -2464,7 +2463,6 @@ pub async fn transcripts(
     State(state): State<AppState>,
     ReadScope(_caller): ReadScope,
 ) -> Result<Json<crate::contract::TranscriptsResponse>, ApiError> {
-    use crate::store::StateStore as _;
     let channels = ops::channels(&state).await;
     let by_id: std::collections::HashMap<String, crate::model::ChannelInfo> = channels
         .into_iter()
@@ -2499,7 +2497,6 @@ pub async fn transcript_thread(
     ReadScope(caller): ReadScope,
     Path((channel_id, thread_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    use crate::store::StateStore as _;
     let channel_ref = crate::model::ChannelId(channel_id.clone());
     let class = state
         .store
@@ -2529,8 +2526,7 @@ pub async fn transcript_thread(
         ));
     }
     for message in &mut page.messages {
-        let stripped =
-            crate::transcripts::strip_legacy_label(&message.content).to_owned();
+        let stripped = crate::transcripts::strip_legacy_label(&message.content).to_owned();
         message.content = stripped;
     }
     crate::render::fill_page(&state.config, &state.headings, &channel, &mut page);
@@ -2550,7 +2546,7 @@ pub async fn transcript_thread(
     })))
 }
 
-/// `GET /api/v1/channels/{channel_id}/timeline`: one channel view's page.
+/// `GET /api/v1/channels/{channel_id}/timeline` — all views share one allowlist boundary.
 pub async fn timeline(
     State(state): State<AppState>,
     ReadScope(caller): ReadScope,

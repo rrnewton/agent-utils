@@ -1373,9 +1373,7 @@ impl StateStore for FakeStore {
         Ok(())
     }
 
-    async fn transcript_threads(
-        &self,
-    ) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
+    async fn transcript_threads(&self) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
         let mut rows: Vec<super::TranscriptThreadRow> = state

@@ -2619,9 +2619,7 @@ pub trait StateStore: Send + Sync {
     ) -> Result<(), StoreError>;
 
     /// Every classed transcript thread, for the Transcripts index.
-    async fn transcript_threads(
-        &self,
-    ) -> Result<Vec<TranscriptThreadRow>, StoreError>;
+    async fn transcript_threads(&self) -> Result<Vec<TranscriptThreadRow>, StoreError>;
 
     /// Set one thread's explicit pin state. Idempotent.
     async fn set_thread_pin(

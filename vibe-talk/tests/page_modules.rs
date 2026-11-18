@@ -25,6 +25,7 @@ const SUITES: &[&str] = &[
     "tests/js/core/outbox.test.mjs",
     "tests/js/core/settings.test.mjs",
     "tests/js/core/search.test.mjs",
+    "tests/js/core/transcripts.test.mjs",
     "tests/js/core/speech.test.mjs",
     "tests/js/core/sync.test.mjs",
     "tests/js/foundation/index.test.mjs",

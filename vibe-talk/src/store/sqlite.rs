@@ -2896,9 +2896,7 @@ impl StateStore for SqliteStore {
         .await
     }
 
-    async fn transcript_threads(
-        &self,
-    ) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
+    async fn transcript_threads(&self) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
         self.with_connection(move |connection| {
             let mut statement = connection
                 .prepare(

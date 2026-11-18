@@ -330,9 +330,7 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
-    async fn transcript_threads(
-        &self,
-    ) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
+    async fn transcript_threads(&self) -> Result<Vec<super::TranscriptThreadRow>, StoreError> {
         refuse()
     }
 

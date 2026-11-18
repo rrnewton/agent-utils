@@ -22,10 +22,9 @@ use vibe_talk::contract::{
     NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
     ThreadPinChangeResponse, ThreadPinsResponse, TimelineResponse, TokenScope, TranscriptRole,
-    TranscriptThreadInfo, TranscriptsResponse,
-    UpstreamClearAttemptView, UpstreamClearNowOutcome, UpstreamClearNowResponse,
-    UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame, VoicePostPrefix,
-    VoicePromptSettings, VoiceSend, VoiceSettings,
+    TranscriptThreadInfo, TranscriptsResponse, UpstreamClearAttemptView, UpstreamClearNowOutcome,
+    UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame,
+    VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
 };
 use vibe_talk::contract::{ChannelHistoryState, HistoryModeChoice, HistoryModeRequest};
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};

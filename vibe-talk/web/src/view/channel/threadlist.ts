@@ -374,8 +374,6 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   function renderThreadSelect(): void {
     const select = el("thread-select") as HTMLSelectElement;
     const options: Array<[string, string]> = [["main", "Main"]];
-    // `#1608 agent-transcripts-timeline`: Transcripts, beside Main/All/Thread list.
-    options.push(["transcripts", "Transcripts"]);
     if (deps.threading()) {
       options.push(["flat", "All"]);
       if (deps.threadListOffered()) {
@@ -390,6 +388,10 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         options.push([`thread:${open.id}`, threadLabel(open, Infinity)]);
       }
     }
+    // `#1608 agent-transcripts-timeline`: Transcripts, beside Main/All/Thread
+    // list — after them, so the standing order of the older views is kept,
+    // and only where the service has threads for traces to sit in.
+    if (deps.threading()) options.push(["transcripts", "Transcripts"]);
     const current = viewChoiceOnScreen();
     const signature = JSON.stringify(options);
     if (select.getAttribute("data-options") !== signature) {
@@ -454,7 +456,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   function drawThreadPickerPopup(select: HTMLSelectElement): void {
     if (!pickerPopup) return;
     const rows: HTMLElement[] = [];
-    const fixed: Array<[string, string]> = [["main", "Main"], ["transcripts", "Transcripts"]];
+    const fixed: Array<[string, string]> = [["main", "Main"]];
     if (deps.threading()) {
       fixed.push(["flat", "All"]);
       if (deps.threadListOffered()) {
@@ -462,6 +464,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         if (deps.layoutFit()) fixed.push(["columns", "Two columns"]);
       }
     }
+    if (deps.threading()) fixed.push(["transcripts", "Transcripts"]);
     for (const [value, label] of fixed) {
       const row = document.createElement("button");
       row.setAttribute("type", "button");

@@ -1891,7 +1891,7 @@ test("a channel registered as one conversation draws every message it is served 
     "Main dropped the replies the server served");
   assert.equal(page.el("channel-view-tabs").hidden, true, "a single conversation offered view tabs");
   assert.equal(page.el("channel-navigation").hidden, true, "a single conversation offered navigation");
-  assert.deepStrictEqual(threadOptions(page), [["main", "Main"], ["flat", "All"]],
+  assert.deepStrictEqual(threadOptions(page), [["main", "Main"], ["flat", "All"], ["transcripts", "Transcripts"]],
     "the conversation offered itself as its own thread");
   assert.equal(threadButton(page.el("discord-log").children[0]), undefined,
     "the conversation offered itself as its own thread");
@@ -1983,7 +1983,7 @@ test("a channel with child threads keeps a root-only Main, even after visiting a
   const page = await threadPage("main");
   const data = threadData();
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "Main is not the served root-only page");
-  assert.equal(threadOptions(page).length, 5, "a threaded channel's picker lost its threads");
+  assert.equal(threadOptions(page).length, 6, "a threaded channel's picker lost its threads");
   assert.ok(threadButton(page.el("discord-log").children[1]), "a thread root lost its replies button");
 
   // A thread page names its thread too: that must not make the channel look scoped to it.
