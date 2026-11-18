@@ -1,6 +1,6 @@
 ---
 title: 'label-dialog-placement: keep the Combine/Edit dialog over the Settings column'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -32,3 +32,7 @@ updated_at: 2026-11-18T06:34:26-05:00
 # Notes
 
 Known cause from the #1825 audit: `.data-popout` is absolutely positioned with `left: -0.3rem; right: -0.3rem; top: 0`. Its existing dismissed-message use is anchored by `#dismissed-group { position: relative; }`; the Labels group lacks that positioning context.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 2ac79646: `#labels-group { position: relative; }`, so the Combine/Edit dialog sits over the Settings column; desktop light/dark and phone screenshots in /tmp/mu-dialogfix-shots (gate pass on 99efe9be).
