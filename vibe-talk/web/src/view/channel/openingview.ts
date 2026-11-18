@@ -57,6 +57,14 @@ export interface OpeningViewDependencies {
   windowStorage(): { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
   deepLinks(): { applied(): boolean };
   sideColumnUp(): boolean;
+  /** Whether the thread list (Threads view) is the layout on screen, where one is offered (`#1849`). */
+  threadListShown?(): boolean;
+  /** Show the thread list as the reader's chosen view (`#1849`). */
+  showThreadList?(): void;
+  /** The top-visible thread card's id in the thread list, or null (`#1849`). */
+  cardAnchorId?(): string | null;
+  /** Put the thread list back on card `id`; false where it is not drawn (`#1849`). */
+  placeCardId?(id: string): boolean;
   columns(): { main: unknown };
   readModes(): { hiding(): boolean; mode(): string };
   screens(): { screen(): string; view(): string };
@@ -222,6 +230,7 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
         const thread = wanted.thread || (wanted.message && wanted.message.thread) || null;
         if (wanted.view === "main") return { view: "main", thread: null, summary: null, origin: "main" };
         if (wanted.view === "all") return { view: "flat", thread: null, summary: null, origin: "main" };
+        if (wanted.view === "threads") return { view: "threads", thread: null, summary: null, origin: "main" };
         if ((wanted.view === "thread" || (!wanted.view && thread)) && thread && deps.providerFacts.threading()) {
           // The very thread this channel already opens in — a reload standing on its own
           // address: the kept choice below says where its Back goes (the thread list it was
@@ -254,6 +263,17 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
     // `#229 desktop-two-column`. In two columns the left column is Main, whatever the channel opens in.
     // `#281 view-keys`: and behind the thread list on its own.
     const opening = deps.sideColumnUp() ? { view: "main", thread: null, summary: null, origin: "main" } : openingChannelView();
+    // `#1849 vibe-talk-reload-keeps-view-and-place`. The Threads view is a layout over Main:
+    // the left column stands on Main behind it, and the list itself is shown as chosen.
+    if (opening.view === "threads") {
+      deps.selection().view = "main";
+      deps.selection().threadId = null;
+      deps.selection().thread = null;
+      deps.selection().origin = "main";
+      if (deps.showThreadList) deps.showThreadList();
+      deps.scheduleBackSync();
+      return;
+    }
     deps.selection().view = opening.view;
     deps.selection().threadId = opening.thread;
     deps.selection().thread = opening.summary;
@@ -269,7 +289,8 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
   }
 
   /** The channel and view a measured place belongs to. */
-  const placeKey = () => JSON.stringify([String(deps.selectedChannelId()), deps.viewKey()]);
+  const placeKey = () => JSON.stringify([String(deps.selectedChannelId()),
+    deps.threadListShown && deps.threadListShown() ? deps.viewKey("threads") : deps.viewKey()]);
 
   /**
    * Note which message the reader's eye is on in the channel list, while there is one on screen to
@@ -279,7 +300,17 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
   function holdChannelPlace() {
     // A reopen comes back to one list: the left column's. `#229 desktop-two-column`.
     if (deps.columnWork().side()) return;
-    if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord" || !deps.reopenedViews.includes(deps.selection().view)) return;
+    if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") return;
+    // `#1849`: in the Threads view the place is the top-visible card, held under its own key.
+    if (deps.threadListShown && deps.threadListShown()) {
+      const anchor = deps.cardAnchorId ? deps.cardAnchorId() : null;
+      deps.uiState().holdPlace({
+        key: JSON.stringify([String(deps.selectedChannelId()), deps.viewKey("threads")]),
+        place: { view: deps.viewKey("threads"), atNewest: false, anchor, offset: 0 },
+      });
+      return;
+    }
+    if (!deps.reopenedViews.includes(deps.selection().view)) return;
     const mark = deps.captureScroll();
     const anchor = mark.anchor;
     deps.uiState().holdPlace({
@@ -303,7 +334,12 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
   /** The view on screen as its channel's choice, or null for a view no channel is reopened in. */
   function viewOnScreen() {
     const channel = String(deps.selectedChannelId());
-    if (!channel || !deps.reopenedViews.includes(deps.selection().view) || (deps.selection().view === "thread" && !deps.selection().threadId)) return null;
+    if (!channel) return null;
+    // `#1849`: the thread list on screen is the Threads view, whatever Main stands behind it.
+    if (deps.threadListShown && deps.threadListShown()) {
+      return { channel, channelView: "threads", thread: null };
+    }
+    if (!deps.reopenedViews.includes(deps.selection().view) || (deps.selection().view === "thread" && !deps.selection().threadId)) return null;
     const thread = deps.selection().view === "thread" ? {
       id: String(deps.selection().threadId),
       origin: ["main", "flat", "list"].includes(deps.selection().origin) ? deps.selection().origin : defaultChannelView(),
@@ -365,8 +401,13 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
   function returnToSavedPlace() {
     const saved = deps.uiState().saved();
     const place = saved ? saved.place : null;
-    if (!saved || !place || place.atNewest || !place.anchor || saved.channel !== String(deps.selectedChannelId()) ||
-        place.view !== deps.viewKey()) return;
+    if (!saved || !place || place.atNewest || !place.anchor || saved.channel !== String(deps.selectedChannelId())) return;
+    // `#1849`: a Threads place is its top card, put back in the card list.
+    if (place.view === deps.viewKey("threads")) {
+      if (deps.threadListShown && deps.threadListShown() && deps.placeCardId) deps.placeCardId(place.anchor);
+      return;
+    }
+    if (place.view !== deps.viewKey()) return;
     const row = [...deps.visibleList().children].find((candidate) =>
       candidate.getAttribute("data-context-id") === place.anchor || deps.idsOf(candidate).includes(place.anchor!));
     if (!row) return;

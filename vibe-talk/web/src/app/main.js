@@ -4251,6 +4251,9 @@ const openingViewOwner = createOpeningView({
   upsertThreadSummary: (canon, summary) => upsertThreadSummary(canon, summary),
   viewKey: (view, thread) => viewKey(view, thread), visibleList: () => visibleList(),
   windowStorage: () => windowStorage(), deepLinks: () => deepLinks, sideColumnUp: () => sideColumnUp(),
+  threadListShown: () => layoutShown.threadList(), showThreadList: () => chooseView("threads"),
+  cardAnchorId: () => { const place = cardAnchor(); return place && place.id ? String(place.id) : null; },
+  placeCardId: (id) => placeCardAnchor({ newest: false, id: String(id), offset: 0 }, true),
   documentsQueryValue: (name) => documentsQueryValue(name),
   documentsDeepLinkKey: () => documentsDeepLinkKey(),
   showView: (name) => showView(name),
@@ -9360,6 +9363,7 @@ application.track(listKeepersMount);
 // foot following the scroll, every listener on a list passive. One owner in web/src/view/channel/listgestures.ts
 // (`#624 voice-page-modularity`), mounted here, in the page's order; its `unmount` waits for the ordered boot's
 // teardown.
+let lastScrollPlaceAt = 0;
 application.track(mountListGestures({
   byId: (id) => el(id),
   leftById: (id) => leftEl(id),
@@ -9371,6 +9375,15 @@ application.track(mountListGestures({
   footWheel: (event) => footRooms.wheel(event),
   footScrolled: (timeStamp) => footRooms.scrolled(timeStamp),
   finishPackSlide: () => finishPackSlide(),
+  noteScrollPlace: () => {
+    // `#1849`: throttled, and only when the anchor message changed — the place is
+    // measured by scrollkeep's capture (holdChannelPlace) and kept in sessionStorage.
+    const now = Date.now();
+    if (now - lastScrollPlaceAt < 750) return;
+    lastScrollPlaceAt = now;
+    holdChannelPlace();
+    saveUiState();
+  },
 }));
 
 

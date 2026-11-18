@@ -1412,6 +1412,25 @@ steps:
   # `New version — reload` in the channel and reload at the reader's deep link, at
   # 393x852 and 1280x800, and assert the bottom bar (and, in the reader, its pane)
   # stands after every reload.
+  # `#1849 vibe-talk-reload-keeps-view-and-place` against the real server binary:
+  # seed a tall hermit-style channel (no threads), read mid-channel, filter by a
+  # search, reload at 412x915 and 1280x800, and assert the view, the channel and
+  # the session scroll anchor (never in the URL) survive.
+  - group: check
+    job: reload-place-browser
+    desc: a reload keeps the view, the channel and the scroll anchor after a search filter, against the real server (fake chat upstream) in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/reload_place_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   - group: check
     job: page-update-reload-browser
     desc: the bottom controls bar after a page-update reload in the channel, the Documents list and the reader, against the real server (fake chat upstream) in current Chromium at 393x852 and 1280x800

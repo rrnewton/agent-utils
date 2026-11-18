@@ -2148,6 +2148,53 @@ test("a reload puts the reader back on the message they were reading, and on the
   assert.ok(atBottomOf(gone.el("scroll-area")), "with the reader's message gone, the reopen did not go to the newest");
 });
 
+test("a reload keeps the Threads view on its channel (#1849 vibe-talk-reload-keeps-view-and-place)", async () => {
+  const first = newPage();
+  first.threadingSupported = true;
+  first.threads = threadData().threads;
+  await signIn(first);
+  await showDiscord(first, threadData().messages);
+  await press(first, first.el("scroll-area"), "3", { ctrlKey: true });
+  await first.settle();
+  assert.equal(first.el("thread-select").value, "threads", "the reader was not in the Threads view");
+  const page = reloadPage(first.storage, (p) => {
+    p.session = first.session;
+    p.threadingSupported = true;
+    p.threads = threadData().threads;
+    p.messages = threadData().messages;
+  });
+  await reopenedChannel(page);
+  await page.settle();
+  assert.equal(page.el("thread-select").value, "threads", "a reload of the Threads view fell back to another view");
+  assert.equal(page.el("screen-main").getAttribute("data-columns"), "list");
+});
+
+test("a scroll, with no page hide, is the place a reload returns to (#1849)", async () => {
+  const channel = tallChannel();
+  const run = async (script) => {
+    const first = newPage(new Map(), script);
+    await signIn(first);
+    await showDiscord(first, channel);
+    const area = first.el("scroll-area");
+    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+    const anchor = first.el("discord-log").children.find((li) => li.getBoundingClientRect().bottom > 0);
+    const left = { id: anchor.getAttribute("data-id"), top: anchor.getBoundingClientRect().top };
+    // The reader scrolls, and the page is refreshed without ever being hidden.
+    await first.el("scroll-area").dispatch("scroll");
+    const page = newPage(first.storage, script, (p) => { p.session = first.session; p.messages = channel; });
+    const row = () => page.el("discord-log").children.find((li) => li.getAttribute("data-id") === left.id);
+    const before = row().getBoundingClientRect().top;
+    await reopenedChannel(page);
+    return { before, left };
+  };
+  const { before, left } = await run(SCRIPT);
+  assert.equal(before, left.top, "a reload after a scroll did not put the reader's message where it was");
+  const control = await run(await brokenModule([{ file: "src/view/channel/listgestures.ts",
+    find: "    listen(leftEl(\"scroll-area\"), \"scroll\", () => deps.noteScrollPlace!(), PASSIVE);",
+    replace: "    void 0;" }]));
+  assert.notEqual(control.before, control.left.top, "the test cannot tell a scroll-noted place from none");
+});
+
 test("a saved view that no longer holds falls back to the default rather than failing", async () => {
   // A thread the device no longer knows of — its snapshot is gone — opens the channel in All.
   const inThread = await threadPage();

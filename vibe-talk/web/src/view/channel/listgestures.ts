@@ -29,6 +29,8 @@ export interface ListGesturesDependencies {
   footScrolled(timeStamp: number): void;
   /** End a slide of the pack gap at once (`#460`). */
   finishPackSlide(): void;
+  /** Note the reader's scroll place for a reload (`#1849`), throttled by the page. */
+  noteScrollPlace?(): void;
 }
 
 /** The listeners, mounted. */
@@ -64,6 +66,12 @@ export function mountListGestures(deps: ListGesturesDependencies): ListGestures 
   // to the page draws them again, as a hidden page draws none.
   listen(leftEl("scroll-area"), "scroll", () => deps.scheduleColumnLinks(), PASSIVE);
   listen(leftEl("side-scroll"), "scroll", () => deps.scheduleColumnLinks(), PASSIVE);
+  // `#1849 vibe-talk-reload-keeps-view-and-place`. The reader's place is noted as they
+  // scroll, not only when the page hides: a refresh that never hid it keeps its place.
+  if (deps.noteScrollPlace) {
+    listen(leftEl("scroll-area"), "scroll", () => deps.noteScrollPlace!(), PASSIVE);
+    listen(leftEl("side-scroll"), "scroll", () => deps.noteScrollPlace!(), PASSIVE);
+  }
   // `#338 column-overscroll`. A turn of the wheel down at the right column's foot opens the room past it, once
   // both the wheel and the list have rested there (`OVERSCROLL_REST_MS`): the scroll that brought the reader to
   // the foot, a fling's included, stops on it. Passive, so the browser scrolls for the wheel without waiting for
