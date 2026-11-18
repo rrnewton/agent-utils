@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-screenshot-harness-real-states: shared screenshot harness serves real Discuss, really shrinks the keyboard, and settles transient UI'
-status: open
+status: closed
 priority: 0
 issue_type: task
 labels:
@@ -37,3 +37,7 @@ Prior work to build on: the fake chat upstream now serves timeline reads and the
 # Notes
 
 Owner-priority, deployed on landing. Dynamic-testing standing rule (thread 185): proof is end-to-end through the real server router sending the page's exact requests, stubbing only external upstreams (the model, the chat upstream). Screenshot matrix standing acceptance (thread 124): light and dark, keyboard really shrunk and closed, phone 412x915 and desktop 1280x800, Discuss half-pane open in phone shots, every image looked at.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as de2fdf32 (gate pass on 8d026f58, ledger 2026-11-18T19:53:55Z). The shared harness now: (1) boots the real server with the fake chat upstream plus a loopback model stub (`scripts/model_stub.py`) and, for Discuss runs, a serving message cache seeded by the server's own history walk, so Discuss preview/Summarize answer through the real router — matrix states 73-76 assert no fixture refusal and the summary state asserts the stub's answer; (2) one shared `shrink_keyboard` helper (height − 336, condition wait on visualViewport) whose check fails the run by name on an unshrunk open shot, proven red in `--self-test` (61 controls); (3) `settle_ui` before every capture (switcher cards, menus, status and freshness pills, spared when the scene photographs them). `scripts/README.md` documents the standard matrix. Evidence: 16/16 matrix images (light/dark × android-412/laptop-1280 × 73-76) inspected — real Discuss content, keyboard-open really shrunk (1280x464, 579 CSS px phone), no stray popups; all screenshot steps green in gate. Note: the /fake-seed endpoint from the brief is not on main; the equivalent real seeding (serving cache + history walk) was used instead. Follow-up accepted from coordb: mocks bind port 0 (claims cannot exclude non-claiming binders).
