@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-summarize-inputs-free-typing: typing in the Summarize count/hours fields is clamped and rewritten'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -66,3 +66,12 @@ Owner-priority, deployed on landing. Screenshot matrix per the
 standing owner-UI acceptance (light/dark, keyboard open/closed,
 phone/desktop, Discuss half-pane open on phone, before/after of the
 targeted state) on a local test instance.
+
+## Resolution
+
+Landed as 86e36f72 on main. While typing, the edited field is never
+clamped, snapped or rewritten; typing hours sets the window exactly
+(fractions allowed, zero messages in range accepted), typing a count
+sets the count and the dependent hours show floored to one decimal.
+Unit tests 59/59, typecheck clean, discuss browser walk passed at
+phone and desktop in both themes, gate passed.
