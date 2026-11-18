@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-fold-pinned-target-inline: keep the pinned target beside the fold separator text'
-status: open
+status: closed
 priority: 0
 issue_type: task
 labels:
@@ -8,7 +8,7 @@ labels:
 - ui
 - pins
 created_at: 2026-11-18T12:15:00-05:00
-updated_at: 2026-11-18T12:15:00-05:00
+updated_at: 2026-11-18T13:10:00-05:00
 ---
 
 # Description
@@ -33,3 +33,17 @@ updated_at: 2026-11-18T12:15:00-05:00
 # Notes
 
 Owner-priority gate, deployed on landing. Lane mu-foldpins2, coordinator coordb. Prior work: #1850 vibe-talk-fold-separator-shows-pinned, `vibe-talk/tests/fold_pins_browser.py`, commit 1990702f.
+
+## Resolution
+
+Landed on main as c8d710e3 ("vibe-talk: make the pinned count the inline
+target in the fold separator"), replayed from gated e28431c6 (gate ledger
+pass, 2026-11-18T17:51:47Z, owner priority). The pinned words are the
+target itself, inline after "… N read messages," with the days tail after
+them and dashed rules spanning both sides; both targets keep distinct
+aria-labels. Proof: `vibe-talk/tests/fold_pins_browser.py` (adjacency gap
+4.8px against a 24px bound, phone/desk, light/dark), page test in
+`tests/js/page/reading-state.mjs`, unit wording in
+`tests/js/present/rows.test.mjs`, screenshots inspected in
+/tmp/foldpins2-shots/{before,after}. Deployed on landing per
+owner-priority gate; coordb deploys.
