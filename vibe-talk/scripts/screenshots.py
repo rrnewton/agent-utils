@@ -1233,9 +1233,13 @@ class Driver:
                 raise Unreachable(scene.name, unmet[0], f"check: {unmet[1]}")
             self.page.wait_for_timeout(100)
 
-        # `#1855`: no transient UI over a shot that did not ask for it.
+        # `#1855`: no transient UI over a shot that did not ask for it. A scene whose own
+        # expectations name the status line is photographing it, so it is kept for that one.
         if not scene.keep_transient:
-            settle_ui(self)
+            settle_ui(
+                self,
+                keep_status=any("status-line" in expr for _desc, expr in scene.expect),
+            )
 
         animations: Literal["allow", "disabled"]
         if scene.animation_offset_ms is not None:
@@ -1328,7 +1332,7 @@ def restore_keyboard(driver: Driver) -> None:
     )
 
 
-def settle_ui(driver: Driver) -> None:
+def settle_ui(driver: Driver, keep_status: bool = False) -> None:
     """Put transient UI away before a capture: switcher cards, open menus, transient status.
 
     Uses the page's own dismissal (any key press puts the view cards away; Escape closes
@@ -1342,8 +1346,14 @@ def settle_ui(driver: Driver) -> None:
         driver.page.keyboard.press("F1")
     else:
         driver.page.keyboard.press("Escape")
+    # The transient status pill ("Ready." and its kin) through its own dismiss control —
+    # unless the scene is photographing that line, which its expectations then name.
+    if not keep_status and bool(driver.js("window.__visible('status-line')")):
+        driver.click("dismiss-status")
+    status_part = "" if keep_status else " && !window.__visible('status-line')"
     driver.page.wait_for_function(
-        "() => !window.__visible('view-cards') && !window.__visible('docs-fetch-menu')",
+        "() => !window.__visible('view-cards') && !window.__visible('docs-fetch-menu')"
+        + status_part,
         timeout=5_000,
     )
 
@@ -4382,6 +4392,11 @@ def _act_discuss_summary(driver: Driver) -> None:
         "() => document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
         timeout=30_000,
     )
+    # Open the answer's sections, so the shot shows the summary itself, not its fold lines.
+    expand = driver.page.locator("#discuss-answer button", has_text="Expand all")
+    if expand.count() > 0:
+        expand.first.click()
+        driver.settle(200)
 
 
 def _after_discuss_summary(driver: Driver) -> None:
