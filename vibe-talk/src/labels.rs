@@ -70,7 +70,8 @@ pub fn extract_hashtags(content: &str) -> Vec<String> {
         }
         let mut j = i + 1;
         let mut label = String::new();
-        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || matches!(chars[j], '-' | '_')) {
+        while j < chars.len() && (chars[j].is_ascii_alphanumeric() || matches!(chars[j], '-' | '_'))
+        {
             label.push(chars[j].to_ascii_lowercase());
             j += 1;
         }
@@ -292,22 +293,34 @@ mod tests {
 
     #[test]
     fn plain_hashtags_at_the_end_of_a_message() {
-        assert_eq!(labels("fixed the thing\n#kvm #benchmarking"), vec!["kvm", "benchmarking"]);
+        assert_eq!(
+            labels("fixed the thing\n#kvm #benchmarking"),
+            vec!["kvm", "benchmarking"]
+        );
         assert_eq!(labels("#kvm"), vec!["kvm"]);
         assert_eq!(labels("(#kvm) [#perf]"), vec!["kvm", "perf"]);
     }
 
     #[test]
     fn case_folds_and_character_set() {
-        assert_eq!(labels("#Benchmarking #KVM-2 #a_b #A"), vec!["benchmarking", "kvm-2", "a_b", "a"]);
+        assert_eq!(
+            labels("#Benchmarking #KVM-2 #a_b #A"),
+            vec!["benchmarking", "kvm-2", "a_b", "a"]
+        );
         assert_eq!(labels("#kvm, done. #perf!"), vec!["kvm", "perf"]);
     }
 
     #[test]
     fn numbers_and_glued_hashes_are_not_labels() {
-        assert!(labels("#123 is fixed").is_empty(), "#123 stays an issue reference");
+        assert!(
+            labels("#123 is fixed").is_empty(),
+            "#123 stays an issue reference"
+        );
         assert!(labels("see #1abc").is_empty());
-        assert!(labels("a#b and x#kvm").is_empty(), "a # glued to a word starts nothing");
+        assert!(
+            labels("a#b and x#kvm").is_empty(),
+            "a # glued to a word starts nothing"
+        );
         assert!(labels("## Heading").is_empty());
         assert!(labels("trailing #").is_empty());
     }
@@ -318,13 +331,19 @@ mod tests {
         assert_eq!(labels("run `#kvm` then #real"), vec!["real"]);
         assert!(labels("```\n#kvm in a fence\n```").is_empty());
         assert_eq!(labels("```rust\nlet x = \"#no\";\n```\n#yes"), vec!["yes"]);
-        assert!(labels("unclosed `#kvm").is_empty(), "an unclosed span masks to the end");
+        assert!(
+            labels("unclosed `#kvm").is_empty(),
+            "an unclosed span masks to the end"
+        );
     }
 
     #[test]
     fn urls_channel_refs_and_short_refs_hide_hashtags() {
         assert!(labels("see https://example.test/page#anchor for it").is_empty());
-        assert_eq!(labels("see https://example.test/#anchor and #kvm"), vec!["kvm"]);
+        assert_eq!(
+            labels("see https://example.test/#anchor and #kvm"),
+            vec!["kvm"]
+        );
         assert!(labels("ask in <#C0123ABCD|general> please").is_empty());
         assert!(labels("in :thread:123 and :issue:456").is_empty());
         assert_eq!(labels("in :thread:123 about #kvm"), vec!["kvm"]);
@@ -350,15 +369,25 @@ mod tests {
         )]);
         // Cards show the display, once, in first-seen order.
         assert_eq!(
-            index.apply(&["benchmark".to_owned(), "kvm".to_owned(), "benchmarking".to_owned()]),
+            index.apply(&[
+                "benchmark".to_owned(),
+                "kvm".to_owned(),
+                "benchmarking".to_owned()
+            ]),
             vec!["benchmarking", "kvm"]
         );
         // Any member (or the display) expands to the whole group for search.
         assert_eq!(index.expand("benchmark"), vec!["benchmark", "benchmarking"]);
-        assert_eq!(index.expand("benchmarking"), vec!["benchmark", "benchmarking"]);
+        assert_eq!(
+            index.expand("benchmarking"),
+            vec!["benchmark", "benchmarking"]
+        );
         assert_eq!(index.expand("kvm"), vec!["kvm"]);
         // No groups: the identity.
-        assert_eq!(GroupIndex::default().apply(&["kvm".to_owned()]), vec!["kvm"]);
+        assert_eq!(
+            GroupIndex::default().apply(&["kvm".to_owned()]),
+            vec!["kvm"]
+        );
     }
 
     #[test]

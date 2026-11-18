@@ -311,20 +311,72 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     return { li, meta, body, content: combinedContent(messages), text, reactions };
   }
 
-  /** Hide each body block whose whole text is hashtags the header chips name (`#1825`). */
+  /** Hide each body line whose whole text is hashtags the header chips name (`#1825`). */
   function hideHashtagOnlyLines(body: HTMLElement, labels: string[]): void {
-    for (const block of [...body.children]) {
-      const tokens = (block.textContent || "").trim().split(/\s+/).filter(Boolean);
-      if (tokens.length === 0) continue;
-      const only = tokens.every((token) => {
+    const onlyHashtags = (text: string): boolean => {
+      const tokens = text.trim().split(/\s+/).filter(Boolean);
+      return tokens.length > 0 && tokens.every((token) => {
         const match = /^#([A-Za-z][A-Za-z0-9_-]*)$/.exec(token);
         return match !== null && labels.includes(match[1]!.toLowerCase());
       });
-      if (only) {
+    };
+    const visit = (block: Element): void => {
+      if (onlyHashtags(block.textContent || "")) {
         (block as HTMLElement).hidden = true;
         block.classList.add("hashtag-line");
+        return;
       }
-    }
+      // A hashtag-only line inside a block: lines split by <br> or by a
+      // newline inside a text node. Hide that line's pieces and its break,
+      // leaving the rest of the block standing.
+      type Piece = { node: Node; text: string };
+      const segments: Piece[][] = [[]];
+      for (const node of [...block.childNodes]) {
+        if (node.nodeName === "BR") {
+          segments.push([]);
+        } else if (node.nodeType === 3) {
+          (node.textContent || "").split("\n").forEach((part, at) => {
+            if (at > 0) segments.push([]);
+            if (part) segments[segments.length - 1]!.push({ node, text: part });
+          });
+        } else {
+          segments[segments.length - 1]!.push({ node, text: node.textContent || "" });
+        }
+      }
+      if (segments.length < 2) {
+        // Not a line container itself (a wrapper, say): look inside.
+        for (const child of [...block.children]) visit(child);
+        return;
+      }
+      for (const segment of segments) {
+        if (!onlyHashtags(segment.map((piece) => piece.text).join(" "))) continue;
+        const nodes = [...new Set(segment.map((piece) => piece.node))];
+        for (const node of nodes) {
+          if (node instanceof HTMLElement) {
+            node.hidden = true;
+            node.classList.add("hashtag-line");
+          } else if (node.parentNode) {
+            // A text node holding more than this line keeps its other lines:
+            // rebuild it as line spans, this one hidden.
+            const parent = node.parentNode;
+            const lines = (node.textContent || "").split("\n");
+            for (const [at, line] of lines.entries()) {
+              if (at > 0) parent.insertBefore(document.createElement("br"), node);
+              const span = document.createElement("span");
+              span.textContent = line;
+              if (onlyHashtags(line)) {
+                span.hidden = true;
+                span.className = "hashtag-line";
+              }
+              parent.insertBefore(span, node);
+            }
+            parent.removeChild(node);
+            break;
+          }
+        }
+      }
+    };
+    for (const block of [...body.children]) visit(block);
   }
 
   function editedMark(messages: Message[]): HTMLElement | null {

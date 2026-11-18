@@ -910,7 +910,9 @@ async fn main() -> anyhow::Result<()> {
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
         post_keys: Arc::new(vibe_talk::post_keys::PostKeys::new()),
         reply_pointers: Arc::new(vibe_talk::reply_pointers::ReplyPointers::new()),
-        label_groups: Arc::new(std::sync::RwLock::new(vibe_talk::labels::GroupIndex::default())),
+        label_groups: Arc::new(std::sync::RwLock::new(
+            vibe_talk::labels::GroupIndex::default(),
+        )),
         send_intent: Arc::new(vibe_talk::send_intent::SendIntent::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
         live: Arc::clone(&live),

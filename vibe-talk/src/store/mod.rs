@@ -1469,7 +1469,10 @@ pub struct LabelGroups {
 /// # Errors
 ///
 /// [`StoreError::BadId`] naming the first refusal.
-pub fn validate_label_group(display: &str, spellings: &[String]) -> Result<Vec<String>, StoreError> {
+pub fn validate_label_group(
+    display: &str,
+    spellings: &[String],
+) -> Result<Vec<String>, StoreError> {
     let valid = |slug: &str| {
         !slug.is_empty()
             && slug.len() <= 64

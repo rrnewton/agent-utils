@@ -176,7 +176,10 @@ async fn hashtags_are_served_as_labels_and_grouping_renames_them_live() {
             Some(json!({"display": "benchmarking", "spellings": ["benchmark", "benchmarking"]})),
         )
         .await;
-    assert!(status.is_client_error(), "read token must not group: {status}");
+    assert!(
+        status.is_client_error(),
+        "read token must not group: {status}"
+    );
 
     let (status, made) = harness
         .call(

@@ -364,8 +364,7 @@ pub(crate) fn stamp(state: &AppState, messages: &mut [Message]) {
         // `#1825 vibe-talk-hashtag-labels`: derived from the text as it now stands, on
         // every serve, so an edit relabels at once and nothing is stored. Grouped
         // spellings show as their group's display (owner thread 167).
-        message.labels =
-            label_groups.apply(&crate::labels::extract_hashtags(&message.content));
+        message.labels = label_groups.apply(&crate::labels::extract_hashtags(&message.content));
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
         message.spoken_content = prepared_body(state, &message.content, &message.mentions, now_ms);
         // `#408 copy-upstream-link`: the message's own address in its service, formed by its
@@ -7889,7 +7888,10 @@ pub async fn update_label_group(
     display: &str,
     spellings: &[String],
 ) -> Result<crate::store::LabelGroups, OpError> {
-    let groups = state.store.update_label_group(id, display, spellings).await?;
+    let groups = state
+        .store
+        .update_label_group(id, display, spellings)
+        .await?;
     let _ = state.refresh_label_groups().await;
     Ok(groups)
 }

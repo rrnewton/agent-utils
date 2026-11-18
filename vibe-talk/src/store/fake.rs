@@ -1518,8 +1518,7 @@ impl StateStore for FakeStore {
                 updated_ms: now,
             },
         );
-        state.label_group_revision =
-            super::next_pin_revision(state.label_group_revision, now);
+        state.label_group_revision = super::next_pin_revision(state.label_group_revision, now);
         Ok(LabelGroups {
             groups: state.label_groups.values().cloned().collect(),
             revision: state.label_group_revision,
@@ -1544,8 +1543,7 @@ impl StateStore for FakeStore {
         group.display = display.to_owned();
         group.spellings = spellings;
         group.updated_ms = now;
-        state.label_group_revision =
-            super::next_pin_revision(state.label_group_revision, now);
+        state.label_group_revision = super::next_pin_revision(state.label_group_revision, now);
         Ok(LabelGroups {
             groups: state.label_groups.values().cloned().collect(),
             revision: state.label_group_revision,
@@ -1558,8 +1556,7 @@ impl StateStore for FakeStore {
         if state.label_groups.remove(&id).is_none() {
             return Err(StoreError::NotFound);
         }
-        state.label_group_revision =
-            super::next_pin_revision(state.label_group_revision, now_ms());
+        state.label_group_revision = super::next_pin_revision(state.label_group_revision, now_ms());
         Ok(LabelGroups {
             groups: state.label_groups.values().cloned().collect(),
             revision: state.label_group_revision,

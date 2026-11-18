@@ -355,11 +355,7 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
-    async fn create_label_group(
-        &self,
-        _: &str,
-        _: &[String],
-    ) -> Result<LabelGroups, StoreError> {
+    async fn create_label_group(&self, _: &str, _: &[String]) -> Result<LabelGroups, StoreError> {
         refuse()
     }
 

@@ -1169,7 +1169,6 @@ function renderServerSearch() {
   const grouped = bucketHits();
   const counts = bucketCounts(grouped);
   const view = bucketView();
-  let anyChip = false;
   for (const def of searchBucketDefs) {
     const chip = bucketChip(def.id);
     if (!chip) continue;
@@ -1177,14 +1176,16 @@ function renderServerSearch() {
     const show = count > 0;
     if (chip.hidden === show) chip.hidden = !show;
     if (!show) continue;
-    anyChip = true;
     const words = typeof def.words === "function" ? def.words(view) : def.words;
     setTextIfChanged(chip, `${count} ${words}`);
     const pressed = bucketOnNow(def.id) ? "true" : "false";
     if (chip.getAttribute("aria-pressed") !== pressed) chip.setAttribute("aria-pressed", pressed);
   }
   const bucketRow = el("search-bucket-row");
-  if (bucketRow.hidden === anyChip) bucketRow.hidden = !anyChip;
+  // `#1825`: the row also carries the Entire-threads chip, which is about the
+  // loaded hits, so the row stands whenever a search is typed — not only
+  // when a server bucket has fresh hits (`anyChip`).
+  if (bucketRow.hidden) bucketRow.hidden = false;
   placeServerHits(grouped);
   if (!serverExpanded) return;
   setTextIfChanged(el("search-scope"), searchScopeLine());

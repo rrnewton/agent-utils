@@ -4756,10 +4756,7 @@ mod tests {
             .create_label_group("perf", &["benchmark".to_owned(), "perf".to_owned()])
             .await
             .expect_err("a grouped spelling must refuse");
-        assert!(
-            refused.to_string().contains("already belongs"),
-            "{refused}"
-        );
+        assert!(refused.to_string().contains("already belongs"), "{refused}");
 
         // Editing keeps its own spellings, renames, and bumps the revision.
         let edited = store

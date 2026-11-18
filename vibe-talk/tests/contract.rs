@@ -10,7 +10,6 @@
 //! generated validators accept exactly what this server sends — every union variant, and every
 //! optional field both present and omitted.
 
-
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
@@ -18,10 +17,10 @@ use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, CatchupFollowupRequest, CatchupFollowupResponse,
     CatchupFooterLink, CatchupPreview, CatchupRecordResponse, CatchupRequest, CatchupResponse,
     CatchupStamp, CatchupUnreadRef, CatchupUpdateRequest, CatchupWindow, ClientConfigResponse,
-    ClientSettings, CommittedPostResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent,
-    LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse,
-    LabelCount, LabelGroupRequest, LabelGroupsResponse, LabelsResponse, NoiseRules, PendingPost,
-    PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
+    ClientSettings, CommittedPostResponse, LabelCount, LabelGroupRequest, LabelGroupsResponse,
+    LabelsResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent,
+    MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules,
+    PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
     ThreadPinChangeResponse, ThreadPinsResponse, TimelineResponse, TokenScope, TranscriptRole,
     TranscriptThreadInfo, TranscriptsResponse, UpstreamClearAttemptView, UpstreamClearNowOutcome,

@@ -53,6 +53,8 @@ export interface ScreenShowingDependencies {
   refreshChannelHistory(): void;
   /** Draw the agent-prefix box as it stands (`agentPrefix.refresh`, `#303 voice-post-prefix`). */
   refreshAgentPrefix(): void;
+  /** Draw the labels list as it stands (`#1825`). */
+  refreshLabels(): void;
   /** Draw who is who in the box's channel (`identityList.render`, `#402 who-is-who-channel-box`). */
   renderIdentities(): void;
   /** Whether nothing holds the focus (`focusLost`). */
@@ -171,6 +173,8 @@ export function createScreenShowing(deps: ScreenShowingDependencies): ScreenShow
     if (name === "settings" && previous !== "settings") deps.refreshChannelHistory();
     // `#303 voice-post-prefix`. Another device may have saved or reset the tag since sign-in.
     if (name === "settings" && previous !== "settings") deps.refreshAgentPrefix();
+    // `#1825`. Labels and groups may have changed since the list was drawn.
+    if (name === "settings" && previous !== "settings") deps.refreshLabels();
     // `#193 compose-draft-loss`. Its ages and channel names as they are now, and none past its days.
     if (name === "settings" && previous !== "settings") deps.renderDismissedSends();
     // `#402 who-is-who-channel-box`. Who is who in the box's channel, as the census stands now.

@@ -452,9 +452,7 @@ impl Query {
                 Node::And(children) => {
                     Node::And(children.iter().map(|c| walk(c, expand)).collect())
                 }
-                Node::Or(children) => {
-                    Node::Or(children.iter().map(|c| walk(c, expand)).collect())
-                }
+                Node::Or(children) => Node::Or(children.iter().map(|c| walk(c, expand)).collect()),
                 other => other.clone(),
             }
         }
@@ -602,7 +600,10 @@ fn folded_value(text: &str) -> String {
 fn field(raw: &str, chars: &[char], i: &mut usize, may_take_phrase: bool) -> Option<Node> {
     let (name, value) = raw.split_once(':')?;
     let name = name.to_ascii_lowercase();
-    if !matches!(name.as_str(), "from" | "in" | "before" | "after" | "has" | "label") {
+    if !matches!(
+        name.as_str(),
+        "from" | "in" | "before" | "after" | "has" | "label"
+    ) {
         return None;
     }
     let mut value = value.to_owned();

@@ -1381,6 +1381,7 @@ const screenShowing = createScreenShowing({
   refreshUpstreamClear: () => upstreamClearBox.refresh(),
   refreshChannelHistory: () => channelHistoryBox.refresh(),
   refreshAgentPrefix: () => agentPrefix.refresh(),
+  refreshLabels: () => { void labelsView.refresh(); },
   renderIdentities: () => identityList.render(),
   focusLost: () => focusLost(),
   settleFocus: () => settleFocus(),
@@ -2884,10 +2885,16 @@ const { setSearchOpen, showSearchOpen } = searchOpenControl;
  * place-keeping, as a filter change does.
  */
 function filterToLabel(label) {
-  setSearchOpen(true);
-  searchField.setQuery(`label:${label}`);
-  searchField.setMarked(`label:${label}`);
-  applySearch();
+  // Owner thread 168: the tapped message is in the results and stays where it
+  // is on the screen — the filter change rides the place-keeper every other
+  // filter change rides (`#243 filter-keeps-selection`).
+  keepingFilterPlace(() => {
+    setSearchOpen(true);
+    searchField.setQuery(`label:${label}`);
+    searchField.setMarked(`label:${label}`);
+    el("search-field").value = `label:${label}`;
+    applySearch();
+  });
 }
 
 // The links in what is on screen, whose messages, and the kinds of link are
