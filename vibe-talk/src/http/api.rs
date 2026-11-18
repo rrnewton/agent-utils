@@ -3806,7 +3806,7 @@ pub async fn catchup_followup(
         );
         Some((time, address, true))
     };
-    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &sent, &cite);
+    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &sent, cite);
     // As the summary's render (`#1392`): the citation addresses this answer
     // itself built are trusted, so a "find the message" answer links the
     // message it found. `#1844`: a follow-up used the channel render, whose
