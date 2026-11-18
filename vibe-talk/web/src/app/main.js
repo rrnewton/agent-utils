@@ -1614,8 +1614,8 @@ const draftSync = createDraftSync({
   },
   deviceId: () => draftDeviceId(deviceStorageOnUse(), () => globalThis.crypto?.randomUUID?.() ?? `device-${Date.now()}-${Math.random()}`),
   deviceLabel: () => draftDeviceLabel(
-    globalThis.matchMedia?.("(pointer: coarse)").matches
-      ? (Math.min(globalThis.screen?.width ?? 9999, globalThis.screen?.height ?? 9999) < 600 ? "Mobile" : "Tablet")
+    ("ontouchstart" in globalThis || (globalThis.navigator?.maxTouchPoints ?? 0) > 0)
+      ? (Math.min(document.documentElement.clientWidth || 9999, document.documentElement.clientHeight || 9999) < 600 ? "Mobile" : "Tablet")
       : "",
   ),
   autosync: () => deviceSettings().get(DEVICE_SETTINGS.draftAutosync) !== false,
