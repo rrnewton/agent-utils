@@ -13,7 +13,7 @@ updated_at: 2026-11-17T20:01:00-05:00
 
 Owner report: zoomed into a thread view, the Discuss "Summarize N unread" row showed a very large unread count — the channel-wide count, not the thread's. The header should read "Discuss: main channel" in the main view and "Discuss: thread <slug>" inside a thread.
 
-Finding: a fresh open inside a thread already scopes (the preview and POST carry the thread id, and the server reads that thread alone). The unscoped path is entering a thread while Discuss stands open bound to the channel: the scope-binding rule kept the panel bound and labelled global and never re-read the preview, so the unread count, the summarize range and the Summarize POST all stayed channel-wide.
+Finding: a fresh open inside a thread already scopes (the preview and POST carry the thread id, and the server reads that thread alone). The unscoped path is entering a thread while Discuss stands open bound to the channel: in-channel view changes never called the Discuss sync at all, and where sync did run the scope-binding rule kept the panel bound and labelled global and never re-read the preview, so the unread count, the summarize range and the Summarize POST all stayed channel-wide.
 
 # Design
 

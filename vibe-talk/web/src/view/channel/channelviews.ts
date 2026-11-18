@@ -78,6 +78,8 @@ export interface ChannelViewsDependencies {
   renderSideColumn(): void;
   renderThreadSelect(): void;
   renderThreadHeading(): void;
+  /** `#1811`. Re-aim Discuss at the selection this render puts on screen. */
+  syncDiscussView?: () => void;
   followReplyStore(): void;
   markListView(): void;
   paintAllThreadFocus(): void;
@@ -364,6 +366,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
       deps.el(`channel-view-${view}`).setAttribute("aria-pressed", deps.selection().view === view ? "true" : "false");
     }
     deps.renderThreadHeading();
+    deps.syncDiscussView?.();
     // A reply open in the stream says where it goes from the same store, so a read that places the
     // message being answered says so under its box (`followReplyStore`).
     deps.followReplyStore();

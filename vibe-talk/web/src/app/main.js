@@ -1884,6 +1884,7 @@ const channelViews = createChannelViews({
   renderSideColumn: () => renderSideColumn(),
   renderThreadSelect: () => renderThreadSelect(),
   renderThreadHeading: () => renderThreadHeading(),
+  syncDiscussView: () => discussView.sync(),
   followReplyStore: () => followReplyStore(),
   markListView: () => markListView(),
   paintAllThreadFocus: () => paintAllThreadFocus(),
