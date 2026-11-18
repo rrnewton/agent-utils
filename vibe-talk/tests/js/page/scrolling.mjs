@@ -2713,7 +2713,7 @@ test("the jump is the FIRST thing in the chip row, drawn at its left end with th
   assert.match(cssBlock('#jump-bookmark[data-direction="down"] .bookmark-arrow'), /rotate\(180deg\)/);
   const row = cssRules(CSS_CODE, "#scroll-tools")[0];
   assert.match(row, /left:\s*calc\(0\.75rem \+ env\(safe-area-inset-left\)\)/, "the row does not reach the left, inside the safe area");
-  assert.match(row, /right:\s*calc\(0\.75rem \+ env\(safe-area-inset-right\)\)/, "the row does not reach the right, inside the safe area");
+  assert.match(row, /right:\s*calc\(0\.75rem \+ env\(safe-area-inset-right\) \+ var\(--channel-pane-end, 0px\)\)/, "the row does not reach the right, inside the safe area");
   assert.match(row, /flex-wrap:\s*wrap-reverse/, "a wrapped row would lift the jump off the bottom line");
   assert.match(row, /justify-content:\s*flex-end/, "the other chips are not kept at the right");
   assert.match(cssBlock("#jump-newest"), /margin-inline-end:\s*auto/, "nothing sends the other chips to the right");

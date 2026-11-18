@@ -1599,7 +1599,7 @@ test("`#433 read-strip-low`: the strip hugs the chips' measured height and the p
   // The gap was a fixed 2.6rem kept for the status pill even while it was hidden. The strip now
   // stands on the chips' own measured height, and what floats higher keeps room for the strip.
   const strip = cssBlock("#read-steer");
-  assert.match(strip, /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-height, 0px\)\);/,
+  assert.match(strip, /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-height, 0px\) \+ var\(--channel-pane-bottom, 0px\)\);/,
     "the strip does not stand on the chips' measured top edge");
   assert.doesNotMatch(strip, /2\.6rem/, "the fixed gap over the chips is still reserved");
   assert.match(cssBlock("#status-line"), /bottom:[^;]*--read-steer-clearance/,

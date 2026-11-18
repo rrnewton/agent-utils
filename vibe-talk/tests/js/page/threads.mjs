@@ -334,8 +334,8 @@ test("the floating chips keep their height clear above the composer, and never s
   // ...and the chips, the status pill and the pull's report over them stand no lower than its top edge.
   assert.match(cssBlock("#frame-body"), /--chips-foot:\s*max\(0\.5rem, calc\(var\(--composer-top, 0px\) \+ 0\.25rem\)\);/,
     "the chips' foot does not follow the message box's top edge");
-  assert.match(cssRules(CSS_CODE, "#scroll-tools")[0], /bottom:\s*var\(--chips-foot, 0\.5rem\);/, "the chips stand on the foot of the list whatever is under them");
-  assert.match(cssBlock("#status-line"), /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-clearance, 0px\) \+ var\(--read-steer-clearance, 0px\)\);/,
+  assert.match(cssRules(CSS_CODE, "#scroll-tools")[0], /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--channel-pane-bottom, 0px\)\);/, "the chips stand on the foot of the list whatever is under them");
+  assert.match(cssBlock("#status-line"), /bottom:\s*calc\(var\(--chips-foot, 0\.5rem\) \+ var\(--scroll-tools-clearance, 0px\) \+ var\(--read-steer-clearance, 0px\) \+ var\(--channel-pane-bottom, 0px\)\);/,
     "the status pill does not rise with the chips, and stands on the box being typed in");
   // The edge is measured where it moves: on a scroll, a change of the list's geometry, and the room.
   // Both in the lists' watch (web/src/view/channel `mountListWatch`, `#624 voice-page-modularity`).
