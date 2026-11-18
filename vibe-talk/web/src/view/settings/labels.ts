@@ -227,7 +227,8 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
   input("label-group-save").addEventListener("click", deps.guard(save));
   input("label-group-dissolve").addEventListener("click", deps.guard(dissolve));
   input("label-group-close").addEventListener("click", closeDialog);
-  void refresh();
+  // No read at mount: the page boots signed out, and a labels read then is a
+  // refused request other walks count. Settings refreshes on show instead.
 
   return {
     refresh,

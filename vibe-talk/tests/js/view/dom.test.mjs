@@ -2506,6 +2506,7 @@ test("`#624 voice-page-modularity`: showing a screen hides the others first, sho
     refreshUpstreamClear: () => log.push("refreshUpstreamClear"),
     refreshChannelHistory: () => log.push("refreshChannelHistory"),
     refreshAgentPrefix: () => log.push("refreshAgentPrefix"),
+    refreshLabels: () => log.push("refreshLabels"),
     renderIdentities: () => log.push("renderIdentities"),
     focusLost: () => false,
     settleFocus: () => log.push("settleFocus"),
@@ -2514,7 +2515,7 @@ test("`#624 voice-page-modularity`: showing a screen hides the others first, sho
   showing.showScreen("settings");
   assert.deepStrictEqual(log, ["closeOverscroll", "stopReading", "disarmClear",
     "renderJumpNewest", "placeChipsOverComposer", "renderControlBar", "placePostCard", "pointSettingsAtReading",
-    "refreshUpstreamClear", "refreshChannelHistory", "refreshAgentPrefix", "renderDismissedSends",
+    "refreshUpstreamClear", "refreshChannelHistory", "refreshAgentPrefix", "refreshLabels", "renderDismissedSends",
     "renderIdentities", "settleFocus", "scheduleBackSync"], "leaving sign-in for Settings, in order");
   assert.deepStrictEqual([el("screen-signin").hidden, el("screen-settings").hidden, el("screen-main").hidden,
     el("screen-help").hidden], [true, false, true, true]);

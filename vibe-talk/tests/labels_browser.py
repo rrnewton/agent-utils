@@ -30,6 +30,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
+from http.server import BaseHTTPRequestHandler
+from typing import TypedDict
+
 import offline_cache_browser as fixture
 from keyboard_hides_bar_browser import IOS_VIEWPORT_JS, KEYBOARD_PX
 from offline_cache_browser import CHANNEL, TOKEN, FakeApi, Json, check, handler_for, message
@@ -39,6 +42,26 @@ if TYPE_CHECKING:
     from playwright.sync_api import Page, Playwright
 
 LANE = "spaces/A/threads/lane"
+
+
+class Group(TypedDict):
+    id: int
+    display: str
+    spellings: list[str]
+    created_ms: int
+    updated_ms: int
+
+
+def _str_list(value: object) -> list[str]:
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _spellings_of(row: Json) -> list[str]:
+    return _str_list(row.get("labels", []))
+
+
+def _rows_of(value: object) -> list[Json]:
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
 
 # (content, labels as the server serves them, thread, is_root)
 SCRIPT: tuple[tuple[str, list[str], str | None, bool], ...] = (
@@ -72,7 +95,7 @@ class LabelsApi(FakeApi):
             "reply_count": 1, "reply_count_exact": True,
             "updated_at": self.messages[5]["timestamp"],
         }]
-        self.groups: list[Json] = []
+        self.groups: list[Group] = []
         self.next_group = 0
 
     def client_config(self, scope: str) -> Json:
@@ -91,9 +114,9 @@ class LabelsApi(FakeApi):
         answer = super().timeline(query)
         # Copies: the base answers with the stored rows themselves, and the
         # group mapping below must not rewrite what later reads count.
-        answer["messages"] = [dict(row) for row in answer["messages"]]
-        for row in answer["messages"]:
-            base = next((m.get("labels", []) for m in self.messages if m["id"] == row["id"]), [])
+        answer["messages"] = [dict(row) for row in _rows_of(answer["messages"])]
+        for row in _rows_of(answer["messages"]):
+            base = next((_spellings_of(m) for m in self.messages if m["id"] == row["id"]), [])
             shown: list[str] = []
             for spelling in base:
                 display = self._display(str(spelling))
@@ -108,7 +131,7 @@ class LabelsApi(FakeApi):
     def labels_answer(self) -> Json:
         counts: dict[str, int] = {}
         for row in self.messages:
-            for spelling in row.get("labels", []):
+            for spelling in _spellings_of(row):
                 counts[str(spelling)] = counts.get(str(spelling), 0) + 1
         labels = []
         for name in sorted(counts):
@@ -126,7 +149,7 @@ class LabelsApi(FakeApi):
         text = query.get("q", [""])[0]
         hits = []
         for row in self.messages:
-            base = [str(s) for s in row.get("labels", [])]
+            base = _spellings_of(row)
             shown: list[str] = []
             for spelling in base:
                 display = self._display(spelling)
@@ -159,7 +182,7 @@ class LabelsApi(FakeApi):
     def group_write(self, method: str, path: str, body: Json | None) -> tuple[int, Json]:
         if path == "/api/v1/label-groups" and method == "POST":
             display = str((body or {}).get("display", ""))
-            spellings = sorted(str(s) for s in (body or {}).get("spellings", []))
+            spellings = sorted(_str_list((body or {}).get("spellings", [])))
             for spelling in spellings:
                 owner = next((g for g in self.groups if spelling in g["spellings"]), None)
                 if owner is not None:
@@ -180,7 +203,7 @@ class LabelsApi(FakeApi):
                          "labels_notice": "Labels are this check's own."}
         if found and method == "PUT":
             display = str((body or {}).get("display", ""))
-            spellings = sorted(str(s) for s in (body or {}).get("spellings", []))
+            spellings = sorted(_str_list((body or {}).get("spellings", [])))
             for spelling in spellings:
                 owner = next((g for g in self.groups
                               if spelling in g["spellings"] and g["id"] != int(found.group(1))), None)
@@ -198,7 +221,7 @@ class LabelsApi(FakeApi):
         return 404, {"error": "not_found", "detail": "not served by this check"}
 
 
-def labels_handler(api: LabelsApi):
+def labels_handler(api: LabelsApi) -> type[BaseHTTPRequestHandler]:
     base = handler_for(api)
 
     class Handler(base):  # type: ignore[valid-type, misc]

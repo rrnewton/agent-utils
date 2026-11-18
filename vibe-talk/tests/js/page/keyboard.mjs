@@ -860,6 +860,9 @@ test("EVERY CONTROL ON SETTINGS keeps its value the moment it changes: nothing t
     // instruction must not reach it, so each box saves with its own button.
     "voice-instructions": "save-voice-instructions",
     "voice-system-prompt": "save-voice-system-prompt",
+    // `#1825`. Combining labels into a group is a write the dialog's own Save makes.
+    "label-group-name": "label-group-save",
+    "label-group-spellings": "label-group-save",
   };
   const page = newPage();
   const controls = [...PAGE_ELEMENTS].filter(([id, markup]) =>

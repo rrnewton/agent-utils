@@ -637,6 +637,22 @@ fn inventory() -> Vec<Route> {
             Write,
             Nothing,
         ),
+        // `#1825 vibe-talk-hashtag-labels`: labels browsed at read scope, groups
+        // combined, edited and dissolved at write.
+        route("GET", "/api/v1/labels", Read, Nothing),
+        route(
+            "POST",
+            "/api/v1/label-groups",
+            Write,
+            Json(r#"{"display":"benchmarking","spellings":["benchmark","benchmarking"]}"#),
+        ),
+        route(
+            "PUT",
+            "/api/v1/label-groups/{id}",
+            Write,
+            Json(r#"{"display":"benchmarking","spellings":["benchmark","benchmarking"]}"#),
+        ),
+        route("DELETE", "/api/v1/label-groups/{id}", Write, Nothing),
         // `#240 reading-bookmark`: the owner's place in a channel, seen at read scope and moved or
         // cleared at write.
         route(

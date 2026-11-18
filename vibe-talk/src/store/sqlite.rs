@@ -8261,7 +8261,8 @@ mod tests {
                  DROP TABLE IF EXISTS own_decided; ALTER TABLE dismissals DROP COLUMN own;
                  DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
                  DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;
-                 DROP TABLE IF EXISTS thread_hues;",
+                 DROP TABLE IF EXISTS thread_hues;
+                 DROP TABLE IF EXISTS label_group_spellings; DROP TABLE IF EXISTS label_groups; DROP TABLE IF EXISTS label_group_state;",
             )
             .expect("undo the later steps");
         let pasted: String = statements.iter().map(|line| format!("{line}\n")).collect();

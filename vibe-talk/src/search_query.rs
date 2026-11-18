@@ -629,7 +629,7 @@ fn field(raw: &str, chars: &[char], i: &mut usize, may_take_phrase: bool) -> Opt
         "has" => (folded_value(&value) == "link").then_some(Node::HasLink),
         "label" => {
             let slug = folded_value(&value);
-            (!slug.is_empty()).then(|| Node::Label(slug))
+            (!slug.is_empty()).then_some(Node::Label(slug))
         }
         "before" => Day::parse(&value).map(Node::Before),
         _ => Day::parse(&value).map(Node::After),
