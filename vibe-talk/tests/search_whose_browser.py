@@ -100,7 +100,7 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int = 1
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     until(page, f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {len(week.SCRIPT)}",
           f"{label}: the channel did not open with the week in it")
     settled(page)

@@ -481,7 +481,6 @@ def main() -> int:
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            page.click("#view-switch")
             page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
             page.evaluate(kb.RECORD_KEYS_JS)
             walk.settled()
@@ -507,7 +506,10 @@ def main() -> int:
             mac_cdp.send("Emulation.setUserAgentOverride", {"userAgent": agent, "platform": "MacIntel"})
             mac_page.goto(url, wait_until="load")
             mac_page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            if mac_page.evaluate("() => document.getElementById('view-switch').getAttribute('aria-pressed')") != "false":
+            # `#1781`: the page now opens on the Channel; press only until it is showing.
+            for _press in range(3):
+                if mac_page.evaluate("() => document.getElementById('view-switch').getAttribute('aria-pressed')") == "false":
+                    break
                 mac_page.click("#view-switch")
             mac_page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
             check(mac_page.evaluate("() => navigator.platform") == "MacIntel", "the Mac's platform was not emulated")
