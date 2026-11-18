@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-thread-button-shows-slug: expand the Thread(n) button to show the thread slug when the row has room'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 - owner-ui
 created_at: 2026-11-17T20:02:16-05:00
-updated_at: 2026-11-17T20:02:16-05:00
+updated_at: 2026-11-18T03:18:10-05:00
+closed_at: 2026-11-18T03:18:10-05:00
 ---
 
 # Description
@@ -35,3 +36,7 @@ Scope is the button label only. #1818 owns anchoring. When the message row has r
 # Notes
 
 [watermelon-full-preview] mu-threadbtn, 2026-11-17. Investigation and implementation in this lane; see the handoff for the prior-work report, the grayscale answer, and the screenshot folder.
+
+## Resolution
+
+[watermelon-full-preview] Landed 9946c1dc on github/main (deploy batch 4, coordb deploys). The coloured Thread(N) tag now shows 🧵, the filed slug and (N) where the row has room, the slug truncating with an ellipsis (capped at 14ch on a phone-width list, inside the existing #377 compact-row container block); the narrowest rows and any thread without a slug keep Thread(N), and the grey start tag is unchanged. No grayscale emoji asset exists; the emoji span ships with filter: grayscale(1) and opacity 0.75, which read well in both themes against the colour comparison in the screenshots (/tmp/threadbtn-shots, 14 images, all inspected). Gate passed on 442f47b6 (185 steps); the one discuss-browser gate failure was attributed 3/3 green on both this tree and current main and cleared by the solo rerun.
