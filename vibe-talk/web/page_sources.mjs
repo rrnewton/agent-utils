@@ -56,10 +56,13 @@ const markup = (html) => html.replace(/<!--[\s\S]*?-->/g, " ");
  * off-origin script is not something this page has, and a reader of this list would miss it.
  */
 export function shellScripts(html) {
-  return [...markup(html).matchAll(/<script\b([^>]*)>/g)].map(([tag, attributes]) => {
+  return [...markup(html).matchAll(/<script\b([^>]*)>/g)].flatMap(([tag, attributes]) => {
+    // `#1845 vibe-talk-appearance-setting`: the one marked pre-paint script is the shell's own,
+    // run before its stylesheets; it loads no file, so it is no part of the bundle's list.
+    if (/\bdata-appearance-init\b/.test(attributes)) return [];
     const src = /\bsrc="\/(?!\/)([^"?#]+)[^"]*"/.exec(attributes);
     if (!src) throw new Error(`the shell has a script that names no local file: ${tag}`);
-    return src[1];
+    return [src[1]];
   });
 }
 

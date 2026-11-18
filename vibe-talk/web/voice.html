@@ -14,6 +14,33 @@
       the box, scrolled to it. Safari does not read this key yet; there the keyboard still pans.
     -->
     <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#14161a" />
+    <!--
+      `#1845 vibe-talk-appearance-setting`. Before first paint: the stored Appearance choice
+      (synced as `vibe-talk.voice.appearance`) resolved against the system, set as
+      `data-theme` before the stylesheets below paint, so a forced Light or Dark never
+      flashes the other. The bundle re-applies the same resolution and keeps the
+      `theme-color` in step. Marked `data-appearance-init`: the page build keeps this
+      script as the shell's own and out of the bundle (web/page_sources.mjs).
+    -->
+    <script data-appearance-init>
+      try {
+        var appearanceChoice = localStorage.getItem("vibe-talk.voice.appearance");
+        var systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        var effective = appearanceChoice === "light" || appearanceChoice === "dark" ? appearanceChoice : systemDark ? "dark" : "light";
+        document.documentElement.setAttribute("data-appearance", appearanceChoice === "light" || appearanceChoice === "dark" || appearanceChoice === "system" ? appearanceChoice : "system");
+        document.documentElement.setAttribute("data-theme", effective);
+        document.documentElement.classList.add(effective === "dark" ? "theme-dark" : "theme-light");
+        document.documentElement.style.colorScheme = effective;
+        document.querySelector('meta[name="theme-color"]').setAttribute("content", effective === "dark" ? "#14161a" : "#f6f7f9");
+        if (appearanceChoice === "light" || appearanceChoice === "dark") {
+          var tokens = effective === "dark"
+            ? {"--bg":"#14161a","--panel":"#1d2026","--edge":"#2c313a","--ink":"#e7e9ee","--muted":"#99a1b0","--accent":"#5b9dd9","--warn":"#d98a5b","--mine":"#24405c","--mine-edge":"#33587b","--muted-on-mine":"#b4bcc8","--warn-on-mine":"#e8a27a","--theirs":"#1d2026","--third":"#26221b","--third-edge":"#3b3529","--dock":"#191c22","--ok":"#5bd98a","--idle":"#6b7484","--paused":"#9b8cf0","--row-hover":"#262c36","--summary-fail-ink":"#ff9aa2","--pin-ink":"#f0c75e","--pin-edge":"#d4a63a","--pin-bg":"#3a3017","--hit-bg":"#6b5410","--hit-ink":"#fff4c7","--reply-tint":"#181e25","--read-ring":"#99a1b0","--thread-grey":"#626975"}
+            : {"--bg":"#f6f7f9","--panel":"#ffffff","--edge":"#d9dde4","--ink":"#1a1d22","--muted":"#5d6674","--accent":"#24618f","--warn":"#9a5416","--mine":"#dbeaf8","--mine-edge":"#b4d0e8","--muted-on-mine":"#525b68","--warn-on-mine":"#9a5416","--theirs":"#ffffff","--third":"#faf6ee","--third-edge":"#e8e0cf","--dock":"#eef1f5","--ok":"#1f8f4c","--idle":"#98a1b0","--paused":"#5b48c4","--row-hover":"#edf1f7","--summary-fail-ink":"#8f1d28","--pin-ink":"#7a5300","--pin-edge":"#c08b14","--pin-bg":"#fbf0d2","--hit-bg":"#ffe066","--hit-ink":"#1a1d22","--reply-tint":"#e9eef3","--read-ring":"#7f8896","--thread-grey":"#9ba1ac"};
+          for (var tokenName in tokens) document.documentElement.style.setProperty(tokenName, tokens[tokenName]);
+        }
+      } catch (ignored) {}
+    </script>
     <title>vibe-talk</title>
     <!--
       `#343 pwa-app-name`. The label under the icon when the page is added to an iOS home screen,
@@ -1831,6 +1858,21 @@
               <section class="settings-section" id="settings-messages" aria-labelledby="settings-messages-title">
                 <h2 id="settings-messages-title" title="How messages are marked and shown."><button class="fold-toggle" id="fold-settings-messages" type="button" aria-expanded="false" aria-controls="fold-settings-messages-body">Messages</button></h2>
                 <div class="fold-body" id="fold-settings-messages-body" hidden="until-found">
+                  <section class="settings-group">
+                    <div class="group-head">
+                      <h3><button class="fold-toggle" id="fold-appearance" type="button" aria-expanded="false" aria-controls="fold-appearance-body">Appearance</button></h3>
+                    </div>
+                    <div class="fold-body" id="fold-appearance-body" hidden="until-found">
+                      <label for="appearance">Appearance</label>
+                      <select id="appearance" aria-describedby="appearance-state">
+                        <option value="system">System — follow your device</option>
+                        <option value="light">Light</option>
+                        <option value="dark">Dark</option>
+                      </select>
+                      <p id="appearance-state" class="hint" aria-live="polite"></p>
+                    </div>
+                  </section>
+
                   <section class="settings-group">
                     <div class="group-head">
                       <h3 title="Whether your messages start read or unread."><button class="fold-toggle" id="fold-mark-own" type="button" aria-expanded="false" aria-controls="fold-mark-own-body">Your own messages</button></h3>

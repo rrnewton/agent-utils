@@ -209,7 +209,8 @@ test("`#229 desktop-two-column`: the layout button is a toggle in the bar, offer
     /grid-template-columns:\s*minmax\(260px, var\(--two-column-split, 50%\)\) minmax\(260px, 1fr\)/,
     "the two columns are not the split the reader dragged the separator to (#1186)");
   // ...and it is the stylesheet's to say, never a query the script reads.
-  assert.doesNotMatch(PAGE_CODE, /matchMedia|innerWidth|outerWidth|screen\.width/);
+  // `#1845 vibe-talk-appearance-setting`: Appearance alone asks the system its colour scheme.
+  assert.doesNotMatch(PAGE_CODE.replaceAll('matchMedia("(prefers-color-scheme: dark)")', ""), /matchMedia|innerWidth|outerWidth|screen\.width/);
 
   const page = await threadPage();
   assert.equal(page.el("column-toggle").hidden, false, "not offered on a channel whose provider has threads");
@@ -1846,7 +1847,7 @@ test("`#261 two-column-connectors`: the links are one SVG over the main screen, 
   // A reduced-motion reader's glide is a jump: the stylesheet says so, and the script reads it.
   assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--column-glide: auto;/,
     "the stylesheet does not tell the page a reduced-motion reader's glide should jump");
-  assert.doesNotMatch(PAGE_CODE, /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
+  assert.doesNotMatch(PAGE_CODE.replaceAll('matchMedia("(prefers-color-scheme: dark)")', ""), /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
 });
 
 test("`#261 two-column-connectors`: a root on Main and its thread's card are joined while both are on screen, out of the root's right edge level with its tag and into the card's left edge, in the thread's colour", async () => {
@@ -3222,7 +3223,7 @@ test("`#298 thread-card-header`: a thread across the window is headed by the sam
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#pane-discord[data-arriving]"), /animation:\s*thread-arrive /);
   assert.match(CSS_CODE, /@media \(prefers-reduced-motion: reduce\) \{\s*#screen-main \{\s*--card-flight: 0ms;\s*\}\s*\.thread-card-header\[data-flying\],\s*#pane-discord\[data-arriving\],\s*#side-pane\[data-arriving\] \{\s*animation: none;/,
     "the card moves, or the thread fades, for a reader who asked for less motion");
-  assert.doesNotMatch(PAGE_CODE, /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
+  assert.doesNotMatch(PAGE_CODE.replaceAll('matchMedia("(prefers-color-scheme: dark)")', ""), /matchMedia|prefers-reduced-motion/, "web/voice.js grew a second opinion about motion");
 });
 
 test("`#298 thread-card-header`: every way into a thread across the window puts the same card at the top — the thread list's replies button, Thread(N) in Main and in All, the picker — and its X says where it goes and goes there, as Esc and ← do", async () => {

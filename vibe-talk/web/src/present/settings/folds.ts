@@ -17,6 +17,7 @@ const SETTINGS_FOLDS: readonly string[] = Object.freeze([
   "canned-prompts",
   "microphone",
   "settings-messages",
+  "appearance",
   "mark-own",
   "mark-read",
   "auto-read",

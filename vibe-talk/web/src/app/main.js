@@ -98,6 +98,7 @@ import {createAutoplay, createReadAloud, createReadingJump, createVoiceCall, cre
 import {CANNED_PROMPTS,
   mountAgentPrefix,
   mountAgentSettings,
+  mountAppearance,
   mountAudioDevices,
   mountBarPlacement,
   mountCannedPrompts,
@@ -268,6 +269,7 @@ const IN_APP_LINKS_KEY = DEVICE_SETTINGS.inAppLinks.key;
 const OPEN_IN_VIEW_KEY = DEVICE_SETTINGS.openInView.key;
 /** `#1321 after-done-setting`. What e does after marking Done: "stay", "next" or "unread". */
 const AFTER_DONE_KEY = DEVICE_SETTINGS.afterDone.key;
+const APPEARANCE_KEY = DEVICE_SETTINGS.appearance.key;
 const SUMMARIZE_COLLAPSED_KEY = DEVICE_SETTINGS.summarizeCollapsed.key;
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
@@ -8091,6 +8093,7 @@ const settingsSyncGlue = createSettingsSyncGlue({
       get IN_APP_LINKS_KEY() { return IN_APP_LINKS_KEY; },
       get OPEN_IN_VIEW_KEY() { return OPEN_IN_VIEW_KEY; },
       get AFTER_DONE_KEY() { return AFTER_DONE_KEY; },
+      get APPEARANCE_KEY() { return APPEARANCE_KEY; },
       get COLLAPSED_LINES_KEY() { return COLLAPSED_LINES_KEY; },
       get CARD_MAX_LINES_KEY() { return CARD_MAX_LINES_KEY; },
       get READ_SPEED_KEY() { return READ_SPEED_KEY; },
@@ -8144,6 +8147,9 @@ const settingsSyncGlue = createSettingsSyncGlue({
     },
     openInView: () => {
       renderOpenInView();
+    },
+    appearance: () => {
+      appearanceControl.restore();
     },
     afterDone: () => {
       renderAfterDone();
@@ -8367,10 +8373,21 @@ application.track(mountSettingsSwitches({
   },
 }));
 
+// `#1845 vibe-talk-appearance-setting`. The Appearance control: painted here, restored first below.
+const appearanceControl = mountAppearance({
+  lookup: (id) => el(id),
+  stored: () => deviceSettings().get(DEVICE_SETTINGS.appearance),
+  keep: (choice) => deviceSettings().keep(DEVICE_SETTINGS.appearance, choice),
+  keptAs: (choice) => deviceSettings().keptAs(DEVICE_SETTINGS.appearance, choice),
+  systemQuery: () => window.matchMedia("(prefers-color-scheme: dark)"),
+});
+application.track(appearanceControl);
+
 // Every setting restored as kept before anything is drawn: the column and the type, the line counts (`#425
 // collapsed-lines`), the read-aloud speed, the switches that shape the lists, and the message box's Enter. The order
 // is said once, in web/src/view/settings/restore.ts (`#624 voice-page-modularity`); each setting's owner applies it.
 restoreStoredSettings({
+  appearance: () => appearanceControl.restore(),
   readingWidth: () => readingWidthControl.apply(storedReadingWidth()),
   textSize: () => textSize.apply(storedMsgScale()),
   collapsedLines: () => collapsedLines.apply(collapsedLines.stored()),

@@ -15,7 +15,8 @@ test("`#624 voice-page-modularity`: the folds, the help topics and the one butto
   // 35 since `#728 vt-quote-read-threshold` added Quoted replies, 37 since
   // `#1321 after-done-setting` added After Done; `#1815` unfolded the
   // single-control groups (17), and `#1825` added Labels (18).
-  assert.equal(SETTINGS_FOLDS.length, 18);
+  // 19 since `#1845 vibe-talk-appearance-setting` added the Appearance fold.
+  assert.equal(SETTINGS_FOLDS.length, 19);
   assert.equal(new Set(SETTINGS_FOLDS).size, SETTINGS_FOLDS.length, "a fold is listed twice");
   for (const slug of FOLDS_HOLDING_DISMISSED) assert.ok(SETTINGS_FOLDS.includes(slug), `${slug} holds the pop-out and does not fold`);
   assert.equal(new Set(HELP_TOPICS).size, HELP_TOPICS.length, "a help topic is listed twice");

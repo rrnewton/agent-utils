@@ -299,7 +299,7 @@ test("`#624 voice-page-modularity`: Settings' switches mount where the browser h
 
 test("`#624 voice-page-modularity`: every setting is restored as kept, once, in the page's order", () => {
   const { restoreStoredSettings } = VIEW_SETTINGS;
-  const order = ["readingWidth", "textSize", "collapsedLines", "cardMaxLines", "quoteReadPercent", "markRead", "readSpeed", "ownRead", "combine",
+  const order = ["appearance", "readingWidth", "textSize", "collapsedLines", "cardMaxLines", "quoteReadPercent", "markRead", "readSpeed", "ownRead", "combine",
     "hideEmpty", "richHeaders", "inAppLinks", "openInView", "afterDone", "summarizeCollapsed", "enterSends"];
   const log = [];
   const deps = Object.fromEntries([...order].reverse().map((name) => [name, (...args) => log.push(`${name}${args.length ? ` ${args.length}` : ""}`)]));

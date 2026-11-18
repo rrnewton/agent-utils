@@ -7,7 +7,9 @@ export { IDENTITY_KEY, SYNCED_SETTING_KEYS } from "./keys.ts";
 export { createSettingsSync, mergedIdentities } from "./sync.ts";
 export type { AgreedSetting, SettingsSync, SettingsSyncDependencies } from "./sync.ts";
 export { DEVICE_SETTINGS, createDeviceSettings } from "./device.ts";
-export type { AfterDone, DeviceSetting, DeviceSettings, DiscussPanelState, ReadAudioSource, SteerOffset } from "./device.ts";
+export type { AfterDone, Appearance, DeviceSetting, DeviceSettings, DiscussPanelState, ReadAudioSource, SteerOffset } from "./device.ts";
+export { THEME_TOKENS, appearanceOf, effectiveTheme, themeColorFor } from "./appearance.ts";
+export type { EffectiveTheme } from "./appearance.ts";
 export {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_MARK_READ_FIRST_PERCENT,

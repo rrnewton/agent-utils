@@ -1423,7 +1423,8 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // `#1321 after-done-setting` put After Done after Message links: what e does after marking
   // is a choice about marking messages, and it syncs as the choices beside it do.
   // `#1825` put Labels last: the hashtag labels of the loaded history are about messages.
-  assert.deepStrictEqual(messages, ["Your own messages", "Mark read on reply", "Mark-read automatically", "Message links", "Recently dismissed", "Labels"]);
+  // `#1845 vibe-talk-appearance-setting` put Appearance first in Messages: how messages are drawn, synced like its neighbours.
+  assert.deepStrictEqual(messages, ["Appearance", "Your own messages", "Mark read on reply", "Mark-read automatically", "Message links", "Recently dismissed", "Labels"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -2738,7 +2739,8 @@ test("`#346 settings-collapsible`: every section but Server and every group in t
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, PAGE_CODE), []);
   // 17 since `#1815 vibe-talk-settings-density-and-channel-header` removed the
   // single-control groups' folds, 18 since `#1825` added Labels.
-  assert.equal(scriptFolds(PAGE_CODE).length, 18, "a fold went missing from the list, or one was added unchecked");
+  // 19 since `#1845 vibe-talk-appearance-setting` added the Appearance fold.
+  assert.equal(scriptFolds(PAGE_CODE).length, 19, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {
@@ -2993,4 +2995,34 @@ test("`#345 settings-multi-column`: a heading pressed is brought back on screen,
   const group = page.el("fold-debug").scrolledIntoView;
   await page.el("fold-settings-all").click();
   assert.equal(page.el("fold-debug").scrolledIntoView, group, "Expand all scrolled to a heading of its own accord");
+});
+
+test("`#1845 vibe-talk-appearance-setting`: each Appearance choice is applied, kept, and read back on reload", async () => {
+  const page = newPage();
+  await signIn(page);
+  const root = () => page.document.documentElement;
+  // Default: System, resolved by the fixture's system (dark unless it says light).
+  assert.equal(page.el("appearance").value, "system", "the control does not start at System");
+  assert.equal(root().getAttribute("data-appearance"), "system");
+  assert.ok(["light", "dark"].includes(root().getAttribute("data-theme")), "no effective theme was painted");
+  page.el("appearance").value = "light";
+  await page.el("appearance").dispatch("change");
+  await page.settle();
+  assert.deepStrictEqual(
+    [root().getAttribute("data-appearance"), root().getAttribute("data-theme"), page.pure("localStorage.getItem('vibe-talk.voice.appearance')")],
+    ["light", "light", "light"],
+    "Light was not applied and kept",
+  );
+  page.el("appearance").value = "dark";
+  await page.el("appearance").dispatch("change");
+  await page.settle();
+  assert.deepStrictEqual(
+    [root().getAttribute("data-theme"), page.pure("localStorage.getItem('vibe-talk.voice.appearance')")],
+    ["dark", "dark"],
+    "Dark was not applied and kept",
+  );
+  // The shell paints before the bundle: the init script stands before the stylesheets.
+  const initAt = HTML.indexOf("data-appearance-init");
+  assert.ok(initAt >= 0 && initAt < HTML.indexOf('rel="stylesheet"'), "the pre-paint script does not stand before the stylesheet");
+  assert.match(HTML, /<meta name="theme-color" content="#14161a" \/>/, "the shell has no theme-color to keep in sync");
 });

@@ -18,6 +18,8 @@ export interface ElementById {
   "alias-note": HTMLParagraphElement;
   "alias-state": HTMLParagraphElement;
   "api-token": HTMLInputElement;
+  "appearance": HTMLSelectElement;
+  "appearance-state": HTMLParagraphElement;
   "audio-agent-icon": HTMLElement;
   "audio-device-icon": HTMLElement;
   "audio-devices-state": HTMLParagraphElement;
@@ -211,6 +213,8 @@ export interface ElementById {
   "error-wrap": HTMLDivElement;
   "expand-all": HTMLButtonElement;
   "expand-all-label": HTMLSpanElement;
+  "fold-appearance": HTMLButtonElement;
+  "fold-appearance-body": HTMLDivElement;
   "fold-auto-read": HTMLButtonElement;
   "fold-auto-read-body": HTMLDivElement;
   "fold-canned-prompts": HTMLButtonElement;

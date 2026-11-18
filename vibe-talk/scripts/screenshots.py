@@ -6468,10 +6468,10 @@ SCENES: tuple[Scene, ...] = (
             (
                 # The owner's name for the list, and the old one gone.
                 # Mark read on reply sits under Your own messages.
-                "Messages holds Your own messages, Mark read on reply, Mark-read automatically, Empty messages, Combining messages and Rich headers",
+                "Messages holds Appearance, Your own messages, Mark read on reply, Mark-read automatically, Empty messages, Combining messages and Rich headers",
                 "(() => { const heads = [...document.querySelectorAll('#settings-messages .settings-group .group-head > h3')]"
                 ".map((h) => h.textContent.trim()); "
-                "return ['Your own messages', 'Mark read on reply', 'Mark-read automatically']"
+                "return ['Appearance', 'Your own messages', 'Mark read on reply', 'Mark-read automatically']"
                 ".every((h, i) => heads[i] === h) && !heads.includes('Read automatically') "
                 "&& ['hide-empty-messages', 'combine-messages', 'rich-headers'].every((id) => document.getElementById(id)); })()",
             ),

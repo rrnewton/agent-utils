@@ -87,6 +87,8 @@ pub const SYNCED_KEYS: &[&str] = &[
     // What e does after marking Done: stay, next message, or next unread
     // (`#1321 after-done-setting`).
     "vibe-talk.voice.after-done",
+    // Light, Dark or System (`#1845 vibe-talk-appearance-setting`).
+    "vibe-talk.voice.appearance",
     "vibe-talk.voice.collapsed-lines",
     "vibe-talk.voice.hidden-link-kinds",
     // Whether the search bar's Links view writes each link as its address (`#620 link-url-chip`).

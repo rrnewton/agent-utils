@@ -4,6 +4,8 @@
 // says the order, once, at load.
 
 export interface StoredSettingsDependencies {
+  /** `#1845 vibe-talk-appearance-setting`. First, before anything is drawn in the wrong theme. */
+  appearance(): unknown;
   /** The column the reader last chose. Applied unconditionally: on a phone the stylesheet never consults the value,
    * so there is nothing to branch on here and no second definition of "is this a desktop" to drift. */
   readingWidth(): unknown;
@@ -29,6 +31,7 @@ export interface StoredSettingsDependencies {
 
 /** Restore each setting as kept, in the page's order: the column and the type before anything is drawn into them. */
 export function restoreStoredSettings(deps: StoredSettingsDependencies): void {
+  deps.appearance();
   deps.readingWidth();
   deps.textSize();
   deps.collapsedLines();

@@ -77,6 +77,9 @@ export type ReadAudioSource = "agent" | "device" | "wit";
 /** What `e` does after marking a message Done (`#1321 after-done-setting`): stay on it, go to the next message, or go to the next unread one. */
 export type AfterDone = "stay" | "next" | "unread";
 
+/** The Appearance choice (`#1845 vibe-talk-appearance-setting`): follow the system, or force light or dark. */
+export type Appearance = "light" | "dark" | "system";
+
 /** An offset on screen, in CSS pixels. */
 export interface SteerOffset {
   readonly x: number;
@@ -148,6 +151,17 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (choice: AfterDone) => choice,
     refused: { value: "stay" },
   } satisfies DeviceSetting<AfterDone>,
+  /**
+   * `#1845 vibe-talk-appearance-setting`. The Appearance choice: "system" unless the reader
+   * chose "light" or "dark". ABSENT MEANS SYSTEM, today's behaviour. Synced, so the choice
+   * follows the owner across devices. A refused read is System.
+   */
+  appearance: {
+    key: "vibe-talk.voice.appearance",
+    read: (raw: string | null): Appearance => (raw === "light" || raw === "dark" ? raw : "system"),
+    write: (choice: Appearance) => choice,
+    refused: { value: "system" },
+  } satisfies DeviceSetting<Appearance>,
   /** Which voice reads messages aloud, as chosen: null for no choice (or one this page does not know). */
   readAudioSource: {
     key: "vibe-talk.voice.read-audio-source",

@@ -218,6 +218,42 @@
   }
 }
 
+/* `#1845 vibe-talk-appearance-setting`: a forced choice beats the system, for the
+   code colours the sheets scope to the block itself. */
+:root[data-theme="light"] .md pre {
+  --hl-comment: #57606a;
+  --hl-string: #0a3069;
+  --hl-constant: #0550ae;
+  --hl-keyword: #cf222e;
+  --hl-type: #953800;
+  --hl-function: #8250df;
+  --hl-escape: #1b7c83;
+  --hl-property: #116329;
+  --hl-macro: #7d4e00;
+  --hl-variable: #a40e26;
+  --hl-inserted: #116329;
+  --hl-inserted-bg: #dafbe1;
+  --hl-deleted: #82071e;
+  --hl-deleted-bg: #ffebe9;
+}
+
+:root[data-theme="dark"] .md pre {
+  --hl-comment: #8b949e;
+  --hl-string: #a5d6ff;
+  --hl-constant: #79c0ff;
+  --hl-keyword: #ff7b72;
+  --hl-type: #ffa657;
+  --hl-function: #d2a8ff;
+  --hl-escape: #56d4dd;
+  --hl-property: #7ee787;
+  --hl-macro: #f2cc60;
+  --hl-variable: #ffa198;
+  --hl-inserted: #7ee787;
+  --hl-inserted-bg: rgba(46, 160, 67, 0.15);
+  --hl-deleted: #ffa198;
+  --hl-deleted-bg: rgba(248, 81, 73, 0.15);
+}
+
 .md .hl-c {
   color: var(--hl-comment);
   font-style: italic;

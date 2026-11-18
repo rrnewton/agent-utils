@@ -24,6 +24,8 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   "vibe-talk.voice.open-in-view",
   // `#1321 after-done-setting`. What e does after marking Done: stay, next message, or next unread.
   "vibe-talk.voice.after-done",
+  // `#1845 vibe-talk-appearance-setting`. Light, Dark or System.
+  "vibe-talk.voice.appearance",
   "vibe-talk.voice.collapsed-lines",
   "vibe-talk.voice.hidden-link-kinds",
   // `#620 link-url-chip`. Whether the Links view writes each link as its address.

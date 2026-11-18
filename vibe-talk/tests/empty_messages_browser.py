@@ -214,7 +214,8 @@ class Reader:
         groups = page.evaluate("""() => [...document.querySelectorAll('#fold-settings-messages-body .settings-group h3')]
             .map((h) => h.textContent.trim())""")
         # `#1815`: Empty messages is a single control shown inline, with no heading.
-        self.check(groups[2:3] == ["Mark-read automatically"] and "Empty messages" not in groups,
+        # `#1845`: Appearance heads Messages, so Mark-read automatically is fourth.
+        self.check(groups[3:4] == ["Mark-read automatically"] and "Empty messages" not in groups,
                    f"Empty messages still has a heading: {groups}")
         self.shot(f"settings-{'on' if page.is_checked('#hide-empty-messages') else 'off'}")
         page.set_checked("#hide-empty-messages", on)

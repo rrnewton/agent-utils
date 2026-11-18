@@ -21,6 +21,7 @@ export interface SettingsSyncViewDependencies {
     readonly IN_APP_LINKS_KEY: string;
     readonly OPEN_IN_VIEW_KEY: string;
     readonly AFTER_DONE_KEY: string;
+    readonly APPEARANCE_KEY: string;
     readonly COLLAPSED_LINES_KEY: string;
     readonly CARD_MAX_LINES_KEY: string;
     readonly READ_SPEED_KEY: string;
@@ -61,6 +62,7 @@ export interface SettingsSyncViewDependencies {
   inAppLinks(): void;
   openInView(): void;
   afterDone(): void;
+  appearance(): void;
   collapsedLines(): void;
   cardMaxLines(): void;
   readSpeed(): void;
@@ -114,6 +116,9 @@ export function mountSettingsSyncView(deps: SettingsSyncViewDependencies) {
           break;
         case deps.keys.AFTER_DONE_KEY:
           deps.afterDone();
+          break;
+        case deps.keys.APPEARANCE_KEY:
+          deps.appearance();
           break;
         case deps.keys.COLLAPSED_LINES_KEY:
           deps.collapsedLines();

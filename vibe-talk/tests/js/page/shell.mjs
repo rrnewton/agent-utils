@@ -1637,7 +1637,11 @@ test("the desktop layout is chosen by CAPABILITY, and no user-agent string decid
   }
   // And the page does not decide the layout in script either: which regime is in force is the
   // stylesheet's business, so there is nothing here to disagree with it.
-  assert.doesNotMatch(PAGE_CODE, /matchMedia/, "web/voice.js grew a second opinion about layout");
+  // `#1845 vibe-talk-appearance-setting`: the one script question about the system is its
+  // colour scheme, for Appearance; the layout regime above stays the stylesheet's alone.
+  for (const at of PAGE_CODE.matchAll(/matchMedia/g)) {
+    assert.ok(PAGE_CODE.startsWith('matchMedia("(prefers-color-scheme: dark)")', at.index), "web/voice.js grew a second opinion about layout");
+  }
 });
 
 test("on a desktop both lists are held to a reading column, and the phone is left alone", () => {

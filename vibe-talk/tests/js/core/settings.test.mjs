@@ -119,6 +119,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     onOff("combineMessages", "vibe-talk.voice.combine", true, THROWN),
     ["openInView", "vibe-talk.voice.open-in-view", "flat", [["main", "main"], ["flat", "flat"]], THROWN],
     ["afterDone", "vibe-talk.voice.after-done", "stay", [["next", "next"], ["unread", "unread"], ["stay", "stay"]], "stay"],
+    ["appearance", "vibe-talk.voice.appearance", "system", [["light", "light"], ["dark", "dark"], ["system", "system"]], "system"],
     ["readAudioSource", "vibe-talk.voice.read-audio-source", null, [["agent", "agent"], ["device", "device"], ["wit", "wit"]], null],
     ["witVoice", "vibe-talk.voice.wit-voice", "", [["Charlie", "Charlie"], ["", null]], ""],
     ["readSteerOffset", "vibe-talk.voice.read-steer-offset", null, [[{ x: 3, y: -4 }, '{"x":3,"y":-4}'], [null, null]], null],
@@ -350,4 +351,20 @@ test("`#624 voice-page-modularity`: a switch kept on the device is on at first o
   assert.equal(fold.on(), false, "a refused read of the fold is open");
   fold.keep(true);
   assert.equal(fold.on(), false, "keeping it changed it");
+});
+
+test("`#1845 vibe-talk-appearance-setting`: Appearance defaults to System, resolves against the system, and is synced", () => {
+  const { appearanceOf, effectiveTheme, themeColorFor, DEVICE_SETTINGS, SYNCED_SETTING_KEYS } = SETTINGS;
+  assert.equal(appearanceOf(null), "system");
+  assert.equal(appearanceOf("light"), "light");
+  assert.equal(appearanceOf("dark"), "dark");
+  assert.equal(appearanceOf("sepia"), "system", "an unknown kept value is System, never a third theme");
+  assert.equal(effectiveTheme("light", true), "light", "Light overrides a dark system");
+  assert.equal(effectiveTheme("dark", false), "dark", "Dark overrides a light system");
+  assert.equal(effectiveTheme("system", true), "dark", "System follows a dark system");
+  assert.equal(effectiveTheme("system", false), "light", "System follows a light system");
+  assert.equal(themeColorFor("dark"), "#14161a");
+  assert.equal(themeColorFor("light"), "#f6f7f9");
+  assert.equal(DEVICE_SETTINGS.appearance.key, "vibe-talk.voice.appearance");
+  assert.ok(SYNCED_SETTING_KEYS.includes(DEVICE_SETTINGS.appearance.key), "the choice is not synced");
 });
