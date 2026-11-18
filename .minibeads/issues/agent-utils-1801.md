@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-trace-posts-expand-short-refs: trace posts expand short references like replies'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - agentctl
 created_at: 2026-11-17T22:05:00.000000000+00:00
-updated_at: 2026-11-17T22:05:00.000000000+00:00
+updated_at: 2026-11-18T01:00:00.000000000+00:00
+closed_at: 2026-11-18T01:00:00.000000000+00:00
 ---
 
 # Description
@@ -65,3 +66,26 @@ to collection, rate limiting, metadata, or the reply path.
 [watermelon-full-preview] mu-refrender. Agreed with coordb as the
 separate change after #1796 (587f4321) landed; the diff goes to coordb
 before the gate.
+
+Two LOW items from coordb's review, recorded, not fixed:
+
+- Retry of a multi-part post: if part 0 landed and part 1 failed with
+  Retry, the retry re-derives part 0, the publish ledger answers it,
+  and the driver still does `seq += 1` for it, so the trace metadata
+  sequence skips a number. Harmless unless something reads the
+  sequence as dense.
+- `split_long`'s last-resort hard split cuts at any char boundary: a
+  single unbroken line that expansion pushes over 3,500 bytes (dozens
+  of references on one line) could be cut inside a `<url|label>`. The
+  follow-up is to cut at whitespace outside `<...>`.
+
+## Resolution
+
+[watermelon-full-preview] Landed 9330bfb9 on main (gate pass on
+d2f3d482, full, 2026-11-18T00:55:09Z). Trace posts now expand short
+references on the wire exactly as replies do, the expanded text is
+re-split under the 3,500-byte post budget with each part under its own
+derived request id, guard notices are logged and never recorded in
+`bare-ref-warnings.json`, and the driver reads the bridge state once
+per pass. Unit tests red before and green after; the touched bridge
+suites pass (662 tests).
