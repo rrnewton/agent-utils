@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-summary-strikethrough-live: summary bullet strikethrough must update live on archive, Done or read, and link-follow must always land on screen'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-strikelive
 labels:
 - vibe-talk
 created_at: 2026-11-18T00:58:00.000000000+00:00
-updated_at: 2026-11-18T00:58:00.000000000+00:00
+updated_at: 2026-11-18T07:28:00.000000000+00:00
+closed_at: 2026-11-18T07:28:00.000000000+00:00
 ---
 
 # Description
@@ -37,3 +38,7 @@ Scope is summary bullets and link-follow only. Discuss persistence across refres
 # Notes
 
 Owner fast-track, deployed on landing (owner-priority gate). Sibling: #1821 owns Discuss persistence across refresh; this issue is only the live strike and the link landing.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as `2674b6717e1680471b5a9ee0da027aa1b9670c17` (gated head `f0f4f704`; the gate's one failure, `vibe-talk.check.search-unmatched-browser`, passed 3/3 standalone on both this tree and current main and passed its solo gate rerun). `createDoneAct` now notifies `onReadStateChanged` at once on a Done, a put back, a refused write's take-back, and when server read state lands in `noteArchived`; the page wires it to `refreshDiscussStrikes`, so archiving or marking Done from a cited message's own row strikes its summary bullet in the same turn the row greys, with no refresh. `revealRow` re-asserts its landing over the next animation frames while the row stands off screen, so a landing moved by late layout is brought back. Tests: unit coverage in `tests/js/view/channel.test.mjs`, the new `tests/discuss_strike_live_browser.py` (repeated follows land on screen; archive, put back and re-archive from the rows strike and un-strike without reload, at 412x915 and 1280x800), and a 16-image screenshot matrix (light and dark, keyboard open with a real `visualViewport` shrink and closed, phone and desktop, before and after) reviewed by the coordinator liaison.
