@@ -8,7 +8,7 @@ actors with explicit program counters, the event-log revision chain,
 the ACTIVE snapshot, journals, the mutation lock, and crashes.
 
 Each actor is a transcription of one command's real phase structure
-in ``py/wrkslots/cli.py`` (line numbers cite ``e16fbeb9``): a
+in the wrkslots CLI module (line numbers cite ``e16fbeb9``): a
 lock-free read captures some state version; work proceeds lock-free;
 the lock is acquired; the under-lock checks compare exactly the
 fields the code compares; events are appended with an explicit
@@ -71,6 +71,8 @@ A, B = 0, 1  # slot indices
 
 
 class Actor(NamedTuple):
+    """One concurrent command: program counter plus captured locals."""
+
     pc: int
     p: int  # local: captured revision / version (per actor, see code)
     q: int  # local: captured version / attempts
