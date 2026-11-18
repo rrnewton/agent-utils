@@ -1660,11 +1660,18 @@ let discussDraftOffer = /** @type {import("../core/outbox/index.ts").SyncedDraft
 let discussDraftKey = /** @type {import("../core/outbox/index.ts").SyncedDraftKey | null} */ (null);
 
 /** Fetch the channel's synced drafts and offer the one for `key`, if any. */
-async function offerSyncedDraft(key, box, offerBar, offerText, remember) {
+async function offerSyncedDraft(key, box, offerBar, offerText, remember, attempts = 40) {
   if (!key.channel) return;
   // Nothing is read before /client-config has proved the token: a refused
   // reopen is sign-in's story to tell, and a draft read must not race it.
-  if (!serverFacts.configApplied()) return;
+  // The restore can run first, so an unproven page asks again shortly; a
+  // refused token never proves, and the asking simply runs out.
+  if (!serverFacts.configApplied()) {
+    if (attempts > 0) {
+      setTimeout(() => void offerSyncedDraft(key, box, offerBar, offerText, remember, attempts - 1), 500);
+    }
+    return;
+  }
   let drafts;
   try {
     drafts = await draftSync.fetchChannel(key.channel);
