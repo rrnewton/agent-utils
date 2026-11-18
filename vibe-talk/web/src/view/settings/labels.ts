@@ -206,8 +206,9 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
         labels?: LabelRow[];
         groups?: LabelGroupRow[];
       };
-      labels = answer.labels || [];
-      groups = answer.groups || [];
+      const { labels: rows, groups: held } = answer;
+      labels = rows || [];
+      groups = held || [];
       draw();
     } catch {
       el("labels-state").textContent = "Labels could not be read from this server.";
