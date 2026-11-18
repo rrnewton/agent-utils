@@ -1,12 +1,12 @@
 ---
 title: 'vibe-talk-tts-skip-timestamps-and-auto-link-ids: skip timestamp citations in speech, auto-link minibeads ids'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - vibe-talk
 created_at: 2026-11-18T01:15:00.000000000+00:00
-updated_at: 2026-11-18T01:15:00.000000000+00:00
+updated_at: 2026-11-18T10:15:00.000000000+00:00
 ---
 
 # Description
@@ -86,3 +86,10 @@ configuration for the coordinator to install at deploy; this change
 proves the rule shape works and hands over the exact snippet.
 
 ## Resolution
+
+[watermelon-full-preview] Landed on main at bf5d461f. Speech
+preparation drops timestamp citation links on the server
+(speakable.rs) and on the page (Discuss device voice); Discuss
+output links configured reference ids through the shared rendering
+pass, proven with the minibeads rule as test configuration only.
+The live rule is installed by the coordinator at deploy.
