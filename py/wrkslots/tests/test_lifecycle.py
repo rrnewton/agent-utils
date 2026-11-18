@@ -39325,6 +39325,176 @@ def test_submodule_remote_alias_to_another_local_repository_still_refuses(
         )
 
 
+def _submodule_refusal_message(project: Path) -> str:
+    config = wrkslots._load_config(str(project), "testhost")
+    record = wrkslots._load_active(config).slots[0]
+    with pytest.raises(wrkslots.Refusal) as raised:
+        wrkslots._submodule_salvage_checkouts(
+            config, record.checkouts[0], wrkslots._GitVcs()
+        )
+    return str(raised.value)
+
+
+def test_submodule_remote_refusal_names_different_repository_urls(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_component_cloned_from_source_module(tmp_path, project, repository)
+    assert create(project).returncode == 0
+    nested = checkout(project) / "component"
+    git(
+        repository / "component",
+        "remote",
+        "set-url",
+        "origin",
+        "https://example.com/upstream/component.git",
+    )
+    git(nested, "remote", "set-url", "origin", "https://example.com/other/component.git")
+
+    message = _submodule_refusal_message(project)
+
+    assert "names a different repository than the source remote" in message
+    assert "https://example.com/other/component.git" in message
+    assert "https://example.com/upstream/component.git" in message
+    assert (
+        f"git -C {nested} remote set-url origin "
+        "https://example.com/upstream/component.git" in message
+    )
+    assert "point the mirror at that repository" in message
+
+
+def test_submodule_remote_refusal_names_mirror_origin_that_names_another_repository(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    component_remote, _module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    assert create(project).returncode == 0
+    nested = checkout(project) / "component"
+    mirror = tmp_path / "mirror.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(component_remote), str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(mirror, "remote", "set-url", "origin", "https://example.com/fork/component.git")
+    git(
+        repository / "component",
+        "remote",
+        "set-url",
+        "origin",
+        "https://example.com/upstream/component.git",
+    )
+    git(nested, "remote", "set-url", "origin", str(mirror))
+
+    message = _submodule_refusal_message(project)
+
+    assert (
+        f"the mirror {mirror.resolve()}'s origin names a different repository: "
+        "https://example.com/fork/component.git "
+        "(source remote: https://example.com/upstream/component.git)" in message
+    )
+    assert (
+        f"git -C {nested} remote set-url origin "
+        "https://example.com/upstream/component.git" in message
+    )
+
+
+def test_submodule_remote_refusal_names_mirror_with_no_origin(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    component_remote, _module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    assert create(project).returncode == 0
+    nested = checkout(project) / "component"
+    mirror = tmp_path / "mirror.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(component_remote), str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(mirror, "remote", "remove", "origin")
+    git(
+        repository / "component",
+        "remote",
+        "set-url",
+        "origin",
+        "https://example.com/upstream/component.git",
+    )
+    git(nested, "remote", "set-url", "origin", str(mirror))
+
+    message = _submodule_refusal_message(project)
+
+    assert f"the mirror {mirror.resolve()} has no origin remote" in message
+    assert "https://example.com/upstream/component.git" in message
+    assert (
+        f"git -C {nested} remote set-url origin "
+        "https://example.com/upstream/component.git" in message
+    )
+
+
+def test_submodule_remote_refusal_names_mirror_path_that_is_not_a_repository(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    add_component_cloned_from_source_module(tmp_path, project, repository)
+    assert create(project).returncode == 0
+    nested = checkout(project) / "component"
+    not_a_repository = tmp_path / "not-a-repository"
+    not_a_repository.mkdir()
+    git(
+        repository / "component",
+        "remote",
+        "set-url",
+        "origin",
+        "https://example.com/upstream/component.git",
+    )
+    git(nested, "remote", "set-url", "origin", str(not_a_repository))
+
+    message = _submodule_refusal_message(project)
+
+    assert f"the mirror {not_a_repository.resolve()} is not a repository" in message
+    assert "https://example.com/upstream/component.git" in message
+    assert (
+        f"git -C {nested} remote set-url origin "
+        "https://example.com/upstream/component.git" in message
+    )
+
+
+def test_submodule_remote_refusal_names_source_remote_that_cannot_be_judged(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    component_remote, module = add_component_cloned_from_source_module(
+        tmp_path, project, repository
+    )
+    assert create(project).returncode == 0
+    nested = checkout(project) / "component"
+    mirror = tmp_path / "mirror.git"
+    subprocess.run(
+        ["git", "clone", "--bare", str(component_remote), str(mirror)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    # The mirror does mirror the source remote, but that remote names the
+    # source repository itself, so it leads nowhere it can be judged.
+    git(mirror, "remote", "set-url", "origin", str(module))
+    git(repository / "component", "remote", "set-url", "origin", str(module))
+    git(nested, "remote", "set-url", "origin", str(mirror))
+
+    message = _submodule_refusal_message(project)
+
+    assert f"the source remote {module} cannot be judged" in message
+    assert "one of the source, the mirror and the slot's copy" in message
+    assert f"git -C {nested} remote set-url origin {module}" in message
+
+
 def test_agent_remove_accepts_submodule_cloned_from_another_local_mirror(
     tmp_path: Path,
 ) -> None:

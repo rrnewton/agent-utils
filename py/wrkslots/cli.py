@@ -35958,59 +35958,127 @@ def _submodule_network_authority(
     if _same_repository_remote(source_authority.url, managed_authority.url):
         return managed_authority
     mirror = _absolute_local_remote_directory(managed, managed_authority)
-    if mirror is not None and _mirrors_source_remote(
-        vcs, submodule.remote, mirror, source, managed, source_authority
-    ):
-        return source_authority
+    if mirror is not None:
+        reason = _mirror_refusal_reason(
+            vcs, submodule.remote, mirror, source, managed, source_authority
+        )
+        if reason is None:
+            return source_authority
+    else:
+        candidate = _local_remote_url_path(managed, managed_authority.url)
+        if candidate is not None and _local_remote_url_is_absolute(
+            managed_authority.url
+        ):
+            reason = (
+                f"the mirror {candidate} is not a repository "
+                f"(source remote: {source_authority.url})"
+            )
+        else:
+            reason = (
+                f"the slot's remote URL {managed_authority.url} names a different "
+                f"repository than the source remote {source_authority.url}"
+            )
     raise Refusal(
         f"submodule {submodule.name} remote {submodule.remote} differs "
-        "from its configured source; preserve the slot for inspection"
+        f"from its configured source: {reason}; preserve the slot for inspection. "
+        "Remedy: set the slot submodule's origin to the .gitmodules URL "
+        f"(git -C {managed} remote set-url {submodule.remote} {source_authority.url}), "
+        "or point the mirror at that repository"
     )
 
 
-def _mirrors_source_remote(
+def _mirror_refusal_reason(
     vcs: _GitVcs,
     remote: str,
     mirror: Path,
     source: Path,
     managed: Path,
     source_authority: _RemoteAuthority,
-) -> bool:
-    """Whether ``mirror`` is a local mirror of ``source``'s remote.
+) -> str | None:
+    """Why ``mirror`` is not a local mirror of ``source``'s remote, or None if it is.
 
-    See _submodule_network_authority.
+    See _submodule_network_authority. The accept/refuse decision is exactly
+    the one the former boolean check made; this only names the failing case.
     """
 
     try:
         mirror_identity = _directory_device_inode(mirror)
+    except OSError:
+        return (
+            f"the mirror {mirror} is not a repository "
+            f"(source remote: {source_authority.url})"
+        )
+    try:
         source_identity = _directory_device_inode(
             vcs.common_directory(source).resolve(strict=True)
         )
         managed_identity = _directory_device_inode(
             vcs.common_directory(managed).resolve(strict=True)
         )
-    except OSError:
-        return False
+    except (OSError, Refusal):
+        return (
+            f"the mirror {mirror} cannot be judged against the source remote "
+            f"{source_authority.url} because the repositories involved cannot "
+            "be identified"
+        )
     if mirror_identity == managed_identity:
-        return False
+        return (
+            f"the mirror {mirror} is the slot's own repository, not a mirror of "
+            f"the source remote {source_authority.url}"
+        )
     if mirror_identity != source_identity:
         try:
             mirror_authority = vcs.remote_authority(mirror, remote)
         except Refusal:
-            return False
+            try:
+                vcs.common_directory(mirror)
+            except Refusal:
+                return (
+                    f"the mirror {mirror} is not a repository "
+                    f"(source remote: {source_authority.url})"
+                )
+            configured = vcs._run(
+                mirror, ["config", "--get", f"remote.{remote}.url"], check=False
+            )
+            if configured.returncode != 0 or not configured.stdout.strip():
+                return (
+                    f"the mirror {mirror} has no {remote} remote "
+                    f"(source remote: {source_authority.url})"
+                )
+            return (
+                f"the mirror {mirror} has no usable {remote} remote "
+                f"(source remote: {source_authority.url})"
+            )
         if not _same_repository_remote(mirror_authority.url, source_authority.url):
-            return False
+            return (
+                f"the mirror {mirror}'s origin names a different repository: "
+                f"{mirror_authority.url} (source remote: {source_authority.url})"
+            )
     # The source's own remote must lead elsewhere.
     if _local_remote_url_path(source, source_authority.url) is None:
-        return True
+        return None
     onward = _absolute_local_remote_directory(source, source_authority)
     if onward is None:
-        return False
+        return (
+            f"the source remote {source_authority.url} cannot be judged: it must "
+            "name a network remote or an absolute local path to a repository "
+            "other than the source, the mirror and the slot's copy"
+        )
     try:
         onward_identity = _directory_device_inode(onward)
     except OSError:
-        return False
-    return onward_identity not in (source_identity, managed_identity, mirror_identity)
+        return (
+            f"the source remote {source_authority.url} cannot be judged: it must "
+            "name a network remote or an absolute local path to a repository "
+            "other than the source, the mirror and the slot's copy"
+        )
+    if onward_identity in (source_identity, managed_identity, mirror_identity):
+        return (
+            f"the source remote {source_authority.url} cannot be judged: it names "
+            f"{onward}, one of the source, the mirror and the slot's copy, instead "
+            "of a repository beyond them"
+        )
+    return None
 
 
 def _directory_device_inode(directory: Path) -> tuple[int, int]:
