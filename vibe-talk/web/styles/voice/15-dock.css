@@ -44,8 +44,11 @@
  * was ever applied before it. Both halves are still here, and both are still asserted. */
 /* `#1786 vibe-talk-search-scope-server-hits`: while the server search's details
    stand open at the foot of the list, its controls (More, Search further back)
-   own the foot and the status pill waits rather than cover them. */
-#frame-body:has(#server-detail:not([hidden])) #status-line {
+   own the foot and the status pill waits rather than cover them. `#1813`: the
+   collapsed line itself (`Search the server`, #server-line) is a control at the
+   foot too, and the pill centred on the pane covered its label, so the wait
+   covers the whole section while it stands. */
+#frame-body:has(#server-search:not([hidden])) #status-line {
   visibility: hidden;
 }
 
