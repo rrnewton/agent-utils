@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-drain-composer-wait-labelled-lock-wait: a composer wait is blamed on a lock, lifecycle lock held across waits, cancelled record resurrected'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -61,3 +61,18 @@ Evidence and record copies were held by the coordinator
 (queue-race records, `/proc/locks` and fdinfo for the lifecycle
 lock). #1773 removed the placeholder wait itself; this issue is
 the labelling, locking and cancel-race remainder.
+
+## Resolution
+
+[watermelon-full-preview] Landed 4652106e on github/main (gated
+562babe4, full validate, 62 steps pass). (a) A staged pane whose draft
+agentctl may not submit now refuses at once as "composer occupied" on
+any real readiness wait, in both editions; zero-timeout probes keep
+their wording, so no agentctl path waits out a composer behind a
+lifecycle or queue lock. (b) The drain's lock-wait label names the
+real wait (Herdr, composer, or a genuine lock acquisition), and
+status counts inbox.v2 items as pending. (c) Every drain write-back
+re-reads the record's phase under the queue lock and drops the write
+when it was cancelled, processed or moved; queue recovery never
+repends a tombstoned item. Regression tests fail on the base and
+pass here, condition-based, in both editions.

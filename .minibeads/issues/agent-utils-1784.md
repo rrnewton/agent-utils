@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-watch-recognise-hook-confirmation: recognise the Claude hook confirmation and page the owner'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -43,3 +43,15 @@ reader fell through to the menu fallback with no question text.
 
 Filed with #1775 agentctl-drain-composer-wait-labelled-lock-wait,
 from the same stuck seats.
+
+## Resolution
+
+[watermelon-full-preview] Landed 4652106e on github/main (gated
+562babe4, full validate, 62 steps pass). The Claude hook
+confirmation classifies as a blocking question naming the hook and
+the first line of its reason in both editions; the watcher pass
+alarms the owner in chat through the bridge owner path (agent, pane,
+reason, only-you-can-answer), rate-limited to one per prompt per
+window, and no answer plan is ever produced for it. Tested with a
+captured screen in both editions, plus a pass-level test that the
+owner alarm fires once per prompt.
