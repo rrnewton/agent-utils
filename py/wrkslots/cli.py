@@ -6538,17 +6538,92 @@ def _open_lock_file(path: Path, label: str) -> int:
     return fd
 
 
-def _flock_until(fd: int, operation: int, deadline: float) -> bool:
-    """Poll a non-blocking flock until ``deadline``; true when it was acquired."""
+# Duplicated descriptors a blocking flock wait acquired on behalf of a
+# caller descriptor (#1808-C): the lock lives on the shared open file
+# description, so the duplicate must stay open while the caller holds the
+# lock and is closed by _flock_release. Keyed by the caller's descriptor.
+_FLOCK_DUPS: dict[int, int] = {}
+_FLOCK_DUPS_LOCK = threading.Lock()
 
-    while True:
+
+def _flock_blocking(fd: int, operation: int, deadline: float) -> bool:
+    """Wait in the kernel for a flock until ``deadline`` (#1808-C).
+
+    A helper thread performs the blocking flock on a duplicated descriptor
+    (no process signals are touched, so the CLI stays embeddable). If the
+    deadline passes first the wait is cancelled: when the helper eventually
+    acquires, it unlocks and closes at once, so a late acquisition never
+    acts and never leaks the lock.
+    """
+
+    try:
+        duplicate = os.dup(fd)
+    except OSError:
+        return False
+    acquired = threading.Event()
+    cancelled = threading.Event()
+    errors: list[OSError] = []
+
+    def wait_in_kernel() -> None:
         try:
-            fcntl.flock(fd, operation | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            fcntl.flock(duplicate, operation)
+        except OSError as exc:
+            errors.append(exc)
+            acquired.set()
+            return
+        with _FLOCK_DUPS_LOCK:
+            late = cancelled.is_set()
+            if not late:
+                _FLOCK_DUPS[fd] = duplicate
+        if late:
+            try:
+                fcntl.flock(duplicate, fcntl.LOCK_UN)
+            finally:
+                os.close(duplicate)
+            return
+        acquired.set()
+
+    thread = threading.Thread(target=wait_in_kernel, daemon=True)
+    thread.start()
+    if acquired.wait(max(0.0, deadline - time.monotonic())) and not errors:
+        return True
+    cancelled.set()
+    if not acquired.is_set():
+        # The helper may still be blocked in flock; it releases on acquire.
+        # If it already registered the duplicate, take it back instead.
+        with _FLOCK_DUPS_LOCK:
+            registered = _FLOCK_DUPS.pop(fd, None)
+        if registered is not None:
+            try:
+                fcntl.flock(registered, fcntl.LOCK_UN)
+            finally:
+                os.close(registered)
+    return False
+
+
+def _flock_release(fd: int) -> None:
+    """Unlock ``fd`` and close any duplicate its blocking wait acquired."""
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        with _FLOCK_DUPS_LOCK:
+            duplicate = _FLOCK_DUPS.pop(fd, None)
+        if duplicate is not None:
+            os.close(duplicate)
+
+
+def _flock_until(fd: int, operation: int, deadline: float) -> bool:
+    """Acquire a flock, blocking in the kernel until ``deadline`` (#1808-C)."""
+
+    try:
+        fcntl.flock(fd, operation | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        pass
+    if time.monotonic() >= deadline:
+        return False
+    return _flock_blocking(fd, operation, deadline)
 
 
 def _enter_registry_turnstile(
@@ -6573,7 +6648,7 @@ def _enter_registry_turnstile(
     try:
         defer_until = min(deadline, time.monotonic() + _REGISTRY_INTENT_DEFER_SECONDS)
         if _flock_until(fd, fcntl.LOCK_SH, defer_until):
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _flock_release(fd)
     finally:
         os.close(fd)
     return None
@@ -6594,6 +6669,7 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[
                 )
         finally:
             if intent is not None:
+                _flock_release(intent)
                 os.close(intent)
         held: dict[Path, int] = getattr(_HELD_LOCKS, "paths", None) or {}
         _HELD_LOCKS.paths = held
@@ -6606,7 +6682,7 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[
                 del held[path]
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _flock_release(fd)
         finally:
             os.close(fd)
 
@@ -6878,21 +6954,15 @@ def _locked_config(
     deadline = time.monotonic() + wait_seconds
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     try:
-        while True:
-            try:
-                fcntl.flock(fd, operation | fcntl.LOCK_NB)
-                break
-            except BlockingIOError as exc:
-                if time.monotonic() >= deadline:
-                    raise _LockBusy(
-                        f"configuration lock is busy for {lock_path}; retry after the "
-                        "other wrkslots mutation exits"
-                    ) from exc
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        if not _flock_until(fd, operation, deadline):
+            raise _LockBusy(
+                f"configuration lock is busy for {lock_path}; retry after the "
+                "other wrkslots mutation exits"
+            )
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _flock_release(fd)
         finally:
             os.close(fd)
 
@@ -45093,8 +45163,23 @@ class _HeartbeatPrevalidated:
     warnings: tuple[str, ...]
 
 
+def _heartbeat_wait_seconds(args: argparse.Namespace, config: Config) -> float:
+    """The lock wait a heartbeat uses (#1808-C).
+
+    Explicit ``--wait-lock`` wins. By default a heartbeat blocks for the
+    shorter of 10 seconds and a third of the configured TTL, so it can
+    never queue long enough to lapse a healthy lease (a 600 s TTL leaves
+    roughly 590 s of margin).
+    """
+
+    if not getattr(args, "wait_lock_defaulted", False):
+        return float(args.wait_lock)
+    return max(1.0, min(10.0, config.heartbeat_ttl_seconds / 3.0))
+
+
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
+    wait_seconds = _heartbeat_wait_seconds(args, config)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
     owner = _capture_caller_process(args.owner_pid, "owner")
@@ -45342,14 +45427,14 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     try:
         try:
             updated, warnings = _run_prevalidated_mutation(
-                config, args.wait_lock, "heartbeat", prepare, commit, tolerate=tolerate
+                config, wait_seconds, "heartbeat", prepare, commit, tolerate=tolerate
             )
         except _RegistryBusy:
             # Every lock-free round was overtaken by writers the classifier
             # could not tolerate: fall back to the old behaviour — wait for
             # the lock and validate there — instead of refusing a heartbeat
             # as busy (#1808-A review).
-            with _mutation_locks(config, args.wait_lock):
+            with _mutation_locks(config, wait_seconds):
                 updated, warnings = locked_body()
     finally:
         for stdout_text, stderr_text in captured_notes:
@@ -92575,9 +92660,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
     parser.add_argument(
         "--wait-lock",
         type=float,
-        default=0.0,
+        default=None,
         metavar="SECONDS",
-        help="wait up to this many seconds for a state lock (default: fail immediately)",
+        help="wait up to this many seconds for a state lock, blocking until "
+        "the deadline (default: 30 seconds for mutations, and for heartbeat "
+        "the shorter of 10 seconds and a third of the heartbeat TTL; an "
+        "explicit 0 fails immediately)",
     )
     parser.add_argument(
         "--allow-existing-unregistered-worktrees",
@@ -95821,6 +95909,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         guide = _load_userguide()
         print(guide, end="" if guide.endswith("\n") else "\n")
         return 0
+    if args.wait_lock is None:
+        # #1808-C: an unset --wait-lock blocks with a bounded default
+        # instead of failing fast; an explicit 0 keeps fail-fast.
+        args.wait_lock = 30.0
+        args.wait_lock_defaulted = True
+    else:
+        args.wait_lock_defaulted = False
     if args.wait_lock < 0 or not args.wait_lock < float("inf"):
         parser.error("--wait-lock must be a finite non-negative number")
     if args.command == "socket-census" and args.project_root is not None:

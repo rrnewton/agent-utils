@@ -30,34 +30,81 @@ use crate::hold_state::parse_hold;
 type Result<T> = std::result::Result<T, String>;
 
 /// How long lock acquisition may wait, from `WRKSLOTS_WAIT_LOCK`
-/// (seconds; unset or invalid means do not wait). The soak launcher
-/// sets this from the Python CLI's `--wait-lock`; direct wrkslotsd
-/// use keeps the non-blocking behaviour.
+/// (seconds). The soak launcher sets this from the Python CLI's
+/// `--wait-lock`. Unset means the bounded default of 30 seconds
+/// (#1808-C, matching the Python edition); an explicit 0 (or an
+/// invalid value) keeps fail-fast.
 pub(crate) fn lock_wait() -> std::time::Duration {
-    std::env::var("WRKSLOTS_WAIT_LOCK")
-        .ok()
-        .and_then(|text| text.parse::<f64>().ok())
-        .filter(|seconds| *seconds > 0.0)
-        .map(std::time::Duration::from_secs_f64)
-        .unwrap_or_default()
+    match std::env::var("WRKSLOTS_WAIT_LOCK") {
+        Ok(text) => text
+            .parse::<f64>()
+            .ok()
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(std::time::Duration::from_secs_f64)
+            .unwrap_or_default(),
+        Err(_) => std::time::Duration::from_secs(30),
+    }
 }
 
-/// Try a non-blocking flock until `deadline`, then report busy.
+/// Block in the kernel for a flock until `deadline`, then report busy
+/// (#1808-C). A waiter thread performs the blocking flock on a duplicated
+/// descriptor (it shares the caller's open file description, so the lock
+/// stays held by the caller's file). A wait cancelled by its deadline
+/// unlocks immediately when it eventually acquires: a late acquisition
+/// never acts and never leaks the lock.
+fn flock_blocking(
+    file: &std::fs::File,
+    deadline: std::time::Instant,
+    shared: bool,
+) -> std::result::Result<(), rustix::io::Errno> {
+    let nonblocking = if shared {
+        rustix::fs::FlockOperation::NonBlockingLockShared
+    } else {
+        rustix::fs::FlockOperation::NonBlockingLockExclusive
+    };
+    let busy = match rustix::fs::flock(file, nonblocking) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if std::time::Instant::now() >= deadline {
+        return Err(busy);
+    }
+    let Ok(waiter_file) = file.try_clone() else {
+        return Err(busy);
+    };
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_cancelled = cancelled.clone();
+    let (sender, receiver) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let blocking = if shared {
+            rustix::fs::FlockOperation::LockShared
+        } else {
+            rustix::fs::FlockOperation::LockExclusive
+        };
+        if rustix::fs::flock(&waiter_file, blocking).is_ok()
+            && thread_cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = rustix::fs::flock(&waiter_file, rustix::fs::FlockOperation::Unlock);
+            return;
+        }
+        let _ = sender.send(());
+    });
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(busy)
+        }
+    }
+}
+
+/// Block for an exclusive flock until `deadline`, then report busy.
 pub(crate) fn flock_wait(
     file: &std::fs::File,
     deadline: std::time::Instant,
 ) -> std::result::Result<(), rustix::io::Errno> {
-    loop {
-        match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(error);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-    }
+    flock_blocking(file, deadline, false)
 }
 
 /// As `flock_wait`, for a shared lock (#1200: the readers' last,
@@ -66,17 +113,7 @@ pub(crate) fn flock_wait_shared(
     file: &std::fs::File,
     deadline: std::time::Instant,
 ) -> std::result::Result<(), rustix::io::Errno> {
-    loop {
-        match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockShared) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(error);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-    }
+    flock_blocking(file, deadline, true)
 }
 
 pub(crate) struct Flock {
@@ -1069,6 +1106,56 @@ mod lock_wait_tests {
         let result = waiter.join().unwrap();
         assert!(result.is_ok());
         assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flock_wait_past_deadline_releases_its_late_acquisition() {
+        // #1808-C: a waiter whose deadline passes while the holder still
+        // holds must never keep the lock when it eventually acquires.
+        let dir = std::env::temp_dir().join(format!(
+            "wrkslots-lock-late-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lock");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        rustix::fs::flock(&holder, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let waiter = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let result = flock_wait(
+            &waiter,
+            std::time::Instant::now() + std::time::Duration::from_millis(150),
+        );
+        assert!(result.is_err());
+        drop(waiter);
+        drop(holder);
+        // Condition, not a clock: the lock becomes free and stays free.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut free = false;
+        for _ in 0..100 {
+            if rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .is_ok()
+            {
+                free = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(free, "a late acquisition leaked the lock");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
