@@ -402,15 +402,23 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     else:
         check(not bound_row["sinceHidden"] and abs(bound_row["sinceMid"] - bound_row["countMid"]) <= 3,
               f"since HH:MM did not stand on the desk row: {bound_row}")
+    # `#1817 vibe-talk-summarize-inputs-free-typing`: typing "1" in hours
+    # stays "1" (the old feedback loop rewrote it), the count follows as
+    # the (here empty) range's 0, and typing past the old 99 cap is kept.
     page.fill("#discuss-hours", "1")
     page.wait_for_function(
-        "() => document.getElementById('discuss-count').value === '1'"
-        " && document.getElementById('discuss-since').value !== ''",
+        "() => document.getElementById('discuss-hours').value === '1'"
+        " && document.getElementById('discuss-count').value === '0'",
+        timeout=20_000)
+    page.fill("#discuss-hours", "150")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-hours').value === '150'",
         timeout=20_000)
     page.fill("#discuss-count", "2")
     page.wait_for_function(
         "() => document.getElementById('discuss-count').value === '2'"
-        " && document.getElementById('discuss-hours').value !== ''",
+        " && document.getElementById('discuss-hours').value !== ''"
+        " && document.getElementById('discuss-hours').value.includes('.')",
         timeout=20_000)
     # `#1527 discuss-summarize-bottom-bar-mobile`: on a phone the ask row is a
     # bar at the pane's bottom with Summarize rightmost; on a desk it stays

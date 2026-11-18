@@ -535,40 +535,51 @@ export function hoursSinceStart(sinceMs: number | null, nowMs: number): number {
   return Math.max(1, Math.ceil((nowMs - sinceMs) / HOUR_MS));
 }
 
+/**
+ * `#1817 vibe-talk-summarize-inputs-free-typing`. Hours from `sinceMs` to
+ * `nowMs`, floored to one decimal place (6.81 -> 6.8): the dependent-hours
+ * display when the count end owns the bound. Never rounded up, so a typed
+ * count never pushes the hours past the message it actually reaches.
+ */
+export function hoursFloor1(sinceMs: number | null, nowMs: number): number {
+  if (sinceMs === null || !Number.isFinite(sinceMs) || !Number.isFinite(nowMs)) return 0;
+  const raw = (nowMs - sinceMs) / HOUR_MS;
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.floor(raw * 10) / 10;
+}
+
+/** The dependent-hours text: floored to one decimal, always one decimal shown. */
+export function formatHoursFloor1(sinceMs: number | null, nowMs: number): string {
+  return hoursFloor1(sinceMs, nowMs).toFixed(1);
+}
+
 /** How many unread fall at/after `nowMs - hours` (unknown times count as in). */
 export function countForHours(unread: readonly CatchupUnreadRef[], hours: number, nowMs: number): number {
-  const whole = Math.trunc(Number(hours));
-  const start = nowMs - (Number.isFinite(whole) && whole >= 1 ? whole : 1) * HOUR_MS;
+  // `#1817`: hours are a free variable as typed (fractions included); no
+  // whole-hour truncation and no minimum of 1.
+  const typed = Number(hours);
+  const start = nowMs - (Number.isFinite(typed) && typed > 0 ? typed : 0) * HOUR_MS;
   let count = 0;
   for (const ref of unread) if (ref.at_ms === null || ref.at_ms >= start) count += 1;
   return count;
 }
 
 /**
- * The bound for "last `hours` hours": the start is `now - K hours`, clamped
- * to the oldest unread when K reaches past it (so N becomes all unread and
- * K restates as the rounded-up hours to that oldest message). When no unread
- * falls inside K, the newest unread alone is covered, as N's minimum of 1.
+ * The bound for "last `hours` hours" (`#1817`): the start is `now - K hours`
+ * exactly as typed. K is a completely free variable: it is never restated,
+ * clamped to the oldest unread, or forced to cover at least one message —
+ * a window with no unread in it is a valid bound whose count is 0.
  */
 export function boundForHours(
   unread: readonly CatchupUnreadRef[],
   hours: number,
   nowMs: number,
 ): { count: number; sinceMs: number | null; hours: number } {
-  if (unread.length === 0) return { count: 0, sinceMs: null, hours: 1 };
-  const whole = Math.trunc(Number(hours));
-  const wanted = Number.isFinite(whole) && whole >= 1 ? whole : 1;
+  const typed = Number(hours);
+  const wanted = Number.isFinite(typed) && typed > 0 ? typed : 1;
+  if (unread.length === 0) return { count: 0, sinceMs: null, hours: wanted };
   const start = nowMs - wanted * HOUR_MS;
-  const oldest = unread[0]?.at_ms ?? null;
-  if (oldest !== null && start <= oldest) {
-    return { count: unread.length, sinceMs: oldest, hours: hoursSinceStart(oldest, nowMs) };
-  }
-  const count = countForHours(unread, wanted, nowMs);
-  if (count === 0) {
-    const newest = unread.at(-1)?.at_ms ?? null;
-    return { count: 1, sinceMs: newest, hours: hoursSinceStart(newest, nowMs) };
-  }
-  return { count, sinceMs: start, hours: wanted };
+  return { count: countForHours(unread, wanted, nowMs), sinceMs: start, hours: wanted };
 }
 
 /** How many unread a "since HH:MM" covers: those whose local time-of-day is at/after it. */
@@ -1465,6 +1476,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   // `#1524`: the bound's explicit start when set by the hours end; null means
   // the count end owns it and the start is that count's oldest message.
   let boundStartMs: number | null = null;
+  // `#1817`: which end owns the bound ("count" | "hours" | "since"), the
+  // hours exactly as typed when the hours end owns it, and the bound input
+  // being edited right now. While an input is being edited its text is the
+  // owner's and is never rewritten; only the dependent end follows.
+  let boundOwner: "count" | "hours" | "since" | null = null;
+  let boundHours: number | null = null;
+  let editingBoundInput: HTMLInputElement | null = null;
   let drawingBound = false;
   let lastSinceMs: number | null = null;
   let pending = false;
@@ -1473,19 +1491,22 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     return deps.now ? deps.now() : Date.now();
   }
 
-  /** The bound as drawn: count, start and rounded-up hours, from the one state. */
+  /** The bound as drawn: count, start and hours, from the one state. */
   function currentBound(): { count: number; sinceMs: number | null; hours: number } {
     if (boundStartMs !== null) {
       let count = 0;
       for (const ref of previewUnread) if (ref.at_ms === null || ref.at_ms >= boundStartMs) count += 1;
-      if (count === 0 && previewUnread.length > 0) {
-        const bound = boundForCount(previewUnread, 1);
-        return { count: bound.count, sinceMs: bound.sinceMs, hours: hoursSinceStart(bound.sinceMs, nowMs()) };
-      }
-      return { count, sinceMs: boundStartMs, hours: hoursSinceStart(boundStartMs, nowMs()) };
+      // `#1817`: an hours window covering no unread is a valid bound (count
+      // 0); it is never snapped to the newest unread. Hours as typed win;
+      // a start set by the clock end restates floored to one decimal.
+      return {
+        count,
+        sinceMs: boundStartMs,
+        hours: boundOwner === "hours" && boundHours !== null ? boundHours : hoursFloor1(boundStartMs, nowMs()),
+      };
     }
     const bound = boundForCount(previewUnread, boundCount || previewUnread.length);
-    return { count: bound.count, sinceMs: bound.sinceMs, hours: hoursSinceStart(bound.sinceMs, nowMs()) };
+    return { count: bound.count, sinceMs: bound.sinceMs, hours: hoursFloor1(bound.sinceMs, nowMs()) };
   }
 
   /** Say whether a request is in flight, here and on the page's entry points. */
@@ -1502,25 +1523,45 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const hours = deps.byId("discuss-hours") as HTMLInputElement;
     const since = deps.byId("discuss-since") as HTMLInputElement;
     const none = previewUnread.length === 0;
-    button.disabled = pending || none;
-    count.disabled = pending || none;
-    hours.disabled = pending || none;
+    // `#1817`: the count/hours ends stay editable with nothing unread, so
+    // any hour value can be typed before (or without) messages in range.
+    count.disabled = pending;
+    hours.disabled = pending;
     since.disabled = pending || none;
     if (none) {
+      button.disabled = true;
       button.textContent = "Summarize";
+      drawingBound = true;
+      try {
+        if (editingBoundInput !== count) count.value = boundOwner === "count" ? String(boundCount) : "0";
+        if (editingBoundInput !== hours) {
+          hours.value = boundOwner === "hours" && boundHours !== null ? String(boundHours) : "";
+        }
+        if (editingBoundInput !== since) since.value = "";
+      } finally {
+        drawingBound = false;
+      }
       return;
     }
     const bound = currentBound();
-    boundCount = bound.count;
     if (boundStartMs !== null) boundStartMs = bound.sinceMs;
+    button.disabled = pending || bound.count === 0;
     drawingBound = true;
     try {
-      count.value = String(bound.count);
-      // `#1761`: the bound's ceiling is the full window (a filled thread's
-      // whole length), not only the newest held page's unread count.
-      count.max = String(Math.max(previewUnread.length, previewWindowCount));
-      hours.value = String(bound.hours);
-      since.value = bound.sinceMs === null ? "" : hhmm(bound.sinceMs);
+      // `#1817`: never rewrite the field being typed in (that rewrite was
+      // the 1->2 jump); only the dependent ends follow. The owning end
+      // shows its value exactly as committed, the other end follows.
+      if (editingBoundInput !== count) {
+        count.value = boundOwner === "count" ? String(boundCount) : String(bound.count);
+      }
+      if (editingBoundInput !== hours) {
+        hours.value = boundOwner === "hours" && boundHours !== null
+          ? String(boundHours)
+          : formatHoursFloor1(bound.sinceMs, nowMs());
+      }
+      if (editingBoundInput !== since) {
+        since.value = bound.sinceMs === null ? "" : hhmm(bound.sinceMs);
+      }
     } finally {
       drawingBound = false;
     }
@@ -1543,6 +1584,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         previewWindowCount = preview.window?.count ?? preview.unread.length;
         boundCount = preview.unread.length;
         boundStartMs = null;
+        boundOwner = null;
+        boundHours = null;
         // `#1761`: a thread whose older pages are still being fetched polls
         // again — each preview fetches one more page — so the held count on
         // screen grows toward the whole thread before Summarize is offered.
@@ -1733,31 +1776,52 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         });
         listening.listen(deps.byId("discuss-summarize"), "click", () => {
           if (pending || lastScope === null || previewUnread.length === 0) return;
+          if (currentBound().count === 0) return;
           fetchFor(lastScope, currentBound().sinceMs);
         });
+        // `#1817`: typing commits on input for the dependent end only; the
+        // field being typed in keeps the owner's raw text and caret. Blur
+        // ends the edit, and only then may the field be redrawn (an empty
+        // or invalid text falls back to the bound). Arrow keys step the
+        // field natively and arrive here as ordinary input events.
         const countInput = deps.byId("discuss-count") as HTMLInputElement;
+        const hoursInput = deps.byId("discuss-hours") as HTMLInputElement;
+        const sinceInput = deps.byId("discuss-since") as HTMLInputElement;
+        for (const input of [countInput, hoursInput, sinceInput]) {
+          listening.listen(input, "focus", () => { editingBoundInput = input; });
+          listening.listen(input, "blur", () => {
+            if (editingBoundInput === input) editingBoundInput = null;
+            drawBound();
+          });
+        }
         listening.listen(countInput, "input", () => {
           if (drawingBound) return;
-          const bound = boundForCount(previewUnread, Number(countInput.value));
-          boundCount = bound.count;
-          boundStartMs = null;
-          // Keep the start the count chose, so hours restates from it.
-          if (bound.sinceMs !== null) boundStartMs = bound.sinceMs;
+          editingBoundInput = countInput;
+          const parsed = Number(countInput.value);
+          if (countInput.value.trim() === "" || !Number.isFinite(parsed) || parsed < 0) return;
+          boundOwner = "count";
+          boundHours = null;
+          boundCount = Math.trunc(parsed);
+          boundStartMs = boundForCount(previewUnread, boundCount).sinceMs;
           drawBound();
         });
-        const hoursInput = deps.byId("discuss-hours") as HTMLInputElement;
         listening.listen(hoursInput, "input", () => {
           if (drawingBound) return;
+          editingBoundInput = hoursInput;
           const parsed = Number(hoursInput.value);
-          if (!Number.isFinite(parsed) || parsed < 1) return;
+          if (hoursInput.value.trim() === "" || !Number.isFinite(parsed) || parsed <= 0) return;
           const bound = boundForHours(previewUnread, parsed, nowMs());
+          boundOwner = "hours";
+          boundHours = parsed;
           boundCount = bound.count;
           boundStartMs = bound.sinceMs;
           drawBound();
         });
-        const sinceInput = deps.byId("discuss-since") as HTMLInputElement;
         listening.listen(sinceInput, "input", () => {
           if (drawingBound) return;
+          editingBoundInput = sinceInput;
+          boundOwner = "since";
+          boundHours = null;
           boundCount = countSince(previewUnread, sinceInput.value);
           boundStartMs = boundForCount(previewUnread, boundCount).sinceMs;
           drawBound();

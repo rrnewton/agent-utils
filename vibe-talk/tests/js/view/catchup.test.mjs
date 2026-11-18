@@ -21,7 +21,7 @@ const {
   DISCUSS_BINDING_RULES, WIDEN_OR_SIDEWAYS_ACTION, discussScopeKey, isSameDiscussScope,
   linkDecision, normalizeDiscussScope, viewChangeDecision,
   applyStrikes, citationIdsOf, hasWord, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, FRESH_CLASS,
-  hoursSinceStart, countForHours, boundForHours, summaryTimeLabel,
+  hoursSinceStart, countForHours, boundForHours, hoursFloor1, formatHoursFloor1, summaryTimeLabel,
 } = VIEW;
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -326,9 +326,19 @@ test("catchup: hours helpers link K, N and since with an injected now (#1524)", 
   assert.equal(countForHours(unread, 2, now), 1);
   assert.equal(countForHours(unread, 3, now), 2);
   assert.deepEqual(boundForHours(unread, 3, now), { count: 2, sinceMs: now - 3 * 3_600_000, hours: 3 });
-  // Past the oldest unread clamps to all unread and to the oldest start.
-  assert.deepEqual(boundForHours(unread, 99, now), { count: 3, sinceMs: unread[0].at_ms, hours: 6 });
-  assert.deepEqual(boundForHours([], 4, now), { count: 0, sinceMs: null, hours: 1 });
+  // `#1817`: K past the oldest is kept exactly as typed (no 99 cap, no
+  // restating to the oldest); the count simply covers everything in range.
+  assert.deepEqual(boundForHours(unread, 99, now), { count: 3, sinceMs: now - 99 * 3_600_000, hours: 99 });
+  assert.deepEqual(boundForHours(unread, 150, now), { count: 3, sinceMs: now - 150 * 3_600_000, hours: 150 });
+  assert.deepEqual(boundForHours([], 4, now), { count: 0, sinceMs: null, hours: 4 });
+  // `#1817`: a window covering no unread is valid and accepted (count 0),
+  // and fractional hours are used as typed.
+  assert.deepEqual(boundForHours(unread, 0.1, now), { count: 0, sinceMs: now - 0.1 * 3_600_000, hours: 0.1 });
+  assert.equal(countForHours(unread, 2.5, now), 2);
+  // `#1817`: the dependent hours floor to one decimal (6.81 -> 6.8).
+  assert.equal(hoursFloor1(now - 6.81 * 3_600_000, now), 6.8);
+  assert.equal(formatHoursFloor1(now - 6.81 * 3_600_000, now), "6.8");
+  assert.equal(formatHoursFloor1(unread[0].at_ms, now), "5.5");
 });
 
 test("catchup: the hours end moves together with N and since (#1524)", async () => {
@@ -348,7 +358,7 @@ test("catchup: the hours end moves together with N and since (#1524)", async () 
     const hours = fx.els["discuss-hours"];
     const since = fx.els["discuss-since"];
     assert.equal(count.value, "3");
-    assert.equal(hours.value, "6", "all unread did not show ceil hours to the oldest");
+    assert.equal(hours.value, "5.5", "all unread did not show floor-1-decimal hours to the oldest");
     assert.equal(since.value, "06:30");
     // Editing K moves the start to now-K, and N and HH:MM follow.
     hours.value = "3";
@@ -356,24 +366,68 @@ test("catchup: the hours end moves together with N and since (#1524)", async () 
     assert.equal(count.value, "2");
     assert.equal(since.value, "09:00");
     assert.equal(hours.value, "3", "editing K rewrote K to another value");
-    // Editing N updates K (rounded up from that message to now).
+    // Editing N updates K (floored to one decimal from that message to now).
     count.value = "1";
     fireInput(count);
-    assert.equal(hours.value, "1");
+    assert.equal(hours.value, "0.5");
     assert.equal(since.value, "11:30");
     // Editing HH:MM updates K.
     since.value = "06:30";
     fireInput(since);
     assert.equal(count.value, "3");
-    assert.equal(hours.value, "6");
-    // K past the oldest clamps to all unread.
+    assert.equal(hours.value, "5.5");
+    // `#1817`: K past the oldest is kept as typed, not clamped or restated.
     hours.value = "99";
     fireInput(hours);
     assert.equal(count.value, "3");
-    assert.equal(hours.value, "6");
+    assert.equal(hours.value, "99");
     click(fx.els["discuss-summarize"]);
     await flush();
-    assert.equal(fx.calls.posts.at(-1).body.since_ms, unread[0].at_ms);
+    assert.equal(fx.calls.posts.at(-1).body.since_ms, now - 99 * 3_600_000);
+  } finally { fx.restore(); }
+});
+
+test("catchup: typing the bound is free — no clamp, snap or rewrite (#1817)", async () => {
+  const now = new Date(2026, 8, 20, 12, 0).getTime();
+  const unread = [
+    { id: "a", at_ms: now - (5 * 60 + 30) * 60_000, label: "06:30 · A" },
+    { id: "b", at_ms: now - (2 * 60 + 15) * 60_000, label: "09:45 · B" },
+    { id: "c", at_ms: now - 30 * 60_000, label: "11:30 · C" },
+  ];
+  const fx = fixture({ nowMs: now, previewBody: { window: { count: 12, unread_count: 3 }, unread } });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const count = fx.els["discuss-count"];
+    const hours = fx.els["discuss-hours"];
+    // Typing "1" gives 1 (the old feedback loop rewrote it to 2).
+    hours.value = "1";
+    fireInput(hours);
+    assert.equal(hours.value, "1", "typing 1 in hours was rewritten");
+    assert.equal(count.value, "1", "the count did not follow the typed hour");
+    // Typing past every cap gives the typed value: no 99 cap.
+    hours.value = "150";
+    fireInput(hours);
+    assert.equal(hours.value, "150", "typing 150 in hours was capped");
+    assert.equal(count.value, "3");
+    // Typing a count beyond the held unread keeps the typed count; the
+    // dependent hours floor to one decimal from the oldest in the bound.
+    count.value = "150";
+    fireInput(count);
+    assert.equal(count.value, "150", "typing 150 in count was capped");
+    assert.equal(hours.value, "5.5", "dependent hours were not floored to one decimal");
+    // Hours covering no messages are accepted: the field keeps the typed
+    // value, the count follows as 0, and Summarize offers nothing.
+    hours.value = "0.1";
+    fireInput(hours);
+    assert.equal(hours.value, "0.1", "empty-range hours were snapped away");
+    assert.equal(count.value, "0", "the count did not follow empty-range hours");
+    assert.equal(fx.els["discuss-summarize"].disabled, true, "Summarize stayed live over an empty bound");
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.deepEqual(fx.calls.posts, [], "Summarize posted over an empty bound");
   } finally { fx.restore(); }
 });
 
@@ -394,7 +448,8 @@ test("catchup: a thread preview polls while older pages fetch, and the count cap
     await flush();
     assert.equal(fx.calls.previews.length, 3, "the preview did not poll the fetch");
     assert.equal(fx.els["discuss-status"].textContent, "2 unread ready.");
-    assert.equal(fx.els["discuss-count"].max, "211", "the count caps at the preview page, not the thread");
+    // `#1817`: the count no longer carries a cap; typing is free.
+    assert.ok(!fx.els["discuss-count"].max, "the count still carries a max cap");
   } finally { fx.restore(); }
 });
 
