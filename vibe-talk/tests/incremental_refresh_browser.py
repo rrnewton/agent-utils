@@ -328,13 +328,19 @@ def main() -> int:
             server, thread_, url = serve(api, web_root)
             try:
                 with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-incremental-") as profile:
-                    context = playwright.chromium.launch_persistent_context(
-                        profile, headless=True, executable_path=args.browser_executable,
-                        viewport={"width": width, "height": height}, color_scheme="dark",
-                        **({"user_agent": ("Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 "
-                                           "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"),
-                            "device_scale_factor": 2.625, "is_mobile": True, "has_touch": True} if phone else {}),
-                    )
+                    if phone:
+                        context = playwright.chromium.launch_persistent_context(
+                            profile, headless=True, executable_path=args.browser_executable,
+                            viewport={"width": width, "height": height}, color_scheme="dark",
+                            user_agent=("Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 "
+                                        "(KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"),
+                            device_scale_factor=2.625, is_mobile=True, has_touch=True,
+                        )
+                    else:
+                        context = playwright.chromium.launch_persistent_context(
+                            profile, headless=True, executable_path=args.browser_executable,
+                            viewport={"width": width, "height": height}, color_scheme="dark",
+                        )
                     page = context.pages[0]
                     errors: list[str] = []
                     page.on("pageerror", lambda error: errors.append(str(error)))

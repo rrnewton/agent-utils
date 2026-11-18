@@ -6352,6 +6352,26 @@ const TUNING_BANDS = {
     "four, subpixel rounding can make the note and first pill touch and read as one element " +
     "even when their boxes do not overlap; past a couple of dozen, the spare room itself uses " +
     "enough of a 360px line that strips with plainly visible room are put back on their own row"],
+  // `#1846 vibe-talk-windowed-rendering`. The render window beside the viewport and its row
+  // caps (Q1/Q2 approved starting values): under a screenful of prefetch a fast flick lands on
+  // unmounted rows; caps far above these mount the list the issue exists to stop mounting.
+  RENDER_PREFETCH_PHONE_PX: [600, 4000, "phone prefetch beside the viewport, px per side"],
+  RENDER_PREFETCH_DESKTOP_PX: [800, 6000, "desktop prefetch beside the viewport, px per side"],
+  RENDER_CAP_PHONE: [20, 200, "mounted rows per list on a phone"],
+  RENDER_CAP_DESKTOP: [20, 300, "mounted rows per list on a desk"],
+  SCROLL_MOUNT_BUDGET: [5, 100, "rows one screenful of scrolling may mount (budget M)"],
+  DATA_REACH_PHONE: [50, 2000, "messages held as data on a phone"],
+  DATA_REACH_DESKTOP: [500, 20000, "messages held as data on a desk"],
+  DATA_BYTES_PER_MESSAGE: [256, 8192, "planning bytes per cached message"],
+  MIN_DATA_REACH_BACK: [0, 0, "the least kept reach-back (0 = device default)"],
+  MAX_DATA_REACH_BACK: [1000, 100000, "the most kept reach-back"],
+  DEFAULT_DATA_REACH_BACK: [0, 0, "kept reach-back meaning device default"],
+  MIN_RENDER_PREFETCH_PX: [0, 0, "the least kept prefetch (0 = device default)"],
+  MAX_RENDER_PREFETCH_PX: [1000, 20000, "the most kept prefetch, px"],
+  DEFAULT_RENDER_PREFETCH_PX: [0, 0, "kept prefetch meaning device default"],
+  MIN_RENDER_ROW_CAP: [0, 0, "the least kept row cap (0 = device default)"],
+  MAX_RENDER_ROW_CAP: [50, 2000, "the most kept row cap"],
+  DEFAULT_RENDER_ROW_CAP: [0, 0, "kept row cap meaning device default"],
 };
 
 /** The fold control on a rendered message, or undefined when it has none. */
