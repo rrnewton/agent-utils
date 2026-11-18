@@ -214,6 +214,8 @@ def toast_walk(desk: Desk) -> None:
     page = desk.page
     page.evaluate("""() => {
         document.getElementById('status').textContent = 'Agent voice on.';
+        // An action notice, as `setStatus` marks it (`#1859`): not the idle wait.
+        document.getElementById('status-line').removeAttribute('data-idle');
         document.getElementById('status-line').hidden = false;
     }""")
     desk.wait_for("() => !document.getElementById('status-line').hidden"

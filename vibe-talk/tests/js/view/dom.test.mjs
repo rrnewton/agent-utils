@@ -129,7 +129,7 @@ function elements() {
   return (id) => {
     if (!made.has(id)) {
       const attrs = new Map();
-      made.set(id, { id, hidden: true, textContent: "", setAttribute: (name, value) => attrs.set(name, value), getAttribute: (name) => attrs.get(name) ?? null });
+      made.set(id, { id, hidden: true, textContent: "", setAttribute: (name, value) => attrs.set(name, value), getAttribute: (name) => attrs.get(name) ?? null, removeAttribute: (name) => attrs.delete(name) });
     }
     return made.get(id);
   };

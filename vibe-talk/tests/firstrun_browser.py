@@ -175,8 +175,10 @@ def walk_fresh(context: BrowserContext, url: str, shots: Path | None, where: str
     shot(page, shots, f"{where}-{scheme}-02-welcome-after")
     dismiss(page, where)
     # `#1837`: back on the Channel the pill draws again when there is something to say.
+    # `#1859`: an idle "Ready." waits instead; an action saying draws.
     page.evaluate("""() => {
-        document.getElementById('status').textContent = 'Ready.';
+        document.getElementById('status').textContent = 'fetching the channel…';
+        document.getElementById('status-line').removeAttribute('data-idle');
         document.getElementById('status-line').hidden = false;
     }""")
     page.wait_for_function(

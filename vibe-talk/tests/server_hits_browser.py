@@ -270,6 +270,7 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
         page.evaluate("""() => {
             document.getElementById('status').textContent =
                 '1 message marked as dealt with here — not in the source chat service.';
+            document.getElementById('status-line').removeAttribute('data-idle');
             document.getElementById('status-line').hidden = false;
         }""")
         walk.until("() => { const t = document.getElementById('status-line');"
@@ -310,6 +311,7 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
         page.evaluate("""() => {
             const status = document.getElementById('status');
             status.textContent = 'fetching the channel…';
+            document.getElementById('status-line').removeAttribute('data-idle');
             document.getElementById('status-line').hidden = false;
         }""")
         walk.until("() => document.getElementById('status').textContent === 'fetching the channel…'",
@@ -439,6 +441,7 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
         document.getElementById('server-line').scrollIntoView({block: 'end'});
         document.getElementById('status').textContent =
             '1 message marked as dealt with here \u2014 not in the source chat service.';
+        document.getElementById('status-line').removeAttribute('data-idle');
         document.getElementById('status-line').hidden = false;
     }""")
     walk.settled()
