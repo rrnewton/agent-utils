@@ -66,6 +66,16 @@ pub async fn log_requests(State(state): State<AppState>, request: Request, next:
         response.status().as_u16(),
         started.elapsed().as_millis(),
     );
+    // `#1848`: the per-route refusal watch counts the same answer, beside
+    // its log line, for every `/api/` request (door refusals included).
+    if private_response {
+        state.route_health.record(
+            &method,
+            &path,
+            response.status().as_u16(),
+            crate::store::now_ms(),
+        );
+    }
     // `#611 timeline-read-failures`. Once per request, beside its access line: why it failed.
     if response.status().is_server_error() {
         access::server_error(

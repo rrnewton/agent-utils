@@ -843,6 +843,37 @@ fn health_body(state: &AppState) -> serde_json::Value {
     // Unauthenticated on purpose: overall + headline only (no per-kind detail), so a deploy
     // watch on loopback can grep summariser health without a token. `#1564`.
     let health = crate::diagnostics::summarizer_health(state);
+    // `#1848`: the refusal watch's standing: the busiest routes' counts (ids
+    // already folded out of their keys) and the last closed window's alerts.
+    let routes: Vec<serde_json::Value> = state
+        .route_health
+        .snapshot()
+        .into_iter()
+        .take(20)
+        .map(|counts| {
+            serde_json::json!({
+                "route": counts.route,
+                "total": counts.total,
+                "client_errors": counts.client_errors,
+                "server_errors": counts.server_errors,
+                "last_status": counts.last_status,
+            })
+        })
+        .collect();
+    let alerts: Vec<serde_json::Value> = state
+        .route_health
+        .alerts()
+        .into_iter()
+        .map(|alert| {
+            serde_json::json!({
+                "route": alert.route,
+                "total": alert.total,
+                "client_errors": alert.client_errors,
+                "server_errors": alert.server_errors,
+                "dominant_status": alert.dominant_status,
+            })
+        })
+        .collect();
     serde_json::json!({
         "status": phase.status(),
         "service": "vibe-talk",
@@ -851,6 +882,10 @@ fn health_body(state: &AppState) -> serde_json::Value {
         "summarizer": {
             "overall": health.overall,
             "headline": health.headline,
+        },
+        "route_health": {
+            "routes": routes,
+            "alerts": alerts,
         },
     })
 }

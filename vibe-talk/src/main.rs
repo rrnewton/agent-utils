@@ -1133,6 +1133,28 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     tokio::spawn(vibe_talk::service_health::run(state.clone()));
+    // `#1848`: close the refusal watch's window when it runs out and raise
+    // each all-refused route as an ERROR line, beside its standing in the
+    // health answer, for the coordinator's tick to pick up.
+    {
+        let health = Arc::clone(&state.route_health);
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                every.tick().await;
+                for alert in health.evaluate(vibe_talk::store::now_ms()) {
+                    tracing::error!(
+                        route = %alert.route,
+                        total = alert.total,
+                        client_errors = alert.client_errors,
+                        server_errors = alert.server_errors,
+                        dominant_status = alert.dominant_status,
+                        "route health: every request to this route was refused for a whole window"
+                    );
+                }
+            }
+        });
+    }
     let tail_state = state.clone();
     let app = vibe_talk::http::router(state);
 

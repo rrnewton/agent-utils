@@ -168,7 +168,10 @@ impl RouteHealth {
     /// The last finished window's alerts.
     #[must_use]
     pub fn alerts(&self) -> Vec<RouteAlert> {
-        self.last_alerts.lock().expect("route health alerts").clone()
+        self.last_alerts
+            .lock()
+            .expect("route health alerts")
+            .clone()
     }
 }
 
@@ -189,17 +192,17 @@ fn is_id_segment(segment: &str) -> bool {
 /// The counting key of one request: method plus folded path.
 #[must_use]
 pub fn route_key(method: &str, path: &str) -> String {
-    let mut key = String::with_capacity(method.len() + path.len() + 8);
-    key.push_str(method);
-    for segment in path.split('/') {
-        key.push('/');
-        key.push_str(if is_id_segment(segment) {
-            "{id}"
-        } else {
-            segment
-        });
-    }
-    key
+    let folded: Vec<&str> = path
+        .split('/')
+        .map(|segment| {
+            if is_id_segment(segment) {
+                "{id}"
+            } else {
+                segment
+            }
+        })
+        .collect();
+    format!("{method} {}", folded.join("/"))
 }
 
 #[cfg(test)]
@@ -238,7 +241,12 @@ mod tests {
     #[test]
     fn a_route_with_any_success_or_too_few_requests_never_alerts() {
         let health = RouteHealth::new();
-        record_all(&health, "GET", "/api/v1/channels", &[200, 404, 404, 404, 404, 404]);
+        record_all(
+            &health,
+            "GET",
+            "/api/v1/channels",
+            &[200, 404, 404, 404, 404, 404],
+        );
         record_all(&health, "POST", "/api/v1/channels/{id}/reply", &[500; 4]);
         assert!(health.evaluate(1_000 + WINDOW_MS).is_empty());
     }

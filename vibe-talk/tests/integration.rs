@@ -46,6 +46,9 @@ mod cache_source;
 #[path = "catchup.rs"]
 mod catchup;
 
+#[path = "route_health.rs"]
+mod route_health;
+
 #[path = "channel_heads.rs"]
 mod channel_heads;
 
