@@ -112,22 +112,21 @@
 
 /* `#1840 vibe-talk-draft-sync-across-devices`: Save draft stands over the
    box's top corner, out of the layout, so the composer keeps exactly the
-   height it always had. The box's cell is the positioning parent. */
-.composer-box-wrap {
+   height it always had. While the continue offer stands over the box, the
+   chip waits: the offer has the reader's eye. */
+#channel-composer {
   position: relative;
-}
-
-.composer-box-wrap > .newline-key {
-  position: absolute;
-  bottom: 0.35rem;
-  inset-inline-end: 0.35rem;
 }
 
 #channel-save-draft {
   position: absolute;
-  top: 0.4rem;
-  inset-inline-end: 0.4rem;
+  top: 1.4rem;
+  inset-inline-end: 1.15rem;
   z-index: 1;
+}
+
+#channel-composer:has(> #draft-sync-offer:not([hidden])) #channel-save-draft {
+  display: none;
 }
 
 .composer-actions > button {
