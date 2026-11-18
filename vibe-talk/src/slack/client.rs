@@ -461,6 +461,14 @@ impl HttpSlackClient {
                 Outcome::Limited(retry_after) => {
                     self.count(|tally, now| tally.limited(method, priority, now));
                     self.note_limited(method, retry_after);
+                    // `#1847 vibe-talk-slack-communication-audit`: teach the
+                    // learned ceiling this method's limit was actually hit at.
+                    if let Some(configured) = self.calls_per_minute.get(method).copied() {
+                        self.sent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .note_limited(method, configured, tokio::time::Instant::now());
+                    }
                     // The provider is limiting now: a read that makes one try meanwhile gives up
                     // here rather than waiting out the `Retry-After` and being paused after it.
                     let one_try = super::budget::gives_way(method)
@@ -600,8 +608,10 @@ impl HttpSlackClient {
                     .sent
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match ceiling.and_then(|ceiling| sent.ceiling_wait(method, priority, ceiling, now))
-                {
+                match ceiling.and_then(|configured| {
+                    let effective = sent.effective_ceiling(method, configured, priority, now);
+                    sent.ceiling_wait(method, priority, effective, now)
+                }) {
                     Some(wait) => wait,
                     None if !sent.admits(method, priority, now) => {
                         return Some(refusal(*waited, Duration::ZERO));
@@ -1639,76 +1649,80 @@ impl ChatClient for HttpSlackClient {
     /// `auth.test` reports only when no display name can be had. A handle may be a number, which
     /// names nobody to a reader. `#325 provider-diagnostics-ids`.
     async fn identity(&self) -> Result<ChatIdentity, ChatError> {
-        async {
-            let value = self.call("auth.test", &[]).await?;
-            let id = value
-                .get("user_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| shape("auth.test answer has no string \"user_id\" field"))?;
-            self.learn_self(id);
-            // `#408 copy-upstream-link`: `auth.test` also reports the workspace's own address,
-            // which is where a message's permalink lives. Learned only where the configuration
-            // did not say one — the operator's word stands over the provider's — and only when
-            // it is a Slack host: whatever answers at the API base does not get to name the host
-            // of every link a reader copies. A bridge whose permalinks live elsewhere says so in
-            // the configuration (`workspace_url`), which is the operator's word to give.
-            if let Some(reported) = value
-                .get("url")
-                .and_then(Value::as_str)
-                .filter(|url| ids::is_slack_link(url))
-                .and_then(crate::upstream_url::workspace_origin)
-            {
-                let mut slot = self
-                    .workspace_url
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if slot.is_none() {
-                    *slot = Some(reported);
-                }
-            }
-            // The team id a message's address in Slack's app names (`#481
-            // slack-app-deep-link`), held as the workspace's origin is: learned once, only
-            // ever read back to form an address, and only in Slack's own shape.
-            if let Some(team) = value
-                .get("team_id")
-                .and_then(Value::as_str)
-                .filter(|team| ids::is_team_id(team))
-            {
-                let mut slot = self
-                    .team_id
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if slot.is_none() {
-                    *slot = Some(team.to_owned());
-                }
-            }
-            let handle = value
-                .get("user")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|handle| !handle.is_empty())
-                .unwrap_or("(no username)");
-            let username = match self.user(id).await {
-                Some((name, _)) => name,
-                None => handle.to_owned(),
-            };
-            Ok::<_, ChatError>(ChatIdentity {
-                id: id.to_owned(),
-                username,
-                // A blank team id is no workspace at all: one user id can then not be told
-                // apart across workspaces, and saying `Some("")` would pretend it could.
-                workspace: value
-                    .get("team_id")
+        // `#1847 vibe-talk-slack-communication-audit`: tag the token's own
+        // account lookup, so its `auth.test` and `users.info` tally as
+        // `identity`, not `untagged`.
+        crate::read_reason::ReadReason::Identity
+            .scope(async {
+                let value = self.call("auth.test", &[]).await?;
+                let id = value
+                    .get("user_id")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|team| !team.is_empty())
-                    .map(str::to_owned),
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| shape("auth.test answer has no string \"user_id\" field"))?;
+                self.learn_self(id);
+                // `#408 copy-upstream-link`: `auth.test` also reports the workspace's own address,
+                // which is where a message's permalink lives. Learned only where the configuration
+                // did not say one — the operator's word stands over the provider's — and only when
+                // it is a Slack host: whatever answers at the API base does not get to name the host
+                // of every link a reader copies. A bridge whose permalinks live elsewhere says so in
+                // the configuration (`workspace_url`), which is the operator's word to give.
+                if let Some(reported) = value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|url| ids::is_slack_link(url))
+                    .and_then(crate::upstream_url::workspace_origin)
+                {
+                    let mut slot = self
+                        .workspace_url
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.is_none() {
+                        *slot = Some(reported);
+                    }
+                }
+                // The team id a message's address in Slack's app names (`#481
+                // slack-app-deep-link`), held as the workspace's origin is: learned once, only
+                // ever read back to form an address, and only in Slack's own shape.
+                if let Some(team) = value
+                    .get("team_id")
+                    .and_then(Value::as_str)
+                    .filter(|team| ids::is_team_id(team))
+                {
+                    let mut slot = self
+                        .team_id
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.is_none() {
+                        *slot = Some(team.to_owned());
+                    }
+                }
+                let handle = value
+                    .get("user")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|handle| !handle.is_empty())
+                    .unwrap_or("(no username)");
+                let username = match self.user(id).await {
+                    Some((name, _)) => name,
+                    None => handle.to_owned(),
+                };
+                Ok::<_, ChatError>(ChatIdentity {
+                    id: id.to_owned(),
+                    username,
+                    // A blank team id is no workspace at all: one user id can then not be told
+                    // apart across workspaces, and saying `Some("")` would pretend it could.
+                    workspace: value
+                        .get("team_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|team| !team.is_empty())
+                        .map(str::to_owned),
+                })
             })
-        }
-        .await
-        .map_err(|error| error.with_provider(&self.provider_name))
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
     }
 
     async fn fetch_page(

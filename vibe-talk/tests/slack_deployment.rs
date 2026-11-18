@@ -349,3 +349,157 @@ async fn a_slack_message_nobody_has_answered_can_have_its_thread_started_from_th
     assert_eq!(sent["posted"]["thread"]["is_root"], false);
     assert_eq!(sent["posted"]["thread"]["root_message_id"], message["id"]);
 }
+
+/// `#1847 vibe-talk-slack-communication-audit`: a page send reaches Slack only
+/// through this server. The page's exact request (`POST .../reply`) is answered
+/// by the real router, and the fake upstream — the only Slack in this test —
+/// sees exactly one `chat.postMessage`, sent by the server with the channel and
+/// text the page gave it. A direct client send path would post to Slack without
+/// this server call and could not produce this upstream record.
+#[tokio::test]
+async fn a_page_send_reaches_slack_only_through_the_server() {
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake).await;
+
+    let (status, sent) = call(
+        &state,
+        "POST",
+        &format!("/api/v1/channels/{TEAM}/reply"),
+        Some(json!({"text": "hello through the server"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    let posts = fake.requests("chat.postMessage");
+    assert_eq!(
+        posts.len(),
+        1,
+        "the server must post exactly once: {posts:?}"
+    );
+    assert_eq!(posts[0]["channel"], TEAM);
+    assert_eq!(posts[0]["text"], "hello through the server");
+    assert_eq!(fake.calls("chat.postMessage"), 1);
+}
+
+/// `#1847 vibe-talk-slack-communication-audit`: a rate-limited Slack upstream
+/// does not block page reads. After a first read fills this server's copy, the
+/// fake is set to rate-limit every further `conversations.history`; the same
+/// timeline read, client-config and the Discuss preview are still answered
+/// from the server's copy, and the upstream call count does not grow — the
+/// reads never waited on Slack. Assertions are on the answers and the call
+/// count, never on elapsed time.
+#[tokio::test]
+async fn a_rate_limited_slack_does_not_block_page_reads() {
+    let fake = Fake::start(fixture(), 20).await;
+    let dir = vibe_talk::testing::TempDir::new("slack-audit-lag");
+    // An hour after the fake's base, so the cache's clock does not age the
+    // fixture's messages out (`slack_fake::ts` is `BASE_SECS + seconds`).
+    let clock = vibe_talk::testing::ManualClock::at((slack_fake::BASE_SECS + 3_600) * 1_000);
+    let state =
+        vibe_talk::testing::with_message_cache(deployment(&fake).await, dir.path(), clock).await;
+    // Serve on, as a cache-first deployment runs: the cache answers reads.
+    state.message_cache.set_serve(true);
+
+    let (status, first) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{TEAM}/timeline?view=main&reason=enter"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(
+        first["messages"].as_array().map(Vec::len),
+        Some(2),
+        "{first}"
+    );
+    // The priming read fills the server's copy behind its answer; wait until
+    // the cache writer has caught up (a condition, not a delay).
+    if let Some(cache) = state.message_cache.cache() {
+        assert!(
+            cache.quiesce_blocking(std::time::Duration::from_secs(20)),
+            "the cache writer caught up"
+        );
+        assert_eq!(
+            cache.counts().served().expect("counts").messages,
+            2,
+            "the priming read must fill the cache"
+        );
+    }
+    let history_calls = fake.calls("conversations.history");
+    assert!(history_calls > 0, "the priming read must reach the fake");
+    // (The read behind a cached answer is the server's own scheduled refresh:
+    // at most one in its period, however often the page reads.)
+
+    fake.with(|state| {
+        state
+            .rate_limit_many
+            .insert("conversations.history".to_owned(), (60, usize::MAX));
+        state
+            .rate_limit_many
+            .insert("conversations.replies".to_owned(), (60, usize::MAX));
+    });
+
+    let (status, page) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{TEAM}/timeline?view=main&reason=enter"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let contents: Vec<&str> = page["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .map(|message| message["content"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        contents,
+        ["first", "second [link](https://example.com)"],
+        "{page}"
+    );
+    // A second limited read answers the same way, and page reads send nothing
+    // themselves: at most the one already-scheduled refresh may have tried.
+    let (status, page) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{TEAM}/timeline?view=main&reason=poll"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(
+        fake.calls("conversations.history") <= history_calls + 1,
+        "page reads sent Slack calls: {} after priming at {history_calls}",
+        fake.calls("conversations.history")
+    );
+
+    let (status, config) = call(&state, "GET", "/api/v1/client-config", None).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["chat_provider_name"], "Slack");
+
+    // A send still goes through while reads are limited: writes are never
+    // held to the ceiling refresh work taught down.
+    let (status, sent) = call(
+        &state,
+        "POST",
+        &format!("/api/v1/channels/{TEAM}/reply"),
+        Some(json!({"text": "still sending while limited"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(fake.calls("chat.postMessage"), 1);
+
+    let (status, preview) = call(
+        &state,
+        "GET",
+        &format!("/api/v1/channels/{TEAM}/catchup/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert!(
+        fake.calls("conversations.history") <= history_calls + 1,
+        "client-config and Discuss reads sent Slack calls"
+    );
+}

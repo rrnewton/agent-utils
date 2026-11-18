@@ -1304,6 +1304,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1847 vibe-talk-slack-communication-audit`: the page only talks to its own
+  # server — every request recorded in Chromium against the real server binary.
+  - group: check
+    job: slack-origin-browser
+    desc: the page contacts only its own server origin (no Slack host) while reading and sending, against the real server in current Chromium
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/slack_origin_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # Discuss (`catchup-side-agent`, slice 1): the panel opens, reads, marks and jumps.
   - group: check
     job: discuss-browser

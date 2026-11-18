@@ -192,6 +192,21 @@ test("the script is strict throughout, declares every entry source's top-level n
   assert.ok(text(STYLE_PATH).endsWith(`/*# sourceMappingURL=${MANIFEST.assets.style.map} */\n`));
 });
 
+test("`#1847 vibe-talk-slack-communication-audit`: the built page holds no Slack API endpoint", () => {
+  // The page must never contact Slack directly: every chat request goes to this
+  // server, which alone holds the token. A Slack API host in the bundle would
+  // be a direct-contact path. Workspace permalink hosts (`*.slack.com/archives/`)
+  // are navigation links the server hands the page for "Open in Slack" and are
+  // never fetched; the API endpoints below are the contact surface.
+  const forbidden = ["slack.com/api", "api.slack.com", "hooks.slack.com"];
+  for (const path of [SCRIPT_PATH, STYLE_PATH, "voice.html", "voice.js", "contract.js"]) {
+    const body = text(path);
+    for (const host of forbidden) {
+      assert.ok(!body.includes(host), `${path} holds the Slack API endpoint ${host}`);
+    }
+  }
+});
+
 test("an error the page throws is reported at the line of its source it was thrown from", async () => {
   // Run with no browser at all, the unminified prelude and entry part and the page build's
   // script stop on the same missing global, at the same statement: each stack, mapped back

@@ -389,10 +389,20 @@ pub const FLAT_PAGE_UPSTREAM_THREADS: usize = 3;
 /// The page cap stays below the whole cap, or it would cap nothing.
 const _: () = assert!(FLAT_PAGE_UPSTREAM_THREADS < FLAT_UPSTREAM_THREADS);
 
+/// How many threads one Flat read for the cache-first background refresh
+/// (`refresh`) may read upstream that cost a call. `#1847
+/// vibe-talk-slack-communication-audit`: the live tally showed one refresh
+/// spending the whole configured `conversations.replies` ceiling (20/min);
+/// a refresh is answered-from-cache work nobody is waiting on, so it reads the
+/// most recently active few (roots are sorted that way in `flat`) and leaves
+/// the rest for the next pass, which the incremental skip-list makes cheap.
+pub const FLAT_REFRESH_UPSTREAM_THREADS: usize = 8;
+
 /// The costly-thread cap of one Flat read made for `reason`.
 pub fn flat_upstream_cap(reason: ReadReason) -> usize {
     match super::budget::Priority::of(reason) {
         super::budget::Priority::Page => FLAT_PAGE_UPSTREAM_THREADS,
+        super::budget::Priority::Refresh => FLAT_REFRESH_UPSTREAM_THREADS,
         _ => FLAT_UPSTREAM_THREADS,
     }
 }
@@ -1982,6 +1992,10 @@ mod tests {
         assert_eq!(
             flat_upstream_cap(ReadReason::Side),
             FLAT_PAGE_UPSTREAM_THREADS
+        );
+        assert_eq!(
+            flat_upstream_cap(ReadReason::Refresh),
+            super::FLAT_REFRESH_UPSTREAM_THREADS
         );
         for reason in [
             ReadReason::Enter,

@@ -151,6 +151,10 @@ pub enum ReadReason {
     /// of live and background work in Slack's shared budget, with a reserved share of each
     /// method's ceiling. `#1715 vibe-talk-refresh-refused-stale-page`.
     Refresh,
+    /// The server: learning the token's own account (`auth.test` and the
+    /// `users.info` that names it). `#1847 vibe-talk-slack-communication-audit`:
+    /// these ran untagged, so the tally could not say what they were for.
+    Identity,
     /// A reason was given, but it is not one the page sends.
     Other,
     /// No reason was given at all.
@@ -158,7 +162,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 32] = [
+pub const ALL: [ReadReason; 33] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -189,6 +193,7 @@ pub const ALL: [ReadReason; 32] = [
     ReadReason::LivePoll,
     ReadReason::Write,
     ReadReason::Refresh,
+    ReadReason::Identity,
     ReadReason::Other,
     ReadReason::Untagged,
 ];
@@ -228,6 +233,7 @@ impl ReadReason {
             Self::LivePoll => "live-poll",
             Self::Write => "write",
             Self::Refresh => "refresh",
+            Self::Identity => "identity",
             Self::Other => "other",
             Self::Untagged => "untagged",
         }
