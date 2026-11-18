@@ -417,6 +417,57 @@ def walk_through(walk: Walk) -> None:
                f"the tapped message jumped: {before and before['y']} -> {after and after['y']}")
     walk.shot("4-chip-filter")
 
+    # 4b. `#1853`: the Labels drop-down — Pinned built in first, labels most
+    # used first, the filter box, single-select through the real routes.
+    page.fill("#search-field", "")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 8",
+               "clearing the search did not bring the channel back")
+    walk.press("#labels-button")
+    walk.until("() => !document.getElementById('labels-panel').hidden", "the Labels panel did not open")
+    walk.check(page.evaluate("() => document.getElementById('labels-button').getAttribute('aria-expanded')") == "true",
+               "the Labels button does not say it is open")
+    option_ids = page.evaluate("() => [...document.querySelectorAll('#labels-listbox .labels-option')].map((li) => li.id)")
+    walk.check(option_ids[:3] == ["labels-option-all", "labels-option-pinned", "labels-option-kvm"],
+               f"the drop-down order says {option_ids}")
+    pinned_count = page.evaluate("() => document.querySelector('#labels-option-pinned .labels-option-count').textContent")
+    walk.check("in this channel" in pinned_count, f"Pinned's count says {pinned_count!r}")
+    kvm_count = page.evaluate("() => document.querySelector('#labels-option-kvm .labels-option-count').textContent")
+    walk.check(kvm_count == "2 in loaded history", f"#kvm's count says {kvm_count!r}")
+    page.fill("#labels-filter-input", "kv")
+    walk.until("() => document.querySelectorAll('#labels-listbox .labels-option').length === 3",
+               "the filter box did not narrow the drop-down")
+    page.fill("#labels-filter-input", "")
+    walk.shot("4b-dropdown")
+    walk.press("#labels-option-perf")
+    walk.until("() => document.getElementById('search-field').value === 'label:perf'",
+               "picking #perf did not filter to it")
+    walk.check(walk.shown() == ["206"], f"label:perf shows {walk.shown()}")
+    walk.check(page.evaluate("() => document.getElementById('labels-button').getAttribute('data-active-label')") == "perf",
+               "the Labels button does not name #perf")
+    # Pinned from the drop-down, then All messages back out of it.
+    walk.press("#labels-button")
+    walk.press("#labels-option-pinned")
+    walk.until("() => document.getElementById('pane-discord').hasAttribute('data-pinned-only')",
+               "picking Pinned did not show the pinned list")
+    walk.press("#labels-button")
+    walk.press("#labels-option-all")
+    walk.until("() => !document.getElementById('pane-discord').hasAttribute('data-pinned-only')",
+               "All messages did not clear the pinned list")
+    # Keyboard alone: Down from the filter box to All, Down again to Pinned,
+    # Enter picks it, Escape closes the panel another time.
+    walk.press("#labels-button")
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("ArrowDown")
+    page.keyboard.press("Enter")
+    walk.until("() => document.getElementById('pane-discord').hasAttribute('data-pinned-only')",
+               "Enter on the first option did not pick Pinned")
+    walk.press("#labels-button")
+    page.keyboard.press("Escape")
+    walk.until("() => document.getElementById('labels-panel').hidden", "Escape did not close the drop-down")
+    walk.press("#labels-button")
+    walk.press("#labels-option-all")
+    page.fill("#search-field", "")
+
     # 5. Settings > Labels: both sort orders, then Combine into a group.
     page.evaluate("() => document.getElementById('open-settings')?.click()")
     # The settings opener's own id varies by build of the walk; fall back to the key.
