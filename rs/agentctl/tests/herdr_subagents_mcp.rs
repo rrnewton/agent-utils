@@ -5,7 +5,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -172,89 +172,267 @@ fn stdio_protocol_matches_python_contract() {
 
 #[test]
 fn websocket_broadcaster_accepts_and_broadcasts_events() {
+    // The verdict is one broadcast frame carrying an appended event
+    // verbatim. Everything before it -- connecting, the handshake, the
+    // frame's arrival -- is retried behind one generous backstop: on a
+    // loaded host the server's threads can be starved past any short
+    // read timeout (the reads used to panic on WouldBlock, and the peer
+    // can reset a starved connection), the free port can be taken
+    // between probing and binding, and the watcher's first offset read
+    // can race the first append and skip it. None of that says anything
+    // about the broadcaster, so each attempt starts over with a fresh
+    // server and port, and appends further events until one is seen.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut last_error = String::new();
+    while Instant::now() < deadline {
+        match websocket_broadcast_attempt(deadline) {
+            Ok(()) => return,
+            // Only transport transients retry. A wrong frame, a wrong
+            // handshake answer, or a failed server exit is the verdict
+            // failing, on the first attempt that produces one.
+            Err(AttemptError::Fatal(error)) => {
+                panic!("the broadcaster failed its verdict: {error}")
+            }
+            Err(AttemptError::Transient(error)) => last_error = error,
+        }
+    }
+    panic!("the broadcaster never broadcast an appended event: {last_error}");
+}
+
+/// How one attempt failed: a transport transient (starved or reset
+/// connection, taken port, skipped append) may retry; anything the
+/// server answered with is a verdict and fails at once.
+enum AttemptError {
+    Transient(String),
+    Fatal(String),
+}
+
+fn transient(error: impl std::fmt::Display) -> AttemptError {
+    AttemptError::Transient(error.to_string())
+}
+
+/// One whole attempt: a fresh server on a fresh port must accept the
+/// handshake and broadcast one of the events appended to its log.
+fn websocket_broadcast_attempt(deadline: Instant) -> Result<(), AttemptError> {
     let base = fake_base("ws");
     let events = base.join("state").join("events.jsonl");
-    std::fs::create_dir_all(events.parent().unwrap()).unwrap();
-    std::fs::write(&events, "").unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    std::fs::create_dir_all(events.parent().unwrap()).map_err(transient)?;
+    std::fs::write(&events, "").map_err(transient)?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(transient)?;
+    let port = listener.local_addr().map_err(transient)?.port();
     drop(listener);
     let mut child: Child = mcp_command(&base, &port.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
-    let _stdin = child.stdin.take().unwrap();
-    let mut stream = connect_within(port, Duration::from_secs(10));
+        .map_err(|error| AttemptError::Transient(format!("spawn: {error}")))?;
+    let stdin = child.stdin.take().unwrap();
+    let result = websocket_broadcast_on(&events, port, deadline);
+    drop(stdin);
+    // The server ends when its stdin does; bound the reap so a server
+    // starved on a loaded host cannot hold the next attempt hostage.
+    if result.is_err() {
+        let _ = child.kill();
+    } else {
+        let exit_deadline = Instant::now() + Duration::from_secs(30);
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < exit_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| AttemptError::Transient(format!("wait: {error}")))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match result {
+        Ok(()) if output.status.success() => Ok(()),
+        Ok(()) => Err(AttemptError::Fatal(format!(
+            "server exited {}: {stderr}",
+            output.status
+        ))),
+        Err(error) => match error {
+            AttemptError::Fatal(message) => Err(AttemptError::Fatal(format!(
+                "{message} (server stderr: {stderr})"
+            ))),
+            AttemptError::Transient(message) => Err(AttemptError::Transient(format!(
+                "{message} (server stderr: {stderr})"
+            ))),
+        },
+    }
+}
+
+fn websocket_broadcast_on(events: &Path, port: u16, deadline: Instant) -> Result<(), AttemptError> {
+    let mut stream = connect_until(port, deadline)?;
     stream
         .write_all(
             b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
         )
-        .unwrap();
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+        .map_err(|error| AttemptError::Transient(format!("handshake write: {error}")))?;
+    let mut reader = BufReader::new(stream.try_clone().map_err(transient)?);
     let mut headers = String::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
     while !headers.ends_with("\r\n\r\n") {
-        assert!(Instant::now() < deadline, "no handshake response");
         let mut byte = [0_u8; 1];
-        reader.read_exact(&mut byte).unwrap();
+        read_exact_retry(&mut reader, &mut byte, deadline)?;
         headers.push(byte[0] as char);
+        if headers.len() > 8192 {
+            return Err(AttemptError::Fatal(format!(
+                "handshake headers run long: {headers:?}"
+            )));
+        }
     }
-    assert!(headers.starts_with("HTTP/1.1 101"), "{headers}");
-    assert!(
-        headers.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
-        "{headers}"
-    );
-    std::fs::write(
-        &events,
-        "{\"id\":\"evt-1\",\"type\":\"up\",\"name\":\"alpha\"}\n",
-    )
-    .unwrap();
-    let payload = read_text_frame(&mut reader, Duration::from_secs(10));
-    let event: Value = serde_json::from_slice(&payload).unwrap();
-    assert_eq!(event, json!({"id": "evt-1", "type": "up", "name": "alpha"}));
-    drop(reader);
-    drop(_stdin);
-    let status = child.wait().unwrap();
-    assert!(status.success());
+    if !headers.starts_with("HTTP/1.1 101")
+        || !headers.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+    {
+        return Err(AttemptError::Fatal(format!(
+            "bad handshake response: {headers}"
+        )));
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(transient)?;
+    // Append events until one is broadcast. The watcher baselines its
+    // offset when it starts, so an event appended before that is
+    // legitimately never sent; later appends are.
+    let mut appended: Vec<String> = Vec::new();
+    let mut buffered: Vec<u8> = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(AttemptError::Transient(
+                "no broadcast frame arrived".to_owned(),
+            ));
+        }
+        let id = format!("evt-{}", appended.len() + 1);
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(events)
+                .map_err(transient)?;
+            use std::io::Write as _;
+            writeln!(
+                file,
+                "{{\"id\":\"{id}\",\"type\":\"up\",\"name\":\"alpha\"}}"
+            )
+            .map_err(transient)?;
+        }
+        appended.push(id);
+        let cycle_end = (Instant::now() + Duration::from_millis(500)).min(deadline);
+        while Instant::now() < cycle_end {
+            if let Some(payload) = poll_frame(&mut reader, &mut buffered)? {
+                let event: Value = serde_json::from_slice(&payload).map_err(transient)?;
+                let id = event["id"].as_str().unwrap_or_default();
+                if appended.iter().any(|sent| sent == id)
+                    && event == json!({"id": id, "type": "up", "name": "alpha"})
+                {
+                    return Ok(());
+                }
+                return Err(AttemptError::Fatal(format!(
+                    "unexpected broadcast frame: {event}"
+                )));
+            }
+        }
+    }
 }
 
-fn connect_within(port: u16, timeout: Duration) -> TcpStream {
-    let deadline = Instant::now() + timeout;
+fn connect_until(port: u16, deadline: Instant) -> Result<TcpStream, AttemptError> {
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
             Ok(stream) => {
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                return stream;
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .map_err(transient)?;
+                return Ok(stream);
             }
             Err(error) => {
-                assert!(Instant::now() < deadline, "cannot connect: {error}");
+                if Instant::now() >= deadline {
+                    return Err(AttemptError::Transient(format!("cannot connect: {error}")));
+                }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
 }
 
-fn read_text_frame(reader: &mut BufReader<TcpStream>, timeout: Duration) -> Vec<u8> {
-    let deadline = Instant::now() + timeout;
-    let mut header = [0_u8; 2];
-    reader.read_exact(&mut header).unwrap();
-    assert_eq!(header[0], 0x81, "expected a final text frame");
-    let mut size = u64::from(header[1] & 0x7f);
-    if size == 126 {
-        let mut extended = [0_u8; 2];
-        reader.read_exact(&mut extended).unwrap();
-        size = u64::from(u16::from_be_bytes(extended));
-    } else if size == 127 {
-        let mut extended = [0_u8; 8];
-        reader.read_exact(&mut extended).unwrap();
-        size = u64::from_be_bytes(extended);
+/// Fill `target` from `reader`, retrying the transient timeouts a
+/// starved peer causes instead of panicking on them.
+fn read_exact_retry(
+    reader: &mut BufReader<TcpStream>,
+    target: &mut [u8],
+    deadline: Instant,
+) -> Result<(), AttemptError> {
+    use std::io::Read as _;
+    let mut filled = 0;
+    while filled < target.len() {
+        match reader.read(&mut target[filled..]) {
+            Ok(0) => return Err(AttemptError::Transient("connection closed".to_owned())),
+            Ok(read) => filled += read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(AttemptError::Transient(format!("read timed out: {error}")));
+                }
+            }
+            Err(error) => return Err(AttemptError::Transient(format!("read: {error}"))),
+        }
     }
-    assert!(Instant::now() < deadline);
-    let mut payload = vec![0_u8; usize::try_from(size).unwrap()];
-    reader.read_exact(&mut payload).unwrap();
-    payload
+    Ok(())
+}
+
+/// One non-blocking poll for a complete text frame in `buffered`,
+/// reading what the socket offers right now into it.
+fn poll_frame(
+    reader: &mut BufReader<TcpStream>,
+    buffered: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>, AttemptError> {
+    use std::io::Read as _;
+    let mut chunk = [0_u8; 4096];
+    match reader.read(&mut chunk) {
+        Ok(0) => return Err(AttemptError::Transient("connection closed".to_owned())),
+        Ok(read) => buffered.extend_from_slice(&chunk[..read]),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+            ) => {}
+        Err(error) => return Err(AttemptError::Transient(format!("read: {error}"))),
+    }
+    if buffered.len() < 2 {
+        return Ok(None);
+    }
+    if buffered[0] != 0x81 {
+        return Err(AttemptError::Fatal(format!(
+            "expected a final text frame, got {:#x}",
+            buffered[0]
+        )));
+    }
+    let mut size = u64::from(buffered[1] & 0x7f);
+    let mut header_len = 2;
+    if size == 126 {
+        if buffered.len() < 4 {
+            return Ok(None);
+        }
+        size = u64::from(u16::from_be_bytes([buffered[2], buffered[3]]));
+        header_len = 4;
+    } else if size == 127 {
+        if buffered.len() < 10 {
+            return Ok(None);
+        }
+        size = u64::from_be_bytes(buffered[2..10].try_into().unwrap());
+        header_len = 10;
+    }
+    let total = header_len + usize::try_from(size).map_err(transient)?;
+    if buffered.len() < total {
+        return Ok(None);
+    }
+    Ok(Some(buffered.drain(..total).skip(header_len).collect()))
 }
