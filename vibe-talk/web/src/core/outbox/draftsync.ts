@@ -204,10 +204,10 @@ export function draftDeviceId(storage: {
   }
 }
 
-/** A coarse device label from a platform string, for the continue offer. */
-export function draftDeviceLabel(platform: string): string {
-  if (/iPhone|Android.*Mobile|Mobile/i.test(platform)) return "phone";
-  if (/iPad|Tablet/i.test(platform)) return "tablet";
+/** A coarse device label from a capability token, for the continue offer. */
+export function draftDeviceLabel(capability: string): string {
+  if (/mobile/i.test(capability)) return "phone";
+  if (/tablet/i.test(capability)) return "tablet";
   return "laptop";
 }
 

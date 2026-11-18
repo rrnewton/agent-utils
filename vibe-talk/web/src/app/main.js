@@ -1607,10 +1607,21 @@ const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom:
  * @type {import("../core/outbox/index.ts").DraftSync}
  */
 const draftSync = createDraftSync({
+  // As the offer is: no draft traffic before the token is proven. A refused
+  // call is kept as pending words and flushed once the page is signed in.
   transport: {
-    getDrafts: (channel) => /** @type {Promise<{drafts: import("../core/outbox/index.ts").SyncedDraft[]}>} */ (api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`)),
-    putDraft: (channel, body) => /** @type {Promise<{draft: import("../core/outbox/index.ts").SyncedDraft | null, replaced: import("../core/outbox/index.ts").SyncedDraft | null}>} */ (api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "PUT", body })),
-    deleteDraft: (channel, body) => api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "DELETE", body }),
+    getDrafts: async (channel) => {
+      if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
+      return api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`);
+    },
+    putDraft: async (channel, body) => {
+      if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
+      return api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "PUT", body });
+    },
+    deleteDraft: async (channel, body) => {
+      if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
+      return api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "DELETE", body });
+    },
   },
   deviceId: () => draftDeviceId(deviceStorageOnUse(), () => globalThis.crypto?.randomUUID?.() ?? `device-${Date.now()}-${Math.random()}`),
   deviceLabel: () => draftDeviceLabel(
@@ -1651,6 +1662,9 @@ let discussDraftKey = /** @type {import("../core/outbox/index.ts").SyncedDraftKe
 /** Fetch the channel's synced drafts and offer the one for `key`, if any. */
 async function offerSyncedDraft(key, box, offerBar, offerText, remember) {
   if (!key.channel) return;
+  // Nothing is read before /client-config has proved the token: a refused
+  // reopen is sign-in's story to tell, and a draft read must not race it.
+  if (!serverFacts.configApplied()) return;
   let drafts;
   try {
     drafts = await draftSync.fetchChannel(key.channel);
