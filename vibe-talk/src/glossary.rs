@@ -534,6 +534,14 @@ mod tests {
     }
 
     #[test]
+    fn tally_breaks_window_ties_deterministically() {
+        let entries = vec![entry("beta", "second."), entry("alpha", "first.")];
+        let ranked = ranked_entries(&entries, "no hits here", &[tally("beta", 3)]);
+        assert_eq!(ranked[0].term, "beta");
+        assert_eq!(ranked, ranked_entries(&entries, "no hits here", &[tally("beta", 3)]));
+    }
+
+    #[test]
     fn selection_respects_the_budget_and_reports_drops() {
         let entries: Vec<GlossaryEntry> = (0..40)
             .map(|i| entry(&format!("term{i:02}"), "a short definition."))
