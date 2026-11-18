@@ -2011,3 +2011,59 @@ test("discussdrop: a fallback tap while full still closes and keeps no partial c
     assert.equal(fx.kept.sheetKeeps.length, sheetKeeps, "the closing tap kept a partial choice");
   } finally { fx.restore(); }
 });
+
+test("discusspersist: open keeps its scope, close keeps closed, a fresh view restores open (#1821)", async () => {
+  const fx = fixture({ selection: THREAD_T1 });
+  try {
+    let keptPanel = null;
+    const keeps = [];
+    const deps = {
+      ...fx.deps,
+      storedPanelState: () => keptPanel,
+      keepPanelState: (state) => { keptPanel = state; keeps.push(state); },
+    };
+    const view = createDiscussView(deps);
+    view.mountControls();
+    assert.equal(view.isOpen(), false, "a fresh view with nothing kept opened");
+    view.open();
+    await flush();
+    assert.equal(view.isOpen(), true);
+    assert.deepEqual(keptPanel, { open: true, channelId: "chan-1", threadId: "t1", view: "flat" },
+      "opening did not keep its thread scope");
+    view.close();
+    assert.deepEqual(keptPanel, { open: false, channelId: "chan-1", threadId: "t1", view: "flat" },
+      "closing did not persist as closed");
+    // Reload with the closed entry: a fresh view over the same store stays closed.
+    const closedFx = fixture({ selection: THREAD_T1 });
+    try {
+      const reloaded = createDiscussView({ ...closedFx.deps, storedPanelState: () => keptPanel, keepPanelState: (s) => { keptPanel = s; } });
+      reloaded.mountControls();
+      reloaded.sync();
+      await flush();
+      assert.equal(reloaded.isOpen(), false, "a kept-closed panel restored open");
+      assert.equal(closedFx.calls.previews.length, 0, "a kept-closed restore read a preview");
+    } finally { closedFx.restore(); }
+    // Reload with the open entry: still open, same scope, no model call.
+    keptPanel = { open: true, channelId: "chan-1", threadId: "t1", view: "flat" };
+    const openFx = fixture({ selection: THREAD_T1 });
+    try {
+      const restored = createDiscussView({ ...openFx.deps, storedPanelState: () => keptPanel, keepPanelState: (s) => { keptPanel = s; } });
+      restored.mountControls();
+      await flush();
+      assert.equal(restored.isOpen(), true, "a kept-open panel did not restore open");
+      assert.equal(restored.boundScope()?.threadId, "t1", "the restored scope lost its thread");
+      assert.deepEqual(openFx.calls.posts, [], "the restore asked the model");
+      assert.equal(openFx.calls.previews.length >= 1, true, "the restore read no preview");
+      // A kept scope on another channel does not force this channel open.
+      keptPanel = { open: true, channelId: "chan-2", threadId: null, view: "flat" };
+      const otherFx = fixture();
+      try {
+        const other = createDiscussView({ ...otherFx.deps, storedPanelState: () => keptPanel, keepPanelState: () => {} });
+        other.mountControls();
+        other.sync();
+        await flush();
+        assert.equal(other.isOpen(), false, "another channel's kept panel forced itself open");
+      } finally { otherFx.restore(); }
+    } finally { openFx.restore(); }
+  } finally { fx.restore(); }
+});

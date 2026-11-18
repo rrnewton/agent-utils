@@ -236,6 +236,9 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
                       body=json.dumps(body))
 
     def open_discuss() -> None:
+        # Already open (restored across a reload, `#1821`): nothing to open.
+        if page.locator("#discuss-panel").is_visible():
+            return
         # Reopen by whichever entry this build shows (`#1470` promotion):
         # the bar icon when promoted, the menu item when not.
         if page.locator("#discuss-open").is_visible():
@@ -726,6 +729,12 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
     open_discuss()
     page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=20_000)
+    # `#1821 vibe-talk-discuss-state-persists`: open stands across a reload
+    # with the same scope, kept on this device; no reopen tap is needed.
+    scope_before = page.locator("#discuss-scope").text_content() or ""
+    page.wait_for_function(
+        "() => { try { return JSON.parse(localStorage.getItem('vibe-talk.voice.discuss-panel') || 'null')?.open === true; } catch (e) { return false; } }",
+        timeout=20_000)
     page.reload(wait_until="load")
     page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
     for _ in range(3):
@@ -738,7 +747,9 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         except Exception:
             continue
     page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
-    open_discuss()
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    check((page.locator("#discuss-scope").text_content() or "") == scope_before,
+          f"the restored scope differs: {scope_before!r} -> {page.locator('#discuss-scope').text_content()!r}")
     page.wait_for_function(f"() => JSON.stringify({folds_open}) === '[false,true]'", timeout=20_000)
     page.wait_for_function(
         "() => !document.getElementById('discuss-summarize').disabled", timeout=20_000)
@@ -947,6 +958,41 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
             && closeRect.top >= panelRect.top && closeRect.bottom <= headRect.bottom + 1;
         }""", timeout=20_000)
     page.evaluate("() => document.getElementById('discuss-test-spacer')?.remove()")
+    page.click("#discuss-close")
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+
+    # `#1821`: closing persists as closed across a reload, then opening
+    # persists as open with the same scope. Condition waits only.
+    page.wait_for_function(
+        "() => { try { return JSON.parse(localStorage.getItem('vibe-talk.voice.discuss-panel') || 'null')?.open === false; } catch (e) { return false; } }",
+        timeout=20_000)
+
+    def to_channel() -> None:
+        page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
+        for _ in range(3):
+            if not page.locator("#discord-channel").is_hidden():
+                break
+            page.click("#view-switch")
+            try:
+                page.wait_for_selector("#discord-channel", state="visible", timeout=5_000)
+                break
+            except Exception:
+                continue
+        page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
+
+    page.reload(wait_until="load")
+    to_channel()
+    check(page.locator("#discuss-panel").is_hidden(), "a kept-closed panel restored open")
+    open_discuss()
+    page.wait_for_function(
+        "() => { try { return JSON.parse(localStorage.getItem('vibe-talk.voice.discuss-panel') || 'null')?.open === true; } catch (e) { return false; } }",
+        timeout=20_000)
+    scope_open = page.locator("#discuss-scope").text_content() or ""
+    page.reload(wait_until="load")
+    to_channel()
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    check((page.locator("#discuss-scope").text_content() or "") == scope_open,
+          "the reopened scope differs after the second reload")
     page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
 

@@ -83,6 +83,15 @@ export interface SteerOffset {
   readonly y: number;
 }
 
+/** `#1821 vibe-talk-discuss-state-persists`. Where Discuss stands on this device: open or
+ * closed, and the conversation it shows (a thread, or the channel in `view`). */
+export interface DiscussPanelState {
+  readonly open: boolean;
+  readonly channelId: string;
+  readonly threadId: string | null;
+  readonly view: "flat" | "main";
+}
+
 /** The device's settings, by name. */
 export const DEVICE_SETTINGS = Object.freeze({
   /** `#543 in-app-message-links`. Whether a link to a message opens it here. */
@@ -249,6 +258,26 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (state: { record: string; open: string[] } | null) => (state === null ? null : JSON.stringify(state)),
     refused: { value: null },
   } satisfies DeviceSetting<{ record: string; open: string[] } | null>,
+  /** `#1821 vibe-talk-discuss-state-persists`. Whether Discuss stands open and the
+   * conversation it shows, so a refresh restores it (and a close stays closed). Per device;
+   * a damaged entry, and a refused read, is no entry (closed). The docked size itself stays
+   * in `discussWidth`, `discussDockedHeight`, `discussSheetFull` and `discussMode`. */
+  discussPanel: {
+    key: "vibe-talk.voice.discuss-panel",
+    read: (raw: string | null): DiscussPanelState | null => {
+      try {
+        const held = JSON.parse(raw || "null") as { open?: unknown; channelId?: unknown; threadId?: unknown; view?: unknown } | null;
+        if (!held || typeof held.open !== "boolean" || typeof held.channelId !== "string"
+          || !(held.threadId === null || typeof held.threadId === "string")
+          || (held.view !== "flat" && held.view !== "main")) return null;
+        return { open: held.open, channelId: held.channelId, threadId: held.threadId as string | null, view: held.view };
+      } catch {
+        return null;
+      }
+    },
+    write: (state: DiscussPanelState | null) => (state === null ? null : JSON.stringify(state)),
+    refused: { value: null },
+  } satisfies DeviceSetting<DiscussPanelState | null>,
   /** `#425 collapsed-lines`. The lines a fold shows, clamped. Synced. */
   collapsedLines: {
     key: "vibe-talk.voice.collapsed-lines",

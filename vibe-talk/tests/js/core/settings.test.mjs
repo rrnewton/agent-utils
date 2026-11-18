@@ -150,6 +150,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["discussMode", "vibe-talk.voice.discuss-mode", "overlay", [["docked", "docked"], ["maximized", "maximized"], ["overlay", "overlay"]], "overlay"],
     ["discussDockedHeight", "vibe-talk.voice.discuss-docked-height", 50, [[65, "65"], [20, "20"]], 50],
     ["discussFolds", "vibe-talk.voice.discuss-folds", null, [[{ record: "chan-1||1700000000000", open: ["Beta"] }, "{\"record\":\"chan-1||1700000000000\",\"open\":[\"Beta\"]}"], [null, null]], null],
+    ["discussPanel", "vibe-talk.voice.discuss-panel", null, [[{ open: true, channelId: "chan-1", threadId: null, view: "flat" }, "{\"open\":true,\"channelId\":\"chan-1\",\"threadId\":null,\"view\":\"flat\"}"], [{ open: false, channelId: "chan-1", threadId: "t9", view: "main" }, "{\"open\":false,\"channelId\":\"chan-1\",\"threadId\":\"t9\",\"view\":\"main\"}"], [null, null]], null],
   ];
   const refused = () => { throw new Error("SecurityError"); };
   const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
@@ -172,6 +173,10 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
   const stray = createDeviceSettings({ getItem: () => "{nonsense", setItem: () => {}, removeItem: () => {} });
   assert.deepStrictEqual([stray.get(DEVICE_SETTINGS.readAudioSource), stray.get(DEVICE_SETTINGS.openInView),
     stray.get(DEVICE_SETTINGS.slackOpen), stray.get(DEVICE_SETTINGS.readSteerOffset)], [null, "flat", "browser", null]);
+  // `#1821 vibe-talk-discuss-state-persists`: a damaged panel entry is no entry, never a throw.
+  assert.equal(stray.get(DEVICE_SETTINGS.discussPanel), null);
+  assert.equal(createDeviceSettings({ getItem: () => "{\"open\":\"yes\",\"channelId\":7}", setItem: () => {}, removeItem: () => {} })
+    .get(DEVICE_SETTINGS.discussPanel), null);
   // `#1497 discuss-fold-state-persist`: a damaged folds entry is no entry, never a throw.
   assert.equal(stray.get(DEVICE_SETTINGS.discussFolds), null);
   assert.equal(createDeviceSettings({ getItem: () => "{\"record\":7,\"open\":\"Beta\"}", setItem: () => {}, removeItem: () => {} })

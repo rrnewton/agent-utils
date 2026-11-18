@@ -162,6 +162,11 @@ export interface DiscussPanelDependencies {
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
   /**
+   * `#1821 vibe-talk-discuss-state-persists`. Openness changed through the one
+   * `setOpen`, so the page can keep it on the device; absent, nothing is kept.
+   */
+  onOpenChange?(open: boolean): unknown;
+  /**
    * `#1501 discuss-read-aloud-parity`. Read one summary aloud through the
    * page's shared read-aloud owner, as the Documents reader does (`#1039`):
    * one call for the whole summary, its blocks as `texts`, an optional
@@ -1095,6 +1100,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       deps.byId("discuss-open").setAttribute("aria-expanded", open ? "true" : "false");
     } catch {
       // A host without the bar button still opens and closes.
+    }
+    // `#1821`: every open and close is kept on the device from this one place.
+    try {
+      deps.onOpenChange?.(open);
+    } catch {
+      // Storage refused: openness holds until a reload, as the layout does.
     }
   }
 

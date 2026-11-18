@@ -62,6 +62,14 @@ export interface DiscussHistoryState {
   snapshot: { scope: DiscussScope; answer: CatchupAnswer } | null;
 }
 
+/** `#1821 vibe-talk-discuss-state-persists`. Where Discuss stands, as kept on the device. */
+export interface DiscussPanelState {
+  open: boolean;
+  channelId: string;
+  threadId: string | null;
+  view: "flat" | "main";
+}
+
 /** The selection the panel scopes to, as far as Discuss reads it. */
 export interface DiscussSelection {
   view: string;
@@ -139,6 +147,9 @@ export interface DiscussViewDependencies {
   /** `#1497 discuss-fold-state-persist`. The kept Discuss folds, forwarded to the panel. */
   storedFolds?(): DiscussFoldState | null;
   keepFolds?(state: DiscussFoldState): void;
+  /** `#1821 vibe-talk-discuss-state-persists`. Where Discuss stands, kept on this device. */
+  storedPanelState?(): DiscussPanelState | null;
+  keepPanelState?(state: DiscussPanelState): void;
   /** `#1524 discuss-bound-hours-control`. Now, forwarded to the panel; injected in tests. */
   now?(): number;
   /** `#1501 discuss-read-aloud-parity`. The shared read-aloud owner, forwarded to the panel. */
@@ -317,6 +328,63 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     }
   }
 
+  // `#1821 vibe-talk-discuss-state-persists`. Keep openness with its bound scope
+  // on the device, from the panel's one openness change; restore it on load.
+  let restoreDone = false;
+  function persistPanelState(open: boolean): void {
+    if (boundRaw === null) return;
+    try {
+      deps.keepPanelState?.({ open, channelId: boundRaw.channelId, threadId: boundRaw.threadId, view: boundRaw.view });
+    } catch {
+      // Storage refused: openness holds until a reload, as the layout does.
+    }
+  }
+
+  /** Reopen for the kept scope once its channel is on screen; true when it just did. */
+  function tryRestorePanel(): boolean {
+    if (restoreDone) return false;
+    // A shell stood open early by the page (`#1821`) has no bound scope yet:
+    // it still needs its kept scope filled, so only a bound panel is done.
+    if (panel.isOpen() && boundScope !== null) {
+      restoreDone = true;
+      return false;
+    }
+    let stored: DiscussPanelState | null = null;
+    try {
+      stored = deps.storedPanelState?.() ?? null;
+    } catch {
+      stored = null;
+    }
+    if (stored === null || !stored.open) {
+      restoreDone = true;
+      return false;
+    }
+    const selected = String(deps.selectedChannelId() ?? "");
+    if (selected === "") return false;
+    if (stored.channelId !== selected) {
+      // Not this channel's panel: an early-opened shell comes down, and a
+      // later sync on the kept channel may still restore it.
+      if (panel.isOpen() && boundScope === null) panel.close();
+      return false;
+    }
+    // Busy, and a summarizer not yet known at boot, both defer: a later
+    // sync (client-config's, a view change's) retries the restore.
+    if (busy || !available()) return false;
+    restoreDone = true;
+    let label = deps.channelLabel?.(stored.channelId) ?? stored.channelId;
+    try {
+      const selection = deps.selection();
+      if (stored.threadId !== null && selection.threadId === stored.threadId) {
+        const named = selection.thread?.display_name ?? selection.thread?.title;
+        if (typeof named === "string" && named !== "") label = named;
+      }
+    } catch {
+      // The channel label stands where the selection is not ready.
+    }
+    openWith({ channelId: stored.channelId, threadId: stored.threadId, view: stored.view, label });
+    return true;
+  }
+
   /** Route one citation tap by the binding; the panel stays unless it closes. */
   function routeLink(ref: MessageLinkRef, outOfScope: boolean): void {
     let current: NormalizedDiscussScope;
@@ -397,6 +465,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     keepMode: deps.keepMode,
     storedFolds: deps.storedFolds,
     keepFolds: deps.keepFolds,
+    onOpenChange: (open: boolean) => persistPanelState(open),
     readDocument: deps.readDocument,
     stopSpeaking: deps.stopSpeaking,
     now: deps.now,
@@ -469,6 +538,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         } catch {
           // A host whose selection is not ready yet labels it at the first sync.
         }
+        // `#1821`: restore at once where the channel already stands; else sync retries.
+        tryRestorePanel();
       }
       return {
         unmount() {
@@ -480,6 +551,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       };
     },
     sync() {
+      // `#1821`: a just-restored panel is not judged by the sync that restored it.
+      if (tryRestorePanel()) return;
       try {
         const currentRaw = scopeNow();
         if (panel.isOpen() && boundScope !== null && boundRaw !== null) {

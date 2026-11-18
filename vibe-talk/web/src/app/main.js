@@ -1302,6 +1302,10 @@ const discussView = createDiscussView({
   // this device with the rest; a new summary's keep replaces the entry whole.
   storedFolds: () => deviceSettings().get(DEVICE_SETTINGS.discussFolds),
   keepFolds: (state) => deviceSettings().keep(DEVICE_SETTINGS.discussFolds, state),
+  // `#1821 vibe-talk-discuss-state-persists`. Where Discuss stands, on this
+  // device with the rest; a refresh restores it, a close stays closed.
+  storedPanelState: () => deviceSettings().get(DEVICE_SETTINGS.discussPanel),
+  keepPanelState: (state) => deviceSettings().keep(DEVICE_SETTINGS.discussPanel, state),
   // `#1501 discuss-read-aloud-parity`. The summary read through the shared
   // owner, as a document is; its stop scopes to its own key alone, as the
   // Documents stop beside it does.
