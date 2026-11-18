@@ -318,7 +318,8 @@ def test_interactive_profiles_require_a_permission_bypass_flag(tmp_path: Path) -
     cloudy.mkdir()
     _write_profiles(cloudy, {"cloud": {"harness": "agentcloud", "mode": "interactive"}})
     _path, profiles = load_profiles(cloudy)
-    assert "no bypass flag known" in profiles["cloud"].public()["permission_bypass_warning"]
+    warning = profiles["cloud"].public()["permission_bypass_warning"]
+    assert isinstance(warning, str) and "no bypass flag known" in warning
 
 
 def test_project_configuration_exposes_a_bounded_workspace_policy(tmp_path: Path) -> None:

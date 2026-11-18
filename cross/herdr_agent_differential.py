@@ -1762,7 +1762,7 @@ def _revive_interop(harness: Harness, report: Report) -> None:
     common = ("--registry", "<ROOT>/registry", *FIXTURE_HERDR)
     expected_arguments = [
         "resume", "session-1", "--no-alt-screen", "--model", "recovery-model",
-        "--config", "model_reasoning_effort=high", "--sandbox", "read-only",
+        "--config", "model_reasoning_effort=high", "--sandbox", "read-only", "--yolo",
     ]
     directions = (
         ("python-to-rust", harness.python, harness.rust),
@@ -1793,7 +1793,7 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                 profile.write_text(json.dumps({
                     "schema": "agentctl-profiles/v1", "profiles": {"recovery": {
                         "harness": "codex", "mode": "interactive", "model": "recovery-model",
-                        "reasoning_effort": "high", "argv": ["--sandbox", "read-only"], "env": {},
+                        "reasoning_effort": "high", "argv": ["--sandbox", "read-only", "--yolo"], "env": {},
                     }},
                 }), encoding="utf-8")
                 profile.chmod(0o600)

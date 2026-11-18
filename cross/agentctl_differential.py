@@ -159,6 +159,16 @@ def _json(outcome: Outcome) -> object:
         return outcome.stdout
 
 
+#: The permission-bypass flag each harness's ad-hoc fixture starts carry (#1822).
+_BYPASS = {
+    "codex": "--harness-arg=--yolo",
+    "claude": "--harness-arg=--dangerously-skip-permissions",
+    "muse": "--harness-arg=--approval-mode=never",
+}
+_BYPASS_FLAGS = ("--yolo", "--dangerously-bypass-approvals-and-sandbox",
+                 "--dangerously-skip-permissions", "bypassPermissions", "--approval-mode=never")
+
+
 def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
     """Declare an effort on a success-expecting `start` (#1216 parity).
 
@@ -167,12 +177,15 @@ def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
     that expect to launch therefore declare a level every harness
     accepts; refusal-expecting and parse-only starts keep their literal
     arguments (they never reach this helper's callers unchanged).
+    The same starts carry the harness's permission-bypass flag (#1822):
+    an ad-hoc start without one refuses in both editions.
     """
     args = tuple(arguments)
     if "start" not in args or "--profile" in args:
         return args
     if "--effort" in args or "--reasoning-effort" in args:
         return args
+    harness = "codex"
     if "--harness" in args:
         # A Herdr-native kind takes no reasoning effort; declaring one is a
         # refusal in both editions, not a launch.
@@ -180,7 +193,10 @@ def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
         if harness not in ("codex", "claude", "muse"):
             return args
     at = args.index("start")
-    return (*args[: at + 2], "--effort", "medium", *args[at + 2:])
+    injected: tuple[str, ...] = ("--effort", "medium")
+    if not any(flag in argument for argument in args for flag in _BYPASS_FLAGS):
+        injected += (_BYPASS[harness],)
+    return (*args[: at + 2], *injected, *args[at + 2:])
 
 
 def _pair(harness: Harness, report: Report, case: PairCase, label: str,
@@ -356,7 +372,8 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         expected_args = (["resume", "session-1", "--no-alt-screen"] if kind == "codex"
                          else ["--resume", "session-1"]) + ["--model", "chosen-model"] + (
                              ["--config", "model_reasoning_effort=medium"] if kind == "codex"
-                             else ["--effort", "medium"]) + ["--extra"]
+                             else ["--effort", "medium"]) + (
+                             ["--yolo"] if kind == "codex" else ["--dangerously-skip-permissions"]) + ["--extra"]
         report.require(f"primary/{kind}/native-launch-presets",
                        all(_state(root).get("launch_arguments") == expected_args
                            for root in (case.python_root, case.rust_root)), "native launch argv was changed or split")
@@ -448,7 +465,8 @@ def _conversations(harness: Harness, report: Report) -> None:
                        and native.get("agent") == "claude" and native.get("source") == "asserted"
                        and isinstance(native.get("value"), str)
                        and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", native["value"]) is not None
-                       and arguments == ["--session-id", native["value"], "--effort", "medium"]
+                       and arguments == ["--session-id", native["value"], "--effort", "medium",
+                                           "--dangerously-skip-permissions"]
                        and value.get("session_value") is None,
                        f"generated conversation not retained separately from routing identity: {value!r}")
     _pair(harness, report, case, "primary/conversation/claude/status", ("status", "worker", *_COMMON))
@@ -556,7 +574,7 @@ def _launch_specs(harness: Harness, report: Report) -> None:
     for root in (newer.python_root, newer.rust_root):
         config = root / ".agentctl" / "profiles.json"
         config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
-            "worker": {"harness": "codex", "mode": "interactive", "argv": [], "env": {},
+            "worker": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"], "env": {},
                        "surprise": True},
         }}), encoding="utf-8")
     _pair(harness, report, newer, "primary/unknown-profile-key",
@@ -589,7 +607,7 @@ def _profiles(harness: Harness, report: Report) -> None:
             "watermelon": {
                 "harness": "muse", "mode": "interactive",
                 "model": "kiki_gb300_mxfp8_6p2_840_nwr", "reasoning_effort": "ultra",
-                "argv": [], "env": {},
+                "argv": ["--approval-mode=never"], "env": {},
             },
             "watermelon-exec": {
                 "harness": "muse", "mode": "headless",
@@ -602,16 +620,18 @@ def _profiles(harness: Harness, report: Report) -> None:
                     "--trust-workspace",
                     '--meta-tag=literal $(unexpanded) "quotes"',
                     "--meta-tag=repeatable",
+                    "--approval-mode=never",
                 ],
                 "env": {},
             },
             "codex-safe-config": {
                 "harness": "codex", "mode": "interactive",
-                "argv": ["--config=features.web_search=true"], "env": {},
+                "argv": ["--config=features.web_search=true", "--yolo"], "env": {},
             },
             # An explicit null agentcloud block means absent in both editions.
             "codex-null-cloud": {
                 "harness": "codex", "mode": "interactive", "agentcloud": None,
+                "argv": ["--yolo"],
             },
             # Launchable only by the Rust edition; both editions must list it identically and
             # its presence must not break any other profile in the file.
@@ -631,11 +651,12 @@ def _profiles(harness: Harness, report: Report) -> None:
         "sol": ["--no-alt-screen", "--model", "gpt-5.6-sol",
                 "--config", "model_reasoning_effort=medium",
                 "--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
-        "watermelon": ["--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "ultra"],
+        "watermelon": ["--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "ultra",
+                        "--approval-mode=never"],
         "muse-literal": ["--reasoning-effort", "medium", "--trust-workspace",
                          '--meta-tag=literal $(unexpanded) "quotes"',
-                         "--meta-tag=repeatable"],
-        "codex-safe-config": ["--no-alt-screen", "--config=features.web_search=true"],
+                         "--meta-tag=repeatable", "--approval-mode=never"],
+        "codex-safe-config": ["--no-alt-screen", "--config=features.web_search=true", "--yolo"],
     }
     for profile in ("astra-ultra", "sol", "watermelon", "muse-literal", "codex-safe-config"):
         case = harness.case(f"primary-profile-{profile}")
@@ -946,12 +967,15 @@ def _profile_resume(harness: Harness, report: Report) -> None:
     conversation = "11111111-1111-4111-8111-111111111111"
     literal_argument = '--meta-tag=literal $(unexpanded) "quotes"'
     literal_environment = 'PROFILE_SELECTOR=literal $(unexpanded) "quotes"'
+    bypass = {"claude": "--dangerously-skip-permissions", "codex": "--yolo",
+              "muse": "--approval-mode=never"}
     expected_arguments = {
-        "claude": ["--resume", conversation, "--model", "selected-model", "--effort", "high", literal_argument],
+        "claude": ["--resume", conversation, "--model", "selected-model", "--effort", "high", literal_argument,
+                   "--dangerously-skip-permissions"],
         "codex": ["resume", conversation, "--no-alt-screen", "--model", "selected-model", "--config",
-                  "model_reasoning_effort=high", literal_argument],
+                  "model_reasoning_effort=high", literal_argument, "--yolo"],
         "muse": ["--model", "selected-model", "--reasoning-effort", "high", literal_argument,
-                 "resume", conversation],
+                 "--approval-mode=never", "resume", conversation],
     }
 
     def configured_case(kind: str, scenario: str, *, raw: Sequence[str] | None = None) -> PairCase:
@@ -963,7 +987,7 @@ def _profile_resume(harness: Harness, report: Report) -> None:
             "schema": "agentctl-profiles/v1",
             "profiles": {"local-policy": {
                 "harness": kind, "mode": "interactive", "model": "selected-model",
-                "reasoning_effort": "high", "argv": [literal_argument] if raw is None else list(raw),
+                "reasoning_effort": "high", "argv": [literal_argument, bypass[kind]] if raw is None else list(raw),
                 "env": {"PROFILE_SELECTOR": literal_environment.partition("=")[2]},
             }},
         }
@@ -1183,7 +1207,7 @@ def _skill_install(harness: Harness, report: Report) -> None:
 
 def _profile_refusals(harness: Harness, report: Report) -> None:
     base = {"schema": "agentctl-profiles/v1", "profiles": {
-        "worker": {"harness": "codex", "mode": "interactive", "argv": [], "env": {}}
+        "worker": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"], "env": {}}
     }}
     for label in ("nonignored", "permissions", "symlink"):
         case = harness.case(f"primary-profile-refusal-{label}")
@@ -1347,7 +1371,7 @@ def _workspace_retirement(harness: Harness, report: Report) -> None:
 def _workspace_policy(harness: Harness, report: Report) -> None:
     """Pin the paired CLI surface for the optional project workspace key."""
     base = {"schema": "agentctl-profiles/v1", "profiles": {
-        "worker": {"harness": "codex", "mode": "interactive", "argv": [], "env": {}}
+        "worker": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"], "env": {}}
     }}
     documents: dict[str, object] = {
         "valid": {"schema": "agentctl-profiles/v1", "profiles": {}, "workspace": "project"},
@@ -2212,7 +2236,7 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
             report.require(label + "/default-record", all(
                 (root / "chosen/agents/worker/agent.json").is_file() and not (root / ".agentctl").exists()
                 and _state(root).get("launch_arguments") == [
-                    "--no-alt-screen", "--config", "model_reasoning_effort=medium"]
+                    "--no-alt-screen", "--config", "model_reasoning_effort=medium", "--yolo"]
                 for root in (case.python_root, case.rust_root)), "registry alias/placement or native defaults changed")
     for label, producer, consumer in (("python-rust", harness.python, harness.rust), ("rust-python", harness.rust, harness.python)):
         case = harness.case(f"primary/interop/{label}")
@@ -2946,7 +2970,7 @@ def _stop_recovery_quoted_globals(harness: Harness, report: Report) -> None:
         shutil.copyfile(root / "fake-herdr", root / executable)
         (root / executable).chmod(0o700)
     outcomes = harness.invoke(case, (
-        "start", "worker", "--effort", "medium", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
+        "start", "worker", "--effort", "medium", "--harness-arg=--yolo", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
     ))
     report.require("primary/stop/quoted-globals/start", all(outcome.returncode == 0 for outcome in outcomes),
                    f"fixture could not start with literal globals: {outcomes!r}")
