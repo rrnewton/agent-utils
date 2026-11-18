@@ -30,13 +30,16 @@ export type { ReadRuns, RunPlace } from "./runs.ts";
 export {
   CARD_INDENTED_CHARS,
   CARD_LINE_CHARS,
+  MAX_THREAD_SLUG_CHARS,
   cardProxyLines,
+  filedThreadSlug,
   firstLineOf,
   foldedCardText,
   proxyLinesOf,
   threadChoice,
   titleLineOf,
   threadFacts,
+  validThreadSlug,
   wrapCardLine,
 } from "./cards.ts";
 export type { ThreadChoice } from "./cards.ts";

@@ -3803,6 +3803,48 @@ test("`#407 unpack-row-parity`: Enter and o fold the selected unpacked row, e ma
   assert.match(page.el("reply-target-meta").textContent, /id 707$/, "r answered another message");
 });
 
+test("`#1819 vibe-talk-thread-button-shows-slug`: Thread(N) shows the emoji, the filed slug and the count, and falls back without a slug", async () => {
+  const slugged = { id: "spaces/A/threads/slugged", root_message_id: "201", is_root: true,
+    reply_count: 57, reply_count_exact: true, display_name: "my-thread-slug" };
+  const plain = { id: "spaces/A/threads/plain", root_message_id: "203", is_root: true,
+    reply_count: 2, reply_count_exact: true };
+  const page = newPage();
+  page.threadingSupported = true;
+  page.threads = [
+    { id: slugged.id, root: null, title: "Slugged discussion", reply_count: 57, reply_count_exact: true,
+      display_name: "my-thread-slug", updated_at: new Date(page.clock()).toISOString() },
+    { id: plain.id, root: null, title: "Plain discussion", reply_count: 2, reply_count_exact: true,
+      updated_at: new Date(page.clock()).toISOString() },
+  ];
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "200", content: "main channel announcement" }),
+    message({ id: "201", content: "slugged thread root", thread: slugged }),
+    message({ id: "202", content: "slugged thread answer", thread: { ...slugged, is_root: false } }),
+    message({ id: "203", content: "plain thread root", thread: plain }),
+    message({ id: "204", content: "plain thread answer", thread: { ...plain, is_root: false } }),
+  ]);
+  await pickThread(page, "main");
+  const badge = threadBadge(rowWithId(page, "201"));
+  assert.equal(badge.text(), "🧵 my-thread-slug (57)", "the slugged tag does not show emoji, slug and count");
+  assert.equal(badge.getAttribute("data-thread-slug"), "my-thread-slug");
+  assert.equal(badge.getAttribute("aria-label"), "Open this thread, my-thread-slug, 57 replies");
+  const parts = [...badge.children].filter((part) => part.className).map((part) => [part.className, part.textContent]);
+  assert.deepStrictEqual(parts, [["thread-badge-emoji", "🧵"], ["thread-badge-slug", "my-thread-slug"], ["thread-badge-count", "(57)"]]);
+  // No filed slug: today's exact compact label, and no slug marker.
+  const plainBadge = threadBadge(rowWithId(page, "203"));
+  assert.equal(plainBadge.textContent, "Thread(2)", "an unslugged tag changed its label");
+  assert.equal(plainBadge.hasAttribute("data-thread-slug"), false);
+  // The stylesheet truncates the slug and falls back where the row has no room.
+  assert.match(cssBlock(".thread-badge-slug"), /text-overflow:\s*ellipsis/, "the slug does not truncate with an ellipsis");
+  assert.match(cssBlock(".thread-badge-emoji"), /grayscale\(1\)/, "the thread emoji is not greyed");
+  assert.ok(CSS_CODE.includes(".thread-badge-count::before"), "the narrow fallback does not restore Thread(N)");
+  // The expanded tag still opens its thread.
+  await badge.click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${slugged.id}`, "the expanded tag did not open its thread");
+});
+
 test("`#934 voice-page-reply-parent-arrow`: a reply and a quote-reply inside a thread draw the arrow to what they answer, in the thread and in All, and the arrow jumps there", async () => {
   // The owner: "When I reply or quote reply especially inside a thread. I'm not getting a little blue arrows to
   // blink it back to the parent." The server now says what a reply it posted answers wherever its provider keeps no

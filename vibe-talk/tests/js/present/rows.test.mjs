@@ -203,6 +203,22 @@ test("`#624 voice-page-modularity`: a quoted stretch as the head of a reply, fro
   assert.ok(said.length <= QUOTE_MAX_CHARS && said.endsWith("word…"), "a long quote was not cut at a word with an ellipsis");
 });
 
+test("`#1819 vibe-talk-thread-button-shows-slug`: a filed thread slug is two to four hyphenated words, from the module alone", () => {
+  const { validThreadSlug, filedThreadSlug, MAX_THREAD_SLUG_CHARS } = ROWS;
+  assert.equal(MAX_THREAD_SLUG_CHARS, 40);
+  assert.deepStrictEqual(
+    ["my-thread-slug", "runner-wedged", "a1-b2", "one-two-three-four"].map(validThreadSlug),
+    [true, true, true, true]);
+  assert.deepStrictEqual(
+    ["single", "one-two-three-four-five", "Has-Caps", "has--gap", "-lead", "trail-", "has_under", "", "  ", null, 7,
+      "a".repeat(41)].map(validThreadSlug),
+    [false, false, false, false, false, false, false, false, false, false, false, false]);
+  // The first valid name wins; an invalid filed name is no slug, never patched into shape.
+  assert.equal(filedThreadSlug("Not A Slug", "runner-wedged"), "runner-wedged");
+  assert.equal(filedThreadSlug(null, undefined, "  my-thread-slug  "), "my-thread-slug");
+  assert.equal(filedThreadSlug("nope", null), "");
+});
+
 test("`#624 voice-page-modularity`: what replies are called, from the module alone", () => {
   const { countOf, replyMarkerName } = ROWS;
   assert.deepStrictEqual([countOf(1), countOf(3)], ["1 reply", "3 replies"]);

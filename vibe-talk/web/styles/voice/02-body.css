@@ -559,7 +559,9 @@
    its row's other controls and pushes the line apart. Its thread's colour stays on its edge and tint;
    only N replies at the foot of a root keeps the larger chip. */
 .thread-badge {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
   padding: 0.05rem 0.5rem;
   border-radius: 999px;
   font: inherit;
@@ -568,6 +570,50 @@
   min-height: 0;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
+}
+
+/* `#1819 vibe-talk-thread-button-shows-slug`. With room the coloured tag shows its thread's
+   filed slug — emoji, slug, count ("🧵 my-thread-slug (57)") — on one line: the slug is the
+   one part that gives, cut with an ellipsis, and the count never wraps. No grayscale thread
+   emoji asset exists (U+1F9F5 is drawn as text), so the emoji span is greyed in CSS; the
+   colour form is the same span without the filter, compared in this lane's screenshots. */
+.thread-badge:has(> .thread-badge-slug) {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  max-width: min(18rem, 100%);
+  white-space: nowrap;
+}
+
+.thread-badge-emoji {
+  flex: none;
+  filter: grayscale(1);
+  opacity: 0.75;
+}
+
+.thread-badge-slug {
+  flex: 1 1 auto;
+  min-width: 4ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-badge-count {
+  flex: none;
+}
+
+/* Where the row has no room (the narrowest phones, a narrow column), the tag falls back to
+   today's compact "Thread(N)": the emoji and slug go, and the count gains its Thread. */
+@container rows (max-width: 23.99rem) {
+  .thread-badge > .thread-badge-emoji,
+  .thread-badge > .thread-badge-slug {
+    display: none;
+  }
+
+  .thread-badge > .thread-badge-count::before {
+    content: "Thread";
+  }
 }
 
 /* `#252 thread-button-state`. A thread nobody has answered is not one yet: its tag is drawn as Reply

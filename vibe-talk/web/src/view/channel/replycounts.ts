@@ -6,7 +6,7 @@
 
 import { allReachesThread, emptyTally, exactReplyCount, replyTallyOf, tallyRecord, threadOf, unseenRepliesIn } from "../../core/channels/index.ts";
 import type { ChannelCanon, ReplyTally } from "../../core/channels/index.ts";
-import { countOf, replyMarkerName } from "../../present/rows/index.ts";
+import { countOf, filedThreadSlug, replyMarkerName } from "../../present/rows/index.ts";
 import { childByClass } from "../../view/dom/index.ts";
 import type { Message, ThreadSummary } from "../../contract/index.ts";
 import { QUOTE_REPLY_TITLE } from "./quoting.ts";
@@ -72,7 +72,7 @@ export interface ReplyCountsDependencies {
 export interface ReplyCounts {
   REPLY_BUTTON_TITLE: string;
   unansweredRoot(message: unknown, reported: number | null, held: number, exact: number | null): boolean;
-  paintThreadBadge(badge: HTMLElement, id: string, replies: number, unanswered: boolean): void;
+  paintThreadBadge(badge: HTMLElement, id: string, replies: number, unanswered: boolean, slug?: string): void;
   startThread(id: string): unknown;
   unansweredThread(message: unknown, record: { id?: unknown }): boolean;
   heldUnansweredRoot(id: unknown): Message | null;
@@ -145,11 +145,18 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
    * thread's coloured Thread(N), which opens it. Written only where it changes: the pass over the rows
    * paints every tag again.
    */
-  function paintThreadBadge(badge: HTMLElement, id: string, replies: number, unanswered: boolean) {
+  function paintThreadBadge(badge: HTMLElement, id: string, replies: number, unanswered: boolean, slug: string = "") {
     const state = unanswered ? "start" : "open";
+    // `#1819 vibe-talk-thread-button-shows-slug`. With room, a coloured Thread(N) whose thread
+    // has a filed slug shows it: thread emoji, slug, count ("🧵 my-thread-slug (57)"), the slug
+    // truncating with an ellipsis; the stylesheet falls back to the compact form where the row
+    // has no room. No slug, no replies, or the grey start state keep today's exact labels.
+    const expanded = !unanswered && replies > 0 && slug !== "";
     const text = !unanswered && replies ? `Thread(${replies})` : "Thread";
     const title = unanswered ? "Start a thread on this message" : "Open this thread";
-    const label = unanswered ? title : replies ? `Open this thread, ${deps.threadCount(replies, true)}` : null;
+    const label = unanswered ? title : replies
+      ? (expanded ? `Open this thread, ${slug}, ${deps.threadCount(replies, true)}` : `Open this thread, ${deps.threadCount(replies, true)}`)
+      : null;
     const hidden = unanswered && deps.knownChannel(deps.selectedChannelId())?.writable === false;
     if (badge.getAttribute("data-thread-state") !== state) {
       badge.setAttribute("data-thread-state", state);
@@ -157,11 +164,51 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
       if (unanswered) badge.style.removeProperty("--thread-hue");
       else badge.style.setProperty("--thread-hue", deps.threadHue(id));
     }
-    if (badge.textContent !== text) badge.textContent = text;
+    if (expanded) {
+      const key = `${slug}\n${replies}`;
+      if ((badge as unknown as { threadBadgeKey?: string }).threadBadgeKey !== key) {
+        (badge as unknown as { threadBadgeKey?: string }).threadBadgeKey = key;
+        const emoji = document.createElement("span");
+        emoji.className = "thread-badge-emoji";
+        emoji.setAttribute("aria-hidden", "true");
+        emoji.textContent = "🧵";
+        const name = document.createElement("span");
+        name.className = "thread-badge-slug";
+        name.textContent = slug;
+        const count = document.createElement("span");
+        count.className = "thread-badge-count";
+        count.textContent = `(${replies})`;
+        badge.replaceChildren(emoji, document.createTextNode(" "), name, document.createTextNode(" "), count);
+      }
+      if (badge.getAttribute("data-thread-slug") !== slug) badge.setAttribute("data-thread-slug", slug);
+    } else {
+      (badge as unknown as { threadBadgeKey?: string }).threadBadgeKey = undefined;
+      if (badge.hasAttribute("data-thread-slug")) badge.removeAttribute("data-thread-slug");
+      if (badge.textContent !== text) badge.textContent = text;
+    }
     if (badge.getAttribute("title") !== title) badge.setAttribute("title", title);
     if (label === null) badge.removeAttribute("aria-label");
     else if (badge.getAttribute("aria-label") !== label) badge.setAttribute("aria-label", label);
     if (badge.hidden !== hidden) badge.hidden = hidden;
+  }
+
+  /**
+   * The filed slug of thread `id` as `message`'s row paints it (`#1819`): the thread summary's
+   * `display_name`, else the root's own, else the stored root's — the same filed name #1796
+   * joins onto `:thread:` refs (`filedThreadSlug` holds it to slug shape). No read is made.
+   */
+  function badgeSlug(id: string, message: Message): string {
+    const canon = deps.channelStore().current();
+    const summary = canon.threads.find((held) => String(held.id) === id);
+    const own = (message as { thread?: { display_name?: unknown } | null }).thread;
+    if (summary || own) {
+      const slug = filedThreadSlug(summary?.display_name, own?.display_name);
+      if (slug) return slug;
+    }
+    const root = canon.messages.find((held) => threadOf(held) === id
+      && (held as { thread?: { is_root?: unknown } | null }).thread?.is_root === true);
+    const held = root ? (root as { thread?: { display_name?: unknown } | null }).thread : null;
+    return filedThreadSlug(held?.display_name);
   }
 
   /**
@@ -426,7 +473,7 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
       const replies = Math.max(typeof reported === "number" ? reported : 0, entry.held, exact || 0) + pending;
       // `#252 thread-button-state`. Grey while nobody has answered; the coloured Thread(N) from the
       // first reply on, which is this pass, the next time the rows are passed over after it arrives.
-      paintThreadBadge(badge, own, replies, pending === 0 && unansweredRoot(message, reported, entry.held, exact));
+      paintThreadBadge(badge, own, replies, pending === 0 && unansweredRoot(message, reported, entry.held, exact), badgeSlug(own, message));
       const gather = childByClass(row, "thread-replies");
       if (gather && message.thread!.is_root) {
         const { count, exact } = deps.gatherCount(own, message, entry.held);

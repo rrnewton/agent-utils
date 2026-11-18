@@ -7,7 +7,7 @@
 
 import type { Message } from "../../contract/index.ts";
 import { namedRecord, threadOf } from "../../core/channels/index.ts";
-import { firstLineOf, threadChoice, threadFacts, titleLineOf } from "../../present/rows/index.ts";
+import { filedThreadSlug, firstLineOf, threadChoice, threadFacts, titleLineOf } from "../../present/rows/index.ts";
 import type { ThreadChoice } from "../../present/rows/index.ts";
 import { noteRowBuilt } from "./rows.ts";
 
@@ -69,7 +69,7 @@ export interface ThreadListDependencies {
   threadReplyCount(id: string, message: Message): number;
   threadCount(count: number | null, exact: boolean): string;
   repliesOf(message: Message): { count: number; exact: boolean };
-  paintThreadBadge(badge: HTMLElement, id: string, replies: number, unanswered: boolean): void;
+  paintThreadBadge(badge: HTMLElement, id: string, replies: number, unanswered: boolean, slug?: string): void;
   unansweredRoot(message: Message, reported: number, held: number, exact: unknown): boolean;
   startThread(id: string): unknown;
   openReply(messages: Message[], row: HTMLElement): unknown;
@@ -773,7 +773,19 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     badge.className = "thread-badge";
     badge.setAttribute("type", "button");
     const replies = deps.threadReplyCount(id, message);
-    deps.paintThreadBadge(badge, id, replies, deps.unansweredRoot(message, replies, 0, null));
+    // `#1819 vibe-talk-thread-button-shows-slug`: the filed slug the badge shows with room —
+    // the summary's `display_name`, else the root's own, else the stored root's, held to slug
+    // shape by `filedThreadSlug` (the same filed name #1796 joins onto `:thread:` refs).
+    const canon = deps.currentCanon();
+    const summary = canon.threads.find((held) => String((held as { id: unknown }).id) === id) as { display_name?: unknown } | undefined;
+    const ownName = (message as { thread?: { display_name?: unknown } | null }).thread?.display_name;
+    let slug = filedThreadSlug(summary?.display_name, ownName);
+    if (!slug) {
+      const root = canon.messages.find((held) => threadOf(held as never) === id
+        && (held as { thread?: { is_root?: unknown } | null }).thread?.is_root === true);
+      slug = filedThreadSlug((root as { thread?: { display_name?: unknown } | null } | undefined)?.thread?.display_name);
+    }
+    deps.paintThreadBadge(badge, id, replies, deps.unansweredRoot(message, replies, 0, null), slug);
     badge.addEventListener("click", deps.inThisColumn(() => deps.guardQuietly(() => {
       if (row.hasAttribute("data-main-row")) return deps.openReplyFromRow(row);
       return badge.getAttribute("data-thread-state") === "start" ? deps.startThread(id) : openThread(id, null, drillAnchorFor(row, message));

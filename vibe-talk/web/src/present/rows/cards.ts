@@ -122,4 +122,32 @@ function threadFacts(choice: Pick<ThreadChoice, "at" | "started" | "count">): st
 }
 
 export { CARD_INDENTED_CHARS, CARD_LINE_CHARS, cardProxyLines, firstLineOf, foldedCardText, proxyLinesOf, threadChoice, threadFacts, titleLineOf, wrapCardLine };
+
+/** Longest filed thread slug, in characters: src/summarize/threads.rs `MAX_SLUG_CHARS`. */
+export const MAX_THREAD_SLUG_CHARS = 40;
+
+/**
+ * Whether `name` is a usable filed thread slug, held to the server's shape
+ * (src/summarize/threads.rs `valid_thread_slug`, `#1819 vibe-talk-thread-button-shows-slug`):
+ * two to four words of lowercase ASCII letters and digits, joined by single
+ * hyphens, at most {@link MAX_THREAD_SLUG_CHARS} characters. The same filed
+ * name #1796 joins onto `:thread:` refs; a name that fails is no slug.
+ */
+export function validThreadSlug(name: unknown): boolean {
+  if (typeof name !== "string") return false;
+  const slug = name.trim();
+  if (slug.length === 0 || slug.length > MAX_THREAD_SLUG_CHARS) return false;
+  const words = slug.split("-");
+  return words.length >= 2 && words.length <= 4
+    && words.every((word) => word !== "" && [...word].every((ch) => (ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9")));
+}
+
+/** The first of `names` that is a filed thread slug, trimmed; "" when none is. */
+export function filedThreadSlug(...names: unknown[]): string {
+  for (const name of names) {
+    if (validThreadSlug(name)) return (name as string).trim();
+  }
+  return "";
+}
+
 export type { ThreadChoice };
