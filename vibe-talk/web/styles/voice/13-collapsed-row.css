@@ -67,6 +67,15 @@
     display: none;
   }
 
+  /* `#1819 vibe-talk-thread-button-shows-slug`: on an OPEN row here the Thread tag's slug
+     gives first, capped so Reply, the tag, ⋯ and Done stay on one line with the count
+     showing ("🧵 storages-tiers-rol… (12)"). In this same narrow query, not a second one:
+     the compact-row rules above are read as this block. Still narrower, the tag falls
+     back to Thread(N) (02-body.css). */
+  .thread-badge-slug {
+    max-width: 14ch;
+  }
+
   /* Never promoted onto the header line here, however short: its own line, under it. */
   :is(#side-log, #side-cards, #discord-log, #pinned-log) li.discord-message > .meta > .rh-head {
     order: 99;

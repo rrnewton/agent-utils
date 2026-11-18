@@ -5323,6 +5323,13 @@ const TUNING_BANDS = {
     "resolution mints the server's keys (#1081 documents-relative-links): not a tuning at all — " +
     "any other value has the page mark document links the server would refuse, or render links " +
     "it would serve as plain text (MAX_ADDRESS in src/documents.rs)"],
+  // `#1819 vibe-talk-thread-button-shows-slug`. Not a tuning either: the longest filed thread
+  // slug the Thread tag may show, mirrored from the server's own cap (MAX_SLUG_CHARS in
+  // src/summarize/threads.rs, held by valid_thread_slug). Any other value has the page show
+  // a name the server would never file as a slug, or refuse one it would.
+  MAX_THREAD_SLUG_CHARS: [40, 40,
+    "the longest filed thread slug, mirroring MAX_SLUG_CHARS in src/summarize/threads.rs; " +
+    "another value shows a name the server would not file, or hides one it would"],
   HERE_SLACK_PX: [0, 32,
     "how far below the scroller's top a document heading still counts as the current section " +
     "(#1038 documents-outline-popup): past a line's height a heading the reader has not reached " +
