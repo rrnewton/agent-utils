@@ -299,6 +299,21 @@ export function isDiscussUnavailable(error: unknown): boolean {
   return typeof record.message === "string" && record.message.includes("summarizer_not_configured");
 }
 
+/**
+ * `text` with its timestamp citations removed, for the device voice:
+ * the Markdown form `[(09:51 ↩)](<address>)` in a raw answer and the
+ * plain rendered `(09:51 ↩)` / `(09:51 ↗)` in a drawn block. Mirrors
+ * speakable.rs `drop_timestamp_citations` (`#1823`).
+ */
+export function withoutTimestampCitations(text: string): string {
+  return text
+    .replace(/\[\(\d{1,2}:\d{2}(?::\d{2})?\s*[↩↗]\)\]\([^)]*\)/g, "")
+    .replace(/\(\d{1,2}:\d{2}(?::\d{2})?\s*[↩↗]\)/g, "")
+    .replace(/ +([.,;:!?])/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -784,9 +799,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const blocks = discussBlocks(box);
     // Kept one per drawn block, never filtered: a tap's index and the
     // light's index are the drawn blocks' own indices.
-    let texts = blocks.map((el) => String(el.textContent ?? "").replace(/\s+/g, " ").trim());
+    // `#1823 vibe-talk-tts-skip-timestamps-and-auto-link-ids`: a drawn
+    // block's timestamp citation (`(09:51 ↩)`, `(09:51 ↗)`) is not said,
+    // as the server's speech preparation drops it (speakable.rs).
+    let texts = blocks.map((el) => withoutTimestampCitations(String(el.textContent ?? "")));
     if (texts.length === 0 || texts.every((text) => text === "")) {
-      texts = lastAnswer.text.split(/\n\s*\n/).map((chunk) => chunk.replace(/\s+/g, " ").trim()).filter((chunk) => chunk !== "");
+      texts = lastAnswer.text.split(/\n\s*\n/).map((chunk) => withoutTimestampCitations(chunk)).filter((chunk) => chunk !== "");
     }
     if (texts.length === 0) {
       deps.setStatus?.("Nothing to read yet.");

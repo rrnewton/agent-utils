@@ -21,7 +21,7 @@ const {
   DISCUSS_BINDING_RULES, WIDEN_OR_SIDEWAYS_ACTION, discussScopeKey, isSameDiscussScope,
   linkDecision, normalizeDiscussScope, viewChangeDecision,
   applyStrikes, citationIdsOf, hasWord, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, FRESH_CLASS,
-  hoursSinceStart, countForHours, boundForHours, hoursFloor1, formatHoursFloor1, summaryTimeLabel,
+  hoursSinceStart, countForHours, boundForHours, hoursFloor1, formatHoursFloor1, summaryTimeLabel, withoutTimestampCitations,
 } = VIEW;
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -2117,4 +2117,13 @@ test("discusspersist: open keeps its scope, close keeps closed, a fresh view res
       } finally { otherFx.restore(); }
     } finally { openFx.restore(); }
   } finally { fx.restore(); }
+});
+
+test("timestamps: citation links are not handed to the device voice (#1823)", () => {
+  assert.equal(withoutTimestampCitations("Ada shipped the fix (09:51 ↩)"), "Ada shipped the fix");
+  assert.equal(withoutTimestampCitations("Ada shipped the fix (09:52 ↗). Next."), "Ada shipped the fix. Next.");
+  assert.equal(
+    withoutTimestampCitations("Ada shipped the fix [(09:51 ↩)](?c=C9&v=all&m=slack:C9:111)"),
+    "Ada shipped the fix");
+  assert.equal(withoutTimestampCitations("at 13:33 we ship (as planned)"), "at 13:33 we ship (as planned)");
 });
