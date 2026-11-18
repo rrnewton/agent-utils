@@ -1345,6 +1345,12 @@ def shrink_keyboard(driver: Driver, scene_name: str, focus: str | None = None) -
     if problem is not None:
         raise Unreachable(scene_name, "the keyboard really shrinks the viewport", problem)
     if focus is not None:
+        # What a real keyboard does next: the browser scrolls the focused field into
+        # the remaining viewport. Only a field still outside after that is a bad shot.
+        driver.page.evaluate(
+            "() => document.activeElement.scrollIntoView({block: 'nearest'})"
+        )
+        driver.page.wait_for_timeout(150)
         rect = cast(
             dict[str, float],
             driver.js(
