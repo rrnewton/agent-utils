@@ -1389,6 +1389,10 @@ test("the status line floats ABOVE the dock rather than reflowing the transcript
   // resizing the scrolling element moves the transcript under the reader's thumb — the very defect
   // `#47 scrollback-stability` exists to remove.
   const line = cssBlock("#status-line");
+  // `#1837 vibe-talk-status-pill-avoids-text`: while the Welcome is up the pill waits
+  // rather than cover its text, in the server-search wait's idiom.
+  assert.match(cssBlock('#frame-body[data-screen="welcome"] #status-line'), /visibility:\s*hidden/,
+    "the status pill still covers the Welcome");
   assert.match(line, /position:\s*absolute/, "it is a reflowing row again");
   assert.match(line, /bottom:\s*/, "it is not anchored to the foot of the body area");
   assert.match(cssBlock("#frame-body"), /position:\s*relative/, "it has nothing to float against");

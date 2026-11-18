@@ -52,6 +52,17 @@
   visibility: hidden;
 }
 
+/* `#1837 vibe-talk-status-pill-avoids-text`: while the Welcome is up (first run, or
+   re-opened from Settings or Help) the pill waits rather than cover its text — on a
+   desk it sat over "You can re-open this screen any time from Settings" at the foot.
+   The wait is the server-search wait's idiom: geometry, the aria-live text and the
+   dismiss timer are untouched, so a "Ready." said at sign-in expires behind the
+   Welcome and never reappears on dismiss. Errors still show: they live in the
+   separate #error-wrap panel, not here. */
+#frame-body[data-screen="welcome"] #status-line {
+  visibility: hidden;
+}
+
 #status-line {
   position: absolute;
   z-index: var(--z-pill);

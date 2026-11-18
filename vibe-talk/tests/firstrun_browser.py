@@ -116,6 +116,21 @@ def sign_in(page: Page, url: str) -> None:
 def expect_welcome(page: Page, where: str) -> None:
     page.wait_for_function("() => !document.getElementById('screen-welcome').hidden",
                            timeout=10_000)
+    # `#1837 vibe-talk-status-pill-avoids-text`: while the Welcome is up the status
+    # pill waits rather than cover its text (on a desk, the foot hint). The pill may
+    # be unhidden with "Ready." behind it; it must not be drawn.
+    page.wait_for_function(
+        "() => getComputedStyle(document.getElementById('status-line')).visibility === 'hidden'",
+        timeout=10_000)
+    check(page.evaluate("""() => {
+        const pill = document.getElementById('status-line').getBoundingClientRect();
+        const hint = [...document.querySelectorAll('#screen-welcome .hint')]
+            .map((el) => el.getBoundingClientRect())
+            .find((r) => r.height > 0);
+        if (!hint) return true;
+        return pill.bottom <= hint.top || pill.top >= hint.bottom
+            || getComputedStyle(document.getElementById('status-line')).visibility === 'hidden';
+    }"""), f"{where}: the status pill is drawn over the Welcome")
     headings = page.evaluate("""() => [...document.querySelectorAll('#screen-welcome .welcome-item dt')]
         .map((dt) => dt.textContent.trim())""")
     check(headings == WELCOME_HEADINGS, f"{where}: the Welcome names {headings}, not {WELCOME_HEADINGS}")
@@ -159,6 +174,15 @@ def walk_fresh(context: BrowserContext, url: str, shots: Path | None, where: str
     check(not on(page, "welcome-guide"), f"{where}: the guided setup shows though a channel is configured")
     shot(page, shots, f"{where}-{scheme}-02-welcome-after")
     dismiss(page, where)
+    # `#1837`: back on the Channel the pill draws again when there is something to say.
+    page.evaluate("""() => {
+        document.getElementById('status').textContent = 'Ready.';
+        document.getElementById('status-line').hidden = false;
+    }""")
+    page.wait_for_function(
+        "() => getComputedStyle(document.getElementById('status-line')).visibility === 'visible'",
+        timeout=10_000)
+    page.evaluate("() => { document.getElementById('status-line').hidden = true; }")
     shot(page, shots, f"{where}-{scheme}-03-channel")
     # A reload is a returning reader: no Welcome, still the Channel.
     page.reload(wait_until="load")
@@ -201,6 +225,14 @@ def walk_phone(context: BrowserContext, url: str, shots: Path | None, scheme: st
     page.wait_for_function(f"() => window.visualViewport.height === {PHONE['height']}",
                            timeout=10_000)
     shot(page, shots, f"phone-{scheme}-05-channel-discuss-keyboard-closed-again")
+    # `#1837`: the phone welcome-from-settings shot the #1781 matrix was missing.
+    page.click("#open-settings")
+    page.wait_for_selector("#open-welcome", state="visible", timeout=10_000)
+    page.click("#open-welcome")
+    expect_welcome(page, "phone from Settings")
+    shot(page, shots, f"phone-{scheme}-06-welcome-from-settings")
+    page.click("#welcome-start")
+    expect_channel(page, "phone back from the Welcome")
 
 
 def walk_saved_voice(context: BrowserContext, url: str, shots: Path | None) -> None:
@@ -321,6 +353,16 @@ def browse(playwright: Playwright, args: argparse.Namespace, web_root: Path) -> 
     api = FirstRunApi(listed=[])
     server, thread, url = serve(api, served)
     try:
+        # `#1837`: the desk no-channel guide shot the #1781 matrix was missing.
+        context = fresh_context(DESK, "light")
+        try:
+            page = context.pages[0]
+            sign_in(page, url)
+            expect_welcome(page, "desk no-channel")
+            check(on(page, "welcome-guide"), "desk no-channel: the guided setup is not showing")
+            shot(page, args.screenshots, "desk-no-channel-02-welcome-guide")
+        finally:
+            context.close()
         context = fresh_context(PHONE, "light", mobile=True)
         try:
             walk_no_channel(context, api, url, args.screenshots)
