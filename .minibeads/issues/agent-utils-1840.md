@@ -1,6 +1,6 @@
 ---
 title: "vibe-talk-draft-sync-across-devices: sync composer drafts across devices"
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -37,3 +37,7 @@ Full design note sent to the coordinator before coding (storage, key, conflicts,
 # Notes
 
 Owner-priority, deployed on landing. Owner request in thread 172 via the liaison; screenshot acceptance per thread 124 (test instance only, keyboard really open, Discuss half-pane in at least the phone shots). Design note to the coordinator precedes any code; the owner may still choose button-only, auto-sync only, or both, and the build follows that choice.
+
+## Resolution
+
+[watermelon-full-preview] Landed as e166ec38 on main (deployed on landing by the coordinator). Server: the `composer_drafts` sqlite table outside the migration ladder (7-day retention, size and count caps), a write-scope drafts API (a read token gets 403, no MCP route), the storage purge and a forgotten channel dropping drafts. Page: idle auto-sync behind the synced `vibe-talk.draft-autosync` setting (default on) plus Save draft buttons on the main and Discuss composers, a quiet "Draft saved" note, and "Continue draft from <device> (N min ago)" offers that never overwrite typing; sending or discarding clears the draft, and device storage stays the offline copy. Proof: Rust store and real-router tests (one device's draft offered on another, sending clears it, the purge drops it), a two-device page suite with injected timers, and a browser cross-device run on a test instance with the standing screenshot matrix.
