@@ -311,6 +311,18 @@
               />
               <span id="search-count" class="search-count" role="status" aria-live="polite" hidden></span>
               <!--
+                `#1852 vibe-talk-search-whole-threads-toggle`. Whole threads, a fixed-width toggle
+                icon on this bar with the others (it stood as an "Entire threads" chip in the
+                results bucket row since `#1825`; the owner asked for it here, as one control).
+                First of the filters, so Links, Pinned and the glass keep the adjacency `#206`
+                and `#211` gave them. Off, the thread emoji stands greyed; on, a highlighted
+                coloured circle stands around it, worn from `aria-pressed` as the bar's other
+                toggles wear theirs.
+              -->
+              <button id="search-entire-threads" class="icon-button" type="button" aria-pressed="false" aria-label="Whole threads: if any msg matches" title="Whole threads: if any msg matches" hidden>
+                <span class="whole-threads-emoji" aria-hidden="true">🧵</span>
+              </button>
+              <!--
                 `#251 author-filter`. Whose messages: everyone's, only yours, or only everyone else's,
                 in turn, as the owner asked — "filter on prompts vs agent responses (me vs them)". One
                 button that cycles, as the read mode's does, because the bar already holds the field,
@@ -365,16 +377,6 @@
                   <path class="pin-head" d="M10 3.5v6L7 13.5h10l-3-4v-6" />
                   <path d="M12 13.5v7" />
                 </svg>
-              </button>
-              <!--
-                `#1852 vibe-talk-search-whole-threads-toggle`. Whole threads, a fixed-width toggle
-                icon on this bar beside the others (it stood as an "Entire threads" chip in the
-                results bucket row since `#1825`; the owner asked for it here, as one control).
-                Off, the thread emoji stands greyed; on, a highlighted coloured circle stands
-                around it, worn from `aria-pressed` as the bar's other toggles wear theirs.
-              -->
-              <button id="search-entire-threads" class="icon-button" type="button" aria-pressed="false" aria-label="Whole threads: if any msg matches" title="Whole threads: if any msg matches" hidden>
-                <span class="whole-threads-emoji" aria-hidden="true">🧵</span>
               </button>
               <button id="search-toggle" class="icon-button" type="button" aria-label="Search messages" title="Search messages" aria-pressed="false" hidden>
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">

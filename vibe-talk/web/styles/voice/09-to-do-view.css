@@ -830,8 +830,9 @@
   margin-left: calc(-1 * var(--bar-gap));
 }
 
-/* `#1852`: Whole threads abuts Pinned the same way, on the channel where both stand. */
-#search-entire-threads {
+/* `#1852`: Whole threads stands first of the filters; the author filter abuts it
+   as it abuts Links, only while Whole threads itself stands. */
+#search-entire-threads:not([hidden]) + #author-filter {
   margin-left: calc(-1 * var(--bar-gap));
 }
 
@@ -1057,8 +1058,7 @@
    wide, it spans the bar exactly. No scrollbar is drawn, because one would add to its height and
    cover the first row; the button cut off at its end says there is more. */
 #link-kinds {
-  /* `#1852`: one more square (Whole threads) stands between Pinned and the glass. */
-  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 2.5 * var(--toggle-hit));
+  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit));
   position: absolute;
   top: calc(100% + 1px + var(--kinds-gap));
   right: var(--links-mid);

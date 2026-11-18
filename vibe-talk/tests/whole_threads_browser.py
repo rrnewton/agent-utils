@@ -84,7 +84,7 @@ def whole_handler(api: WholeApi):  # type: ignore[no-untyped-def]
     """The labels fixture's handler, plus the reply write it does not serve."""
     import json as _json
     from urllib.parse import urlsplit as _split
-    base = labels_handler(api)  # type: ignore[arg-type]
+    base = labels_handler(api)
 
     class Handler(base):  # type: ignore[valid-type, misc]
         def do_POST(self) -> None:  # noqa: N802
