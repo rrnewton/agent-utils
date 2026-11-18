@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-remove-stale-active-revision: prepared removal writes ACTIVE from a stale whole-registry state'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-17T17:42:37.000000000-05:00
-updated_at: 2026-11-17T17:42:37.000000000-05:00
+updated_at: 2026-11-18T08:28:17.000000000-05:00
+closed_at: 2026-11-18T08:28:17.000000000-05:00
 ---
 
 # Description
@@ -30,3 +31,9 @@ updated_at: 2026-11-17T17:42:37.000000000-05:00
 # Notes
 
 [watermelon-full-preview] P0, owner-priority fast track. The diff goes to the coordinator before the gate.
+
+Follow-up (separate small change, own gate): ttl-teardown passes `previous=` to `_write_active_state` with no positioned event writer, so the defence replays the log there; that path already replays via `_load_active` under the same locks, so nothing material is added, but giving it a chain-tip-positioned writer makes the tip read the only log access.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as `f1697dc388895326a9a20e7ce4ca99e5ffab4318` (replayed tip of gated `e4e7f988`; gate's only reds were two untouched steps, both green on the exclusive rerun; the replayed tree was verified with the stale-revision, prevalidated-mutation, schema-skew, Eden and batch/retire/create lock-scope suites plus the Rust append test). Under the lock, a prepared removal now advances the current log-derived state when this slot's record is unchanged, so another slot's heartbeat during salvage is preserved and the appended events continue the log; the retirement event writer is repositioned at the chain tip. `_write_active_state` refuses any passed `previous=` whose revision is not the revision the log currently ends at, read by number from the positioned writer's tip (no log load, no listing), and never writes ACTIVE from a stale state; the Rust central append refuses a stale `previous_revision` the same way. No new persisted fields: no event payload, state record, or journal field was added. The three batch-census lifecycle failures seen during landing were reproduced identically on pure main without this change and were ruled a test-setup holder-lifetime artifact on the loaded host, not a regression.
