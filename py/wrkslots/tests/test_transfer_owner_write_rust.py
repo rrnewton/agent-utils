@@ -62,7 +62,7 @@ def _repo(path: Path) -> str:
 
 
 def _dead_identity() -> dict[str, object]:
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         identity = wrkslots_cli._read_process_identity(proc.pid)
         return {
@@ -288,7 +288,7 @@ def test_transfer_live_owner_refuses(tmp_path: Path) -> None:
 
 def test_transfer_outsider_successor_refuses(tmp_path: Path) -> None:
     rust_root, oracle_root = _pair(tmp_path, _dead_identity())
-    outsider = subprocess.Popen(["sleep", "60"])
+    outsider = subprocess.Popen(["sleep", "3600"])
     try:
         with pytest.raises(Exception) as caught:
             _python(oracle_root, outsider.pid)

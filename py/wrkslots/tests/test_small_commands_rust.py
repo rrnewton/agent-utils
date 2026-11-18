@@ -362,7 +362,7 @@ def test_supersede_handoff_matches_python(tmp_path: Path) -> None:
     outputs: dict[str, tuple[int, str]] = {}
     for tag, root in (("rust", rust_root), ("oracle", oracle_root)):
         sleeper = subprocess.Popen(
-            ["sleep", "60"], cwd=root / "worktrees" / "slot-a"
+            ["sleep", "3600"], cwd=root / "worktrees" / "slot-a"
         )
         try:
             if tag == "rust":

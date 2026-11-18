@@ -55,7 +55,7 @@ def _commit(repo: Path, name: str, text: str) -> str:
 
 
 def _dead_identity() -> dict[str, object]:
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         identity = wrkslots_cli._read_process_identity(proc.pid)
         return {

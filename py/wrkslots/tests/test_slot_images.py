@@ -1255,7 +1255,7 @@ def test_wait_for_exit_uses_the_processes_found_once() -> None:
         assert slotimage._wait_for_exit([child.pid], 10)
     finally:
         child.wait()
-    lingering = subprocess.Popen(["sleep", "30"])
+    lingering = subprocess.Popen(["sleep", "3600"])
     try:
         assert not slotimage._wait_for_exit([lingering.pid], 0.2)
     finally:

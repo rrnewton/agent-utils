@@ -423,7 +423,7 @@ def test_naming_matches_read_argv_and_environ_from_proc(slot: Path) -> None:
             sys.executable,
             "-I",
             "-c",
-            "import time; time.sleep(60)",
+            "import time; time.sleep(3600)",
             str(slot),
         ],
         env={**os.environ, "TARGET_CHECKOUT": str(slot / "repo")},

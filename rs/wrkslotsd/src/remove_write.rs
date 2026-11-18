@@ -5020,7 +5020,7 @@ mod link_tests {
         let slot = slot.canonicalize().unwrap();
         let unused = unused.canonicalize().unwrap();
         let mut child = std::process::Command::new("sleep")
-            .arg("30")
+            .arg("3600")
             .current_dir(&slot)
             .spawn()
             .unwrap();

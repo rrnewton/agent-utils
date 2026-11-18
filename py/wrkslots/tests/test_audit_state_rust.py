@@ -68,7 +68,7 @@ def _repo(path: Path) -> str:
 
 
 def _dead_identity() -> dict[str, object]:
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         identity = wrkslots_cli._read_process_identity(proc.pid)
         return {
@@ -1222,7 +1222,7 @@ def _handle_identity(proc: subprocess.Popen[bytes]) -> dict[str, object]:
 
 
 def _dead_handle_identity() -> dict[str, object]:
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         return _handle_identity(proc)
     finally:
@@ -1303,7 +1303,7 @@ def test_audit_validate_live_process_run_handle_matches_python(
 ) -> None:
     root = _validate_fixture(tmp_path)
     checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         _write_run_handle(
             root,
@@ -1327,7 +1327,7 @@ def test_audit_validate_other_boot_run_handle_matches_python(
 ) -> None:
     root = _validate_fixture(tmp_path)
     checkout = root / "worktrees" / "validate" / "slot-a" / "repo"
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         identity = _handle_identity(proc)
         identity["boot_id"] = "foreign-boot"
@@ -1701,7 +1701,7 @@ def _churn_hook(
     work = tmp_path / f"churn-{tag}"
     work.mkdir()
     vanishing = subprocess.run(
-        ["/bin/sh", "-c", "setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $!"],
+        ["/bin/sh", "-c", "setsid sleep 3600 </dev/null >/dev/null 2>&1 & echo $!"],
         capture_output=True, text=True, check=True, cwd=work, timeout=30,
     ).stdout.strip()
     appeared = work / "appeared.pid"
@@ -1714,7 +1714,7 @@ def _churn_hook(
         # After a removal's path fence the checkout lives under a fenced name.
         f"d={slot}; [ -d $d ] || d=$(find {slot.parent.parent} -maxdepth 4 -type d "
         f"-name {slot.name} 2>/dev/null | head -n 1); cd \"$d\" || exit 1; "
-        f"setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {appeared}"
+        f"setsid sleep 3600 </dev/null >/dev/null 2>&1 & echo $! > {appeared}"
     )
     return hook, appeared
 
@@ -1728,7 +1728,7 @@ def _stop_appeared(appeared: Path) -> str:
 
     pid = appeared.read_text().strip()
     cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-    if cmdline[:2] == [b"sleep", b"300"]:
+    if cmdline[:2] == [b"sleep", b"3600"]:
         os.kill(int(pid), 9)
     return pid
 
@@ -1879,7 +1879,7 @@ def test_pinned_process_evidence_fails_loudly_when_a_process_uses_the_slot(
 
     slot = tmp_path / "slot"
     slot.mkdir()
-    process = subprocess.Popen(["sleep", "60"], cwd=slot)
+    process = subprocess.Popen(["sleep", "3600"], cwd=slot)
     try:
         with pytest.raises(pytest.fail.Exception, match="mark it real_process_evidence") as caught:
             wrkslots_cli._capture_process_path_census([slot])
@@ -1929,7 +1929,7 @@ def _heavy_churn_hook(base: Path, tag: str, slot: Path, *, vanishing: int) -> tu
     pids = subprocess.run(
         [
             "/bin/sh", "-c",
-            f"for i in $(seq {vanishing}); do setsid sleep 300 </dev/null >/dev/null 2>&1 & "
+            f"for i in $(seq {vanishing}); do setsid sleep 3600 </dev/null >/dev/null 2>&1 & "
             "echo $!; done",
         ],
         capture_output=True, text=True, check=True, cwd=work, timeout=60,
@@ -1941,7 +1941,7 @@ def _heavy_churn_hook(base: Path, tag: str, slot: Path, *, vanishing: int) -> tu
         f"kill -KILL {' '.join(pids)}\n"
         f"for i in $(seq {vanishing}); do setsid sleep 0.$((i % 9 + 1)) </dev/null >/dev/null 2>&1 & done\n"
         f"cd {slot} || exit 1\n"
-        f"setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {appeared}\n"
+        f"setsid sleep 3600 </dev/null >/dev/null 2>&1 & echo $! > {appeared}\n"
     )
     return f"/bin/sh {script}", appeared
 
@@ -2007,7 +2007,7 @@ def _holder_replacement_hook(base: Path, tag: str, slot: Path) -> tuple[str, Pat
     holder_file = work / "holder.pid"
     holder_file.write_text(
         subprocess.run(
-            ["/bin/sh", "-c", "setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $!"],
+            ["/bin/sh", "-c", "setsid sleep 3600 </dev/null >/dev/null 2>&1 & echo $!"],
             capture_output=True, text=True, check=True, cwd=slot, timeout=30,
         ).stdout.strip()
     )
@@ -2017,7 +2017,7 @@ def _holder_replacement_hook(base: Path, tag: str, slot: Path) -> tuple[str, Pat
         f"[ -e {work}/fired ] && exit 0; : > {work}/fired; "
         f"kill -KILL {holder}; "
         f"n=0; while [ -e /proc/{holder}/stat ] && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done; "
-        f"cd {slot} || exit 1; setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {appeared}"
+        f"cd {slot} || exit 1; setsid sleep 3600 </dev/null >/dev/null 2>&1 & echo $! > {appeared}"
     )
     return hook, appeared, holder_file
 
@@ -2057,7 +2057,7 @@ def test_audit_follows_a_matched_holder_replaced_before_its_recheck(
             holder = int(holder_file.read_text())
             with contextlib.suppress(OSError):
                 if Path(f"/proc/{holder}/cmdline").read_bytes().split(b"\0")[:2] == [
-                    b"sleep", b"300",
+                    b"sleep", b"3600",
                 ]:
                     os.kill(holder, 9)
             pid = _stop_appeared(appeared)

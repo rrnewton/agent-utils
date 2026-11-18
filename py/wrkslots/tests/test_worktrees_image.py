@@ -1746,7 +1746,7 @@ def test_migrate_refuses_a_slot_used_only_through_an_open_fd(
         lambda cfg, records: {(record.machine, record.slot, record.generation): ("dead", "gone")},
     )
     child = subprocess.Popen(
-        [sys.executable, "-c", "import time,sys; f=open(sys.argv[1],'rb'); time.sleep(60)", str(held_file)],
+        [sys.executable, "-c", "import time,sys; f=open(sys.argv[1],'rb'); time.sleep(3600)", str(held_file)],
         cwd="/tmp",
     )
     try:
@@ -2259,7 +2259,7 @@ def test_layout_census_refuses_a_live_holder_and_validation_slots(
     )
     assert imagecmd._layout_census(config, state) == [record]
 
-    holder = subprocess.Popen(["sleep", "60"], cwd=slot_path)
+    holder = subprocess.Popen(["sleep", "3600"], cwd=slot_path)
     try:
         with pytest.raises(cli.Refusal):
             imagecmd._layout_census(config, state)

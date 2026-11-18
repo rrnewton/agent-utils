@@ -297,7 +297,7 @@ def test_attested_stop_keeps_every_guard_that_protects_work(tmp_path: Path) -> N
     """A process in the slot, an unread handoff and a hold each still refuse."""
 
     project = _project(tmp_path)
-    user = subprocess.Popen(["sleep", "60"], cwd=t.checkout(project))
+    user = subprocess.Popen(["sleep", "3600"], cwd=t.checkout(project))
     try:
         refused = _attested_remove(project)
         assert refused.returncode == 3, refused.stderr

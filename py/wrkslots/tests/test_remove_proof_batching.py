@@ -339,7 +339,7 @@ def test_parent_death_signal_stops_child(tmp_path: Path) -> None:
     child_code = (
         "import sys, time; sys.path.insert(0, {d!r}); "
         "from wrkslots.cli import _install_parent_death_signal; "
-        "_install_parent_death_signal(); print('ready', flush=True); time.sleep(60)"
+        "_install_parent_death_signal(); print('ready', flush=True); time.sleep(3600)"
     ).format(d=str(py_dir))
     wrapper = tmp_path / "wrapper.py"
     wrapper.write_text(

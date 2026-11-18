@@ -1055,7 +1055,7 @@ def spawn_process_outside_coordinator() -> int:
     """Start a live same-user process whose current ancestry excludes this test."""
     launcher = (
         "import os, subprocess; "
-        "child = subprocess.Popen(['sleep', '60'], stdin=subprocess.DEVNULL, "
+        "child = subprocess.Popen(['sleep', '3600'], stdin=subprocess.DEVNULL, "
         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
         "print(os.getpid(), child.pid, flush=True)"
     )
@@ -4195,7 +4195,7 @@ def test_create_without_coordinator_authorization_is_rejected_by_parser(
 
 def test_create_binds_another_child_of_the_invoking_coordinator(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
-    owner = subprocess.Popen(["sleep", "60"], cwd=project, text=True)
+    owner = subprocess.Popen(["sleep", "3600"], cwd=project, text=True)
     try:
         created = create(project, owner_pid=owner.pid)
 
@@ -4237,7 +4237,7 @@ def delegated_create_arguments(coordinator_pid: int, owner_pid: int | None) -> l
 @pytest.mark.ordinary_environment
 def test_create_binds_owner_running_beside_its_assigned_coordinator(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
-    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    coordinator = subprocess.Popen(["sleep", "3600"], text=True)
     script = """
 import contextlib, io, json, os, sys
 from wrkslots import cli
@@ -4293,7 +4293,7 @@ def test_create_refuses_borrowed_coordinator_without_self_binding(
     tmp_path: Path, bind_unrelated_owner: bool
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
-    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    coordinator = subprocess.Popen(["sleep", "3600"], text=True)
     try:
         refused = command(
             project,
@@ -4316,7 +4316,7 @@ def test_create_refuses_borrowed_coordinator_without_self_binding(
 
 def test_create_refuses_dead_assigned_coordinator_before_mutation(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
-    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    coordinator = subprocess.Popen(["sleep", "3600"], text=True)
     terminate_process(coordinator)
 
     refused = command(
@@ -4334,7 +4334,7 @@ def test_interrupted_delegated_create_recovers_after_assigned_coordinator_exits(
     tmp_path: Path,
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
-    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    coordinator = subprocess.Popen(["sleep", "3600"], text=True)
     coordinator_identity = wrkslots._identity_to_obj(
         wrkslots._read_process_identity(coordinator.pid)
     )
@@ -4375,7 +4375,7 @@ def test_create_rechecks_assigned_coordinator_at_mutation_and_publication(
     change: str,
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
-    coordinator = subprocess.Popen(["sleep", "60"], text=True)
+    coordinator = subprocess.Popen(["sleep", "3600"], text=True)
     captured = wrkslots._read_process_identity(coordinator.pid)
     original_read = wrkslots._read_process_identity
     original_locks = wrkslots._mutation_locks
@@ -4606,7 +4606,7 @@ def test_ownerless_batch_classification_is_read_only_beside_live_dirty_create(
     before = legacy.read_bytes()
     inode = legacy.stat(follow_symlinks=False).st_ino
 
-    sibling = subprocess.Popen(["sleep", "60"], text=True)
+    sibling = subprocess.Popen(["sleep", "3600"], text=True)
     try:
         refused = command(
             project,
@@ -6196,7 +6196,7 @@ def test_frozen_validate_excludes_late_same_uid_checkout_entry(
                 " try: operation(); results.append(f\"{name}=opened\")\n"
                 " except OSError as error: results.append(f\"{name}={error.errno}\")\n"
                 "print(\",\".join(results),flush=True)\n"
-                "time.sleep(60)\n",
+                "time.sleep(3600)\n",
                 str(guard),
                 str(payload),
                 str(guard.with_name(f"{guard.name}.renamed")),
@@ -6283,7 +6283,7 @@ def test_frozen_validate_sealed_guard_fd_cannot_open_late_payload(
                     "except OSError as error: results.append(f\"openat={error.errno}\")\n"
                     "else: results.append(\"openat=opened\")\n"
                     "print(\",\".join(results),flush=True)\n"
-                    "time.sleep(60)\n",
+                    "time.sleep(3600)\n",
                     str(guard),
                 ],
                 text=True,
@@ -6850,7 +6850,7 @@ def test_frozen_validate_detects_pre_exclusion_same_uid_holder_and_rolls_back(
                 sys.executable,
                 "-c",
                 "import os,sys,time; os.chdir(sys.argv[1]); "
-                "print(os.getcwd(), flush=True); time.sleep(60)",
+                "print(os.getcwd(), flush=True); time.sleep(3600)",
                 str(fenced),
             ],
             text=True,
@@ -10110,7 +10110,7 @@ def test_recover_ownerless_validate_checkout_refuses_live_or_authored_work(
     assert target.is_dir()
     (target / "authored.txt").unlink()
 
-    owner = subprocess.Popen(["sleep", "60"], cwd=target, text=True)
+    owner = subprocess.Popen(["sleep", "3600"], cwd=target, text=True)
     try:
         live = command(
             project,
@@ -11701,7 +11701,7 @@ def test_ownerless_cleanup_refuses_linked_checkout_or_rolls_back_cache_after_fen
     journal_path = control_directory(project) / "ACTIVE.testhost.journal"
     journal = json.loads(journal_path.read_text())
     fenced = project / journal["fenced"]
-    holder = subprocess.Popen(["sleep", "60"], cwd=fenced, text=True)
+    holder = subprocess.Popen(["sleep", "3600"], cwd=fenced, text=True)
     try:
         refused = raw_command(
             project, "recover", "--coordinator-pid", str(os.getpid())
@@ -12157,7 +12157,7 @@ def test_lock_conflict_refuses_without_state_change(tmp_path: Path) -> None:
             f"subject = Path({str(project / 'worktrees' / 'ACTIVE')!r})",
             "with wrkslots._locked(subject, exclusive=True, wait_seconds=0):",
             "    print('locked', flush=True)",
-            "    time.sleep(60)",
+            "    time.sleep(3600)",
         )
     )
     holder = subprocess.Popen(
@@ -12198,7 +12198,7 @@ def test_lock_conflict_under_json_format_prints_a_json_refusal(tmp_path: Path) -
             f"subject = Path({str(project / 'worktrees' / 'ACTIVE')!r})",
             "with wrkslots._locked(subject, exclusive=True, wait_seconds=0):",
             "    print('locked', flush=True)",
-            "    time.sleep(60)",
+            "    time.sleep(3600)",
         )
     )
     holder = subprocess.Popen(
@@ -15187,7 +15187,7 @@ def test_destructive_recover_still_refuses_nonancestor_coordinator(
     assert interrupted.returncode == 86
     journal = create_journal_path(project)
     before = journal.read_bytes()
-    sibling = subprocess.Popen(["sleep", "60"], text=True)
+    sibling = subprocess.Popen(["sleep", "3600"], text=True)
     try:
         refused = command(
             project,
@@ -15638,7 +15638,7 @@ def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
                     sys.executable,
                     "-c",
                     "import os,sys,time; os.chdir(sys.argv[1]); "
-                    "print(os.getcwd(), flush=True); time.sleep(60)",
+                    "print(os.getcwd(), flush=True); time.sleep(3600)",
                     str(checkout(project)),
                 ],
                 text=True,
@@ -18447,7 +18447,7 @@ def _hold_configuration_lock_in_another_process(project: Path) -> subprocess.Pop
             f"config = Path({str(project / '.wrkslots.yml')!r})",
             "with wrkslots._locked_config(config, 0):",
             "    print('locked', flush=True)",
-            "    time.sleep(60)",
+            "    time.sleep(3600)",
         )
     )
     holder = subprocess.Popen(
@@ -19076,7 +19076,7 @@ def test_validate_complete_still_refuses_live_owner_from_shared_cgroup(
     made = create(project, slot_type="validate", branch=None)
     assert made.returncode == 0, made.stderr
     tree = checkout(project, slot_type="validate")
-    owner = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    owner = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
     try:
         replace_owner(project, wrkslots._read_process_identity(owner.pid))
         set_liveness(project, "dead")
@@ -19111,7 +19111,7 @@ def test_validate_complete_still_refuses_live_path_use_after_owner_dies(
     tree = checkout(project, slot_type="validate")
     mark_owner_dead_in_current_cgroup(project)
     set_liveness(project, "dead")
-    user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    user = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
     try:
         refused = command(
             project,
@@ -20548,7 +20548,7 @@ def test_recover_continues_past_a_refused_paired_slot(
     _kill_grouped_batch_after_prepare(project, monkeypatch, slots)
     config = wrkslots._load_config(str(project), "testhost")
     fenced02 = next(slot_paths["slot02"].parent.glob(".slot02.fenced.*"))
-    user = subprocess.Popen(["sleep", "60"], cwd=fenced02, text=True)
+    user = subprocess.Popen(["sleep", "3600"], cwd=fenced02, text=True)
 
     def same_uid(
         paths: Sequence[Path], *, budget: wrkslots._ReadOnlyCommandBudget
@@ -20618,7 +20618,7 @@ def test_grouped_batch_rechecks_later_slot_after_grouped_census(
         nonlocal user
         if point == "after-validate-batch-grouped-census":
             fenced02 = next(slot_paths["slot02"].parent.glob(".slot02.fenced.*"))
-            user = subprocess.Popen(["sleep", "60"], cwd=fenced02, text=True)
+            user = subprocess.Popen(["sleep", "3600"], cwd=fenced02, text=True)
 
     monkeypatch.setattr(
         wrkslots, "_capture_same_uid_process_path_census", same_uid
@@ -22835,7 +22835,7 @@ def test_validate_batch_rechecks_later_slot_use_after_shared_census(
     def enter_at_final_path_fence(source: os.PathLike[str], target: os.PathLike[str]) -> None:
         nonlocal late_user
         if Path(source) == paths["late-use"]:
-            late_user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+            late_user = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
         real_rename(source, target)
 
     monkeypatch.setattr(
@@ -23893,7 +23893,7 @@ def test_validate_batch_recovery_refusal_restores_sealed_mode(
     config = wrkslots._load_config(str(project), "testhost")
     seal_journal = wrkslots._validate_batch_seal_journal_path(config)
     assert seal_journal.is_file()
-    user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    user = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
     try:
         refused = raw_command_with_census_authority_stub(
             project,
@@ -27129,7 +27129,7 @@ def test_supersede_handoff_rebinds_a_live_lane_and_voids_the_queue_entry(
     ]
 
     slot_dir = checkout(project).parent
-    successor = subprocess.Popen(["sleep", "60"], cwd=slot_dir)
+    successor = subprocess.Popen(["sleep", "3600"], cwd=slot_dir)
     try:
         code = wrkslots.main(
             [
@@ -27194,7 +27194,7 @@ def test_supersede_handoff_refuses_without_coordinator_authorization(
     project, _repository, _remote = make_project(tmp_path)
     _queue_a_dead_owner_candidate(project)
     slot_dir = checkout(project).parent
-    successor = subprocess.Popen(["sleep", "60"], cwd=slot_dir)
+    successor = subprocess.Popen(["sleep", "3600"], cwd=slot_dir)
     try:
         result = raw_command(
             project,
@@ -27223,7 +27223,7 @@ def test_supersede_handoff_refuses_an_owner_that_does_not_use_the_slot(
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
     _queue_a_dead_owner_candidate(project)
-    successor = subprocess.Popen(["sleep", "60"], cwd=tmp_path)
+    successor = subprocess.Popen(["sleep", "3600"], cwd=tmp_path)
     try:
         result = raw_command(
             project,
@@ -27254,7 +27254,7 @@ def test_supersede_handoff_refuses_a_slot_with_no_handoff_read_entry(
     project, _repository, _remote = make_project(tmp_path)
     assert create(project).returncode == 0
     slot_dir = checkout(project).parent
-    successor = subprocess.Popen(["sleep", "60"], cwd=slot_dir)
+    successor = subprocess.Popen(["sleep", "3600"], cwd=slot_dir)
     try:
         result = raw_command(
             project,
@@ -29154,7 +29154,7 @@ def test_host_context_recover_rejects_invalid_handoff_before_mutation(
         elif mutation == "unrelated-runner":
             monkeypatch.setenv("WRKSLOTS_REMOVE_RUNNER_PID", str(coordinator.pid))
         elif mutation == "unrelated-writer":
-            other = subprocess.Popen(["sleep", "60"], text=True)
+            other = subprocess.Popen(["sleep", "3600"], text=True)
             identity = wrkslots._read_process_identity(other.pid)
             set_host_context_handoff(monkeypatch, identity, proof_fd)
         else:
@@ -29406,7 +29406,7 @@ def test_host_context_runner_must_be_in_invoking_ancestry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sibling = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(120)"],
+        [sys.executable, "-c", "import time; time.sleep(3600)"],
         text=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -29635,7 +29635,7 @@ def test_host_context_runner_refuses_live_nonancestor_validate_owner(
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
     coordinator = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(120)"],
+        [sys.executable, "-c", "import time; time.sleep(3600)"],
         text=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -29762,7 +29762,7 @@ def test_remove_unrelated_pane_does_not_block_recordless_removal(
     slot does not veto removal of a recordless agent slot with storage."""
 
     project, _repository, _remote = prepared_removable_slot(tmp_path)
-    bystander = subprocess.Popen(["sleep", "60"], cwd=tmp_path, text=True)
+    bystander = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         removed = remove(project)
     finally:
@@ -29778,7 +29778,7 @@ def test_remove_pane_with_cwd_in_slot_blocks_naming_pid(tmp_path: Path) -> None:
     removal, and the refusal names that process."""
 
     project, _repository, _remote = prepared_removable_slot(tmp_path)
-    user = subprocess.Popen(["sleep", "60"], cwd=checkout(project), text=True)
+    user = subprocess.Popen(["sleep", "3600"], cwd=checkout(project), text=True)
     try:
         refused = remove(project)
     finally:
@@ -30300,7 +30300,7 @@ def test_adopt_refuses_pid_outside_invoking_process_ancestry(tmp_path: Path) -> 
     project, _repository, _remote = make_project(tmp_path)
     made = create(project, bind_owner=False)
     assert made.returncode == 0, made.stderr
-    sleeper = subprocess.Popen(["sleep", "60"], text=True)
+    sleeper = subprocess.Popen(["sleep", "3600"], text=True)
     try:
         refused = command(
             project,
@@ -30328,7 +30328,7 @@ def test_remove_refuses_live_process_using_slot(tmp_path: Path) -> None:
     made = create(project)
     assert made.returncode == 0, made.stderr
     tree = checkout(project)
-    sleeper = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    sleeper = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
     try:
         commit_task(repository, tree, "codex/task")
         handed_off = finish(project)
@@ -30478,7 +30478,7 @@ def test_import_existing_registers_coordinator_child_using_the_slot(
     tree = checkout(project)
     tree.parent.mkdir()
     git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
-    owner = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    owner = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
     try:
         applied = command(
             project,
@@ -30517,7 +30517,7 @@ def test_import_existing_refuses_coordinator_child_not_using_the_slot(
     tree = checkout(project)
     tree.parent.mkdir()
     git(repository, "worktree", "add", "-b", "codex/imported", str(tree), "origin/main")
-    owner = subprocess.Popen(["sleep", "60"], cwd=project, text=True)
+    owner = subprocess.Popen(["sleep", "3600"], cwd=project, text=True)
     try:
         refused = command(
             project,
@@ -34733,7 +34733,7 @@ def test_abort_create_empty_admin_prune_refuses_live_directory_holder(
             if kind == "cwd"
             else "descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY); "
         )
-        + "print('ready', flush=True); time.sleep(300)"
+        + "print('ready', flush=True); time.sleep(3600)"
     )
     holder = subprocess.Popen(
         [sys.executable, "-c", script, str(target)],
@@ -34783,7 +34783,7 @@ def test_abort_create_empty_admin_recheck_catches_late_holder(
                     sys.executable,
                     "-c",
                     "import os, sys, time; os.chdir(sys.argv[1]); "
-                    "print('ready', flush=True); time.sleep(300)",
+                    "print('ready', flush=True); time.sleep(3600)",
                     str(target),
                 ],
                 stdout=subprocess.PIPE,
@@ -35536,7 +35536,7 @@ def fake_gate_admission(
 ) -> tuple[dict[str, str], subprocess.Popen[str]]:
     """A live process in ``cwd`` named by a fake gate admission ticket."""
 
-    sleeper = subprocess.Popen(["sleep", "60"], cwd=cwd, text=True)
+    sleeper = subprocess.Popen(["sleep", "3600"], cwd=cwd, text=True)
     admission = tmp_path / "gate-admission"
     folder = admission / ("queue" if queued else "runs")
     folder.mkdir(parents=True)
@@ -35671,7 +35671,7 @@ def _idle_child(cwd: Path, *words: str) -> subprocess.Popen[bytes]:
     """A sleeping child in ``cwd`` whose command line carries ``words``."""
 
     return subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(120)", *words],
+        [sys.executable, "-c", "import time; time.sleep(3600)", *words],
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -39623,7 +39623,7 @@ def test_agent_remove_verifies_an_existing_local_archive_before_the_lock(
     set_liveness(project, "dead")
     # A process still using the slot: removal makes and checks the bundle
     # before the lock, then refuses under it.
-    user = subprocess.Popen(["sleep", "60"], cwd=tree, text=True)
+    user = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
     try:
         refused = remove(project)
     finally:
@@ -42450,7 +42450,7 @@ def test_recover_absent_agent_row_archives_when_liveness_unverifiable_and_nothin
         b"",
         2,
     )
-    bystander = subprocess.Popen(["sleep", "60"], cwd=tmp_path, text=True)
+    bystander = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         monkeypatch.setattr(
             wrkslots,
@@ -42493,7 +42493,7 @@ def test_recover_absent_agent_row_refuses_when_a_process_references_the_absent_s
         b"",
         2,
     )
-    user = subprocess.Popen(["sleep", "60"], cwd=tmp_path, text=True)
+    user = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         config = wrkslots._load_config(str(project), "testhost")
         slot_path = wrkslots._slot_directory(config, record.slot, "agent")
@@ -52578,7 +52578,7 @@ def test_host_context_recover_resumes_an_absent_validate_batch_outside_the_coord
         with pytest.raises(wrkslots.Refusal, match="not in the invoking process ancestry"):
             wrkslots._assert_caller_process(identity, "coordinator")
         if handoff == "unrelated-writer":
-            unrelated = subprocess.Popen(["sleep", "60"], text=True)
+            unrelated = subprocess.Popen(["sleep", "3600"], text=True)
             identity = wrkslots._read_process_identity(unrelated.pid)
         set_host_context_handoff(monkeypatch, identity, proof_fd)
         capsys.readouterr()
@@ -58587,7 +58587,7 @@ def test_owner_consented_release_removes_a_live_owners_read_handoff_slot(
     # The consenting owner is alive by definition, and so is the rest of its
     # session. A live process sharing the owner's cgroup that touches nothing in
     # the slot must not block the release; only direct use does.
-    sibling = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    sibling = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         assert (
             wrkslots._read_process_identity(sibling.pid).cgroup_path == owner.cgroup_path
@@ -58694,7 +58694,7 @@ def test_owner_consented_release_refuses_a_handoff_by_a_different_owner(
 ) -> None:
     project, _digest = _owner_consent_ready(tmp_path)
     writer = wrkslots._read_process_identity(os.getpid())
-    successor = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    successor = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         successor_identity = wrkslots._read_process_identity(successor.pid)
         replace_owner(project, successor_identity)
@@ -58845,7 +58845,7 @@ def test_owner_consented_release_still_refuses_a_process_using_the_checkout(
 ) -> None:
     project, _digest = _owner_consent_ready(tmp_path)
     tree = checkout(project)
-    user = subprocess.Popen(["sleep", "600"], cwd=tree, text=True)
+    user = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
     try:
         refused = remove(project)
 
@@ -59142,7 +59142,7 @@ def test_owner_release_lets_remove_proceed_while_the_owner_lives(tmp_path: Path)
     # The owner is alive, its heartbeat is fresh and the registered liveness
     # authority reports it alive. A live process in the owner's cgroup that
     # touches nothing in the slot does not block; only direct use does.
-    sibling = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    sibling = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         assert (
             wrkslots._read_process_identity(sibling.pid).cgroup_path == owner.cgroup_path
@@ -59214,7 +59214,7 @@ def test_owner_release_refuses_every_caller_but_the_exact_owner(tmp_path: Path) 
     _write_owner_handoff(project, tmp_path)
     tail = "state: REFUSED -- the slot was not released and its owner still holds it."
 
-    stranger = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    stranger = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         # A process that is not the caller's ancestor cannot be named as owner.
         outsider = _release(project, pid=stranger.pid)
@@ -59386,7 +59386,7 @@ def test_remove_after_owner_release_refuses_the_owners_process_in_the_slot(
     project, _digest = _owner_release_ready(tmp_path)
     tree = checkout(project)
     # A child of the owner (this test process) still working in the checkout.
-    child = subprocess.Popen(["sleep", "600"], cwd=tree, text=True)
+    child = subprocess.Popen(["sleep", "3600"], cwd=tree, text=True)
     try:
         refused = remove(project)
 
@@ -59594,7 +59594,7 @@ def test_owner_release_is_void_after_a_renewed_heartbeat_or_a_new_owner(
     assert _status_rows(project)["slot01"]["owner_release"]["state"] == "released"  # type: ignore[index]
 
     # A different owner process generation is not the one that released.
-    successor = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    successor = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         replace_owner(project, wrkslots._read_process_identity(successor.pid))
         row = _status_rows(project)["slot01"]
@@ -59942,7 +59942,7 @@ def test_remove_agent_batch_refuses_only_the_slot_a_live_process_uses(
 ) -> None:
     project, _repository, slots = dead_agent_batch_project(tmp_path)
     held = checkout(project, "slot02")
-    sleeper = subprocess.Popen(["sleep", "60"], cwd=held, text=True)
+    sleeper = subprocess.Popen(["sleep", "3600"], cwd=held, text=True)
     try:
         result = remove_agent_batch(project, slots)
     finally:
@@ -59983,7 +59983,7 @@ def test_remove_agent_batch_shared_census_catches_use_through_an_outside_hardlin
             sys.executable,
             "-c",
             "import sys, time; handle = open(sys.argv[1]); "
-            "print('ready', flush=True); time.sleep(60)",
+            "print('ready', flush=True); time.sleep(3600)",
             str(alias),
         ],
         cwd=tmp_path,
@@ -60020,7 +60020,7 @@ def test_remove_agent_batch_fresh_scan_catches_a_process_that_starts_after_the_c
 
     def start_late_entrant(point: str) -> None:
         if point == "after-agent-batch-shared-census" and not late:
-            late.append(subprocess.Popen(["sleep", "60"], cwd=held, text=True))
+            late.append(subprocess.Popen(["sleep", "3600"], cwd=held, text=True))
         original(point)
 
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", start_late_entrant)
@@ -60084,7 +60084,7 @@ def test_remove_agent_batch_checks_the_fenced_path_by_identity_before_deleting(
                     sys.executable,
                     "-c",
                     "import sys, time; handle = open(sys.argv[1]); "
-                    "print('ready', flush=True); time.sleep(60)",
+                    "print('ready', flush=True); time.sleep(3600)",
                     str(alias),
                 ],
                 cwd=tmp_path,
@@ -60165,7 +60165,7 @@ def test_remove_agent_batch_checks_the_fenced_path_against_other_mount_namespace
                     "--mount",
                     "sh",
                     "-c",
-                    'mount --bind "$1" "$2" && cd "$2" && echo ready && exec sleep 60',
+                    'mount --bind "$1" "$2" && cd "$2" && echo ready && exec sleep 3600',
                     "sh",
                     str(fenced),
                     str(alias),
@@ -60232,7 +60232,7 @@ def test_remove_agent_batch_stops_and_names_recover_when_an_item_leaves_its_jour
     def hold_fenced_slot(point: str) -> None:
         fenced = fenced_slot_path(project, "slot02")
         if point == "after-path-fence" and fenced is not None and not holders:
-            holders.append(subprocess.Popen(["sleep", "60"], cwd=fenced, text=True))
+            holders.append(subprocess.Popen(["sleep", "3600"], cwd=fenced, text=True))
         original(point)
 
     def failing_rollback(*_args: object, **_kwargs: object) -> None:
@@ -61461,7 +61461,7 @@ def test_remove_finds_a_use_that_began_during_its_lock_wait(
     ) -> Iterator[None]:
         if scanned and not entered:
             entered.append(
-                subprocess.Popen(["sleep", "300"], cwd=tree, start_new_session=True)
+                subprocess.Popen(["sleep", "3600"], cwd=tree, start_new_session=True)
             )
         with real_locks(
             config,
@@ -61581,7 +61581,7 @@ def start_bind_alias_holder(
             "--mount",
             "sh",
             "-c",
-            f'mount --bind "$1" "$2" && cd "$2"{detached} && echo ready && exec sleep 60',
+            f'mount --bind "$1" "$2" && cd "$2"{detached} && echo ready && exec sleep 3600',
             "sh",
             str(target),
             str(alias),
@@ -62251,9 +62251,9 @@ def test_agent_batch_fenced_scan_matches_paths_and_hard_links_by_identity(
     holders: list[subprocess.Popen[str]] = []
     opener = (
         "import sys, time; handle = open(sys.argv[1]); "
-        "print('ready', flush=True); time.sleep(60)"
+        "print('ready', flush=True); time.sleep(3600)"
     )
-    idler = "import time; print('ready', flush=True); time.sleep(60)"
+    idler = "import time; print('ready', flush=True); time.sleep(3600)"
     try:
         through_alias = start_ready_holder(opener, alias, cwd=tmp_path, holders=holders)
         inside = start_ready_holder(idler, cwd=fenced / "sub", holders=holders)
@@ -62297,7 +62297,7 @@ def test_agent_batch_fenced_scan_matches_a_socket_bound_before_the_fence(
         try:
             holder = start_ready_holder(
                 "import socket, sys, time; s = socket.socket(socket.AF_UNIX); "
-                "s.bind(sys.argv[1]); s.listen(); print('ready', flush=True); time.sleep(60)",
+                "s.bind(sys.argv[1]); s.listen(); print('ready', flush=True); time.sleep(3600)",
                 canonical / "agent.sock",
                 cwd=tmp_path,
                 holders=holders,
@@ -62341,7 +62341,7 @@ def mapping_only_holder(
             assert address not in (None, ctypes.c_void_p(-1).value)
             os.close(fd)
             print("ready", flush=True)
-            time.sleep(60)
+            time.sleep(3600)
             """
         ),
         target,
@@ -62669,7 +62669,7 @@ def start_unlinked_file_holder(
             "sh",
             "-c",
             'mount --bind "$1" "$2" && exec 3>"$2/held-unlinked" && rm "$2/held-unlinked" '
-            '&& umount -l "$2" && echo ready && exec sleep 60',
+            '&& umount -l "$2" && echo ready && exec sleep 3600',
             "sh",
             str(target),
             str(alias),
@@ -63076,7 +63076,7 @@ def test_remove_agent_batch_falls_back_to_lsof_when_the_fenced_scan_cannot_decid
         ):
             start_ready_holder(
                 "import sys, time; handle = open(sys.argv[1]); "
-                "print('ready', flush=True); time.sleep(60)",
+                "print('ready', flush=True); time.sleep(3600)",
                 alias,
                 cwd=tmp_path,
                 holders=holders,
@@ -63393,7 +63393,7 @@ def test_remove_agent_batch_member_scans_alone_once_its_group_scan_is_stale(
             assert fenced is not None
             holders.append(start_ready_holder(
                 "import sys, time; handle = open(sys.argv[1]); "
-                "print('ready', flush=True); time.sleep(120)",
+                "print('ready', flush=True); time.sleep(3600)",
                 fenced / held_relative, cwd=tmp_path, holders=[],
             ))
         elif point == "after-agent-batch-item":
@@ -63440,7 +63440,7 @@ def test_remove_agent_batch_member_refused_before_its_fence_leaves_the_group(
     """
 
     project, _repository, slots = dead_agent_batch_project(tmp_path)
-    holder = subprocess.Popen(["sleep", "120"], cwd=checkout(project, "slot02"), text=True)
+    holder = subprocess.Popen(["sleep", "3600"], cwd=checkout(project, "slot02"), text=True)
     try:
         returncode, payload, stderr = in_process_agent_batch(project, slots)
     finally:
@@ -63864,7 +63864,7 @@ def test_remove_agent_batch_honors_a_live_owners_release_like_remove(
     assert released.returncode == 0, released.stderr
     _read_owner_handoff(project)
     owner = wrkslots._read_process_identity(os.getpid())
-    sibling = subprocess.Popen(["sleep", "600"], cwd=tmp_path, text=True)
+    sibling = subprocess.Popen(["sleep", "3600"], cwd=tmp_path, text=True)
     try:
         assert (
             wrkslots._read_process_identity(sibling.pid).cgroup_path == owner.cgroup_path
@@ -68187,7 +68187,7 @@ def test_agent_remove_refuses_a_process_that_enters_after_its_unlocked_scan(
         record: wrkslots.ActiveRecord,
     ) -> None:
         entered.append(
-            subprocess.Popen(["sleep", "300"], cwd=tree, start_new_session=True)
+            subprocess.Popen(["sleep", "3600"], cwd=tree, start_new_session=True)
         )
         real_recheck(config, agent_batch, record)
 

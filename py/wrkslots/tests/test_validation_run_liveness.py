@@ -1878,7 +1878,7 @@ def _handoff_process(
     """
 
     child = subprocess.Popen(
-        ["sleep", "300"],
+        ["sleep", "3600"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -2329,7 +2329,7 @@ def _real_run_process(host: _RealHost) -> Iterator[_RunProcess]:
     """Record a live child as the run's process generation in its handle."""
 
     child = subprocess.Popen(
-        ["sleep", "300"],
+        ["sleep", "3600"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

@@ -76,7 +76,7 @@ def _holder(path: Path) -> subprocess.Popen[str]:
             "import os, sys, time\n"
             "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
             "print('ready', flush=True)\n"
-            "time.sleep(60)\n",
+            "time.sleep(3600)\n",
             str(path),
         ],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -157,7 +157,7 @@ def _fd_holder(path: Path) -> tuple[subprocess.Popen[str], int]:
             "import os, sys, time\n"
             "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
             "print(fd, flush=True)\n"
-            "time.sleep(60)\n",
+            "time.sleep(3600)\n",
             str(path),
         ],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

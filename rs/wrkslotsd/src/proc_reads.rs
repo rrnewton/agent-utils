@@ -426,7 +426,7 @@ pub(crate) mod test_support {
     /// A child whose working directory is in the slot.
     pub(crate) fn in_cwd(slot: &Slot) -> Child {
         let child = Command::new("sleep")
-            .arg("600")
+            .arg("3600")
             .current_dir(&slot.slot)
             .stdin(Stdio::null())
             .spawn()
@@ -441,7 +441,7 @@ pub(crate) mod test_support {
         std::fs::write(&file, b"x").unwrap();
         let child = Command::new("sh")
             .arg("-c")
-            .arg("exec sleep 600 3<\"$0\"")
+            .arg("exec sleep 3600 3<\"$0\"")
             .arg(&file)
             .current_dir(&slot.outside)
             .stdin(Stdio::null())
@@ -465,7 +465,7 @@ pub(crate) mod test_support {
             .unwrap();
         assert!(copied.success());
         let child = Command::new(&program)
-            .arg("600")
+            .arg("3600")
             .current_dir(&slot.outside)
             .stdin(Stdio::null())
             .spawn()

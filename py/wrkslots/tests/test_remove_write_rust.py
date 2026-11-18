@@ -71,7 +71,7 @@ def _repo(path: Path) -> str:
 
 
 def _dead_identity() -> dict[str, object]:
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         identity = wrkslots_cli._read_process_identity(proc.pid)
         return {
@@ -348,7 +348,7 @@ if mode == "read":
         adopt_legacy_change=False, expected_generation=None,
         wait_lock=0.0)) == 0
 Path(done).write_text("done")
-time.sleep(60)
+time.sleep(3600)
 """
 
 
@@ -708,7 +708,7 @@ def test_remove_pane_process_in_slot_refuses(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     (rust_root / "live.py").write_text(PANE_VERDICT_SCRIPT)
     user = subprocess.Popen(
-        ["sleep", "60"], cwd=rust_root / "worktrees" / "slot-a" / "repo", text=True
+        ["sleep", "3600"], cwd=rust_root / "worktrees" / "slot-a" / "repo", text=True
     )
     try:
         result = _rust_remove(rust_root)
@@ -1241,7 +1241,7 @@ os.chroot(slot)
 os.fchdir(away)
 os.close(away)
 print("ready", flush=True)
-time.sleep(600)
+time.sleep(3600)
 """
 _MAP_ONLY_CHILD = """
 import ctypes, os, sys, time
@@ -1259,7 +1259,7 @@ os.close(fd)
 os.unlink(held)
 os.chdir(outside)
 print("ready", flush=True)
-time.sleep(600)
+time.sleep(3600)
 """
 
 

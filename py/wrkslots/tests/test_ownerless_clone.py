@@ -383,7 +383,7 @@ def test_refuses_live_process_inside_the_clone(
     project, remote, clone = make_clone(tmp_path)
     allow_test_host(monkeypatch, processes=True)
     holder = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)"], cwd=clone
+        [sys.executable, "-c", "import time; time.sleep(3600)"], cwd=clone
     )
     try:
         assert run_clone(project, clone, remote) == 3

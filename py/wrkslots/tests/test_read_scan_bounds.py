@@ -61,7 +61,7 @@ def _registry(base: Path, slots: int) -> Path:
     _git(base, "init", "-q", "--bare", "-b", "main", str(remote))
     _git(upstream, "remote", "add", "origin", str(remote))
     _git(upstream, "push", "-q", "origin", "main")
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         identity_obj = wrkslots_cli._read_process_identity(proc.pid)
         identity = {
@@ -404,7 +404,7 @@ def test_scan_memory_limit_applies_an_address_space_cap(
 def test_handoff_publication_parses_each_historical_record_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    proc = subprocess.Popen(["sleep", "30"])
+    proc = subprocess.Popen(["sleep", "3600"])
     try:
         owner = wrkslots_cli._read_process_identity(proc.pid)
     finally:

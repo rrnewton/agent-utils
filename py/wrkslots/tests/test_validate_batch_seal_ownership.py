@@ -120,7 +120,7 @@ def test_concurrent_remove_leaves_the_running_invocations_seal(
             [
                 sys.executable,
                 "-c",
-                "import time; time.sleep(120)",
+                "import time; time.sleep(3600)",
                 "-m",
                 "wrkslots",
                 "--project-root",
@@ -364,7 +364,7 @@ def test_seal_whose_target_was_reaped_does_not_deadlock_absent_row_recovery(
         # interpreter behind as an orphan when only the launcher is killed.
         operator = subprocess.Popen(
             [
-                sys.executable, "-c", "import time; time.sleep(120)",
+                sys.executable, "-c", "import time; time.sleep(3600)",
                 "-m", "wrkslots", "--project-root", str(project), "remove",
                 "target" if sealer == "live-with-wrkslots-operator" else "other-slot",
             ]
@@ -473,7 +473,7 @@ def test_host_context_recover_retires_a_seal_from_a_coordinator_outside_its_ance
         with pytest.raises(wrkslots.Refusal, match="not in the invoking process ancestry"):
             wrkslots._assert_caller_process(identity, "coordinator")
         if handoff == "unrelated-writer":
-            unrelated = subprocess.Popen(["sleep", "60"], text=True)
+            unrelated = subprocess.Popen(["sleep", "3600"], text=True)
             identity = wrkslots._read_process_identity(unrelated.pid)
         set_host_context_handoff(monkeypatch, identity, proof_fd)
         capsys.readouterr()
@@ -580,7 +580,7 @@ def test_a_dead_actors_seal_is_retired_by_the_next_create(
     if actor == "earlier-boot":
         _rewrite_actor(seal, boot_id="00000000-0000-4000-8000-000000000000")
     elif actor == "exited":
-        child = subprocess.Popen(["sleep", "60"])
+        child = subprocess.Popen(["sleep", "3600"])
         try:
             exited = wrkslots._read_process_identity(child.pid)
         finally:
@@ -1035,7 +1035,7 @@ def test_adopt_names_a_live_seal_as_in_progress_without_suggesting_recover(
         [
             sys.executable,
             "-c",
-            "import time; time.sleep(120)",
+            "import time; time.sleep(3600)",
             "-m",
             "wrkslots",
             "--project-root",
@@ -1257,7 +1257,7 @@ def test_adopt_wait_stops_when_the_batch_dies_mid_wait(
         [
             sys.executable,
             "-c",
-            "import time; time.sleep(120)",
+            "import time; time.sleep(3600)",
             "-m",
             "wrkslots",
             "--project-root",
@@ -1318,7 +1318,7 @@ def test_zombie_and_reused_pid_operators_are_dead_not_live(
 
     project, _target, seal, _original = _crashed_seal(tmp_path, monkeypatch)
     sleeper = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(120)"]
+        [sys.executable, "-c", "import time; time.sleep(3600)"]
     )
     try:
         _rewrite_operator(seal, sleeper.pid)
@@ -1333,7 +1333,7 @@ def test_zombie_and_reused_pid_operators_are_dead_not_live(
 
         # Zombie: the recorded generation exited and awaits reaping.
         zombie = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(120)"]
+            [sys.executable, "-c", "import time; time.sleep(3600)"]
         )
         try:
             _rewrite_operator(seal, zombie.pid)
@@ -1528,7 +1528,7 @@ def test_recover_refuses_a_seal_whose_batch_is_still_running(
         [
             sys.executable,
             "-c",
-            "import time; time.sleep(120)",
+            "import time; time.sleep(3600)",
             "-m",
             "wrkslots",
             "--project-root",

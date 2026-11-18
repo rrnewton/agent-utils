@@ -86,7 +86,7 @@ def test_a_live_owner_a_wrong_agent_or_generation_and_an_outside_successor_are_r
 ) -> None:
     project, _repository, _remote = make_project(tmp_path)
     assert create(project).returncode == 0
-    sleeper = subprocess.Popen(["sleep", "60"], text=True)
+    sleeper = subprocess.Popen(["sleep", "3600"], text=True)
     try:
         live = transfer(project, sleeper.pid)
         assert live.returncode == 3 and "owner is live" in live.stderr, live.stderr

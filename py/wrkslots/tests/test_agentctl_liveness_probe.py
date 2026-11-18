@@ -50,7 +50,7 @@ def exited_identity() -> dict[str, object]:
 def pane_holder() -> Iterator[str]:
     pane = f"wTEST:p{os.getpid()}"
     env = dict(os.environ, HERDR_PANE_ID=pane)
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], env=env)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)"], env=env)
     try:
         yield pane
     finally:

@@ -1680,7 +1680,7 @@ def _settled(child: subprocess.Popen[bytes], entry: str, target: Path) -> subpro
 
 
 def _in_cwd(slot: _GoneSlot) -> subprocess.Popen[bytes]:
-    child = subprocess.Popen(["sleep", "600"], cwd=slot.slot, stdin=subprocess.DEVNULL)
+    child = subprocess.Popen(["sleep", "3600"], cwd=slot.slot, stdin=subprocess.DEVNULL)
     return _settled(child, "cwd", slot.slot)
 
 
@@ -1688,7 +1688,7 @@ def _holding_fd(slot: _GoneSlot) -> subprocess.Popen[bytes]:
     held = slot.slot / "held"
     held.write_bytes(b"x")
     child = subprocess.Popen(
-        ["sh", "-c", 'exec sleep 600 3<"$0"', str(held)],
+        ["sh", "-c", 'exec sleep 3600 3<"$0"', str(held)],
         cwd=slot.outside, stdin=subprocess.DEVNULL,
     )
     return _settled(child, "fd/3", held)
@@ -2110,7 +2110,7 @@ os.chroot(slot)
 os.fchdir(away)
 os.close(away)
 print("ready", flush=True)
-time.sleep(600)
+time.sleep(3600)
 """
 
 
@@ -2219,7 +2219,7 @@ import socket, sys, time
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 server.bind(sys.argv[1])
 print("ready", flush=True)
-time.sleep(600)
+time.sleep(3600)
 """
 
 _TWO_TREES_CHILD = """
@@ -2227,7 +2227,7 @@ import os, sys, time
 held = open(sys.argv[2], "rb")
 os.chdir(sys.argv[1])
 print("ready", flush=True)
-time.sleep(600)
+time.sleep(3600)
 """
 
 

@@ -85,7 +85,7 @@ def test_remove_waits_for_a_live_finish_journal_then_proceeds(tmp_path: Path) ->
 
     with _own_fs(tmp_path) as base:
         root = _fixture(base)
-        sleeper = subprocess.Popen(["sleep", "120"])
+        sleeper = subprocess.Popen(["sleep", "3600"])
         try:
             journal = _write_live_finish_journal(root, sleeper.pid)
             env = dict(os.environ)
@@ -114,7 +114,7 @@ def test_remove_with_a_tiny_wait_refuses_and_names_the_holder(tmp_path: Path) ->
 
     with _own_fs(tmp_path) as base:
         root = _fixture(base)
-        sleeper = subprocess.Popen(["sleep", "120"])
+        sleeper = subprocess.Popen(["sleep", "3600"])
         try:
             _write_live_finish_journal(root, sleeper.pid)
             env = dict(os.environ)
