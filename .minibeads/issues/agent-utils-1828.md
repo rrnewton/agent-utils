@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-transition-model-check: an executable model of registry transitions, locks and crashes that finds wedges'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-modelcheck
 labels:
 - wrkslots
 created_at: 2026-11-17T22:44:40.000000000-05:00
-updated_at: 2026-11-17T22:44:40.000000000-05:00
+updated_at: 2026-11-18T06:32:48.000000000-05:00
+closed_at: 2026-11-18T06:32:48.000000000-05:00
 ---
 
 # Description
@@ -25,3 +26,7 @@ Without encoding the answers as assertions, the checker rediscovers #1807 on the
 # Notes
 
 [watermelon-full-preview] Owner-requested model-checking exercise (2026-11-17). First cut (model scope plus whether #1807 is rediscovered) is reported to the coordinator before the search goes wide. #1568's py/wrkslots/lifecyclemodel.py covers single-slot lifecycle safety/liveness; this issue adds the multi-actor registry/revision/lock/crash dimension it deliberately folded away (cross-slot effects there are two scenario flags).
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as `84ee787c349f5827ab2dd7ed81ca87764ebbf190` (replayed tip of gated `87159244`; gate failed only python.wrkslots.shard-6 on the wait-lock test, exclusive rerun passed — test sleeper 120 s expiry under load, fix 98b5de09 pending, not this change; components.json overlap landed with a verified combined tree). py/wrkslots/transitionmodel.py + py/wrkslots/TRANSITIONMODEL.md + gated tests (fast subset default, full battery under WRKSLOTS_MODEL_FULL=1) rediscover #1807 unguided on current main and #1766 on its pre-fix order, with every fix variant closing both. Report: ai_docs/reports/research/2026-11-18-wrkslots-model-check.md. Confirmed new findings filed as #1830 wrkslots-forked-log-journal-no-exit and #1831 wrkslots-create-recovery-ttl-drift-loop; liveness note #1832 wrkslots-prevalidated-starvation-under-churn; code-read note #1833 wrkslots-reopen-coordinator-reassert. Three candidates refuted with traces (renewed-heartbeat finish, hold vs finish-recovery, snapshot divergence). Unverified, stated in the report: recover atomicity, single-machine scope, and the agent path's second-repository registration handling (noted, not filed).
