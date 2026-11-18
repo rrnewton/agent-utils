@@ -28,6 +28,7 @@ test("closing the search bar clears its filters inside the kept place", () => {
     el: (id) => elements[id],
     setLinksOnly: (on) => record.push(`links=${on}`),
     setPinnedOnly: (on) => record.push(`pinned=${on}`),
+    setEntireThreads: (on) => record.push(`whole=${on}`),
     setAuthorFilter: (author) => record.push(`author=${author}`),
     hidingRead: () => false,
     holdingReader: (act) => { record.push("hold"); act(); },
@@ -42,7 +43,7 @@ test("closing the search bar clears its filters inside the kept place", () => {
   owner.setSearchOpen(false);
   assert.equal(
     record.join(" "),
-    "keep open=false query=\"\" marked=\"\" mark links=false pinned=false author=everyone toggle aria-pressed=false hold main-data-searching bar pill tools",
+    "keep open=false query=\"\" marked=\"\" mark links=false pinned=false whole=false author=everyone toggle aria-pressed=false hold main-data-searching bar pill tools",
   );
   assert.equal(elements["search-field"].value, "");
 });
