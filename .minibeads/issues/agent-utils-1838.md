@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-reader-continues-into-thread: read-aloud continues into the thread and back out'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-readerdrill
@@ -8,7 +8,8 @@ labels:
 - vibe-talk
 - ui
 created_at: 2026-11-18T07:50:00-05:00
-updated_at: 2026-11-18T07:50:00-05:00
+updated_at: 2026-11-18T14:35:00-05:00
+closed_at: 2026-11-18T14:35:00-05:00
 ---
 
 # Description
@@ -32,3 +33,7 @@ Fail safe: if the message is not in the view switched to, the read stops cleanly
 # Notes
 
 Owner-priority gate: deployed on landing. Lane mu-readerdrill on branch mu-readerdrill/1838. Builds on #1818 vibe-talk-thread-drill-in-keeps-anchor.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 7245b572371eb25dbfa5ab3db10c2bbc77f4dbfc (gated head 3c13ea5c, owner gate validate: OK, ledger head_sha 3c13ea5ce7a46cdf87ea5a5feaaccfc2b93ac238; verified-tree route on replay tree 42aae595). A view switch into or out of a thread captures the playing read (message, parts, the prepared block or device chunk it is on, held or not) and resumes it after the new view's entry is paid, at that smallest unit; pace and voice are untouched, autoplay continues in the new view, and the resumed follow re-places nothing while a composer is held (#1839). A switch to a view without the message stops cleanly, turns reading mode off, and says so on the status line. Chromium walks at 412x915 and 1280x800 assert the resume chunk, the anchor place, the next reply, Back, and the fail-safe (the base fails at the resume); the screenshot matrix (phone and desktop, light and dark, keyboard really shrunk and closed, Discuss open on the phone) was reviewed by the lane.
