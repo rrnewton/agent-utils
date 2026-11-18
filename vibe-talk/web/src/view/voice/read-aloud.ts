@@ -2641,7 +2641,19 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       if (!reading && row.getAttribute("data-reading-marked") === null) continue;
       // `#1587`: a new message or block brings its row into the band; the sentence
       // light refines from there. With no sentence light this is the only follow.
-      if (reading) followReading(row, 24);
+      // `#1856`: a row taller than the port is followed by its sentence, as in
+      // `lightSentence` (`#1588`): centring the whole row at a block boundary pulled
+      // the list back up over the sentence being read, the owner's yank in miniature.
+      if (reading) {
+        let portH = 0;
+        try { portH = deps.el("scroll-area")?.clientHeight || 0; } catch (_error) { portH = 0; }
+        const rowRect = row.getBoundingClientRect();
+        if (portH > 0 && rowRect.bottom - rowRect.top > portH && litSentenceRange) {
+          followReading(litSentenceRange, 24);
+        } else {
+          followReading(row, 24);
+        }
+      }
       markReadingBlock(row);
       const named = childByClass(row, "msg-author");
       if (named && reading && row.getAttribute("data-reading") === "true") named.textContent = readingLabel();
@@ -3066,6 +3078,16 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   /** A read is playing or held, or moving to another of its blocks (`readJumpPending`). */
   function readInProgress() {
     return nowPlaying !== null || readJumpPending;
+  }
+
+  /**
+   * `#1856 vibe-talk-read-aloud-follow-not-yanked-up`. Whether Read is actively following:
+   * a message (not a document, whose surface is its own) is playing and not held, so the
+   * follow is keeping its sentence on screen and the scroll holders must stand down for
+   * it (`createScrollKeeping.readFollowing`, `createThreadEntry.readFollowing`).
+   */
+  function readFollowing() {
+    return nowPlaying !== null && nowPlaying.kind !== "document" && nowPlaying.paused !== true;
   }
 
   /** Hold the read (`true`) or carry on from where it was held (`false`). The one path. */
@@ -3981,6 +4003,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   stepSection,
   renderReadTransport,
   readInProgress,
+  readFollowing,
   toggleReadingPaused,
   reactToHeldSentence,
   readingRowsShown,

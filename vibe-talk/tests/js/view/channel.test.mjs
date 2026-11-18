@@ -2508,6 +2508,45 @@ test("`#1818 vibe-talk-thread-drill-in-keeps-anchor`: a drill-in anchor is resto
   assert.equal(record.drill, null, "a drill for another thread was kept");
 });
 
+test("`#1856 vibe-talk-read-aloud-follow-not-yanked-up`: while Read is following, the drill anchor is not re-placed", () => {
+  const { createThreadEntry, freshEntryState } = CHANNEL_VIEW;
+  const record = freshEntryState();
+  const rows = [];
+  const list = { children: rows };
+  const area = { scrollTop: 500, clientHeight: 100, getBoundingClientRect: () => ({ top: 0, bottom: 100 }) };
+  const entry = createThreadEntry({
+    el: (id) => (id === "discord-log" ? list : id === "scroll-area" ? area : { hidden: true, getBoundingClientRect: () => ({ height: 0, top: 0, bottom: 0 }) }),
+    activeEntry: () => record,
+    channelContextKey: () => "ctx",
+    selection: () => ({ view: "thread", threadId: "t1" }),
+    channelViewsHas: () => true,
+    viewKey: () => "thread:t1",
+    applyReadRuns: () => {},
+    atBottom: () => false,
+    renderScrollTools: () => {},
+    requestVisibleSummaries: () => {},
+    floatingClearance: () => 0,
+    drawnTop: (row) => row.top,
+    openThreadRootId: () => null,
+    isOpenThreadRoot: () => false,
+    rowIsRead: () => true,
+    toFoot: () => {},
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; },
+    setJumpNewest: () => {},
+    screen: () => "main",
+    view: () => "discord",
+    pinsView: () => ({ only: false }),
+    readFollowing: () => true,
+  });
+  const row = (id, top) => ({ top, hidden: false, className: "", parentNode: list,
+    getAttribute: (name) => (name === "data-ids" ? id : name === "data-collapsed" ? "false" : null),
+    hasAttribute: () => false, getBoundingClientRect: () => ({ top, height: 20, bottom: top + 20 }) });
+  rows.push(row("m1", -400), row("m2", -300));
+  record.drill = { id: "m2", top: 40, thread: "t1" };
+  entry.payThreadEntry();
+  assert.equal(area.scrollTop, 500, "the drill anchor was re-placed over the read being followed");
+});
+
 
 test("`#1839 vibe-talk-composer-stays-in-view-while-dictating`: while a composer holds the view, a redraw keeps the composer, not a message", () => {
   const { createScrollKeeping } = CHANNEL_VIEW;

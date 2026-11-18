@@ -2286,6 +2286,7 @@ const threadEntry = createThreadEntry({
   view: () => screens.view(),
   pinsView: () => pinsView(),
   composerHeld: () => heldComposer() !== null,
+  readFollowing: () => readAloudOwner().readFollowing(),
 });
 const { entryState, payThreadEntry, entryLandingMark, keepEntryLanding, landOnFirstUnread, placeEntryLanding, entryLandingHolds } = threadEntry;
 
@@ -2534,6 +2535,7 @@ const scrollKeeping = createScrollKeeping({
   renderJumpNewest: () => renderJumpNewest(),
   setJumpNewest: (on, view, turns) => setJumpNewest(on, view, turns),
   composerHeld: () => heldComposer(),
+  readFollowing: () => readAloudOwner().readFollowing(),
 });
 const {
   visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingReader, captureScroll, restoreScroll, followIfPinned,

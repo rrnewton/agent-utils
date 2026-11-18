@@ -78,6 +78,13 @@ export interface ThreadEntryDependencies {
    * box, and holding a message still must not carry that box off screen. Absent: never held.
    */
   composerHeld?(): boolean;
+  /**
+   * Whether Read is actively following (`#1856 vibe-talk-read-aloud-follow-not-yanked-up`):
+   * a message is playing and not held. While it stands, no entry landing or drill anchor
+   * moves the list either: the follow keeps the read sentence on screen, and re-placing a
+   * drilled message's top on every repaint yanked the list back up over it. Absent: never.
+   */
+  readFollowing?(): boolean;
 }
 
 /** Entering a thread, as the page calls it. */
@@ -183,8 +190,10 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     // `#1839`: while the composer holds the view the anchor is not placed at all - the
     // measured nudge that keeps the clicked message still is exactly what carries the
     // box being dictated into off screen. Paid (true) so the entry does not retry it as
-    // an unpaid landing on every read while the reader writes.
-    if (deps.composerHeld && deps.composerHeld()) return true;
+    // an unpaid landing on every read while the reader writes. `#1856`: the same while
+    // Read is following — re-placing the drilled top is what yanked the list back up
+    // over the sentence being read, on every repaint.
+    if ((deps.composerHeld && deps.composerHeld()) || (deps.readFollowing && deps.readFollowing())) return true;
     const row = drillRow(drill.id);
     if (!row) return false;
     const area = deps.el("scroll-area");
@@ -216,7 +225,9 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
       if (drillKeeper !== keeper) return;
       // `#1839`: the keeper stands down while the composer holds the view, for good:
       // re-placing its message on a live-refresh mutation is the reported jump.
-      if (deps.composerHeld && deps.composerHeld()) {
+      // `#1856`: the same while Read is following — the keeper's re-place on every
+      // repaint fought the follow's down-write for the whole read.
+      if ((deps.composerHeld && deps.composerHeld()) || (deps.readFollowing && deps.readFollowing())) {
         stopDrillKeeper();
         return;
       }
@@ -340,6 +351,9 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
    * landed message.
    */
   function keepEntryLanding(mark: EntryLandingMark): boolean {
+    // `#1856`: while Read is following, the landing is not re-placed at all: the follow
+    // owns the reader's place, and a nudge back to the landed row is the reported yank.
+    if (deps.readFollowing && deps.readFollowing()) return true;
     const rows = ([...deps.el("discord-log").children] as HTMLElement[]) as HTMLElement[];
     const rowFor = (ids: readonly string[]) => shownRowFor(rows.find((candidate) => idsOf(candidate).some((id) => ids.includes(id))));
     const first = rowFor(mark.first);
@@ -461,7 +475,8 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
   function placeEntryLanding(row: HTMLElement, first: HTMLElement): void {
     // `#1839`: no landing write while the composer holds the view; the landing is
     // still recorded, so entryLandingHolds keeps it for when the reader stops writing.
-    if (deps.composerHeld && deps.composerHeld()) {
+    // `#1856`: the same while Read is following.
+    if ((deps.composerHeld && deps.composerHeld()) || (deps.readFollowing && deps.readFollowing())) {
       entryState().landing = { key: deps.channelContextKey(), row, first, at: deps.el("scroll-area").scrollTop };
       return;
     }

@@ -69,6 +69,14 @@ export interface ScrollKeepingDependencies {
    * unkept, as before.
    */
   composerHeld?(): Element | null;
+  /**
+   * Whether Read is actively following (`#1856 vibe-talk-read-aloud-follow-not-yanked-up`):
+   * a message is playing and not held. While it stands, a redraw is held on nothing: the
+   * follow keeps the read sentence on screen, and restoring a pre-redraw anchor (or the
+   * newest line) over it is the yank the owner reported. The priority lives here, in the
+   * one scroll owner, beside the composer's (`#1839`). Absent: never following.
+   */
+  readFollowing?(): boolean;
 }
 
 /**
@@ -406,6 +414,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
       return;
     }
+    // `#1856`: while Read is following, the redraw is held on nothing: the follow will
+    // put the reader back on the sentence being read, and any anchor restore here is a
+    // second writer moving the list the other way.
+    if (deps.readFollowing && deps.readFollowing()) {
+      if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
+      return;
+    }
     if (mark.anchor && mark.anchor.parentNode) {
       const shown = shownRowFor(mark.anchor);
       const held = shown !== mark.anchor ? shown as Element : mark.anchor;
@@ -464,6 +479,9 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // it outranks both the newest line and the message anchor - putting either back can
     // carry the box being dictated into off screen. `mark.composerTop` is its place then.
     if (keepComposerInView(area, typeof mark.composerTop === "number" ? mark.composerTop : null)) return;
+    // `#1856`: while Read is following, no restore at all — neither the newest line nor
+    // the captured anchor may be put back over the sentence being read.
+    if (deps.readFollowing && deps.readFollowing()) return;
     if (mark.pinned) {
       deps.scrollToNewest();
       return;
