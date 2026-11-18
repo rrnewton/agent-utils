@@ -1968,7 +1968,10 @@ def _cmd_image_set_default(args: argparse.Namespace) -> int:
     from wrkslots import cli
 
     config = _config(args)
-    with cli._locked_config(config.config_path, args.wait_lock, control=config.control):
+    # A config-file write, not a registry mutation: the legacy lock
+    # alone, exactly as before stage D (callers may hold only a stub
+    # config with a path, never a control directory).
+    with cli._locked_config(config.config_path, args.wait_lock):
         raw = cli._read_config(config.config_path)
         updated = dict(raw)
         if args.representation == "worktree":
@@ -2564,7 +2567,9 @@ def _cmd_sandbox_write_defaults(args: argparse.Namespace) -> int:
     from wrkslots import cli
 
     config = _config(args)
-    with cli._locked_config(config.config_path, args.wait_lock, control=config.control):
+    # As in _cmd_image_set_default: a config-file write under the
+    # legacy lock alone.
+    with cli._locked_config(config.config_path, args.wait_lock):
         raw = cli._read_config(config.config_path)
         existing = raw.get("sandbox", {})
         if not isinstance(existing, dict):
