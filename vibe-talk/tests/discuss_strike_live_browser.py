@@ -19,7 +19,9 @@ import time
 import urllib.request
 from pathlib import Path
 
-from playwright.sync_api import Page, sync_playwright
+from typing import Literal
+
+from playwright.sync_api import Page, Route, sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -52,7 +54,7 @@ def call(base: str, method: str, path: str, token: str,
     return parsed
 
 
-def walk(page: Page, base: str, width: int, height: int, scheme: str) -> None:
+def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark", "light"]) -> None:
     cited: dict[str, str] = {}
     writes: list[tuple[str, dict[str, object]]] = []
 
@@ -82,17 +84,17 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str) -> None:
             "turns": [],
         }
 
-    def catchup(route) -> None:
+    def catchup(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json",
                       body=json.dumps(answer()))
 
-    def saved_record(route) -> None:
+    def saved_record(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=json.dumps({
             "exists": False, "thread_id": None, "current_summary": None,
             "timeline": [], "staleness": None,
         }))
 
-    def preview(route) -> None:
+    def preview(route: Route) -> None:
         a, b = cited["a"], cited["b"]
         route.fulfill(status=200, content_type="application/json", body=json.dumps({
             "channel": {"id": CHANNEL, "label": "lead team"},
@@ -106,11 +108,11 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str) -> None:
             ],
         }))
 
-    def dismiss(route) -> None:
+    def dismiss(route: Route) -> None:
         writes.append((route.request.url, route.request.post_data_json or {}))
         route.fulfill(status=200, content_type="application/json", body="{}")
 
-    def client_config(route) -> None:
+    def client_config(route: Route) -> None:
         body = call(base, "GET", "/api/v1/client-config", WRITE_TOKEN)
         body["discuss_available"] = True
         route.fulfill(status=200, content_type="application/json",
@@ -256,7 +258,8 @@ def main() -> int:
                     time.sleep(0.25)
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
-                for width, height, scheme in ((412, 915, "dark"), (1280, 800, "light")):
+                combos: list[tuple[int, int, Literal["dark", "light"]]] = [(412, 915, "dark"), (1280, 800, "light")]
+                for width, height, scheme in combos:
                     context = browser.new_context(
                         viewport={"width": width, "height": height},
                         color_scheme=scheme)

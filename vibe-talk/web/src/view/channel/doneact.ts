@@ -1018,9 +1018,9 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       // column when it was made in the left one and the right one shows its thread again since. The
       // other column's line above reaches neither. `#306 done-stale-across-views`.
       deps.followDoneEverywhere(requested, column);
+      renderTodoControls();
       // `#1820`: the take-back changed the read set again.
       deps.onReadStateChanged?.();
-      renderTodoControls();
       if (landed.length > 0) (error as { landed?: number }).landed = landed.length;
       throw error;
     } finally {
@@ -1174,9 +1174,9 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       // column when it was made in the left one and the right one shows its thread again since. The
       // other column's line above reaches neither. `#306 done-stale-across-views`.
       deps.followDoneEverywhere(restored, column);
+      renderTodoControls();
       // `#1820`: the take-back changed the read set again.
       deps.onReadStateChanged?.();
-      renderTodoControls();
       if (landed.length > 0) (error as { landed?: number }).landed = landed.length;
       throw error;
     } finally {
