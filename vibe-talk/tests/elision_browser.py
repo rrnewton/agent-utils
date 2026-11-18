@@ -278,7 +278,7 @@ def open_layout(browser: Browser, api: FakeApi, width: int, height: int, touch: 
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     page.wait_for_selector(f'#discord-log > li[data-id="{IDS["headed"]}"]', timeout=10_000)
     page.wait_for_timeout(300)
     return page, errors

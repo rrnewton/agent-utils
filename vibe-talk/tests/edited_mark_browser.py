@@ -389,7 +389,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
         except Exception:
             pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
         page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-        page.click("#view-switch")
+        # `#1781`: sign-in lands on the channel already.
         page.wait_for_selector('#discord-log > li[data-id="206"] .edited-mark', timeout=10_000)
         for scheme in ("dark", "light"):
             page.emulate_media(color_scheme=scheme)

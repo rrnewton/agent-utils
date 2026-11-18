@@ -390,7 +390,7 @@ def settings_walk(desk: Desk) -> None:
     desk.notes.append(f"host {head['hostSize']:.1f}px weight {head['hostWeight']} on one line"
                       f"{', cut' if head['cut'] else ''}; the head {head_height:.0f}px in {rows} row(s)")
 
-    # The keys: Tab from Back goes to Expand all, Open help, then the first section. Into the screen, that
+    # The keys: Tab from Back goes to Expand all, Welcome, Open help, then the first section. Into the screen, that
     # is: the transient status line's X, when it is up, stands between the title bar and the screen.
     page.focus("#close-settings")
     walked: list[str] = []
@@ -402,8 +402,8 @@ def settings_walk(desk: Desk) -> None:
             walked.append(str(focused))
         if len(walked) == 3:
             break
-    desk.check(walked == ["fold-settings-all", "open-help", "fold-settings-voice-agent"], f"Tab from Back went to {walked}")
-    desk.notes.append("Tab: Back, Expand all, Open help, Voice agent")
+    desk.check(walked == ["fold-settings-all", "open-welcome", "open-help"], f"Tab from Back went to {walked}")
+    desk.notes.append("Tab: Back, Expand all, Welcome, Open help, Voice agent")
 
     # Expand all still opens everything, and its label's change keeps the row.
     page.click("#fold-settings-all")
@@ -423,7 +423,8 @@ def settings_walk(desk: Desk) -> None:
 def two_columns(desk: Desk, rows: int) -> None:
     """Open the channel in All, then two columns."""
     page = desk.page
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
+
     desk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= {rows}",
                   "the channel did not open")
     page.click("#column-toggle")

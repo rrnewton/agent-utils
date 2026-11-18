@@ -313,7 +313,7 @@ def views_walk(chromium: BrowserType, args: argparse.Namespace) -> str:
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel, open in All.
             wait_until(lambda: rows() == api.ids("flat"), "the channel did not open in All")
             pick("main")
             wait_until(lambda: rows() == api.ids("main"), "Main was not drawn")
@@ -458,7 +458,7 @@ def open_all(desk: Desk) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel, open in All.
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24",
                   "the channel did not open in All")
     desk.settled()

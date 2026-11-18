@@ -371,7 +371,7 @@ def open_channel(browser: Browser, api: FakeApi, *, reduced: bool = False, schem
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     page.wait_for_selector(f'#discord-log > li[data-id="{api.messages[-1]["id"]}"]', timeout=10_000)
     if not touch:
         page.mouse.move(1, 1)  # off every row, so the keys alone choose what is selected

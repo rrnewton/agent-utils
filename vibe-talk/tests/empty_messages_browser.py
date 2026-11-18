@@ -276,7 +276,7 @@ def open_all(reader: Reader) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=int(STATE_S * 1000))
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel, open in All.
     reader.wait_for("() => document.querySelector(\"#discord-log > li[data-id='209']\")", "the channel did not open in All")
     reader.settled()
 
