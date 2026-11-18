@@ -17,7 +17,7 @@ updated_at: 2026-11-18T06:34:26-05:00
 
 # Design
 
-- Design first; do not code until coordb approves the short design note for mu-hashtags.
+- Design approved by coordb as written (2026-11-18): one label row or inline fallback, measured on width changes only, search unchanged, stored text untouched. Do not code until coordb lifts the landing freeze.
 - Measure placement from the rendered meta line, not from a viewport-width guess: the header keeps the chips only when they fit within the room the meta line can give them without displacing or wrapping beyond the accepted label row.
 - When there is no room, do not render the header chips for that row and do not hide its hashtag-only body line; the original hashtags stay inline in the rendered body. Stored text, raw view, and copy remain untouched either way.
 - Exercise both widths the owner matrix uses: phone 412x915, including a real `visualViewport` shrink for the on-screen keyboard, and desktop 1280x800; include light and dark where placement is theme-independent but screenshot coverage is not.
@@ -28,6 +28,7 @@ updated_at: 2026-11-18T06:34:26-05:00
 - A fixture row whose labels fit the meta line shows header chips and hides its hashtag-only line, as #1825 does now.
 - A fixture row whose labels do not fit shows no header label chips and keeps the hashtag line visible inline in the body; the labels remain discoverable through `label:<slug>` search.
 - The decision is per-row and stable across redraws, theme changes, and the phone keyboard opening or closing; it does not oscillate as the list scrolls.
+- A row whose labels change after a live edit or update re-measures and can move between the header and inline placements.
 - Browser coverage at phone and desktop proves both branches, with a real keyboard-height viewport shrink on the phone; screenshots are inspected and sent to coordb before landing.
 
 # Notes
