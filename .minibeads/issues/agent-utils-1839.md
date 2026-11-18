@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-composer-stays-in-view-while-dictating: keep the focused composer on screen during live refresh'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -32,3 +32,9 @@ updated_at: 2026-11-18T08:15:00-05:00
 # Notes
 
 Root cause reported to coordb before the fix (2026-11-18): `placeDrillAnchor` in `vibe-talk/web/src/view/channel/threadentry.ts` keeps a clicked message at a fixed viewport top through ResizeObserver/MutationObserver re-placement with no composer-focus stand-down, and `holdingRows`/`restoreScroll` in `scrollkeep.ts` always restore to a message anchor; the two fight `toFoot` while the owner dictates. `#thread-list` is rebuilt with `replaceChildren(...threadCards(...))` on every landing in `readcore.ts`.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main in three commits: (a) 59651b9a - while a composer has focus or input arrived within COMPOSER_HOLD_MS (5s), the scroll holders anchor to the composer's whole box and the #1818 drill keeper, entry landing and keepEntryLanding stand down; a reader scrolled up into the scrollback is never yanked back down. (b)+(c) 1d72d24f - sameMessage compares copies with the server version (observed_ms, restamped on every provider serve) left off, so a re-observed refresh keeps every store object and replaces zero rows, and threadCards reuses a card whose stamp still matches instead of rebuilding the list on every landing. Follow-up ecbbee8a - the held box is the whole composer container (Send row included) and the visible band ends at the dock bar's top.
+
+Evidence: composer_stays_browser.py fails on the base build (composer off-screen after a refresh) and passes with the fix at 412x915 and 1280x800; refresh_replaces_browser.py counts 56 replaced channel rows on the base build and zero with the fix; a drive-through against the real server binary (fake Discord upstream only) replaced zero rows across a live 45s poll refresh. Screenshot matrices in /tmp/mu-composerjump-shots and /tmp/mu-composerjump-shots2, inspected.
