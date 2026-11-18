@@ -1,13 +1,14 @@
 ---
 title: 'vibe-talk-toast-avoids-discuss-controls: dealt-with toast must not cover the docked Discuss pane controls'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - ui
 created_at: 2026-11-17T12:12:16-05:00
-updated_at: 2026-11-17T12:12:16-05:00
+updated_at: 2026-11-18T05:12:06-05:00
+closed_at: 2026-11-18T05:12:06-05:00
 ---
 
 # Description
@@ -26,3 +27,7 @@ Same class, from coordb (2026-11-17, /tmp/mu-discusstweak-shots/phone-dark-resum
 # Notes
 
 [watermelon-full-preview] Filed by mu-uinits from the liaison's review of the deployed batch, bundled with #1783 vibe-talk-review-nits-1761-1762-1767 in one lane at normal priority.
+
+## Resolution
+
+[watermelon-full-preview] Landed 40f359e4 on github/main (gate #8 full pass on 6ac6010b). On the final base the pill lift is #1813's --channel-pane-bottom helper (upstream, live) standing #status-line by the docked pane's height and centring it on the channel pane; this lane's 22-discuss comment records that equivalence, and server_hits_browser covers it: phone walks in light/dark with keyboard open/closed show both the dealt-with toast and the "fetching the channel..." pill over the docked half-pane and assert no intersection with the pane (and so its disclosure rows and ask bar) and a hittable dismiss. Screenshot matrix /tmp/mu-uinits-shots/after5, inspected; liaison review pending before announcement.
