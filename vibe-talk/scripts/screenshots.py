@@ -4346,6 +4346,7 @@ def _open_discuss(driver: Driver) -> None:
     those routes "not served by this check" at the fixture edge.
     """
     driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     _ensure_pane(driver, "pane-discord")
     driver.page.wait_for_function(
         "() => document.querySelectorAll('#discord-log > li').length > 0 "
@@ -4353,7 +4354,10 @@ def _open_discuss(driver: Driver) -> None:
         timeout=15_000,
     )
     driver.page.wait_for_function("() => window.__visible('discuss-open')", timeout=15_000)
-    driver.click("discuss-open")
+    # The kept panel state can restore the panel already open after a reload; the button
+    # toggles, so pressing it then would close the very panel the state photographs.
+    if not bool(driver.js("window.__visible('discuss-panel')")):
+        driver.click("discuss-open")
     driver.page.wait_for_function("() => window.__visible('discuss-panel')", timeout=15_000)
     # The preview really answered: the panel names its scope from the server's response.
     driver.page.wait_for_function(
