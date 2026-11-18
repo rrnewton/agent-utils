@@ -188,6 +188,7 @@
   align-items: center;
   gap: 0.6rem;
   padding: 0.35rem 0.2rem;
+  min-width: 0;
 }
 
 .label-row > input[type="checkbox"] {
@@ -203,7 +204,7 @@
 .label-count {
   color: var(--ink-2, inherit);
   font-size: 0.85rem;
-  white-space: nowrap;
+  min-width: 0;
 }
 
 .label-group-marker {

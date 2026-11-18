@@ -379,10 +379,14 @@ def walk_through(walk: Walk) -> None:
     names = page.evaluate("() => [...document.querySelectorAll('#labels-list .label-name')].map((n) => n.textContent)")
     walk.check(names == ["#kvm", "#benchmark", "#benchmarking", "#perf"],
                f"count order says {names}")
+    page.locator("#labels-list").scroll_into_view_if_needed()
+    walk.settled()
     walk.shot("5-settings-count")
     page.click("#labels-sort")
     names = page.evaluate("() => [...document.querySelectorAll('#labels-list .label-name')].map((n) => n.textContent)")
     walk.check(names == ["#benchmark", "#benchmarking", "#kvm", "#perf"], f"A-Z order says {names}")
+    page.locator("#labels-list").scroll_into_view_if_needed()
+    walk.settled()
     walk.shot("6-settings-alpha")
     page.click("#labels-sort")
 
@@ -401,6 +405,8 @@ def walk_through(walk: Walk) -> None:
     page.fill("#labels-filter", "")
     walk.until("() => document.getElementById('labels-combine').textContent.includes('(2)')",
                "the two checks did not survive filtering")
+    page.locator("#labels-list").scroll_into_view_if_needed()
+    walk.settled()
     walk.press("#labels-combine")
     walk.until("() => !document.getElementById('label-group-dialog').hidden", "the Combine dialog did not open")
     prefilled = page.evaluate("() => document.getElementById('label-group-name').value")
