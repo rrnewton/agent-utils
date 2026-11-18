@@ -4355,9 +4355,9 @@ def _open_discuss(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__visible('discuss-open')", timeout=15_000)
     driver.click("discuss-open")
     driver.page.wait_for_function("() => window.__visible('discuss-panel')", timeout=15_000)
-    # The preview really answered: the bound names a count the server computed.
+    # The preview really answered: the panel names its scope from the server's response.
     driver.page.wait_for_function(
-        "() => Number(document.getElementById('discuss-count').value) > 0",
+        "() => document.getElementById('discuss-scope').textContent.trim().length > 0",
         timeout=15_000,
     )
 
@@ -4368,11 +4368,23 @@ def _act_discuss_preview(driver: Driver) -> None:
 
 def _act_discuss_summary(driver: Driver) -> None:
     _open_discuss(driver)
+    # The bound is the reader's own field: a channel already read shows zero unread, and
+    # summarizing its last messages is still a real Discuss read. Set the bound the way a
+    # reader does, then press Summarize.
+    if int(cast(float, driver.js("Number(document.getElementById('discuss-count').value)"))) == 0:
+        driver.page.fill("#discuss-count", "6")
     driver.click("discuss-summarize")
     driver.page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
         timeout=30_000,
     )
+
+
+def _after_discuss_summary(driver: Driver) -> None:
+    """Put the summarized messages back to unread, so the next profile's preview is real too."""
+    if bool(driver.js("window.__visible('discuss-mark-unread')")):
+        driver.click("discuss-mark-unread")
+        driver.settle(300)
 
 
 def _act_discuss_keyboard_closed(driver: Driver) -> None:
@@ -7059,8 +7071,8 @@ SCENES: tuple[Scene, ...] = (
         expect=(
             ("the Discuss panel is open", "window.__visible('discuss-panel')"),
             (
-                "the preview bound names a real count from the server",
-                "Number(document.getElementById('discuss-count').value) > 0",
+                "the preview answered with its scope from the server",
+                "document.getElementById('discuss-scope').textContent.trim().length > 0",
             ),
             (
                 "no fixture refusal is showing for Discuss",
@@ -7075,6 +7087,7 @@ SCENES: tuple[Scene, ...] = (
         name="74-discuss-summary",
         what="Discuss summarized: the loopback model stub's answer, served by the real route",
         act=_act_discuss_summary,
+        after=_after_discuss_summary,
         profiles=MATRIX_PROFILES,
         expect=(
             ("the Discuss panel is open", "window.__visible('discuss-panel')"),
