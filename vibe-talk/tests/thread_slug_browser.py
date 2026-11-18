@@ -82,6 +82,22 @@ VIEWPORT_JS = """(() => {
     window.__keyboardClose = () => { sim.height = null; events.dispatchEvent(new Event('resize')); };
 })();"""
 
+# Whether a row's acts — Reply, its thread tag, ⋯ and Done — stand on one line, and how far
+# the tag's slug is cut there.
+ROWLINE_JS = """(id) => {
+    const row = [...document.querySelectorAll('#discord-log > li.discord-message')]
+        .find((li) => (li.getAttribute('data-ids') || '').split(' ').includes(id));
+    if (!row) return null;
+    const tops = {};
+    for (const [name, cls] of [['reply', '.reply-button'], ['badge', '.thread-badge'],
+            ['more', '.row-more-button'], ['done', '.done-button']]) {
+        const node = row.querySelector(cls);
+        tops[name] = node && node.getClientRects().length ? node.getBoundingClientRect().top : null;
+    }
+    const slug = row.querySelector('.thread-badge-slug');
+    return { tops, slugCut: slug ? slug.scrollWidth > slug.clientWidth + 1 : false };
+}"""
+
 # A row's thread tag as the engine draws it: its words, its parts, the slug's truncation, the
 # emoji's filter, and whether it stays inside its row with nothing scrolling sideways.
 BADGE_JS = """(id) => {
@@ -383,6 +399,18 @@ def walk(page: Page, size: str, phone: bool, shots: Path | None) -> list[str]:
     fresh = badge(page, "207")
     check(str(fresh["text"]) == "Thread" and str(fresh["state"]) == "start", f"{size}: grey tag changed: {fresh}")
     notes.append("the slugged tag reads 🧵 my-thread-slug (57) with a greyed emoji; without a slug it is Thread(2)")
+    if phone:
+        # The long slug truncates on the phone instead of pushing Done onto a second line.
+        line = page.evaluate(ROWLINE_JS, "203")
+        check(isinstance(line, dict), "the long-slug row is not on the list")
+        assert isinstance(line, dict)
+        tops = line["tops"]
+        assert isinstance(tops, dict)
+        drawn = [float(str(tops[name])) for name in ("reply", "badge", "more", "done") if tops[name] is not None]
+        check(len(drawn) == 4 and max(drawn) - min(drawn) <= 2,
+              f"{size}: the long slug wraps the row's acts: {tops}")
+        check(bool(line["slugCut"]), f"{size}: the long slug is not truncated on the phone: {line}")
+        notes.append("at 412px the long slug truncates and Reply, the tag, ⋯ and Done stay on one line")
 
     # The full matrix for this size: scheme × keyboard, Discuss open on the phone.
     for scheme in ("dark", "light"):

@@ -603,6 +603,16 @@
   flex: none;
 }
 
+/* On a phone-width list the slug gives first, capped so Reply, the tag, ⋯ and Done stay on
+   one line with the count showing ("🧵 storages-tiers-rol… (12)"); the tag's own flex
+   shrinking alone would let its acts wrap instead, the slug's base size being its whole
+   name. Still narrower, the fallback below takes the slug away altogether. */
+@container rows (max-width: 31.99rem) {
+  .thread-badge-slug {
+    max-width: 14ch;
+  }
+}
+
 /* Where the row has no room (the narrowest phones, a narrow column), the tag falls back to
    today's compact "Thread(N)": the emoji and slug go, and the count gains its Thread. */
 @container rows (max-width: 23.99rem) {
