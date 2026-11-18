@@ -12,6 +12,7 @@ use http_body_util::BodyExt as _;
 use serde_json::{json, Value};
 use slack_fake::{profiled, thread, ts, Fake, FakeState, TOKEN};
 use tower::ServiceExt as _;
+use vibe_talk::chat::ChatClient as _;
 use vibe_talk::providers::ChatRouter;
 use vibe_talk::state::AppState;
 use vibe_talk::testing::WRITE_TOKEN;
@@ -378,6 +379,97 @@ async fn a_page_send_reaches_slack_only_through_the_server() {
     assert_eq!(posts[0]["channel"], TEAM);
     assert_eq!(posts[0]["text"], "hello through the server");
     assert_eq!(fake.calls("chat.postMessage"), 1);
+}
+
+/// `#1847 vibe-talk-slack-communication-audit`: a rate-limited Slack upstream
+/// does not delay the live stream. The stream is answered from this server's
+/// live feed, never from Slack: with every read method rate-limited, opening
+/// the stream answers at once, an ingested arrival reaches it, and the fake
+/// saw no read at all. The wait is for that arrival (a
+/// condition with a deadline), never a measure of elapsed time.
+#[tokio::test]
+async fn a_rate_limited_slack_does_not_delay_the_stream() {
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake).await;
+    // One fixture message, read before limiting: an arrival for the live feed
+    // to carry, as the poller or the tail would publish it.
+    let channel = vibe_talk::model::ChannelId(TEAM.to_owned());
+    let page = fake
+        .client()
+        .fetch_timeline(
+            &channel,
+            &vibe_talk::threads::TimelineRequest {
+                view: vibe_talk::threads::TimelineView::Main,
+                thread_id: None,
+                limit: 50,
+                before: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("the fixture reads");
+    let message = page
+        .messages
+        .into_iter()
+        .find(|message| message.content == "first")
+        .expect("the fixture's first message");
+    fake.with(|state| {
+        state
+            .rate_limit_many
+            .insert("conversations.history".to_owned(), (60, usize::MAX));
+        state
+            .rate_limit_many
+            .insert("conversations.replies".to_owned(), (60, usize::MAX));
+    });
+    let history_calls = fake.calls("conversations.history");
+    let replies_calls = fake.calls("conversations.replies");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/channels/{TEAM}/stream"))
+        .header("authorization", format!("Bearer {WRITE_TOKEN}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = vibe_talk::http::router(state.clone())
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    state.live.publish(&channel, message);
+
+    // Read frames until the ingested message arrives (the condition), bounded
+    // by one deadline for the whole wait.
+    let arrived = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut seen = String::new();
+        while !seen.contains("\"first\"") {
+            let Some(frame) = body.frame().await else {
+                break;
+            };
+            let frame = frame.expect("the frame read");
+            if let Ok(bytes) = frame.into_data() {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        seen
+    })
+    .await
+    .expect("the stream delivered within its deadline");
+    assert!(
+        arrived.contains("\"first\""),
+        "the ingested message did not arrive on the stream: {arrived}"
+    );
+    assert_eq!(
+        fake.calls("conversations.history"),
+        history_calls,
+        "the stream read Slack history"
+    );
+    assert_eq!(
+        fake.calls("conversations.replies"),
+        replies_calls,
+        "the stream read Slack replies"
+    );
 }
 
 /// `#1847 vibe-talk-slack-communication-audit`: a rate-limited Slack upstream
