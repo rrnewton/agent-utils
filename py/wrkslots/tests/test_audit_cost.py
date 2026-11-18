@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
+from typing import cast
 
 import pytest
 from wrkslots import cli as wrkslots_cli
@@ -31,7 +33,7 @@ def _audit_history(root: Path, *, force_full: bool) -> list[tuple[str, ...]]:
     assert found, "fixture has no initialized submodule"
     original = wrkslots_cli._audit_private_history_absent
     if force_full:
-        wrkslots_cli._audit_private_history_absent = lambda *args: False  # type: ignore[assignment]
+        wrkslots_cli._audit_private_history_absent = lambda *args: False
     try:
         return [
             _kept_tips(
@@ -42,7 +44,7 @@ def _audit_history(root: Path, *, force_full: bool) -> list[tuple[str, ...]]:
             for submodule, path in found
         ]
     finally:
-        wrkslots_cli._audit_private_history_absent = original  # type: ignore[assignment]
+        wrkslots_cli._audit_private_history_absent = original
 
 
 def _kept_tips(history: object) -> tuple[str, ...]:
@@ -171,7 +173,7 @@ def test_audit_private_history_precheck_absent_when_clean(tmp_path: Path) -> Non
 
 
 def test_audit_durable_candidates_shared_per_submodule(tmp_path: Path) -> None:
-    """Durable candidates are derived once per (repository, submodule)."""
+    """Durable candidates are derived once for one submodule checkout."""
 
     root = _nested_submodule_fixture(tmp_path / "nested")
     config = wrkslots_cli._load_config(str(root), None)
@@ -185,16 +187,16 @@ def test_audit_durable_candidates_shared_per_submodule(tmp_path: Path) -> None:
     submodule, path = found[0]
     authority = vcs.remote_authority(path, submodule.remote)
     first = vcs.durable_candidates(config, submodule, path, authority)
-    # A second row's copy of the same submodule reuses the derivation:
-    # its path is never even read.
-    second = vcs.durable_candidates(
-        config, submodule, tmp_path / "no-such-copy", authority
-    )
+    # The same checkout reuses the derivation; another checkout has
+    # its own user-config context and is never answered from it.
+    second = vcs.durable_candidates(config, submodule, path, authority)
     assert first == second
     assert len(vcs._durable_candidates_cache) == 1
 
 
-def test_audit_repository_facts_shared_per_repository(tmp_path: Path) -> None:
+def test_audit_repository_facts_shared_per_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Durable ref tips are enumerated once per repository (#1794)."""
 
     root = _fixture(tmp_path / "case")
@@ -209,17 +211,232 @@ def test_audit_repository_facts_shared_per_repository(tmp_path: Path) -> None:
     original = wrkslots_cli._GitVcs._run
 
     def counting(repo: Path, args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append(" ".join(str(item) for item in args))  # type: ignore[arg-type]
+        calls.append(" ".join(str(item) for item in cast(Iterable[object], args)))
         return original(repo, args, **kwargs)  # type: ignore[arg-type]
 
-    wrkslots_cli._GitVcs._run = staticmethod(counting)  # type: ignore[assignment]
-    try:
-        first = vcs.durable_ref_tips(repository)
-        second = vcs.durable_ref_tips(repository)
-    finally:
-        wrkslots_cli._GitVcs._run = original  # type: ignore[assignment]
+    monkeypatch.setattr(
+        wrkslots_cli._GitVcs, "_run", staticmethod(counting)
+    )
+    first = vcs.durable_ref_tips(repository)
+    second = vcs.durable_ref_tips(repository)
     assert first == second
     assert sum("for-each-ref" in call for call in calls) == 1
+
+
+def _remote_authority_outcome(
+    vcs: wrkslots_cli._GitVcs, checkout: Path
+) -> tuple[str, str]:
+    try:
+        return "url", vcs.remote_authority(checkout, "origin").url
+    except wrkslots_cli.Refusal as exc:
+        return "refused", str(exc)
+
+
+def _conditional_remote_repo(
+    base: Path, condition: str, extra: str
+) -> tuple[Path, Path]:
+    """A repository whose two linked worktrees see different remotes."""
+
+    remote = base / "remote.git"
+    remote.mkdir(parents=True)
+    _git(remote, "init", "-q", "--bare", "-b", "main")
+    main = base / "main"
+    main.mkdir(parents=True)
+    _git(main, "init", "-q", "-b", "main")
+    (main / "file.txt").write_text("one\n")
+    _git(main, "add", "file.txt")
+    _git(main, "commit", "-q", "-m", "one")
+    _git(main, "remote", "add", "origin", str(remote))
+    _git(main, "branch", "b1")
+    _git(main, "branch", "b2")
+    w1 = base / "w1"
+    w2 = base / "w2"
+    _git(main, "worktree", "add", "-q", str(w1), "b1")
+    _git(main, "worktree", "add", "-q", str(w2), "b2")
+    if condition == "onbranch":
+        included = main / ".git" / "extra-onbranch.cfg"
+        included.write_text(extra)
+        config = main / ".git" / "config"
+        config.write_text(
+            config.read_text()
+            + '\n[includeIf "onbranch:b2"]\n\tpath = extra-onbranch.cfg\n'
+        )
+    else:
+        included = main / ".git" / "extra-gitdir.cfg"
+        included.write_text(extra)
+        gitdir = main / ".git" / "worktrees" / "w2"
+        config = main / ".git" / "config"
+        config.write_text(
+            config.read_text()
+            + f'\n[includeIf "gitdir:{gitdir}"]\n\tpath = extra-gitdir.cfg\n'
+        )
+    return w1, w2
+
+
+def test_audit_remote_authority_never_shares_an_onbranch_answer(
+    tmp_path: Path,
+) -> None:
+    """An onbranch: pushurl belongs to its own worktree only (review q1)."""
+
+    w1, w2 = _conditional_remote_repo(
+        tmp_path / "q1",
+        "onbranch",
+        '[remote "origin"]\n\tpushurl = /tmp/elsewhere.git\n',
+    )
+    plain = wrkslots_cli._GitVcs()
+    expected = _remote_authority_outcome(plain, w2)
+    audit = wrkslots_cli._AuditGitVcs()
+    assert _remote_authority_outcome(audit, w1)[0] == "url"
+    assert _remote_authority_outcome(audit, w2) == expected
+    assert expected[0] == "refused"
+
+
+def test_audit_remote_authority_never_shares_a_gitdir_answer(
+    tmp_path: Path,
+) -> None:
+    """A gitdir: insteadOf rewrite belongs to its own worktree only (q1g)."""
+
+    base = tmp_path / "q1g"
+    _conditional_remote_repo(
+        base,
+        "gitdir",
+        '[url "/tmp/rewritten.git"]\n'
+        f"\tinsteadOf = {base / 'remote.git'}\n",
+    )
+    plain = wrkslots_cli._GitVcs()
+    expected = _remote_authority_outcome(plain, base / "w2")
+    audit = wrkslots_cli._AuditGitVcs()
+    _remote_authority_outcome(audit, base / "w1")
+    assert _remote_authority_outcome(audit, base / "w2") == expected
+
+
+def test_audit_effective_urls_never_cross_a_worktree_config(
+    tmp_path: Path,
+) -> None:
+    """A config.worktree insteadOf is not another worktree's answer (q2)."""
+
+    base = tmp_path / "q2"
+    mirror_a = base / "mirrorA.git"
+    mirror_b = base / "mirrorB.git"
+    for mirror in (mirror_a, mirror_b):
+        mirror.mkdir(parents=True)
+        _git(mirror, "init", "-q", "--bare", "-b", "main")
+    module = base / "mod"
+    module.mkdir(parents=True)
+    _git(module, "init", "-q", "-b", "main")
+    (module / "file.txt").write_text("one\n")
+    _git(module, "add", "file.txt")
+    _git(module, "commit", "-q", "-m", "one")
+    _git(module, "config", "extensions.worktreeConfig", "true")
+    _git(module, "remote", "add", "origin", str(mirror_b))
+    w1 = base / "w1"
+    w2 = base / "w2"
+    _git(module, "worktree", "add", "-q", str(w1), "HEAD")
+    _git(module, "worktree", "add", "-q", str(w2), "HEAD")
+    (module / ".git" / "worktrees" / "w1" / "config.worktree").write_text(
+        f'[url "{mirror_a}"]\n\tinsteadOf = {mirror_b}\n'
+    )
+    (module / ".git" / "worktrees" / "w2" / "config.worktree").write_text(
+        '[user]\n\tname = x\n'
+    )
+    audit = wrkslots_cli._AuditGitVcs()
+    assert audit.remote_effective_urls(w1, "origin") == (str(mirror_a),)
+    assert audit.remote_effective_urls(w2, "origin") == (str(mirror_b),)
+    assert wrkslots_cli._GitVcs().remote_effective_urls(w2, "origin") == (
+        str(mirror_b),
+    )
+    # The durable candidates built from those URLs differ too.
+    root = _fixture(base / "case")
+    config = wrkslots_cli._load_config(str(root), None)
+    source = root / "src.git"
+    source.mkdir()
+    _git(source, "init", "-q", "--bare", "-b", "main")
+    for checkout_path in (w1, w2):
+        authority = audit.remote_authority(checkout_path, "origin")
+        submodule = wrkslots_cli.Checkout(
+            name="mod",
+            path="mod",
+            repository="src.git",
+            branch="",
+            start_point=_git(checkout_path, "rev-parse", "HEAD"),
+            remote="origin",
+            remote_url_sha256=authority.sha256,
+            landed_ref="refs/remotes/origin/main",
+            head=_git(checkout_path, "rev-parse", "HEAD"),
+        )
+        _source, mirrors = audit.durable_candidates(
+            config, submodule, checkout_path, authority
+        )
+        assert mirrors == ((mirror_a,) if checkout_path == w1 else (mirror_b,))
+
+
+def test_audit_durable_candidates_never_cross_a_global_gitdir_include(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A global gitdir: insteadOf for one clone is not another's (q3)."""
+
+    base = tmp_path / "q3"
+    root = _fixture(base / "case")
+    config = wrkslots_cli._load_config(str(root), None)
+    origin = root / "origin.git"
+    mirror_a = root / "mirrorA.git"
+    source = root / "src.git"
+    for repository in (origin, mirror_a, source):
+        repository.mkdir()
+        _git(repository, "init", "-q", "--bare", "-b", "main")
+    clones: list[Path] = []
+    for name in ("c1", "c2"):
+        clone = root / name
+        clone.mkdir()
+        _git(clone, "init", "-q", "-b", "main")
+        (clone / "file.txt").write_text("one\n")
+        _git(clone, "add", "file.txt")
+        _git(clone, "commit", "-q", "-m", "one")
+        _git(clone, "remote", "add", "origin", str(origin))
+        clones.append(clone)
+    included = root / "inc.cfg"
+    included.write_text(f'[url "{mirror_a}"]\n\tinsteadOf = {origin}\n')
+    global_config = root / "gcfg"
+    global_config.write_text(
+        f'[includeIf "gitdir:{clones[0]}/"]\n\tpath = {included}\n'
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+    audit = wrkslots_cli._AuditGitVcs()
+    results: list[tuple[Path, ...]] = []
+    for clone in clones:
+        authority = audit.remote_authority(clone, "origin")
+        submodule = wrkslots_cli.Checkout(
+            name="mod",
+            path="mod",
+            repository="src.git",
+            branch="",
+            start_point=_git(clone, "rev-parse", "HEAD"),
+            remote="origin",
+            remote_url_sha256=authority.sha256,
+            landed_ref="refs/remotes/origin/main",
+            head=_git(clone, "rev-parse", "HEAD"),
+        )
+        results.append(
+            audit.durable_candidates(config, submodule, clone, authority)[1]
+        )
+    assert mirror_a in results[0]
+    assert mirror_a not in results[1]
+    plain_authority = wrkslots_cli._GitVcs().remote_authority(clones[1], "origin")
+    plain_submodule = wrkslots_cli.Checkout(
+        name="mod",
+        path="mod",
+        repository="src.git",
+        branch="",
+        start_point=_git(clones[1], "rev-parse", "HEAD"),
+        remote="origin",
+        remote_url_sha256=plain_authority.sha256,
+        landed_ref="refs/remotes/origin/main",
+        head=_git(clones[1], "rev-parse", "HEAD"),
+    )
+    assert results[1] == wrkslots_cli._durable_candidates(
+        wrkslots_cli._GitVcs(), config, plain_submodule, clones[1], plain_authority
+    )[1]
 
 
 def test_streamed_replay_matches_list_replay(tmp_path: Path) -> None:

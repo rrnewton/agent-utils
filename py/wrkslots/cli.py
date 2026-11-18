@@ -25101,7 +25101,7 @@ class _AuditGitVcs(_GitVcs):
         self._commit_object_ids: dict[Path, tuple[str, ...]] = {}
         self._effective_urls: dict[tuple[Path, str], tuple[str, ...]] = {}
         self._durable_candidates_cache: dict[
-            tuple[str, str, str], tuple[Path, tuple[Path, ...]]
+            tuple[Path, str, str, str], tuple[Path, tuple[Path, ...]]
         ] = {}
 
     def common_directory(self, repository: Path) -> Path:
@@ -25213,16 +25213,12 @@ class _AuditGitVcs(_GitVcs):
             return super().remote_authority(
                 checkout, remote, env_overrides=env_overrides
             )
-        # A remote's URL lives in the common config, so worktrees of
-        # one repository share the answer — unless a per-worktree
-        # config file could override it, in which case the checkout
-        # keeps its own key (#1794).
-        if os.path.lexists(
-            self.absolute_git_directory(checkout) / "config.worktree"
-        ):
-            key = (checkout.absolute(), remote)
-        else:
-            key = (self.common_directory(checkout), remote)
+        # Git evaluates conditional includes and per-worktree config
+        # for the checkout it is asked about (includeIf onbranch: or
+        # gitdir:, extensions.worktreeConfig), so a remote authority
+        # is only ever shared with the same checkout, never with
+        # another worktree of the same repository (#1794 review).
+        key = (checkout.absolute(), remote)
         if key not in self._remote_authorities:
             self._remote_authorities[key] = super().remote_authority(checkout, remote)
         return self._remote_authorities[key]
@@ -25245,7 +25241,12 @@ class _AuditGitVcs(_GitVcs):
         return self._commit_object_ids[common]
 
     def remote_effective_urls(self, path: Path, remote: str) -> tuple[str, ...]:
-        key = (self.common_directory(path), remote)
+        # The user's Git configuration can select URLs by this
+        # checkout's own directory, branch or per-worktree config
+        # (includeIf gitdir:/onbranch:, config.worktree insteadOf),
+        # so the answer is keyed by the checkout itself, never by
+        # the repository it shares with other worktrees (#1794).
+        key = (path.absolute(), remote)
         if key not in self._effective_urls:
             self._effective_urls[key] = super().remote_effective_urls(path, remote)
         return self._effective_urls[key]
@@ -25257,9 +25258,21 @@ class _AuditGitVcs(_GitVcs):
         path: Path,
         authority: _RemoteAuthority,
     ) -> tuple[Path, tuple[Path, ...]]:
-        """Durable candidates shared per (repository, submodule) (#1794)."""
+        """Durable candidates cached for one submodule checkout.
 
-        key = (submodule.repository, submodule.remote, authority.sha256)
+        The candidate URLs come from the invoking user's Git
+        configuration, which can be selected by that checkout's own
+        path, branch or per-worktree config; candidates therefore
+        never cross checkouts, however alike their repositories are
+        (#1794 review).
+        """
+
+        key = (
+            path.absolute(),
+            submodule.repository,
+            submodule.remote,
+            authority.sha256,
+        )
         if key not in self._durable_candidates_cache:
             self._durable_candidates_cache[key] = _durable_candidates(
                 self, config, submodule, path, authority
@@ -56625,9 +56638,9 @@ def _audit_submodule_private_history(
 
     authority = vcs.remote_authority(path, submodule.remote)
     if isinstance(vcs, _AuditGitVcs):
-        # Durable candidates are per (repository, submodule), shared
-        # across every row of that repository; only the removal
-        # filter below is per record (#1794).
+        # Durable candidates are cached for this submodule
+        # checkout; only the removal filter below is per record
+        # (#1794).
         source, mirrors = vcs.durable_candidates(config, submodule, path, authority)
         durable = _durable_filter(config, record, submodule, path, vcs, source, mirrors)
     else:
