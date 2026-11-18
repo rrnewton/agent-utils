@@ -156,6 +156,10 @@ pub struct AppState {
     /// its own. `#934 voice-page-reply-parent-arrow`; see [`crate::reply_pointers`]. In memory, and
     /// filed in the store.
     pub reply_pointers: Arc<crate::reply_pointers::ReplyPointers>,
+    /// The label groups as derivation sees them (`#1825`): loaded from the store at
+    /// startup and replaced on every group edit, so `ops::stamp` (sync) maps
+    /// spellings to displays without a store read per serve.
+    pub label_groups: Arc<std::sync::RwLock<crate::labels::GroupIndex>>,
     /// What the user said lately, as the voice page heard it, and which of their asks to send were
     /// spent. `#511 voice-explicit-send-only`; see [`crate::send_intent`]. In memory.
     pub send_intent: Arc<crate::send_intent::SendIntent>,
@@ -287,6 +291,30 @@ impl AppState {
         let pointers = self.store.reply_pointers().await?;
         let count = pointers.len();
         self.reply_pointers.restore(pointers);
+        Ok(count)
+    }
+
+    /// Reload the label-group index from the store (`#1825`). Called at startup
+    /// and after every group edit, so derivation and search see edits live.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::store::StoreError`] when the store cannot be read; the index
+    /// then keeps its previous value (groups simply stop moving, labels stay).
+    pub async fn refresh_label_groups(&self) -> Result<usize, crate::store::StoreError> {
+        let groups = self.store.label_groups().await?;
+        let count = groups.groups.len();
+        let index = crate::labels::GroupIndex::new(
+            groups
+                .groups
+                .into_iter()
+                .map(|group| (group.display, group.spellings))
+                .collect(),
+        );
+        *self
+            .label_groups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = index;
         Ok(count)
     }
 

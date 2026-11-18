@@ -432,6 +432,37 @@ impl Query {
             .is_none_or(|root| node_matches(root, subject, day_start_ms))
     }
 
+    /// This query with every `label:` slug expanded through `expand` (`#1825` label
+    /// groups: any spelling must find the whole group). A slug expanding to several
+    /// spellings becomes an OR of labels; under a `-` it stays negated as a group.
+    /// Pure: the caller supplies the group knowledge, so parsing never sees a store.
+    #[must_use]
+    pub fn expand_labels(&self, expand: &dyn Fn(&str) -> Vec<String>) -> Self {
+        fn walk(node: &Node, expand: &dyn Fn(&str) -> Vec<String>) -> Node {
+            match node {
+                Node::Label(slug) => {
+                    let spellings = expand(slug);
+                    if spellings.len() <= 1 {
+                        Node::Label(slug.clone())
+                    } else {
+                        Node::Or(spellings.into_iter().map(Node::Label).collect())
+                    }
+                }
+                Node::Not(inner) => Node::Not(Box::new(walk(inner, expand))),
+                Node::And(children) => {
+                    Node::And(children.iter().map(|c| walk(c, expand)).collect())
+                }
+                Node::Or(children) => {
+                    Node::Or(children.iter().map(|c| walk(c, expand)).collect())
+                }
+                other => other.clone(),
+            }
+        }
+        Self {
+            root: self.root.as_ref().map(|root| walk(root, expand)),
+        }
+    }
+
     /// Every positive word and phrase, folded, in order: what an index can be asked for.
     #[must_use]
     pub fn positive_terms(&self) -> Vec<String> {

@@ -910,6 +910,7 @@ async fn main() -> anyhow::Result<()> {
         post_lanes: Arc::new(vibe_talk::post_lanes::PostLanes::new()),
         post_keys: Arc::new(vibe_talk::post_keys::PostKeys::new()),
         reply_pointers: Arc::new(vibe_talk::reply_pointers::ReplyPointers::new()),
+        label_groups: Arc::new(std::sync::RwLock::new(vibe_talk::labels::GroupIndex::default())),
         send_intent: Arc::new(vibe_talk::send_intent::SendIntent::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
         live: Arc::clone(&live),
@@ -992,6 +993,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
         Err(error) => tracing::warn!(%error, "could not restore the reply pointers"),
+    }
+    // `#1825 vibe-talk-hashtag-labels`. The groups derivation maps spellings through.
+    match state.refresh_label_groups().await {
+        Ok(groups) => {
+            if groups > 0 {
+                tracing::info!(groups, "restored the label groups");
+            }
+        }
+        Err(vibe_talk::store::StoreError::Unavailable(_)) => {}
+        Err(error) => tracing::warn!(%error, "could not restore the label groups"),
     }
     state.refresh_routes();
     // `#628 documents-index-server`. Rebuild the fold from the cache when it

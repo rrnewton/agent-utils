@@ -582,6 +582,53 @@ pub struct SearchResponse {
     pub untrusted_content_notice: &'static str,
 }
 
+/// One label in `GET /api/v1/labels` (`#1825 vibe-talk-hashtag-labels`).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LabelCount {
+    /// The name filters and chips use: a group's display, or a plain spelling.
+    pub name: String,
+    /// How many held messages carry it. COUNTS COVER THE LOADED HISTORY ONLY
+    /// (the server's message cache), never all-time; the page says so.
+    pub count: usize,
+    /// The group this name displays for, when it is grouped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<i64>,
+}
+
+/// `GET /api/v1/labels` (`#1825`): every hashtag label in the loaded history,
+/// counted, with the label groups. Read scope.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LabelsResponse {
+    /// Every label, grouped spellings folded into their display, by name.
+    pub labels: Vec<LabelCount>,
+    /// Every label group, as stored.
+    pub groups: Vec<crate::store::LabelGroup>,
+    /// The revision the groups are at; a page compares it to notice edits.
+    pub groups_revision: i64,
+    /// The standing statement that these labels are this server's own.
+    pub labels_notice: &'static str,
+}
+
+/// A label-group create or edit (`POST`/`PUT /api/v1/label-groups`, `#1825`).
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LabelGroupRequest {
+    /// The group's display name: one of its spellings.
+    pub display: String,
+    /// Every spelling in the group, the display included.
+    pub spellings: Vec<String>,
+}
+
+/// What a label-group create, edit or dissolve did (`#1825`).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct LabelGroupsResponse {
+    /// Every group after the call.
+    pub groups: Vec<crate::store::LabelGroup>,
+    /// The revision the groups are at after the call.
+    pub revision: i64,
+    /// The standing statement that these groups are this server's own.
+    pub labels_notice: &'static str,
+}
+
 /// One channel's part of a [`SearchResponse`]. Times are milliseconds since the Unix epoch on the
 /// provider's clock, as messages' are; `as_of_ms` is the server's.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1920,6 +1967,10 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<CatchupUpdateRequest>(),
         // `#1608 agent-transcripts-timeline`. Appended, for the same reason.
         generator.subschema_for::<TranscriptsResponse>(),
+        // `#1825 vibe-talk-hashtag-labels`. Appended, for the same reason.
+        generator.subschema_for::<LabelsResponse>(),
+        generator.subschema_for::<LabelGroupsResponse>(),
+        generator.subschema_for::<LabelGroupRequest>(),
     ]
 }
 

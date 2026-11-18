@@ -13,6 +13,8 @@
 //!
 //! `autotests = false` means cargo no longer finds a new `tests/*.rs` by itself: add it below
 //! (or as a `[[test]]` target). `every_test_file_is_compiled` fails when one is in neither.
+#![recursion_limit = "8192"]
+
 
 // The loopback Slack Web API fake the Slack tests share; each imports it with
 // `use crate::slack_fake;`.

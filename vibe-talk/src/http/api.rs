@@ -6789,6 +6789,74 @@ pub async fn unpin_message(
     })))
 }
 
+// --- hashtag labels ------------------------------------------------------------------------------
+//
+// `#1825 vibe-talk-hashtag-labels`. READ scope to browse, WRITE scope to group,
+// and NO MCP TOOL, for the `#39` reason the pins give.
+
+/// The standing statement that the labels and groups are this server's own.
+pub const LABELS_NOTICE: &str = "Labels are vibe-talk's own, derived from message \
+                                 text on this server and shown on every device signed in \
+                                 to it; nothing is sent to the source chat service. \
+                                 Counts cover the loaded history only.";
+
+/// `GET /api/v1/labels` — every label in the loaded history, counted, with the groups.
+pub async fn labels(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+) -> Result<Response, ApiError> {
+    let (labels, groups) = ops::labels(&state).await?;
+    Ok(no_store(Json(crate::contract::LabelsResponse {
+        labels,
+        groups: groups.groups,
+        groups_revision: groups.revision,
+        labels_notice: LABELS_NOTICE,
+    })))
+}
+
+/// `POST /api/v1/label-groups` — combine spellings under one display. Write scope.
+pub async fn create_label_group(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Json(request): Json<crate::contract::LabelGroupRequest>,
+) -> Result<Response, ApiError> {
+    let groups = ops::create_label_group(&state, &request.display, &request.spellings).await?;
+    Ok(no_store(Json(crate::contract::LabelGroupsResponse {
+        groups: groups.groups,
+        revision: groups.revision,
+        labels_notice: LABELS_NOTICE,
+    })))
+}
+
+/// `PUT /api/v1/label-groups/{id}` — rename a group or edit its spellings. Write scope.
+pub async fn update_label_group(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(id): Path<i64>,
+    Json(request): Json<crate::contract::LabelGroupRequest>,
+) -> Result<Response, ApiError> {
+    let groups = ops::update_label_group(&state, id, &request.display, &request.spellings).await?;
+    Ok(no_store(Json(crate::contract::LabelGroupsResponse {
+        groups: groups.groups,
+        revision: groups.revision,
+        labels_notice: LABELS_NOTICE,
+    })))
+}
+
+/// `DELETE /api/v1/label-groups/{id}` — dissolve a group. Write scope.
+pub async fn dissolve_label_group(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let groups = ops::dissolve_label_group(&state, id).await?;
+    Ok(no_store(Json(crate::contract::LabelGroupsResponse {
+        groups: groups.groups,
+        revision: groups.revision,
+        labels_notice: LABELS_NOTICE,
+    })))
+}
+
 // --- the reading bookmark ------------------------------------------------------------------------
 //
 // `#240 reading-bookmark`. READ scope to see it, WRITE scope to move or clear it, and NO MCP TOOL,

@@ -562,6 +562,17 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/thread-pins/{thread_id}",
             axum::routing::put(api::pin_thread).delete(api::unpin_thread),
         )
+        // `#1825 vibe-talk-hashtag-labels`. READ to browse labels, WRITE to
+        // combine/edit/dissolve groups, and NO MCP TOOL, for the pins' reason.
+        .route("/api/v1/labels", get(api::labels))
+        .route(
+            "/api/v1/label-groups",
+            axum::routing::post(api::create_label_group),
+        )
+        .route(
+            "/api/v1/label-groups/{id}",
+            axum::routing::put(api::update_label_group).delete(api::dissolve_label_group),
+        )
         // `#240 reading-bookmark`. The owner's place in a channel's backlog, one per channel. READ
         // scope to see it, WRITE scope to move or clear it — a PUT or DELETE that may carry
         // `if_revision`, refused 409 when another device moved it first — and NO MCP TOOL, for the

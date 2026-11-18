@@ -82,6 +82,81 @@ pub fn extract_hashtags(content: &str) -> Vec<String> {
     labels
 }
 
+/// The label groups as derivation sees them (`#1825`, owner thread 167): which
+/// display each spelling belongs to, and which spellings a display stands for.
+/// Built from the store's groups; empty when there are none, in which case
+/// [`GroupIndex::apply`] is the identity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupIndex {
+    /// Spelling (or display) → the group's display.
+    display_of: std::collections::HashMap<String, String>,
+    /// Display → every spelling in its group, sorted.
+    members_of: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl GroupIndex {
+    /// Build from `(display, spellings)` pairs, as the store serves them. The
+    /// display is always a member of its own group, listed or not.
+    #[must_use]
+    pub fn new(groups: Vec<(String, Vec<String>)>) -> Self {
+        let mut display_of = std::collections::HashMap::new();
+        let mut members_of = std::collections::HashMap::new();
+        for (display, mut spellings) in groups {
+            if !spellings.contains(&display) {
+                spellings.push(display.clone());
+            }
+            spellings.sort();
+            spellings.dedup();
+            for spelling in &spellings {
+                display_of.insert(spelling.clone(), display.clone());
+            }
+            members_of.insert(display, spellings);
+        }
+        Self {
+            display_of,
+            members_of,
+        }
+    }
+
+    /// Whether no group exists.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.members_of.is_empty()
+    }
+
+    /// Map extracted spellings to what cards show: each spelling's group
+    /// display, or the spelling itself, deduped in first-seen order.
+    #[must_use]
+    pub fn apply(&self, extracted: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for spelling in extracted {
+            let shown: &str = self
+                .display_of
+                .get(spelling)
+                .map_or(spelling.as_str(), String::as_str);
+            if !out.iter().any(|held| held == shown) {
+                out.push(shown.to_owned());
+            }
+        }
+        out
+    }
+
+    /// Every spelling a label-filter slug may mean: the whole group when the
+    /// slug names any member or the display, else just the slug. Search
+    /// expands a `label:` node to these so any spelling finds the group.
+    #[must_use]
+    pub fn expand(&self, slug: &str) -> Vec<String> {
+        match self.display_of.get(slug) {
+            Some(display) => self
+                .members_of
+                .get(display)
+                .cloned()
+                .unwrap_or_else(|| vec![slug.to_owned()]),
+            None => vec![slug.to_owned()],
+        }
+    }
+}
+
 /// Positions that cannot hold a hashtag: fenced code, inline code, URLs and
 /// `<#…>` channel references. Masking (rather than stripping) keeps every
 /// other position's neighbours exactly as written.
@@ -209,7 +284,7 @@ fn mask_channel_refs(chars: &[char], masked: &mut [bool]) {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_hashtags;
+    use super::{extract_hashtags, GroupIndex};
 
     fn labels(text: &str) -> Vec<String> {
         extract_hashtags(text)
@@ -265,6 +340,25 @@ mod tests {
         // Coordb amendment 2: a plain '#name' that happens to spell a channel
         // name is still a label; only the linked '<#C…|name>' form is not.
         assert_eq!(labels("ask in #general please"), vec!["general"]);
+    }
+
+    #[test]
+    fn groups_map_spellings_to_the_display_and_expand_back() {
+        let index = GroupIndex::new(vec![(
+            "benchmarking".to_owned(),
+            vec!["benchmark".to_owned(), "benchmarking".to_owned()],
+        )]);
+        // Cards show the display, once, in first-seen order.
+        assert_eq!(
+            index.apply(&["benchmark".to_owned(), "kvm".to_owned(), "benchmarking".to_owned()]),
+            vec!["benchmarking", "kvm"]
+        );
+        // Any member (or the display) expands to the whole group for search.
+        assert_eq!(index.expand("benchmark"), vec!["benchmark", "benchmarking"]);
+        assert_eq!(index.expand("benchmarking"), vec!["benchmark", "benchmarking"]);
+        assert_eq!(index.expand("kvm"), vec!["kvm"]);
+        // No groups: the identity.
+        assert_eq!(GroupIndex::default().apply(&["kvm".to_owned()]), vec!["kvm"]);
     }
 
     #[test]

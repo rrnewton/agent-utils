@@ -11,6 +11,8 @@
 //! Every function below assumes the caller has already been authorized for the scope it needs;
 //! the scope each one needs is stated in its documentation and enforced by its only callers.
 
+use std::sync::Arc;
+
 use crate::cache::shadow::{Ask, Consumer, Upstream, View, Wants};
 use crate::cache::{PendingServe, RefreshClaim, RefreshKey, ServeOutcome, ServedAnswer};
 use crate::chat::ChatError;
@@ -353,10 +355,17 @@ pub(crate) fn stamp(state: &AppState, messages: &mut [Message]) {
     // provider keeps no pointer of its own.
     state.reply_pointers.fill(messages);
     let now_ms = jiff::Timestamp::now().as_millisecond();
+    let label_groups = state
+        .label_groups
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     for message in messages {
         // `#1825 vibe-talk-hashtag-labels`: derived from the text as it now stands, on
-        // every serve, so an edit relabels at once and nothing is stored.
-        message.labels = crate::labels::extract_hashtags(&message.content);
+        // every serve, so an edit relabels at once and nothing is stored. Grouped
+        // spellings show as their group's display (owner thread 167).
+        message.labels =
+            label_groups.apply(&crate::labels::extract_hashtags(&message.content));
         message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
         message.spoken_content = prepared_body(state, &message.content, &message.mentions, now_ms);
         // `#408 copy-upstream-link`: the message's own address in its service, formed by its
@@ -7801,6 +7810,98 @@ pub async fn set_thread_pin(
         .set_thread_pin(&channel.id, thread_id, pinned)
         .await?;
     Ok((channel, change))
+}
+
+/// Every hashtag label in the loaded history, counted, with the groups
+/// (`#1825`). Read scope. Counts aggregate the server's held copy across every
+/// channel it answers for; grouped spellings fold into their display.
+pub async fn labels(
+    state: &AppState,
+) -> Result<(Vec<crate::contract::LabelCount>, crate::store::LabelGroups), OpError> {
+    let groups = state.store.label_groups().await?;
+    let index = crate::labels::GroupIndex::new(
+        groups
+            .groups
+            .iter()
+            .map(|group| (group.display.clone(), group.spellings.clone()))
+            .collect(),
+    );
+    let group_id_of: std::collections::HashMap<String, i64> = groups
+        .groups
+        .iter()
+        .map(|group| (group.display.clone(), group.id))
+        .collect();
+    let channels = channels(state).await;
+    let sink = Arc::clone(&state.message_cache);
+    let scans = channels.iter().map(|channel| {
+        let sink = Arc::clone(&sink);
+        let id = channel.id.clone();
+        async move {
+            tokio::task::spawn_blocking(move || sink.label_counts(&id))
+                .await
+                .unwrap_or(Err(crate::cache::search::SearchRefusal::NoCache))
+        }
+    });
+    let mut totals: std::collections::BTreeMap<String, usize> = Default::default();
+    for scanned in futures_util::future::join_all(scans).await {
+        let Ok(counts) = scanned else { continue };
+        for (spelling, count) in counts {
+            *totals.entry(spelling).or_insert(0) += count;
+        }
+    }
+    // Fold grouped spellings into their display; keep the raw names the page's
+    // checklist needs by ALSO listing each spelling under its own name with its
+    // group id (Settings checks spellings, not displays, when combining).
+    let mut labels: Vec<crate::contract::LabelCount> = totals
+        .iter()
+        .map(|(spelling, count)| {
+            let display = index
+                .apply(std::slice::from_ref(spelling))
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| spelling.clone());
+            crate::contract::LabelCount {
+                name: spelling.clone(),
+                count: *count,
+                group_id: group_id_of.get(&display).copied(),
+            }
+        })
+        .collect();
+    labels.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((labels, groups))
+}
+
+/// Create a label group and refresh derivation (`#1825`). Write scope at the route.
+pub async fn create_label_group(
+    state: &AppState,
+    display: &str,
+    spellings: &[String],
+) -> Result<crate::store::LabelGroups, OpError> {
+    let groups = state.store.create_label_group(display, spellings).await?;
+    let _ = state.refresh_label_groups().await;
+    Ok(groups)
+}
+
+/// Edit a label group and refresh derivation (`#1825`).
+pub async fn update_label_group(
+    state: &AppState,
+    id: i64,
+    display: &str,
+    spellings: &[String],
+) -> Result<crate::store::LabelGroups, OpError> {
+    let groups = state.store.update_label_group(id, display, spellings).await?;
+    let _ = state.refresh_label_groups().await;
+    Ok(groups)
+}
+
+/// Dissolve a label group and refresh derivation (`#1825`).
+pub async fn dissolve_label_group(
+    state: &AppState,
+    id: i64,
+) -> Result<crate::store::LabelGroups, OpError> {
+    let groups = state.store.dissolve_label_group(id).await?;
+    let _ = state.refresh_label_groups().await;
+    Ok(groups)
 }
 
 /// The revision a channel's pins are at, for a read to carry, or `None` when it cannot be said.

@@ -94,7 +94,15 @@ pub async fn search(
     if ask.q.chars().count() > MAX_QUERY_CHARS {
         return Err(OpError::EmptyQuery);
     }
-    let query = Arc::new(crate::search_query::parse(&ask.q));
+    // `#1825`: a `label:` slug naming any spelling of a group finds the whole
+    // group; the cache's subjects carry the raw typed spellings.
+    let label_groups = state
+        .label_groups
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let parsed = crate::search_query::parse(&ask.q);
+    let query = Arc::new(parsed.expand_labels(&|slug| label_groups.expand(slug)));
     if query.is_empty() {
         return Err(OpError::EmptyQuery);
     }

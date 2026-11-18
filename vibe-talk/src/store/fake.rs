@@ -33,7 +33,7 @@ use super::{
     TranscriptCursor, TranscriptPage, Turn, UpstreamClearAttempt, UpstreamClearMode,
     UpstreamClearSetting, MAX_PINS_PER_CHANNEL, MAX_TRANSCRIPT_PAGE, MAX_TURN_CHARS,
 };
-use super::{HistoryMode, HistoryModeSetting};
+use super::{HistoryMode, HistoryModeSetting, LabelGroup, LabelGroups};
 use crate::model::{ChannelId, MessageId};
 use crate::voice_agent::OwnerPrompt;
 
@@ -107,6 +107,10 @@ struct State {
     pin_revisions: BTreeMap<String, i64>,
     /// `(channel, thread)` to its transcript class. `#1608 agent-transcripts-timeline`.
     thread_classes: BTreeMap<(String, String), crate::transcripts::ThreadClass>,
+    /// Label groups by id, and their shared revision. `#1825`.
+    label_groups: BTreeMap<i64, super::LabelGroup>,
+    label_group_revision: i64,
+    next_label_group_id: i64,
     /// `(channel, thread)` to its explicit thread-pin state. `#1550 thread-list-pins`.
     thread_pins: BTreeMap<(String, String), bool>,
     /// Channel to its thread-pin revision.
@@ -219,6 +223,27 @@ fn fake_bump(state: &mut State, channel: &ChannelId) -> i64 {
         .pin_revisions
         .insert(channel.as_str().to_owned(), next);
     next
+}
+
+/// The fake's already-grouped refusal, wording-identical to the real store's.
+fn fake_refuse_grouped(
+    state: &State,
+    spellings: &[String],
+    except: Option<i64>,
+) -> Result<(), StoreError> {
+    for spelling in spellings {
+        if let Some(group) = state
+            .label_groups
+            .values()
+            .find(|group| Some(group.id) != except && group.spellings.contains(spelling))
+        {
+            return Err(StoreError::BadId(format!(
+                "#{spelling} already belongs to the label group \"{}\"; dissolve or edit that group first",
+                group.display
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn armed(state: &mut State) -> Result<(), StoreError> {
@@ -1460,6 +1485,85 @@ impl StateStore for FakeStore {
             .copied()
             .unwrap_or(0);
         Ok(ThreadPinChange { changed, revision })
+    }
+
+    async fn label_groups(&self) -> Result<LabelGroups, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(LabelGroups {
+            groups: state.label_groups.values().cloned().collect(),
+            revision: state.label_group_revision,
+        })
+    }
+
+    async fn create_label_group(
+        &self,
+        display: &str,
+        spellings: &[String],
+    ) -> Result<LabelGroups, StoreError> {
+        let spellings = super::validate_label_group(display, spellings)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        fake_refuse_grouped(&state, &spellings, None)?;
+        state.next_label_group_id += 1;
+        let id = state.next_label_group_id;
+        let now = now_ms();
+        state.label_groups.insert(
+            id,
+            LabelGroup {
+                id,
+                display: display.to_owned(),
+                spellings,
+                created_ms: now,
+                updated_ms: now,
+            },
+        );
+        state.label_group_revision =
+            super::next_pin_revision(state.label_group_revision, now);
+        Ok(LabelGroups {
+            groups: state.label_groups.values().cloned().collect(),
+            revision: state.label_group_revision,
+        })
+    }
+
+    async fn update_label_group(
+        &self,
+        id: i64,
+        display: &str,
+        spellings: &[String],
+    ) -> Result<LabelGroups, StoreError> {
+        let spellings = super::validate_label_group(display, spellings)?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        if !state.label_groups.contains_key(&id) {
+            return Err(StoreError::NotFound);
+        }
+        fake_refuse_grouped(&state, &spellings, Some(id))?;
+        let now = now_ms();
+        let group = state.label_groups.get_mut(&id).expect("checked above");
+        group.display = display.to_owned();
+        group.spellings = spellings;
+        group.updated_ms = now;
+        state.label_group_revision =
+            super::next_pin_revision(state.label_group_revision, now);
+        Ok(LabelGroups {
+            groups: state.label_groups.values().cloned().collect(),
+            revision: state.label_group_revision,
+        })
+    }
+
+    async fn dissolve_label_group(&self, id: i64) -> Result<LabelGroups, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        if state.label_groups.remove(&id).is_none() {
+            return Err(StoreError::NotFound);
+        }
+        state.label_group_revision =
+            super::next_pin_revision(state.label_group_revision, now_ms());
+        Ok(LabelGroups {
+            groups: state.label_groups.values().cloned().collect(),
+            revision: state.label_group_revision,
+        })
     }
 
     async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError> {

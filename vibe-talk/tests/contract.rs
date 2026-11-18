@@ -10,6 +10,7 @@
 //! generated validators accept exactly what this server sends — every union variant, and every
 //! optional field both present and omitted.
 
+
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
@@ -19,7 +20,8 @@ use vibe_talk::contract::{
     CatchupStamp, CatchupUnreadRef, CatchupUpdateRequest, CatchupWindow, ClientConfigResponse,
     ClientSettings, CommittedPostResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent,
     LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse,
-    NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
+    LabelCount, LabelGroupRequest, LabelGroupsResponse, LabelsResponse, NoiseRules, PendingPost,
+    PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
     ThreadPinChangeResponse, ThreadPinsResponse, TimelineResponse, TokenScope, TranscriptRole,
     TranscriptThreadInfo, TranscriptsResponse, UpstreamClearAttemptView, UpstreamClearNowOutcome,
@@ -874,6 +876,50 @@ fn samples() -> Value {
                 pinned: false,
                 changed: false,
                 revision: 1_790_000_000_000,
+            }),
+        ],
+        // `#1825 vibe-talk-hashtag-labels`: labels with a group beside plain ones, an
+        // empty browse, and a group create/edit, so every optional field is seen.
+        "LabelsResponse": [
+            to(&LabelsResponse {
+                labels: vec![
+                    LabelCount { name: "benchmarking".into(), count: 12, group_id: Some(1) },
+                    LabelCount { name: "kvm".into(), count: 3, group_id: None },
+                ],
+                groups: vec![vibe_talk::store::LabelGroup {
+                    id: 1,
+                    display: "benchmarking".into(),
+                    spellings: vec!["benchmark".into(), "benchmarking".into()],
+                    created_ms: 1_790_000_000_000,
+                    updated_ms: 1_790_000_000_000,
+                }],
+                groups_revision: 1_790_000_000_000,
+                labels_notice: "labels are this server's own",
+            }),
+            to(&LabelsResponse {
+                labels: Vec::new(),
+                groups: Vec::new(),
+                groups_revision: 0,
+                labels_notice: "labels are this server's own",
+            }),
+        ],
+        "LabelGroupsResponse": [
+            to(&LabelGroupsResponse {
+                groups: vec![vibe_talk::store::LabelGroup {
+                    id: 1,
+                    display: "benchmarking".into(),
+                    spellings: vec!["benchmark".into(), "benchmarking".into()],
+                    created_ms: 1_790_000_000_000,
+                    updated_ms: 1_790_000_000_000,
+                }],
+                revision: 1_790_000_000_000,
+                labels_notice: "labels are this server's own",
+            }),
+        ],
+        "LabelGroupRequest": [
+            to(&LabelGroupRequest {
+                display: "benchmarking".into(),
+                spellings: vec!["benchmark".into(), "benchmarking".into()],
             }),
         ],
         "PinsResponse": [

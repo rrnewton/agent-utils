@@ -283,6 +283,10 @@ struct ShadowProgress {
 /// claim. `#497 cache-shadow-missing-row`.
 pub const NOTES_PER_HOUR: u32 = 30;
 
+/// How many held rows one label-count scan reads (`#1825`): the search budget's
+/// size, so the Settings browse costs one bounded scan, never the whole file.
+const LABEL_COUNT_BUDGET: usize = 20_000;
+
 /// The most messages of each kind one diagnostic line names; it counts the rest.
 const NOTED_ROWS: usize = 8;
 
@@ -2388,6 +2392,45 @@ impl Sink {
             view,
             frontier,
         })
+    }
+
+    /// Every hashtag label the cache holds of `channel`, counted (`#1825`), under
+    /// the same gates as [`Sink::search`]. Counts cover the held copy only.
+    pub fn label_counts(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<std::collections::BTreeMap<String, usize>, super::search::SearchRefusal> {
+        use super::search::{SearchRefusal, SearchView};
+        let cache = self
+            .cache()
+            .filter(|cache| cache.is_open())
+            .ok_or(SearchRefusal::NoCache)?;
+        if !self.serve_enabled() {
+            return Err(SearchRefusal::ServeOff);
+        }
+        let route = self
+            .state
+            .routes()
+            .fills
+            .get(channel)
+            .cloned()
+            .ok_or(SearchRefusal::NotRouted)?;
+        match self.verification(&route.key) {
+            Verification::Verified => {}
+            Verification::Suspended => return Err(SearchRefusal::Suspended),
+            Verification::Mismatched => return Err(SearchRefusal::AccountMismatch),
+            Verification::Unverified => return Err(SearchRefusal::Unverified),
+        }
+        let view = if route.shape == Shape::Bridge {
+            SearchView::Flat
+        } else {
+            SearchView::All
+        };
+        let chan = ChanKey::new(route.key.clone(), channel.as_str());
+        cache
+            .label_counts(&chan, view, LABEL_COUNT_BUDGET)
+            .served()
+            .ok_or(SearchRefusal::Blocked)
     }
 
     /// What the cache holds of the newest page `ask` names, for a read whose upstream read failed or

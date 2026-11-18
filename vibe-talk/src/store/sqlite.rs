@@ -600,6 +600,16 @@ impl SqliteStore {
                 ) STRICT;",
             )
             .map_err(backend)?;
+        // `#1825 vibe-talk-hashtag-labels`: the label-group tables live OUTSIDE the
+        // migration ladder ON PURPOSE, so a binary-switch rollback stays possible:
+        // `migrate_through` refuses any file whose `user_version` exceeds the
+        // ladder a binary knows, so a ladder step here would make the previous
+        // binary unable to open this database at all. These tables are purely
+        // additive (nothing older references them), so creating them if absent
+        // leaves `user_version` untouched and a rolled-back binary serves as
+        // before. A future ladder step that touches them must CREATE IF NOT
+        // EXISTS and adopt them, never assume their absence.
+        ensure_label_group_tables(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             retention,
@@ -665,6 +675,137 @@ fn read_client_settings(
         out.push(row.map_err(backend)?);
     }
     Ok(out)
+}
+
+/// The label-group tables (`#1825`), created if absent. NOT a migration: see
+/// the call in [`SqliteStore::open`] for why they live outside [`MIGRATIONS`].
+/// Idempotent by construction (`IF NOT EXISTS`), so opening any database —
+/// fresh, current, or one a newer binary already added them to — is safe.
+fn ensure_label_group_tables(connection: &Connection) -> Result<(), StoreError> {
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS label_groups (
+                group_id   INTEGER PRIMARY KEY,
+                display    TEXT    NOT NULL,
+                created_ms INTEGER NOT NULL,
+                updated_ms INTEGER NOT NULL
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS label_group_spellings (
+                spelling TEXT    PRIMARY KEY NOT NULL,
+                group_id INTEGER NOT NULL REFERENCES label_groups(group_id)
+            ) STRICT;
+
+            CREATE TABLE IF NOT EXISTS label_group_state (
+                id       INTEGER PRIMARY KEY CHECK (id = 1),
+                revision INTEGER NOT NULL
+            ) STRICT;
+            ",
+        )
+        .map_err(backend)
+}
+
+/// Every label group in `connection`, by display, with the shared revision.
+fn label_groups_in(connection: &Connection) -> Result<super::LabelGroups, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT g.group_id, g.display, g.created_ms, g.updated_ms, s.spelling \
+             FROM label_groups g LEFT JOIN label_group_spellings s ON s.group_id = g.group_id \
+             ORDER BY g.display, s.spelling",
+        )
+        .map_err(backend)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(backend)?;
+    let mut groups: Vec<super::LabelGroup> = Vec::new();
+    for row in rows {
+        let (id, display, created_ms, updated_ms, spelling) = row.map_err(backend)?;
+        if groups.last().map(|g: &super::LabelGroup| g.id) != Some(id) {
+            groups.push(super::LabelGroup {
+                id,
+                display,
+                spellings: Vec::new(),
+                created_ms,
+                updated_ms,
+            });
+        }
+        if let (Some(group), Some(spelling)) = (groups.last_mut(), spelling) {
+            group.spellings.push(spelling);
+        }
+    }
+    let revision: i64 = connection
+        .query_row(
+            "SELECT revision FROM label_group_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .unwrap_or(0);
+    Ok(super::LabelGroups { groups, revision })
+}
+
+/// Grow the label-group revision and return it (pins' `next_pin_revision` rule).
+fn bump_label_group_revision(connection: &Connection) -> Result<i64, StoreError> {
+    let previous: i64 = connection
+        .query_row(
+            "SELECT revision FROM label_group_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .unwrap_or(0);
+    let revision = super::next_pin_revision(previous, now_ms());
+    connection
+        .execute(
+            "INSERT INTO label_group_state (id, revision) VALUES (1, ?1) \
+             ON CONFLICT(id) DO UPDATE SET revision = excluded.revision",
+            rusqlite::params![revision],
+        )
+        .map_err(backend)?;
+    Ok(revision)
+}
+
+/// Refuse when any of `spellings` already belongs to a group other than
+/// `except` (`None` on create): a spelling has at most one group.
+fn refuse_grouped_spellings(
+    connection: &Connection,
+    spellings: &[String],
+    except: Option<i64>,
+) -> Result<(), StoreError> {
+    for spelling in spellings {
+        let owner: Option<i64> = connection
+            .query_row(
+                "SELECT group_id FROM label_group_spellings WHERE spelling = ?1",
+                rusqlite::params![spelling],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(owner) = owner.filter(|owner| Some(*owner) != except) {
+            let display: String = connection
+                .query_row(
+                    "SELECT display FROM label_groups WHERE group_id = ?1",
+                    rusqlite::params![owner],
+                    |row| row.get(0),
+                )
+                .map_err(backend)?;
+            return Err(StoreError::BadId(format!(
+                "#{spelling} already belongs to the label group \"{display}\"; dissolve or edit that group first"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Apply every migration this file has not seen yet.
@@ -3022,6 +3163,121 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn label_groups(&self) -> Result<super::LabelGroups, StoreError> {
+        self.with_connection(move |connection| label_groups_in(connection))
+            .await
+    }
+
+    async fn create_label_group(
+        &self,
+        display: &str,
+        spellings: &[String],
+    ) -> Result<super::LabelGroups, StoreError> {
+        let display = display.to_owned();
+        let spellings = super::validate_label_group(&display, spellings)?;
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            refuse_grouped_spellings(&transaction, &spellings, None)?;
+            let now = now_ms();
+            transaction
+                .execute(
+                    "INSERT INTO label_groups (display, created_ms, updated_ms) VALUES (?1, ?2, ?2)",
+                    rusqlite::params![display, now],
+                )
+                .map_err(backend)?;
+            let id = transaction.last_insert_rowid();
+            for spelling in &spellings {
+                transaction
+                    .execute(
+                        "INSERT INTO label_group_spellings (spelling, group_id) VALUES (?1, ?2)",
+                        rusqlite::params![spelling, id],
+                    )
+                    .map_err(backend)?;
+            }
+            bump_label_group_revision(&transaction)?;
+            let groups = label_groups_in(&transaction)?;
+            transaction.commit().map_err(backend)?;
+            Ok(groups)
+        })
+        .await
+    }
+
+    async fn update_label_group(
+        &self,
+        id: i64,
+        display: &str,
+        spellings: &[String],
+    ) -> Result<super::LabelGroups, StoreError> {
+        let display = display.to_owned();
+        let spellings = super::validate_label_group(&display, spellings)?;
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let exists: Option<i64> = transaction
+                .query_row(
+                    "SELECT group_id FROM label_groups WHERE group_id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+            refuse_grouped_spellings(&transaction, &spellings, Some(id))?;
+            transaction
+                .execute(
+                    "UPDATE label_groups SET display = ?1, updated_ms = ?2 WHERE group_id = ?3",
+                    rusqlite::params![display, now_ms(), id],
+                )
+                .map_err(backend)?;
+            transaction
+                .execute(
+                    "DELETE FROM label_group_spellings WHERE group_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(backend)?;
+            for spelling in &spellings {
+                transaction
+                    .execute(
+                        "INSERT INTO label_group_spellings (spelling, group_id) VALUES (?1, ?2)",
+                        rusqlite::params![spelling, id],
+                    )
+                    .map_err(backend)?;
+            }
+            bump_label_group_revision(&transaction)?;
+            let groups = label_groups_in(&transaction)?;
+            transaction.commit().map_err(backend)?;
+            Ok(groups)
+        })
+        .await
+    }
+
+    async fn dissolve_label_group(&self, id: i64) -> Result<super::LabelGroups, StoreError> {
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            transaction
+                .execute(
+                    "DELETE FROM label_group_spellings WHERE group_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(backend)?;
+            let removed = transaction
+                .execute(
+                    "DELETE FROM label_groups WHERE group_id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(backend)?;
+            if removed == 0 {
+                return Err(StoreError::NotFound);
+            }
+            bump_label_group_revision(&transaction)?;
+            let groups = label_groups_in(&transaction)?;
+            transaction.commit().map_err(backend)?;
+            Ok(groups)
+        })
+        .await
+    }
+
     async fn bookmark(&self, channel: &ChannelId) -> Result<Bookmark, StoreError> {
         let channel = channel.clone();
         self.with_connection(move |connection| bookmark_row(connection, channel.as_str()))
@@ -4471,6 +4727,105 @@ mod tests {
             error.to_string().contains("newer vibe-talk"),
             "the operator has to be told why: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn label_groups_round_trip_refuse_a_second_group_and_survive_reopen() {
+        let dir = TempDir::new("sqlite-label-groups");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        let store = SqliteStore::open(&file, Retention::default()).expect("open");
+        assert!(store.label_groups().await.expect("read").groups.is_empty());
+
+        let made = store
+            .create_label_group(
+                "benchmarking",
+                &["benchmark".to_owned(), "benchmarking".to_owned()],
+            )
+            .await
+            .expect("create");
+        assert_eq!(made.groups.len(), 1);
+        assert_eq!(made.groups[0].display, "benchmarking");
+        assert_eq!(
+            made.groups[0].spellings,
+            vec!["benchmark".to_owned(), "benchmarking".to_owned()]
+        );
+        assert!(made.revision > 0);
+
+        // A spelling already grouped refuses a second group, naming the first.
+        let refused = store
+            .create_label_group("perf", &["benchmark".to_owned(), "perf".to_owned()])
+            .await
+            .expect_err("a grouped spelling must refuse");
+        assert!(
+            refused.to_string().contains("already belongs"),
+            "{refused}"
+        );
+
+        // Editing keeps its own spellings, renames, and bumps the revision.
+        let edited = store
+            .update_label_group(
+                made.groups[0].id,
+                "benchmarking",
+                &[
+                    "bench".to_owned(),
+                    "benchmark".to_owned(),
+                    "benchmarking".to_owned(),
+                ],
+            )
+            .await
+            .expect("edit");
+        assert_eq!(edited.groups[0].spellings.len(), 3);
+        assert!(edited.revision > made.revision);
+
+        // Persistence across reopen, and the ensure step is idempotent: opening
+        // the same file again neither fails nor loses the group.
+        drop(store);
+        let reopened = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        let held = reopened.label_groups().await.expect("read back");
+        assert_eq!(held.groups.len(), 1);
+        assert_eq!(held.groups[0].spellings.len(), 3);
+
+        // Dissolve: the spellings are plain labels again.
+        let gone = reopened
+            .dissolve_label_group(held.groups[0].id)
+            .await
+            .expect("dissolve");
+        assert!(gone.groups.is_empty());
+    }
+
+    #[test]
+    fn a_v26_database_with_the_label_tables_already_present_opens_and_serves() {
+        // Rollback compatibility (coordb, #1825): the tables live outside the
+        // ladder, so a database at the current ladder version that already
+        // holds them opens under this build, and `user_version` never moved.
+        let dir = TempDir::new("sqlite-label-rollback");
+        let file = dir.path().join("state").join("vibe-talk.sqlite3");
+        {
+            let store = SqliteStore::open(&file, Retention::default()).expect("open");
+            let guard = store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let version: i64 = guard
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version");
+            assert_eq!(
+                usize::try_from(version).expect("version"),
+                MIGRATIONS.len(),
+                "the ensure step must not move user_version"
+            );
+            let tables: i64 = guard
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' \
+                     AND name IN ('label_groups', 'label_group_spellings', 'label_group_state')",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("tables");
+            assert_eq!(tables, 3, "a fresh database gets the tables");
+        }
+        // Open twice: the ensure step is idempotent.
+        SqliteStore::open(&file, Retention::default()).expect("second open");
     }
 
     #[tokio::test]

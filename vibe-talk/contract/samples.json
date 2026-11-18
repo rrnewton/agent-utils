@@ -826,6 +826,68 @@
       "mode": "default"
     }
   ],
+  "LabelGroupRequest": [
+    {
+      "display": "benchmarking",
+      "spellings": [
+        "benchmark",
+        "benchmarking"
+      ]
+    }
+  ],
+  "LabelGroupsResponse": [
+    {
+      "groups": [
+        {
+          "created_ms": 1790000000000,
+          "display": "benchmarking",
+          "id": 1,
+          "spellings": [
+            "benchmark",
+            "benchmarking"
+          ],
+          "updated_ms": 1790000000000
+        }
+      ],
+      "labels_notice": "labels are this server's own",
+      "revision": 1790000000000
+    }
+  ],
+  "LabelsResponse": [
+    {
+      "groups": [
+        {
+          "created_ms": 1790000000000,
+          "display": "benchmarking",
+          "id": 1,
+          "spellings": [
+            "benchmark",
+            "benchmarking"
+          ],
+          "updated_ms": 1790000000000
+        }
+      ],
+      "groups_revision": 1790000000000,
+      "labels": [
+        {
+          "count": 12,
+          "group_id": 1,
+          "name": "benchmarking"
+        },
+        {
+          "count": 3,
+          "name": "kvm"
+        }
+      ],
+      "labels_notice": "labels are this server's own"
+    },
+    {
+      "groups": [],
+      "groups_revision": 0,
+      "labels": [],
+      "labels_notice": "labels are this server's own"
+    }
+  ],
   "LiveDeleteEvent": [
     {
       "channel_id": "100",

@@ -1177,6 +1177,109 @@ export interface HistoryModeRequest {
 export type HoldReason = "rate_limited" | "upstream_error" | "provider_signal" | "storage";
 
 /**
+ * One label in `GET /api/v1/labels` (`#1825 vibe-talk-hashtag-labels`).
+ */
+export interface LabelCount {
+  /**
+   * How many held messages carry it. COUNTS COVER THE LOADED HISTORY ONLY
+   * (the server's message cache), never all-time; the page says so.
+   */
+  count: number;
+  /**
+   * The group this name displays for, when it is grouped.
+   */
+  group_id?: number | null;
+  /**
+   * The name filters and chips use: a group's display, or a plain spelling.
+   */
+  name: string;
+}
+
+/**
+ * One label group (`#1825 vibe-talk-hashtag-labels`, owner thread 167): a display
+ * name and the alternate spellings that all mean it (`benchmark` under
+ * `benchmarking`). A spelling belongs to at most one group — the store refuses
+ * a create or edit that would give it a second one.
+ */
+export interface LabelGroup {
+  /**
+   * When the group was created, milliseconds since the epoch.
+   */
+  created_ms: number;
+  /**
+   * The canonical slug every spelling displays and filters as.
+   */
+  display: string;
+  /**
+   * The group's row id, as the API names it.
+   */
+  id: number;
+  /**
+   * Every spelling in the group, the display included, sorted.
+   */
+  spellings: string[];
+  /**
+   * When it last changed, milliseconds since the epoch.
+   */
+  updated_ms: number;
+}
+
+/**
+ * A label-group create or edit (`POST`/`PUT /api/v1/label-groups`, `#1825`).
+ */
+export interface LabelGroupRequest {
+  /**
+   * The group's display name: one of its spellings.
+   */
+  display: string;
+  /**
+   * Every spelling in the group, the display included.
+   */
+  spellings: string[];
+}
+
+/**
+ * What a label-group create, edit or dissolve did (`#1825`).
+ */
+export interface LabelGroupsResponse {
+  /**
+   * Every group after the call.
+   */
+  groups: LabelGroup[];
+  /**
+   * The standing statement that these groups are this server's own.
+   */
+  labels_notice: string;
+  /**
+   * The revision the groups are at after the call.
+   */
+  revision: number;
+}
+
+/**
+ * `GET /api/v1/labels` (`#1825`): every hashtag label in the loaded history,
+ * counted, with the label groups. Read scope.
+ */
+export interface LabelsResponse {
+  /**
+   * Every label group, as stored.
+   */
+  groups: LabelGroup[];
+  /**
+   * The revision the groups are at; a page compares it to notice edits.
+   */
+  groups_revision: number;
+  /**
+   * Every label, grouped spellings folded into their display, by name.
+   */
+  labels: LabelCount[];
+  /**
+   * The standing statement that these labels are this server's own.
+   */
+  labels_notice: string;
+}
+
+/**
  * The data of a live stream `message_delete` event: only the ids, never the removed text.
  */
 export interface LiveDeleteEvent {
@@ -1344,6 +1447,15 @@ export interface Message {
    * Snowflake of this message.
    */
   id: MessageId;
+  /**
+   * The hashtag labels of this message (`#1825 vibe-talk-hashtag-labels`), derived by
+   * [`crate::labels::extract_hashtags`] from `content` EVERY TIME the message is served
+   * (in [`crate::ops::stamp`], as `noise` is decided) — never stored and never trusted
+   * from whoever sent the message, so an edit updates the labels with the text. Bare
+   * slugs (`kvm`); auto-generated topics will carry an `auto:` prefix when they exist.
+   * EMPTY means the text holds no hashtag. Absent from an older server means the same.
+   */
+  labels?: string[];
   /**
    * Whether the owner's noise rules call this message read already. `#196 auto-read-noise`.
    *
@@ -3393,6 +3505,9 @@ export interface Contract {
   CatchupFollowupResponse: CatchupFollowupResponse;
   CatchupUpdateRequest: CatchupUpdateRequest;
   TranscriptsResponse: TranscriptsResponse;
+  LabelsResponse: LabelsResponse;
+  LabelGroupsResponse: LabelGroupsResponse;
+  LabelGroupRequest: LabelGroupRequest;
 }
 
 /** A contract type a peer may extend with new `type` tags. */

@@ -1435,6 +1435,75 @@ pub struct ThreadPinChange {
     pub revision: i64,
 }
 
+/// One label group (`#1825 vibe-talk-hashtag-labels`, owner thread 167): a display
+/// name and the alternate spellings that all mean it (`benchmark` under
+/// `benchmarking`). A spelling belongs to at most one group — the store refuses
+/// a create or edit that would give it a second one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LabelGroup {
+    /// The group's row id, as the API names it.
+    pub id: i64,
+    /// The canonical slug every spelling displays and filters as.
+    pub display: String,
+    /// Every spelling in the group, the display included, sorted.
+    pub spellings: Vec<String>,
+    /// When the group was created, milliseconds since the epoch.
+    pub created_ms: i64,
+    /// When it last changed, milliseconds since the epoch.
+    pub updated_ms: i64,
+}
+
+/// Every label group, and the revision they are at (it grows on any change).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabelGroups {
+    /// Every group, by display name.
+    pub groups: Vec<LabelGroup>,
+    /// See [`StateStore::label_groups`].
+    pub revision: i64,
+}
+
+/// Check a group's display and spellings as the extractor could have typed them:
+/// each a slug (`[a-z0-9_-]`, letter first, already folded), none empty, none
+/// repeated, the display among the spellings.
+///
+/// # Errors
+///
+/// [`StoreError::BadId`] naming the first refusal.
+pub fn validate_label_group(display: &str, spellings: &[String]) -> Result<Vec<String>, StoreError> {
+    let valid = |slug: &str| {
+        !slug.is_empty()
+            && slug.len() <= 64
+            && slug.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            && slug
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
+    };
+    if !valid(display) {
+        return Err(StoreError::BadId(format!(
+            "a label group's name must be a hashtag slug like \"benchmarking\", not {display:?}"
+        )));
+    }
+    let mut sorted: Vec<String> = spellings.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() != spellings.len() {
+        return Err(StoreError::BadId(
+            "a label group lists a spelling twice".to_owned(),
+        ));
+    }
+    if sorted.is_empty() || !sorted.iter().all(|s| valid(s)) {
+        return Err(StoreError::BadId(
+            "a label group's spellings must be hashtag slugs".to_owned(),
+        ));
+    }
+    if !sorted.iter().any(|s| s == display) {
+        return Err(StoreError::BadId(format!(
+            "the group's name {display:?} must be one of its spellings"
+        )));
+    }
+    Ok(sorted)
+}
+
 /// Check a snapshot and bring it inside its bounds, returning it as it will be stored.
 ///
 /// The TEXT is cut rather than refused, at a character boundary, and marked `truncated`: the
@@ -2628,6 +2697,29 @@ pub trait StateStore: Send + Sync {
         thread_id: &str,
         pinned: bool,
     ) -> Result<ThreadPinChange, StoreError>;
+
+    /// Every label group on this server (`#1825`), with the revision they are at.
+    /// Server-wide, not per channel: a spelling means the same group everywhere.
+    async fn label_groups(&self) -> Result<LabelGroups, StoreError>;
+
+    /// Create a label group. Refuses when a spelling already belongs to a group.
+    async fn create_label_group(
+        &self,
+        display: &str,
+        spellings: &[String],
+    ) -> Result<LabelGroups, StoreError>;
+
+    /// Replace a label group's name and spellings. Refuses as [`Self::create_label_group`]
+    /// does, the group's own spellings aside.
+    async fn update_label_group(
+        &self,
+        id: i64,
+        display: &str,
+        spellings: &[String],
+    ) -> Result<LabelGroups, StoreError>;
+
+    /// Dissolve a label group; its spellings are plain labels again.
+    async fn dissolve_label_group(&self, id: i64) -> Result<LabelGroups, StoreError>;
 
     /// This channel's bookmark and the revision it is at. `#240 reading-bookmark`.
     ///

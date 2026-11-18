@@ -19,7 +19,7 @@ use super::{
     SummaryKey, ThreadPinChange, ThreadPins, TranscriptCursor, TranscriptPage, Turn,
     UpstreamClearAttempt, UpstreamClearMode, UpstreamClearSetting,
 };
-use super::{HistoryMode, HistoryModeSetting};
+use super::{HistoryMode, HistoryModeSetting, LabelGroups};
 use crate::model::{ChannelId, MessageId};
 use crate::voice_agent::OwnerPrompt;
 
@@ -348,6 +348,31 @@ impl StateStore for DisabledStore {
         _: &str,
         _: bool,
     ) -> Result<ThreadPinChange, StoreError> {
+        refuse()
+    }
+
+    async fn label_groups(&self) -> Result<LabelGroups, StoreError> {
+        refuse()
+    }
+
+    async fn create_label_group(
+        &self,
+        _: &str,
+        _: &[String],
+    ) -> Result<LabelGroups, StoreError> {
+        refuse()
+    }
+
+    async fn update_label_group(
+        &self,
+        _: i64,
+        _: &str,
+        _: &[String],
+    ) -> Result<LabelGroups, StoreError> {
+        refuse()
+    }
+
+    async fn dissolve_label_group(&self, _: i64) -> Result<LabelGroups, StoreError> {
         refuse()
     }
 
