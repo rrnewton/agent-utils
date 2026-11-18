@@ -22712,6 +22712,38 @@ class _GitVcs:
                 "recovery; refusing before the salvage push so no local ref is mutated"
             )
 
+    def remote_effective_urls(self, path: Path, remote: str) -> tuple[str, ...]:
+        """Every URL ``remote`` resolves to under the invoking user's
+        configuration (its insteadOf rewrites, where its fetches
+        actually went), or () when that read fails.
+
+        Deliberately not `_run`: the user's own Git configuration is
+        the authority here, and nothing is contacted.
+        """
+
+        user_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_") or key.startswith("GIT_CONFIG_")
+        }
+        user_env.update(
+            {"LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
+        )
+        try:
+            effective = subprocess.run(
+                ["git", "-C", str(path), "remote", "get-url", "--all", remote],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=user_env,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ()
+        if effective.returncode != 0:
+            return ()
+        return tuple(line for line in effective.stdout.splitlines() if line)
+
     def assert_remote_authority(
         self, checkout: Path, remote: str, authority: _RemoteAuthority
     ) -> None:
@@ -24898,7 +24930,7 @@ class _AuditGitVcs(_GitVcs):
             tuple[Path, tuple[str, ...]], tuple[str, ...]
         ] = {}
         self._submodule_paths: dict[Path, tuple[str, ...]] = {}
-        self._indexed_gitlinks: dict[Path, tuple[str, ...]] = {}
+        self._indexed_gitlinks: dict[tuple[object, ...], tuple[str, ...]] = {}
         self._heads: dict[Path, str] = {}
         self._branches: dict[Path, str] = {}
         self._absolute_git_directories: dict[Path, Path] = {}
@@ -24907,6 +24939,10 @@ class _AuditGitVcs(_GitVcs):
         ] = {}
         self._durable_ref_tips: dict[Path, frozenset[str]] = {}
         self._commit_object_ids: dict[Path, tuple[str, ...]] = {}
+        self._effective_urls: dict[tuple[Path, str], tuple[str, ...]] = {}
+        self._durable_candidates_cache: dict[
+            tuple[str, str, str], tuple[Path, tuple[Path, ...]]
+        ] = {}
 
     def common_directory(self, repository: Path) -> Path:
         key = repository.absolute()
@@ -24966,8 +25002,16 @@ class _AuditGitVcs(_GitVcs):
     def _indexed_gitlink_paths(self, repository: Path) -> tuple[str, ...]:
         # submodule_paths and the submodule salvage inventory both parse
         # this one listing; an audit asks both of the same checkout, so
-        # the listing is taken once and shared (#1284).
-        key = repository.absolute()
+        # the listing is taken once and shared (#1284). Worktrees of one
+        # repository whose index files are identical share it too: the
+        # listing is a function of the index, so its identity keys it
+        # (#1794).
+        identity = self._index_identity(repository)
+        key: tuple[object, ...] = (
+            (self.common_directory(repository), identity)
+            if identity is not None
+            else (repository.absolute(),)
+        )
         if key not in self._indexed_gitlinks:
             self._indexed_gitlinks[key] = super()._indexed_gitlink_paths(
                 repository
@@ -25009,7 +25053,16 @@ class _AuditGitVcs(_GitVcs):
             return super().remote_authority(
                 checkout, remote, env_overrides=env_overrides
             )
-        key = (checkout.absolute(), remote)
+        # A remote's URL lives in the common config, so worktrees of
+        # one repository share the answer — unless a per-worktree
+        # config file could override it, in which case the checkout
+        # keeps its own key (#1794).
+        if os.path.lexists(
+            self.absolute_git_directory(checkout) / "config.worktree"
+        ):
+            key = (checkout.absolute(), remote)
+        else:
+            key = (self.common_directory(checkout), remote)
         if key not in self._remote_authorities:
             self._remote_authorities[key] = super().remote_authority(checkout, remote)
         return self._remote_authorities[key]
@@ -25030,6 +25083,35 @@ class _AuditGitVcs(_GitVcs):
         if common not in self._commit_object_ids:
             self._commit_object_ids[common] = super().commit_object_ids(path)
         return self._commit_object_ids[common]
+
+    def remote_effective_urls(self, path: Path, remote: str) -> tuple[str, ...]:
+        key = (self.common_directory(path), remote)
+        if key not in self._effective_urls:
+            self._effective_urls[key] = super().remote_effective_urls(path, remote)
+        return self._effective_urls[key]
+
+    def durable_candidates(
+        self,
+        config: Config,
+        submodule: Checkout,
+        path: Path,
+        authority: _RemoteAuthority,
+    ) -> tuple[Path, tuple[Path, ...]]:
+        """Durable candidates shared per (repository, submodule) (#1794)."""
+
+        key = (submodule.repository, submodule.remote, authority.sha256)
+        if key not in self._durable_candidates_cache:
+            self._durable_candidates_cache[key] = _durable_candidates(
+                self, config, submodule, path, authority
+            )
+        return self._durable_candidates_cache[key]
+
+    def _index_identity(self, repository: Path) -> tuple[int, int, int, int] | None:
+        try:
+            status = (self.absolute_git_directory(repository) / "index").stat()
+        except OSError:
+            return None
+        return (status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns)
 
 
 def _resolved_repository_path(
@@ -33311,7 +33393,7 @@ def _private_pseudoref_commits(
     Unfinished-operation files refuse elsewhere.
     """
 
-    git_directory = Path(vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip())
+    git_directory = vcs.absolute_git_directory(path)
     candidates: set[str] = set()
     named: dict[str, str] = {}
     try:
@@ -34333,9 +34415,7 @@ def _submodule_private_history_uncached(
 
     _assert_files_ref_storage(vcs, path)
     common = vcs.common_directory(path)
-    git_directory = Path(
-        vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
-    )
+    git_directory = vcs.absolute_git_directory(path)
     unresolvable: list[tuple[str, str, str]] = []
     # Durable negatives and the alternate stores every scan walk may
     # read, with lazy fetching off in every walk (#1785).
@@ -34855,34 +34935,26 @@ def _durable_submodule_repositories(
     nothing here contacts one.
     """
 
-    _relative, source = _stored_repository_path(config, submodule.repository)
-    durable = [source]
-    # The configured URL, and the URLs the invoking user's Git configuration
-    # rewrites it to (insteadOf), which is where its fetches actually went.
-    # Reading them runs no program and contacts nothing.
-    urls = [authority.url]
-    user_env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") or key.startswith("GIT_CONFIG_")
-    }
-    user_env.update({"LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
-    try:
-        effective = subprocess.run(
-            ["git", "-C", str(path), "remote", "get-url", "--all", submodule.remote],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=user_env,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        effective = None
-    if effective is not None and effective.returncode == 0:
-        urls.extend(line for line in effective.stdout.splitlines() if line)
-    # What removal deletes: the slot directory, at its canonical path or
-    # fenced, and the Git directory of each of its checkouts.  The slot may be
-    # fenced, so its checkouts are found from this submodule's superprojects.
+    source, mirrors = _durable_candidates(vcs, config, submodule, path, authority)
+    return _durable_filter(config, record, submodule, path, vcs, source, mirrors)
+
+
+def _durable_filter(
+    config: Config,
+    record: ActiveRecord,
+    submodule: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+    source: Path,
+    mirrors: Sequence[Path],
+) -> tuple[Path, ...]:
+    """Drop durable candidates removal itself deletes (see the caller).
+
+    What removal deletes: the slot directory, at its canonical path or
+    fenced, and the Git directory of each of its checkouts.  The slot may be
+    fenced, so its checkouts are found from this submodule's superprojects.
+    """
+
     top = path
     for _depth in range(64):
         parent = vcs._run(
@@ -34906,27 +34978,48 @@ def _durable_submodule_repositories(
         )
         if not checkout_path.is_dir():
             continue
-        removed.append(
-            Path(
-                vcs._run(checkout_path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
-            ).resolve()
-        )
+        removed.append(vcs.absolute_git_directory(checkout_path).resolve())
+    durable: list[Path] = []
     resolved_source = source.resolve(strict=False)
-    if any(
-        resolved_source == root or resolved_source.is_relative_to(root) for root in removed
+    if not any(
+        resolved_source == root or resolved_source.is_relative_to(root)
+        for root in removed
     ):
-        durable.remove(source)
+        durable.append(source)
+    for mirror in mirrors:
+        if any(mirror == root or mirror.is_relative_to(root) for root in removed):
+            continue
+        durable.append(mirror)
+    return tuple(durable)
+
+
+def _durable_candidates(
+    vcs: _GitVcs,
+    config: Config,
+    submodule: Checkout,
+    path: Path,
+    authority: _RemoteAuthority,
+) -> tuple[Path, tuple[Path, ...]]:
+    """The record-independent durable candidates for one submodule.
+
+    The source repository and every local-mirror repository its remote
+    URLs name, before the per-record removal filter: an audit judging
+    many rows of one repository derives these once per
+    (repository, submodule) and reuses them for every row (#1794).
+    """
+
+    _relative, source = _stored_repository_path(config, submodule.repository)
+    urls = (authority.url, *vcs.remote_effective_urls(path, submodule.remote))
+    mirrors: list[Path] = []
     for url in dict.fromkeys(urls):
         mirror = _absolute_local_remote_directory(
             path, _RemoteAuthority(url=url, sha256=hashlib.sha256(url.encode()).hexdigest())
         )
-        if mirror is None or mirror in durable:
-            continue
-        if any(mirror == root or mirror.is_relative_to(root) for root in removed):
+        if mirror is None or mirror == source or mirror in mirrors:
             continue
         if vcs._run(mirror, ["rev-parse", "--git-dir"], check=False).returncode == 0:
-            durable.append(mirror)
-    return tuple(durable)
+            mirrors.append(mirror)
+    return source, tuple(mirrors)
 
 
 def _index_state_trees(
@@ -56371,9 +56464,16 @@ def _audit_submodule_private_history(
     """
 
     authority = vcs.remote_authority(path, submodule.remote)
-    durable = _durable_submodule_repositories(
-        vcs, config, record, submodule, path, authority
-    )
+    if isinstance(vcs, _AuditGitVcs):
+        # Durable candidates are per (repository, submodule), shared
+        # across every row of that repository; only the removal
+        # filter below is per record (#1794).
+        source, mirrors = vcs.durable_candidates(config, submodule, path, authority)
+        durable = _durable_filter(config, record, submodule, path, vcs, source, mirrors)
+    else:
+        durable = _durable_submodule_repositories(
+            vcs, config, record, submodule, path, authority
+        )
     kept = vcs.head(path)
     if _audit_private_history_absent(vcs, path, kept, durable):
         return None

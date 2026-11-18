@@ -9,6 +9,7 @@ fold. Temporary fixture registries only.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -167,6 +168,30 @@ def test_audit_private_history_precheck_absent_when_clean(tmp_path: Path) -> Non
     checkout_path = wrkslots_cli._stored_path(config, record.checkouts[0].path, "checkout path")
     kept = vcs.head(checkout_path)
     assert wrkslots_cli._audit_private_history_absent(vcs, checkout_path, kept, ()) is True
+
+
+def test_audit_durable_candidates_shared_per_submodule(tmp_path: Path) -> None:
+    """Durable candidates are derived once per (repository, submodule)."""
+
+    root = _nested_submodule_fixture(tmp_path / "nested")
+    config = wrkslots_cli._load_config(str(root), None)
+    state = wrkslots_cli._load_active(config)
+    record = state.slots[0]
+    vcs = wrkslots_cli._AuditGitVcs()
+    found = wrkslots_cli._submodule_salvage_checkouts(
+        config, record.checkouts[0], vcs
+    )
+    assert found
+    submodule, path = found[0]
+    authority = vcs.remote_authority(path, submodule.remote)
+    first = vcs.durable_candidates(config, submodule, path, authority)
+    # A second row's copy of the same submodule reuses the derivation:
+    # its path is never even read.
+    second = vcs.durable_candidates(
+        config, submodule, tmp_path / "no-such-copy", authority
+    )
+    assert first == second
+    assert len(vcs._durable_candidates_cache) == 1
 
 
 def test_audit_repository_facts_shared_per_repository(tmp_path: Path) -> None:
