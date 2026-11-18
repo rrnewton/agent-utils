@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-history-up-arrow: Up and Down in the search box cycle previous search terms'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -36,3 +36,7 @@ Prior-ask report (the owner asked what happened to the earlier ask): an exhausti
 - Screenshot matrix per the standing acceptance (light and dark, keyboard open emulated and closed, phone 412x915 and desktop 1280x800, Discuss half-pane open in at least the phone shots, plus before/after of the recalled-term state), every image looked at, folder path and one line per image in the report.
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 238bcec338147b5d84098787036ef17ba89ff920 (replay of gated ae45e4e8, verified combined tree da633984). `createSearchHistory` in `web/src/core/search/history.ts` holds the last 50 run terms newest-first, de-duplicated, on the device under `vibe-talk.search-history`; Enter remembers, Up/Down walk it from `filterchips.ts` with the typed draft restored past the newest, typing ends the walk, Escape unchanged. Core, page and view suites cover every clause; the full local validate passed, and the gate's only red (read-aloud-blocks geometry) passed 3/3 solo on this tree and on main and again on the exclusive rerun. Screenshot matrix in /tmp/mu-searchhist-shots1816 (32 images, inspected; Discuss open in the phone shots).
