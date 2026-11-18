@@ -685,9 +685,8 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
     width: 2.7rem;
   }
 
-  /* `#1783` (a): five digits on a phone too (see the base rule). */
   #discuss-hours {
-    width: 4.4rem;
+    width: 2.7rem;
   }
 
   #discuss-since {
