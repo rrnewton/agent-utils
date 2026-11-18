@@ -175,6 +175,39 @@ export interface ChannelRows {
 export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
   const el = deps.byId;
 
+  // `#1836`: rows first measured while their list is hidden have no layout
+  // yet; when a list gains size, measure what stands in it.
+  if (typeof ResizeObserver !== "undefined") {
+    const sweep = (list: Element): void => {
+      for (const row of list.children) measureLabelRow(row as HTMLElement);
+    };
+    const watcher = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.contentRect.width > 0) sweep(entry.target);
+      }
+    });
+    for (const listId of ["discord-log", "pinned-log"]) {
+      try {
+        watcher.observe(el(listId));
+      } catch { /* a list this page has not drawn */ }
+    }
+  }
+
+  // `#1836`: label placement follows WIDTH changes only (a column resize, a
+  // window resize); a height change (the keyboard) never re-measures.
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    let lastWidth = window.innerWidth;
+    window.addEventListener("resize", () => {
+      if (window.innerWidth === lastWidth) return;
+      lastWidth = window.innerWidth;
+      for (const listId of ["discord-log", "pinned-log"]) {
+        try {
+          for (const row of el(listId).children) measureLabelRow(row as HTMLElement);
+        } catch { /* a list this page has not drawn */ }
+      }
+    });
+  }
+
   function emptyMessage(message: Message | null | undefined): boolean {
     if (!message || !BLANK_TEXT.test(String(message.content || ""))) return false;
     if (Array.isArray(message.reactions) && message.reactions.some((reaction) => reaction && (reaction as { count?: number }).count as number > 0)) return false;
@@ -275,6 +308,8 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
         if (!rowLabels.includes(label)) rowLabels.push(label);
       }
     }
+    const labelCluster = document.createElement("span");
+    labelCluster.className = "label-chips";
     for (const label of rowLabels) {
       const chip = document.createElement("button");
       chip.type = "button";
@@ -286,16 +321,18 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
         event.stopPropagation();
         deps.filterToLabel(label, li);
       });
-      meta.append(chip);
+      labelCluster.append(chip);
     }
+    if (rowLabels.length > 0) meta.append(labelCluster);
     const body = document.createElement("div");
     body.className = "body";
     deps.renderBodyInto(body, messages);
-    // Owner thread 168: a body line of ONLY hashtags is the labels said twice
-    // once the chips stand in the header, so it is hidden at render time (the
-    // stored text, raw view and copy keep it whole). The meta line wraps, so
-    // the chips always have room when they stand; a row served no labels
-    // keeps its line inline.
+    // Owner thread 168, completed by `#1836 label-inline-fallback`: a body
+    // line of ONLY hashtags is the labels said twice once the chips stand in
+    // the header, so it hides at render time (the stored text, raw view and
+    // copy keep it whole) — but only while the header has room, which
+    // `measureLabelRow` decides per row after layout: one visual label row
+    // in the cluster, or the labels stay inline and the line stands.
     if (rowLabels.length > 0) hideHashtagOnlyLines(body, rowLabels);
     const heading = deps.headingOf(message);
     const firstBody = body.children[0];
@@ -309,6 +346,29 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     const reactions = reactionStrip(messages);
     if (reactions) li.append(reactions);
     return { li, meta, body, content: combinedContent(messages), text, reactions };
+  }
+
+  /**
+   * Place one row's labels (`#1836`, approved design): the header chips stand
+   * only when they occupy ONE visual row in their cluster; otherwise the
+   * cluster hides and the hashtag lines stand inline in the body. Measured
+   * from layout (chip offsetTops), called by the render pass after a row is
+   * laid out and again on width changes — never on height changes, so the
+   * on-screen keyboard cannot flip a row. A live edit rebuilds the row, and
+   * the next pass measures the new labels again.
+   */
+  function measureLabelRow(row: HTMLElement): void {
+    const cluster = row.querySelector(".label-chips") as HTMLElement | null;
+    if (!cluster || cluster.children.length === 0) return;
+    const wasHidden = cluster.hidden;
+    if (wasHidden) cluster.hidden = false;
+    const tops = new Set([...cluster.children].map((chip) => (chip as HTMLElement).offsetTop));
+    const room = tops.size <= 1;
+    cluster.hidden = !room;
+    for (const line of row.querySelectorAll(".hashtag-line")) {
+      (line as HTMLElement).hidden = room;
+    }
+    void wasHidden;
   }
 
   /** Hide each body line whose whole text is hashtags the header chips name (`#1825`). */
@@ -1002,6 +1062,8 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     for (const row of [...rows, ...deps.byId("pinned-log").children]) {
       deps.dressChannelRow(row as HTMLElement, { tally, answered, viewing,
         inMain: deps.selectionView() === "main" && mainList.has(row), inAll: inAll && mainList.has(row) });
+      // `#1836`: the row is laid out now; place its labels (header or inline).
+      measureLabelRow(row as HTMLElement);
       // The linked message's mark is drawn as a row is built; a row kept or put back by a view
       // (`#1229 keyed-row-patching`) is not built again, so the pass draws the mark on it here.
       deps.drawLinkedMark(row as HTMLElement);

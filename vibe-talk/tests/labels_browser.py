@@ -72,6 +72,8 @@ SCRIPT: tuple[tuple[str, list[str], str | None, bool], ...] = (
     ("Lane thread root about the deploy.", [], LANE, True),
     ("Reply with a result #kvm", ["kvm"], LANE, False),
     ("Last word on the lane. #perf", ["perf"], None, False),
+    ("A wide label set for the fallback.\n#alpha-long-label #bravo-long-label #charlie-long-label #delta-long-label",
+     ["alpha-long-label", "bravo-long-label", "charlie-long-label", "delta-long-label"], None, False),
 )
 
 
@@ -337,8 +339,8 @@ def walk_through(walk: Walk) -> None:
         pass  # no first-run Welcome on this path (#1781)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
     # `#1781`: sign-in lands on the channel in All already; no view switch.
-    walk.until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 7",
-               "the channel did not open with its seven messages")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 8",
+               "the channel did not open with its eight messages")
     walk.settled()
 
     # 1. Chips on the cards; the hashtag-only line of 201 hides behind them.
@@ -353,6 +355,29 @@ def walk_through(walk: Walk) -> None:
     }""")
     walk.check(hidden_line, "201's hashtag-only line still stands under its chips")
     walk.shot("1-cards")
+
+    # 1b. `#1836`: the wide label set falls back inline where it wraps, and
+    # comes back to the header when the width returns (desk fits at once).
+    inline_state = page.evaluate("""() => {
+      const row = document.querySelector('#discord-log > li[data-id="207"]');
+      const cluster = row.querySelector('.label-chips');
+      const line = row.querySelector('.hashtag-line');
+      return {clusterHidden: cluster ? cluster.hidden : null, lineHidden: line ? line.hidden : null};
+    }""")
+    if walk.touch:
+        walk.check(inline_state == {"clusterHidden": True, "lineHidden": False},
+                   f"phone wide labels should stand inline, not wrapped in the header: {inline_state}")
+    else:
+        walk.check(inline_state == {"clusterHidden": False, "lineHidden": True},
+                   f"desk wide labels should stand in the header: {inline_state}")
+    walk.shot("1b-inline-fallback")
+    if walk.touch:
+        page.set_viewport_size({"width": 1280, "height": 915})
+        walk.until("() => { const c = document.querySelector('#discord-log > li[data-id=\"207\"] .label-chips'); return c && !c.hidden; }",
+                   "widening did not bring the wide labels back to the header")
+        page.set_viewport_size({"width": 412, "height": 915})
+        walk.until("() => { const c = document.querySelector('#discord-log > li[data-id=\"207\"] .label-chips'); return c && c.hidden; }",
+                   "narrowing did not put the wide labels back inline")
 
     # 2. Typing label:kvm filters to the two KVM messages.
     walk.press("#search-toggle")
@@ -373,7 +398,7 @@ def walk_through(walk: Walk) -> None:
 
     # 4. A chip tap filters, and the tapped message keeps its screen place.
     page.fill("#search-field", "")
-    walk.until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 7",
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 8",
                "clearing the search did not bring the channel back")
     row = page.locator('#discord-log > li[data-id="201"]')
     row.scroll_into_view_if_needed()
@@ -403,17 +428,17 @@ def walk_through(walk: Walk) -> None:
         if page.evaluate(f"() => document.getElementById('{body}').hidden"):
             page.click(toggle)
     walk.until("() => !document.getElementById('fold-labels-body').hidden", "the Labels fold did not open")
-    walk.until("() => document.querySelectorAll('#labels-list .label-row').length === 4",
-               "Settings did not list the four labels")
+    walk.until("() => document.querySelectorAll('#labels-list .label-row').length === 8",
+               "Settings did not list the eight labels")
     names = page.evaluate("() => [...document.querySelectorAll('#labels-list .label-name')].map((n) => n.textContent)")
-    walk.check(names == ["#kvm", "#benchmark", "#benchmarking", "#perf"],
+    walk.check(names == ["#kvm", "#alpha-long-label", "#benchmark", "#benchmarking", "#bravo-long-label", "#charlie-long-label", "#delta-long-label", "#perf"],
                f"count order says {names}")
     page.locator("#labels-list").scroll_into_view_if_needed()
     walk.settled()
     walk.shot("5-settings-count")
     page.click("#labels-sort")
     names = page.evaluate("() => [...document.querySelectorAll('#labels-list .label-name')].map((n) => n.textContent)")
-    walk.check(names == ["#benchmark", "#benchmarking", "#kvm", "#perf"], f"A-Z order says {names}")
+    walk.check(names == ["#alpha-long-label", "#benchmark", "#benchmarking", "#bravo-long-label", "#charlie-long-label", "#delta-long-label", "#kvm", "#perf"], f"A-Z order says {names}")
     page.locator("#labels-list").scroll_into_view_if_needed()
     walk.settled()
     walk.shot("6-settings-alpha")
@@ -449,7 +474,7 @@ def walk_through(walk: Walk) -> None:
                "not exactly one (G) row after combining")
     grouped = page.evaluate("""() => [...document.querySelectorAll('#labels-list .label-name')]
       .map((n) => n.textContent)""")
-    walk.check(grouped == ["#benchmarking", "#kvm", "#perf"],
+    walk.check(grouped == ["#benchmarking", "#kvm", "#alpha-long-label", "#bravo-long-label", "#charlie-long-label", "#delta-long-label", "#perf"],
                f"after combining the list says {grouped}")
     walk.shot("8-grouped")
 

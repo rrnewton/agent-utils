@@ -773,10 +773,17 @@ pub fn load_warmup(paths: &[String], max_chars: usize) -> (String, u64) {
 /// warm-up. A file with no glossary entries keeps the plain
 /// [`assemble_warmup`] behaviour, in order, under the same budget.
 #[must_use]
-pub fn load_warmup_for_window(paths: &[String], max_chars: usize, window_text: &str) -> (String, u64) {
+pub fn load_warmup_for_window(
+    paths: &[String],
+    max_chars: usize,
+    window_text: &str,
+) -> (String, u64) {
     let files_fingerprint = warmup_fingerprint(paths);
     if paths.is_empty() || max_chars == 0 {
-        return (String::new(), crate::glossary::selection_fingerprint(files_fingerprint, ""));
+        return (
+            String::new(),
+            crate::glossary::selection_fingerprint(files_fingerprint, ""),
+        );
     }
     let mut files: Vec<(String, String)> = Vec::new();
     for path in paths {
@@ -794,7 +801,10 @@ pub fn load_warmup_for_window(paths: &[String], max_chars: usize, window_text: &
         }
     }
     if files.is_empty() {
-        return (String::new(), crate::glossary::selection_fingerprint(files_fingerprint, ""));
+        return (
+            String::new(),
+            crate::glossary::selection_fingerprint(files_fingerprint, ""),
+        );
     }
     // Fast path: one glossary file is the shipped shape; select directly.
     if files.len() == 1 {
@@ -834,7 +844,10 @@ pub fn load_warmup_for_window(paths: &[String], max_chars: usize, window_text: &
         out
     } else {
         let kept: String = out.chars().take(max_chars).collect();
-        format!("{}\n[warm-up cut here by this server to fit its budget]", kept.trim_end())
+        format!(
+            "{}\n[warm-up cut here by this server to fit its budget]",
+            kept.trim_end()
+        )
     };
     let fingerprint = crate::glossary::selection_fingerprint(files_fingerprint, &text);
     (text, fingerprint)
@@ -1547,18 +1560,31 @@ mod tests {
         let window = "term00 and term01, term00 again";
         let (first, first_fp) = load_warmup_for_window(&paths, 400, window);
         let (second, second_fp) = load_warmup_for_window(&paths, 400, window);
-        assert_eq!(first, second, "same glossary and window must inject identically");
+        assert_eq!(
+            first, second,
+            "same glossary and window must inject identically"
+        );
         assert_eq!(first_fp, second_fp);
         assert!(
             first.chars().count() <= 400,
             "{} chars over budget: {first}",
             first.chars().count()
         );
-        assert!(first.contains("term00"), "most relevant term kept first: {first}");
+        assert!(
+            first.contains("term00"),
+            "most relevant term kept first: {first}"
+        );
         // A glossary edit changes what Discuss sees, so the fingerprint moves.
-        std::fs::write(&path, text.replace("definition number 0.", "renamed gloss.")).unwrap();
+        std::fs::write(
+            &path,
+            text.replace("definition number 0.", "renamed gloss."),
+        )
+        .unwrap();
         let (_, edited_fp) = load_warmup_for_window(&paths, 400, window);
-        assert_ne!(first_fp, edited_fp, "glossary change must move the fingerprint");
+        assert_ne!(
+            first_fp, edited_fp,
+            "glossary change must move the fingerprint"
+        );
     }
 
     #[test]

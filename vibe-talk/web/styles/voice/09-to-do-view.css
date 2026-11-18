@@ -169,8 +169,22 @@
   cursor: pointer;
 }
 
-/* A hashtag-only body line hidden because its chips stand in the header. */
-.hashtag-line {
+/* The label chips' cluster (`#1836`): one flex row that may wrap; placement
+   measures whether it wrapped. */
+.label-chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.label-chips[hidden] {
+  display: none;
+}
+
+/* A hashtag-only body line hidden because its chips stand in the header
+   (`#1836`: shown again inline when the header has no room). */
+.hashtag-line[hidden] {
   display: none;
 }
 

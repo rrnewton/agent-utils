@@ -54,7 +54,12 @@ pub fn parse_glossary(text: &str) -> Vec<GlossaryEntry> {
         let Some((term, definition)) = split_entry(rest.trim()) else {
             continue;
         };
-        let term = term.trim().trim_matches('*').trim().trim_matches('`').trim();
+        let term = term
+            .trim()
+            .trim_matches('*')
+            .trim()
+            .trim_matches('`')
+            .trim();
         let definition = definition.trim();
         if term.is_empty() || definition.is_empty() {
             continue;
@@ -175,7 +180,10 @@ pub fn build_glossary(
     };
     let mut out: Vec<GlossaryEntry> = Vec::new();
     for term in ranked_terms {
-        if out.iter().any(|e: &GlossaryEntry| e.term.eq_ignore_ascii_case(term)) {
+        if out
+            .iter()
+            .any(|e: &GlossaryEntry| e.term.eq_ignore_ascii_case(term))
+        {
             continue;
         }
         if let Some(entry) = lookup(term) {
@@ -184,7 +192,10 @@ pub fn build_glossary(
     }
     let mut rest: Vec<GlossaryEntry> = base
         .iter()
-        .filter(|e| !out.iter().any(|held| held.term.eq_ignore_ascii_case(&e.term)))
+        .filter(|e| {
+            !out.iter()
+                .any(|held| held.term.eq_ignore_ascii_case(&e.term))
+        })
         .cloned()
         .collect();
     rest.sort_by(|a, b| {
@@ -233,14 +244,12 @@ pub fn ranked_entries(
         })
         .collect();
     ranked.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| {
-                a.2.term
-                    .to_lowercase()
-                    .cmp(&b.2.term.to_lowercase())
-                    .then_with(|| a.2.term.cmp(&b.2.term))
-            })
+        b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)).then_with(|| {
+            a.2.term
+                .to_lowercase()
+                .cmp(&b.2.term.to_lowercase())
+                .then_with(|| a.2.term.cmp(&b.2.term))
+        })
     });
     ranked.into_iter().map(|(_, _, entry)| entry).collect()
 }
@@ -255,7 +264,8 @@ pub struct Selection {
 }
 
 /// Warm-up header shared with `catchup::assemble_warmup`.
-pub const WARMUP_HEADER: &str = "Reference material for the work this channel discusses (background only; \
+pub const WARMUP_HEADER: &str =
+    "Reference material for the work this channel discusses (background only; \
      the messages after it are the news):";
 
 /// Select the entries Discuss should see for `window_text` within `max_chars`.
@@ -328,7 +338,10 @@ pub fn assemble_glossary_warmup(
     }
     let mut text = text.trim_end().to_owned();
     if selection.dropped > 0 {
-        let note = format!("\n[glossary: {} term(s) omitted to fit budget]", selection.dropped);
+        let note = format!(
+            "\n[glossary: {} term(s) omitted to fit budget]",
+            selection.dropped
+        );
         if text.chars().count() + note.chars().count() <= max_chars {
             text.push_str(&note);
         }
@@ -416,7 +429,9 @@ pub fn parse_glossary_report_args(
         }
     }
     let Some(glossary_path) = glossary_path else {
-        anyhow::bail!("usage: vibe-talk glossary-report [--max-chars N] [--window FILE] <glossary.md>");
+        anyhow::bail!(
+            "usage: vibe-talk glossary-report [--max-chars N] [--window FILE] <glossary.md>"
+        );
     };
     Ok(Some(GlossaryReportOptions {
         glossary_path,
@@ -433,7 +448,8 @@ pub fn run_glossary_report(options: &GlossaryReportOptions) -> String {
     let entries = parse_glossary(&text);
     let stats = glossary_stats(&text, entries.len());
     let fits = stats.chars <= options.max_chars;
-    let mut out = format!(
+    let mut out =
+        format!(
         "glossary {}: {} entries, {} words, {} chars, ~{} tokens (estimate: 1 token / 4 chars)\n\
          budget {} chars: {}\n",
         options.glossary_path.display(),
@@ -446,7 +462,8 @@ pub fn run_glossary_report(options: &GlossaryReportOptions) -> String {
     );
     if let Some(window_path) = &options.window_path {
         let window = std::fs::read_to_string(window_path).unwrap_or_default();
-        let (warmup, selection) = assemble_glossary_warmup(&entries, &window, &[], options.max_chars);
+        let (warmup, selection) =
+            assemble_glossary_warmup(&entries, &window, &[], options.max_chars);
         let window_lower = window.to_lowercase();
         let present = entries
             .iter()
@@ -538,7 +555,10 @@ mod tests {
         let entries = vec![entry("beta", "second."), entry("alpha", "first.")];
         let ranked = ranked_entries(&entries, "no hits here", &[tally("beta", 3)]);
         assert_eq!(ranked[0].term, "beta");
-        assert_eq!(ranked, ranked_entries(&entries, "no hits here", &[tally("beta", 3)]));
+        assert_eq!(
+            ranked,
+            ranked_entries(&entries, "no hits here", &[tally("beta", 3)])
+        );
     }
 
     #[test]
