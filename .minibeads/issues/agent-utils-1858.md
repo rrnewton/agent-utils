@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-followup-find-cites-asker-message: a find-the-message follow-up links the askers own message'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -30,3 +30,7 @@ updated_at: 2026-11-18T13:30:00-05:00
 # Notes
 
 Owner-priority fast-track from the #1844 live check (liaison, 2026-11-18). Test instances only; no live tests. #1848 vibe-talk-route-health-alert continues after this.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 82b0a60d (gate 33458336; the only failures were three untouched browser steps — approval-card phone help, offline-cache phone, screenshots desks — each passed its exclusive rerun). The follow-up fetch now steps the cache-only walk back until the saved summary's through message is in the context (recap bound), and every follow-up prompt states the find rule: answer short, cite the one message first, the owner's own [OWNER] message for "where I ask". The seeded router test proves the asker's after-window message reaches the prompt and is cited, with no provider read; mutation-checked.
