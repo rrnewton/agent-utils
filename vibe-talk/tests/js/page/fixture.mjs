@@ -5242,6 +5242,11 @@ const TUNING_BANDS = {
   // under four a second checks chase every resize of a page still settling; far slower than
   // frames a reader sees misses the loss until whatever pushed it has itself gone.
   JUMP_LOST_CHECK_MS: [50, 1000, "ms between checks of a jumped-to row while it may still be lost"],
+  COMPOSER_HOLD_MS: [1000, 30000,
+    "how long after the last input in a message box the composer still holds the view " +
+    "(`#1839`): shorter hands the view back to a message anchor mid-dictation, the jump " +
+    "reported; longer keeps a reader who stopped writing from being landed where a " +
+    "thread entry or refresh would put them"],
   FOLLOW_REST_PX: [4, 20, "px above the rows' foot that still counts as resting on it for follow"],
   KEYBOARD_MIN_PX: [100, 220,
     "the least height an on-screen keyboard takes from the viewport before the page hides both bars for it: " +

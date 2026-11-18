@@ -2218,6 +2218,25 @@ const sentRead = createSentRead({
 });
 const { answeredRow, doneWhereNotDrawn, answeredDone, doneHeldHere, markAnsweredDone, channelMarksUpstream, rootThisStarts, channelIsOneThread, serviceMarkNotAsked, markReadInService, markSentRead } = sentRead;
 
+// `#1839 vibe-talk-composer-stays-in-view-while-dictating`. The composer that holds the
+// view: a message box with focus, or the one input last arrived in while that input is
+// still recent. While it stands, the scroll holders keep that box in view instead of
+// holding a message, and the thread entry places no landing or drill anchor.
+const COMPOSER_HOLD_MS = 5000;
+let heldComposerField = null;
+let heldComposerInputAt = -Infinity;
+document.addEventListener("input", (event) => {
+  if (isComposer(event.target)) {
+    heldComposerField = event.target;
+    heldComposerInputAt = Date.now();
+  }
+}, true);
+function heldComposer() {
+  if (isComposer(document.activeElement)) return document.activeElement;
+  if (heldComposerField && Date.now() - heldComposerInputAt < COMPOSER_HOLD_MS) return heldComposerField;
+  return null;
+}
+
 /**
  * Entering a thread, on its first unread message (`createThreadEntry`, `#624
  * voice-page-modularity`): the landing owed on entry and kept across its read.
@@ -2247,6 +2266,7 @@ const threadEntry = createThreadEntry({
   screen: () => screens.screen(),
   view: () => screens.view(),
   pinsView: () => pinsView(),
+  composerHeld: () => heldComposer() !== null,
 });
 const { entryState, payThreadEntry, entryLandingMark, keepEntryLanding, landOnFirstUnread, placeEntryLanding, entryLandingHolds } = threadEntry;
 
@@ -2494,6 +2514,7 @@ const scrollKeeping = createScrollKeeping({
   scrollToNewest: () => scrollToNewest(),
   renderJumpNewest: () => renderJumpNewest(),
   setJumpNewest: (on, view, turns) => setJumpNewest(on, view, turns),
+  composerHeld: () => heldComposer(),
 });
 const {
   visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingReader, captureScroll, restoreScroll, followIfPinned,

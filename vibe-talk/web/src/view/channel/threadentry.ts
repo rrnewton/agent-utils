@@ -71,6 +71,13 @@ export interface ThreadEntryDependencies {
   screen(): string;
   view(): string;
   pinsView(): { only: boolean };
+  /**
+   * Whether a composer holds the view (`#1839 vibe-talk-composer-stays-in-view-while-dictating`):
+   * a message box has focus or input arrived in one within the last few seconds. While it
+   * stands, no entry landing or drill anchor moves the list: the reader is dictating into the
+   * box, and holding a message still must not carry that box off screen. Absent: never held.
+   */
+  composerHeld?(): boolean;
 }
 
 /** Entering a thread, as the page calls it. */
@@ -173,6 +180,11 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
    * where the click's place is now under that card. False while its row is not drawn.
    */
   function placeDrillAnchor(drill: DrillAnchor & { thread: string }): boolean {
+    // `#1839`: while the composer holds the view the anchor is not placed at all - the
+    // measured nudge that keeps the clicked message still is exactly what carries the
+    // box being dictated into off screen. Paid (true) so the entry does not retry it as
+    // an unpaid landing on every read while the reader writes.
+    if (deps.composerHeld && deps.composerHeld()) return true;
     const row = drillRow(drill.id);
     if (!row) return false;
     const area = deps.el("scroll-area");
@@ -202,6 +214,12 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     drillKeeper = keeper;
     const correct = (): void => {
       if (drillKeeper !== keeper) return;
+      // `#1839`: the keeper stands down while the composer holds the view, for good:
+      // re-placing its message on a live-refresh mutation is the reported jump.
+      if (deps.composerHeld && deps.composerHeld()) {
+        stopDrillKeeper();
+        return;
+      }
       if (entry.drill !== drill) {
         stopDrillKeeper();
         return;
@@ -441,6 +459,12 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
    * the first unread row `first`: `row` itself, or the one under the root.
    */
   function placeEntryLanding(row: HTMLElement, first: HTMLElement): void {
+    // `#1839`: no landing write while the composer holds the view; the landing is
+    // still recorded, so entryLandingHolds keeps it for when the reader stops writing.
+    if (deps.composerHeld && deps.composerHeld()) {
+      entryState().landing = { key: deps.channelContextKey(), row, first, at: deps.el("scroll-area").scrollTop };
+      return;
+    }
     // `#1585 linked-message-always-expanded`. The row brought to the head — the thread's
     // root, for a thread-root open — is shown in full, as the first unread below it is.
     expandLandedRow(row);

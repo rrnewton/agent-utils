@@ -15,6 +15,8 @@ export interface ScrollMark {
   readonly top: number;
   /** The anchor row's message id, where it has one: a redraw that replaces the row is re-found by it. */
   readonly anchorId?: string | null;
+  /** The held composer's viewport top as the mark was taken, where it stood in view (`#1839`). */
+  readonly composerTop?: number | null;
 }
 
 /** A walk for the search whose control holds still while it reads, as far as keeping the reader reads it. */
@@ -58,6 +60,15 @@ export interface ScrollKeepingDependencies {
    */
   selectionIn?(area: HTMLElement): { id: string; start: number; end: number } | null;
   restoreSelectionIn?(area: HTMLElement, selection: { id: string; start: number; end: number }): void;
+  /**
+   * The composer the reader is writing in while it holds the view (`#1839
+   * vibe-talk-composer-stays-in-view-while-dictating`): its element while a message box has
+   * focus or input arrived in one within the last few seconds, else null. While it stands, a
+   * redraw is held on the composer, never on a message: the reader is dictating into that box,
+   * and a hold that puts it off screen is the defect, whatever message it preserves. Absent:
+   * unkept, as before.
+   */
+  composerHeld?(): Element | null;
 }
 
 /**
@@ -258,6 +269,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       anchor,
       top: anchor ? anchor.getBoundingClientRect().top : 0,
       anchorId: anchor ? anchor.getAttribute("data-id") : null,
+      composerTop: composerBefore(area),
     };
   }
 
@@ -318,6 +330,50 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     else element.scrollIntoView({ block: block as ScrollLogicalPosition, inline: inline as ScrollLogicalPosition });
   }
 
+  /** The band the reader actually sees, in viewport coordinates: shrunk by the keyboard. */
+  function visibleBand(area: HTMLElement): { head: number; foot: number } {
+    const box = area.getBoundingClientRect();
+    const visual = typeof window !== "undefined" ? window.visualViewport : null;
+    return visual ? { head: 0, foot: visual.height } : { head: box.top, foot: box.bottom };
+  }
+
+  /** Whether `rect` stands even partly in `band`. */
+  function inBand(rect: DOMRect, band: { head: number; foot: number }): boolean {
+    return rect.height > 0 && rect.bottom > band.head && rect.top < band.foot;
+  }
+
+  /**
+   * Keep the held composer where it stood, with one measured write (`#1839`): while the
+   * reader is dictating, the box they are writing in is the place kept, not a message - but
+   * only where the box stood in view as the change began. A reader who has scrolled up
+   * into the scrollback with the box still focused is reading, and is left on their
+   * message as before (`#1144`): the guard never yanks them back down to the box.
+   * False where no composer holds the view, or it stood out of view, so the caller
+   * keeps its own hold.
+   */
+  function keepComposerInView(area: HTMLElement, beforeTop: number | null): boolean {
+    const composer = deps.composerHeld ? deps.composerHeld() : null;
+    if (!composer || beforeTop === null) return false;
+    const rect = composer.getBoundingClientRect();
+    if (!rect || rect.height <= 0) return true;
+    area.scrollTop += rect.top - beforeTop;
+    // The restore can still leave the box past an edge (the list grew at the foot):
+    // bring it just inside, never through the history between.
+    const band = visibleBand(area);
+    const now = composer.getBoundingClientRect();
+    if (now.bottom > band.foot) area.scrollTop += now.bottom - band.foot;
+    else if (now.top < band.head) area.scrollTop += now.top - band.head;
+    return true;
+  }
+
+  /** The held composer's top as a change begins, where it stood in view; else null. */
+  function composerBefore(area: HTMLElement): number | null {
+    const composer = deps.composerHeld ? deps.composerHeld() : null;
+    if (!composer) return null;
+    const rect = composer.getBoundingClientRect();
+    return rect && inBand(rect, visibleBand(area)) ? rect.top : null;
+  }
+
   function holdingRows(mutate: () => void): void {
     if (holdDepth > 0) {
       mutate();
@@ -325,12 +381,17 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     }
     const mark = captureScroll();
     const area = el("scroll-area");
+    const composerWas = composerBefore(area);
     const selection = deps.selectionIn ? deps.selectionIn(area) : null;
     holdDepth += 1;
     try {
       mutate();
     } finally {
       holdDepth -= 1;
+    }
+    if (keepComposerInView(area, composerWas)) {
+      if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
+      return;
     }
     if (mark.anchor && mark.anchor.parentNode) {
       const shown = shownRowFor(mark.anchor);
@@ -386,6 +447,10 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
 
   function restoreScroll(mark: ScrollMark): void {
     const area = el("scroll-area");
+    // `#1839`: while the composer holds the view and stood in view as the change began,
+    // it outranks both the newest line and the message anchor - putting either back can
+    // carry the box being dictated into off screen. `mark.composerTop` is its place then.
+    if (keepComposerInView(area, typeof mark.composerTop === "number" ? mark.composerTop : null)) return;
     if (mark.pinned) {
       deps.scrollToNewest();
       return;
