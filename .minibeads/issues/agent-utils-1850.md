@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-fold-separator-shows-pinned: split pinned messages out of the fold separator'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -8,7 +8,7 @@ labels:
 - ui
 - pins
 created_at: 2026-11-18T10:35:00-05:00
-updated_at: 2026-11-18T10:35:00-05:00
+updated_at: 2026-11-18T12:10:00-05:00
 ---
 
 # Description
@@ -33,3 +33,17 @@ updated_at: 2026-11-18T10:35:00-05:00
 # Notes
 
 Owner thread 189 (2026-11-18), via coordb lane mu-foldpins. Proof per standing dynamic-testing rule (owner thread 185): real page against real server routes, deterministic browser test, shots of a fold with a pin before/after tapping "M pinned" and after tapping the rest, phone and desk, light and dark, keyboard open in one phone shot.
+
+## Resolution
+
+Landed on main as 1990702f ("vibe-talk: name pinned messages in the fold
+separator and open them alone"), gated at 2d3d022d (gate ledger pass,
+2026-11-18T17:05:14Z, owner priority). Folded runs holding pins read
+"… N read messages, M pinned …" with two labelled targets; the pinned
+target reveals only the pinned rows between updated separators, and pin
+changes update the line in place on the existing rows. Proof: page test
+in tests/js/page/reading-state.mjs, unit wording in
+tests/js/present/rows.test.mjs, real-Chromium walks in
+tests/fold_pins_browser.py (phone/desk, light/dark, keyboard shrunk,
+Discuss open on phone), screenshots inspected in /tmp/foldpins-shots.
+Deployed on landing per owner-priority gate; coordb deploys.
