@@ -358,6 +358,9 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
    * the next pass measures the new labels again.
    */
   function measureLabelRow(row: HTMLElement): void {
+    // A row a test double drew without the full element surface has no
+    // layout to measure; placement waits for a real row.
+    if (typeof row.querySelector !== "function") return;
     const cluster = row.querySelector(".label-chips") as HTMLElement | null;
     if (!cluster || cluster.children.length === 0) return;
     const wasHidden = cluster.hidden;
