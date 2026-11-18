@@ -280,7 +280,9 @@ def incremental_walk(walk: Walk, api: FakeApi) -> None:
     api.reset()
     walk.wait_calls(api, calls + 1, "the reset never re-read the channel")
     walk.wait_for(SAME_JS, "a no-change re-read replaced row elements (budget B1)")
-    walk.notes.append("no-change re-read after a stream reset: zero row elements replaced")
+    walk.check(not bool(page.evaluate("() => document.body.innerText.includes('live feed fell behind')")),
+               "a no-change resync still announced itself (step 2: silent unless it changed something)")
+    walk.notes.append("no-change re-read after a stream reset: zero row elements replaced, no resync notice")
     walk.shot("4-no-change-reread")
 
 

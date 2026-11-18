@@ -87,3 +87,5 @@ export {
   upsertThread,
   versionOf,
 } from "./incremental.ts";
+export { DEFAULT_ROW_PX, correctionFor, forgetHeight, heightFor, noteMeasured, rangeHeight, rowClassOf } from "./heights.ts";
+export type { RowClass } from "./heights.ts";

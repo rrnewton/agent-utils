@@ -908,3 +908,24 @@ test("`#1846` step 1: a no-change page merge keeps the array; one changed row bu
   // Local filtering over the deep desktop cache finds by data alone.
   assert.deepEqual(CHANNELS.filterCachedMessages(canon, "changed").map((x) => String(x.id)), [String(changed[0].id)]);
 });
+
+test("`#1846` step 2: heights are measured per bucket, estimated by class median, and spacers sum estimates", () => {
+  const { emptyCanon, noteMeasured, heightFor, rangeHeight, correctionFor, rowClassOf, DEFAULT_ROW_PX } = CHANNELS;
+  const canon = emptyCanon("h");
+  const m = (id, content) => ({ id, timestamp: "2026-10-01T00:00:01Z", content, author: "a" });
+  // Nothing measured: the default.
+  assert.equal(heightFor(canon, m("1", "hi"), "phone", false), DEFAULT_ROW_PX);
+  noteMeasured(canon, "1", 100, "phone", "plain");
+  noteMeasured(canon, "2", 120, "phone", "plain");
+  // Measured wins for its own row; the class median (120, upper median) estimates others.
+  assert.equal(heightFor(canon, m("1", "hi"), "phone", false), 100);
+  assert.equal(heightFor(canon, m("9", "hi"), "phone", false), 120);
+  // Another bucket knows nothing yet.
+  assert.equal(heightFor(canon, m("9", "hi"), "desk", false), DEFAULT_ROW_PX);
+  // Spacer math and the correction the anchor will apply.
+  const rows = [m("1", "hi"), m("2", "hi"), m("3", "hi")];
+  assert.equal(rangeHeight(canon, rows, 0, 3, "phone", () => false), 100 + 120 + 120);
+  assert.equal(correctionFor(120, 90), -30);
+  assert.equal(rowClassOf({ ...m("1", "x"), thread: { is_root: true } }, false), "root");
+  assert.equal(rowClassOf(m("1", "x"), true), "collapsed");
+});

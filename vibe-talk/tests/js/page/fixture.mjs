@@ -6373,6 +6373,8 @@ const TUNING_BANDS = {
   MIN_RENDER_PREFETCH_PX: [0, 0, "the least kept prefetch (0 = device default)"],
   MAX_RENDER_PREFETCH_PX: [1000, 20000, "the most kept prefetch, px"],
   DEFAULT_RENDER_PREFETCH_PX: [0, 0, "kept prefetch meaning device default"],
+  DEFAULT_ROW_PX: [40, 200, "row height before anything is measured, px"],
+  SAMPLES_KEPT: [4, 200, "measured heights kept per row class for its median"],
   MIN_RENDER_ROW_CAP: [0, 0, "the least kept row cap (0 = device default)"],
   MAX_RENDER_ROW_CAP: [50, 2000, "the most kept row cap"],
   DEFAULT_RENDER_ROW_CAP: [0, 0, "kept row cap meaning device default"],

@@ -8,6 +8,7 @@
 import type { Message } from "../../contract/index.ts";
 import { isNoise } from "../../present/rows/index.ts";
 import type { ChannelStore } from "../../core/channels/index.ts";
+import { changedIdsSince, clockOf } from "../../core/channels/index.ts";
 import type { TimelineReadOptions } from "./readcore.ts";
 
 /** One decoded stream frame. */
@@ -177,8 +178,15 @@ function onStreamFrame(frame: LiveFrame): void {
     // into the gap cannot be known, so it is said — unless the stream of every channel, which
     // carries this channel too, is what the call is hearing from.
     if (!watchAll.attached() && voiceCall().canSendText() && relayMode() !== "off") voiceCall().reportUnrelayed([], "gap");
-    setStatus("the live feed fell behind — re-reading the channel.");
-    refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))();
+    // `#1846` step 2: a resync that changes nothing is silent — the notice is for a re-read
+    // that actually brought something, not for every stream reset (the owner saw it over the
+    // newest message after a no-change re-read). Versions say which it was (step 1).
+    const beforeReset = clockOf(channelStore.current());
+    void refreshQuietly(() => loadDiscord({ keepPosition: true, reason: "reset" }))().then(() => {
+      if (changedIdsSince(channelStore.current(), beforeReset).length > 0) {
+        setStatus("the live feed fell behind — re-reading the channel.");
+      }
+    });
     // `#457 settings-server-side`. The same gap could hide a settings frame: re-read.
     refreshServerSettings().catch(() => {});
     return;
