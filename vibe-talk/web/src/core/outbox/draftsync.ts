@@ -144,8 +144,14 @@ export function createDraftSync(deps: DraftSyncDependencies): DraftSync {
   return {
     noteTyped(key, text) {
       const id = idOf(key);
-      pending.set(id, { key, text });
       cancelTimer(id);
+      // Blank words are no draft: nothing to sync, and no timer left armed
+      // for a later clear to have to cancel.
+      if (!text.trim()) {
+        pending.delete(id);
+        return;
+      }
+      pending.set(id, { key, text });
       if (!deps.autosync()) return;
       timers.set(
         id,

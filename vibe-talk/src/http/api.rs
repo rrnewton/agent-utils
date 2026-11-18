@@ -1370,11 +1370,13 @@ pub async fn put_composer_draft(
 
 /// `DELETE /api/v1/channels/{channel_id}/drafts` — forget one scope's draft.
 /// `#1840`. WRITE scope. Idempotent: sending or discarding twice is fine.
+/// The scope rides in the query, as the bookmark's revision does: a DELETE
+/// with a body is a request some stacks never read whole.
 pub async fn delete_composer_draft(
     State(state): State<AppState>,
     _scope: WriteScope,
     Path(channel_id): Path<String>,
-    Json(request): Json<crate::contract::DeleteComposerDraftRequest>,
+    Query(request): Query<crate::contract::DeleteComposerDraftRequest>,
 ) -> Result<Response, ApiError> {
     let channel = crate::model::ChannelId(channel_id);
     let thread = request.thread_id.unwrap_or_default();

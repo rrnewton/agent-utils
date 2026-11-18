@@ -328,7 +328,7 @@ fn inventory() -> Vec<Route> {
             "DELETE",
             "/api/v1/channels/{channel_id}/drafts",
             Write,
-            Json(r#"{"scope":"main"}"#),
+            Query("?scope=main", "?scope=nope"),
         ),
         route(
             "POST",

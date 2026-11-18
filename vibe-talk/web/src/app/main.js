@@ -1620,7 +1620,10 @@ const draftSync = createDraftSync({
     },
     deleteDraft: async (channel, body) => {
       if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
-      return api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "DELETE", body });
+      const query = body.thread_id
+        ? `?scope=${encodeURIComponent(body.scope)}&thread_id=${encodeURIComponent(body.thread_id)}`
+        : `?scope=${encodeURIComponent(body.scope)}`;
+      return api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts${query}`, { method: "DELETE" });
     },
   },
   deviceId: () => draftDeviceId(deviceStorageOnUse(), () => globalThis.crypto?.randomUUID?.() ?? `device-${Date.now()}-${Math.random()}`),

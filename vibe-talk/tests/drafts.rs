@@ -87,9 +87,9 @@ async fn a_draft_from_one_device_is_offered_on_another_and_sending_clears_it() {
     let (status, _) = call(
         &app,
         "DELETE",
-        &drafts_uri(),
+        &format!("{}?scope=main", drafts_uri()),
         Some(WRITE_TOKEN),
-        Some(json!({ "scope": "main" })),
+        None,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
