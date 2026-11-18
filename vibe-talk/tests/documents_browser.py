@@ -56,6 +56,12 @@ from typing import cast
 from playwright.sync_api import Locator, Page, Route, sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Every wait in this walk is on a page or server condition, so its timeout
+# only ever reports a hang: 120 s, the browser-suite backstop (#1765 step 2),
+# so a host too loaded to schedule the renderer for tens of seconds cannot
+# turn a condition that is coming into a failure.
+HANG_BACKSTOP_MS = 120_000
 CHANNEL = "100000000000000001"
 READ_TOKEN = "documents-check-read-token-not-a-real-credential"
 WRITE_TOKEN = "documents-check-write-token-not-a-real-credential"
@@ -143,7 +149,7 @@ def wait_heading_at_top(page: Page, heading_id: str, label: str) -> None:
             && b.getAttribute('aria-current') === 'true';
         }""",
         arg=[heading_id, label],
-        timeout=20_000,
+        timeout=HANG_BACKSTOP_MS,
     )
 
 
@@ -156,7 +162,7 @@ def wait_here_is(page: Page, label: str) -> None:
           return marked.length === 1 && marked[0].textContent.trim() === label;
         }""",
         arg=label,
-        timeout=20_000,
+        timeout=HANG_BACKSTOP_MS,
     )
 
 
@@ -179,27 +185,84 @@ def call(base: str, method: str, path: str, token: str, body: dict[str, object] 
     return parsed
 
 def tap_card(page: object, card: object) -> None:
-    """Tap a card's centre, waiting for it to be laid out first."""
-    card.wait_for(state="visible", timeout=20_000)  # type: ignore[attr-defined]
-    box = None
-    for _ in range(50):
-        box = card.bounding_box()  # type: ignore[attr-defined]
-        if box is not None:
-            break
-        page.wait_for_timeout(200)  # type: ignore[attr-defined]
-    assert box is not None
-    page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)  # type: ignore[attr-defined]
+    """Tap a card's centre, waiting for it to be laid out first.
+
+    The locator does the tapping: it re-resolves the card and taps the
+    element it finds, so a live refresh that rebuilds every card between
+    a coordinate measure and the tap cannot land the tap on whatever
+    card moved into the stale coordinates.
+    """
+    card.tap(timeout=HANG_BACKSTOP_MS)  # type: ignore[attr-defined]
 
 
-def star_appearance(star: Locator) -> dict[str, str]:
-    """One star button's glyph, pressed state, and computed ink and ground."""
-    found = star.evaluate(
-        """(el) => {
-          const s = getComputedStyle(el);
-          return {text: el.textContent, pressed: el.getAttribute('aria-pressed'),
-                  color: s.color, background: s.backgroundColor};
-        }""")
-    return cast(dict[str, str], found)
+def star_appearance(page: Page, find: str) -> dict[str, str]:
+    """One star button's glyph, pressed state, and computed ink and ground.
+
+    `find` is a page-side expression for the star, run fresh on every
+    attempt: a live refresh rebuilds every card (`replaceChildren`), so a
+    node resolved by one attempt can be detached before it is read, and
+    resolving a locator at all can outlast its 30 s timeout on a loaded
+    host. The evaluate runs in one page task, so the star it reads is the
+    star that is there; retrying it behind a generous backstop waits on
+    the star being readable, not on a deadline racing the refresh.
+    """
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            found = page.evaluate(
+                f"""() => {{
+                  const el = {find};
+                  if (!el) return null;
+                  const s = getComputedStyle(el);
+                  return {{text: el.textContent, pressed: el.getAttribute('aria-pressed'),
+                          color: s.color, background: s.backgroundColor}};
+                }}""")
+        except Exception as error:
+            if "Timeout" not in str(error) or time.monotonic() >= deadline:
+                raise
+            found = None
+        if found is not None:
+            return cast(dict[str, str], found)
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"the star was never readable: {find}")
+        page.wait_for_timeout(200)
+
+
+def card_star_find(text: str) -> str:
+    """The page-side expression for the star of the card naming `text`.
+
+    Whitespace is stripped before matching: a card's name is spread over
+    spans whose text nodes carry the layout's newlines, which a locator's
+    normalised `has_text` forgives and a raw `includes` does not.
+    """
+    return ("[...document.querySelectorAll('#documents-list .doc-card')]"
+            f".find((c) => c.textContent.replace(/\\s+/g, '').includes({json.dumps(text)}))"
+            "?.querySelector('.doc-star')")
+
+
+
+def scrolled_card_box(page: Page, text: str) -> dict[str, float]:
+    """Scroll the card naming `text` into view and return its box.
+
+    The query, the scroll and the measure run inside one page task, so a
+    live refresh that rebuilds every card between polls can only ever
+    detach a node no one is holding -- unlike a locator's scroll, whose
+    resolved node the refresh takes away mid-action ("Element is not
+    attached to the DOM"). The wait is the card being found and measured.
+    """
+    handle = page.wait_for_function(
+        """(text) => {
+          const card = [...document.querySelectorAll('#documents-list .doc-card')]
+            .find((c) => c.textContent.replace(/\\s+/g, '').includes(text));
+          if (!card) return null;
+          card.scrollIntoView({block: 'center'});
+          const r = card.getBoundingClientRect();
+          return {x: r.x, y: r.y, width: r.width, height: r.height};
+        }""",
+        arg=text,
+        timeout=120_000,
+    )
+    return cast(dict[str, float], handle.json_value())
 
 
 def check_star_gold(label: str, off: dict[str, str], on: dict[str, str]) -> None:
@@ -229,9 +292,9 @@ def check_fetch_since_prompt(page: Page, width: int, height: int, use_touch: boo
         "() => { const root = document.getElementById('scroll-area');"
         " root.scrollTop = root.scrollHeight; }")
     press("#docs-fetch")
-    page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=20_000)
+    page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=HANG_BACKSTOP_MS)
     press("#docs-fetch-since")
-    page.wait_for_selector("#docs-since", state="visible", timeout=20_000)
+    page.wait_for_selector("#docs-since", state="visible", timeout=HANG_BACKSTOP_MS)
     check("Fetch documents mentioned since" in (page.locator("#docs-since-title").text_content() or ""),
           "the prompt does not ask since when")
     position = page.evaluate(
@@ -243,9 +306,9 @@ def check_fetch_since_prompt(page: Page, width: int, height: int, use_touch: boo
           f"the prompt is not inside the {width}x{height} viewport: {box}")
     page.wait_for_function(
         "() => document.activeElement && document.activeElement.id === 'docs-since-days'",
-        timeout=20_000)
+        timeout=HANG_BACKSTOP_MS)
     press("#docs-since-cancel")
-    page.wait_for_selector("#docs-since", state="hidden", timeout=20_000)
+    page.wait_for_selector("#docs-since", state="hidden", timeout=HANG_BACKSTOP_MS)
 
 
 def check_doc_search(page: Page, width: int, height: int) -> None:
@@ -255,14 +318,14 @@ def check_doc_search(page: Page, width: int, height: int) -> None:
     fetched-documents search, whose result opens the reader at the
     highlighted match."""
     page.click("#docs-search-toggle")
-    page.wait_for_selector("#docs-search-field", state="visible", timeout=20_000)
+    page.wait_for_selector("#docs-search-field", state="visible", timeout=HANG_BACKSTOP_MS)
     # Default mode: typing a file-name fragment narrows the list in place.
     total_cards = page.locator("#documents-list .doc-card").count()
     check(total_cards > 1, f"the search check needs several cards, saw {total_cards}")
     page.fill("#docs-search-field", "demo-doc")
     page.wait_for_function(
         "() => document.querySelectorAll('#documents-list .doc-card').length === 1",
-        timeout=20_000)
+        timeout=HANG_BACKSTOP_MS)
     check("demo-doc" in (page.locator("#documents-list .doc-card").first.text_content() or ""),
           "the local filter did not keep the named document")
     # A fragment matching nothing says so instead of showing a bare list.
@@ -270,17 +333,17 @@ def check_doc_search(page: Page, width: int, height: int) -> None:
     page.wait_for_function(
         "() => (document.getElementById('documents-list')?.textContent || '')"
         ".includes('No documents match')",
-        timeout=20_000)
+        timeout=HANG_BACKSTOP_MS)
     # Full-text mode: tick Search text, then the server search runs.
     page.fill("#docs-search-field", "final")
     page.check("#docs-search-fulltext")
     page.click("#docs-search-go")
-    page.wait_for_selector(".doc-search-hit", timeout=20_000)
+    page.wait_for_selector(".doc-search-hit", timeout=HANG_BACKSTOP_MS)
     note = page.locator("#docs-search-note").text_content() or ""
     check("match" in note and "fetched document" in note and "searched" in note,
           f"the search note does not state its reach: {note!r}")
     page.click(".doc-search-hit")
-    page.wait_for_selector("#doc-body mark.search-hit", timeout=20_000)
+    page.wait_for_selector("#doc-body mark.search-hit", timeout=HANG_BACKSTOP_MS)
     marks = page.locator("#doc-body mark.search-hit")
     check("final" in (marks.first.text_content() or "").lower(),
           "the reader's first mark is not the searched word")
@@ -347,10 +410,11 @@ def main() -> int:
                 browser = pw.chromium.launch()
                 ctx = browser.new_context(viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
                 page = ctx.new_page()
+                ctx.set_default_timeout(HANG_BACKSTOP_MS)
                 page.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 page.goto(base + "/?v=docs", wait_until="load")
-                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 check(page.locator("#documents-list .doc-card").count() == 3, "the list did not draw every row")
                 check("demo-doc" in (page.locator("#documents-list").text_content() or ""),
                       "the list does not name its document")
@@ -373,15 +437,15 @@ def main() -> int:
                 cover_days = str(int((time.time() * 1000 - mentioned_ms) // 86_400_000) + 1)
                 for days, hours in (("0", "0"), (cover_days, "0")):
                     page.tap("#docs-fetch")
-                    page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=20_000)
+                    page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=HANG_BACKSTOP_MS)
                     page.tap("#docs-fetch-since")
-                    page.wait_for_selector("#docs-since", state="visible", timeout=20_000)
+                    page.wait_for_selector("#docs-since", state="visible", timeout=HANG_BACKSTOP_MS)
                     page.fill("#docs-since-days", days)
                     page.fill("#docs-since-hours", hours)
                     page.tap("#docs-since-go")
-                    page.wait_for_selector("#docs-since", state="hidden", timeout=20_000)
+                    page.wait_for_selector("#docs-since", state="hidden", timeout=HANG_BACKSTOP_MS)
                     page.wait_for_function(
-                        "() => !document.getElementById('docs-fetch').disabled", timeout=20_000)
+                        "() => !document.getElementById('docs-fetch').disabled", timeout=HANG_BACKSTOP_MS)
                     landed = {d["file_name"]: d for d in cast(
                         list[dict[str, object]],
                         call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)["documents"])}
@@ -396,15 +460,15 @@ def main() -> int:
 
                 # The bar's Fetch drop-up: Fetch visible, with a result said.
                 page.tap("#docs-fetch")
-                page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=20_000)
+                page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=HANG_BACKSTOP_MS)
                 page.tap("#docs-fetch-menu >> text=Fetch visible")
                 page.wait_for_function(
-                    "() => !document.getElementById('docs-fetch').disabled", timeout=20_000)
+                    "() => !document.getElementById('docs-fetch').disabled", timeout=HANG_BACKSTOP_MS)
 
                 # The paste row: a real touch fetches it from the server and opens the reader.
                 paste_card = page.locator("#documents-list .doc-card", has_text="demo-doc")
                 tap_card(page, paste_card)
-                page.wait_for_selector("#doc-body h1", timeout=20_000)
+                page.wait_for_selector("#doc-body h1", timeout=HANG_BACKSTOP_MS)
                 check("Demo deployment report" in (page.text_content("#doc-body") or ""),
                       "the reader did not render the fetched document")
                 # Wrapped items stay whole (`#1235 documents-list-continuation`): one
@@ -446,7 +510,7 @@ def main() -> int:
                 check(page.locator("#doc-outline-pop").is_hidden(), "the outline pop-up starts open")
                 page.tap("#doc-outline-open")
                 page.wait_for_function(
-                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=HANG_BACKSTOP_MS)
                 texts = [t.strip() for t in page.locator("#doc-outline button").all_text_contents()]
                 check(texts == OUTLINE_TEXTS, f"the outline lists {texts}, not {OUTLINE_TEXTS}")
                 indent = page.evaluate(
@@ -495,7 +559,7 @@ def main() -> int:
                     raise AssertionError("the scroller has no box to tap in")
                 page.touchscreen.tap(area_box["x"] + 30, area_box["y"] + 40)
                 page.wait_for_function(
-                    "() => document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                    "() => document.getElementById('doc-outline-pop').hidden", timeout=HANG_BACKSTOP_MS)
                 top_after = page.evaluate("() => document.getElementById('scroll-area').scrollTop")
                 check(top_after == top_before, "closing the outline moved the document")
 
@@ -509,7 +573,7 @@ def main() -> int:
                     route.abort()
 
                 ctx.route("https://paste.example/**", abort_source)
-                with ctx.expect_page(timeout=20_000) as popup_info:
+                with ctx.expect_page(timeout=HANG_BACKSTOP_MS) as popup_info:
                     page.tap("#doc-title a")
                 popup = popup_info.value
                 deadline = time.time() + 10
@@ -522,27 +586,27 @@ def main() -> int:
                 popup.close()
 
                 page.tap("#doc-back")
-                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
 
                 # Fetched-documents search at phone size (`#1266`).
                 check_doc_search(page, 393, 852)
                 page.tap("#doc-back")
-                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
 
                 # The system Back gesture: list -> document -> back to the list.
                 tap_card(page, paste_card)
-                page.wait_for_selector("#doc-body h1", timeout=20_000)
+                page.wait_for_selector("#doc-body h1", timeout=HANG_BACKSTOP_MS)
                 page.go_back()
-                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 check(page.locator("#pane-docs").is_visible(), "Back from the reader left the Documents view")
 
                 # A mention jumps to its message; Back returns to the list.
                 mention = page.locator("#documents-list .doc-card", has_text="demo-doc").locator(".doc-mentions-link")
                 mention.tap()
-                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
+                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=HANG_BACKSTOP_MS)
                 page.go_back()
                 # Back from the jump returns to the Documents list it started from.
-                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 check(page.locator("#pane-docs").is_visible(), "Back from the mention jump left the Documents view")
 
                 # A document link in a message opens the reader in-app (reply
@@ -551,13 +615,13 @@ def main() -> int:
                 # step joins this walk with #1081's in-reader links.
                 page.tap("#view-switch")
                 page.tap("#view-switch")
-                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
-                page.wait_for_selector("#discord-log a[data-doc]", timeout=20_000)
+                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=HANG_BACKSTOP_MS)
+                page.wait_for_selector("#discord-log a[data-doc]", timeout=HANG_BACKSTOP_MS)
                 page.tap("#discord-log a[data-doc]")
-                page.wait_for_function("() => !document.getElementById('docs-reader').hidden", timeout=20_000)
+                page.wait_for_function("() => !document.getElementById('docs-reader').hidden", timeout=HANG_BACKSTOP_MS)
                 check(page.locator("#pane-docs").is_visible(), "the document link did not open the reader in-app")
                 page.go_back()
-                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
+                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=HANG_BACKSTOP_MS)
                 check(page.locator("#pane-docs").is_hidden(),
                       "Back from a channel-opened document landed on the documents list")
                 page.wait_for_function(
@@ -569,20 +633,32 @@ def main() -> int:
                       const within = root.getBoundingClientRect();
                       return at.bottom > within.top && at.top < within.bottom;
                     }""",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 # On to the list again for the row checks below.
                 page.tap("#view-switch")
-                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
 
                 # The index document (`#1081`): its relative links render as
                 # in-app document links, and a tap opens the linked document
                 # in the reader though no message ever mentioned it (the
                 # reader's fetch admits it by key).
-                guide_card = page.locator("#documents-list .doc-card", has_text="guide.md")
-                tap_card(page, guide_card)
-                page.wait_for_selector("#doc-body h1", timeout=20_000)
-                check("Guide index" in (page.text_content("#doc-body") or ""),
-                      "the reader did not render the guide")
+                # Open the guide, and prove the reader rendered it: a tap
+                # that a rebuild or a starved fetch turned aside opens
+                # something else (or an error) under the same h1 wait, so
+                # go back and tap the freshly located card again until
+                # the guide itself is what the reader shows.
+                guide_deadline = time.monotonic() + HANG_BACKSTOP_MS / 1000
+                while True:
+                    tap_card(page, page.locator(
+                        "#documents-list .doc-card", has_text="guide.md"))
+                    page.wait_for_selector("#doc-body h1", timeout=HANG_BACKSTOP_MS)
+                    if "Guide index" in (page.text_content("#doc-body") or ""):
+                        break
+                    check(time.monotonic() < guide_deadline,
+                          "the reader did not render the guide")
+                    page.tap("#doc-back")
+                    page.wait_for_selector(
+                        "#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 next_link = page.locator("#doc-body a", has_text="the next document")
                 check(next_link.get_attribute("data-doc") == NEXT_KEY,
                       "the relative link carries no document key")
@@ -598,7 +674,7 @@ def main() -> int:
                 page.wait_for_function(
                     "() => (document.getElementById('doc-body')?.textContent || '')"
                     ".includes('Next document')",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 listed = cast(list[dict[str, object]],
                               call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)["documents"])
                 admitted = [d for d in listed if d["key"] == NEXT_KEY]
@@ -611,9 +687,9 @@ def main() -> int:
                 page.wait_for_function(
                     "() => (document.getElementById('doc-body')?.textContent || '')"
                     ".includes('Guide index')",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 page.tap("#doc-back")
-                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                page.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
 
                 # The broken GitHub row: the raw stub answers an error, and
                 # the row says why instead of doing nothing.
@@ -622,27 +698,28 @@ def main() -> int:
                 page.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('Could not fetch it.'))",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 ctx.close()
 
                 # The same outline flow at desktop size with a mouse: open, jump,
                 # HERE, and Escape from the keyboard inside the panel.
                 dctx = browser.new_context(viewport={"width": 1280, "height": 800})
                 dpage = dctx.new_page()
+                dctx.set_default_timeout(HANG_BACKSTOP_MS)
                 dpage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 dpage.goto(base + "/?v=docs", wait_until="load")
-                dpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                dpage.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 # The since prompt at desktop size too (`#1308`).
                 check_fetch_since_prompt(dpage, 1280, 800, use_touch=False)
                 dpage.locator("#documents-list .doc-card", has_text="demo-doc").click()
-                dpage.wait_for_selector("#doc-body h1", timeout=20_000)
+                dpage.wait_for_selector("#doc-body h1", timeout=HANG_BACKSTOP_MS)
                 check(dpage.locator("#doc-title a").get_attribute("href")
                       == "https://paste.example/demo-doc",
                       "the desktop title does not link to the source")
                 dpage.click("#doc-outline-open")
                 dpage.wait_for_function(
-                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                    "() => !document.getElementById('doc-outline-pop').hidden", timeout=HANG_BACKSTOP_MS)
                 dtexts = [t.strip() for t in dpage.locator("#doc-outline button").all_text_contents()]
                 check(dtexts == OUTLINE_TEXTS, f"the desktop outline lists {dtexts}, not {OUTLINE_TEXTS}")
                 # Hover underlines an entry (`#1542`), with no button chrome.
@@ -655,7 +732,7 @@ def main() -> int:
                       const s = getComputedStyle(b);
                       return s.textDecorationLine.includes('underline')
                         && s.backgroundColor === 'rgba(0, 0, 0, 0)';
-                    }""", timeout=20_000)
+                    }""", timeout=HANG_BACKSTOP_MS)
                 hover_entry.click()
                 wait_heading_at_top(dpage, "doc-setup-details", "1.1 Setup details")
                 check(not dpage.locator("#doc-outline-pop").is_hidden(),
@@ -667,14 +744,14 @@ def main() -> int:
                       "the second desktop pick closed the pop-up")
                 dpage.keyboard.press("Escape")
                 dpage.wait_for_function(
-                    "() => document.getElementById('doc-outline-pop').hidden", timeout=20_000)
+                    "() => document.getElementById('doc-outline-pop').hidden", timeout=HANG_BACKSTOP_MS)
 
                 # At desktop size (`#1081`): a ctrl+click on an in-document
                 # link follows its GitHub address in a new page, and a plain
                 # click on a non-document link still leaves the app. Both
                 # destinations are fulfilled locally, never really fetched.
                 dpage.click("#doc-back")
-                dpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                dpage.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 github_requests: list[str] = []
 
                 def abort_github(route: Route) -> None:
@@ -685,8 +762,8 @@ def main() -> int:
                 dctx.route("https://example.com/**",
                            lambda route: route.fulfill(status=200, body="example stub"))
                 dpage.locator("#documents-list .doc-card", has_text="guide.md").click()
-                dpage.wait_for_selector("#doc-body h1", timeout=20_000)
-                with dctx.expect_page(timeout=20_000) as popup_info:
+                dpage.wait_for_selector("#doc-body h1", timeout=HANG_BACKSTOP_MS)
+                with dctx.expect_page(timeout=HANG_BACKSTOP_MS) as popup_info:
                     dpage.locator("#doc-body a", has_text="the next document") \
                         .click(modifiers=["Control"])
                 popup = popup_info.value
@@ -700,15 +777,15 @@ def main() -> int:
                 check("Guide index" in (dpage.text_content("#doc-body") or ""),
                       "the ctrl+click moved the reader")
                 dpage.locator("#doc-body a", has_text="an example").click()
-                dpage.wait_for_url("https://example.com/elsewhere", timeout=20_000)
+                dpage.wait_for_url("https://example.com/elsewhere", timeout=HANG_BACKSTOP_MS)
                 dpage.go_back()
                 # The app's own Back handling takes the return from there;
                 # what matters is being back in the app, in Documents.
                 dpage.wait_for_function(
-                    "() => !document.getElementById('pane-docs').hidden", timeout=20_000)
+                    "() => !document.getElementById('pane-docs').hidden", timeout=HANG_BACKSTOP_MS)
                 # Fetched-documents search at desktop size (`#1266`).
                 dpage.goto(base + "/?v=docs", wait_until="load")
-                dpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                dpage.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 check_doc_search(dpage, 1280, 800)
                 dctx.close()
 
@@ -717,10 +794,11 @@ def main() -> int:
                 sctx = browser.new_context(
                     viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
                 spage = sctx.new_page()
+                sctx.set_default_timeout(HANG_BACKSTOP_MS)
                 spage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 spage.goto(base + "/?v=docs", wait_until="load")
-                spage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                spage.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 paste_key = str(by_file["demo-doc"]["key"])
 
                 # Star the paste document from its card; the star fills and
@@ -728,15 +806,15 @@ def main() -> int:
                 # to be visible (`#1306 doc-star-gold`): the gold check reads
                 # the card star's appearance on both sides of the tap.
                 paste_card = spage.locator("#documents-list .doc-card", has_text="demo-doc")
-                phone_card_off = star_appearance(paste_card.locator(".doc-star"))
+                phone_card_off = star_appearance(spage, card_star_find("demo-doc"))
                 paste_card.locator(".doc-star").tap()
                 spage.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('demo-doc')"
                     " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 check_star_gold("phone card star", phone_card_off,
-                                star_appearance(paste_card.locator(".doc-star")))
+                                star_appearance(spage, card_star_find("demo-doc")))
                 deadline = time.time() + 30
                 held_states: dict[str, object] = {}
                 while time.time() < deadline:
@@ -754,12 +832,12 @@ def main() -> int:
                 spage.locator(".doc-bucket[data-bucket='starred']").tap()
                 spage.wait_for_function(
                     "() => document.querySelectorAll('#documents-list .doc-card').length === 1",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 spage.reload(wait_until="load")
                 # Four by now: the linked next.md was admitted in the #1081 walk.
                 spage.wait_for_function(
                     "() => document.querySelectorAll('#documents-list .doc-card').length >= 3",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 starred = spage.locator(
                     "#documents-list .doc-card", has_text="demo-doc").locator(".doc-star")
                 check(starred.get_attribute("aria-pressed") == "true",
@@ -769,7 +847,7 @@ def main() -> int:
                 # starred, tap it off and read the outline, then tap the
                 # star back on for the steps below (`#1306`).
                 tap_card(spage, spage.locator("#documents-list .doc-card", has_text="demo-doc"))
-                spage.wait_for_selector("#doc-body h1", timeout=20_000)
+                spage.wait_for_selector("#doc-body h1", timeout=HANG_BACKSTOP_MS)
                 # `#1545 hamburger-show-hidden-list-only` at phone width: in
                 # the reader the hamburger offers no Show hidden and no
                 # empty Reader box (both return only with their own views).
@@ -778,34 +856,33 @@ def main() -> int:
                     "() => !document.getElementById('action-menu').hidden"
                     " && document.getElementById('docs-show-hidden').hidden"
                     " && document.getElementById('reader-box').hidden",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 spage.locator("#action-menu-open").click()
                 spage.wait_for_function(
-                    "() => document.getElementById('action-menu').hidden", timeout=20_000)
+                    "() => document.getElementById('action-menu').hidden", timeout=HANG_BACKSTOP_MS)
                 check(spage.locator("#doc-star").get_attribute("aria-pressed") == "true",
                       "the reader header does not show the card's star")
-                phone_header_on = star_appearance(spage.locator("#doc-star"))
+                phone_header_on = star_appearance(spage, "document.getElementById('doc-star')")
                 spage.tap("#doc-star")
                 spage.wait_for_function(
                     "() => document.getElementById('doc-star')"
                     "?.getAttribute('aria-pressed') === 'false'",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 check_star_gold("phone reader star",
-                                star_appearance(spage.locator("#doc-star")), phone_header_on)
+                                star_appearance(spage, "document.getElementById('doc-star')"), phone_header_on)
                 spage.tap("#doc-star")
                 spage.wait_for_function(
                     "() => document.getElementById('doc-star')"
                     "?.getAttribute('aria-pressed') === 'true'",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 spage.tap("#doc-back")
-                spage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                spage.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
 
                 # A real swipe hides the guide card; Undo brings it back.
-                guide_card = spage.locator("#documents-list .doc-card", has_text="guide.md")
-                guide_card.scroll_into_view_if_needed()
-                box = guide_card.bounding_box()
-                check(box is not None, "the guide card has no box to swipe")
-                assert box is not None
+                # No card handle is held across the scroll: a live refresh
+                # rebuilds every card, so `scrolled_card_box` queries,
+                # scrolls and measures in one page task instead.
+                box = scrolled_card_box(spage, "guide.md")
                 cdp = sctx.new_cdp_session(spage)
                 sx, sy = box["x"] + 60, box["y"] + box["height"] / 2
                 cdp.send("Input.dispatchTouchEvent",
@@ -818,20 +895,16 @@ def main() -> int:
                 spage.wait_for_function(
                     "() => ![...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('guide.md'))",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 spage.locator("#docs-undo").click()
                 spage.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('guide.md'))",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
 
                 # Swipe again, then the hamburger's Show hidden shows it
                 # dimmed, and Unhide restores it for good.
-                guide_card = spage.locator("#documents-list .doc-card", has_text="guide.md")
-                guide_card.scroll_into_view_if_needed()
-                box = guide_card.bounding_box()
-                check(box is not None, "the guide card has no box to swipe again")
-                assert box is not None
+                box = scrolled_card_box(spage, "guide.md")
                 sx, sy = box["x"] + 60, box["y"] + box["height"] / 2
                 cdp.send("Input.dispatchTouchEvent",
                          {"type": "touchStart", "touchPoints": [{"x": sx, "y": sy}]})
@@ -843,25 +916,48 @@ def main() -> int:
                 spage.wait_for_function(
                     "() => ![...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('guide.md'))",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 spage.locator("#action-menu-open").click()
-                spage.wait_for_selector("#docs-show-hidden", state="visible", timeout=20_000)
+                spage.wait_for_selector("#docs-show-hidden", state="visible", timeout=HANG_BACKSTOP_MS)
                 spage.locator("#docs-show-hidden").click()
                 dimmed = spage.locator("#documents-list .doc-card.doc-hidden", has_text="guide.md")
-                dimmed.wait_for(state="visible", timeout=20_000)
+                dimmed.wait_for(state="visible", timeout=HANG_BACKSTOP_MS)
                 opacity = dimmed.evaluate("(el) => getComputedStyle(el).opacity")
                 check(float(opacity) < 0.9, f"the shown hidden card is not dimmed (opacity {opacity})")
                 dimmed.locator(".doc-unhide").click()
                 spage.wait_for_function(
                     "() => ![...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.classList.contains('doc-hidden'))",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
+                # The unhide must also reach the server's synced settings
+                # before this device goes away: the fresh devices below
+                # converge from the server's copy, and on a loaded host
+                # the mirror can still be in flight at the close, leaving
+                # the guide hidden for every later device. Poll the
+                # server copy -- the condition -- as the star's poll above
+                # does, behind the same generous backstop.
+                guide_key = str(by_file["guide.md"]["key"])
+                sync_deadline = time.time() + HANG_BACKSTOP_MS / 1000
+                server_states: dict[str, object] = {}
+                while time.time() < sync_deadline:
+                    settings = call(base, "GET", "/api/v1/client-settings", READ_TOKEN)
+                    for entry in cast(list[dict[str, object]], settings["settings"]):
+                        if entry["key"] == "vibe-talk.voice.doc-states" and entry["value"]:
+                            server_states = json.loads(str(entry["value"]))
+                    guide_state = server_states.get(guide_key)
+                    if not (isinstance(guide_state, dict) and guide_state.get("h") == 1):
+                        break
+                    time.sleep(0.5)
+                guide_state = server_states.get(guide_key)
+                check(not (isinstance(guide_state, dict) and guide_state.get("h") == 1),
+                      f"the unhide did not reach the server state: {server_states}")
                 sctx.close()
 
                 # A fresh device (empty storage) converges from the server:
                 # the paste is starred, and nothing is hidden any more.
                 fctx = browser.new_context(viewport={"width": 393, "height": 852})
                 fpage = fctx.new_page()
+                fctx.set_default_timeout(HANG_BACKSTOP_MS)
                 fpage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 fpage.goto(base + "/?v=docs", wait_until="load")
@@ -869,16 +965,17 @@ def main() -> int:
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('demo-doc')"
                     " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
-                    timeout=30_000)
+                    timeout=HANG_BACKSTOP_MS)
                 fctx.close()
 
                 # Desktop: the Hide button hides, Show hidden and Unhide undo it.
                 hctx = browser.new_context(viewport={"width": 1280, "height": 800})
                 hpage = hctx.new_page()
+                hctx.set_default_timeout(HANG_BACKSTOP_MS)
                 hpage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 hpage.goto(base + "/?v=docs", wait_until="load")
-                hpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                hpage.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
 
                 # The gold star at desktop size (`#1306 doc-star-gold`), on
                 # the guide's card and then in its reader header, restored
@@ -889,60 +986,67 @@ def main() -> int:
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('demo-doc')"
                     " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
-                    timeout=30_000)
+                    timeout=HANG_BACKSTOP_MS)
+                # And the guide itself must be back in the list -- not
+                # still hidden by a state another device has not
+                # converged yet -- before its star is read.
+                hpage.wait_for_function(
+                    "() => [...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.replace(/\\s+/g, '').includes('guide.md'))",
+                    timeout=HANG_BACKSTOP_MS)
                 guide_star = hpage.locator(
                     "#documents-list .doc-card", has_text="guide.md").locator(".doc-star")
-                desk_card_off = star_appearance(guide_star)
+                desk_card_off = star_appearance(hpage, card_star_find("guide.md"))
                 guide_star.click()
                 hpage.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('guide.md')"
                     " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
-                    timeout=20_000)
-                check_star_gold("desktop card star", desk_card_off, star_appearance(guide_star))
+                    timeout=HANG_BACKSTOP_MS)
+                check_star_gold("desktop card star", desk_card_off, star_appearance(hpage, card_star_find("guide.md")))
                 hpage.locator("#documents-list .doc-card", has_text="guide.md").click()
-                hpage.wait_for_selector("#doc-body h1", timeout=20_000)
+                hpage.wait_for_selector("#doc-body h1", timeout=HANG_BACKSTOP_MS)
                 # `#1545` at desktop width, as at phone width above.
                 hpage.click("#action-menu-open")
                 hpage.wait_for_function(
                     "() => !document.getElementById('action-menu').hidden"
                     " && document.getElementById('docs-show-hidden').hidden"
                     " && document.getElementById('reader-box').hidden",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 hpage.click("#action-menu-open")
                 hpage.wait_for_function(
-                    "() => document.getElementById('action-menu').hidden", timeout=20_000)
+                    "() => document.getElementById('action-menu').hidden", timeout=HANG_BACKSTOP_MS)
                 hpage.wait_for_function(
                     "() => document.getElementById('doc-star')"
                     "?.getAttribute('aria-pressed') === 'true'",
-                    timeout=20_000)
-                desk_header_on = star_appearance(hpage.locator("#doc-star"))
+                    timeout=HANG_BACKSTOP_MS)
+                desk_header_on = star_appearance(hpage, "document.getElementById('doc-star')")
                 hpage.click("#doc-star")
                 hpage.wait_for_function(
                     "() => document.getElementById('doc-star')"
                     "?.getAttribute('aria-pressed') === 'false'",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 check_star_gold("desktop reader star",
-                                star_appearance(hpage.locator("#doc-star")), desk_header_on)
+                                star_appearance(hpage, "document.getElementById('doc-star')"), desk_header_on)
                 hpage.click("#doc-back")
-                hpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                hpage.wait_for_selector("#documents-list .doc-card", timeout=HANG_BACKSTOP_MS)
                 hpage.locator("#documents-list .doc-card", has_text="guide.md") \
                     .locator(".doc-hide").click()
                 hpage.wait_for_function(
                     "() => ![...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('guide.md'))",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 hpage.click("#action-menu-open")
-                hpage.wait_for_selector("#docs-show-hidden", state="visible", timeout=20_000)
+                hpage.wait_for_selector("#docs-show-hidden", state="visible", timeout=HANG_BACKSTOP_MS)
                 hpage.click("#docs-show-hidden")
                 hdim = hpage.locator("#documents-list .doc-card.doc-hidden", has_text="guide.md")
-                hdim.wait_for(state="visible", timeout=20_000)
+                hdim.wait_for(state="visible", timeout=HANG_BACKSTOP_MS)
                 hdim.locator(".doc-unhide").click()
                 hpage.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('guide.md')"
                     " && !c.classList.contains('doc-hidden'))",
-                    timeout=20_000)
+                    timeout=HANG_BACKSTOP_MS)
                 hctx.close()
                 browser.close()
             print("documents browser check: real-server list, touch fetch, reader, outline pop-up, "
