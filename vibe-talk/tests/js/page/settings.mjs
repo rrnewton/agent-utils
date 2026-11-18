@@ -1422,7 +1422,8 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // Mark read on reply sits under Your own messages: both say what marks read.
   // `#1321 after-done-setting` put After Done after Message links: what e does after marking
   // is a choice about marking messages, and it syncs as the choices beside it do.
-  assert.deepStrictEqual(messages, ["Your own messages", "Mark read on reply", "Mark-read automatically", "Message links", "Recently dismissed"]);
+  // `#1825` put Labels last: the hashtag labels of the loaded history are about messages.
+  assert.deepStrictEqual(messages, ["Your own messages", "Mark read on reply", "Mark-read automatically", "Message links", "Recently dismissed", "Labels"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -2736,8 +2737,8 @@ function foldProblems(html, css, script) {
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, PAGE_CODE), []);
   // 17 since `#1815 vibe-talk-settings-density-and-channel-header` removed the
-  // single-control groups' folds, counted and checked above.
-  assert.equal(scriptFolds(PAGE_CODE).length, 17, "a fold went missing from the list, or one was added unchecked");
+  // single-control groups' folds, 18 since `#1825` added Labels.
+  assert.equal(scriptFolds(PAGE_CODE).length, 18, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {
