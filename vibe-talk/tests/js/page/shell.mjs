@@ -1226,6 +1226,12 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
     `the Documents reader: ${[...docs.shown, "doc-outline-open"].join(" + ")} need ${withOutline.toFixed(1)}px of ` +
       `the ${budget.toFixed(1)}px a ${PHONE_PX}px phone leaves, so Outline pushes the switch off the edge`
   );
+  // `#1812 vibe-talk-discuss-off-in-documents`: no Discuss on the Documents bar;
+  // the menu's Discuss stands there disabled and says why.
+  assert.ok(!docs.shown.includes("discuss-open"), "Discuss is on the Documents view's bar");
+  assert.equal(page.el("discuss-menu-open").hidden, false, "the menu does not list Discuss in Documents");
+  assert.equal(page.el("discuss-menu-open").getAttribute("aria-disabled"), "true", "Discuss is not disabled in Documents");
+  assert.equal(page.el("discuss-menu-open").getAttribute("title"), "Discuss is not available in Documents", "Documents does not say why Discuss is off");
 
   // `#241 voice-composer`. There is no second mode to price any more: writing to the agent happens
   // in a box in the transcript, and the bar is the same strip while you write as before.

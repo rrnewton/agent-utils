@@ -73,7 +73,9 @@ export const PACK_VIEWS: Record<string, string[]> = {
   // precede the other.
   "read-new": ["voice"],
   // `catchup-side-agent`. Discuss summarizes the channel or thread on screen, so it
-  // belongs on the channel view and nowhere else.
+  // belongs on the channel view and nowhere else. `#1812`: over Documents the bar
+  // keeps it hidden (the strip is priced to the edge); the menu's Discuss stands
+  // there disabled with its reason instead — see `renderControlBar` below.
   "discuss-open": ["discord"],
 };
 
@@ -121,7 +123,9 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
       // A host without the box keeps the toggles' own drawing.
     }
     // `catchup-side-agent`. Discuss in the menu, on the channel's view as reading is.
-    deps.el("discuss-menu-open").hidden = deps.view() !== "discord";
+    // `#1812`: over Documents it stands there too, disabled with its reason
+    // (drawn by the Discuss view); promotion keeps the same line after this.
+    deps.el("discuss-menu-open").hidden = deps.view() !== "discord" && deps.view() !== "docs";
     // `#1265 documents-star-hide`; `#1545`: Show hidden, on the Documents
     // LIST only — the reader (docs-reader up) has no list to unhide into.
     let docsReaderUp = false;

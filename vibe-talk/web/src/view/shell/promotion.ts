@@ -214,9 +214,11 @@ export function createPromotion(deps: PromotionDependencies): Promotion {
     const canMove = typeof pack.appendChild === "function" && typeof menu.appendChild === "function";
     // Discuss is pinned (`#1502`): on the bar wherever it is offered, never in the
     // menu while the bar has it — the menu item stays hidden in every state.
+    // `#1812`: over Documents the bar has no Discuss, so the menu lists it there
+    // instead, disabled with its reason (drawn by the Discuss view).
     const discussAvailable = deps.screen() === "main" && deps.view() === "discord";
     deps.el("discuss-open").hidden = !discussAvailable;
-    deps.el("discuss-menu-open").hidden = true;
+    deps.el("discuss-menu-open").hidden = !(deps.screen() === "main" && deps.view() === "docs");
     if (canMove) {
       for (const key of PROMOTION_ORDER) {
         for (const id of MOVABLE[key] ?? []) {

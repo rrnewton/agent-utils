@@ -281,6 +281,9 @@ export interface DiscussPanel {
 /** Why Discuss cannot work on a deployment with no direct LLM summarizer, said once. */
 export const DISCUSS_UNAVAILABLE_HINT = "Discuss needs a direct LLM summarizer ([summaries.llm])";
 
+/** Why Discuss cannot work over Documents (`#1812`): its scope is the channel or thread on screen. */
+export const DISCUSS_DOCUMENTS_HINT = "Discuss is not available in Documents";
+
 /**
  * Whether a catch-up failure is the deployment refusing for want of a direct LLM
  * summarizer (503 `discuss_not_available_on_this_backend`, or the summarizer's own

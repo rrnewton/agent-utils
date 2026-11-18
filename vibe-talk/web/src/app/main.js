@@ -1270,6 +1270,8 @@ const discussView = createDiscussView({
   // No direct LLM summarizer, no Discuss: client-config's `discuss_available`,
   // held with the other server facts and read here only when drawn or pressed.
   discussAvailable: () => serverFacts.discussAvailable(),
+  // `#1812 vibe-talk-discuss-off-in-documents`: Documents disables Discuss.
+  inDocumentsView: () => screens.view() === "docs",
   enterSends: () => enterSends.current(),
   selectedChannelId: () => String(selectedChannelId() ?? ""),
   selection: () => selection(),

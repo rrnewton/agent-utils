@@ -167,6 +167,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     return Number.isFinite(px) ? Math.min(960, Math.max(320, px)) : 560;
   };
   let currentSelection = selection;
+  let inDocs = false;
   const deps = {
     byId: (id) => {
       const found = els[id];
@@ -197,6 +198,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     },
     selectedChannelId: () => "chan-1",
     selection: () => currentSelection,
+    inDocumentsView: () => inDocs,
     serviceName: () => "discord",
     channelLabel: (id) => `Channel ${id}`,
     onJump: (ref) => calls.jumps.push(ref),
@@ -240,6 +242,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   return {
     els, calls, deps, kept,
     setSelection(next) { currentSelection = next; },
+    setInDocuments(next) { inDocs = next; },
     restore() {
       if (savedDocument === undefined) delete globalThis.document;
       else globalThis.document = savedDocument;
@@ -541,6 +544,41 @@ test("catchup: the bar button opens and closes; entering a thread re-scopes Disc
     click(fx.els["discuss-open"]);
     assert.equal(view.isOpen(), false);
     assert.equal(fx.els["discuss-open"].getAttribute("aria-expanded"), "false");
+  } finally { fx.restore(); }
+});
+
+test("catchup: Documents disables Discuss with its tooltip, closes the panel, and switching back restores it (#1812)", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    assert.equal(view.isOpen(), true);
+    const postsBefore = fx.calls.posts.length;
+    fx.setInDocuments(true);
+    view.sync();
+    assert.equal(view.isOpen(), false, "switching to Documents left the panel open");
+    const button = fx.els["discuss-open"];
+    assert.equal(button.getAttribute("aria-disabled"), "true", "Documents did not disable the control");
+    assert.equal(button.getAttribute("title"), VIEW.DISCUSS_DOCUMENTS_HINT, "Documents did not say why on the control");
+    assert.equal(button.getAttribute("aria-label"), VIEW.DISCUSS_DOCUMENTS_HINT);
+    const item = fx.els["discuss-menu-open"];
+    assert.equal(item.getAttribute("aria-disabled"), "true", "Documents did not disable the menu Discuss");
+    assert.equal(item.getAttribute("title"), VIEW.DISCUSS_DOCUMENTS_HINT);
+    view.open();
+    view.toggle();
+    assert.equal(view.isOpen(), false, "Discuss opened in Documents");
+    assert.ok(fx.calls.statuses.includes(VIEW.DISCUSS_DOCUMENTS_HINT), "Documents did not say why in place");
+    assert.equal(view.restoreFromHistory({ discussOpen: true, scope: { channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" }, recordKey: "chan-1:global", snapshot: null }), false, "history restored Discuss in Documents");
+    assert.equal(fx.calls.posts.length, postsBefore, "Documents asked the model");
+    assert.equal(fx.calls.previews.length, 1, "Documents read a preview");
+    fx.setInDocuments(false);
+    view.sync();
+    assert.equal(button.getAttribute("aria-disabled"), null, "switching back left the control disabled");
+    assert.equal(button.getAttribute("title"), "Catch up on this channel or thread");
+    view.open();
+    assert.equal(view.isOpen(), true, "switching back did not restore Discuss");
+    assert.equal(fx.calls.posts.length, postsBefore, "reopening after Documents asked the model again");
   } finally { fx.restore(); }
 });
 

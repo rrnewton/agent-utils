@@ -5,7 +5,7 @@
 // Construction is inert: no element is looked up, no listener is added and nothing is
 // fetched until the controls are mounted and the panel opened.
 
-export { DISCUSS_UNAVAILABLE_HINT, HOUR_MS, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, boundForHours, countForHours, countSince, createDiscussPanel, discussReadKey, discussTitle, formatHoursFloor1, formatStampLine, hhmm, hoursFloor1, hoursSinceStart, isDiscussUnavailable, summaryTimeLabel } from "./panel.ts";
+export { DISCUSS_DOCUMENTS_HINT, DISCUSS_UNAVAILABLE_HINT, HOUR_MS, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, boundForHours, countForHours, countSince, createDiscussPanel, discussReadKey, discussTitle, formatHoursFloor1, formatStampLine, hhmm, hoursFloor1, hoursSinceStart, isDiscussUnavailable, summaryTimeLabel } from "./panel.ts";
 export { FRESH_CLASS, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, applyStrikes, citationIdsOf, hasWord } from "./strikes.ts";
 export type { StrikeElement } from "./strikes.ts";
 export type {
@@ -26,7 +26,7 @@ export type {
 
 import { createListening } from "../dom/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
-import { DISCUSS_UNAVAILABLE_HINT, createDiscussPanel, isDiscussUnavailable } from "./panel.ts";
+import { DISCUSS_DOCUMENTS_HINT, DISCUSS_UNAVAILABLE_HINT, createDiscussPanel, isDiscussUnavailable } from "./panel.ts";
 import type { CatchupAnswer, CatchupRequestBody, DiscussFoldState, DiscussScope } from "./panel.ts";
 import {
   discussScopeKey,
@@ -106,6 +106,13 @@ export interface DiscussViewDependencies {
    * `discuss_available`, held with the other server facts.
    */
   discussAvailable?(): boolean;
+  /**
+   * `#1812 vibe-talk-discuss-off-in-documents`. Whether the Documents major
+   * view is active: Discuss has no document scope there, so it is disabled
+   * (tooltip on the control), an open panel closes, and no entry point opens
+   * it until the reader switches back. Absent means never in Documents.
+   */
+  inDocumentsView?(): boolean;
   /** The chat service `channelId` is read through, for jump refs; "discord" unwired. */
   serviceName?(channelId: string): string;
   /** The reader's name for `channelId`, for the scope line; the id unwired. */
@@ -225,9 +232,18 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
   // the button is drawn unavailable from then on, as if the boot had said so.
   let refused = false;
 
-  /** Whether Discuss can work here now: the boot's word, and no refusal since. */
+  /** `#1812`. Whether the Documents major view is active, asked at the moment it is needed. */
+  function documentsActive(): boolean {
+    try {
+      return deps.inDocumentsView?.() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether Discuss can work here now: the boot's word, no refusal since, and not in Documents. */
   function available(): boolean {
-    return !refused && (deps.discussAvailable?.() ?? true);
+    return !refused && !documentsActive() && (deps.discussAvailable?.() ?? true);
   }
 
   /**
@@ -240,7 +256,9 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     // Busy draws like unavailable (`discuss-summarize-button`): while one request is
     // in flight no entry point starts another, and the reason shows on hover.
     const off = !available() || busy;
-    const why = busy && available() ? "Summarizing…" : DISCUSS_UNAVAILABLE_HINT;
+    const why = documentsActive()
+      ? DISCUSS_DOCUMENTS_HINT
+      : busy && available() ? "Summarizing…" : DISCUSS_UNAVAILABLE_HINT;
     const button = deps.byId("discuss-open");
     if (!off) {
       button.removeAttribute("aria-disabled");
@@ -249,7 +267,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     } else {
       button.setAttribute("aria-disabled", "true");
       button.setAttribute("title", why);
-      if (why === DISCUSS_UNAVAILABLE_HINT) button.setAttribute("aria-label", why);
+      if (why === DISCUSS_UNAVAILABLE_HINT || why === DISCUSS_DOCUMENTS_HINT) button.setAttribute("aria-label", why);
       button.setAttribute("aria-expanded", "false");
     }
     // The menu's Discuss (the phone's way in) says the same, in its own dress.
@@ -262,7 +280,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       } else {
         item.setAttribute("aria-disabled", "true");
         item.setAttribute("title", why);
-        if (why === DISCUSS_UNAVAILABLE_HINT) item.setAttribute("aria-label", why);
+        if (why === DISCUSS_UNAVAILABLE_HINT || why === DISCUSS_DOCUMENTS_HINT) item.setAttribute("aria-label", why);
       }
     } catch {
       // A host without the menu item: the bar button already says it.
@@ -528,7 +546,10 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         // controls' standing act for its items) and opens the same panel.
         try {
           listening.listen(deps.byId("discuss-menu-open"), "click", () => {
-            if (!busy && available()) open();
+            // `#1812`: in Documents the item stands disabled; a tap says why
+            // in place, as its tooltip does on hover.
+            if (documentsActive()) deps.setStatus?.(DISCUSS_DOCUMENTS_HINT);
+            else if (!busy && available()) open();
           });
         } catch {
           // A host without the menu item keeps the bar button's way in.
@@ -555,6 +576,14 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       // `#1821`: a just-restored panel is not judged by the sync that restored it.
       if (tryRestorePanel()) return;
       try {
+        // `#1812`: Documents disables Discuss. Close an open panel (its
+        // snapshot is kept, so switching back and reopening restores it with
+        // no model call) and draw the control disabled with its reason.
+        if (documentsActive()) {
+          if (panel.isOpen()) panel.close();
+          drawAvailability();
+          return;
+        }
         const currentRaw = scopeNow();
         if (panel.isOpen() && boundScope !== null && boundRaw !== null) {
           const decision = viewChangeDecision(boundScope, normalizeDiscussScope(currentRaw));
@@ -599,6 +628,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       if (typeof state !== "object" || state === null) return false;
       const record = state as Partial<DiscussHistoryState>;
       if (record.discussOpen !== true || typeof record.scope !== "object" || record.scope === null) return false;
+      // `#1812`: no entry point opens Discuss in Documents, Back included.
+      if (!available() || busy) return false;
       const scope = record.scope as DiscussScope;
       boundRaw = scope;
       boundScope = normalizeDiscussScope(scope);
@@ -616,6 +647,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       if (busy) return;
       if (panel.isOpen()) panel.close();
       else if (available()) open();
+      // `#1812`: Mod+8 in Documents does not open it, and says why in place.
+      else if (documentsActive()) deps.setStatus?.(DISCUSS_DOCUMENTS_HINT);
     },
     width: () => panel.width(),
     setWidth: (px: unknown) => panel.setWidth(px),
