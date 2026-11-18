@@ -461,7 +461,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Arc::new(ChatRouter::single(fake, "fake", config.live_poll_seconds()))
+        // Keyed as the legacy `[discord]` provider it stands in for: under any
+        // other key the message cache's route table (keyed by the config's
+        // providers) never fills this router's channels, and cache-only
+        // readers such as Discuss see an empty window on a fake server.
+        Arc::new(ChatRouter::single(fake, "discord", config.live_poll_seconds()))
     } else {
         Arc::new(ChatRouter::from_config(&config).context("building the chat providers")?)
     };
