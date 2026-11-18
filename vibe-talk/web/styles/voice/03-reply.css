@@ -110,6 +110,13 @@
   min-width: 0;
 }
 
+/* `#1840 vibe-talk-draft-sync-across-devices`: the Save draft chip shares
+   the actions row; a tighter gap keeps the row at the lines it always had
+   at a large type size, where it wraps. */
+.composer-actions {
+  column-gap: 0.4rem;
+}
+
 .composer-actions > button {
   min-width: 0;
 }
