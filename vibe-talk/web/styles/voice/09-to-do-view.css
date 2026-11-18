@@ -822,7 +822,6 @@
    width the gap would have cost is the field's. */
 #author-filter,
 #links-filter,
-#pinned-filter,
 #search-entire-threads {
   position: relative;
   width: var(--toggle-hit);
@@ -831,9 +830,54 @@
   color: var(--muted);
 }
 
+/* `#1853`: the Labels drop-down's button, where the Pinned toggle stood. Wider
+   than the bar's squares: pin glyph, the word (the active label's name while
+   one filters), and a chevron. Its whole height is the bar's target. */
+#labels-button {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  height: var(--toggle-hit);
+  padding: 0 0.45rem;
+  border-radius: 0;
+  color: var(--muted);
+}
+
+#labels-button .labels-filter-word {
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+#labels-button .labels-filter-chevron {
+  width: 14px;
+  height: 14px;
+}
+
+/* A filter in force says so on the button: Pinned in gold as ever, a hashtag
+   label in the accent. */
+#labels-button[data-active-label="pinned"] {
+  color: var(--pin-ink);
+}
+
+#labels-button[data-active-label="pinned"]::before {
+  content: "";
+  position: absolute;
+  inset: calc((var(--toggle-hit) - var(--search-disc)) / 2) 0.2rem;
+  border-radius: 999px;
+  background: var(--pin-bg);
+  box-shadow: inset 0 0 0 1px var(--pin-edge);
+  pointer-events: none;
+}
+
+#labels-button[data-active-label]:not([data-active-label="pinned"]) {
+  color: var(--accent);
+}
+
 /* On the filter that only ever shows with Links before it, so the squares abut where both are up
    and nothing changes over the call, where Links stands beside the glass alone. */
-#pinned-filter {
+#labels-button {
   margin-left: calc(-1 * var(--bar-gap));
 }
 
@@ -845,7 +889,6 @@
 
 #author-filter::before,
 #links-filter::before,
-#pinned-filter::before,
 #search-entire-threads::before {
   content: "";
   position: absolute;
@@ -856,7 +899,7 @@
 
 #author-filter .icon,
 #links-filter .icon,
-#pinned-filter .icon {
+#labels-button .icon {
   position: relative;
   width: 21px;
   height: 21px;
@@ -884,19 +927,87 @@
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 
-/* ON says so twice, from the one attribute that says it to a screen reader: the pin fills in and
-   takes the pin colour, on a gold-ringed disc. */
-#pinned-filter[aria-pressed="true"] {
-  color: var(--pin-ink);
-}
-
-#pinned-filter[aria-pressed="true"]::before {
-  background: var(--pin-bg);
-  box-shadow: inset 0 0 0 1px var(--pin-edge);
-}
-
-#pinned-filter[aria-pressed="true"] .pin-head {
+/* Pinned chosen (from the drop-down or Shift+P): the pin fills in, as the
+   toggle's ON drew it. */
+#labels-button[data-active-label="pinned"] .pin-head {
   fill: currentColor;
+}
+
+/* `#1853`: the Labels panel. It hangs under the bar over the list (never
+   pushing messages down), full-width on a phone, anchored to the bar on a
+   desktop; rows keep the bar's 44px target and the list scrolls at half the
+   viewport with the filter box sticky at its head. */
+#labels-panel {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  width: min(22rem, calc(100vw - 1rem));
+  max-height: 50vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.6rem;
+  box-shadow: 0 4px 18px rgb(0 0 0 / 35%);
+  padding: 0.5rem;
+  z-index: 30;
+}
+
+.labels-panel-filter-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+#labels-button-input {
+  position: sticky;
+  top: 0;
+  width: 100%;
+  min-height: var(--toggle-hit);
+  margin-bottom: 0.4rem;
+}
+
+#labels-listbox {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.labels-option {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: var(--toggle-hit);
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.4rem;
+  cursor: pointer;
+}
+
+.labels-option[data-active] {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.labels-option[aria-selected="true"] .labels-option-name {
+  font-weight: 700;
+}
+
+.labels-option-pinned .labels-option-name {
+  color: var(--pin-ink);
+  font-weight: 700;
+}
+
+.labels-option-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.labels-option-count {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
 }
 
 /* `#251 author-filter`. Whose messages, left of Links: its square abuts Links' as Pinned's does, on
@@ -1065,7 +1176,7 @@
    wide, it spans the bar exactly. No scrollbar is drawn, because one would add to its height and
    cover the first row; the button cut off at its end says there is more. */
 #link-kinds {
-  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit));
+  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit) + 1.7rem);
   position: absolute;
   top: calc(100% + 1px + var(--kinds-gap));
   right: var(--links-mid);
@@ -1083,7 +1194,7 @@
 }
 
 /* Over the call view there are no pins, and Links stands next to the glass. */
-#pinned-filter[hidden] ~ #link-kinds {
+#labels-button[hidden] ~ #link-kinds {
   --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 0.5 * var(--toggle-hit));
 }
 

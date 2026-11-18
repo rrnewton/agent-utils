@@ -3995,6 +3995,21 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
           read_state_notice: INBOX_NOTICE,
         });
       }
+      // `#1825`/`#1853`: the labels browse the drop-down and Settings share:
+      // counts over the messages this fixture holds, groups as the page set them.
+      if (String(path) === "/api/v1/labels") {
+        const counts = new Map();
+        for (const held of page.messages) {
+          for (const label of held.labels || []) counts.set(label, (counts.get(label) || 0) + 1);
+        }
+        const groups = page.labelGroups || [];
+        const groupId = new Map(groups.map((group) => [group.display, group.id]));
+        return json(200, {
+          labels: [...counts].map(([name, count]) => ({ name, count, group_id: groupId.get(name) ?? null })),
+          groups, groups_revision: 1,
+          labels_notice: "Labels are this fixture's own. Counts cover the loaded history only.",
+        });
+      }
       // `#206 pin-message`. The pins, as the server keeps them: listed oldest message first, a PUT
       // keeping the row the page sent, a DELETE that is not an error twice, and the bound dropping
       // the oldest pin and naming it.
@@ -8814,11 +8829,26 @@ async function tapPin(page, row) {
 }
 
 /** Open the search bar if it is shut, and turn the Pinned filter on. */
+async function pickLabel(page, value) {
+  await page.el("labels-button").click();
+  await page.settle();
+  const option = page.el("labels-listbox").children.find((li) => li.id === `labels-option-${value}`);
+  assert.ok(option, `the Labels drop-down has no ${value} option`);
+  await option.click();
+  await page.settle();
+  await page.settle();
+}
+
+/** The old Pinned toggle, through the Labels drop-down (`#1853`). */
+async function togglePinned(page) {
+  const on = page.el("pane-discord").hasAttribute("data-pinned-only");
+  await pickLabel(page, on ? "all" : "pinned");
+}
+
+/** Open the search bar if it is shut, and turn the Pinned filter on. */
 async function showPinned(page) {
   if (page.el("search-field").hidden) await page.el("search-toggle").click();
-  await page.el("pinned-filter").click();
-  await page.settle();
-  await page.settle();
+  await pickLabel(page, "pinned");
 }
 
 const linksOf = (li) => li.descendants().filter((node) => node.className === "row-link");
@@ -10593,7 +10623,7 @@ export { ACKNOWLEDGED, ALIAS_NOTICE, ALICE, BASE_CSS, BIG, BIG_ROOT, BOTTOM_SLAC
   sentCards, sentOk, sentWithoutKey, serveByChannel, serveScoped, servedBookmarkPage, serverFloor,
   serviceOf, servicesPage, session_lines, setReadNew, settingsChannel, settingsFoldState,
   settingsGroup, settingsHeading, settingsHeadings, settingsOptions, settingsSection,
-  enterChannel, enterDocs, enterVoice, settleRedraftWait, settleSend, settleSpokenYes, showDiscord, showLinks, showPinned, shownIds,
+  enterChannel, enterDocs, enterVoice, settleRedraftWait, settleSend, settleSpokenYes, pickLabel, showDiscord, showLinks, showPinned, togglePinned, shownIds,
   sideAtFoot, sideIds, sideRow, signIn, sourceCalls, sourceConstant, sourceString, sourceStringTable, speakRelay,
   discordSplitPost, speech, splitPost, spokenDraft, sseDelete, sseMessage, sseUpdate, stackPlaces, startChatting,
   startNeutralCall, startOf, startTalking, startTalkingNamed, startV1Call, state, statusText,

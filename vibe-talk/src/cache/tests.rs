@@ -3505,6 +3505,48 @@ fn a_cache_search_takes_rare_terms_from_the_index_once_every_text_is_folded() {
 }
 
 #[test]
+fn a_cache_search_for_label_pinned_reads_the_pin_set_alone() {
+    // `#1853`: `label:pinned` matches the caller's pin set, never a hashtag:
+    // m3's text says #pinned (reserved, no label) and m2 is pinned with no
+    // hashtag at all; only m2 may hit, and -label:pinned must exclude it.
+    use super::search::{SearchRequest, SearchView};
+    let fx = Fixture::new("cache-search-label-pinned");
+    let first = T0 + 100 * STEP;
+    fx.clock.set(first);
+    let mut rows: Vec<Message> = (1..=5).map(m).collect();
+    rows[2].content = "kept for later #pinned".to_owned();
+    rows[3].content = "about #kvm".to_owned();
+    fx.list(rows, first, Some(newest_proof(ListStart::At(T0 + STEP))));
+    let day = |d: crate::search_query::Day| d.start_ms_at_offset(0);
+    let pins: std::collections::HashSet<String> = ["m2".to_owned()].into_iter().collect();
+    let search = |query: &str| {
+        let query = crate::search_query::parse(query);
+        let request = SearchRequest {
+            query: &query,
+            view: SearchView::Main,
+            below_ms: i64::MAX,
+            limit: 50,
+            budget: 1_000,
+            day_start_ms: &day,
+            pinned_ids: &pins,
+        };
+        fx.cache
+            .search(&fx.chan, &request)
+            .served()
+            .expect("served")
+    };
+    let hit_ids = |hits: &[CachedMessage]| -> Vec<String> {
+        hits.iter().map(|h| h.message.id.0.clone()).collect()
+    };
+    assert_eq!(hit_ids(&search("label:pinned").hits), ids(&["m2"]));
+    assert_eq!(
+        hit_ids(&search("-label:pinned").hits),
+        ids(&["m5", "m4", "m3", "m1"])
+    );
+    assert_eq!(hit_ids(&search("label:kvm").hits), ids(&["m4"]));
+}
+
+#[test]
 fn a_cache_search_horizon_stops_at_the_age_limit() {
     use super::search::{SearchRequest, SearchView};
     let fx = Fixture::with_limits(

@@ -2545,7 +2545,7 @@ test("`#624 voice-page-modularity`: the control bar shows each pack member only 
     if (!els.has(id)) els.set(id, { id, hidden: false, children: [] });
     return els.get(id);
   };
-  for (const id of ["view-switch", "action-menu-open", "reader-toggle", "autoplay-toggle", "open-settings", "search-toggle", "search-field", "search-count", "pinned-filter", "links-filter", "author-filter", "control-bar", "topbar", "close-settings", "topbar-title", "bar-pack", "prompts-open"]) el(id);
+  for (const id of ["view-switch", "action-menu-open", "reader-toggle", "autoplay-toggle", "open-settings", "search-toggle", "search-field", "search-count", "labels-button", "labels-panel", "links-filter", "author-filter", "control-bar", "topbar", "close-settings", "topbar-title", "bar-pack", "prompts-open"]) el(id);
   el("bar-pack").children = [el("discord-channel"), el("prompts-open")];
   let view = "discord";
   const log = [];

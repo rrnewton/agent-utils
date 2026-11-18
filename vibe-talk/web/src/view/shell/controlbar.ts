@@ -204,9 +204,11 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     deps.el("search-toggle").hidden = deps.screen() !== "main";
     deps.el("search-field").hidden = deps.el("search-toggle").hidden || !deps.searchOpen();
     deps.el("search-count").hidden = deps.el("search-field").hidden;
-    // `#206 pin-message`. Beside the glass while the bar is open, and over the channel only: a pin is
-    // a channel message, and the call's transcript has none to filter to.
-    deps.el("pinned-filter").hidden = deps.el("search-field").hidden || deps.view() !== "discord";
+    // `#206 pin-message`, a Labels drop-down since `#1853`. Beside the glass while the bar is
+    // open, and over the channel only: a pin is a channel message, and the call's transcript
+    // has none to filter to. Its panel goes with the button.
+    deps.el("labels-button").hidden = deps.el("search-field").hidden || deps.view() !== "discord";
+    if (deps.el("labels-button").hidden) deps.el("labels-panel").hidden = true;
     // `#211 link-filter`. Beside Pinned while the bar is open, and over the call view as well: it
     // filters what the search filters, and a turn can hold a link as a channel message can.
     deps.el("links-filter").hidden = deps.el("search-field").hidden;

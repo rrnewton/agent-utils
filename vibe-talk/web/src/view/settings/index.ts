@@ -74,4 +74,4 @@ export type { StoredScreen, StoredScreenDependencies } from "./screen.ts";
 export { appearanceStateWords, mountAppearance } from "./appearance.ts";
 export type { AppearanceControl, AppearanceDependencies } from "./appearance.ts";
 export { mountLabels } from "./labels.ts";
-export type { LabelsDependencies, LabelsView } from "./labels.ts";
+export type { LabelDropdownEntry, LabelsDependencies, LabelsView } from "./labels.ts";

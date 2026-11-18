@@ -94,7 +94,7 @@ import {KEYBOARD_SEND_PARTS,
 import {briefAge, fullLocalAt, stamp} from "../present/time/index.ts";
 import {doneReadWords, failureWords, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords} from "../present/notices/index.ts";
 import {LINK_KINDS_KEY, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, editedDrawn, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, savedReadMode, undoLabel, undoName, upstreamUrlOf} from "../present/rows/index.ts";
-import {PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCardFlight, createCardPlaces, createColumnSplitter, createColumnReplies, createColumnWork, createColumnStateAccess, createColumns, createElementLookup, createFootRooms, createLayoutShown, createJumpAnchor, createLinkedMark, createPackSlides, screenMotionMs, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createChannelScope, createChannelLoading, createDayTap, createMessageDetails, createNoiseActs, createRichHeaders, createStartsRead, createFilterPlace, createFreshRead, createHeldDone, createReadState, createPendingSends, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshComposerState, freshEntryState, freshDoneState, freshLoadState, freshOlderPages, freshPinsView, freshScrollPlace, freshScrollTools, freshSelection, freshTimelineRows, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountTextSelection, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, createChannelHead,
+import {PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCardFlight, createCardPlaces, createColumnSplitter, createColumnReplies, createColumnWork, createColumnStateAccess, createColumns, createElementLookup, createFootRooms, createLayoutShown, createJumpAnchor, createLinkedMark, createPackSlides, screenMotionMs, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createChannelScope, createChannelLoading, createDayTap, createMessageDetails, createNoiseActs, createRichHeaders, createStartsRead, createFilterPlace, createFreshRead, createHeldDone, createReadState, createPendingSends, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshComposerState, freshEntryState, freshDoneState, freshLoadState, freshOlderPages, freshPinsView, freshScrollPlace, freshScrollTools, freshSelection, freshTimelineRows, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountTextSelection, createLabelsFilter, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, createChannelHead,
   createSearchOpenControl,
   createServiceWords,
   createOpenInView,
@@ -3054,6 +3054,9 @@ function landSearchEntry() {
 // The search bar opened and closed: web/src/view/channel/searchopen.ts
 // (`createSearchOpenControl`, #624). Closing clears the query and filters inside
 // the filter-kept place, as before.
+// `#1853`: the Labels drop-down, created with the mounts below; the search
+// bar's closing shuts its panel through this holder until then.
+let labelsFilterRef = null;
 const searchOpenControl = createSearchOpenControl({
   keepingFilterPlace,
   searchField,
@@ -3062,6 +3065,7 @@ const searchOpenControl = createSearchOpenControl({
   setLinksOnly: (on) => setLinksOnly(on),
   setPinnedOnly: (on) => setPinnedOnly(on),
   setEntireThreads: (on) => { setEntireThreads(on); el("search-entire-threads").setAttribute("aria-pressed", String(on)); },
+  closeLabelsPanel: () => { labelsFilterRef?.setOpen(false); },
   setAuthorFilter: (author) => setAuthorFilter(author),
   hidingRead: () => hidingRead(),
   holdingReader,
@@ -3092,6 +3096,18 @@ function filterToLabel(label) {
     el("search-field").value = `label:${label}`;
     applySearch();
   });
+  labelsFilterRef?.syncButton();
+}
+
+/** `#1853`: take a label filter away, the bar staying open (All messages). */
+function clearLabelQuery() {
+  keepingFilterPlace(() => {
+    searchField.setQuery("");
+    searchField.setMarked("");
+    el("search-field").value = "";
+    applySearch();
+  });
+  labelsFilterRef?.syncButton();
 }
 
 // The links in what is on screen, whose messages, and the kinds of link are
@@ -6112,8 +6128,14 @@ const pinnedMessagesOwner = createPinnedMessages({
 });
 const {
   pinStore, pinsView, isPinnedId, forgetPins, notePinsRevision, ensurePins,
-  drawRowPin, renderPins, syncPinnedList, setPinnedOnly, togglePin,
+  drawRowPin, renderPins, syncPinnedList, togglePin,
 } = pinnedMessagesOwner;
+
+/** Pinned on or off, the drop-down's button restating itself (`#1853`). */
+function setPinnedOnly(on, keepPlace) {
+  pinnedMessagesOwner.setPinnedOnly(on, keepPlace);
+  labelsFilterRef?.syncButton();
+}
 
 // --- messages read automatically ------------------------------------------------------------------
 //
@@ -9452,13 +9474,30 @@ application.track(mountListControls({
 // as toggles, each kind of link, and the search field's typing, Enter and Escape. One owner in
 // web/src/view/channel/filterchips.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
 // `unmount` waits for the ordered boot's teardown.
+// The Labels drop-down on the search bar (`#1853`): Pinned the built-in first
+// label, hashtag labels and groups after it, one source with Settings.
+const labelsFilter = createLabelsFilter({
+  byId: (id) => el(id),
+  entries: () => labelsView.dropdownEntries(),
+  refreshLabels: () => labelsView.refresh(),
+  pinCount: () => pinStore.size(),
+  pinLoaded: () => pinStore.revision() !== null,
+  pinnedOnly: () => pinsView().only,
+  setPinnedOnly: (on) => setPinnedOnly(on),
+  query: () => searchField.query(),
+  filterToLabel: (label) => filterToLabel(label),
+  clearLabelQuery: () => clearLabelQuery(),
+  guard: (run) => { void guardQuietly(run)(); },
+});
+labelsFilterRef = labelsFilter;
+application.track(labelsFilter);
+labelsFilter.syncButton();
+
 application.track(mountFilterChips({
   intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   byId: (id) => el(id),
   searchOpen: () => searchField.open(),
   setSearchOpen: (open) => setSearchOpen(open),
-  pinnedOnly: () => pinsView().only,
-  setPinnedOnly: (on) => setPinnedOnly(on),
   linksOnly: () => searchField.links(),
   setLinksOnly: (on) => setLinksOnly(on),
   cycleAuthorFilter: () => cycleAuthorFilter(),
@@ -9468,7 +9507,7 @@ application.track(mountFilterChips({
   setLinksRaw: (raw) => setLinksRaw(raw),
   keepingFilterPlace: (change) => keepingFilterPlace(change),
   liftingHideRead: (change) => liftingHideRead(change),
-  setQuery: (text) => searchField.setQuery(text),
+  setQuery: (text) => { searchField.setQuery(text); labelsFilterRef?.syncButton(); },
   query: () => searchField.query(),
   setMarked: (text) => searchField.setMarked(text),
   searchTyped: (text) => searchTyped(text),

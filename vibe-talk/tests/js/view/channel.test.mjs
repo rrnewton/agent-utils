@@ -1178,9 +1178,9 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
     swallow: (event) => log.push(`swallow ${event.key}`),
   });
   const run = (act) => { log.length = 0; act(); return [...log]; };
-  assert.deepStrictEqual([run(() => fire("search-toggle", "click")), run(() => fire("pinned-filter", "click")), run(() => fire("links-filter", "click")),
+  assert.deepStrictEqual([run(() => fire("search-toggle", "click")), run(() => fire("links-filter", "click")),
     run(() => fire("author-filter", "click", { type: "click" })), run(() => fire("link-raw", "click"))],
-  [["search true"], ["pinned true"], ["links true"], ["author 0"], ["raw true"]], "a chip did not toggle, or the pin chip passed more than its one argument");
+  [["search true"], ["links true"], ["author 0"], ["raw true"]], "a chip did not toggle, or the pin chip passed more than its one argument");
   assert.deepStrictEqual(LINK_KINDS.map(({ chip }) => run(() => fire(chip, "click"))[0]), LINK_KINDS.map(({ kind }) => `kind ${kind} ${kind === "pr"}`));
   let into = null;
   fire("link-kinds", "focusin", { target: { scrollIntoView: (options) => { into = options; } } });

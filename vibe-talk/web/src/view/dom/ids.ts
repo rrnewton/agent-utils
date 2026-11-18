@@ -447,7 +447,11 @@ export interface ElementById {
   "pane-discord": HTMLDivElement;
   "pane-docs": HTMLDivElement;
   "pane-voice": HTMLDivElement;
-  "pinned-filter": HTMLButtonElement;
+  "labels-button": HTMLButtonElement;
+  "labels-filter-input": HTMLInputElement;
+  "labels-listbox": HTMLOListElement;
+  "labels-panel": HTMLDivElement;
+  "labels-panel-state": HTMLParagraphElement;
   "pinned-log": HTMLOListElement;
   "post-confirm": HTMLElement;
   "post-confirm-cancel": HTMLButtonElement;

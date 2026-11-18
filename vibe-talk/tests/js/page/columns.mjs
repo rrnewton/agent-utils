@@ -859,7 +859,7 @@ test("`#229 desktop-two-column`: keys for the page — another channel, the Pinn
   await page.settle();
   // Shift+P from the right column: the Pinned filter, which is the left column's list.
   await press(page, page.el("side-scroll"), "P", { shiftKey: true });
-  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "true", "Shift+P from the right column did nothing");
+  assert.equal((page.el("pane-discord").hasAttribute("data-pinned-only") ? "true" : "false"), "true", "Shift+P from the right column did nothing");
   assert.equal(page.el("pinned-log").hidden, false, "the Pinned filter is not the left column's list");
   assert.equal(page.el("side-pinned-log").hidden, true, "the Pinned filter took the right column's list");
   assert.equal(page.el("side-log").hidden, false, "the right column's thread went behind the Pinned filter");

@@ -1891,7 +1891,8 @@ li.discord-message[data-root-continuation] > .thread-replies {
 }
 
 #screen-main[data-columns="list"] > #width-grip,
-#screen-main[data-columns="list"] #pinned-filter,
+#screen-main[data-columns="list"] #labels-button,
+#screen-main[data-columns="list"] #labels-panel,
 #screen-main[data-columns="list"] #links-filter,
 #screen-main[data-columns="list"] #author-filter,
 #screen-main[data-columns="list"] #link-kinds {

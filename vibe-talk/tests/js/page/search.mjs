@@ -15,7 +15,7 @@ import { ALICE, CHANNEL, CODER, CSS, FakeElement, HOLD_MS, HTML, HTML_CODE, LINK
   savedUiState, search, searchDay, searchHistory, searchMoment, showDiscord, showPinned, shownIds,
   signIn, sourceConstant, sseMessage, startTalking, startTalkingNamed, state, statusText, storedPin,
   tapArrow, tapRow, test, threadData, threadHistory, threadPage, threadsHistory, timelineAnswer,
-  touchAt, turnTodoOn, twoColumns, typeAndPause, unfiltered, unpackPage, unpackRows, viewOf, youSay } from "./fixture.mjs";
+  touchAt, turnTodoOn, twoColumns, typeAndPause, unfiltered, unpackPage, unpackRows, viewOf, youSay, togglePinned } from "./fixture.mjs";
 
 /** Everything the record holds for one call, in the order it was said. */
 function recorded(page, id, texts) {
@@ -1209,7 +1209,7 @@ test("`#262 search-load-older`: while a filter chooses rows the step back offers
   await page.settle();
   assert.equal(chip.textContent, `Search before ${day}`, "Mine alone did not offer a search further back");
   // Over the Pinned list there is nothing older to find.
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   assert.equal(chip.hidden, true, "the step back was offered over the Pinned list");
   // A thumb's target: the 44px square drawn as nothing.
@@ -1859,7 +1859,7 @@ test("`#262 search-load-older`: a filter's walk back to an old pin ends a walk i
   await page.settle();
   assert.match(page.el("side-older").textContent, /^Search replies before /);
   // The old pin, selected over the left column's Pinned list.
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   await page.settle();
   await tapRow(page, pin.id, "pinned-log");
@@ -1870,7 +1870,7 @@ test("`#262 search-load-older`: a filter's walk back to an old pin ends a walk i
   await page.settle();
   assert.equal(page.el("side-older").textContent, "Fetching older messages… · Stop");
   // Pinned off: the left column walks back to the pin, and one walk at a time is on the page.
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   assert.equal(page.olderOptions[0].signal.aborted, true, "the right column's read went on beside the walk back to the pin");
   assert.match(page.el("side-older").textContent, /^Search replies before /, "the right column's walk went on");

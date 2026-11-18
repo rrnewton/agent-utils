@@ -13,7 +13,7 @@ import { CHANNEL, CSS, GLYPHS, HOLD_MS, HTML_CODE, PRESENT_ROWS, REPO, SCRIPT, P
   pagedTimeline, passTime, press, reReadChannel, readAloudMessages, reloadWith, reopenedChannel, rowMore,
   rowMoreButton, rowMoreMenu, rowState, rowWithId, search, showDiscord, showLinks, signIn,
   sourceConstant, startTalking, statusText, storedPin, tapKind, tapPin, test, threadData,
-  turnTodoOn, unfiltered, untilDeepLink, upstreamReadButton } from "./fixture.mjs";
+  turnTodoOn, unfiltered, untilDeepLink, upstreamReadButton, togglePinned } from "./fixture.mjs";
 
 // --- `#543 in-app-message-links` ----------------------------------------------------------------------
 //
@@ -431,9 +431,9 @@ test("the Links filter sits right beside Pinned, only while the bar is open, and
   assertMarkupContains("search-float", "links-filter");
   const bar = HTML_CODE.slice(HTML_CODE.indexOf('id="search-float"'));
   const at = (id) => bar.indexOf(`id="${id}"`);
-  assert.ok(at("search-count") < at("links-filter") && at("links-filter") < at("pinned-filter"),
+  assert.ok(at("search-count") < at("links-filter") && at("links-filter") < at("labels-button"),
     "the Links filter is not between the count and Pinned");
-  assert.equal(bar.slice(bar.indexOf("</button>", at("links-filter")) + "</button>".length, at("pinned-filter")).trim(),
+  assert.equal(bar.slice(bar.indexOf("</button>", at("links-filter")) + "</button>".length, at("labels-button")).trim(),
     "<button", "something stands between Links and Pinned");
   // An icon in the house style, the same stroke, cap and join as the pin and the glass.
   const svgOf = (id) => {
@@ -447,12 +447,9 @@ test("the Links filter sits right beside Pinned, only while the bar is open, and
   assert.match(markup, /aria-label="Show only links"/);
   assert.match(markup, /aria-pressed="false"/);
   assert.match(markup, /class="icon-button"/);
-  // The same square as Pinned, sized and drawn by the same rules.
-  for (const selector of ["#links-filter", "#links-filter::before", "#links-filter .icon"]) {
-    assert.deepStrictEqual(cssRules(CSS, selector), cssRules(CSS, selector.replace("links", "pinned")).slice(0, 1),
-      `${selector} is not drawn by the rule that draws Pinned`);
-  }
   assert.match(cssBlock("#links-filter"), /width: var\(--toggle-hit\)/);
+  // The Labels button beside it (`#1853`) keeps the bar's height, wider for its word.
+  assert.match(cssBlock("#labels-button"), /height: var\(--toggle-hit\)/);
   assert.match(cssBlock("#links-filter[aria-pressed=\"true\"]"), /color: var\(--accent\)/, "Links on does not say so");
 
   const page = newPage();
@@ -462,7 +459,7 @@ test("the Links filter sits right beside Pinned, only while the bar is open, and
   assert.equal(filter.hidden, true, "the filter is offered before the search bar is open");
   await page.el("search-toggle").click();
   assert.equal(filter.hidden, false, "the open bar has no Links filter");
-  assert.equal(page.el("pinned-filter").hidden, false);
+  assert.equal(page.el("labels-button").hidden, false);
   await filter.click();
   await page.settle();
   assert.equal(filter.getAttribute("aria-pressed"), "true", "the filter does not say it is on");
@@ -470,7 +467,7 @@ test("the Links filter sits right beside Pinned, only while the bar is open, and
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(filter.hidden, false, "the Links filter is not offered over the call view");
-  assert.equal(page.el("pinned-filter").hidden, true);
+  assert.equal(page.el("labels-button").hidden, true);
   assert.equal(filter.getAttribute("aria-pressed"), "true", "switching views turned the filter off");
   await page.el("view-switch").click();
   await page.settle();
@@ -696,7 +693,7 @@ test("Links is ANDed with the search text and with Pinned, and the count speaks 
   await page.el("search-field").setValue("");
 
   // Pinned and Links: the pins that hold a link.
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   await page.settle();
   assert.deepStrictEqual(linkRowTexts(page, "pinned-log"), ["an old pinned link https://example.com/pinned"],
@@ -714,7 +711,7 @@ test("Links is ANDed with the search text and with Pinned, and the count speaks 
   await page.el("search-toggle").click();
   await page.settle();
   assert.equal(page.el("links-filter").getAttribute("aria-pressed"), "false");
-  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "false");
+  assert.equal((page.el("pane-discord").hasAttribute("data-pinned-only") ? "true" : "false"), "false");
   assert.equal(unfiltered(page, "discord-log").length, 4, "a filter outlived the bar");
   assert.equal(page.el("search-empty").hidden, true);
 });
@@ -1005,7 +1002,7 @@ test("PRs, Commits, Actions, Issues, Files and Other come up under Links, all on
   assert.match(row, /top: calc\(100% \+ 1px \+ var\(--kinds-gap\)\)/, "the kinds are not below the bar");
   assert.match(row, /right: var\(--links-mid\)/);
   assert.match(row, /transform: translateX\(min\(50%, var\(--links-mid\)\)\)/, "the kinds are not centred under Links, or not kept to the bar's end");
-  assert.match(row, /--links-mid: calc\(2px \+ var\(--search-disc\) \+ var\(--glass-clear\) \+ var\(--bar-gap\) \+ 1\.5 \* var\(--toggle-hit\)\)/);
+  assert.match(row, /--links-mid: calc\(2px \+ var\(--search-disc\) \+ var\(--glass-clear\) \+ var\(--bar-gap\) \+ 1\.5 \* var\(--toggle-hit\) \+ 1\.7rem\)/, "the kinds are not centred under Links");
   // `#266 link-filter-kinds`. Six are wider than a phone: never wider than the bar, the row scrolls
   // sideways inside it, no button squeezed narrower than its words, and with no scrollbar to make it
   // taller than the room the list leaves it. A focus ring is drawn inside the button the row clips.
@@ -1015,7 +1012,7 @@ test("PRs, Commits, Actions, Issues, Files and Other come up under Links, all on
   assert.match(cssBlock("#link-kinds::-webkit-scrollbar"), /display: none/);
   assert.match(kind, /flex: 0 0 auto/, "a kind can be squeezed narrower than its words");
   assert.match(cssBlock(".link-kind:focus-visible"), /outline-offset: -2px/, "the focus ring is drawn where the row clips it");
-  assert.match(cssBlock("#pinned-filter[hidden] ~ #link-kinds"),
+  assert.match(cssBlock("#labels-button[hidden] ~ #link-kinds"),
     /--links-mid: calc\(2px \+ var\(--search-disc\) \+ var\(--glass-clear\) \+ var\(--bar-gap\) \+ 0\.5 \* var\(--toggle-hit\)\)/,
     "over the call view the kinds are placed as if Pinned were beside Links");
   assert.match(cssBlock("#screen-main[data-searching] #search-float"), /padding: 3px 2px 3px 3px;/,
@@ -1350,7 +1347,7 @@ test("the kinds are ANDed with the text and with Pinned, and over Pinned the emp
   await page.el("search-field").setValue("");
 
   // Pinned AND Links AND the kinds: the pins with a link left.
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   await page.settle();
   assert.deepStrictEqual(shownHrefs(page, "pinned-log"), { "8800000000000000204": ["https://example.org/pinned"] },

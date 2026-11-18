@@ -768,7 +768,7 @@ test("the bar's buttons stay their size under a larger font, so the field keeps 
   for (const token of ["--search-disc", "--search-hit", "--toggle-hit", "--bar-gap", "--float-edge"]) {
     assert.match(root, new RegExp(`${token}:\\s*[\\d.]+px;`), `${token} grows with the reader's font`);
   }
-  for (const selector of ["#search-toggle .icon", "#links-filter .icon", "#pinned-filter .icon"]) {
+  for (const selector of ["#search-toggle .icon", "#links-filter .icon", "#labels-button .icon"]) {
     const block = cssBlock(selector);
     assert.match(block, /width:\s*\d+px/, `${selector} grows with the reader's font`);
     assert.match(block, /height:\s*\d+px/, `${selector} grows with the reader's font`);
@@ -778,7 +778,7 @@ test("the bar's buttons stay their size under a larger font, so the field keeps 
   assert.match(cssBlock("#screen-main[data-searching] #search-float"), /padding:\s*\d+px \d+px \d+px \d+px;/,
     "the open bar's inset grows with the reader's font");
   // ...and nothing on the bar is sized by another rem in their place.
-  for (const selector of ["#search-toggle", "#links-filter", "#pinned-filter", "#screen-main[data-searching] #search-toggle"]) {
+  for (const selector of ["#search-toggle", "#links-filter", "#labels-button", "#screen-main[data-searching] #search-toggle"]) {
     assert.doesNotMatch(cssBlock(selector), /(width|height|margin[\w-]*|inset):[^;]*\drem/,
       `${selector} is sized in rem`);
   }

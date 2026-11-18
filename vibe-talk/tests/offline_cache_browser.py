@@ -1707,8 +1707,8 @@ FILTER_BAR_JS = """({pinned, fieldMin}) => {""" + FLOAT_HELPERS_JS + f"""
     const mid = (r) => (r.top + r.bottom) / 2;
     const bar = document.getElementById('search-float'), field = document.getElementById('search-field');
     const glass = document.getElementById('search-toggle');
-    const filters = ['links-filter', 'pinned-filter'].map((id) => document.getElementById(id)).filter(shown);
-    const wanted = pinned ? 'links-filter pinned-filter' : 'links-filter';
+    const filters = ['links-filter', 'labels-button'].map((id) => document.getElementById(id)).filter(shown);
+    const wanted = pinned ? 'links-filter labels-button' : 'links-filter';
     if (filters.map((f) => f.id).join(' ') !== wanted) {
         return {problems: [`the open bar holds ${filters.map(name).join(', ') || 'no filter'}, not ${wanted}`], field: 0, text: 0};
     }
@@ -1793,7 +1793,7 @@ KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
     const problems = [];
     const row = document.getElementById('link-kinds');
     if (!shown(row)) return {problems: ['no kinds of link are shown under Links'], placement: '', scrolls: false, chips: []};
-    if (shown(document.getElementById('pinned-filter')) !== pinned) problems.push(`Pinned is ${pinned ? 'not ' : ''}on the bar`);
+    if (shown(document.getElementById('labels-button')) !== pinned) problems.push(`Pinned is ${pinned ? 'not ' : ''}on the bar`);
     const b = box(document.getElementById('search-float')), l = box(document.getElementById('links-filter'));
     const r = box(row), width = document.documentElement.clientWidth;
     const mid = (l.left + l.right) / 2, rowMid = (r.left + r.right) / 2;
@@ -1810,7 +1810,7 @@ KINDS_JS = """({pinned}) => {""" + FLOAT_HELPERS_JS + """
     if (document.documentElement.scrollWidth > width + 0.5) problems.push(`the page is ${document.documentElement.scrollWidth}px wide on a ${width}px screen`);
     const scrolls = row.scrollWidth > row.clientWidth + 1;
     if (scrolls && !['auto', 'scroll'].includes(getComputedStyle(row).overflowX)) problems.push('the kinds overflow their row with no way to scroll to them');
-    const others = ['search-field', 'search-toggle', 'links-filter', 'pinned-filter'].map((id) => document.getElementById(id)).filter(shown);
+    const others = ['search-field', 'search-toggle', 'links-filter', 'labels-button'].map((id) => document.getElementById(id)).filter(shown);
     // `#620 link-url-chip`: URL first, which is no kind; placed and pressed as they are, never counted.
     const chips = [...row.querySelectorAll('button')];
     const said = chips.map((chip) => (chip.firstChild ? chip.firstChild.textContent.trim() : ''));
@@ -4155,8 +4155,9 @@ def menu_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
 
                 # The pinned row again, in the Pinned filter, and its Unpin reached by a thumb.
                 tap("#search-toggle")
-                until("() => !document.getElementById('pinned-filter').hidden", "the open bar has no Pinned filter")
-                tap("#pinned-filter")
+                until("() => !document.getElementById('labels-button').hidden", "the open bar has no Labels filter")
+                tap("#labels-button")
+                tap("#labels-option-pinned")
                 until("() => document.querySelectorAll('#pinned-log > li[data-id]').length === 1",
                       "the pinned row did not show in the filter")
                 menu_of("pinned-log", "201")
@@ -4268,7 +4269,7 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
 
             # The Pinned filter on the open bar, before and after the count takes its room.
             tap("#search-toggle")
-            until("() => !document.getElementById('pinned-filter').hidden", "the open bar has no Pinned filter")
+            until("() => !document.getElementById('labels-button').hidden", "the open bar has no Labels filter")
             bare = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 96})
             check(not bare["problems"], f"{label}, the filters on the open bar: {bare['problems']}")
             page.fill("#search-field", "a")
@@ -4278,9 +4279,10 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             page.fill("#search-field", "")
 
             # Its tap shows the pins, and none of them is under the bar.
-            tap("#pinned-filter")
-            until("() => document.getElementById('pinned-filter').getAttribute('aria-pressed') === 'true'",
-                  "a tap on the filter did not turn it on")
+            tap("#labels-button")
+            tap("#labels-option-pinned")
+            until("() => document.getElementById('pane-discord').hasAttribute('data-pinned-only')",
+                  "choosing Pinned in the Labels drop-down did not turn it on")
             until("() => document.querySelectorAll('#pinned-log > li[data-id]').length === 2", "the pins did not show")
             check(ids("pinned-log") == ["200", "201"], f"{label}: the filter showed {ids('pinned-log')}")
             covered = page.evaluate("() => { const bar = document.getElementById('search-float').getBoundingClientRect();"
@@ -4295,7 +4297,7 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             # The glass folds the bar, and the filter with it.
             tap("#search-toggle")
             until("() => document.getElementById('pinned-log').hidden", "folding the bar left the filter on")
-            check(page.evaluate("() => document.getElementById('pinned-filter').getAttribute('aria-pressed')") == "false",
+            check(page.evaluate("() => document.getElementById('labels-button').getAttribute('data-active-label')") is None,
                   f"{label}: the filter still says it is on")
             check(ids("discord-log") == ["200", "201", "202"], f"{label}: the channel came back as {ids('discord-log')}")
             check(not errors, f"{label}, pins: the page threw: {errors}")

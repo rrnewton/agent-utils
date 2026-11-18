@@ -28,7 +28,7 @@ import { PAGE_CODE, SETTINGS, ACKNOWLEDGED, ALICE, BOTTOM_SLACK_PX, BOUND_NOTICE
   startTalking, statusText, storedPin, tagged, tallChannel, tapArrow, tapBookmarkClear, tapKind,
   tapPin, tapRow, test, threadBadge, threadButton, threadData, threadPage, threadedService,
   throughHere, timelineAnswer, turnTodoOn, twoColumnServer, twoColumns, unfiltered, unreadChip,
-  unreadSaid, viewOf, wordsIn, yOf, youSay } from "./fixture.mjs";
+  unreadSaid, viewOf, wordsIn, yOf, youSay, togglePinned, pickLabel } from "./fixture.mjs";
 
 const MESSAGE_EPOCH = Date.parse("2026-08-19T04:31:00.000Z");
 
@@ -217,27 +217,26 @@ test("a pinned row is marked in words and by an edge of its own, legible on the 
 });
 
 test("the Pinned filter sits right beside the glass, only while the bar is open, and says what it does", async () => {
-  // Markup: field, count, the filter, the glass — the filter IMMEDIATELY before the glass.
-  assertMarkupContains("search-float", "pinned-filter");
+  // Markup: field, count, the Labels button, its panel, the glass (`#1853`).
+  assertMarkupContains("search-float", "labels-button");
   const bar = HTML_CODE.slice(HTML_CODE.indexOf('id="search-float"'));
   const at = (id) => bar.indexOf(`id="${id}"`);
-  assert.ok(at("search-count") < at("pinned-filter") && at("pinned-filter") < at("search-toggle"),
-    "the filter is not between the count and the glass");
-  assert.equal(bar.slice(bar.indexOf("</button>", at("pinned-filter")) + "</button>".length, at("search-toggle")).trim(),
-    "<button", "something stands between the filter and the glass");
+  assert.ok(at("search-count") < at("labels-button") && at("labels-button") < at("search-toggle"),
+    "the Labels button is not between the count and the glass");
+  assert.equal(bar.slice(bar.indexOf("</button>", at("labels-button")) + "</button>".length, at("search-toggle")).trim(),
+    "<button", "something stands between the Labels button and the glass");
   // An icon in the house style: the glass's own stroke, cap and join.
   const svgOf = (id) => {
     const from = bar.indexOf("<svg", at(id));
     return bar.slice(from, bar.indexOf(">", from));
   };
   for (const attribute of ['class="icon"', 'stroke-width="1.9"', 'stroke-linecap="round"', 'aria-hidden="true"']) {
-    assert.ok(svgOf("pinned-filter").includes(attribute) && svgOf("search-toggle").includes(attribute),
+    assert.ok(svgOf("labels-button").includes(attribute) && svgOf("search-toggle").includes(attribute),
       `the pin icon does not share ${attribute} with the glass`);
   }
   // A whole 44px target, kept out of the glass's own square — since `#211 link-filter` by a margin
   // on the glass, which holds for whichever filter stands beside it.
-  const target = cssBlock("#pinned-filter");
-  assert.match(target, /width: var\(--toggle-hit\)/);
+  const target = cssBlock("#labels-button");
   assert.match(target, /height: var\(--toggle-hit\)/);
   // Since `#212 link-filter` that margin is a token, because the kinds of link under Links are placed
   // by it too.
@@ -248,18 +247,19 @@ test("the Pinned filter sits right beside the glass, only while the bar is open,
   const page = newPage();
   await signIn(page);
   await showDiscord(page, backlog(2));
-  // Named for what it does, and a toggle that says whether it is on.
-  const markup = bar.slice(at("pinned-filter"), bar.indexOf(">", at("pinned-filter")));
-  assert.match(markup, /aria-label="Show only pinned messages"/);
-  assert.match(markup, /aria-pressed="false"/);
-  const filter = page.el("pinned-filter");
+  // Named for what it does, and a drop-down that says whether it is open.
+  const markup = bar.slice(at("labels-button"), bar.indexOf(">", at("labels-button")));
+  assert.match(markup, /aria-label="Labels. Filter by label"/);
+  assert.match(markup, /title="Filter by label"/);
+  assert.match(markup, /aria-haspopup="listbox"/);
+  assert.match(markup, /aria-expanded="false"/);
+  const filter = page.el("labels-button");
   assert.equal(filter.hidden, true, "the filter is offered before the search bar is open");
-  assert.equal(filter.getAttribute("aria-pressed"), "false");
   await page.el("search-toggle").click();
-  assert.equal(filter.hidden, false, "the open bar has no Pinned filter");
-  await filter.click();
-  await page.settle();
-  assert.equal(filter.getAttribute("aria-pressed"), "true", "the filter does not say it is on");
+  assert.equal(filter.hidden, false, "the open bar has no Labels filter");
+  await togglePinned(page);
+  assert.equal(page.el("pane-discord").hasAttribute("data-pinned-only"), true, "the filter does not say it is on");
+  assert.equal(filter.getAttribute("data-active-label"), "pinned");
   // The call's transcript has no pins; the filter is not offered over it, and comes back with the channel.
   // `documents-view-client`: the rotation passes Documents, which offers no filter either.
   await page.el("view-switch").click();
@@ -271,7 +271,7 @@ test("the Pinned filter sits right beside the glass, only while the bar is open,
   await page.el("view-switch").click();
   await page.settle();
   assert.equal(filter.hidden, false);
-  assert.equal(filter.getAttribute("aria-pressed"), "true");
+  assert.equal(page.el("pane-discord").hasAttribute("data-pinned-only"), true);
 });
 
 test("Pinned shows this channel's pins in the order they were sent, loaded or not, whatever the view and Hide read", async () => {
@@ -326,7 +326,7 @@ test("Pinned shows this channel's pins in the order they were sent, loaded or no
   // Closing the bar clears the text AND turns the filter off: nothing is left filtering unseen.
   await page.el("search-toggle").click();
   await page.settle();
-  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "false", "the filter outlived the bar");
+  assert.equal((page.el("pane-discord").hasAttribute("data-pinned-only") ? "true" : "false"), "false", "the filter outlived the bar");
   assert.equal(page.el("pinned-log").hidden, true);
   assert.equal(page.el("discord-log").hidden, false, "the channel's list did not come back");
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"], "the channel's own filters did not survive the filter");
@@ -348,14 +348,14 @@ test("Escape closes the bar and the filter with it, and a pin opened in its thre
   await showPinned(page);
   await page.el("search-field").dispatch("keydown", { key: "Escape" });
   await page.settle();
-  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "false", "Escape left the filter on");
+  assert.equal((page.el("pane-discord").hasAttribute("data-pinned-only") ? "true" : "false"), "false", "Escape left the filter on");
   assert.equal(page.el("pinned-log").hidden, true);
 
   await showPinned(page);
   await threadBadge(page.el("pinned-log").children[0]).click();
   await page.settle();
   await page.settle();
-  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "false", "opening the thread left the filter on");
+  assert.equal((page.el("pane-discord").hasAttribute("data-pinned-only") ? "true" : "false"), "false", "opening the thread left the filter on");
   assert.equal(page.el("thread-heading").hidden, false, "the pin's thread did not open");
   assert.deepStrictEqual(shownIds(page), ["201", "202"]);
 });
@@ -2222,7 +2222,7 @@ test("DONE HERE WHILE MAIN'S READ IS ON ITS WAY: the read, sent before, does not
   await doneButton(page.el("pinned-log").children[0]).click();
   await page.settle();
   assert.ok(page.dealtWith.has(inboxId(8)), "the Done was not stored");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" });
   land();
@@ -2252,7 +2252,7 @@ test("A DONE WHOSE WRITE FAILS puts back only what it changed, not what a read b
   await showPinned(page);
   const done = doneButton(page.el("pinned-log").children[0]).click();
   await page.settle();
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" }, "the Done waited for its write");
   // While it is on its way, A's answer is dealt with on another device, and Main's poll says so —
@@ -2332,7 +2332,7 @@ test("DONE FROM THE PINNED LIST on Main: a pinned reply dealt with there counts 
   await doneButton(page.el("pinned-log").children[0]).click();
   await page.settle();
   assert.ok(page.dismissCalls.some((body) => (body.messages || []).includes(inboxId(8))), "the Done was not sent");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: null, 7: "1 unread" },
     "a reply dealt with in the Pinned list still counted as unread");
@@ -4659,7 +4659,7 @@ test("`#243 filter-keeps-selection`: THE OWNER'S SEQUENCE — search, Pinned, a 
     if (how === "touch") await tapRow(page, "27", "pinned-log");
     else await clickRow(page, "27", "pinned-log");
     const y = yOf(page, "27", "pinned-log");
-    if (clear === "Pinned") await page.el("pinned-filter").click();
+    if (clear === "Pinned") await togglePinned(page);
     else if (clear === "Escape") await press(page, page.el("search-field"), "Escape");
     else await page.el("search-toggle").click();
     await page.settle();
@@ -4688,11 +4688,11 @@ test("`#243 filter-keeps-selection`: turned on, Pinned keeps a selected pin wher
   parkAt(page, "33", 200);
   await clickRow(page, "33");
   let y = yOf(page, "33");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   keptAt(page, "33", y, "turning Pinned on", "pinned-log");
   assert.deepStrictEqual(litIds(page), ["33"], "the pin selected in the channel is not lit in the Pinned list");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   keptAt(page, "33", y, "turning Pinned off again");
   // A message that is not pinned, chosen by a tap: the pin nearest it stands where it stood, and the
@@ -4700,11 +4700,11 @@ test("`#243 filter-keeps-selection`: turned on, Pinned keeps a selected pin wher
   parkAt(page, "26", 160);
   await tapRow(page, "26");
   y = yOf(page, "26");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   keptAt(page, "27", y, "turning Pinned on over a message that is not pinned", "pinned-log");
   assert.equal(statusText(page), "Not pinned — the nearest pin is here.");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   keptAt(page, "26", y, "turning Pinned on and off without a scroll");
 });
@@ -4793,7 +4793,8 @@ test("`#243 filter-keeps-selection`: Pinned turned on at the newest line before 
     area.scrollTop = area.scrollHeight;
     assert.ok(atBottomOf(area), "the fixture's reader is not on the newest line");
     // No read has carried the pins' revision, so the filter reads them now: "Loading…" first.
-    await page.el("pinned-filter").click();
+    await page.el("labels-button").click();
+    await page.el("labels-listbox").children.find((li) => li.id === "labels-option-pinned").click();
     const loading = { top: area.scrollTop, said: page.el("search-empty").textContent };
     for (let i = 0; i < 3; i += 1) await page.settle();
     return { page, area, loading };
@@ -4879,7 +4880,7 @@ test("`#243 filter-keeps-selection`: a pin older than anything loaded is walked 
     if (/[?&]before=/.test(String(path))) lines.push(page.el("load-older").textContent);
     return serve(path);
   };
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   for (let i = 0; i < 4 * FILTER_WALK_PAGES; i += 1) await page.settle();
   assert.equal(olderReads(page).length, 3, `the walk read ${olderReads(page).length} older pages, not the three to the pin`);
   assert.deepStrictEqual(lines, Array(3).fill("Loading earlier messages…"), "the step-back line did not say what the walk was doing");
@@ -4901,7 +4902,7 @@ test("`#243 filter-keeps-selection`: the walk back is bounded: a pin further bac
   await showPinned(page);
   await tapRow(page, all[0].id, "pinned-log");
   const y = yOf(page, all[0].id, "pinned-log");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   for (let i = 0; i < 4 * (FILTER_WALK_PAGES + 3); i += 1) await page.settle();
   assert.equal(olderReads(page).length, FILTER_WALK_PAGES, "the walk back was not bounded");
   assert.equal(placeRow(page, all[0].id), undefined);
@@ -4964,7 +4965,7 @@ test("`#243 filter-keeps-selection`: and nothing else moves it afterwards — no
     await showPinned(page);
     // The newest message, pinned and chosen: in the channel's list it is at the newest line.
     await clickRow(page, "40", "pinned-log");
-    await page.el("pinned-filter").click();
+    await togglePinned(page);
     await page.settle();
     return page;
   };
@@ -5008,7 +5009,7 @@ async function pinThirtyKept(script = SCRIPT) {
   await showPinned(page);
   parkAt(page, "30", PIN_THIRTY_Y, "pinned-log");
   await clickRow(page, "30", "pinned-log");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   keptAt(page, "30", PIN_THIRTY_Y, "turning Pinned off over the pin chosen");
   return page;
@@ -5054,7 +5055,7 @@ test("`#243 filter-keeps-selection`: after the reader acts in the list — a pre
     await showDiscord(page, messages);
     await showPinned(page);
     await clickRow(page, "40", "pinned-log");
-    await page.el("pinned-filter").click();
+    await togglePinned(page);
     await page.settle();
     assert.ok(atBottomOf(page.el("scroll-area")), "the fixture's pin is not at the newest line once the filter goes");
     return page;
@@ -5109,7 +5110,7 @@ test("`#243 filter-keeps-selection`: a pin that is the second part of a combined
     await clickRow(page, "30", "pinned-log");
     // Where the pin's text starts in the Pinned list, where it is a row of its own.
     const [text] = blockTops(page, placeRow(page, "30", "pinned-log")).tops;
-    await page.el("pinned-filter").click();
+    await togglePinned(page);
     await page.settle();
     return { page, text };
   };
@@ -5145,7 +5146,7 @@ test("`#243 filter-keeps-selection`: a reader who scrolls while the walk back re
       if (/[?&]before=/.test(String(path)) && seen++ === 0) during(page);
       return serve(path);
     };
-    await page.el("pinned-filter").click();
+    await togglePinned(page);
     for (let i = 0; i < 4 * FILTER_WALK_PAGES; i += 1) await page.settle();
     return { page, y };
   };
@@ -5669,10 +5670,10 @@ test("`#251 author-filter`: the author filter sits left of Links, only while the
       `the ${mode} icon is never drawn`);
   }
   assert.match(cssBlock("#author-filter .author-icon"), /display:\s*none/, "every state's icon is drawn at once");
-  // The same square as Links and Pinned, drawn by the same rules, abutting Links.
+  // The same square as Links, drawn by the same rules, abutting Links.
   for (const selector of ["#author-filter", "#author-filter::before", "#author-filter .icon"]) {
-    assert.deepStrictEqual(cssRules(CSS, selector), cssRules(CSS, selector.replace("author", "pinned")).slice(0, 1),
-      `${selector} is not drawn by the rule that draws Pinned`);
+    assert.deepStrictEqual(cssRules(CSS, selector), cssRules(CSS, selector.replace("author", "links")).slice(0, 1),
+      `${selector} is not drawn by the rule that draws Links`);
   }
   assert.match(cssBlock("#author-filter + #links-filter"), /margin-left:\s*calc\(-1 \* var\(--bar-gap\)\)/);
   // ...except on a narrow phone, where a third square on the line would take the field's room: there it
@@ -5868,7 +5869,7 @@ test("`#251 author-filter`: ANDed with the search text, Links and Pinned, the co
   await page.el("links-filter").click();
   await page.settle();
   // Pinned: the owner's pins, and then everyone else's.
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   await page.settle();
   assert.deepStrictEqual(passing(page, "pinned-log"), ["3", "6"], "Pinned and Mine are not both required");
@@ -6050,4 +6051,55 @@ test("`#584 thread-view-bookmark-chip`: over the thread list b, Shift+B and the 
   assert.equal(statusText(two.page), "No bookmarks in thread view.", "Shift+B on a card in two columns said something else");
   await press(two.page, two.page.el("side-scroll"), "b");
   assert.equal(statusText(two.page), "Back at your bookmark.", "b in two columns did not go to Main's line");
+});
+
+test("`#1853`: the Labels drop-down lists Pinned first, then labels most used first, and picking one filters to it", async () => {
+  const page = newPage();
+  const messages = backlog(3);
+  messages[0].labels = ["kvm"];
+  messages[1].labels = ["kvm", "perf"];
+  messages[2].labels = [];
+  page.pinned.set(messages[2].id, storedPin(messages[2]));
+  page.servePinsRevision = true;
+  page.pinsRevision = 1;
+  await signIn(page);
+  await showDiscord(page, messages);
+  await page.el("search-toggle").click();
+  await page.settle();
+  const button = page.el("labels-button");
+  assert.equal(button.getAttribute("aria-label"), "Labels. Filter by label", "the Labels button does not say what it does");
+  await button.click();
+  await page.settle();
+  await page.settle();
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  assert.equal(page.el("labels-panel").hidden, false);
+  const options = page.el("labels-listbox").children;
+  assert.deepStrictEqual(options.map((li) => li.id),
+    ["labels-option-all", "labels-option-pinned", "labels-option-kvm", "labels-option-perf"],
+    "Pinned is not the built-in first label, or the labels are not most used first");
+  assert.equal(options[1].children[1].textContent, "1 in this channel", "Pinned does not say its channel count");
+  assert.equal(options[2].children[1].textContent, "2 in loaded history", "#kvm does not say its loaded-history count");
+  // The filter box narrows the hashtag rows; All and Pinned stay.
+  await page.el("labels-filter-input").setValue("kv");
+  assert.deepStrictEqual(page.el("labels-listbox").children.map((li) => li.id),
+    ["labels-option-all", "labels-option-pinned", "labels-option-kvm"]);
+  await page.el("labels-filter-input").setValue("");
+  // Picking #kvm filters like the typed search, and the button names it.
+  await pickLabel(page, "kvm");
+  assert.equal(page.el("search-field").value, "label:kvm");
+  assert.deepStrictEqual(unfiltered(page, "discord-log").map((li) => li.getAttribute("data-id")), [String(messages[0].id), String(messages[1].id)]);
+  assert.equal(button.getAttribute("data-active-label"), "kvm");
+  assert.match(button.getAttribute("aria-label"), /#kvm selected/);
+  assert.equal(page.el("labels-panel").hidden, true, "picking a label left the panel open");
+  // Picking it again clears, as All messages does.
+  await pickLabel(page, "kvm");
+  assert.equal(page.el("search-field").value, "");
+  assert.deepStrictEqual(unfiltered(page, "discord-log").map((li) => li.getAttribute("data-id")), messages.map((m) => String(m.id)));
+  assert.equal(button.getAttribute("data-active-label"), null);
+  // Escape shuts the panel and puts the focus back on the button.
+  await button.click();
+  await page.settle();
+  await page.el("labels-filter-input").dispatch("keydown", { key: "Escape", preventDefault: () => {} });
+  assert.equal(page.el("labels-panel").hidden, true, "Escape left the panel open");
+  assert.equal(button.getAttribute("aria-expanded"), "false");
 });

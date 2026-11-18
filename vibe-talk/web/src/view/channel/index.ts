@@ -116,6 +116,8 @@ export type { SummaryWatch, SummaryWatchDependencies } from "./summarywatch.ts";
 export { createLastPane } from "./lastpane.ts";
 export type { LastPane } from "./lastpane.ts";
 export type { ReplyRouting, ReplyState } from "./replystate.ts";
+export { createLabelsFilter, loneLabelOf } from "./labelsfilter.ts";
+export type { LabelsFilter, LabelsFilterDependencies } from "./labelsfilter.ts";
 export { mountFilterChips } from "./filterchips.ts";
 export type { FilterChips, FilterChipsDependencies, SearchKey } from "./filterchips.ts";
 export { mountListWatch } from "./listwatch.ts";

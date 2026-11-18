@@ -163,6 +163,55 @@ impl Harness {
 }
 
 #[tokio::test]
+async fn pinned_is_the_builtin_label_over_http_and_pinned_the_slug_is_reserved() {
+    // `#1853`: the page's exact pin write and pins read over the real router,
+    // the reserved slug refused as a group, and no hashtag named pinned.
+    let harness = Harness::new();
+    let id = "1000000000000000100";
+    let (status, change) = harness
+        .call(
+            "PUT",
+            &format!("/api/v1/channels/{READ_CHANNEL}/pins/{id}"),
+            Some(WRITE_TOKEN),
+            Some(json!({
+                "author": "build-bot", "author_id": "7", "author_is_bot": true,
+                "content": "fixed the stall\n#benchmark #kvm",
+                "timestamp": "2026-10-04T12:00:00Z", "thread_id": null, "thread_root": false
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{change}");
+    assert_eq!(change["pinned"], json!(true));
+
+    let (status, pins) = harness
+        .call(
+            "GET",
+            &format!("/api/v1/channels/{READ_CHANNEL}/pins"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{pins}");
+    assert_eq!(pins["pins"][0]["message_id"], json!(id), "{pins}");
+
+    // A group may not claim the built-in's slug.
+    let (status, refused) = harness
+        .call(
+            "POST",
+            "/api/v1/label-groups",
+            Some(WRITE_TOKEN),
+            Some(json!({"display": "pinned", "spellings": ["pinned", "kvm"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(format!("{refused}").contains("reserved"), "{refused}");
+
+    // The served labels carry the hashtags alone: no `pinned` among them,
+    // before the pin and after it alike (labels are derived, pins are not).
+    assert_eq!(harness.served_labels().await, vec!["benchmark", "kvm"]);
+}
+
+#[tokio::test]
 async fn hashtags_are_served_as_labels_and_grouping_renames_them_live() {
     let harness = Harness::new();
     assert_eq!(harness.served_labels().await, vec!["benchmark", "kvm"]);

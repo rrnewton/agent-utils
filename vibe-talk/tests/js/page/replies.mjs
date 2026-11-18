@@ -27,7 +27,7 @@ import { ALICE, BASE_CSS, CHANNEL, CODER, CSS, CSS_CODE, DESKTOP_QUERY, DISCORD_
   sourceString, splitPost, sseDelete, sseMessage, stackPlaces, startTalking, statusText, storedPin,
   tagOf, takesASide, tallColumns, tapArrow, test, threadBadge, threadButton, threadData,
   threadOptions, threadPage, timelineReads, tokenValues, turnSummariesOn, turnTodoOn,
-  putReplyDown, twoColumnServer, twoColumns, unpackedRow, withLiveChannel, wordsIn } from "./fixture.mjs";
+  putReplyDown, twoColumnServer, twoColumns, unpackedRow, withLiveChannel, wordsIn, togglePinned } from "./fixture.mjs";
 
 const REPLY_LANDED_MS = sourceConstant("REPLY_LANDED_MS");
 
@@ -5609,10 +5609,10 @@ test("`#467 inline-send-in-place`: the row is drawn straight after the list, and
   const at = pane.indexOf(page.el("discord-log"));
   assert.ok(pane[at + 1] && pane[at + 1].hasClass("outgoing-inplace"),
     "the reply's row is not straight after the list, where it is drawn without anchor positioning");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   assert.equal(inPlaceRows(page).length, 0, "the reply's row is drawn under the Pinned filter");
-  await page.el("pinned-filter").click();
+  await togglePinned(page);
   await page.settle();
   assert.equal(inPlaceRows(page).length, 1, "the reply's row did not come back with the list");
 });

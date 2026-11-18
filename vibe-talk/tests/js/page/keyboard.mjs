@@ -3446,11 +3446,11 @@ test("`#281 view-keys` x `#265 window-channel-memory`: a reloaded window keeps w
 test("Shift+P AND Shift+L turn the Pinned and Links filters on and off, with the search bar that holds them", async () => {
   const page = await keyboardPage();
   await press(page, page.el("scroll-area"), "P", { shiftKey: true });
-  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "true", "Shift+P did not turn Pinned on");
+  assert.equal((page.el("pane-discord").hasAttribute("data-pinned-only") ? "true" : "false"), "true", "Shift+P did not turn Pinned on");
   assert.equal(page.el("search-field").hidden, false, "a filter came on with the bar that holds it shut");
   assert.equal(focused(page), page.el("scroll-area"), `after Shift+P the focus is on ${focusName(page)}`);
   await press(page, page.el("scroll-area"), "P", { shiftKey: true });
-  assert.equal(page.el("pinned-filter").getAttribute("aria-pressed"), "false", "Shift+P did not turn Pinned off");
+  assert.equal((page.el("pane-discord").hasAttribute("data-pinned-only") ? "true" : "false"), "false", "Shift+P did not turn Pinned off");
   await press(page, page.el("scroll-area"), "L", { shiftKey: true });
   assert.equal(page.el("links-filter").getAttribute("aria-pressed"), "true", "Shift+L did not turn Links on");
   // A plain p is the selected message's pin, not the filter.

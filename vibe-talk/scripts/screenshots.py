@@ -5626,7 +5626,7 @@ SCENES: tuple[Scene, ...] = (
                 "(() => { const f = document.getElementById('search-field').getBoundingClientRect(); "
                 "const c = document.getElementById('search-count').getBoundingClientRect(); "
                 "const l = document.getElementById('links-filter').getBoundingClientRect(); "
-                "const p = document.getElementById('pinned-filter').getBoundingClientRect(); "
+                "const p = document.getElementById('labels-button').getBoundingClientRect(); "
                 "const g = document.getElementById('search-toggle').getBoundingClientRect(); "
                 "const bar = document.getElementById('search-float').getBoundingClientRect(); "
                 "const area = document.getElementById('scroll-area'); "
@@ -5661,7 +5661,7 @@ SCENES: tuple[Scene, ...] = (
                 "Links reads as on, immediately left of Pinned, which is left of the glass",
                 "(() => { const l = document.getElementById('links-filter'); "
                 "const a = l.getBoundingClientRect(); "
-                "const p = document.getElementById('pinned-filter').getBoundingClientRect(); "
+                "const p = document.getElementById('labels-button').getBoundingClientRect(); "
                 "const g = document.getElementById('search-toggle').getBoundingClientRect(); "
                 "return l.getAttribute('aria-pressed') === 'true' && a.width >= 44 "
                 "&& a.right <= p.left + 1 && p.left - a.right < 20 && p.right <= g.left + 1 "

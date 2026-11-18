@@ -339,9 +339,10 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
         return float(after or 0)
 
     def pinned_on() -> None:
-        press("#pinned-filter")
-        until("() => document.getElementById('pinned-filter').getAttribute('aria-pressed') === 'true'",
-              "a tap on Pinned did not turn it on")
+        press("#labels-button")
+        press("#labels-option-pinned")
+        until("() => document.getElementById('pane-discord').hasAttribute('data-pinned-only')",
+              "choosing Pinned in the Labels drop-down did not turn it on")
         until(f"() => document.querySelectorAll('#pinned-log > li[data-ids]').length === {len(PINNED)}",
               "the Pinned list does not show the five pins")
         settled()
@@ -365,7 +366,7 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
 
     # 1. Search, Pinned, a loaded pin chosen, Pinned tapped off.
     press("#search-toggle")
-    until("() => !document.getElementById('pinned-filter').hidden", "the open search bar has no Pinned filter")
+    until("() => !document.getElementById('labels-button').hidden", "the open search bar has no Labels filter")
     pinned_on()
     shot("1-pinned")
     before = choose(LOADED_PIN)
@@ -373,7 +374,8 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
         check(page.evaluate("(id) => document.querySelector(`#pinned-log > li[data-id='${id}']`)"
                             ".getAttribute('data-selected')", LOADED_PIN) == "true",
               f"{label}: the click did not select pin {LOADED_PIN}")
-    press("#pinned-filter")
+    press("#labels-button")
+    press("#labels-option-all")
     after = kept(LOADED_PIN, before, "Pinned cleared over a loaded pin")
     if not touch:
         check(page.evaluate("(id) => document.querySelector(`#discord-log > li[data-id='${id}']`)"
@@ -387,7 +389,8 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
     old_before = choose(OLD_PIN)
     api.timeline_gate.clear()
     if touch:
-        press("#pinned-filter")
+        press("#labels-button")
+        press("#labels-option-all")
     else:
         page.keyboard.press("Escape")
     until("() => document.getElementById('pinned-log').hidden", "clearing the filter left the Pinned list up")
@@ -407,13 +410,14 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
     # 3. Pinned again, the second part of a combined row chosen, and Pinned off: its own text stands
     # where it stood, and the part above it goes above that, not the pin below. Escape closed the search
     # on the desk: the glass opens it again.
-    if page.evaluate("() => document.getElementById('pinned-filter').hidden"):
+    if page.evaluate("() => document.getElementById('labels-button').hidden"):
         press("#search-toggle")
-        until("() => !document.getElementById('pinned-filter').hidden", "the glass did not open the search again")
+        until("() => !document.getElementById('labels-button').hidden", "the glass did not open the search again")
     pinned_on()
     choose(COMBINED_PIN, 0.6)
     text_before = block_top("pinned-log", COMBINED_PIN)
-    press("#pinned-filter")
+    press("#labels-button")
+    press("#labels-option-all")
     back_with(COMBINED_PIN, "Pinned off over the second part of a combined row")
     combined_top, _, _, ids = row_box("discord-log", COMBINED_PIN)
     check(ids == f"{200 + COMBINED - 1} {COMBINED_PIN}",

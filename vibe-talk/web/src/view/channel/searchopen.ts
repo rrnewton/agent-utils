@@ -23,6 +23,8 @@ export interface SearchOpenDependencies {
   setPinnedOnly(on: boolean): void;
   /** `#1852`: Whole threads lives in this bar too, and goes with it on close. */
   setEntireThreads(on: boolean): void;
+  /** `#1853`: shut the Labels drop-down with its bar. Optional for doubles. */
+  closeLabelsPanel?(): void;
   setAuthorFilter(author: string): void;
   hidingRead(): boolean;
   holdingReader(act: () => void): void;
@@ -71,6 +73,8 @@ export function createSearchOpenControl(deps: SearchOpenDependencies): SearchOpe
       // `#1852`: so does Whole threads — reading or replying never touches it,
       // only closing the bar (or the toggle itself) turns it off.
       deps.setEntireThreads(false);
+      // `#1853`: and its Labels drop-down, panel and all.
+      deps.closeLabelsPanel?.();
       // `#251 author-filter`. And whose messages.
       deps.setAuthorFilter("everyone");
     }

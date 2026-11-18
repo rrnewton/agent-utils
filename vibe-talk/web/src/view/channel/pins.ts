@@ -441,7 +441,8 @@ export function createPinnedMessages(deps: PinnedMessagesDependencies): PinnedMe
     if (on === pinsView().only) return;
     const change = (): void => {
       pinsView().only = on;
-      el("pinned-filter").setAttribute("aria-pressed", on ? "true" : "false");
+      // `#1853`: the Labels drop-down's button restates itself from this
+      // state (`createLabelsFilter.syncButton`); no toggle attribute remains.
       if (on) el("pane-discord").setAttribute("data-pinned-only", "");
       else el("pane-discord").removeAttribute("data-pinned-only");
       deps.renderChannelNavigation();

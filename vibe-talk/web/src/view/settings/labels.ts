@@ -28,12 +28,24 @@ export interface LabelsDependencies {
   guard(run: () => Promise<unknown>): () => void;
 }
 
+/** One row of the search bar's Labels drop-down (`#1853`): a plain label or
+ * a whole group under its display, most used first in `dropdownEntries`. */
+export interface LabelDropdownEntry {
+  readonly name: string;
+  readonly count: number;
+  readonly grouped: boolean;
+  readonly spellings: readonly string[];
+}
+
 /** The labels browser's commands. */
 export interface LabelsView {
   /** (Re)read the labels from the server and draw the list. */
   refresh(): Promise<void>;
   /** Every spelling a label slug may mean (its whole group), for search. */
   expand(slug: string): string[];
+  /** The drop-down's rows (`#1853`): groups collapsed as `entries` collapses
+   * them, most used first (A–Z on ties), spellings kept for filtering. */
+  dropdownEntries(): LabelDropdownEntry[];
 }
 
 /** Mount the browser: first read at once, then on `refresh`. */
@@ -125,7 +137,7 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
     );
     el("labels-state").textContent =
       labels.length === 0
-        ? "No hashtag labels in the loaded history yet. Type one, like #kvm, at the end of a message."
+        ? "No hashtag labels in the loaded history yet. Type one, like #kvm, at the end of a message. #pinned is reserved for the built-in Pinned label and never becomes a hashtag label."
         : `${labels.length} label${labels.length === 1 ? "" : "s"} in the loaded history. Tick spellings that mean the same thing, then Combine.`;
     drawCombine();
   }
@@ -232,6 +244,20 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
 
   return {
     refresh,
+    dropdownEntries(): LabelDropdownEntry[] {
+      // The built-in Pinned label is never a row here (`#1853`): the
+      // drop-down draws it itself from the pin set, and the extractor
+      // reserves the slug, so no served row can be named `pinned`.
+      return entries()
+        .filter((entry) => entry.name !== "pinned")
+        .map((entry) => ({
+          name: entry.name,
+          count: entry.count,
+          grouped: entry.group !== undefined,
+          spellings: entry.group ? [...entry.group.spellings] : [entry.name],
+        }))
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    },
     expand(slug: string): string[] {
       const group = groups.find(
         (held) => held.display === slug || held.spellings.includes(slug),

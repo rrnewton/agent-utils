@@ -365,17 +365,26 @@
                 </svg>
               </button>
               <!--
-                `#206 pin-message`. The Pinned filter, IMMEDIATELY beside the glass and only while the
-                bar is open, as the owner asked: on, the list is this channel's pinned messages and
-                nothing else — whatever the view and whatever the read mode says — and the search text
-                still narrows it. Closing the bar clears the text, and turns this off with it, so no
-                filter is ever left in force behind a control that is not on screen.
+                `#206 pin-message`, grown into the Labels drop-down by
+                `#1853 vibe-talk-labels-dropdown-pinned-builtin` (owner thread 190).
+                IMMEDIATELY beside the glass and only while the bar is open, where the
+                Pinned toggle stood: the button opens a list whose first label is the
+                built-in Pinned (this channel's pin set, gold as ever), followed by
+                the hashtag labels and groups of the loaded history, most used
+                first, under a filter box for long lists. Picking one filters to
+                it; picking it again, or All messages, clears. Closing the bar
+                clears the text and turns the filter off with it, so no filter is
+                ever left in force behind a control that is not on screen.
               -->
-              <button id="pinned-filter" class="icon-button" type="button" aria-pressed="false" aria-label="Show only pinned messages" title="Show only pinned messages" hidden>
+              <button id="labels-button" class="icon-button labels-filter-button" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="Labels. Filter by label" title="Filter by label" hidden>
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M8.5 3.5h7" />
                   <path class="pin-head" d="M10 3.5v6L7 13.5h10l-3-4v-6" />
                   <path d="M12 13.5v7" />
+                </svg>
+                <span class="labels-filter-word">Labels</span>
+                <svg class="icon labels-filter-chevron" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m6 9 6 6 6-6" />
                 </svg>
               </button>
               <button id="search-toggle" class="icon-button" type="button" aria-label="Search messages" title="Search messages" aria-pressed="false" hidden>
@@ -415,6 +424,12 @@
                 <button id="link-kind-issue" class="link-kind" type="button" aria-pressed="true" title="Show links to issues">Issues<span id="link-kind-issue-count" class="link-kind-count"></span></button>
                 <button id="link-kind-file" class="link-kind" type="button" aria-pressed="true" title="Show links to files and folders of code">Files<span id="link-kind-file-count" class="link-kind-count"></span></button>
                 <button id="link-kind-other" class="link-kind" type="button" aria-pressed="true" title="Show links to everything else: documents, pages and other sites">Other<span id="link-kind-other-count" class="link-kind-count"></span></button>
+              </div>
+              <div id="labels-panel" hidden>
+                <label class="labels-panel-filter-label" for="labels-filter-input">Filter labels</label>
+                <input id="labels-filter-input" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Filter labels" />
+                <ol id="labels-listbox" role="listbox" aria-label="Filter by label"></ol>
+                <p id="labels-panel-state" class="hint" role="status"></p>
               </div>
             </div>
           </div>

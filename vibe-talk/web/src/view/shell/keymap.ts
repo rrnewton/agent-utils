@@ -588,7 +588,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     {
       group: KEYS_VIEW, chords: [{ key: "p", shift: true }],
       does: "Only the pinned messages, or all of them again",
-      controls: ["pinned-filter"],
+      controls: ["labels-button"],
       run: () => filterFromKeyboard("pinned"),
     },
     {

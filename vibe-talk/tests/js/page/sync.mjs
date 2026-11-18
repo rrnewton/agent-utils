@@ -28,7 +28,7 @@ import { ALICE, BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, COUNTS_ALL_READ_MS, CS
   sourceConstant, speakRelay, sseDelete, sseMessage, sseUpdate, startTalking, tagOf, tagged,
   tallChannel, tallColumns, test, threadBadge, threadButton, threadData, threadOptions, threadPage,
   timelineAnswer, turnTodoOn, twoColumnServer, twoColumns, unreadChip, viewOf, watchTurns, wideCard,
-  withLiveChannel, withReplies, yOf } from "./fixture.mjs";
+  withLiveChannel, withReplies, yOf, togglePinned } from "./fixture.mjs";
 
 /** Placing in its module (`createPlacing`, `#624`): a patch there, and a page built with patches. */
 const placingPatch = ([find, replace]) => ({ file: "src/view/channel/placing.ts", find, replace });
@@ -5927,7 +5927,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: a draft arriving un
     await showPinned(page);
     // The newest message, pinned and chosen: once the filter goes it is at the newest line, held.
     await clickRow(page, "40", "pinned-log");
-    await page.el("pinned-filter").click();
+    await togglePinned(page);
     await page.settle();
     return page;
   };

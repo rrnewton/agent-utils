@@ -22,9 +22,6 @@ export interface FilterChipsDependencies {
   /** Whether the search is open, and opening or closing it (closing clears it). */
   searchOpen(): boolean;
   setSearchOpen(open: boolean): void;
-  /** Whether only the pinned messages are shown, and showing only them or all again. */
-  pinnedOnly(): boolean;
-  setPinnedOnly(on: boolean): void;
   /** Whether only the messages with links are shown, and showing only them or all again. */
   linksOnly(): boolean;
   setLinksOnly(on: boolean): void;
@@ -87,8 +84,8 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
   // `#129 message-search`. The glass is a toggle, and the second tap is the way out: a control that
   // only ever opens leaves the reader looking for a close button that is not on a phone keyboard.
   listen(el("search-toggle"), "click", () => deps.setSearchOpen(!deps.searchOpen()));
-  // `#206 pin-message`. A toggle, like the glass beside it.
-  listen(el("pinned-filter"), "click", () => deps.setPinnedOnly(!deps.pinnedOnly()));
+  // `#1853`: the Labels drop-down beside the glass owns Pinned now
+  // (`createLabelsFilter`); this mount keeps the glass and the other toggles.
   // `#211 link-filter`. The same, for links.
   listen(el("links-filter"), "click", () => deps.setLinksOnly(!deps.linksOnly()));
   // `#251 author-filter`. Everyone, Mine, Theirs, in turn.
