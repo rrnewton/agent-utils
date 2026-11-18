@@ -1664,6 +1664,8 @@ let mainDraftOffer = /** @type {import("../core/outbox/index.ts").SyncedDraft | 
 let discussDraftOffer = /** @type {import("../core/outbox/index.ts").SyncedDraft | null} */ (null);
 let discussDraftKey = /** @type {import("../core/outbox/index.ts").SyncedDraftKey | null} */ (null);
 
+let lastOfferFetch = { id: "", at: 0 };
+
 /** Fetch the channel's synced drafts and offer the one for `key`, if any. */
 async function offerSyncedDraft(key, box, offerBar, offerText, remember, attempts = 40) {
   if (!key.channel) return;
@@ -1677,6 +1679,12 @@ async function offerSyncedDraft(key, box, offerBar, offerText, remember, attempt
     }
     return;
   }
+  // A restore for a scope just fetched asks nothing again: the composer is
+  // restored on view changes that have nothing to do with drafts, and each
+  // needless read keeps the page's status alive a little longer.
+  const fetchId = `${key.channel}\n${key.thread}\n${key.scope}`;
+  if (lastOfferFetch.id === fetchId && Date.now() - lastOfferFetch.at < 60_000) return;
+  lastOfferFetch = { id: fetchId, at: Date.now() };
   let drafts;
   try {
     drafts = await draftSync.fetchChannel(key.channel);
