@@ -425,6 +425,7 @@ impl FakeDiscord {
             spoken_content: String::new(),
             content_html: String::new(),
             noise: false,
+            labels: Vec::new(),
             // Seeding an ordinary message. `seed_reply` is how a fixture makes one that answers
             // another, and it is a separate call so that "this is a reply" is always something a
             // test said out loud rather than something it inherited.

@@ -26,6 +26,7 @@ export type SearchNode =
   | { readonly kind: "in"; readonly place: "thread" | "main" }
   | { readonly kind: "before" | "after"; readonly day: SearchDay }
   | { readonly kind: "has" }
+  | { readonly kind: "label"; readonly slug: string }
   | { readonly kind: "not"; readonly child: SearchNode }
   | { readonly kind: "and" | "or"; readonly children: readonly SearchNode[] };
 
@@ -40,6 +41,8 @@ export interface SearchSubject {
   readonly createdMs: number;
   readonly inThread: boolean;
   readonly hasLink: boolean;
+  /** Its hashtag labels, folded (`#1825`). */
+  readonly labels: readonly string[];
 }
 
 /** What `searchSubject` folds: each part of a message the haystack is made of. */
@@ -50,6 +53,7 @@ export interface SearchSubjectInput {
   readonly links?: readonly string[];
   readonly createdMs?: number;
   readonly inThread?: boolean;
+  readonly labels?: readonly string[];
 }
 
 /** Why some alternative of a query needs a scan of what the server holds, if any does. */
@@ -138,7 +142,7 @@ function searchField(raw: string, chars: readonly string[], cursor: { at: number
   const colon = raw.indexOf(":");
   if (colon < 0) return null;
   const name = raw.slice(0, colon).replace(/[A-Z]/g, (letter) => letter.toLowerCase());
-  if (!["from", "in", "before", "after", "has"].includes(name)) return null;
+  if (!["from", "in", "before", "after", "has", "label"].includes(name)) return null;
   let value = raw.slice(colon + 1);
   let afterPhrase: number | null = null;
   if (value === "" && mayTakePhrase && chars[cursor.at] === "\"") {
@@ -155,6 +159,9 @@ function searchField(raw: string, chars: readonly string[], cursor: { at: number
     if (place === "thread" || place === "main") node = { kind: "in", place };
   } else if (name === "has") {
     if (searchFoldedValue(value) === "link") node = { kind: "has" };
+  } else if (name === "label") {
+    const slug = searchFoldedValue(value);
+    if (slug) node = { kind: "label", slug };
   } else {
     const day = searchDay(value);
     if (day) node = { kind: name as "before" | "after", day };
@@ -297,6 +304,8 @@ export function searchQueryTree(node: SearchNode | null): SearchTree | null {
       return [node.kind, searchDayText(node.day)];
     case "has":
       return ["has", "link"];
+    case "label":
+      return ["label", node.slug];
     case "not":
       return ["not", searchQueryTree(node.child)];
     default:
@@ -325,6 +334,8 @@ export function searchQueryMatches(node: SearchNode | null, subject: SearchSubje
       return subject.createdMs >= dayStartMs(node.day);
     case "has":
       return subject.hasLink;
+    case "label":
+      return subject.labels.includes(node.slug);
     case "not":
       return !searchQueryMatches(node.child, subject, dayStartMs);
     case "and":
@@ -335,7 +346,7 @@ export function searchQueryMatches(node: SearchNode | null, subject: SearchSubje
 }
 
 /** A message, folded once for matching: the haystack is the author, the drawn text and each link address, one a line. */
-export function searchSubject({ author = "", authorId = "", text = "", links = [], createdMs = 0, inThread = false }: SearchSubjectInput): SearchSubject {
+export function searchSubject({ author = "", authorId = "", text = "", links = [], createdMs = 0, inThread = false, labels = [] }: SearchSubjectInput): SearchSubject {
   return {
     text: searchFold([author, text, ...links].join("\n")),
     author: searchFold(author),
@@ -343,6 +354,7 @@ export function searchSubject({ author = "", authorId = "", text = "", links = [
     createdMs,
     inThread,
     hasLink: links.length > 0,
+    labels: labels.map((label) => searchFold(label)),
   };
 }
 

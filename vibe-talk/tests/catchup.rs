@@ -52,6 +52,7 @@ fn message(seq: i64, thread: Option<(&str, bool)>, noise: bool) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise,
+        labels: Vec::new(),
         thread: thread.map(|(thread_id, is_root)| vibe_talk::threads::MessageThread {
             class: None,
             hue: None,

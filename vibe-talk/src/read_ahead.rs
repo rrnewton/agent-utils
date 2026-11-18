@@ -709,6 +709,7 @@ mod tests {
             spoken_content: String::new(),
             content_html: String::new(),
             noise: false,
+            labels: Vec::new(),
             thread: thread.map(|id| MessageThread {
                 class: None,
                 hue: None,

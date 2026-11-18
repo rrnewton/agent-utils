@@ -36,6 +36,7 @@ fn message(id: &str, thread: &str, root: bool, minutes: u64) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         thread: Some(MessageThread {
             class: None,
             hue: None,

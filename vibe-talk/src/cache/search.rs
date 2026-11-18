@@ -428,7 +428,9 @@ pub(crate) fn test_rows(
             created_ms,
             row.in_thread,
             row.search_text.contains("http://") || row.search_text.contains("https://"),
-        );
+        )
+        // `#1825`: labels derived from the cached text, as they are at serve time.
+        .with_labels(&crate::labels::extract_hashtags(&message.content));
         if request.query.matches(&subject, request.day_start_ms) {
             outcome.hits.push(row.message);
         }

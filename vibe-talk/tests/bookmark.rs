@@ -51,6 +51,7 @@ fn message(id: &str) -> Message {
         op_key: None,
         observed_ms: None,
         noise: false,
+        labels: Vec::new(),
         reactions: None,
     }
 }

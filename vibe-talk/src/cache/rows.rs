@@ -243,6 +243,7 @@ pub(crate) fn reconstruct(
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         reactions: extra.reactions,
         heading: None,
         mentions: extra.mentions,

@@ -305,6 +305,7 @@ async fn a_gap_a_suspect_channel_and_a_blocked_one_each_miss() {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         reactions: None,
         heading: None,
     };

@@ -416,6 +416,7 @@ async fn a_channel_whose_messages_come_back_blank_warns_about_the_message_conten
                 spoken_content: String::new(),
                 content_html: String::new(),
                 noise: false,
+                labels: Vec::new(),
                 reactions: None,
                 heading: None,
                 mentions: Vec::new(),

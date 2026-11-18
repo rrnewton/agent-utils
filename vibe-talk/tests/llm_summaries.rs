@@ -282,6 +282,7 @@ fn message(id: &str, content: &str) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         reactions: None,
         heading: None,
         mentions: Vec::new(),

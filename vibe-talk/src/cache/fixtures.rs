@@ -29,6 +29,7 @@ pub(crate) fn message(id: &str, author: &str, content: &str, created_ms: i64) ->
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         reactions: None,
         heading: None,
         mentions: Vec::new(),

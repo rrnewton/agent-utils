@@ -909,6 +909,7 @@ mod tests {
             spoken_content: String::new(),
             content_html: String::new(),
             noise: false,
+            labels: Vec::new(),
             thread: thread.map(|(id, is_root)| MessageThread {
                 class: None,
                 hue: None,

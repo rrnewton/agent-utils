@@ -254,6 +254,14 @@ pub struct Message {
     /// and it is the server's. Absent means `false`, which is also what an older server meant.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub noise: bool,
+    /// The hashtag labels of this message (`#1825 vibe-talk-hashtag-labels`), derived by
+    /// [`crate::labels::extract_hashtags`] from `content` EVERY TIME the message is served
+    /// (in [`crate::ops::stamp`], as `noise` is decided) — never stored and never trusted
+    /// from whoever sent the message, so an edit updates the labels with the text. Bare
+    /// slugs (`kvm`); auto-generated topics will carry an `auto:` prefix when they exist.
+    /// EMPTY means the text holds no hashtag. Absent from an older server means the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     /// The emoji people reacted to this message with, and how many of each. `#219
     /// emoji-reactions`.
     ///
@@ -625,6 +633,7 @@ mod tests {
             spoken_content: String::new(),
             content_html: String::new(),
             noise: false,
+            labels: Vec::new(),
             reactions: None,
             heading: None,
             mentions: Vec::new(),

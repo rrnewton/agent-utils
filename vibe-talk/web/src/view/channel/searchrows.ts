@@ -216,6 +216,8 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         links: deps.messageLinks(message).map((link) => String(link.href)),
         createdMs: Date.parse(String((message as { timestamp?: unknown }).timestamp)) || 0,
         inThread: Boolean((message as { thread?: { is_root?: boolean } }).thread && (message as { thread?: { is_root?: boolean } }).thread?.is_root === false),
+        // `#1825`: the labels the server derived and served with the message.
+        labels: ((message as { labels?: unknown }).labels as string[] | undefined) || [],
       } as never);
       subjectByMessage.set(message, subject);
     }

@@ -56,6 +56,7 @@ fn thread_message(id: &str, n: i64, content: &str) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         thread: Some(MessageThread {
             class: None,
             hue: None,

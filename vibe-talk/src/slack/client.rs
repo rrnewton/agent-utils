@@ -1267,6 +1267,7 @@ impl Raw {
             spoken_content: String::new(),
             content_html: String::new(),
             noise: false,
+            labels: Vec::new(),
             // Absent stays absent: Slack omits the field on a message nobody reacted to, and a
             // bridge that cannot supply reactions omits it on every message. `#312
             // slack-reactions`; see `super::reactions`.

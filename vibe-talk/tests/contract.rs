@@ -86,6 +86,7 @@ fn message(id: &str) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         reactions: None,
         heading: None,
         mentions: Vec::new(),
@@ -119,6 +120,7 @@ fn threaded_message(id: &str) -> Message {
         // `#196 auto-read-noise`: present on one sample and absent on the other, so the
         // generated validators are proven against both.
         noise: true,
+        labels: Vec::new(),
         // `#217 markdown-blocks`, the same way.
         content_html: "<p><em>hello</em></p>\n".into(),
         // `#219 emoji-reactions`: a standard emoji and a custom one here, none on the plain

@@ -8,7 +8,7 @@
 //!
 //! **Settled by the owner (2026-10-27):** Gmail's syntax as the base (implicit AND, upper-case
 //! `OR`, `-term`, `"phrase"`, parentheses) plus the field operators the chat services share
-//! (`from:`, `in:`, `before:`, `after:`, `has:`), over OUR matching: a term matches a message when
+//! (`from:`, `in:`, `before:`, `after:`, `has:`, `label:`), over OUR matching: a term matches a message when
 //! its folded text is a SUBSTRING of the message's folded text, so matching is case- and
 //! accent-insensitive and finds a term inside a word (`coord` finds "coordinator", `andoff` finds
 //! "handoff"). Upstream search services match words (Slack's, measured, whole words and their
@@ -71,6 +71,7 @@
 //!   `after:D` one created at or after it (Gmail's reading: `after:` includes its day, `before:`
 //!   does not). The caller resolves days, because only it knows the zone.
 //! - `has:link` matches a message with a link.
+//! - `label:x` matches a message whose derived hashtag labels (`#1825`) include `x`, folded.
 //! - A query that is only negations matches everything they do not exclude; an empty query (no
 //!   term at all) is no search, and [`Query::is_empty`] says so.
 //!
@@ -300,6 +301,8 @@ pub enum Node {
     After(Day),
     /// `has:link`.
     HasLink,
+    /// `label:<slug>`: the message carries this hashtag label, folded (`#1825`).
+    Label(String),
     /// `-x`.
     Not(Box<Node>),
     /// Every child.
@@ -322,6 +325,7 @@ impl Node {
             Self::Before(day) => json!(["before", day.to_string()]),
             Self::After(day) => json!(["after", day.to_string()]),
             Self::HasLink => json!(["has", "link"]),
+            Self::Label(slug) => json!(["label", slug]),
             Self::Not(inner) => json!(["not", inner.to_json()]),
             Self::And(children) | Self::Or(children) => {
                 let mut list = vec![json!(if matches!(self, Self::And(_)) {
@@ -351,6 +355,8 @@ pub struct Subject {
     pub in_thread: bool,
     /// Whether it has a link.
     pub has_link: bool,
+    /// Its hashtag labels, folded (`#1825`). Empty until [`Subject::with_labels`].
+    pub labels: Vec<String>,
 }
 
 impl Subject {
@@ -372,7 +378,15 @@ impl Subject {
             created_ms,
             in_thread,
             has_link,
+            labels: Vec::new(),
         }
+    }
+
+    /// Attach the message's hashtag labels (raw slugs; folded here, `#1825`).
+    #[must_use]
+    pub fn with_labels(mut self, labels: &[String]) -> Self {
+        self.labels = labels.iter().map(|label| fold(label)).collect();
+        self
     }
 }
 
@@ -449,6 +463,7 @@ fn node_matches(node: &Node, subject: &Subject, day_start_ms: &dyn Fn(Day) -> i6
         Node::Before(day) => subject.created_ms < day_start_ms(*day),
         Node::After(day) => subject.created_ms >= day_start_ms(*day),
         Node::HasLink => subject.has_link,
+        Node::Label(slug) => subject.labels.iter().any(|label| label == slug),
         Node::Not(inner) => !node_matches(inner, subject, day_start_ms),
         Node::And(children) => children
             .iter()
@@ -556,7 +571,7 @@ fn folded_value(text: &str) -> String {
 fn field(raw: &str, chars: &[char], i: &mut usize, may_take_phrase: bool) -> Option<Node> {
     let (name, value) = raw.split_once(':')?;
     let name = name.to_ascii_lowercase();
-    if !matches!(name.as_str(), "from" | "in" | "before" | "after" | "has") {
+    if !matches!(name.as_str(), "from" | "in" | "before" | "after" | "has" | "label") {
         return None;
     }
     let mut value = value.to_owned();
@@ -580,6 +595,10 @@ fn field(raw: &str, chars: &[char], i: &mut usize, may_take_phrase: bool) -> Opt
             _ => None,
         },
         "has" => (folded_value(&value) == "link").then_some(Node::HasLink),
+        "label" => {
+            let slug = folded_value(&value);
+            (!slug.is_empty()).then(|| Node::Label(slug))
+        }
         "before" => Day::parse(&value).map(Node::Before),
         _ => Day::parse(&value).map(Node::After),
     }?;
@@ -878,6 +897,14 @@ mod tests {
                 .parse::<jiff::Timestamp>()
                 .expect("created is RFC 3339")
                 .as_millisecond();
+            let msg_labels: Vec<String> = message["labels"]
+                .as_array()
+                .map(|l| {
+                    l.iter()
+                        .filter_map(|h| h.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
             let subject = Subject::new(
                 &haystack(author, message["text"].as_str().unwrap_or(""), &hrefs),
                 author,
@@ -885,7 +912,8 @@ mod tests {
                 created_ms,
                 message["in_thread"].as_bool().unwrap_or(false),
                 !hrefs.is_empty(),
-            );
+            )
+            .with_labels(&msg_labels);
             let query = parse(case["query"].as_str().expect("query"));
             let got = query.matches(&subject, &|day| day.start_ms_at_offset(offset));
             assert_eq!(got, case["matches"].as_bool().expect("matches"), "{case}");

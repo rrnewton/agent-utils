@@ -59,6 +59,7 @@ fn message(channel: &str, at_ms: i64, text: &str) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         reactions: None,
         heading: None,
     }

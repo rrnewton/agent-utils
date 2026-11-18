@@ -2479,6 +2479,34 @@ impl MessageCache {
         })
     }
 
+    /// Every hashtag label the cache holds of `chan` in `view`, with how many messages
+    /// carry it (`#1825 vibe-talk-hashtag-labels`). Derived from the held texts in one
+    /// scan, like a search with no term; bounded by `budget` rows so a huge cache
+    /// cannot make the Settings browse unbounded. Counts cover the held copy only —
+    /// the page says "in loaded history", never all-time.
+    #[must_use]
+    pub fn label_counts(
+        &self,
+        chan: &ChanKey,
+        view: search::SearchView,
+        budget: usize,
+    ) -> Read<std::collections::BTreeMap<String, usize>> {
+        let scope_key = view.horizon_scope().key();
+        self.read_scope(chan, &scope_key, |connection| {
+            let snapshot = connection.unchecked_transaction()?;
+            let (rows, _more) =
+                reader::search_rows(&snapshot, chan, view.scope_sql(), i64::MAX, budget)?;
+            snapshot.finish()?;
+            let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+            for row in &rows {
+                for label in crate::labels::extract_hashtags(&row.message.message.content) {
+                    *counts.entry(label).or_insert(0) += 1;
+                }
+            }
+            Ok(counts)
+        })
+    }
+
     /// The replies of one thread, oldest first, when the copy held is the thread `root` (just read
     /// upstream) describes, and its claims were listed within `fresh_ms` and after the latest
     /// offer dropped for the channel, this process's or one the file records: see [`held`].

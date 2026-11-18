@@ -1739,6 +1739,7 @@ async fn the_message_cache_switch_logs_numbers_and_never_an_id_or_a_word_it_held
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         reactions: None,
         heading: None,
     };

@@ -55,6 +55,7 @@ fn message(id: &str, thread: Option<&str>) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         thread: thread.map(|thread| MessageThread {
             class: None,
             hue: None,

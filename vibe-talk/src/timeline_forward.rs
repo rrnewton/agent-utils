@@ -583,6 +583,7 @@ mod tests {
             content_html: String::new(),
             thread: None,
             noise: false,
+            labels: Vec::new(),
             reactions: None,
             heading: None,
             mentions: Vec::new(),

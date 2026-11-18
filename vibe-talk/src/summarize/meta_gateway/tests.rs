@@ -158,6 +158,7 @@ fn message(content: &str) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise: false,
+        labels: Vec::new(),
         timestamp: "2026-01-01T00:00:00Z".to_owned(),
         spoken_time: "midnight".to_owned(),
         reply_to: None,
