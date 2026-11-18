@@ -10712,6 +10712,47 @@ def _load_archive(
     return _load_archive_snapshot(config, selected) if states is None else states[1]
 
 
+def _log_active_revision(
+    config: Config, machine: str, event_writer: _EventWriter | None
+) -> int | None:
+    """The active revision the event log currently ends at, read cheaply (#1807).
+
+    With a positioned writer, the log's tip sequence is already known, so
+    event files are read by number from the tip backwards to the newest
+    active-state-recorded or state-imported event: no log load, no log
+    listing, and in practice one file, since active writes are the events
+    that move the revision. Without a writer, the log is replayed as the
+    ordinary previous-state load would replay it. Returns None when the
+    log holds no active revision (an empty or missing log); the caller
+    then judges by the snapshot, which is the only state there is.
+    """
+
+    if event_writer is not None and event_writer.sequence:
+        sequence = event_writer.sequence
+        while sequence >= 1:
+            path = event_writer.directory / f"{sequence:020d}.json"
+            try:
+                raw = _as_mapping(_read_json(path, "append-only event"), "append-only event")
+            except StateError:
+                return None
+            payload = raw.get("payload")
+            if isinstance(payload, Mapping):
+                if raw.get("kind") == "active-state-recorded":
+                    revision = payload.get("revision")
+                    if isinstance(revision, int):
+                        return revision
+                elif raw.get("kind") == "state-imported":
+                    active = payload.get("active")
+                    if isinstance(active, Mapping):
+                        revision = active.get("revision")
+                        if isinstance(revision, int):
+                            return revision
+            sequence -= 1
+        return None
+    derived = _states_from_events(config, machine, require_repository=False)
+    return None if derived is None else derived[0].revision
+
+
 def _write_active_state(
     config: Config,
     state: ActiveState,
@@ -10745,17 +10786,15 @@ def _write_active_state(
         # Defence in depth (#1807): a passed ``previous`` must be the state
         # the log currently ends at, never a stale whole-registry snapshot
         # taken before another slot's event landed. Refuse before anything
-        # is appended, and never write ACTIVE from the stale state.
-        derived = _states_from_events(
-            config, state.machine, require_repository=require_repository
-        )
-        current_revision = (
-            _load_active_snapshot(
+        # is appended, and never write ACTIVE from the stale state. The
+        # comparison is against the log's ended revision only, read
+        # cheaply from its tip (see _log_active_revision), so a
+        # prevalidated create or adopt still loads no log under its lock.
+        current_revision = _log_active_revision(config, state.machine, event_writer)
+        if current_revision is None:
+            current_revision = _load_active_snapshot(
                 config, state.machine, require_repository=require_repository
             ).revision
-            if derived is None
-            else derived[0].revision
-        )
         if previous.revision != current_revision:
             raise StateError(
                 f"active state for slot {slot} cannot be recorded from stale "
