@@ -92,7 +92,17 @@ def assert_bar(page: Page, label: str, pane: bool) -> None:
 
 def walk(page: Page, base: str, label: str, doc_key: str) -> None:
     page.goto(base + "/", wait_until="load")
+    # `#1781`: a token-seeded first run meets the Welcome; dismiss it, then to the call view.
+    try:
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+        if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+            page.click("#welcome-start")
+    except Exception:
+        pass
     page.wait_for_selector("#screen-main:not([hidden])", timeout=20_000)
+    page.click("#view-switch")
+    page.click("#view-switch")
+    page.wait_for_selector("#pane-voice:not([hidden])", timeout=20_000)
     assert_bar(page, f"{label} call view", pane=True)
     page.click("#view-switch")
     page.wait_for_selector("#pane-discord:not([hidden])", timeout=20_000)

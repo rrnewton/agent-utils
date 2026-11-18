@@ -209,8 +209,9 @@ def sign_in(desk: Desk) -> None:
     desk.page.fill("#api-token", fixture.TOKEN)
     desk.page.click("#save-token")
     try:
-        desk.page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
-        desk.page.click("#welcome-start")
+        desk.page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+        if desk.page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+            desk.page.click("#welcome-start")
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     desk.page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)

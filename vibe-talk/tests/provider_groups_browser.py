@@ -176,8 +176,9 @@ def sign_in(page: Page, url: str) -> None:
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     try:
-        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
-        page.click("#welcome-start")
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+        if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+            page.click("#welcome-start")
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)

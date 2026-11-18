@@ -296,8 +296,9 @@ class Desk:
         self.page.fill("#api-token", TOKEN)
         self.page.click("#save-token")
         try:
-            self.page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
-            self.page.click("#welcome-start")
+            self.page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+            if self.page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+                self.page.click("#welcome-start")
         except Exception:
             pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
         self.page.wait_for_selector("#open-settings", state="visible", timeout=10_000)

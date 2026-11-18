@@ -180,12 +180,13 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.fill("#api-token", TOKEN)
             page.click("#save-token")
             try:
-                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
-                page.click("#welcome-start")
+                page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+                if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+                    page.click("#welcome-start")
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel, open in All.
             reader.desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24",
                                  "the channel did not open in All")
             reader.desk.settled()
@@ -466,8 +467,9 @@ def deep_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                     page.fill("#api-token", TOKEN)
                     page.click("#save-token")
                     try:
-                        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
-                        page.click("#welcome-start")
+                        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+                        if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+                            page.click("#welcome-start")
                     except Exception:
                         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
                     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
@@ -513,8 +515,9 @@ def deep_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 page2.fill("#api-token", TOKEN)
                 page2.click("#save-token")
                 try:
-                    page2.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
-                    page2.click("#welcome-start")
+                    page2.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+                    if page2.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+                        page2.click("#welcome-start")
                 except Exception:
                     pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
                 page2.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
