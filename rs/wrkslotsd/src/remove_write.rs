@@ -4303,7 +4303,6 @@ fn retire_handoff_sidecar(
 /// One removal validated and planned with no mutation locks held (#1287).
 struct PreparedRemove {
     record: Value,
-    events: Vec<Value>,
     salvage: Vec<Value>,
     answer_state: String,
     answer_detail: String,
@@ -4520,7 +4519,6 @@ fn prepare_remove(
         .to_string();
     Ok(PreparedRemove {
         record,
-        events,
         salvage,
         answer_state: answer.state,
         answer_detail: answer.detail,
