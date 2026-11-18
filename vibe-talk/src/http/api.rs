@@ -3785,7 +3785,7 @@ pub async fn catchup_followup(
         .provider
         .clone()
         .unwrap_or_else(|| "discord".to_owned());
-    let (text, _cited) = crate::catchup::shape_answer(&raw, &sent, |id| {
+    let cite = |id: &crate::model::MessageId| {
         let message = by_id.get(id.as_str())?;
         let time = if message.spoken_time.is_empty() {
             message.timestamp.clone()
@@ -3805,10 +3805,24 @@ pub async fn catchup_followup(
             message.thread.as_ref().map(|thread| thread.id.as_str()),
         );
         Some((time, address, true))
-    });
-    let text_html = crate::render::body_html(
+    };
+    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &sent, &cite);
+    // As the summary's render (`#1392`): the citation addresses this answer
+    // itself built are trusted, so a "find the message" answer links the
+    // message it found. `#1844`: a follow-up used the channel render, whose
+    // sanitizer strips every relative href, and citations stood as bare text.
+    let trusted: std::collections::HashSet<String> = cited_ids
+        .iter()
+        .filter_map(|id| {
+            cite(id).map(|(_, address, in_scope)| {
+                crate::catchup::trusted_cite_address(&address, in_scope)
+            })
+        })
+        .collect();
+    let text_html = crate::render::body_html_catchup(
         &text,
         crate::render::markup_for(&state.config, &fetched.channel),
+        &trusted,
     );
     let now = crate::store::now_ms();
     let you = crate::contract::DiscussTurn {

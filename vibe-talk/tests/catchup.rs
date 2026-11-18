@@ -1245,12 +1245,10 @@ async fn a_followup_with_the_pages_exact_request_answers_and_cites_the_found_mes
         !answer.contains("[m:"),
         "no raw citation token is printed: {answer}"
     );
+    let agent_html = body["agent"]["text_html"].as_str().expect("agent html");
     assert!(
-        body["agent"]["text_html"]
-            .as_str()
-            .expect("agent html")
-            .contains(&found_id),
-        "{body}"
+        agent_html.contains("href=") && agent_html.contains(&found_id),
+        "the found message is not linked in the rendered answer: {agent_html}"
     );
     // Both turns joined the record, and exactly one extra model call was spent.
     let (status, record) = get(&app, &format!("{channel_path}/record"), WRITE_TOKEN).await;
