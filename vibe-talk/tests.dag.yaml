@@ -2773,6 +2773,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1818 vibe-talk-thread-drill-in-keeps-anchor` in the browser engine, at 412x915 by touch and
+  # 1280x800 with a mouse: a reply scrolled to a measured offset in All opens its thread at that
+  # offset (within a few px), a row above it growing 120px late is corrected back by the
+  # ResizeObserver keeper, Back returns the reply to its place in All, and the thread's root at
+  # the head of Main opens its thread where it stood.
+  - group: check
+    job: thread-drill-anchor-browser
+    desc: drilling into a thread keeps the clicked message at the same viewport offset, through late layout and Back, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/thread_drill_anchor_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 7
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#1557 discord-split-merge-regression` in the browser engine, at 390x844 by touch and 1280x800
   # with a mouse, in Main: a Discord post the plugin split at the 2,000-char cap (three chunks a
   # second apart, only the first answering the prompt, each an unanswered potential root) is one

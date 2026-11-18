@@ -12,6 +12,16 @@ import { REPLY_LANDING_GAP_PX } from "./replyarrows.ts";
 import { expandLandedRow } from "./fold.ts";
 import type { GestureStart } from "./sidecontrols.ts";
 
+/**
+ * A drill-in anchor measured on the message clicked in the channel (`#1818
+ * vibe-talk-thread-drill-in-keeps-anchor`): that message's id, and its top
+ * relative to the scroll container (`row top - scroll-area top`) at the click.
+ */
+export interface DrillAnchor {
+  id: string;
+  top: number;
+}
+
 /** A column's own record of entering a view (`freshEntryState`). */
 export interface EntryState {
   threadOwed: string | null;
@@ -19,11 +29,13 @@ export interface EntryState {
   readOwed: string | null;
   landing: { key: string; row: HTMLElement; first: HTMLElement; at: number } | null;
   backGesture: GestureStart | null;
+  /** The drill-in anchor owed by this entry, with the thread it was measured for, or null. */
+  drill: (DrillAnchor & { thread: string }) | null;
 }
 
 /** A fresh record of entering a view (`freshEntryState`). */
 export function freshEntryState(): EntryState {
-  return { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null };
+  return { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null };
 }
 
 /** The landing a read is about to rebuild the rows under (`entryLandingMark`). */
@@ -111,12 +123,133 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
    */
   const ENTRY_ROOT_ROOM = 0.5;
 
+  // --- the drill-in anchor (`#1818 vibe-talk-thread-drill-in-keeps-anchor`) -------------------------
+  //
+  // The owner (thread 158, 2026-11-17): "when I have the message X on screen and I click to the
+  // thread containing it, I want X to still be on screen. IDEALLY we would be able to place X at
+  // the SAME place on the screen so that what is above/below changes but not it." So a drill-in
+  // from X's Thread(n) button measures X's top against the scroll container before navigating
+  // (`drillAnchorFor` in threadlist.ts) and this entry puts X back at that offset once the thread
+  // is drawn, in place of the first-unread landing: the reader clicked that message, and keeping
+  // it still outranks landing on a different one. If X is the root, the root is the anchor, as
+  // its id is what was measured. The anchor is then kept through late layout — an image loading
+  // above X, a summary settling above it — by a ResizeObserver (never a timer), until the reader
+  // scrolls, leaves the thread, or enters another view. Back keeps what it does today: leaving
+  // the thread clears the anchor and the held view restores as before.
+
+  /** The live keeper of a placed drill anchor: its entry, its measure, and where it left the list. */
+  interface DrillKeeper {
+    entry: EntryState;
+    drill: DrillAnchor & { thread: string };
+    at: number;
+    resize: ResizeObserver | null;
+    mutation: MutationObserver | null;
+  }
+
+  let drillKeeper: DrillKeeper | null = null;
+
+  function stopDrillKeeper(): void {
+    if (drillKeeper?.resize) drillKeeper.resize.disconnect();
+    if (drillKeeper?.mutation) drillKeeper.mutation.disconnect();
+    drillKeeper = null;
+  }
+
+  /** The drawn row standing for message `id` in the thread's list, or null while it is not drawn. */
+  function drillRow(id: string): HTMLElement | null {
+    const rows = [...deps.el("discord-log").children] as HTMLElement[];
+    const found = rows.find((candidate) => idsOf(candidate).includes(id));
+    if (!found) return null;
+    const row = shownRowFor(found);
+    return row && !row.hidden ? row : null;
+  }
+
+  /** Put the anchor message back at its measured offset. False while its row is not drawn. */
+  function placeDrillAnchor(drill: DrillAnchor & { thread: string }): boolean {
+    const row = drillRow(drill.id);
+    if (!row) return false;
+    const area = deps.el("scroll-area");
+    const delta = row.getBoundingClientRect().top - area.getBoundingClientRect().top - drill.top;
+    if (Math.abs(delta) > 0.5) deps.nudge(area, delta);
+    deps.renderScrollTools();
+    return true;
+  }
+
+  /**
+   * Keep a placed anchor at its offset through late layout: every resize of the list's rows (an
+   * image loading above it), of the summary seam above the list, or of the list's own rows coming
+   * and going re-places it. The keeper lets go the moment its entry's anchor is no longer the one
+   * measured, the reader scrolls away from where it left the list, or the thread is left — and it
+   * never fires on a clock.
+   */
+  function keepDrillAnchor(drill: DrillAnchor & { thread: string }): void {
+    stopDrillKeeper();
+    const entry = entryState();
+    const area = deps.el("scroll-area");
+    const list = deps.el("discord-log");
+    const keeper: DrillKeeper = { entry, drill, at: area.scrollTop, resize: null, mutation: null };
+    drillKeeper = keeper;
+    const correct = (): void => {
+      if (drillKeeper !== keeper) return;
+      if (entry.drill !== drill) {
+        stopDrillKeeper();
+        return;
+      }
+      if (deps.activeEntry() !== entry) return;
+      if (deps.selection().view !== "thread" || String(deps.selection().threadId ?? "") !== drill.thread) {
+        stopDrillKeeper();
+        return;
+      }
+      if (Math.abs(area.scrollTop - keeper.at) > 1) {
+        stopDrillKeeper();
+        return;
+      }
+      if (keeper.resize) {
+        for (const child of [...list.children]) keeper.resize.observe(child as Element);
+      }
+      if (!placeDrillAnchor(drill)) return;
+      keeper.at = area.scrollTop;
+    };
+    if (typeof ResizeObserver === "function") {
+      keeper.resize = new ResizeObserver(correct);
+      keeper.resize.observe(list);
+      for (const child of [...list.children]) keeper.resize.observe(child as Element);
+      keeper.resize.observe(deps.el("channel-summary"));
+    }
+    if (typeof MutationObserver === "function") {
+      keeper.mutation = new MutationObserver(correct);
+      keeper.mutation.observe(list, { childList: true });
+    }
+  }
+
   /**
    * Land the thread just entered on its first unread message, once its rows are drawn. Called where a
    * thread's rows first appear: from what the page holds, or when the entering read lands. A read for
    * any other view, or a thread left before its read landed, owes nothing.
    */
   function payThreadEntry(): void {
+    // `#1818`: a drill-in anchor owed by this entry is paid before any first-unread landing, and
+    // while its row is still on its way (the entering read has not drawn it) nothing else lands:
+    // the reader is waiting on that message, not on the newest line the switch left them at.
+    const drill = entryState().drill;
+    if (drill) {
+      if (deps.selection().view !== "thread" || String(deps.selection().threadId ?? "") !== drill.thread) {
+        entryState().drill = null;
+        stopDrillKeeper();
+      } else if (placeDrillAnchor(drill)) {
+        entryState().threadOwed = null;
+        entryState().threadAwaitsRead = false;
+        keepDrillAnchor(drill);
+        deps.requestVisibleSummaries();
+        return;
+      } else if (!(deps.channelViewsHas(deps.viewKey()) && entryState().readOwed !== deps.channelContextKey())) {
+        return;
+      } else {
+        // The thread is fully held and still has no row for the clicked message: the anchor
+        // cannot be paid, so the entry lands as any other (`landOnFirstUnread` below).
+        entryState().drill = null;
+        stopDrillKeeper();
+      }
+    }
     if (entryState().threadOwed === null) return;
     if (entryState().threadOwed !== deps.channelContextKey() || deps.selection().view !== "thread") {
       entryState().threadOwed = null;

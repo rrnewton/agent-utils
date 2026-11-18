@@ -10,7 +10,7 @@
 import type { Message, ThreadSummary } from "../../contract/index.ts";
 import { createThreadHues } from "./hues.ts";
 import type { ThreadHues } from "./hues.ts";
-import type { EntryState } from "./threadentry.ts";
+import type { DrillAnchor, EntryState } from "./threadentry.ts";
 
 /** The selection of the channel on screen, as the views read and change it. */
 export interface ViewSelection {
@@ -193,7 +193,7 @@ export interface ChannelViews {
   channelCard(): HTMLElement | null;
   keepReaderPlace(place: ReaderPlaceResult): boolean;
   readBehindSwitch(): Promise<void>;
-  changeChannelView(view: string, threadId?: string | null, summary?: ThreadSummary | null, origin?: string | null, before?: ReaderPlaceResult | null): Promise<void>;
+  changeChannelView(view: string, threadId?: string | null, summary?: ThreadSummary | null, origin?: string | null, before?: ReaderPlaceResult | null, drill?: DrillAnchor | null): Promise<void>;
   inheritAllCover(view: string, threadId?: string | null, summary?: ThreadSummary | null): boolean;
   catchUpHeldView(words?: boolean): boolean;
   catchUpFromAll(): void;
@@ -537,7 +537,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
    * was before a change of layout that brings this switch, read before the layout drew that column at
    * another width (`leftColumnPlace`). Read here, after it, the place is not the one the reader had.
    */
-  async function changeChannelView(view: string, threadId: string | null = null, summary: ThreadSummary | null = null, origin: string | null = null, before: ReaderPlaceResult | null = null): Promise<void> {
+  async function changeChannelView(view: string, threadId: string | null = null, summary: ThreadSummary | null = null, origin: string | null = null, before: ReaderPlaceResult | null = null, drill: DrillAnchor | null = null): Promise<void> {
     deps.noteDeepLinkReaderMove();
     // `#277 reply-in-column`. The list a reply open in this column answers a message of is going.
     if (deps.replyDocked() && deps.activeColumn() === deps.replyColumn()) deps.putDockedReplyAway();
@@ -570,6 +570,10 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     // thread is laid out afresh, so runs of read messages opened on an earlier visit collapse again.
     deps.entryState().threadOwed = view === "thread" ? channelContextKey() : null;
     deps.entryState().threadAwaitsRead = false;
+    // `#1818 vibe-talk-thread-drill-in-keeps-anchor`: a drill-in from a message row carries that
+    // message's measured offset into this entry, for `payThreadEntry` to restore in the thread;
+    // any other switch owes no anchor, and Back from the thread is such a switch.
+    deps.entryState().drill = view === "thread" && drill ? { id: String(drill.id), top: drill.top, thread: String(threadId ?? "") } : null;
     // ...and a landing made on an earlier visit is spent: a view this page held comes back with the
     // rows it was made on, at the scroll position it left, and must not hold the reader there again.
     deps.entryState().landing = null;

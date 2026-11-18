@@ -39,7 +39,7 @@ export interface ThreadListDependencies {
   layoutFit(): boolean;
   layoutColumns(): boolean;
   layoutThreadList(): boolean;
-  changeChannelView(view: string, id?: string, summary?: unknown): unknown;
+  changeChannelView(view: string, id?: string, summary?: unknown, origin?: string | null, before?: unknown, drill?: { id: string; top: number } | null): unknown;
   defaultChannelView(): string;
   chooseView(view: string): void;
   openThreadFromList(id: string, summary: unknown): unknown;
@@ -108,7 +108,7 @@ export interface ThreadList {
   renderThreadHeading(): unknown;
   onThreadSelect(): unknown;
   refreshThreadDirectory(): Promise<void>;
-  openThread(id: unknown, summary?: unknown): unknown;
+  openThread(id: unknown, summary?: unknown, drill?: { id: string; top: number } | null): unknown;
   closeThread(): unknown;
   olderThreadsToRead(): boolean;
   loadOlderThreads(): Promise<void>;
@@ -629,11 +629,24 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     }
   }
 
-  function openThread(id: unknown, summary: unknown = null): unknown {
+  /**
+   * The drill-in anchor of the message on `row`, measured before navigating (`#1818
+   * vibe-talk-thread-drill-in-keeps-anchor`): its id, and its top relative to the scroll
+   * container. If the message is the thread's root, its id is the root's, and the root is
+   * what the thread anchors. Only a drill-in from a message row measures one; the picker,
+   * the cards and the unread chip (which promises the first unread reply) open a thread
+   * with no anchor and land as they always have.
+   */
+  function drillAnchorFor(row: HTMLElement, message: Message): { id: string; top: number } {
+    const area = deps.byId("scroll-area");
+    return { id: String(message.id), top: row.getBoundingClientRect().top - area.getBoundingClientRect().top };
+  }
+
+  function openThread(id: unknown, summary: unknown = null, drill: { id: string; top: number } | null = null): unknown {
     if (!deps.threading() || !id) return;
     if (deps.layoutColumns()) return deps.selectSideThread(String(id), summary);
     if (deps.layoutThreadList()) return deps.openThreadFromList(String(id), summary);
-    return deps.changeChannelView("thread", String(id), summary);
+    return deps.changeChannelView("thread", String(id), summary, null, null, drill);
   }
 
   function closeThread(): unknown {
@@ -763,7 +776,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     deps.paintThreadBadge(badge, id, replies, deps.unansweredRoot(message, replies, 0, null));
     badge.addEventListener("click", deps.inThisColumn(() => deps.guardQuietly(() => {
       if (row.hasAttribute("data-main-row")) return deps.openReplyFromRow(row);
-      return badge.getAttribute("data-thread-state") === "start" ? deps.startThread(id) : openThread(id);
+      return badge.getAttribute("data-thread-state") === "start" ? deps.startThread(id) : openThread(id, null, drillAnchorFor(row, message));
     })()));
     deps.sayRowShortcut(badge, "thread-badge");
     meta.append(badge);

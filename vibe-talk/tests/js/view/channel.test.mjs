@@ -2342,7 +2342,7 @@ test("`#624 voice-page-modularity`: a sent reply marks what it answers Done on t
 
 test("`#624 voice-page-modularity`: entering a thread lands on its first unread message, opened, and a thread with nothing unread is left where it was", () => {
   const { createThreadEntry, freshEntryState } = CHANNEL_VIEW;
-  assert.deepStrictEqual(freshEntryState(), { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null });
+  assert.deepStrictEqual(freshEntryState(), { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null });
   const record = freshEntryState();
   const log = [];
   const rows = [];
@@ -2381,6 +2381,56 @@ test("`#624 voice-page-modularity`: entering a thread lands on its first unread 
   rows.length = 0;
   rows.push(read);
   assert.equal(entry.landOnFirstUnread(), false, "a thread with nothing unread was landed somewhere");
+});
+
+test("`#1818 vibe-talk-thread-drill-in-keeps-anchor`: a drill-in anchor is restored at its measured offset instead of the first-unread landing", () => {
+  const { createThreadEntry, freshEntryState } = CHANNEL_VIEW;
+  const record = freshEntryState();
+  const log = [];
+  const rows = [];
+  const list = { children: rows };
+  const area = { scrollTop: 0, clientHeight: 100, getBoundingClientRect: () => ({ top: 0, bottom: 100 }) };
+  const entry = createThreadEntry({
+    el: (id) => (id === "discord-log" ? list : id === "scroll-area" ? area : id === "channel-summary" ? { hidden: true, getBoundingClientRect: () => ({ height: 0, top: 0, bottom: 0 }) } : { hidden: true, getBoundingClientRect: () => ({ height: 0, top: 0, bottom: 0 }) }),
+    activeEntry: () => record,
+    channelContextKey: () => "ctx",
+    selection: () => ({ view: "thread", threadId: "t1" }),
+    channelViewsHas: () => true,
+    viewKey: () => "thread:t1",
+    applyReadRuns: () => log.push("runs"),
+    atBottom: () => false,
+    renderScrollTools: () => log.push("tools"),
+    requestVisibleSummaries: () => log.push("summaries"),
+    floatingClearance: () => 0,
+    drawnTop: (row) => row.top,
+    openThreadRootId: () => null,
+    isOpenThreadRoot: () => false,
+    rowIsRead: (row) => row.read === true,
+    toFoot: () => log.push("foot"),
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; },
+    setJumpNewest: (wanted) => log.push(`jump:${wanted}`),
+    screen: () => "main",
+    view: () => "discord",
+    pinsView: () => ({ only: false }),
+  });
+  const row = (id, top, read) => ({ read, top, hidden: false, className: "", parentNode: list,
+    getAttribute: (name) => (name === "data-ids" ? id : name === "data-collapsed" ? "false" : null),
+    hasAttribute: () => false, getBoundingClientRect: () => ({ top, height: 20, bottom: top + 20 }) });
+  rows.push(row("m1", 10, true), row("m2", 90, true), row("m3", 130, false));
+  record.threadOwed = "ctx";
+  record.drill = { id: "m2", top: 40, thread: "t1" };
+  entry.payThreadEntry();
+  assert.equal(area.scrollTop, 50, "the anchor row was not put back at its measured offset (90 - 40)");
+  assert.equal(record.threadOwed, null, "the drill-in still owed a first-unread landing");
+  assert.equal(record.landing, null, "the drill-in made a first-unread landing");
+  assert.deepStrictEqual(log, ["tools", "summaries"], "the anchor was not drawn after");
+  // A drill owed for another thread is spent, and the entry lands as any other.
+  record.drill = { id: "m2", top: 40, thread: "other" };
+  record.threadOwed = "ctx";
+  area.scrollTop = 0;
+  log.length = 0;
+  entry.payThreadEntry();
+  assert.equal(record.drill, null, "a drill for another thread was kept");
 });
 
 test("`#1585 linked-message-always-expanded`: a thread landing opens the row it brings to the head, from the module alone", () => {
@@ -2701,7 +2751,7 @@ test("`#624 voice-page-modularity`: a thread's count comes from its summary befo
     channelCanon: () => canon,
     view: () => "discord",
     threading: () => true,
-    entryState: () => ({ threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null }),
+    entryState: () => ({ threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null }),
     selection: () => ({ view: "main", threadId: null, thread: null, origin: null }),
     readMode: () => "show",
     transcriptShown: () => false,
