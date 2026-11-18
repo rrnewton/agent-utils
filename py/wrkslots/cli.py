@@ -17010,6 +17010,41 @@ def _dead_mount_owner(
     return None
 
 
+#: Bound on one dead-mount probe. A live mount answers at once; a
+#: hung FUSE server can hold a plain stat in the kernel indefinitely,
+#: which no lifecycle command may wait on (#1802).
+_DEAD_MOUNT_PROBE_SECONDS = 5.0
+
+
+def _mount_point_is_dead(point: Path) -> bool:
+    """Whether ``point`` cannot be stat'ed as live storage, in bounded time.
+
+    The lstat runs on a daemon thread with a join bound: a timeout
+    counts as dead, because a mount that cannot answer within the
+    bound is unusable storage either way, and the probe itself must
+    never block the command.
+    """
+
+    outcome: list[bool] = []
+
+    def probe() -> None:
+        try:
+            os.lstat(point)
+        except OSError as exc:
+            outcome.append(exc.errno in _DEAD_MOUNT_ERRNOS)
+        except Exception:
+            outcome.append(False)
+        else:
+            outcome.append(False)
+
+    worker = threading.Thread(target=probe, daemon=True)
+    worker.start()
+    worker.join(_DEAD_MOUNT_PROBE_SECONDS)
+    if worker.is_alive():
+        return True
+    return bool(outcome and outcome[0])
+
+
 def _discover_dead_mounts(
     config: Config, states: Sequence[ActiveState], acted: Path
 ) -> None:
@@ -17050,11 +17085,8 @@ def _discover_dead_mounts(
             or _path_is_within(acted, point)
         ):
             continue
-        try:
-            os.lstat(point)
-        except OSError as exc:
-            if exc.errno in _DEAD_MOUNT_ERRNOS:
-                _record_dead_mount(point)
+        if _mount_point_is_dead(point):
+            _record_dead_mount(point)
 
 
 def _report_dead_mounts(

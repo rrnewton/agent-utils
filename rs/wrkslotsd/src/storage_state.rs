@@ -364,15 +364,35 @@ pub(crate) fn dead_mount_point(
         .max_by_key(|point| point.components().count())
 }
 
+/// Bound on one dead-mount probe. A live mount answers at once; a
+/// hung FUSE server can hold a plain stat in the kernel
+/// indefinitely, which no lifecycle command may wait on (#1802).
+const DEAD_MOUNT_PROBE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The dead FUSE mount point responsible for a failed stat of
-/// `path` in this process's mount table, or None.
+/// `path` in this process's mount table, or None. The stat runs on
+/// a helper thread with a receive bound: a timeout counts as dead,
+/// because a mount that cannot answer within the bound is unusable
+/// storage either way, and the probe itself must never block.
 pub(crate) fn dead_mount_at(path: &Path) -> Option<PathBuf> {
-    let errno = std::fs::symlink_metadata(path)
-        .err()
-        .and_then(|error| error.raw_os_error());
-    if !is_dead_mount_errno(errno) {
-        return None;
-    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let probed = path.to_path_buf();
+    std::thread::spawn(move || {
+        let errno = std::fs::symlink_metadata(&probed)
+            .err()
+            .and_then(|error| error.raw_os_error());
+        let _ = sender.send(errno);
+    });
+    let errno = match receiver.recv_timeout(DEAD_MOUNT_PROBE) {
+        Ok(errno) => {
+            if !is_dead_mount_errno(errno) {
+                return None;
+            }
+            errno
+        }
+        // Timed out: match the table as if the stat failed dead.
+        Err(_) => Some(107),
+    };
     let entries = mount_entries().ok()?;
     dead_mount_point(path, &entries, errno)
 }
