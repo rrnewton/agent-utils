@@ -716,6 +716,13 @@ def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
                 self.json(200, api.timeline(parse_qs(parts.query)))
             elif path.endswith("/pins"):
                 self.json(200, api.pin_list())
+            elif path.endswith("/drafts"):
+                # `#1840`: synced drafts; a check that opens a channel is
+                # asked for them, and holds none.
+                if scope != "write":
+                    self.json(403, {"error": "forbidden", "detail": "this token may read but not post"})
+                else:
+                    self.json(200, {"drafts": []})
             elif summary := re.fullmatch(r"/api/v1/channels/[^/]+/messages/([^/]+)/summary", path):
                 self.json(*api.summary(summary.group(1)))
             elif path.endswith("/stream"):
@@ -735,12 +742,24 @@ def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
             self.json(*api.post(unquote(urlsplit(self.path).path), parsed if isinstance(parsed, dict) else {}))
 
         def do_PUT(self) -> None:  # noqa: N802
-            self.pin_write(json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}"))
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            if unquote(urlsplit(self.path).path).endswith("/drafts"):
+                # `#1840`: a synced draft write; kept nowhere in a check.
+                with api.lock:
+                    api.requests.append(f"PUT {self.path}")
+                self.json(200, {"draft": None, "replaced": None})
+                return
+            self.pin_write(body)
 
         def do_DELETE(self) -> None:  # noqa: N802
             # Read whole, as do_POST does: a body left in this kept-alive
             # socket is parsed as the next request and desyncs the check.
             self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if unquote(urlsplit(self.path).path).endswith("/drafts"):
+                with api.lock:
+                    api.requests.append(f"DELETE {self.path}")
+                self.json(200, {"deleted": True})
+                return
             self.pin_write(None)
 
         def pin_write(self, body: Json | None) -> None:
