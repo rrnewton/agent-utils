@@ -1,12 +1,12 @@
 ---
 title: 'wrkslots-ignored-evidence-unbounded-events: bound salvage and finish ignored-file evidence so one removal cannot write 45 MB events'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-17T09:30:00-05:00
-updated_at: 2026-11-17T09:30:00-05:00
+updated_at: 2026-11-18T10:45:00-05:00
 ---
 
 # Description
@@ -36,3 +36,7 @@ Urgency check (before any fix): no command the consumer runs refuses. The Python
 Replay cost: replaying the affected log takes about 21 s per command (86,596 events, seven of them 45 MB), so each command pays the full parse even after the fix. Whether old events could later be summarised or compacted is a separate question (history is immutable and hash-chained, so any compaction needs its own design); it is noted here for later and explicitly not done in this issue.
 
 Overlap: the locked-registry (#1766), census-exit (#1769), dead-bind (#1771) and hook-cwd (#1768) lanes also touch `py/wrkslots/cli.py`; this change stays inside the salvage/finish-evidence and event-reader code and rebases right before the gate.
+
+## Resolution
+
+Landed on main as e6ee5a82. Events, the handoff and the active record now carry only the level-3 `ignored_summary` (count, total bytes, disposition counts, canonical manifest sha256, manifest path/bytes/sha256, at most 64 inline entries); the full per-file manifest is a receipt beside the salvage receipt, written and read back before any referencing event, and remove enforces the exact finish record through the manifest sha256 in both editions. Emission is gated on the #1788 writer ceiling: below level 3 writers emit the previous full-list shape, byte-compatible with older writers, so a pinned consumer sets `writer_ceiling: 2` (with `writer_ceiling`/`reader_floor` in `ignorable_keys`) and needs no paired move. The observer replay bound is a documented finite 128 MiB with a synthetic 20 MiB event test; other readers were already uncapped. Gate PARTIAL (284 steps, exit 0, no failed steps; 7 delegated-live-scope cross checks skipped-unverified). The 117-second enforcement test's speed is tracked separately in #1844 wrkslots-bounded-evidence-fast-fixture.
