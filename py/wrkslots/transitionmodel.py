@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import deque
-from typing import NamedTuple
+from typing import Callable, NamedTuple, TypeVar, cast
 
 # Code-variant flags (scenario constants, never state).
 REVCHECK = "assert-compares-revision"  # proposed minimal guard
@@ -130,12 +130,24 @@ class Scenario:
     disable: frozenset[str] = frozenset()  # actor keys: rm | cr | vb
 
 
-def _put(t: tuple, i: int, v: object) -> tuple:
-    return t[:i] + (v,) + t[i + 1 :]
+_T = TypeVar("_T")
+
+# Transition sink shared by every actor: (action name, kind, next).
+AddFn = Callable[[str, str, "State"], None]
+
+
+def _pair(t: tuple[_T, _T], i: int, v: _T) -> tuple[_T, _T]:
+    return (v, t[1]) if i == 0 else (t[0], v)
 
 
 def _actor(s: State, i: int, a: Actor) -> State:
-    return s._replace(actors=_put(s.actors, i, a))
+    actors = list(s.actors)
+    actors[i] = a
+    return s._replace(
+        actors=cast(
+            "tuple[Actor, Actor, Actor, Actor, Actor]", tuple(actors)
+        )
+    )
 
 
 def initial_states(sc: Scenario) -> tuple[State, ...]:
@@ -155,7 +167,7 @@ def initial_states(sc: Scenario) -> tuple[State, ...]:
         proof=(
             "live" if sc.contention else "dead",
             "unbound" if sc.b_unbound else "live",
-        ),  # type: ignore[arg-type]
+        ),
         hold=(0, 0),
         handoff=("none", "none") if sc.contention else ("read", "none"),
         jrnl=("none", "none"),
@@ -193,9 +205,9 @@ def _append(s: State, prev: int, *, hb_slot: int = -1, pres_off: int = -1) -> St
                           version=s.version + 1)
     log_hb, log_pres = s.log_hb, s.log_pres
     if hb_slot >= 0:
-        log_hb = _put(log_hb, hb_slot, min(2, log_hb[hb_slot] + 1))
+        log_hb = _pair(log_hb, hb_slot, min(2, log_hb[hb_slot] + 1))
     if pres_off >= 0:
-        log_pres = _put(log_pres, pres_off, 0)
+        log_pres = _pair(log_pres, pres_off, 0)
     # A continuous append atop a fork keeps the chain broken and
     # buries the discontinuity below the tip (14989: tail recovery
     # then refuses, the log being broken before the tail).
@@ -234,7 +246,7 @@ def _removable(s: State, i: int) -> bool:
 # (plus bit 8: the basis commit advanced a stale state).
 # ------------------------------------------------------------------
 
-def _prepared_remove(s: State, sc: Scenario, add) -> None:
+def _prepared_remove(s: State, sc: Scenario, add: AddFn) -> None:
     me = s.actors[0]
     pc = me.pc
     if pc == 0:
@@ -340,17 +352,17 @@ def _prepared_remove(s: State, sc: Scenario, add) -> None:
                 s._replace(lock=-1), 0, me._replace(pc=DONE)))
             return
         nxt = _append(s, s.tip)  # evidence event at the writer tip
-        nxt = nxt._replace(jrnl=_put(nxt.jrnl, A, "fpend"),
-                           jlive=_put(nxt.jlive, A, 1))
+        nxt = nxt._replace(jrnl=_pair(nxt.jrnl, A, "fpend"),
+                           jlive=_pair(nxt.jlive, A, 1))
         add("RmJournalEvent", "cmd", _actor(nxt, 0, me._replace(pc=8)))
     elif pc == 8:
-        nxt = s._replace(jrnl=_put(s.jrnl, A, "ffence"),
-                         storage=_put(s.storage, A, "fenced"),
+        nxt = s._replace(jrnl=_pair(s.jrnl, A, "ffence"),
+                         storage=_pair(s.storage, A, "fenced"),
                          lock=-1, version=s.version + 1)
         add("RmJournalFileFence", "cmd", _actor(nxt, 0, me._replace(pc=9)))
     elif pc == 9:
         # Lock-free deletion of the fenced tree (63136 tail).
-        nxt = s._replace(storage=_put(s.storage, A, "deleted"))
+        nxt = s._replace(storage=_pair(s.storage, A, "deleted"))
         add("RmTailDelete", "cmd", _actor(nxt, 0, me._replace(pc=10)))
     elif pc == 10:
         if s.lock != -1:
@@ -364,8 +376,8 @@ def _prepared_remove(s: State, sc: Scenario, add) -> None:
             return
         nxt = _append(s._replace(lock=0), s.tip, pres_off=A)
         nxt = _sync_snap(nxt._replace(
-            arch=_put(s.arch, A, 1), jrnl=_put(s.jrnl, A, "none"),
-            jlive=_put(s.jlive, A, 0), lock=-1))
+            arch=_pair(s.arch, A, 1), jrnl=_pair(s.jrnl, A, "none"),
+            jlive=_pair(s.jlive, A, 0), lock=-1))
         add("RmComplete", "cmd", _actor(nxt, 0, me._replace(pc=DONE)))
 
 
@@ -378,7 +390,7 @@ def _prepared_remove(s: State, sc: Scenario, add) -> None:
 # identity the adopter of unbound B must match.
 # ------------------------------------------------------------------
 
-def _heartbeat(s: State, sc: Scenario, add) -> None:
+def _heartbeat(s: State, sc: Scenario, add: AddFn) -> None:
     tgt = A if sc.contention else B
     me = s.actors[1]
     pc = me.pc
@@ -400,7 +412,7 @@ def _heartbeat(s: State, sc: Scenario, add) -> None:
                 s._replace(lock=-1), 1, me._replace(pc=DONE)))
             return
         nxt = _append(s, s.tip, hb_slot=tgt)
-        nxt = nxt._replace(hb_exp=_put(nxt.hb_exp, tgt, 0), hbn=s.hbn + 1)
+        nxt = nxt._replace(hb_exp=_pair(nxt.hb_exp, tgt, 0), hbn=s.hbn + 1)
         add("HbAppend", "cmd", _actor(nxt, 1, me._replace(pc=2)))
         add("HbCrashMidAppend", "env", _actor(
             s._replace(lock=-1, partial=1), 1, me._replace(pc=DONE)))
@@ -418,7 +430,7 @@ def _heartbeat(s: State, sc: Scenario, add) -> None:
 # durable, journal not yet cleared.
 # ------------------------------------------------------------------
 
-def _create(s: State, sc: Scenario, add) -> None:
+def _create(s: State, sc: Scenario, add: AddFn) -> None:
     me = s.actors[2]
     pc = me.pc
     if pc == 0:
@@ -426,30 +438,30 @@ def _create(s: State, sc: Scenario, add) -> None:
             s.ok == 1 and s.log_pres[B] == 0 and s.storage[B] == "absent"
             and s.jrnl[B] == "none" and s.lock == -1 and s.seal == "none"
         ):
-            nxt = s._replace(lock=2, jrnl=_put(s.jrnl, B, "create0"),
-                             jlive=_put(s.jlive, B, 1),
+            nxt = s._replace(lock=2, jrnl=_pair(s.jrnl, B, "create0"),
+                             jlive=_pair(s.jlive, B, 1),
                              version=s.version + 1)
             add("CrJournal", "cmd", _actor(nxt, 2, me._replace(pc=1)))
     elif pc == 1:
-        nxt = s._replace(storage=_put(s.storage, B, "present"))
+        nxt = s._replace(storage=_pair(s.storage, B, "present"))
         add("CrWorktrees", "cmd", _actor(nxt, 2, me._replace(pc=2)))
     elif pc == 2:
         if s.partial:
             add("CrRefusePartial", "cmd", _actor(
-                s._replace(lock=-1, jlive=_put(s.jlive, B, 0)),
+                s._replace(lock=-1, jlive=_pair(s.jlive, B, 0)),
                 2, me._replace(pc=DONE)))
             return
         nxt = _append(s, s.tip)
-        nxt = nxt._replace(log_pres=_put(nxt.log_pres, B, 1),
-                           proof=_put(nxt.proof, B, "live"),
-                           truth=_put(nxt.truth, B, 1),
-                           hb_exp=_put(nxt.hb_exp, B, 0),
-                           jrnl=_put(nxt.jrnl, B, "create1"))
+        nxt = nxt._replace(log_pres=_pair(nxt.log_pres, B, 1),
+                           proof=_pair(nxt.proof, B, "live"),
+                           truth=_pair(nxt.truth, B, 1),
+                           hb_exp=_pair(nxt.hb_exp, B, 0),
+                           jrnl=_pair(nxt.jrnl, B, "create1"))
         nxt = _sync_snap(nxt)
         add("CrPublish", "cmd", _actor(nxt, 2, me._replace(pc=3)))
     elif pc == 3:
-        nxt = s._replace(jrnl=_put(s.jrnl, B, "none"),
-                         jlive=_put(s.jlive, B, 0), lock=-1,
+        nxt = s._replace(jrnl=_pair(s.jrnl, B, "none"),
+                         jlive=_pair(s.jlive, B, 0), lock=-1,
                          version=s.version + 1)
         add("CrClearJournal", "cmd", _actor(nxt, 2, me._replace(pc=DONE)))
 
@@ -466,7 +478,7 @@ def _create(s: State, sc: Scenario, add) -> None:
 # the seal does not already gate).
 # ------------------------------------------------------------------
 
-def _validate_batch(s: State, sc: Scenario, add) -> None:
+def _validate_batch(s: State, sc: Scenario, add: AddFn) -> None:
     me = s.actors[3]
     pc = me.pc
     fixed = PRECLASS in sc.fixes
@@ -480,12 +492,12 @@ def _validate_batch(s: State, sc: Scenario, add) -> None:
                              version=s.version + 1)
             add("VbSeal", "cmd", _actor(nxt, 3, me._replace(pc=1)))
     elif pc == 1:
-        nxt = s._replace(jrnl=_put(s.jrnl, A, "vprep"),
-                         jlive=_put(s.jlive, A, 1), version=s.version + 1)
+        nxt = s._replace(jrnl=_pair(s.jrnl, A, "vprep"),
+                         jlive=_pair(s.jlive, A, 1), version=s.version + 1)
         add("VbFinishPrepared", "cmd", _actor(nxt, 3, me._replace(pc=2)))
     elif pc == 2:
-        nxt = s._replace(jrnl=_put(s.jrnl, A, "vfence"),
-                         storage=_put(s.storage, A, "fenced"),
+        nxt = s._replace(jrnl=_pair(s.jrnl, A, "vfence"),
+                         storage=_pair(s.storage, A, "fenced"),
                          version=s.version + 1)
         add("VbFence", "cmd", _actor(nxt, 3, me._replace(pc=3)))
     elif pc == 3 and fixed:
@@ -494,11 +506,11 @@ def _validate_batch(s: State, sc: Scenario, add) -> None:
         # own lock (reason "in worktrees image") is dropped.
         if s.reg[A] == "foreign":
             nxt = s._replace(lock=-1, seal="dead",
-                             jlive=_put(s.jlive, A, 0))
+                             jlive=_pair(s.jlive, A, 0))
             add("VbRefuseForeignPreDelete", "cmd",
                 _actor(nxt, 3, me._replace(pc=DONE)))
         elif s.reg[A] == "own":
-            nxt = s._replace(reg=_put(s.reg, A, "none"))
+            nxt = s._replace(reg=_pair(s.reg, A, "none"))
             add("VbDropOwnLock", "cmd", _actor(nxt, 3, me._replace(pc=4)))
         else:
             add("VbClassifyClean", "cmd", _actor(s, 3, me._replace(pc=4)))
@@ -511,7 +523,7 @@ def _validate_batch(s: State, sc: Scenario, add) -> None:
         viol = s.viol
         if viol == "none" and s.reg[A] != "none":
             viol = "deleted-while-locked"
-        nxt = s._replace(storage=_put(s.storage, A, "deleted"), viol=viol,
+        nxt = s._replace(storage=_pair(s.storage, A, "deleted"), viol=viol,
                          version=s.version + 1)
         add("VbDeleteSubvolume", "cmd", _actor(nxt, 3, me._replace(pc=5)))
     elif pc == 5 and fixed:
@@ -525,7 +537,7 @@ def _validate_batch(s: State, sc: Scenario, add) -> None:
         # refusal, after the delete (eb14b70d:58561).
         if s.reg[A] != "none":
             nxt = s._replace(lock=-1, seal="dead",
-                             jlive=_put(s.jlive, A, 0))
+                             jlive=_pair(s.jlive, A, 0))
             add("VbRefuseStillRegistered", "cmd",
                 _actor(nxt, 3, me._replace(pc=DONE)))
         else:
@@ -534,13 +546,13 @@ def _validate_batch(s: State, sc: Scenario, add) -> None:
         if s.partial:
             add("VbRefusePartial", "cmd", _actor(
                 s._replace(lock=-1, seal="dead",
-                           jlive=_put(s.jlive, A, 0)),
+                           jlive=_pair(s.jlive, A, 0)),
                 3, me._replace(pc=DONE)))
             return
         nxt = _append(s, s.tip, pres_off=A)
         nxt = _sync_snap(nxt._replace(
-            arch=_put(s.arch, A, 1), jrnl=_put(s.jrnl, A, "none"),
-            jlive=_put(s.jlive, A, 0), seal="none", seal_tgt=-1,
+            arch=_pair(s.arch, A, 1), jrnl=_pair(s.jrnl, A, "none"),
+            jlive=_pair(s.jlive, A, 0), seal="none", seal_tgt=-1,
             lock=-1))
         add("VbArchive", "cmd", _actor(nxt, 3, me._replace(pc=DONE)))
 
@@ -554,7 +566,7 @@ def _validate_batch(s: State, sc: Scenario, add) -> None:
 # Locals: p=captured version, q=failed rounds.
 # ------------------------------------------------------------------
 
-def _adopt(s: State, sc: Scenario, add) -> None:
+def _adopt(s: State, sc: Scenario, add: AddFn) -> None:
     if not sc.contention:
         return
     me = s.actors[4]
@@ -578,8 +590,8 @@ def _adopt(s: State, sc: Scenario, add) -> None:
         if s.version == me.p:
             nxt = _append(s, s.tip, hb_slot=B)
             nxt = _sync_snap(nxt._replace(
-                proof=_put(s.proof, B, "live"),
-                hb_exp=_put(s.hb_exp, B, 0), lock=-1))
+                proof=_pair(s.proof, B, "live"),
+                hb_exp=_pair(s.hb_exp, B, 0), lock=-1))
             add("AdCommit", "cmd", _actor(nxt, 4, me._replace(pc=DONE)))
         elif me.q + 1 >= 5:
             add("AdBusyExhausted", "cmd", _actor(
@@ -607,7 +619,7 @@ def _adopt(s: State, sc: Scenario, add) -> None:
 _FINISH_KINDS = ("fpend", "ffence", "vprep", "vfence", "fdone")
 
 
-def _recover(s: State, sc: Scenario, add) -> None:
+def _recover(s: State, sc: Scenario, add: AddFn) -> None:
     if s.lock != -1:
         return
     # _ensure_state_shard (9322-9330) rewrites a lagging ACTIVE
@@ -649,7 +661,7 @@ def _recover(s: State, sc: Scenario, add) -> None:
                     continue
                 viol = s.viol if s.viol != "none" else "deleted-while-locked"
                 add("RecFinishDeleteLocked", "sched", s._replace(
-                    storage=_put(s.storage, i, "deleted"), viol=viol,
+                    storage=_pair(s.storage, i, "deleted"), viol=viol,
                     version=s.version + 1))
                 continue
             nxt = _append(s, s.tip, pres_off=i)
@@ -657,9 +669,9 @@ def _recover(s: State, sc: Scenario, add) -> None:
             if tgt == i:
                 seal, tgt = "none", -1
             nxt = _sync_snap(nxt._replace(
-                arch=_put(s.arch, i, 1), jrnl=_put(s.jrnl, i, "none"),
-                storage=_put(s.storage, i, "deleted"),
-                reg=_put(s.reg, i, "none") if kind.startswith("v")
+                arch=_pair(s.arch, i, 1), jrnl=_pair(s.jrnl, i, "none"),
+                storage=_pair(s.storage, i, "deleted"),
+                reg=_pair(s.reg, i, "none") if kind.startswith("v")
                 else s.reg,
                 seal=seal, seal_tgt=tgt))
             add("RecFinishArchive", "sched", nxt)
@@ -668,20 +680,20 @@ def _recover(s: State, sc: Scenario, add) -> None:
                 continue  # TTL equality check refuses (68800)
             if kind == "create1":
                 add("RecCreateClear", "sched", s._replace(
-                    jrnl=_put(s.jrnl, i, "none"), version=s.version + 1))
+                    jrnl=_pair(s.jrnl, i, "none"), version=s.version + 1))
             else:
                 nxt = _append(s, s.tip)
                 nxt = nxt._replace(
-                    log_pres=_put(nxt.log_pres, i, 1),
-                    proof=_put(nxt.proof, i, "live"),
-                    truth=_put(nxt.truth, i, 1),
-                    hb_exp=_put(nxt.hb_exp, i, 0),
-                    storage=_put(nxt.storage, i, "present"),
-                    jrnl=_put(nxt.jrnl, i, "none"))
+                    log_pres=_pair(nxt.log_pres, i, 1),
+                    proof=_pair(nxt.proof, i, "live"),
+                    truth=_pair(nxt.truth, i, 1),
+                    hb_exp=_pair(nxt.hb_exp, i, 0),
+                    storage=_pair(nxt.storage, i, "present"),
+                    jrnl=_pair(nxt.jrnl, i, "none"))
                 add("RecCreateComplete", "sched", _sync_snap(nxt))
                 add("RecCreateAbort", "sched", s._replace(
-                    jrnl=_put(s.jrnl, i, "none"),
-                    storage=_put(s.storage, i, "absent"),
+                    jrnl=_pair(s.jrnl, i, "none"),
+                    storage=_pair(s.storage, i, "absent"),
                     version=s.version + 1))
     if s.seal == "dead" and s.seal_tgt >= 0 and s.jrnl[s.seal_tgt] == "none":
         add("RecSealRetire", "sched",
@@ -698,7 +710,7 @@ def _recover(s: State, sc: Scenario, add) -> None:
 _CRASH_NAMES = ("CrashRm", "CrashHb", "CrashCr", "CrashVb", "CrashAd")
 
 
-def _environment(s: State, sc: Scenario, add) -> None:
+def _environment(s: State, sc: Scenario, add: AddFn) -> None:
     for idx in range(5):
         me = s.actors[idx]
         if me.pc in (0, DONE, BUSY):
@@ -707,22 +719,25 @@ def _environment(s: State, sc: Scenario, add) -> None:
         if nxt.lock == idx:
             nxt = nxt._replace(lock=-1)
         if idx in (0, 3) and nxt.jrnl[A] != "none":
-            nxt = nxt._replace(jlive=_put(nxt.jlive, A, 0))
+            nxt = nxt._replace(jlive=_pair(nxt.jlive, A, 0))
         if idx == 2 and nxt.jrnl[B] != "none":
-            nxt = nxt._replace(jlive=_put(nxt.jlive, B, 0))
+            nxt = nxt._replace(jlive=_pair(nxt.jlive, B, 0))
         if idx == 3 and nxt.seal == "live":
             nxt = nxt._replace(seal="dead")
         add(_CRASH_NAMES[idx], "env", nxt)
     # Passage of time expires every live record's heartbeat.
     if any(s.log_pres[i] == 1 and s.hb_exp[i] == 0 for i in (A, B)):
-        exp = tuple(1 if s.log_pres[i] == 1 else s.hb_exp[i] for i in (A, B))
-        add("Tick", "env", s._replace(hb_exp=exp))  # type: ignore[arg-type]
+        exp = (
+            1 if s.log_pres[A] == 1 else s.hb_exp[A],
+            1 if s.log_pres[B] == 1 else s.hb_exp[B],
+        )
+        add("Tick", "env", s._replace(hb_exp=exp))
     for i, death, probe in ((A, "OwnerDeathA", "ProbeDeadA"),
                             (B, "OwnerDeathB", "ProbeDeadB")):
         if s.truth[i] == 1 and s.log_pres[i] == 1:
-            add(death, "env", s._replace(truth=_put(s.truth, i, 0)))
+            add(death, "env", s._replace(truth=_pair(s.truth, i, 0)))
         if s.truth[i] == 0 and s.proof[i] == "live" and s.log_pres[i] == 1:
-            add(probe, "sched", s._replace(proof=_put(s.proof, i, "dead")))
+            add(probe, "sched", s._replace(proof=_pair(s.proof, i, "dead")))
     # A misjudged (truly live) owner of A renews its heartbeat:
     # an atomic locked append, refused on seal overlap (44306).
     # Bounded to the expiry-crossing renewal (the case recover's
@@ -734,18 +749,18 @@ def _environment(s: State, sc: Scenario, add) -> None:
         and not (s.seal != "none" and s.seal_tgt == A)
     ):
         nxt = _append(s, s.tip, hb_slot=A)
-        nxt = _sync_snap(nxt._replace(hb_exp=_put(nxt.hb_exp, A, 0)))
+        nxt = _sync_snap(nxt._replace(hb_exp=_pair(nxt.hb_exp, A, 0)))
         add("RenewHeartbeatA", "owner", nxt)
     # hold/unhold are ordinary wrkslots commands (44538, 44595):
     # legal exits, gated on no journal for the target (44546).
     if s.ok == 1 and s.lock == -1 and s.log_pres[A] == 1 and s.holdn < 2:
         if s.hold[A] == 0 and s.jrnl[A] == "none":
             add("HoldA", "human", s._replace(
-                hold=_put(s.hold, A, 1), holdn=s.holdn + 1,
+                hold=_pair(s.hold, A, 1), holdn=s.holdn + 1,
                 version=s.version + 1))
         if s.hold[A] == 1:
             add("UnholdA", "human", s._replace(
-                hold=_put(s.hold, A, 0), holdn=s.holdn + 1,
+                hold=_pair(s.hold, A, 0), holdn=s.holdn + 1,
                 version=s.version + 1))
     # A config TTL edit is observable only through create
     # recovery's equality check (68800), so the edit is offered
@@ -762,7 +777,7 @@ def _environment(s: State, sc: Scenario, add) -> None:
         # post-fix the prune and archive then happen inside
         # recover (59011).  Wrkslots itself drops only its own.
         add("HandGitUnlock", "hand",
-            s._replace(reg=_put(s.reg, A, "none")))
+            s._replace(reg=_pair(s.reg, A, "none")))
 
 
 def successors(s: State, sc: Scenario) -> list[tuple[str, str, State]]:
@@ -928,7 +943,9 @@ def _canon(s: State) -> State:
         actors[0] = Actor(a0.pc, 0, 0, 0, 0)
     holds_capture = actors[0].pc in (3, 4) or actors[4].pc in (1, 2)
     return s._replace(
-        actors=tuple(actors),  # type: ignore[arg-type]
+        actors=cast(
+            "tuple[Actor, Actor, Actor, Actor, Actor]", tuple(actors)
+        ),
         version=s.version if holds_capture else 0,
     )
 
