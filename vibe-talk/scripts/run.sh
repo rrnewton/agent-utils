@@ -675,6 +675,7 @@ EOF
 [message_cache]
 enabled = true
 serve = true
+backfill = "full"
 EOF
         printf 'path = "%s/state/message-cache.sqlite3"\n' "$SHOTS_TMP"
         # `#1855`: Discuss through the real router. Without a [summaries.llm] section the

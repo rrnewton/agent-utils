@@ -7347,6 +7347,15 @@ def run_captures(
     def seed_discuss_cache() -> None:
         base = url.rstrip("/")
         headers = {"Authorization": f"Bearer {token}"}
+        # A first write-scope read, which is what the history walk starts from.
+        first_read = Request(
+            f"{base}/api/v1/channels/{channel}/messages?limit=6", headers=headers
+        )
+        try:
+            with urlopen(first_read, timeout=10):  # noqa: S310
+                pass
+        except (HTTPError, URLError):
+            pass
         request = Request(
             f"{base}/api/v1/channels/{channel}/history/prioritize",
             method="POST",
