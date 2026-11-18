@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-hashtag-labels: typed hashtags become filterable labels with card chips, search and Settings browse'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -53,6 +53,10 @@ Coordb amendments (2026-11-17, GO): (1) `# Heading` with a space is never a labe
 Open question (owner TBD, not built): "hide a label" — whether a label can be hidden from chips/Settings without deleting it, and whether hiding is per-device or server-kept. Recorded here so the TBD is not lost; no hide control ships in this issue.
 
 Auto-generated topics are out of scope; only the `auto:` prefix reservation above is made so they can land later without renaming hashtag labels.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as d1a87ebb (gate pass on 26e500f2). Hashtag extractor with hard unit tests; `Message.labels` derived at serve time (edits relabel live); `label:<slug>` in the shared search language (Rust + page twin + corpus); label groups in sqlite tables outside the migration ladder (rollback-safe), with Settings > Labels browse/search/sort, persistent checkboxes, the Combine dialog and (G) editing; card chips in Pinned geometry with hashtag-only lines hidden at render; the Entire-threads chip beside the #1797 buckets; chip taps riding the #243 place-keeper. Screenshot matrix in /tmp/mu-hashtags-shots1825 (38, inspected). Open questions stand: "hide a label" (owner TBD) and the general "rollback-compatible migrations" convention. The #1818 rect-anchor swap for chip taps remains a follow-up once its helper is on main.
 
 Presentation (owner thread 168): a body line of ONLY hashtags is hidden at render time when its labels show as header chips (stored text, raw view and copy untouched; the line stays inline if the header has no room). Clicking a chip opens the label-filtered search with the clicked message kept at the same screen position, reusing #1818's viewport-anchoring helper (rebase onto it once landed, no second anchor). An "Entire threads" toggle stands with the #1797 bucket chips: off by default (individual hits as now); on, any thread with a hit shows whole. It ANDs with the buckets: buckets choose WHICH scopes contribute hits, Entire-threads chooses whether a hit stands alone or brings its thread.
 
