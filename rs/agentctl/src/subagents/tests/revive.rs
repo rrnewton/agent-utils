@@ -3811,13 +3811,10 @@ fn ultra_profile_status_reports_only_real_environment_drift() {
             },
         )
         .unwrap();
-    assert!(
-        fixture.manager().status("worker").unwrap()["profile_drift"].is_null()
-    );
+    assert!(fixture.manager().status("worker").unwrap()["profile_drift"].is_null());
     let path = fixture.root.join(".agentctl/profiles.json");
     let mut config = agent::read_private_json(&path).unwrap();
-    config["profiles"]["muse-ultra"]["env"] =
-        json!({"RECOVERY_MODE": "on", "EXTRA_MODE": "on"});
+    config["profiles"]["muse-ultra"]["env"] = json!({"RECOVERY_MODE": "on", "EXTRA_MODE": "on"});
     agent::atomic_json(&path, &config).unwrap();
     let drift = &fixture.manager().status("worker").unwrap()["profile_drift"];
     assert_eq!(drift["fields"], json!(["environment_names"]), "{drift}");
