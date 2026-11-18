@@ -70,6 +70,9 @@ pub struct AppState {
     /// Where the startup channel probe stands, for `/healthz` and `/readyz`, and for the
     /// background readers that wait for it. `#718 vt-startup-probe-restart`.
     pub startup_probe: Arc<crate::probe::StartupStatus>,
+    /// Per-route refusal counts over the current window (`#1848`); the access
+    /// layer counts into it, a background tick evaluates closed windows.
+    pub route_health: Arc<crate::route_health::RouteHealth>,
     /// The one place this server keeps anything between restarts.
     ///
     /// Reached only through the trait, never as a concrete database, so the backend can be

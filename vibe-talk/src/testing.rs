@@ -437,6 +437,7 @@ fn state_pieces_with(
         summary_counters: Arc::new(crate::summarize::counters::SummaryCounters::new()),
         thread_names: Arc::new(crate::summarize::threads::ThreadNames::new()),
         startup_probe: Arc::new(crate::probe::StartupStatus::default()),
+        route_health: Arc::new(crate::route_health::RouteHealth::new()),
     };
     crate::short_refs::set_thread_slugs(
         Arc::clone(&state.thread_names) as Arc<dyn crate::short_refs::ThreadSlugs>

@@ -931,6 +931,7 @@ async fn main() -> anyhow::Result<()> {
         summary_counters: Arc::new(vibe_talk::summarize::counters::SummaryCounters::new()),
         thread_names,
         startup_probe: Arc::clone(&startup_probe),
+        route_health: Arc::new(vibe_talk::route_health::RouteHealth::new()),
     };
     // `#208 persistent-cache`. A cache installed behind the sink keeps the store's summaries in
     // step with what it learns: a summary of an edited or deleted message, or of an erased
