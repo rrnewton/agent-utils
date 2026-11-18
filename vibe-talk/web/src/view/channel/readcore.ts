@@ -43,8 +43,9 @@ export interface TimelineReaderLike {
   staleAsOf(payload: TimelineResponse): number | null;
 }
 import { READ_MODE_LABELS, READ_MODE_TITLES, READ_MODE_VERBS, allNoticeWords, nextReadMode } from "../../present/rows/index.ts";
-import { createOlderPager } from "../../core/channels/index.ts";
+import { createOlderPager, heightFor, measuredHeight, noteMeasured, rowClassOf } from "../../core/channels/index.ts";
 import { isMessageRow, patchRows, rowShown, shownRowFor } from "./rows.ts";
+import { offsetsFor, sliceFor } from "./windowing.ts";
 import { cardRunIds, threadCardId } from "./cards.ts";
 import { childByClass } from "../dom/index.ts";
 import { neighbourStayed, rowNeighbours } from "./cardplace.ts";
@@ -311,6 +312,11 @@ export interface TimelineViewDependencies {
   /** Move the list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
   nudge(area: HTMLElement, delta: number): void;
   toPosition(area: HTMLElement, top: number): void;
+  /**
+   * The render window in force (`#1846` step 3), or null for full rendering: prefetch beside
+   * the viewport and the mounted-row cap, from the device settings (windowed.ts). Absent: off.
+   */
+  windowed?(): { prefetchPx: number; rowCap: number } | null;
   screensView(): string;
   renderJumpNewest(): void;
 }
@@ -473,6 +479,175 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const discordNode = deps.discordNode;
   const threadCards = deps.threadCards;
   const glom = deps.glom;
+  // `#1846` step 3: the render window's standing state (groups last drawn, slice mounted).
+  let winGroups: Message[][] | null = null;
+  let winFrom = -1;
+  let winTo = -1;
+  let winListening = false;
+  let winConverging = false;
+
+  function groupHeightPx(group: Message[], bucket: string): number {
+    const canon = channelStore.current();
+    // A measured group height stands under its first id (noteMeasured on unmount).
+    const measured = measuredHeight(canon, String((group[0] as Message).id), bucket);
+    if (measured !== null) return measured;
+    let total = 0;
+    for (const message of group) total += heightFor(canon, message, bucket, false);
+    return total;
+  }
+
+  /**
+   * Draw only the window of `groups` around the reader (`#1846` step 3): spacers carry the
+   * unmounted heights (step 2 index), rows outside the slice are measured and unmounted, and
+   * the anchor row is held with one measured write through the scroll owner. False when
+   * windowing is off, so the caller draws in full as before.
+   */
+  function renderWindowed(list: HTMLElement, groups: Message[][]): boolean {
+    const cfg = deps.windowed ? deps.windowed() : null;
+    if (!cfg || selection().view === "threads") return false;
+    const area = el("scroll-area");
+    const bucket = String(area.clientWidth || list.clientWidth || 360);
+    const canon = channelStore.current();
+    // Same groups in the same order (a re-read that only edited content): keep the slice by
+    // index, so a changed height estimate above the window cannot re-slice it (budget B4).
+    const sameSequence = winGroups !== null && winGroups !== groups &&
+      winGroups.flatMap((group) => group.map((message) => String(message.id))).join(" ") ===
+        groups.flatMap((group) => group.map((message) => String(message.id))).join(" ");
+    winGroups = groups;
+    const heights = groups.map((group) => groupHeightPx(group, bucket));
+    const offsets = offsetsFor(heights);
+    let slice = sameSequence && winFrom >= 0
+      ? { from: Math.min(winFrom, groups.length), to: Math.min(winTo, groups.length) }
+      : sliceFor(offsets, area.scrollTop, area.clientHeight, cfg.prefetchPx, cfg.rowCap);
+    // A standing selection pins its group into the window, as focus and speech do in step 5.
+    const selectionNow = deps.selectionIn ? deps.selectionIn(list) : null;
+    if (selectionNow) {
+      const at = groups.findIndex((group) => group.some((message) => String(message.id) === selectionNow.id));
+      if (at >= 0 && (at < slice.from || at >= slice.to)) {
+        const from = Math.max(0, Math.min(at - Math.floor(cfg.rowCap / 3), groups.length - cfg.rowCap));
+        slice = { from, to: Math.min(groups.length, from + cfg.rowCap) };
+      }
+    }
+    // The anchor: the first mounted row not yet scrolled off the top, and where it sits.
+    const areaTop = area.getBoundingClientRect().top;
+    let anchorKey: string | null = null;
+    let anchorTop = 0;
+    for (const row of [...list.children]) {
+      if ((row as HTMLElement).dataset.windowSpacer) continue;
+      const rect = row.getBoundingClientRect();
+      if (rect.bottom > areaTop) {
+        anchorKey = idsOf(row).join(" ");
+        anchorTop = rect.top;
+        break;
+      }
+    }
+    const byKey = new Map<string, Element[]>();
+    for (const row of [...list.children]) {
+      if ((row as HTMLElement).dataset.windowSpacer) continue;
+      const key = idsOf(row).join(" ");
+      const held = byKey.get(key);
+      if (held) held.push(row);
+      else byKey.set(key, [row]);
+    }
+    const doc = list.ownerDocument;
+    const spacer = (kind: string, px: number): HTMLElement => {
+      const found = [...list.children].find((row) => (row as HTMLElement).dataset.windowSpacer === kind) as HTMLElement | undefined;
+      const node = found || doc.createElement("li");
+      node.dataset.windowSpacer = kind;
+      node.setAttribute("aria-hidden", "true");
+      node.style.height = `${Math.max(0, Math.round(px))}px`;
+      node.style.padding = "0";
+      node.style.margin = "0";
+      node.style.border = "none";
+      node.style.listStyle = "none";
+      return node;
+    };
+    const next: Element[] = [spacer("top", offsets[slice.from] as number)];
+    for (let at = slice.from; at < slice.to; at += 1) {
+      const group = groups[at] as Message[];
+      const key = group.map((message) => String(message.id)).join(" ");
+      let row = byKey.get(key)?.shift();
+      if (row) {
+        const drawn = rowMessages(row);
+        // As patchRows on the newest page: the very object, or word for word (a fresh serve).
+        if (drawn.length !== group.length ||
+            group.some((message, i) => drawn[i] !== message && !sameMessage(drawn[i], message))) row = undefined;
+      }
+      next.push(row ?? discordNode(group));
+    }
+    next.push(spacer("bottom", (offsets[offsets.length - 1] as number) - (offsets[slice.to] as number)));
+    const keep = new Set(next);
+    for (const row of [...list.children]) {
+      if (keep.has(row) || (row as HTMLElement).dataset.windowSpacer) continue;
+      const first = rowMessages(row)[0];
+      if (first) noteMeasured(canon, String(first.id), (row as HTMLElement).offsetHeight, bucket, rowClassOf(first, false));
+      list.removeChild(row);
+    }
+    for (let at = 0; at < next.length; at += 1) {
+      const wanted = next[at] as Element;
+      if (list.children[at] !== wanted) list.insertBefore(wanted, list.children[at] ?? null);
+    }
+    // Measure what stands, so the class medians (and so every spacer) price real rows from
+    // the next window on instead of the default until each row happens to unmount.
+    for (const row of next) {
+      if ((row as HTMLElement).dataset.windowSpacer) continue;
+      const first = rowMessages(row)[0];
+      if (first) noteMeasured(canon, String(first.id), (row as HTMLElement).offsetHeight, bucket, rowClassOf(first, false));
+    }
+    winFrom = slice.from;
+    winTo = slice.to;
+    // Converge in the same call: measuring just repriced every spacer, so the slice the
+    // reader's px position names may have moved; re-slice once with the real heights
+    // instead of leaving the next scroll to discover a different window (budget B3).
+    if (!winConverging && !sameSequence) {
+      const heightsNow = groups.map((group) => groupHeightPx(group, bucket));
+      const sliceNow = sliceFor(offsetsFor(heightsNow), area.scrollTop, area.clientHeight, cfg.prefetchPx, cfg.rowCap);
+      if (sliceNow.from !== winFrom || sliceNow.to !== winTo) {
+        winConverging = true;
+        try {
+          renderWindowed(list, groups);
+        } finally {
+          winConverging = false;
+        }
+        return true;
+      }
+    }
+    if (anchorKey) {
+      const held = [...list.children].find((row) => !(row as HTMLElement).dataset.windowSpacer && idsOf(row).join(" ") === anchorKey);
+      if (held) {
+        const delta = held.getBoundingClientRect().top - anchorTop;
+        if (Math.abs(delta) > 0.5) deps.nudge(area, delta);
+      }
+    }
+    if (!winListening && typeof area.addEventListener === "function") {
+      winListening = true;
+      let queued = false;
+      area.addEventListener("scroll", () => {
+        if (queued || !winGroups) return;
+        queued = true;
+        const run = () => {
+          queued = false;
+          if (!winGroups || !(deps.windowed && deps.windowed())) return;
+          const cfgNow = deps.windowed();
+          if (!cfgNow) return;
+          const heightsNow = winGroups.map((group) => groupHeightPx(group, bucket));
+          const offsetsNow = offsetsFor(heightsNow);
+          // Hysteresis: re-slice only when the visible band reaches the window's inner
+          // margin — the prefetch exists so small moves (an anchor write, a re-read's
+          // restore) mount nothing at all.
+          let visFrom = 0;
+          while (visFrom < winGroups.length && (offsetsNow[visFrom + 1] as number) <= area.scrollTop) visFrom += 1;
+          let visTo = visFrom;
+          while (visTo < winGroups.length && (offsetsNow[visTo] as number) < area.scrollTop + area.clientHeight) visTo += 1;
+          if (visFrom - winFrom < 2 || winTo - visTo < 2) renderWindowed(list, winGroups);
+        };
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+        else run();
+      }, { passive: true });
+    }
+    return true;
+  }
+
   const idsOf = deps.idsOf;
   const rowMessages = deps.rowMessages;
   const hiddenEmpty = deps.hiddenEmpty;
@@ -1021,7 +1196,7 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
     // The reader's text selection is kept across the rebuild, as at a landing (`#1209`).
     const list = el("discord-log");
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-    patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+    if (!renderWindowed(list, glom(shown))) patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
     el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   }
@@ -1065,7 +1240,7 @@ function renderCachedTimeline(): void {
     // rebuild itself patches in place (`#1229 keyed-row-patching`).
     const list = el("discord-log");
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-    patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
+    if (!renderWindowed(list, glom(shown))) patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     holdingReplyArrows(renderChannelRows);
     listState().backlog = shown.length;
@@ -1572,8 +1747,12 @@ function applyNewestPage(payload: TimelineResponse, saved = false): number {
     messages.length > 0 ? (messages[0] as Message).timestamp : undefined);
   // The reader's text selection is kept across the rebuild, as at a landing (`#1209`).
   const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-  patchRows(list, glom(messages), (group) => discordNode(group), kept,
-    (drawn, incoming) => drawn === incoming || sameMessage(drawn, incoming), selection().view);
+  // `#1846` step 3: a fresh newest page with nothing kept draws through the window when it
+  // stands; a page kept over older rows draws in full, and the next full redraw windows it.
+  if (!(kept.length === 0 && renderWindowed(list, glom(messages)))) {
+    patchRows(list, glom(messages), (group) => discordNode(group), kept,
+      (drawn, incoming) => drawn === incoming || sameMessage(drawn, incoming), selection().view);
+  }
   if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
   // ids are still in the set from the read that brought them, so a reset here would un-grey them.

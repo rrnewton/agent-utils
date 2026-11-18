@@ -77,6 +77,12 @@ export function heightFor(canon: ChannelCanon, message: Message, bucket: string,
   return lines <= 3 ? base : Math.round(base * (1 + (lines - 3) * 0.18));
 }
 
+/** The measured height standing for `id` at `bucket`, or null where none does. */
+export function measuredHeight(canon: ChannelCanon, id: string, bucket: string): number | null {
+  const held = stateOf(canon).measured.get(`${id}|${bucket}`);
+  return held === undefined ? null : held;
+}
+
 /** Total estimated height of `messages[from..to)` at `bucket` (a spacer's height). */
 export function rangeHeight(
   canon: ChannelCanon,

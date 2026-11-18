@@ -179,6 +179,8 @@ export type { LinkedMark, LinkedMarkDependencies, LinkedMessage } from "./linked
 export { JUMP_LOST_CHECK_MS, JUMP_LOST_WINDOW_MS, createJumpAnchor } from "./jumpanchor.ts";
 export type { JumpAnchor, JumpAnchorDependencies } from "./jumpanchor.ts";
 export { createTimelineView } from "./readcore.ts";
+export { offsetsFor, sliceFor } from "./windowing.ts";
+export type { WindowSlice } from "./windowing.ts";
 export type { TimelineAbandonedRead, TimelineColumn, TimelineColumnSteps, TimelineEntryState, TimelineFoldRead, TimelineLoadState, TimelineOlderPages, TimelineReadOptions, TimelineReaderLike, TimelineRows, TimelineSelection, TimelineView, TimelineViewDependencies } from "./readcore.ts";
 export { COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_LISTS, FOLD_MORE, SCROLLBACK_PX, SUMMARY_LOOKAHEAD_PX, createFolding } from "./folding.ts";
 export type { FoldEntry, FoldPane, Folding, FoldingDependencies, ScrollPlace, ScrollToolsPass } from "./folding.ts";

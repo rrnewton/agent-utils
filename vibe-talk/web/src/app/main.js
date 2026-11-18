@@ -62,7 +62,7 @@ import {DISMISSED_SENDS_DAYS,
   sentReceiptRetires as receiptRetires,
   underDraft,
   unsentText,} from "../core/outbox/index.ts";
-import {DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync} from "../core/settings/index.ts";
+import {DEFAULT_COLLAPSED_LINES, DEFAULT_DISCUSS_WIDTH, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampDiscussWidth, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createEnterSends, createInAppLinks, createKeptSwitch, createMarkReadFirstPercent, createMarkReadLongWords, createQuoteReadPercent, createSettingsSync, windowedConfig} from "../core/settings/index.ts";
 import {childByClass,
   createOncePerFrame,
   focusLost,
@@ -7285,6 +7285,7 @@ const timelineView = createTimelineView({
   captureScroll, restoreScroll, screensView: () => screens.view(), renderJumpNewest,
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
+  windowed: () => { const cfg = windowedConfig(deviceSettings(), window.innerWidth < 900); return cfg.windowed ? { prefetchPx: cfg.prefetchPx, rowCap: cfg.rowCap } : null; },
 });
 const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
 /**

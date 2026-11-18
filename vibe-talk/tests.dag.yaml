@@ -2921,6 +2921,19 @@ steps:
   # ResizeObserver keeper, Back returns the reply to its place in All, and the thread's root at
   # the head of Main opens its thread where it stood.
   - group: check
+    job: windowed-refresh-browser
+    desc: windowed budgets (5000 mount at most the cap, a screenful at most 20, off-screen edit no DOM), in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/windowed_refresh_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 45
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 7
+      classification: latency-bound
+  - group: check
     job: incremental-refresh-browser
     desc: live updates touch only their rows (no-change poll zero, one edit one row), in current Chromium at 412x915 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
