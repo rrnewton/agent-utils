@@ -20,6 +20,8 @@ import dataclasses
 import fcntl
 import json
 import os
+import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -802,14 +804,91 @@ def test_a_tolerated_heartbeat_plus_another_change_revalidates(
     assert _row(project, "slot03") is not None
 
 
+_CRASHING_HEARTBEAT = r"""
+import os, sys
+from wrkslots import cli
+real = cli._atomic_write_json
+def failing(path, *a, **k):
+    if os.path.basename(str(path)).startswith("ACTIVE."):
+        raise OSError(28, "No space left on device (simulated)")
+    return real(path, *a, **k)
+cli._atomic_write_json = failing
+sys.exit(cli.main(sys.argv[1:]))
+"""
+
+
+@pytest.mark.parametrize("operation", ("create", "adopt"))
+def test_a_lagging_shard_after_a_failed_heartbeat_is_never_tolerated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+) -> None:
+    """#1808-B review: an event appended without its shard write (the
+    heartbeat died in between) leaves the shard one revision behind the
+    log. The classifier must fold the event and find the shard unequal,
+    so the command revalidates from the log instead of appending a
+    non-continuing event that breaks every later replay."""
+    project = _three_slot_project(tmp_path)
+    _treat_every_event_as_settled(monkeypatch)
+    ledger = _LockLedger(monkeypatch, project)
+    done: list[int] = []
+
+    def crashing_heartbeat() -> None:
+        if done:
+            return
+        argv = [
+            "--project-root", str(project), "--wait-lock", "5",
+            "heartbeat", "slot02", "--agent", "codex-2",
+            "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        ]
+        completed = subprocess.run(
+            [sys.executable, "-c", _CRASHING_HEARTBEAT, *argv],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ),
+        )
+        done.append(completed.returncode)
+
+    ledger.during_validation = crashing_heartbeat
+    argv = _create_argv(project) if operation == "create" else _adopt_argv(project)
+
+    rc = cli.main(argv)
+
+    captured = capsys.readouterr()
+    assert done and done[0] != 0
+    assert rc == 0, captured.err
+    assert ledger.count("validate", held=False) == 2
+    # The log still replays and the registry answers afterwards.
+    config = cli._load_config(str(project), "testhost")
+    cli._states_from_events(config, "testhost")
+    assert cli.main(["--project-root", str(project), "status"]) == 0
+
+
 def test_a_heartbeat_from_the_target_agent_is_not_tolerated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """#1808-B: a heartbeat for a slot of the target agent stays fail-closed."""
+    """#1808-B: a heartbeat for a slot of the target agent stays fail-closed.
+
+    The heartbeating slot is a validation slot, so the create's own
+    lock-free validation does not refuse on the shared agent name first:
+    the tolerated-change classifier is genuinely reached, and its
+    same-agent rule is what sends the create back to revalidate.
+    """
     project, _repository, _remote = make_project(tmp_path)
-    made = create(project, slot="slot02", agent="codex-3", branch="codex/task2")
+    made = create(
+        project, slot="slot02", agent="codex-3", branch=None, slot_type="validate"
+    )
     assert made.returncode == 0, made.stderr
     _treat_every_event_as_settled(monkeypatch)
+    classifier_calls: list[int] = []
+    refresh = cli._heartbeat_only_refresh
+
+    def spied(*args: object, **kwargs: object) -> object:
+        classifier_calls.append(1)
+        return refresh(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "_heartbeat_only_refresh", spied)
     ledger = _LockLedger(monkeypatch, project)
     writes: list[int] = []
     ledger.during_validation = _concurrent_heartbeat(
@@ -819,7 +898,8 @@ def test_a_heartbeat_from_the_target_agent_is_not_tolerated(
     rc = cli.main(_create_argv(project))
 
     captured = capsys.readouterr()
-    # Revalidation judged the current registry: codex-3 already owns a slot.
-    assert rc == 3
-    assert "already owns slot" in captured.err
-    assert _row(project, "slot03") is None
+    assert rc == 0, captured.err
+    # The classifier ran and refused toleration: a second round validated.
+    assert classifier_calls
+    assert ledger.count("validate", held=False) == 2
+    assert _row(project, "slot03") is not None

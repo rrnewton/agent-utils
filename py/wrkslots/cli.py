@@ -7323,17 +7323,18 @@ def _heartbeat_only_refresh(
 ) -> tuple[list[ActiveState], list[ArchiveState]] | None:
     """Refresh prepared states across another slot's heartbeat, or refuse (#1808-B).
 
-    Returns the current states (read as shard snapshots, never by loading an
-    event log) only when every registry change since ``before`` is provably
-    one or more ``ttl-renewed`` heartbeats of other slots: the configuration
-    is unchanged, no journal, seal, quarantine or image record moved, existing
+    Returns the prepared states folded forward over the appended events
+    only when every registry change since ``before`` is provably one or
+    more ``ttl-renewed`` heartbeats of other slots: the configuration is
+    unchanged, no journal, seal, quarantine or image record moved, existing
     event files are untouched, the appended events chain from the prepared
-    tip (each link verified) and name only other slots, the archives are
-    record-identical, and every changed active record differs from its
-    prepared record solely in ``heartbeat_at``. A heartbeating slot that
-    shares the target's agent, a requested branch or a checkout path is
-    refused like any other change. Anything else returns None and the caller
-    revalidates from scratch: fail-closed, always.
+    tip (each link and revision verified, each recorded record differing
+    from its predecessor solely in ``heartbeat_at``), the archives are
+    record-identical, and the ACTIVE shards equal the folded states
+    exactly. A heartbeating slot that shares the target's agent, a
+    requested branch or a checkout path is refused like any other change.
+    Anything else returns None and the caller revalidates from scratch:
+    fail-closed, always.
     """
 
     if before.config_sha256 != after.config_sha256:
@@ -7353,6 +7354,16 @@ def _heartbeat_only_refresh(
             continue
         else:
             return None
+    # Fold the appended events onto the prepared (log-derived) states, then
+    # require the shard files to equal that fold exactly. Both heartbeat
+    # editions append the event before writing the shard, so a heartbeat
+    # that dies in between leaves the shard one revision behind the log;
+    # trusting the shard there would append a non-continuing event and
+    # break every later replay. A lagging (or otherwise divergent) shard
+    # means no toleration: the caller revalidates from the log.
+    folded_by_machine: dict[str, ActiveState] = {
+        item.machine: item for item in prepared_states
+    }
     heartbeating: set[str] = set()
     for machine, filenames in added_events.items():
         prefix = f"EVENTS.{machine}/"
@@ -7367,6 +7378,9 @@ def _heartbeat_only_refresh(
         ]
         if sorted(filenames) != expected:
             return None
+        prepared_state = folded_by_machine.get(machine)
+        if prepared_state is None:
+            return None
         directory = _event_directory(config, machine)
         try:
             tip_path = directory / prior[-1]
@@ -7378,6 +7392,8 @@ def _heartbeat_only_refresh(
                 _as_str(claimed.get("previous_sha256"), "append-only event.previous_sha256"),
             )
             previous = _as_str(tip["sha256"], "append-only event.sha256")
+            records = {record.slot: record for record in prepared_state.slots}
+            revision = prepared_state.revision
             for sequence, filename in enumerate(sorted(filenames), start=len(prior) + 1):
                 event = _event_from_path(directory / filename, machine, sequence, previous)
                 previous = _as_str(event["sha256"], "append-only event.sha256")
@@ -7386,11 +7402,53 @@ def _heartbeat_only_refresh(
                 payload = _as_mapping(event["payload"], "append-only event.payload")
                 if payload.get("action") != "ttl-renewed" or payload.get("slot") == slot:
                     return None
-                heartbeating.add(_as_str(payload.get("slot"), "append-only event.payload.slot"))
+                heartbeating_slot = _as_str(
+                    payload.get("slot"), "append-only event.payload.slot"
+                )
+                prior_record = records.get(heartbeating_slot)
+                raw_record = payload.get("record")
+                if prior_record is None or raw_record is None:
+                    return None
+                folded_record = _record_from_obj(
+                    raw_record, "append-only active-record event.record"
+                )
+                if folded_record.slot != heartbeating_slot or folded_record.machine != machine:
+                    return None
+                if folded_record.agent == agent:
+                    return None
+                for checkout in folded_record.checkouts:
+                    if checkout.branch in branches or checkout.path in paths:
+                        return None
+                if payload.get("revision") == revision + 1 and payload.get("previous_revision") == revision:
+                    # Not yet in the prepared state: fold it forward, and
+                    # only a heartbeat_at change may separate it from its
+                    # predecessor.
+                    if dataclasses.replace(
+                        prior_record, heartbeat_at=folded_record.heartbeat_at
+                    ) != folded_record:
+                        return None
+                    records[heartbeating_slot] = folded_record
+                    revision += 1
+                elif payload.get("revision") is not None and payload.get("revision") <= revision:
+                    # The prepared validation already read this heartbeat
+                    # (it landed while the validation ran): the prepared
+                    # record must be exactly the event's record.
+                    if prior_record != folded_record:
+                        return None
+                else:
+                    return None
+                heartbeating.add(heartbeating_slot)
+            folded_by_machine[machine] = ActiveState(
+                machine,
+                revision,
+                tuple(
+                    records[record.slot] for record in prepared_state.slots
+                ),
+            )
         except (Refusal, StateError, OSError):
             return None
     try:
-        refreshed_states = [
+        shard_states = [
             _load_active_snapshot(config, machine) for machine in _state_machines(config)
         ]
         refreshed_archives = [
@@ -7404,28 +7462,13 @@ def _heartbeat_only_refresh(
     for refreshed in refreshed_archives:
         if list(prepared_archive_by_machine[refreshed.machine].records) != list(refreshed.records):
             return None
-    prepared_by_machine = {item.machine: item for item in prepared_states}
-    if {item.machine for item in refreshed_states} != set(prepared_by_machine):
+    shard_by_machine = {item.machine: item for item in shard_states}
+    if set(shard_by_machine) != set(folded_by_machine):
         return None
-    for refreshed in refreshed_states:
-        prepared_records = {record.slot: record for record in prepared_by_machine[refreshed.machine].slots}
-        refreshed_records = {record.slot: record for record in refreshed.slots}
-        if set(prepared_records) != set(refreshed_records):
+    for machine, folded in folded_by_machine.items():
+        if shard_by_machine[machine] != folded:
             return None
-        for name, current in refreshed_records.items():
-            prior_record = prepared_records[name]
-            if prior_record == current:
-                continue
-            if name not in heartbeating:
-                return None
-            if dataclasses.replace(prior_record, heartbeat_at=current.heartbeat_at) != current:
-                return None
-            if current.agent == agent:
-                return None
-            for checkout in current.checkouts:
-                if checkout.branch in branches or checkout.path in paths:
-                    return None
-    return refreshed_states, refreshed_archives
+    return [folded_by_machine[item.machine] for item in prepared_states], refreshed_archives
 
 
 def _run_prevalidated_mutation(
