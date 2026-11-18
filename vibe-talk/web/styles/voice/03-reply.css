@@ -125,6 +125,15 @@
   z-index: 1;
 }
 
+/* The box keeps the chip's room at its end (`#1867
+   vibe-talk-save-draft-chip-covers-text`): typed words wrap before they
+   reach the chip, at any width or type size, and the chip is never over
+   the text. The room follows the chip: its words, its padding and the
+   inset it stands in from the box's edge. */
+#channel-composer #channel-compose-text {
+  padding-inline-end: 7rem;
+}
+
 #channel-composer:has(> #draft-sync-offer:not([hidden])) #channel-save-draft {
   display: none;
 }

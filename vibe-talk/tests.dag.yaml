@@ -2529,6 +2529,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1867 vibe-talk-save-draft-chip-covers-text`: the Save draft chip never
+  # covers typed words, at a phone's and a desk's size, against the real server.
+  - group: check
+    job: save-draft-chip-browser
+    desc: the Save draft chip clear of the box's text area, in current Chromium at 412x915 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/save_draft_chip_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 600
+    cpu_timeout: 240
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#621 send-double-check` in the browser engine at 393x852: the Sending card mid-send
   # shows tick one green (server accepted) and tick two gray (upstream held); the tap readout
   # shows durations from the Send tap.
