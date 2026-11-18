@@ -334,7 +334,20 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   function visibleBand(area: HTMLElement): { head: number; foot: number } {
     const box = area.getBoundingClientRect();
     const visual = typeof window !== "undefined" ? window.visualViewport : null;
-    return visual ? { head: 0, foot: visual.height } : { head: box.top, foot: box.bottom };
+    const band = visual ? { head: 0, foot: visual.height } : { head: box.top, foot: box.bottom };
+    // The bottom chrome (the dock bar) stands over the foot of the screen: a composer
+    // kept merely inside the visual viewport can still sit under it with its Send row
+    // cut off (`#1839`, liaison on the first shots). The band ends at the bar's top.
+    try {
+      const dock = el("dock");
+      if (dock) {
+        const top = dock.getBoundingClientRect().top;
+        if (top > band.head && top < band.foot) band.foot = top;
+      }
+    } catch (_error) {
+      // No dock to measure: the viewport's own foot is the band's.
+    }
+    return band;
   }
 
   /** Whether `rect` stands even partly in `band`. */

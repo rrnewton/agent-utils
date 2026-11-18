@@ -264,8 +264,19 @@ COMPOSER_JS = """() => {
   if (!box || !area) return null;
   const rect = box.getBoundingClientRect();
   const vv = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  // The whole composer: the container through its Send row, against the visible
+  // area above the bottom chrome (`#1839`, the liaison's measure).
+  const whole = document.getElementById('channel-composer');
+  const send = document.getElementById('channel-send');
+  const dock = document.getElementById('dock');
+  const dockTop = dock ? dock.getBoundingClientRect().top : 0;
+  const foot = dockTop > 0 && dockTop < vv ? dockTop : vv;
+  const wholeRect = whole ? whole.getBoundingClientRect() : rect;
+  const sendRect = send ? send.getBoundingClientRect() : rect;
   return { top: rect.top, bottom: rect.bottom, vv, scrollTop: area.scrollTop,
-           focused: document.activeElement === box };
+           focused: document.activeElement === box,
+           wholeTop: wholeRect.top, wholeBottom: wholeRect.bottom,
+           sendBottom: sendRect.bottom, foot };
 }"""
 
 IN_VIEW_JS = """() => {
@@ -306,6 +317,11 @@ class Walk:
         self.check(state["top"] >= -1 and state["bottom"] <= state["vv"] + 1,
                    f"{why}: the composer left the visual viewport "
                    f"(top {state['top']:.0f}, bottom {state['bottom']:.0f}, viewport {state['vv']:.0f})")
+        self.check(state["wholeTop"] >= -1 and state["wholeBottom"] <= state["foot"] + 1
+                   and state["sendBottom"] <= state["foot"] + 1,
+                   f"{why}: the whole composer was not above the bottom chrome "
+                   f"(whole {state['wholeTop']:.0f}..{state['wholeBottom']:.0f}, "
+                   f"Send bottom {state['sendBottom']:.0f}, visible foot {state['foot']:.0f})")
         # Following the foot as new rows land moves scrollTop down the list; the defect
         # moved it UP into the scrollback (3508 -> 1291 in the owner's trace). Only an
         # upward jump, or losing the composer, fails here.

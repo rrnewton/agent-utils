@@ -2242,9 +2242,15 @@ document.addEventListener("input", (event) => {
   }
 }, true);
 function heldComposer() {
-  if (isComposer(document.activeElement)) return document.activeElement;
-  if (heldComposerField && Date.now() - heldComposerInputAt < COMPOSER_HOLD_MS) return heldComposerField;
-  return null;
+  const field = isComposer(document.activeElement) ? document.activeElement
+    : heldComposerField && Date.now() - heldComposerInputAt < COMPOSER_HOLD_MS ? heldComposerField
+    : null;
+  if (!field) return null;
+  // The whole composer, not the field alone: its container carries the Send row under
+  // the box, and keeping only the field in view left that row under the bottom bar
+  // (`#1839`). A field with no container around it is its own box.
+  const box = field.parentElement;
+  return box && /composer/.test(`${box.id} ${box.className}`) ? box : field;
 }
 
 /**
