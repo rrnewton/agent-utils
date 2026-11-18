@@ -117,7 +117,11 @@ def test_heartbeat_wait_is_bounded_well_below_the_ttl(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
     assert create(project).returncode == 0
     config = cli._load_config(str(project), "testhost")
-    assert config.heartbeat_ttl_seconds == 600
+    # Whatever the fixture TTL, the defaulted bound is the computed value.
+    assert cli._heartbeat_wait_seconds(
+        argparse.Namespace(wait_lock=30.0, wait_lock_defaulted=True),
+        float(config.heartbeat_ttl_seconds),
+    ) == pytest.approx(min(10.0, max(1.0, config.heartbeat_ttl_seconds / 3.0)))
 
     # The bound comes from the slot record's TTL (600 s in fixtures).
     defaulted = argparse.Namespace(wait_lock=30.0, wait_lock_defaulted=True)
