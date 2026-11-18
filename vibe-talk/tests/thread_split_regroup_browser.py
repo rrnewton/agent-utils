@@ -249,7 +249,6 @@ def row_ids(page: Page) -> list[str]:
 def regroup_walk(walk: Walk) -> None:
     page = walk.page
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-    page.click("#view-switch")
     walk.wait_for("() => !!document.querySelector('#discord-log > li')", "the channel did not open")
     page.select_option("#thread-select", f"thread:{THREAD_ID}")
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li').length === {1 + len(PART_IDS)}",
@@ -335,6 +334,12 @@ def main() -> int:
                         script += "localStorage.setItem('vibe-talk.voice.combine', '0');"
                         page.add_init_script(script)
                         page.goto(url, wait_until="load")
+                        # `#1781`: a token-seeded first run meets the Welcome; dismiss it.
+                        try:
+                            page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                            page.click("#welcome-start")
+                        except Exception:
+                            pass
                         walk = Walk(page, label, width, args.screenshots, args.report)
                         regroup_walk(walk)
                         walk.check(not errors, f"the page threw: {errors}")
