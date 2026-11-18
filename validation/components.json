@@ -411,6 +411,7 @@
         "py/wrkslots/tests/test_adopt_write_rust.py",
         "py/wrkslots/tests/test_agentctl_liveness_probe.py",
         "py/wrkslots/tests/test_archive_state_rust.py",
+        "py/wrkslots/tests/test_audit_cost.py",
         "py/wrkslots/tests/test_audit_lock_free.py",
         "py/wrkslots/tests/test_audit_state_rust.py",
         "py/wrkslots/tests/test_batch_lock_scope.py",
