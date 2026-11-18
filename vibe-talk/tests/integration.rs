@@ -83,6 +83,9 @@ mod hidden_channels;
 #[path = "ingest.rs"]
 mod ingest;
 
+#[path = "labels.rs"]
+mod labels;
+
 #[path = "live.rs"]
 mod live;
 
