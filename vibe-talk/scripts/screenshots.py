@@ -1342,10 +1342,13 @@ def settle_ui(driver: Driver, keep_status: bool = False) -> None:
     `keep_transient` and skip this. Error banners are deliberately untouched: they are
     evidence, not clutter.
     """
-    if bool(driver.js("window.__visible('discuss-panel')")):
-        driver.page.keyboard.press("F1")
-    else:
-        driver.page.keyboard.press("Escape")
+    # Only when a popup is actually up: Escape also closes whole screens (Settings), and
+    # dismissing one of those would break the next state's walk, not settle this one.
+    if bool(driver.js("window.__visible('view-cards') || window.__visible('docs-fetch-menu')")):
+        if bool(driver.js("window.__visible('discuss-panel')")):
+            driver.page.keyboard.press("F1")
+        else:
+            driver.page.keyboard.press("Escape")
     # The transient status pill ("Ready." and its kin) through its own dismiss control —
     # unless the scene is photographing that line, which its expectations then name.
     if not keep_status and bool(driver.js("window.__visible('status-line')")):
