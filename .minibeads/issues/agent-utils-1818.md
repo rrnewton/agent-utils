@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-thread-drill-in-keeps-anchor: thread drill-in keeps the clicked message at the same viewport offset'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-drillanchor
@@ -8,7 +8,8 @@ labels:
 - vibe-talk
 - ui
 created_at: 2026-11-17T20:01:38-05:00
-updated_at: 2026-11-17T20:01:38-05:00
+updated_at: 2026-11-18T01:30:22-05:00
+closed_at: 2026-11-18T01:30:22-05:00
 ---
 
 # Description
@@ -36,3 +37,7 @@ Entry points that carry no channel message (the thread picker, thread-list cards
 # Notes
 
 Owner-priority gate: deployed on landing. Lane mu-drillanchor on branch mu-drillanchor/1818.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 6c0f9843346ee77910dc75c3c47e1c76ba071c06 (gated head 2949657f, owner gate validate: OK; replay tree matched the verified combined tree on c037d086). Drilling into a thread from a message row's Thread(n) button now measures that message's viewport top at the click and restores it in the thread at the same screen place — compensating for the thread header card above the scroller, clamped fully visible just below the floating line (by its drawn top, date rule included) where it stood too near the top — and keeps it there through late layout with a ResizeObserver keeper until the reader scrolls or leaves; the root anchors when the root was clicked, Back is unchanged, and the picker, cards and unread chip keep their landings. Chromium tests at 412x915 and 1280x800 assert the viewport offsets (mid reply 300px to 300px; late growth held; Back exact), with a failing negative control; the screenshot matrix and marked before/after pairs (phone 300.3 to 300.4px, desktop 299.8 to 299.6px) were reviewed by the lane and confirmed by coordb.
