@@ -2854,6 +2854,9 @@ steps:
     desc: the focused thread composer stays in the visual viewport through dictation, live arrivals and a refresh, in current Chromium at 412x915 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/composer_stays_browser.py
+    job: refresh-replaces-browser
+    desc: a no-change poll refresh (restamped observed_ms only) replaces zero channel rows and zero thread cards, in current Chromium at 412x915 and 1280x800
+    cmd: cd vibe-talk && python3 tests/refresh_replaces_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 360
@@ -2861,6 +2864,7 @@ steps:
     hint:
       resources: {browser: 1}
       est_duration_s: 7
+      est_duration_s: 100
       classification: latency-bound
   - group: check
     job: thread-drill-anchor-browser

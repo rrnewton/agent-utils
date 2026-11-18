@@ -40,6 +40,12 @@ test("`#624 voice-page-modularity`: the channel store's rules hold from the modu
   assert.equal(sameMessage({ id: "1", content: "x" }, { id: "1", content: "x" }), true);
   assert.equal(sameMessage({ content: "x", id: "1" }, { id: "1", content: "x" }), false, "fields in another order are another copy");
   assert.equal(sameMessage(undefined, undefined), false, "nothing held is never the arriving copy");
+  // `#1839`: the server version alone is not a change - a copy fetched upstream is
+  // stamped with its read's start, so two serves of one message differ only there.
+  assert.equal(sameMessage({ id: "1", content: "x", observed_ms: 100 }, { id: "1", content: "x", observed_ms: 200 }), true,
+    "a re-observed copy was taken for a changed message");
+  assert.equal(sameMessage({ id: "1", content: "x", observed_ms: 100 }, { id: "1", content: "y", observed_ms: 100 }), false,
+    "a changed message was taken for a re-observed one");
 });
 
 test("`#624 voice-page-modularity`: folding a page into a store, from the module alone: a newest page's window, older pages, removals below it", () => {
@@ -53,6 +59,12 @@ test("`#624 voice-page-modularity`: folding a page into a store, from the module
   mergeIntoCanon(canon, "messages", [m("3", 3), m("5", 5)], false, true, () => true);
   assert.deepStrictEqual(canon.messages.map((x) => x.id), ["1", "2", "3", "5"]);
   assert.equal(canon.messages[2], kept, "a copy held word for word did not keep the store's object");
+  // `#1839`: a newest page that only re-observed its rows (a fresh `observed_ms` on
+  // each, as a provider fetch stamps them) keeps every store object, so the rows
+  // drawn from them are kept too and a no-change refresh replaces zero rows.
+  const beforeRows = [...canon.messages];
+  mergeIntoCanon(canon, "messages", beforeRows.map((x) => ({ ...x, observed_ms: 9999 })), false, false, () => true);
+  assert.deepStrictEqual(canon.messages, beforeRows, "a re-observed page replaced a store object");
   // ...but a message removed upstream below the window goes with the next newest page.
   canon.removed.set("1", 9);
   mergeIntoCanon(canon, "messages", [m("3", 3), m("5", 5)], false, true, () => true);

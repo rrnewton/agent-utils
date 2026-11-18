@@ -149,9 +149,25 @@ export function inViewOf(message: Message, view: string, thread: string | null, 
   return !id || (message.thread as { is_root?: unknown }).is_root === true || id === scope;
 }
 
-/** Whether `held` is `arriving`, word for word: the same message, to draw and to keep. */
+/**
+ * A copy with its server version left off: `observed_ms` says when a read observed the
+ * message (`#473`), and a copy fetched upstream is stamped with that read's start, so
+ * two serves of the same message differ in it alone. It is the copy-choice rules'
+ * field, read directly there; it is not part of the message to draw or to keep.
+ */
+const withoutVersion = (copy: unknown): unknown => {
+  if (!copy || typeof copy !== "object") return copy;
+  const { observed_ms: _version, ...rest } = copy as Record<string, unknown>;
+  return rest;
+};
+
+/**
+ * Whether `held` is `arriving`, word for word but for the server version above: the
+ * same message, to draw and to keep (`#1839`: a refresh that only re-observed its
+ * rows is no change, and keeps the store's objects - and so their rows).
+ */
 export const sameMessage = (held: unknown, arriving: unknown): boolean =>
-  held !== undefined && JSON.stringify(held) === JSON.stringify(arriving);
+  held !== undefined && JSON.stringify(withoutVersion(held)) === JSON.stringify(withoutVersion(arriving));
 
 /** The store of the channel the page reads: which one is current, and opening another. */
 export interface ChannelStore {

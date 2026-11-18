@@ -741,9 +741,51 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     return `Could not load older threads: ${threadPages.error.replace(/[.\s]+$/, "")}.`;
   }
 
+  /**
+   * What a card was built from, stamped on it as built (`#1839`): the summary without
+   * its server version (`observed_ms` is restamped on every serve, as on a message),
+   * and the counts and read state the tally gave it. A card whose stamp still matches
+   * is the card that would be built, so a refresh that changed nothing keeps its node.
+   */
+  type CardStamp = string;
+  const cardStampOf = (row: HTMLElement): CardStamp | undefined =>
+    (row as { cardStamp?: CardStamp }).cardStamp;
+  const versionless = (value: unknown): string =>
+    JSON.stringify(value, (key, held) => (key === "observed_ms" ? undefined : held)) || "";
+
   function threadCards(summaries: readonly unknown[]): HTMLElement[] {
     const tally = deps.replyTally();
-    return deps.withPendingThreads(summaries).map((summary: unknown) => threadCard(summary, tally));
+    // Keyed reuse (`#1839`): the cards now on the list, by thread, stand for a summary
+    // whose stamp still matches; the rest are built as before. Gone threads' cards are
+    // left out of the answer, and the caller's replaceChildren drops them.
+    const held = new Map<string, HTMLElement[]>();
+    const list = el("thread-list");
+    if (list) {
+      for (const row of [...list.children]) {
+        const id = row.getAttribute("data-context-id");
+        if (!id) continue;
+        const rows = held.get(id);
+        if (rows) rows.push(row as HTMLElement);
+        else held.set(id, [row as HTMLElement]);
+      }
+    }
+    return deps.withPendingThreads(summaries).map((summary: unknown) => {
+      const id = String((summary as { id: unknown }).id);
+      const candidates = held.get(id);
+      const row = candidates ? candidates.shift() : undefined;
+      if (row && cardStampOf(row) === cardStamp(summary, tally)) return row;
+      return threadCard(summary, tally);
+    });
+  }
+
+  /** The stamp of the card `summary` would build now, from its summary and the tally. */
+  function cardStamp(summary: unknown, tally: unknown): CardStamp {
+    const id = String((summary as { id: unknown }).id);
+    const choice = threadChoice(id, summary as never);
+    const unread = deps.sideCardUnread(choice, tally);
+    const size = deps.cardMessageCount(choice, tally);
+    return [versionless(summary), unread, deps.sideCardReplies(choice, tally),
+      size.messages, size.exact, deps.threadIsRead(choice, unread)].join("|");
   }
 
   function threadCard(summary: unknown, tally: unknown): HTMLElement {
@@ -777,6 +819,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     (row as { cardMessagesExact?: boolean }).cardMessagesExact = size.exact;
     deps.paintLitCard(row, id);
     deps.searchable(row, title.textContent || "");
+    (row as { cardStamp?: CardStamp }).cardStamp = cardStamp(summary, tally);
     return row;
   }
 
