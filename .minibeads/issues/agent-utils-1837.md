@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-status-pill-avoids-text: the status pill and freshness line must not cover readable text or controls'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-pilltext
@@ -44,3 +44,7 @@ Design note sent to coordb before coding (this lane codes only on approval). Sum
 Design note first, then implement on coordb approval (owner-priority gate, deployed on landing). Nested worktree on branch mu-pilltext/1837; screenshots and validation follow the standing owner-UI matrix and the lane's validation steps.
 
 Known limit (coordb, 2026-11-18): the freshness line's stale/offline/failed wording is a warning and persists while it is true, so while it stands it can still cover the first card at the head of the list. The current ("Live · updated") wording is idle information and now takes itself away, which covers the common case; app landings already measure the pill while it is up. A scroll-padding clearance was tried and dropped: it fought the list's own place-keeping (the collapsed-lines keeper moved a row by the clearance), and auto-away covers the common case without it.
+
+## Resolution
+
+[watermelon-full-preview] Landed in two commits: (a) 0f7982ba — while the Welcome is up (first run or re-opened) the status pill waits (visibility hidden under data-screen="welcome"), so "Ready." never covers its text and expires behind it; the firstrun walk asserts the wait and gained the two missing #1781 shots (phone welcome-from-settings, desk no-channel guide). (b)+(c)+(d) b9a0889f (verified-tree landing over an overlap on fixture.mjs/main.js; combined tree checked in a detached worktree) — a current freshness pill takes itself away after 7s while stale/offline/failed wording persists; idle status confirmations ("Ready.") dismiss after 2.5s against 6s for action/progress words; and the desk at-hit state ("No more hits on the server") is proven already clear by the #1813 wait, now asserted in the server-hits walk at phone and desk sizes. Timing tests use fake timers and state transitions only; the full module glob passed 3245/3245 and the page suite 2557/2557; gate passed on rerun of a transient port-collision step. Change-specific screenshots are in /tmp/mu-pilltext-dynamic (change-* live-gone/stale/action pairs at phone and desk, light and dark; *-no-more-hits-pill-clear), before/after Welcome shots in /tmp/mu-pilltext-a-shots-before and /tmp/mu-pilltext-a-shots-after. Known limit stands as noted above: a persisting stale/offline warning can still cover the first card while it is true.
