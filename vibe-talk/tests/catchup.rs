@@ -1296,3 +1296,81 @@ async fn a_malformed_followup_body_answers_json_never_plain_text() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_followup_find_reaches_the_askers_message_after_the_summary_window() {
+    // `#1858`: the summary is saved over the first three messages with a
+    // two-message window; the owner's "where I ask" message lands after the
+    // summary's through_id, followed by newer chat that pushes it out of
+    // the newest window. The follow-up must still be shown that message
+    // (cache-only), be told the find rule, and cite it.
+    let text = testing::config_toml() + "\n[summaries]\ncatchup_window_messages = 2\n";
+    let mut messages: Vec<Message> = (0..3).map(|seq| message(seq, None, false)).collect();
+    let mut target = message(4, None, false);
+    target.content = "what is the upshot of the transitive provenance closure work?".to_owned();
+    let target_id = target.id.as_str().to_owned();
+    messages.push(message(3, None, false));
+    messages.push(target);
+    messages.push(message(5, None, false));
+    messages.push(message(6, None, false));
+    let through_id = messages[2].id.as_str().to_owned();
+    let later: Vec<Message> = messages.split_off(3);
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) = cached_state(&text, backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state.clone());
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    summarizer.answer_with("first point");
+    let (status, summary) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    assert_eq!(
+        summary["window"]["through_id"],
+        json!(through_id),
+        "the summary window ends before the target: {summary}"
+    );
+
+    // The rest of the channel lands, the target among it; the cache holds it.
+    backend
+        .messages
+        .lock()
+        .expect("messages")
+        .extend(later.iter().cloned());
+    fill(&state, TimelineView::Flat, None).await;
+
+    summarizer.answer_with(&format!("You asked that here [m:{target_id}]."));
+    let reads = backend.reads();
+    let wire = "{\"thread_id\":null,\"text\":\"Find the message where I ask about upshot of the transitive provenance closure work.  What's the binary TCB\"}";
+    let (status, _content_type, raw) = post_raw(
+        &app,
+        &format!("{channel_path}/messages"),
+        Some(WRITE_TOKEN),
+        wire,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raw}");
+    assert_eq!(backend.reads(), reads, "the follow-up read upstream");
+    let body: Value = serde_json::from_str(&raw).expect("json answer");
+    let answer = body["agent"]["text"].as_str().expect("agent text");
+    assert!(
+        answer.contains(&format!("m=discord:{WRITE_CHANNEL}:{target_id}")),
+        "the answer does not link the asker's message: {answer}"
+    );
+    let calls = summarizer.prompt_calls();
+    let prompt = &calls.last().expect("a follow-up call").1;
+    let target_line = prompt
+        .lines()
+        .find(|line| line.contains(&target_id))
+        .expect("the target message in the prompt");
+    assert!(
+        target_line.contains("transitive provenance closure"),
+        "the target line is not the asker's message: {target_line}"
+    );
+    assert!(
+        prompt.contains("answer SHORT") && prompt.contains("[OWNER]"),
+        "the find rule is missing from the prompt: {prompt}"
+    );
+}

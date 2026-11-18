@@ -3728,6 +3728,29 @@ pub async fn catchup_followup(
             state.config.summaries.catchup_window_messages,
         ))
         .await?;
+    // `#1858`: the context must span from the summary's window through the
+    // newest held message. A message the owner asks to find can sit after
+    // the summary's through_id yet older than the newest window, where a
+    // newest-only fetch never shows it; when the through message is not in
+    // what was fetched, step the (still cache-only) walk back until it is
+    // or the recap bound is reached.
+    let fetched = match summary.window.through_id.as_ref() {
+        Some(through)
+            if thread_id.is_none() && !fetched.messages.iter().any(|held| &held.id == through) =>
+        {
+            crate::read_reason::ReadReason::Discuss
+                .scope(ops::catchup_fetch(
+                    &state,
+                    Scope::Write,
+                    &channel_id,
+                    view,
+                    thread_id,
+                    ops::MAX_RECAP_MESSAGES,
+                ))
+                .await?
+        }
+        _ => fetched,
+    };
     let owner = crate::owner::Owner::of(&state);
     let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
     let context_ms = u64::try_from(context_began.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -3747,6 +3770,16 @@ pub async fn catchup_followup(
     }
     prompt.push_str("\n\nThe owner's new question:\n");
     prompt.push_str(&question);
+    // `#1858`: a find-the-message question wants the one message, not a
+    // second summary — and for "where I ask", the owner's own message, not
+    // a reply about it. Stated on every follow-up, as the summary's own
+    // instruction is.
+    prompt.push_str(
+        "\n\nIf the question asks you to find a specific message — \"find the message where I ask ...\" \
+         or similar — answer SHORT: name that one message first and cite it, quote its key line, and \
+         stop. Do not re-summarize the window. When the owner says \"where I ask\", the message wanted \
+         is the owner's own [OWNER] message that matches, not a reply about it.",
+    );
     // `#1356 discuss-readonly-tools`: a follow-up may pull more context with the
     // read-only tools, cache only. The channel id rides in the prompt (not the
     // system prompt, which is shared with the first summary) so the model can
