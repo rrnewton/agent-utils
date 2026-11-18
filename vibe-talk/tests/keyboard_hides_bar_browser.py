@@ -534,7 +534,7 @@ def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     page = desk.page
     before = len(posted(api))
     thread = page.evaluate("""() => [...document.getElementById('thread-select').options]
-        .map((o) => o.value).find((v) => !['main', 'flat', 'threads', 'columns', 'all'].includes(v) && v)""")
+        .map((o) => o.value).find((v) => !['main', 'flat', 'threads', 'columns', 'all', 'transcripts'].includes(v) && v)""")
     desk.check(isinstance(thread, str), "the picker offers no thread")
     assert isinstance(thread, str)
     page.select_option("#thread-select", thread)

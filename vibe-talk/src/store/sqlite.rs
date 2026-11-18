@@ -531,21 +531,6 @@ pub const MIGRATIONS: &[&str] = &[
         revision   INTEGER NOT NULL
     ) STRICT;
     ",
-    // v27 — transcript thread classes. `#1608 agent-transcripts-timeline`.
-    // One row per classed day-thread: the durable record the Transcripts
-    // index reads (design section 2.2). Ids and the class only, no text.
-    "
-    CREATE TABLE thread_class (
-        channel_id TEXT    NOT NULL,
-        thread_id  TEXT    NOT NULL,
-        agent      TEXT    NOT NULL,
-        team       TEXT,
-        day        TEXT    NOT NULL,
-        source     TEXT    NOT NULL,
-        decided_ms INTEGER NOT NULL,
-        PRIMARY KEY (channel_id, thread_id)
-    ) STRICT;
-    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -595,6 +580,26 @@ impl SqliteStore {
             .pragma_update(None, "secure_delete", "ON")
             .map_err(backend)?;
         migrate(&connection)?;
+        // `#1608 agent-transcripts-timeline`, under the #1825 rollback rule:
+        // the transcript-class table is additive and OUTSIDE the migration
+        // ladder, so a database this build wrote still opens under an older
+        // binary (which simply never reads the table). One row per classed
+        // day-thread: the durable record the Transcripts index reads
+        // (design section 2.2). Ids and the class only, no text.
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS thread_class (
+                    channel_id TEXT    NOT NULL,
+                    thread_id  TEXT    NOT NULL,
+                    agent      TEXT    NOT NULL,
+                    team       TEXT,
+                    day        TEXT    NOT NULL,
+                    source     TEXT    NOT NULL,
+                    decided_ms INTEGER NOT NULL,
+                    PRIMARY KEY (channel_id, thread_id)
+                ) STRICT;",
+            )
+            .map_err(backend)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             retention,
@@ -5043,6 +5048,16 @@ mod tests {
             );
         }
         let store = SqliteStore::open(&file, Retention::default()).expect("reopen");
+        // The class table is additive, outside the ladder (#1825 rule): the
+        // file still reports the ladder's own version, so an older binary
+        // opens it and simply never reads the table.
+        {
+            let connection = Connection::open(&file).expect("raw open");
+            let version: i64 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, i64::try_from(MIGRATIONS.len()).expect("small"));
+        }
         let rows = store.transcript_threads().await.expect("index");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].thread_id, "1700.0001");

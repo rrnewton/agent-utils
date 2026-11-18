@@ -260,6 +260,14 @@ fn inventory() -> Vec<Route> {
             Read,
             Query("?cap=5", "?cap=soon"),
         ),
+        // `#1608 agent-transcripts-timeline`: reads, store/cache only.
+        route("GET", "/api/v1/transcripts", Read, limit),
+        route(
+            "GET",
+            "/api/v1/transcripts/{channel_id}/{thread_id}",
+            Read,
+            limit,
+        ),
         route("GET", "/api/v1/channels/{channel_id}/digest", Read, limit),
         route(
             "GET",

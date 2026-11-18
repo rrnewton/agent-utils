@@ -2457,12 +2457,22 @@ fn exclude_transcripts(
     }
 }
 
+/// Query parameters for the transcripts routes: a page-size limit, held
+/// to the same shape as every other read's (`?limit=soon` is refused).
+#[derive(Debug, Default, Deserialize)]
+pub struct TranscriptsQuery {
+    /// Maximum entries requested.
+    pub limit: Option<u16>,
+}
+
 /// `GET /api/v1/transcripts`: the Transcripts index — classed day-threads,
 /// newest day first, then agent. Store-only; no upstream read.
 pub async fn transcripts(
     State(state): State<AppState>,
     ReadScope(_caller): ReadScope,
+    Query(query): Query<TranscriptsQuery>,
 ) -> Result<Json<crate::contract::TranscriptsResponse>, ApiError> {
+    let _ = query.limit;
     let channels = ops::channels(&state).await;
     let by_id: std::collections::HashMap<String, crate::model::ChannelInfo> = channels
         .into_iter()
@@ -2496,7 +2506,9 @@ pub async fn transcript_thread(
     State(state): State<AppState>,
     ReadScope(caller): ReadScope,
     Path((channel_id, thread_id)): Path<(String, String)>,
+    Query(query): Query<TranscriptsQuery>,
 ) -> Result<Response, ApiError> {
+    let _ = query.limit;
     let channel_ref = crate::model::ChannelId(channel_id.clone());
     let class = state
         .store
@@ -5716,6 +5728,8 @@ pub const PURGED: &[&str] = &[
     "reply_pointers",
     // `discuss-transcript-persist`.
     "discuss_records",
+    // `#1608 agent-transcripts-timeline`.
+    "thread_class",
     "message_cache",
 ];
 
