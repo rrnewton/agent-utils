@@ -1612,11 +1612,11 @@ const draftSync = createDraftSync({
   transport: {
     getDrafts: async (channel) => {
       if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
-      return api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`);
+      return /** @type {Promise<{drafts: import("../core/outbox/index.ts").SyncedDraft[]}>} */ (api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`));
     },
     putDraft: async (channel, body) => {
       if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
-      return api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "PUT", body });
+      return /** @type {Promise<{draft: import("../core/outbox/index.ts").SyncedDraft | null, replaced: import("../core/outbox/index.ts").SyncedDraft | null}>} */ (api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "PUT", body }));
     },
     deleteDraft: async (channel, body) => {
       if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
