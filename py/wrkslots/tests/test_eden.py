@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from wrkslots import cli as wrkslots_cli
-from wrkslots import eden
+from wrkslots import eden, slotimage
 
 REV = "a" * 40
 DIGEST = "b" * 64
@@ -1287,6 +1287,192 @@ def test_remove_of_an_eden_validate_slot_uses_no_git(
     config_dir = str(slot_path / ".eden-state")
     assert ("eden", "--config-dir", config_dir, "remove", "-y", str(mount)) in daemon.calls
     assert ("eden", "--config-dir", config_dir, "stop") in daemon.calls
+
+
+def test_not_mounted_mounts_parsing() -> None:
+    stdout = "/m/one\n/m/two (not mounted)\n\n/m/three (not mounted)\n"
+
+    assert eden.not_mounted_mounts(stdout) == ("/m/two", "/m/three")
+    assert eden.not_mounted_mounts("/m/one\n") == ()
+
+
+def test_peer_unmount_order_is_deepest_first_within_the_shared_group() -> None:
+    mountinfo = "\n".join(
+        [
+            "1 0 0:1 / /host/mnt ro shared:14071 - fuse.edenfs edenfs rw",
+            "2 0 0:1 / /host/mnt/sub ro shared:14071 - fuse.edenfs edenfs rw",
+            "3 0 0:1 / /host/other/deep/nest ro shared:14071 - fuse.edenfs edenfs rw",
+            "4 0 0:1 / /host/unrelated ro shared:99 - fuse.edenfs edenfs rw",
+            "5 0 0:1 / /host/mnt ro shared:14071 - ext4 /dev/sda rw",
+        ]
+    )
+    entries = slotimage._parse_mount_table(mountinfo)
+
+    order = wrkslots_cli._eden_peer_unmount_order("/host/mnt", entries)
+
+    assert order == ("/host/other/deep/nest", "/host/mnt/sub", "/host/mnt")
+    # Without a shared peer id there are no proven peers.
+    bare = slotimage._parse_mount_table(
+        "1 0 0:1 / /host/mnt ro - fuse.edenfs edenfs rw"
+    )
+    assert wrkslots_cli._eden_peer_unmount_order("/host/mnt", bare) == ()
+
+
+def _fake_peer_table(
+    monkeypatch: pytest.MonkeyPatch, mountinfo: str
+) -> list[list[str]]:
+    entries = slotimage._parse_mount_table(mountinfo)
+    monkeypatch.setattr(
+        slotimage, "verification_table", lambda: entries
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(argv: Sequence[str]) -> str:
+        calls.append(list(argv))
+        return ""
+
+    monkeypatch.setattr(slotimage, "_run_on_host", fake_run)
+    return calls
+
+
+def test_peer_outside_the_managed_root_refuses_and_unmounts_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_peer_table(
+        monkeypatch,
+        "\n".join(
+            [
+                "1 0 0:1 / /managed/mnt ro shared:14071 - fuse.edenfs edenfs rw",
+                "2 0 0:1 / /elsewhere/view ro shared:14071 - fuse.edenfs edenfs rw",
+            ]
+        ),
+    )
+
+    with pytest.raises(wrkslots_cli.Refusal, match="/elsewhere/view"):
+        wrkslots_cli._unmount_eden_peer_group("/managed/mnt", ("/managed",))
+
+    assert calls == []
+
+
+def test_peer_group_under_the_root_unmounts_deepest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_peer_table(
+        monkeypatch,
+        "\n".join(
+            [
+                "1 0 0:1 / /managed/mnt ro shared:14071 - fuse.edenfs edenfs rw",
+                "2 0 0:1 / /managed/mnt/sub ro shared:14071 - fuse.edenfs edenfs rw",
+                "3 0 0:1 / /managed/a/b/c ro shared:14071 - fuse.edenfs edenfs rw",
+            ]
+        ),
+    )
+
+    wrkslots_cli._unmount_eden_peer_group("/managed/mnt", ("/managed",))
+
+    assert calls == [
+        ["umount", "/managed/a/b/c"],
+        ["umount", "/managed/mnt/sub"],
+        ["umount", "/managed/mnt"],
+    ]
+
+
+class _StubEdenNotMounted:
+    """Eden already removed the checkout: list shows it (not mounted)."""
+
+    def __init__(self, mount: Path) -> None:
+        self.mount = str(mount)
+        self.calls: list[tuple[str, ...]] = []
+        self.live = True
+
+    def __call__(self, argv: Sequence[str]) -> tuple[int, str, str]:
+        self.calls.append(tuple(argv))
+        if argv[0] == "sl":
+            return (1, "", f"repository {self.mount} not found")
+        rest = list(argv[3:] if len(argv) > 2 and argv[1] == "--config-dir" else argv[1:])
+        if rest[:2] == ["redirect", "list"]:
+            return (0, "[]", "")
+        if rest[:1] == ["du"] or "du" in argv:
+            return (0, '{"orphaned_redirections": 0}', "")
+        if rest[:1] == ["remove"]:
+            self.live = False
+            shutil.rmtree(self.mount, ignore_errors=True)
+            return (0, "", "")
+        if rest[:1] == ["list"]:
+            if self.live:
+                return (0, f"{self.mount} (not mounted)\n", "")
+            return (0, "", "")
+        return (0, "", "")
+
+
+def test_remove_resumes_when_eden_lists_the_checkout_not_mounted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _direct_config(tmp_path)
+    slot_path = wrkslots_cli._slot_directory(config, "eden-a", "agent")
+    mount = config.eden_mount_root / "agent" / "eden-a"  # type: ignore[operator]
+    identity = wrkslots_cli._read_process_identity(os.getpid())
+    record = wrkslots_cli.ActiveRecord(
+        slot="eden-a",
+        agent="agent-eden-a",
+        task="task-1",
+        purpose="testing",
+        slot_type="agent",
+        machine="node-a",
+        generation=1,
+        created_at="2026-11-15T00:00:00Z",
+        heartbeat_at="2026-11-15T00:00:00Z",
+        heartbeat_ttl_seconds=60,
+        owner=None,
+        coordinator_lease=identity,
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(
+            wrkslots_cli.Checkout(
+                name="main",
+                path=str(mount),
+                repository="/backing/repo",
+                branch=eden.EDEN_BRANCH,
+                start_point=REV,
+                remote=eden.EDEN_REMOTE,
+                remote_url_sha256=DIGEST,
+                landed_ref=eden.EDEN_LANDED_REF,
+                head=REV,
+                containing_remote_refs=(),
+                vcs="eden",
+            ),
+        ),
+    )
+    (slot_path / ".eden-state").mkdir(parents=True)
+    mount.mkdir(parents=True)
+    _write_row(config, record)
+    daemon = _StubEdenNotMounted(mount)
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", daemon)
+    unmounted: list[str] = []
+    monkeypatch.setattr(
+        wrkslots_cli,
+        "_unmount_eden_peer_group",
+        lambda mount, roots: unmounted.append(mount),
+    )
+    journal: dict[str, object] = {
+        "removed": [],
+        "removing": ["main"],
+    }
+    journal_path = tmp_path / "finish.journal"
+
+    result = wrkslots_cli._finish_remove_paths(
+        config,
+        record,
+        journal,
+        wrkslots_cli._GitVcs(),
+        wrkslots_cli._FinishContext(mode="remove", actor="coordinator"),
+        journal_path=journal_path,
+    )
+
+    assert result["removed"] == ["main"]
+    assert not any(call[0] == "sl" for call in daemon.calls)
+    assert not slot_path.exists()
+    assert unmounted == [str(mount)]
 
 
 # ------------------------------------------- discovery guard (#1555)

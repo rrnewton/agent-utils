@@ -44480,6 +44480,87 @@ def _eden_leftover_lines(fields: _EdenCreateFields) -> list[str]:
     ]
 
 
+def _eden_peer_unmount_order(
+    mount: str, entries: Sequence[slotimage.MountEntry]
+) -> tuple[str, ...]:
+    """FUSE peer-group entries of ``mount``, deepest first (#1805).
+
+    Bind propagation copies one Eden mount into every namespace under a
+    shared parent, so the host table can hold many FUSE entries in one
+    ``shared:<id>`` peer group; Eden unmounts only its own and its rmdir
+    then fails EBUSY. The group is every FUSE entry sharing the mount's
+    ``shared:<id>`` peer id. Deepest first so a child copy never pins
+    its parent. An unlisted mount, and one with no peer id, has no
+    proven peers: peer detection is a heuristic, so nothing is ever
+    unmounted on weaker evidence than the shared peer id.
+    """
+
+    target = Path(mount)
+    top: slotimage.MountEntry | None = None
+    for entry in entries:
+        if entry.mount_point == target:
+            top = entry
+    if top is None:
+        return ()
+    peer_id: str | None = None
+    for token in top.propagation.split():
+        if token.startswith("shared:"):
+            peer_id = token
+            break
+    if peer_id is None:
+        return ()
+    group: list[str] = []
+    for entry in entries:
+        if not entry.fstype.startswith("fuse"):
+            continue
+        if peer_id not in entry.propagation.split():
+            continue
+        group.append(str(entry.mount_point))
+    return tuple(
+        sorted(group, key=lambda p: (len(Path(p).parts), p), reverse=True)
+    )
+
+
+def _unmount_eden_peer_group(mount: str, roots: Sequence[str]) -> None:
+    """Unmount every peer-group FUSE entry of ``mount`` on the host (#1805).
+
+    Runs before ``eden remove`` so Eden's rmdir finds no copy pinning the
+    mount. Only points under a managed root (the worktrees directory and
+    its image/bind views) are ever unmounted: peer detection is a
+    heuristic, so any peer outside them refuses, naming the point, and
+    nothing is unmounted. The host table and host-namespace unmount go
+    through ``slotimage``'s host routing, exactly as for image mounts.
+    """
+
+    try:
+        entries = slotimage.verification_table()
+    except slotimage.ImageError as exc:
+        raise Refusal(
+            f"cannot read the host mount table to unmount Eden peers of "
+            f"{mount}: {exc}"
+        ) from exc
+    order = _eden_peer_unmount_order(mount, entries)
+    outside = [
+        point
+        for point in order
+        if not any(eden.is_inside(os.path.realpath(point), os.path.realpath(root)) for root in roots)
+    ]
+    if outside:
+        raise Refusal(
+            "Eden peer(s) of "
+            f"{mount} outside the managed worktrees root: "
+            + ", ".join(outside)
+            + "; unmount them yourself, then retry the remove"
+        )
+    for point in order:
+        try:
+            slotimage._run_on_host(["umount", point])
+        except slotimage.ImageError as exc:
+            raise Refusal(
+                f"cannot unmount Eden peer {point} of {mount}: {exc}"
+            ) from exc
+
+
 def _eden_stop_slot_daemon(
     runner: eden.Runner, config_dir: str, mount: str
 ) -> tuple[str, ...]:
@@ -62530,7 +62611,21 @@ def _finish_remove_paths(
             # <slot>/<name> form) for rows created before it.
             mount = _stored_path(config, checkout.path, "checkout path")
             config_dir = str(slot_path / ".eden-state")
+            # A resumed remove whose earlier attempt already removed the
+            # checkout finds it listed "(not mounted)" (#1805): there is
+            # no working copy to probe, so the salvage precheck (and the
+            # redirect/du probes below) can only fail; go straight to
+            # the removal sequence, which verifies the mount is gone.
+            not_mounted = False
             if record.slot_type == "agent":
+                rc_l, list_out, _e = _eden_runner(
+                    ["eden", "--config-dir", config_dir, "list"]
+                )
+                not_mounted = (
+                    rc_l == 0
+                    and str(mount) in eden.not_mounted_mounts(list_out)
+                )
+            if record.slot_type == "agent" and not not_mounted:
                 rc, status, stderr = _eden_runner(["sl", "-R", str(mount), "status"])
                 if rc != 0:
                     raise Refusal(f"Eden salvage status failed: {stderr.strip()}")
@@ -62552,15 +62647,24 @@ def _finish_remove_paths(
                     for saved in dest.iterdir():
                         if saved.is_file():
                             saved.read_bytes()
-            rc, out, stderr = _eden_runner(
-                ["eden", "--config-dir", config_dir, "redirect", "list",
-                 "--mount", str(mount), "--json"]
+            targets: tuple[str, ...]
+            if not_mounted:
+                targets = ()
+                orphaned_before = 0
+            else:
+                rc, out, stderr = _eden_runner(
+                    ["eden", "--config-dir", config_dir, "redirect", "list",
+                     "--mount", str(mount), "--json"]
+                )
+                if rc != 0:
+                    raise Refusal(f"Eden redirect list failed: {stderr.strip()}")
+                targets = tuple(item.target for item in eden.parse_redirections(out))
+                rc, out, _e = _eden_runner(["eden", "du", "--json", str(mount)])
+                orphaned_before = eden.parse_orphaned_bytes(out) if rc == 0 else 0
+            _unmount_eden_peer_group(
+                str(mount),
+                (str(config.worktrees), *_eden_image_roots(config)),
             )
-            if rc != 0:
-                raise Refusal(f"Eden redirect list failed: {stderr.strip()}")
-            targets = tuple(item.target for item in eden.parse_redirections(out))
-            rc, out, _e = _eden_runner(["eden", "du", "--json", str(mount)])
-            orphaned_before = eden.parse_orphaned_bytes(out) if rc == 0 else 0
             problems = eden.remove_sequence(
                 _eden_runner, config_dir, str(mount), targets,
                 tuple(t for t in targets if Path(t).exists() or Path(t).is_symlink()),

@@ -122,6 +122,23 @@ def checkouts_by_state_dir(
     return tuple(pairs)
 
 
+def not_mounted_mounts(stdout: str) -> tuple[str, ...]:
+    """Mounts ``eden list`` reports as ``(not mounted)`` (#1805).
+
+    Eden keeps a checkout in the list after removing it, rendered as
+    ``<mount> (not mounted)``; such a checkout has no working copy left
+    to probe, so salvage prechecks against it can only fail.
+    """
+
+    suffix = " (not mounted)"
+    found: list[str] = []
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.endswith(suffix):
+            found.append(stripped[: -len(suffix)])
+    return tuple(found)
+
+
 def count_checkouts(runner: Runner, config_dirs: Sequence[str]) -> tuple[str, ...]:
     """All Eden mounts on the host, deduplicated by mount path.
 
