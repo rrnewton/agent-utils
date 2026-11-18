@@ -1114,6 +1114,12 @@ class Driver:
 
     def load(self, with_token: bool, placement: str | None = None) -> None:
         script = STUB_JS
+        # `#1781 vibe-talk-first-run-welcome-channel-default`. No scene here is the first
+        # run itself (that has its own walk), and a load deliberately starts from the
+        # default with every saved preference cleared — which is exactly a first run, so
+        # the Welcome would stand over every scene that follows. Seed it seen, the way
+        # the token below is seeded: a returning reader's device, not a weaker Welcome.
+        script += "\ntry { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}\n"
         if with_token:
             script += (
                 "\ntry { localStorage.setItem('vibe-talk.token', "

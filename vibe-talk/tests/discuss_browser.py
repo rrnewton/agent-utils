@@ -259,14 +259,11 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     page.add_init_script(DEVICE_VOICE)
     page.add_init_script(
         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+    # `#1781 vibe-talk-first-run-welcome-channel-default`. This walk is not the first
+    # run itself (that has its own walk): seed the Welcome seen, as the token is seeded.
+    page.add_init_script(
+        "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}")
     page.goto(base + "/", wait_until="load")
-    # `#1781`: a token-seeded first run meets the Welcome; dismiss it onto the Channel.
-    try:
-        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
-        if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
-            page.click("#welcome-start")
-    except Exception:
-        pass
     page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
     # To the channel view, which carries Discuss: the switch rotates through
     # the views, so press it until the channel picker (channel view only) is up.
