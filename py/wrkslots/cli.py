@@ -29428,10 +29428,10 @@ def _assert_eden_checkout_safe(
         info = eden.parse_info(stdout)
     except eden.EdenError as exc:
         raise Refusal(str(exc)) from exc
-    if info.revision != checkout.head:
-        raise Refusal(
-            f"checkout {checkout.name} revision changed: expected {checkout.head}, found {info.revision}"
-        )
+    # No revision pin (#1702): a clean checkout may sit at any
+    # revision whose drafts accounting accepts; the observed
+    # revision is recorded on the returned checkout and lands in
+    # the finish receipt.  Dirt still refuses.
     rc, stdout, stderr = runner(["sl", "-R", str(path), "status"])
     if rc != 0:
         raise Refusal(f"checkout {checkout.name} Sapling status failed: {stderr.strip()}")
@@ -29441,7 +29441,7 @@ def _assert_eden_checkout_safe(
             f"checkout {checkout.name} has uncommitted Sapling changes ({first}); "
             "preserve them (salvage bundle) before finishing"
         )
-    return checkout
+    return dataclasses.replace(checkout, head=info.revision)
 
 
 def _assert_checkout_safe(
@@ -29457,7 +29457,20 @@ def _assert_checkout_safe(
     expected_ignored: tuple[_IgnoredFile, ...] | None = None,
 ) -> Checkout:
     if checkout.vcs == "eden":
-        return _assert_eden_checkout_safe(config, checkout)
+        safe = _assert_eden_checkout_safe(config, checkout)
+        if accounting and accounting_sink is not None:
+            # Sapling draft accounting (#1702): without this the
+            # finish totals rested entirely on the --validation
+            # text for an Eden slot.
+            mount = _stored_path(config, safe.path, "checkout path")
+            try:
+                acct_entry = eden.classify_drafts(
+                    _eden_runner, str(mount), safe.name, safe.head
+                )
+            except eden.EdenError as exc:
+                raise Refusal(str(exc)) from exc
+            accounting_sink.append(acct_entry)
+        return safe
     path = _stored_path(config, checkout.path, "checkout path")
     _relative, repository = _stored_repository_path(config, checkout.repository)
     head = vcs.verify_existing_worktree(repository, path)
@@ -41486,8 +41499,7 @@ def _eden_cap_section(
 def _edenfs_unit_name(config_dir: str) -> str:
     """The per-slot daemon unit: ``edenfs@<escaped state dir>.service`` (#1423)."""
 
-    escaped = config_dir.lstrip("/").replace("-", "\\x2d").replace("/", "-")
-    return f"edenfs@{escaped}.service"
+    return eden.unit_name(config_dir)
 
 
 def _resolve_eden_backing(config: Config, given: str) -> str:

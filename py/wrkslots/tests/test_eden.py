@@ -277,8 +277,11 @@ def test_eden_checkout_safe_proofs(tmp_path: Path) -> None:
             )
         return clean(argv)
 
-    with pytest.raises(wrkslots_cli.Refusal, match="revision changed"):
-        wrkslots_cli._assert_eden_checkout_safe(config, checkout, moved)
+    # A clean checkout moved to a newer revision is accepted, and
+    # the observed revision is what the finish receipt records
+    # (#1702: no provisioning-revision pin).
+    accepted = wrkslots_cli._assert_eden_checkout_safe(config, checkout, moved)
+    assert accepted.head == "c" * 40
 
 
 def test_trial_record_shape_replays(tmp_path: Path) -> None:
@@ -356,6 +359,19 @@ def test_remove_sequence_cleans_and_stops() -> None:
     )
     assert problems == ()
     assert any("stop" in call for call in calls)
+    # The slot's own daemon unit is stopped, disabled and verified
+    # gone (#1702); no other unit and no shared daemon is named.
+    unit = eden.unit_name("/slot/.eden-state")
+    assert ("systemctl", "--user", "stop", unit) in calls
+    assert ("systemctl", "--user", "disable", unit) in calls
+    assert ("systemctl", "--user", "is-active", unit) in calls
+    assert unit.startswith("edenfs@") and unit.endswith(".service")
+    assert all(
+        "/slot/.eden-state" in eden.unit_name("/slot/.eden-state")
+        or "eden-state" not in call[-1] or call[-1] == unit
+        for call in calls
+        if call[:1] == ("systemctl",)
+    )
 
     def failing(argv: Sequence[str]) -> tuple[int, str, str]:
         if "remove" in argv:
@@ -1754,3 +1770,82 @@ def test_remove_of_an_outside_mount_eden_validate_slot(
     assert not mount.exists()
     config_dir = str(slot_path / ".eden-state")
     assert ("eden", "--config-dir", config_dir, "remove", "-y", str(mount)) in daemon.calls
+
+
+def test_classify_drafts_counts_landed_and_unaccounted() -> None:
+    """Sapling drafts classify from sl evidence alone (#1702)."""
+    landed_node = "a" * 40
+    open_node = "b" * 40
+    loose_node = "c" * 40
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "draft()" in args:
+            return (0, f"{landed_node}\n{open_node}\n{loose_node}\n", "")
+        if "public()" in args:
+            return (0, "landed work\nDifferential Revision: D123\n", "")
+        if "bookmark()" in args:
+            return (0, f"{open_node}\n", "")
+        if landed_node in args:
+            return (0, "landed work\nDifferential Revision: D123\n", "")
+        if open_node in args:
+            return (0, "on review\nDifferential Revision: D999\n", "")
+        return (0, "loose work\n", "")
+
+    entry = eden.classify_drafts(runner, "/slot/checkout", "main", "d" * 40)
+    assert entry["checkout"] == "main"
+    assert [node for node, _s in entry["landed"]] == [landed_node]  # type: ignore[attr-defined]
+    assert [node for node, _s in entry["open"]] == [open_node]  # type: ignore[attr-defined]
+    assert [node for node, _s in entry["unaccounted"]] == [loose_node]  # type: ignore[attr-defined]
+
+
+def test_finish_accounting_counts_eden_drafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finish accounting for an Eden slot counts Sapling drafts (#1702)."""
+    slot = tmp_path / "slot"
+    (slot / "checkout").mkdir(parents=True)
+    config = wrkslots_cli.Config(
+        config_path=tmp_path / ".wrkslots.yml",
+        root=tmp_path,
+        worktrees=tmp_path,
+        control=tmp_path,
+        machine="node-a",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=tmp_path / "live.py",
+    )
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+    landed_node = "a" * 40
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        args = list(argv)
+        if "info" in args:
+            return (
+                0,
+                '{"mount": "/slot/checkout", "state_dir": "/slot/.eden-state/c",'
+                f' "backing_repo": "/backing/repo", "checked_out_revision": "{REV}"}}',
+                "",
+            )
+        if "status" in args:
+            return (0, "", "")
+        if "draft()" in args:
+            return (0, f"{landed_node}\n", "")
+        if "public()" in args:
+            return (0, "landed\nDifferential Revision: D7\n", "")
+        if "bookmark()" in args:
+            return (0, "", "")
+        return (0, "landed\nDifferential Revision: D7\n", "")
+
+    monkeypatch.setattr(wrkslots_cli, "_eden_runner", runner)
+    sink: list[dict[str, object]] = []
+    safe = wrkslots_cli._assert_checkout_safe(
+        config, checkout, wrkslots_cli._GitVcs(),
+        accounting=True, accounting_sink=sink,
+    )
+    assert safe.head == REV
+    assert len(sink) == 1
+    entry = sink[0]
+    assert [node for node, _s in entry["landed"]] == [landed_node]  # type: ignore[attr-defined]
+    assert entry["unaccounted"] == []

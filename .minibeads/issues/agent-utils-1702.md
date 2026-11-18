@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-eden-finish-accounting: Eden slot finish must count Sapling drafts, accept a moved clean checkout, and stop its own daemon unit on remove'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -65,3 +65,36 @@ Reported by a consuming team's lead on 2026-11-15, from finishing one Eden
 
 Related: #1554 part B (Eden remove sequence), #1558 (create-eden journal),
 #1423 (per-slot daemon unit), #1700, #1701.
+
+## Resolution
+
+Done (mu-wsfix), stubbed runners only (no real Eden):
+
+1. `eden.classify_drafts` enumerates the checkout's `draft()`
+   commits (which include the journal's recent heads), reads the
+   public history's Differential Revisions and the bookmarked
+   drafts, and classifies each draft landed (its Differential
+   Revision is in public history), open (bookmarked for review),
+   or unaccounted. `_assert_checkout_safe` now runs it for Eden
+   checkouts under `accounting=True`, so finish totals for an
+   Eden slot rest on `sl` evidence, never on the --validation
+   text alone.
+2. `_assert_eden_checkout_safe` no longer pins the provisioning
+   revision: a clean checkout at any revision is accepted, dirt
+   still refuses, and the observed revision is returned on the
+   checkout so the finish receipt records it (finish already
+   stores the final checkouts).
+3. `eden.remove_sequence` stops and disables the slot's OWN
+   `edenfs@<escaped state dir>.service` unit (`systemctl --user`,
+   name from the one derivation in `eden.unit_name`, which
+   `_edenfs_unit_name` now delegates to) after `eden stop`, and
+   verifies it is gone; a unit that cannot be stopped refuses
+   naming the unit and the exact command. No other slot's unit
+   and no shared daemon is ever named.
+
+Tests: `test_classify_drafts_counts_landed_and_unaccounted`,
+`test_finish_accounting_counts_eden_drafts`, the moved-checkout
+case in `test_eden_checkout_safe_proofs` (now accepted with the
+observed head), and unit stop/disable/verify assertions in
+`test_remove_sequence_cleans_and_stops` — all in
+`py/wrkslots/tests/test_eden.py` with stubbed runners.

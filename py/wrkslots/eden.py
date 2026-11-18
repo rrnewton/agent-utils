@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -519,6 +520,24 @@ def remove_sequence(
     if rc != 0:
         return (f"eden remove failed: {stderr.strip()}",)
     runner(["eden", "--config-dir", config_dir, "stop"])
+    # Stop and disable this slot's OWN daemon unit and prove it gone
+    # (#1702): `eden stop` alone leaves the systemd unit able to
+    # restart the daemon, which the removal census then refuses.
+    # The shared default daemon (no --config-dir) is never named.
+    unit = unit_name(config_dir)
+    for verb in ("stop", "disable"):
+        rc, _out, stderr = runner(["systemctl", "--user", verb, unit])
+        if rc != 0 and "not loaded" not in stderr:
+            return (
+                f"cannot {verb} the slot's daemon unit {unit}: "
+                f"{stderr.strip()}; run 'systemctl --user {verb} {unit}'",
+            )
+    rc, stdout, _err = runner(["systemctl", "--user", "is-active", unit])
+    if stdout.strip() == "active":
+        return (
+            f"daemon unit {unit} is still active after stop; "
+            f"run 'systemctl --user stop {unit}'",
+        )
     rc, stdout, stderr = runner(["eden", "--config-dir", config_dir, "list"])
     if rc != 0:
         return (f"eden list failed after remove: {stderr.strip()}",)
@@ -562,3 +581,83 @@ def verify_removed(
             f"orphaned redirections grew: {orphaned_before} -> {orphaned_after} bytes"
         )
     return tuple(problems)
+
+
+def unit_name(config_dir: str) -> str:
+    """The per-slot daemon unit: ``edenfs@<escaped state dir>.service`` (#1423)."""
+
+    escaped = config_dir.lstrip("/").replace("-", "\\x2d").replace("/", "-")
+    return f"edenfs@{escaped}.service"
+
+
+_DIFFREV_RE = re.compile(r"Differential Revision:\s*(?:\S*/)?D(\d+)")
+
+
+def _diffrev(message: str) -> str | None:
+    match = _DIFFREV_RE.search(message)
+    return match.group(1) if match else None
+
+
+def classify_drafts(
+    runner: Runner, mount: str, checkout_name: str, head: str
+) -> dict[str, object]:
+    """Classify one Eden checkout's Sapling drafts (#1702).
+
+    Drafts are the checkout's non-public commits (`draft()`), which
+    include the journal's recent heads.  A draft is landed when its
+    Differential Revision already appears in public history, open
+    when it carries a bookmark (published for review), and
+    unaccounted otherwise.  The caller's --validation text plays no
+    part: only the `sl` evidence decides.
+    """
+
+    def run(argv: list[str]) -> str:
+        rc, stdout, stderr = runner(argv)
+        if rc != 0:
+            raise EdenError(
+                f"Sapling accounting failed ({' '.join(argv)}): "
+                f"{stderr.strip() or stdout.strip()}"
+            )
+        return stdout
+
+    nodes = [
+        line.strip()
+        for line in run(
+            ["sl", "-R", mount, "log", "-r", "draft()", "-T", "{node}\n"]
+        ).splitlines()
+        if line.strip()
+    ]
+    public_text = run(
+        ["sl", "-R", mount, "log", "-r", "public()", "-l", "1000",
+         "-T", "{desc}\n"]
+    )
+    landed_revs = {
+        match.group(1) for match in _DIFFREV_RE.finditer(public_text)
+    }
+    open_nodes = {
+        line.strip()
+        for line in run(
+            ["sl", "-R", mount, "log", "-r", "bookmark()", "-T", "{node}\n"]
+        ).splitlines()
+        if line.strip()
+    }
+    landed: list[tuple[str, str]] = []
+    opened: list[tuple[str, str]] = []
+    unaccounted: list[tuple[str, str]] = []
+    for node in nodes:
+        message = run(["sl", "-R", mount, "log", "-r", node, "-T", "{desc}"])
+        subject = message.splitlines()[0] if message.splitlines() else ""
+        rev = _diffrev(message)
+        if rev is not None and rev in landed_revs:
+            landed.append((node, subject))
+        elif node in open_nodes:
+            opened.append((node, subject))
+        else:
+            unaccounted.append((node, subject))
+    return {
+        "checkout": checkout_name,
+        "head": head,
+        "landed": landed,
+        "open": opened,
+        "unaccounted": unaccounted,
+    }
