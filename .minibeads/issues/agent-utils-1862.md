@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-floaters-off-text: the remaining floaters never cover the message being read'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -28,3 +28,7 @@ updated_at: 2026-11-18T16:45:00-05:00
 # Notes
 
 Owner-priority, deployed on landing. Builds on #1859 vibe-talk-ready-toast-covers-text; the desktop strip follow is #1866.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 9d953acd on main (gate on 55045c40: one contention flake, approval-card-small-phones CPU-timeout, passed solo and in the exclusive gate rerun). A current Live pill and the device-voice reading confirmations are waited out like the idle Ready; warnings and action words draw. A React-alone strip keeps scroll room at the scrollers' foot while it stands. The desktop strip's follow is #1866, untouched here.
