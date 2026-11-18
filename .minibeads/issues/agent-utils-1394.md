@@ -31,6 +31,10 @@ See the plan file. Layer 1 (stable systems primer, ~2,000 chars, consumer-held) 
 
 Simple version built (owner GO, thread 169): the committed `vibe-talk/prompts/discuss-glossary.md` is the single source of truth for definitions (human-reviewed, one line per term), because a generated file with invented definitions would be served unreviewed and a wrong gloss is worse than an unknown term. Generation is the deterministic per-window selection in `vibe-talk/src/glossary.rs`: unknown-term tallies rank candidates offline, window occurrences rank entries at request time, and the fingerprint combines the files fingerprint with the selected text so any glossary edit invalidates the warm-up. No second generated file is committed; `vibe-talk glossary-report` regenerates the measurement on demand. Tool-call retrieval of definitions is the follow-up, not built here.
 
+## Resolution
+
+[watermelon-full-preview] Simple version landed on main (commits d7dd17af, e9c31f34; gate green, GATE_SLOTS=3 owner priority with recorded local-preflight waiver). Glossary: 35 entries, 547 words, 3,529 chars, ~883 estimated tokens (1 token / 4 chars; no tokenizer in vibe-talk); fits the 6,000-char budget whole, 0 dropped. Fixture window W1 (10 fixed messages): terms covered before 0, after 26 of 26 present. Live-model unknown-terms recount not run (no gateway in repo); the deployed unknown_term_count trend beside warmup_fingerprint decides. Remains open for the broader design (agent list, weekly generation, primer layers, Owner 094) and the tool-call retrieval follow-up.
+
 # Notes
 
 [watermelon-full-preview] #1394 discuss-glossary-preamble, mu-discussgloss. Stays open pending the owner's go.
