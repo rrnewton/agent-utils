@@ -3892,7 +3892,7 @@ def _all_channels_clear(route: Route) -> None:
 
     channel_id = unquote(urlsplit(route.request.url).path.split("/")[-2])
     channel = {"id": channel_id, "label": "lead team" if channel_id != ALL_CHANNELS_SECOND["id"] else "build noise",
-               "writable": True, "alias": None, "added": False}
+               "provider": "discord", "writable": True, "alias": None, "added": False}
     route.fulfill(
         status=200,
         content_type="application/json",
