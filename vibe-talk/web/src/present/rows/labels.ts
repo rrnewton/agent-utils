@@ -70,6 +70,19 @@ const reactionText = (tally: ReactionFace): string => (tally.custom ? `:${tally.
 const readRunText = (count: number, days = "", pinned = 0): string => lineWords(
   `… ${count} read message${count === 1 ? "" : "s"}${pinned > 0 ? `, ${pinned} pinned` : ""}`, days);
 
+/** Words held together with no-break spaces, as `lineWords` holds each side of its dot. */
+const heldWords = (words: string): string => words.replace(/ /g, "\u00a0").replace(/–/g, "–\u2060");
+
+/**
+ * The main line's share of a pinned run's sentence (`#1854`): "… N read messages," — the pinned
+ * words themselves are the separate target beside it, so the line ends at the comma they follow.
+ */
+const readRunHeadText = (count: number): string =>
+  heldWords(`… ${count} read message${count === 1 ? "" : "s"},`);
+
+/** The tail after the pinned target (`#1854`): the days and closing ellipsis, or the ellipsis alone. */
+const readRunTailText = (days = ""): string => (days ? `\u00b7\u00a0${heldWords(days)}\u00a0…` : "…");
+
 /**
  * `#245 done-feedback`. What the Undo chip calls the message it would put back: the message's first
  * words, cut at a word to about this many characters — the whole of what its tooltip says. The chip
@@ -133,6 +146,8 @@ export {
   lineWords,
   reactionKey,
   reactionText,
+  readRunHeadText,
+  readRunTailText,
   readRunText,
   undoLabel,
   undoName,

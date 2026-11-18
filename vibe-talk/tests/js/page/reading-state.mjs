@@ -1429,11 +1429,18 @@ test("Fold read: a fold with a pin names it, and tapping the pin count shows onl
   await chooseReadMode(page, "Fold read");
   const head = () => page.el("discord-log").children.find((li) => li.getAttribute("data-read-run") === "head");
   const pinsButton = (li) => li.children.find((node) => node.className === "read-run-pins");
-  assert.match(readRunLineOf(head()).textContent.replace(/\u00a0/g, " "), /^… 6 read messages, 1 pinned( · .+)? …$/);
+  const tailOf = (li) => li.children.find((node) => node.className === "read-run-tail");
+  const separatorWords = (li) => [readRunLineOf(li), pinsButton(li), tailOf(li)]
+    .filter((node) => node && !node.hidden).map((node) => node.textContent.replace(/\u00a0/g, " ")).join(" ");
+  assert.match(separatorWords(head()), /^… 6 read messages, 1 pinned( · .+)? …$/);
+  assert.equal(readRunLineOf(head()).textContent.replace(/\u00a0/g, " "), "… 6 read messages,",
+    "the main line does not end where the pinned target begins");
   const button = pinsButton(head());
   assert.ok(button && !button.hidden, "the pinned count is not a separate target");
+  assert.equal(button.textContent, "1 pinned", "the pinned words are not the target itself");
   assert.equal(button.getAttribute("aria-label"), "Show 1 pinned message in this folded run");
   assert.equal(readRunLineOf(head()).getAttribute("aria-label"), "Show 6 read messages");
+  assert.ok(tailOf(head()) && !tailOf(head()).hidden, "the separator tail after the pinned target is missing");
   // Tapping the pinned count reveals only the pinned row, splitting the fold.
   await button.click();
   await page.settle();
@@ -1450,7 +1457,7 @@ test("Fold read: a fold with a pin names it, and tapping the pin count shows onl
   page.pinsRevision = 2;
   await pollOnce(page);
   await page.settle();
-  assert.match(readRunLineOf(segmentHead).textContent.replace(/\u00a0/g, " "), /^… 3 read messages, 1 pinned( · .+)? …$/,
+  assert.match(separatorWords(segmentHead), /^… 3 read messages, 1 pinned( · .+)? …$/,
     "an external pin did not update the folded segment's count");
   assert.ok([...page.el("discord-log").children].every((li, atIndex) => li === rowsBefore[atIndex]),
     "a pin change rebuilt the rows instead of updating the line in place");

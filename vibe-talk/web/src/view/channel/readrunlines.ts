@@ -4,7 +4,7 @@
 // and the rows a redraw replaced. The runs themselves are readcore's; the modes are
 // present/rows'.
 
-import { READ_RUN_PEEL_MIN, READ_RUN_PEEL_SIZE, readRunText } from "../../present/rows/index.ts";
+import { READ_RUN_PEEL_MIN, READ_RUN_PEEL_SIZE, readRunHeadText, readRunTailText, readRunText } from "../../present/rows/index.ts";
 import { idsOf, rowMessages } from "./rows.ts";
 
 /** Which edge of a folded run a peel reveals: its oldest (`first`) or newest (`last`) messages. */
@@ -14,6 +14,8 @@ export type ReadRunPeelEdge = "first" | "last";
 type RunRow = HTMLElement & {
   readRunLine?: HTMLButtonElement | null;
   readRunPins?: HTMLButtonElement | null;
+  readRunTail?: HTMLElement | null;
+  readRunFull?: string;
   readRunPeels?: HTMLElement | null;
   readRunPeelFirst?: HTMLButtonElement | null;
   readRunPeelLast?: HTMLButtonElement | null;
@@ -113,7 +115,20 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
     held.readRunLine = line;
     ensurePeels(row as HTMLElement);
     ensurePinsButton(row as HTMLElement);
+    ensureTail(row as HTMLElement);
     return line;
+  }
+
+  function ensureTail(row: HTMLElement): HTMLElement {
+    const held = row as RunRow;
+    if (held.readRunTail) return held.readRunTail;
+    const tail = document.createElement("span");
+    tail.className = "read-run-tail";
+    tail.setAttribute("aria-hidden", "true");
+    tail.hidden = true;
+    held.readRunTail = tail;
+    row.append(tail);
+    return tail;
   }
 
   function pinsButton(row: HTMLElement): HTMLButtonElement {
@@ -204,6 +219,7 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
 
   function readRunWords(row: Element): string {
     const held = row as RunRow;
+    if (held.readRunFull) return held.readRunFull;
     return held.readRunLine ? String(held.readRunLine.textContent) : "";
   }
 
@@ -219,6 +235,7 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
       if (held.hidden) held.hidden = false;
       if (held.readRunLine && !held.readRunLine.hidden) held.readRunLine.hidden = true;
       if (held.readRunPins && !held.readRunPins.hidden) held.readRunPins.hidden = true;
+      if (held.readRunTail && !held.readRunTail.hidden) held.readRunTail.hidden = true;
       if (held.readRunPeels && !held.readRunPeels.hidden) held.readRunPeels.hidden = true;
       return;
     }
@@ -226,23 +243,35 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
     held.hidden = role === "member";
     if (role !== "head") {
       if (held.readRunPins && !held.readRunPins.hidden) held.readRunPins.hidden = true;
+      if (held.readRunTail && !held.readRunTail.hidden) held.readRunTail.hidden = true;
       if (held.readRunPeels && !held.readRunPeels.hidden) held.readRunPeels.hidden = true;
       return;
     }
     const line = readRunLine(row);
-    const words = readRunText(count, runDaysOf(row), pinned) as string;
-    if (line.textContent !== words) line.textContent = words;
+    const days = runDaysOf(row);
+    const words = readRunText(count, days, pinned) as string;
+    held.readRunFull = words;
+    // `#1854`: with pins, the pinned words are the target itself, inline in the sentence.
+    const lineWords = pinned > 0 ? readRunHeadText(count) as string : words;
+    if (line.textContent !== lineWords) line.textContent = lineWords;
     line.setAttribute("title", `Show ${count === 1 ? "this read message" : `these ${count} read messages`}`);
     line.setAttribute("aria-label", `Show ${count} read message${count === 1 ? "" : "s"}`);
     line.hidden = false;
     const pins = ensurePinsButton(row as HTMLElement);
+    const tail = ensureTail(row as HTMLElement);
     if (pinned > 0) {
       const label = `${pinned} pinned`;
       if (pins.textContent !== label) pins.textContent = label;
       pins.setAttribute("aria-label", `Show ${pinned} pinned message${pinned === 1 ? "" : "s"} in this folded run`);
       pins.setAttribute("title", `Show only the ${pinned} pinned message${pinned === 1 ? "" : "s"} in this run`);
       if (pins.hidden) pins.hidden = false;
-    } else if (!pins.hidden) pins.hidden = true;
+      const tailWords = readRunTailText(days) as string;
+      if (tail.textContent !== tailWords) tail.textContent = tailWords;
+      if (tail.hidden) tail.hidden = false;
+    } else {
+      if (!pins.hidden) pins.hidden = true;
+      if (!tail.hidden) tail.hidden = true;
+    }
     placeReadRunPeel(row, count);
   }
 

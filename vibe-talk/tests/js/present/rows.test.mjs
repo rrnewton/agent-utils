@@ -11,7 +11,7 @@ import { moduleForTests } from "../../../web/build.mjs";
 const ROWS = await moduleForTests("src/present/rows/index.ts");
 
 test("`#624 voice-page-modularity`: what a fold hides, and the lines for gaps and runs, from the module alone", () => {
-  const { elisionLabel, gapWords, readRunText, cardGapWords, cardRunText, lineLabel } = ROWS;
+  const { elisionLabel, gapWords, readRunText, readRunHeadText, readRunTailText, cardGapWords, cardRunText, lineLabel } = ROWS;
   assert.deepStrictEqual([elisionLabel({ words: 9, chars: 54 }), elisionLabel({ words: 243, chars: 1400 }),
     elisionLabel({ words: 1, chars: 400 })], ["", "(~240 more words)", "(~400 more characters)"]);
   assert.equal(gapWords(1), "… 1 unmatched message …");
@@ -26,6 +26,11 @@ test("`#624 voice-page-modularity`: what a fold hides, and the lines for gaps an
   assert.equal(readRunText(5, "", 1), "… 5 read messages, 1 pinned …");
   assert.equal(readRunText(5, "", 2), "… 5 read messages, 2 pinned …");
   assert.equal(lineLabel(readRunText(5, "", 2)), "5 read messages, 2 pinned");
+  // #1854: the pinned words are the target itself, so the sentence splits around them.
+  assert.equal(readRunHeadText(5), "…\u00a05\u00a0read\u00a0messages,");
+  assert.equal(readRunHeadText(1), "…\u00a01\u00a0read\u00a0message,");
+  assert.equal(readRunTailText(), "…");
+  assert.equal(readRunTailText("Jan 5, Mon"), "\u00b7\u00a0Jan\u00a05,\u00a0Mon\u00a0…");
 });
 
 test("`#624 voice-page-modularity`: the Undo chip's words and a reaction's face, from the module alone", () => {

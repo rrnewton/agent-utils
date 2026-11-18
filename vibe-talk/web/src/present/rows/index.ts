@@ -17,6 +17,8 @@ export {
   lineWords,
   reactionKey,
   reactionText,
+  readRunHeadText,
+  readRunTailText,
   readRunText,
   undoLabel,
   undoName,

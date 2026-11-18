@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Folded runs naming their pinned messages, in real Chromium (`#1850`).
 
+#1854 adjacency is asserted in the same walk.
+
 A channel of seven messages: the first six read, the newest unread, the
 third pinned through the fixture's pins route (the same shapes the real
 server's pins routes serve; the routes themselves are pinned over HTTP in
@@ -110,7 +112,19 @@ class Walk:
 
 
 LINE_JS = """() => [...document.querySelectorAll('#discord-log > li[data-read-run="head"]')]
-  .map((li) => li.querySelector('.read-run')?.textContent)"""
+  .map((li) => [...li.querySelectorAll('.read-run, .read-run-pins, .read-run-tail')]
+    .filter((el) => !el.hidden).map((el) => el.textContent).join(' '))"""
+ADJACENCY_JS = """() => {
+  const head = document.querySelector('#discord-log > li[data-read-run="head"]');
+  const line = head?.querySelector('.read-run');
+  const pins = head?.querySelector('.read-run-pins');
+  const tail = head?.querySelector('.read-run-tail');
+  if (!head || !line || !pins || !tail) return null;
+  const box = (el) => { const r = el.getBoundingClientRect(); return {x: r.x, right: r.right, width: r.width}; };
+  const headBox = box(head), lineBox = box(line), pinsBox = box(pins), tailBox = box(tail);
+  return {head: headBox, line: lineBox, pins: pinsBox, tail: tailBox,
+    lineToPins: pinsBox.x - lineBox.right, pinsToTail: tailBox.x - pinsBox.right};
+}"""
 SHOWN_JS = """() => [...document.querySelectorAll('#discord-log > li[data-id]')]
   .filter((li) => li.getClientRects().length && !li.hidden)
   .map((li) => li.getAttribute('data-id'))"""
@@ -140,19 +154,40 @@ def walk_through(walk: Walk) -> None:
     page.evaluate("() => document.getElementById('todo-filter').click()")
     walk.until("() => document.getElementById('todo-filter').dataset.readMode === 'fold'",
                "Fold read did not turn on")
-    walk.until("""() => [...document.querySelectorAll('#discord-log .read-run')]
-      .some((line) => line.textContent.replace(/\u00a0/g, ' ').startsWith('… 6 read messages, 1 pinned'))""",
+    walk.until("""() => [...document.querySelectorAll('#discord-log > li[data-read-run="head"]')]
+      .some((li) => [...li.querySelectorAll('.read-run, .read-run-pins, .read-run-tail')]
+        .filter((el) => !el.hidden).map((el) => el.textContent).join(' ')
+        .replace(/\u00a0/g, ' ').startsWith('… 6 read messages, 1 pinned'))""",
                "the fold did not name its pinned message")
     walk.shot("1-fold-with-pin")
     pins = page.evaluate("""() => {
       const button = document.querySelector('#discord-log .read-run-pins');
       const line = document.querySelector('#discord-log .read-run');
+      const tail = document.querySelector('#discord-log .read-run-tail');
       return button && {hidden: button.hidden, label: button.getAttribute('aria-label'),
-        text: button.textContent, lineLabel: line.getAttribute('aria-label')};
+        text: button.textContent, lineLabel: line.getAttribute('aria-label'),
+        lineText: line.textContent.replace(/\u00a0/g, ' '), tailHidden: tail?.hidden,
+        tailText: tail?.textContent.replace(/\u00a0/g, ' ')};
     }""")
-    walk.check(pins == {"hidden": False, "label": "Show 1 pinned message in this folded run",
-                        "text": "1 pinned", "lineLabel": "Show 6 read messages"},
+    walk.check(pins is not None and pins["hidden"] is False
+               and pins["label"] == "Show 1 pinned message in this folded run"
+               and pins["text"] == "1 pinned" and pins["lineLabel"] == "Show 6 read messages"
+               and pins["lineText"] == "… 6 read messages," and pins["tailHidden"] is False
+               and str(pins["tailText"]).endswith("…"),
                f"the two targets are not distinct and labelled: {pins}")
+    # `#1854`: the pinned target is the pinned words, inline in the sentence —
+    # beside the main line on desk and phone, with rules spanning both sides.
+    adjacency = page.evaluate(ADJACENCY_JS)
+    walk.check(adjacency is not None, "the separator pieces are missing")
+    if adjacency is not None:
+        walk.check(0 <= adjacency["lineToPins"] < 24,
+                   f"the pinned target is detached from the label text: {adjacency}")
+        walk.check(0 <= adjacency["pinsToTail"] < 24,
+                   f"the separator tail is detached from the pinned target: {adjacency}")
+        walk.check(adjacency["line"]["x"] - adjacency["head"]["x"] >= 16,
+                   f"the left dashed rule does not span: {adjacency}")
+        walk.check(adjacency["head"]["right"] - adjacency["tail"]["right"] >= 16,
+                   f"the right dashed rule does not span: {adjacency}")
     # Tap the pinned count: only the pinned row, between two separators.
     walk.press("#discord-log .read-run-pins")
     walk.until("""() => [...document.querySelectorAll('#discord-log > li[data-id="202"]')]
