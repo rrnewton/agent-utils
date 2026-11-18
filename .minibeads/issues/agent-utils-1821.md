@@ -1,12 +1,13 @@
 ---
 title: 'vibe-talk-discuss-state-persists: Discuss open, size and scope survive a refresh'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-11-17T20:01:58-05:00
-updated_at: 2026-11-17T20:01:58-05:00
+updated_at: 2026-11-18T00:08:07-05:00
+closed_at: 2026-11-18T00:08:07-05:00
 ---
 
 # Description
@@ -31,3 +32,7 @@ updated_at: 2026-11-17T20:01:58-05:00
 # Notes
 
 Owner fast-track (owner thread 162). Owner-UI screenshot matrix applies: light and dark theme, keyboard open and closed, phone 412x915 and desktop 1280x800 on a test instance, with the before/after persisted state shown.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as `d3818f6d091056378e8b4d56a86ac3aa7d9ced3f` (gated head `be91a6f4`, gate green; combined tree `4f23c158` verified after main moved). Discuss openness and its bound scope (channel plus thread, or the channel's main/flat view) now persist per device in `vibe-talk.voice.discuss-panel` beside the already-kept docked size, written from the panel's one openness change so every close persists as closed, and restored during boot (preview and saved record only, no model call) once the kept channel is on screen; another channel's kept scope, a busy panel, or a not-yet-known summarizer defers the restore instead of forcing it. Unit tests cover keep-open, keep-closed, restore, and the other-channel case; the Chromium walk and the screenshot matrix (light/dark, keyboard open/closed, phone 412x915 at scale 2.6 and desktop 1280x800, before/after reload) show open-after-reload with the same scope and closed-after-reload closed, on a test instance with a fake API throughout.
