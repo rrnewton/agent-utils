@@ -4603,7 +4603,14 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
             workspace_id: pane.workspace_id.clone(),
             label: labels_by_tab.get(&pane.tab_id).cloned(),
             idle_shell: client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false),
-            composer_text: true,
+            // Read like the watch pass does; an unreadable screen still
+            // counts as holding text (fail-closed).
+            composer_text: match client
+                .read_screen_with_runtime(&pane.pane_id, &crate::agent::SystemRuntime::default())
+            {
+                Ok(screen) => crate::tabs::composer_holds_text(&screen),
+                Err(_) => true,
+            },
             foreground: client
                 .pane_info(&pane.pane_id)
                 .map(|info| info.agent.unwrap_or(info.status))
@@ -4639,16 +4646,34 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
         })
         .flatten()
         .collect();
+    // The listing keeps no idle clock of its own, so it previews every
+    // unclaimed idle shell as though its grace had already elapsed: the
+    // verdicts and `would_do` name what a watch pass closes once each such
+    // shell has stayed idle for `bare_shell_grace_seconds`. Without this an
+    // empty clock and a hard-coded composer made `--dry-run` unable to name
+    // any close at all.
+    let grace = config.bare_shell_grace_seconds as f64;
+    let claimed: std::collections::BTreeSet<&str> = agent_facts
+        .iter()
+        .filter_map(|agent| agent.pane_id.as_deref())
+        .collect();
+    let assumed_since: BTreeMap<String, f64> = pane_facts
+        .iter()
+        .filter(|pane| pane.idle_shell && !claimed.contains(pane.pane_id.as_str()))
+        .map(|pane| (pane.pane_id.clone(), 0.0))
+        .collect();
     let (rows, actions) = crate::tabs::plan(
         &pane_facts,
         &order_tabs,
         &agent_facts,
-        &BTreeMap::new(),
-        0.0,
-        config.bare_shell_grace_seconds as f64,
+        &assumed_since,
+        grace,
+        grace,
         workspaces.first().copied(),
     );
     Ok(json!({
+        "grace_assumed_elapsed": true,
+        "bare_shell_grace_seconds": config.bare_shell_grace_seconds,
         "tabs": rows.iter().map(|row| json!({
             "workspace_id": row.workspace_id, "tab_id": row.tab_id,
             "label": row.label, "owner": row.owner,

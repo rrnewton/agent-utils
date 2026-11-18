@@ -114,9 +114,13 @@ pub enum TabAction {
 /// bare prompt (ends with a prompt character) with nothing typed after it.
 /// Anything else — text after a prompt, or no prompt at all — counts as
 /// holding text, so an unrecognised shell is never closed under its owner.
+/// The screen may carry SGR styling (the watch reads styled rows); styling
+/// is dropped first, so a coloured prompt that ends in a reset sequence is
+/// still recognised as a bare prompt.
 #[must_use]
 pub fn composer_holds_text(screen: &str) -> bool {
-    let Some(line) = screen.lines().rev().find(|line| !line.trim().is_empty()) else {
+    let plain = crate::submission::join_rows(&crate::submission::render_screen(screen));
+    let Some(line) = plain.lines().rev().find(|line| !line.trim().is_empty()) else {
         return false;
     };
     let line = line.trim_end();
@@ -495,5 +499,12 @@ mod tests {
         assert!(composer_holds_text("❯ half-typed message\n"));
         assert!(composer_holds_text("some unrecognised screen\n"));
         assert!(!composer_holds_text(""));
+        // A styled two-line bash prompt whose last row ends in an SGR reset.
+        assert!(!composer_holds_text(
+            "\u{1b}[0m\u{1b}[38;5;4m[user@host /work (main)] \u{1b}[0m\r\n\u{1b}[0m\u{1b}[1m\u{1b}[38;5;6m$ \u{1b}[0m\n"
+        ));
+        assert!(composer_holds_text(
+            "\u{1b}[1m\u{1b}[38;5;6m$ \u{1b}[0mhalf-typed\u{1b}[0m\n"
+        ));
     }
 }
