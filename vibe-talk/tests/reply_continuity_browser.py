@@ -1089,7 +1089,7 @@ def quick_reply_walk(walk: Walk) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
                   "quick: the channel did not open")
     walk.settled()
@@ -1216,7 +1216,7 @@ def dock_reply_walk(walk: Walk) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
                   "dock: the channel did not open")
     walk.settled()
@@ -1294,7 +1294,7 @@ def docked_cancel_putdown_walk(walk: Walk) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
                   "docked-cancel: the channel did not open")
     walk.settled()
@@ -1617,7 +1617,7 @@ def quote_layout_walk(walk: Walk) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length >= {COUNT}",
                   "the channel did not open")
     walk.settled()
@@ -1686,7 +1686,7 @@ def post_to_main_walk(walk: Walk) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     count = len(walk.api.messages)
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {count}",
                   "post-to-main: the channel did not open")
