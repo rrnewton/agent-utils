@@ -1,6 +1,6 @@
 ---
 title: 'label-inline-fallback: show header labels inline when the meta line has no room'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -34,3 +34,7 @@ updated_at: 2026-11-18T06:34:26-05:00
 # Notes
 
 Deferred explicitly by the #1825 liaison audit (2026-11-18): the landed implementation always places labels in the meta line. Automatic topic labels and Pinned-as-a-built-in-label are separate owner questions and are not part of this issue.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 2784a3ea: chips stand only on one visual label row (list-ResizeObserver width-only measurement; height changes never re-measure; live edits re-measure on the next pass), otherwise the hashtag line stands inline. Screenshots in /tmp/mu-inline-shots (gate pass on 7614ddf2; the keyboard-browser gate flake passed its exclusive rerun).
