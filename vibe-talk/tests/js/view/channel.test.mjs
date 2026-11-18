@@ -2208,6 +2208,75 @@ test("`#624 voice-page-modularity`: a column's reply arrows start fresh, and a l
   assert.equal(freshReplyArrows().countsDrawn, false, "a fresh column shared its arrows record");
 });
 
+test("#1820 vibe-talk-summary-strikethrough-live: a landing moved off screen by late layout is brought back on the next frames", () => {
+  const { createReplyArrows, freshReplyArrows } = CHANNEL_VIEW;
+  const active = freshReplyArrows();
+  const frames = [];
+  const hadRaf = "requestAnimationFrame" in globalThis;
+  const oldRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (fn) => { frames.push(fn); return frames.length; };
+  try {
+    const area = { hidden: false, children: [], scrollTop: 0, clientHeight: 100, getBoundingClientRect: () => ({ top: 0, bottom: 100, height: 100 }) };
+    let top = 500;
+    const nudges = [];
+    const owner = createReplyArrows({
+      el: (id) => (id === "scroll-area" ? area : { hidden: true, children: [] }),
+      leftEl: () => ({ hidden: true, getBoundingClientRect: () => ({ top: 0, bottom: 0, height: 0 }) }),
+      inThisColumn: (fn) => fn,
+      guardQuietly: (fn) => fn,
+      gatherFromReply: () => {},
+      filterState: () => ({ hold: null }),
+      endFilterWalk: () => {}, endSearchWalks: () => {},
+      selectLanded: () => {},
+      setSearchOpen: () => {}, openReadRun: () => {}, renderScrollTools: () => {},
+      nudge: (_area, delta) => { nudges.push(delta); top -= delta; },
+      setStatus: () => {},
+      channelContextKey: () => "ctx",
+      heldMessage: () => null,
+      inView: () => false,
+      selection: () => ({ view: "main", threadId: null }),
+      threading: () => true,
+      olderPages: () => ({ moreAbove: false, cursor: null }),
+      viewKey: () => "main",
+      channelCanon: () => ({ views: new Map() }),
+      selectedChannelId: () => "C1",
+      changeChannelView: async () => {},
+      channelReadsBusy: () => false,
+      loadOlder: () => null,
+      walkCursorOwed: () => false,
+      hidingRead: () => false,
+      timelineMessages: () => [],
+      hiddenEmpty: () => false,
+      readHiding: () => false,
+      layoutColumns: () => false,
+      columnSteps: () => ({ pause: () => {}, resume: () => {} }),
+      activeArrows: () => active,
+      replyJumpTicket: () => { let n = 0; return { current: () => n, bump: () => { n += 1; } }; },
+    });
+    const row = {
+      isConnected: true, className: "", children: [],
+      getAttribute: (k) => (k === "data-id" ? "m1" : null),
+      setAttribute: () => {}, removeAttribute: () => {},
+      getBoundingClientRect: () => ({ top, bottom: top + 20, left: 0 }),
+    };
+    owner.revealRow(row);
+    assert.ok(top < 100 && top + 20 > 0, `the first nudge did not land the row on screen (top=${top})`);
+    // Late layout (the sheet's animated drop, content above growing)
+    // shoves the landed row off screen after the landing's own turn.
+    top = 500;
+    while (frames.length > 0) {
+      const fn = frames.shift();
+      fn();
+      if (top < 100 && top + 20 > 0) break;
+    }
+    assert.ok(top < 100 && top + 20 > 0, `late layout left the landed row off screen (top=${top}, nudges=${nudges.length})`);
+    assert.ok(nudges.length >= 2, "the landing was not re-asserted after late layout moved the row");
+  } finally {
+    if (hadRaf) globalThis.requestAnimationFrame = oldRaf;
+    else delete globalThis.requestAnimationFrame;
+  }
+});
+
 test("`#624 voice-page-modularity`: replies are gathered by pointer and by thread, to any depth, and a fresh column gathers nothing", () => {
   const { createReplyGathering, freshGatherState, freshListState } = CHANNEL_VIEW;
   assert.deepStrictEqual(freshGatherState(), { gathered: null });
@@ -2738,6 +2807,54 @@ test("`#624 voice-page-modularity`: Done's state, saving wait and refused-write 
   owner.noteInboxWrite(["m3"]); owner.noteInboxWrite(["m3"]);
   const stands = owner.settleInboxWrite(["m3"], true, new Set());
   assert.deepStrictEqual([...stands], ["m3"], "a refused write with a later one on its way took the act back");
+});
+
+test("#1820 vibe-talk-summary-strikethrough-live: Done, put back and landed read state notify the read set's watchers at once", async () => {
+  const { createDoneAct, freshDoneState } = CHANNEL_VIEW;
+  const state = freshDoneState();
+  let notices = 0;
+  const clock = { setTimeout: () => 1, clearTimeout: () => {}, now: () => 0 };
+  const noop = () => {};
+  const owner = createDoneAct({
+    api: async () => ({}), clockOnUse: () => clock, dismissStatus: noop, doneHeldHere: () => false,
+    doneSettlesHere: () => null,
+    el: () => ({ children: [], hidden: false, textContent: "", setAttribute: () => {}, removeAttribute: () => {}, replaceChildren: () => {} }),
+    followDoneEverywhere: noop, guardQuietly: (fn) => fn, heldDonePart: (h) => h,
+    hidingRead: () => false, holdingMessage: (fn) => fn(), holdingReplyArrows: (fn) => fn(),
+    idsOf: () => [], inColumn: (_c, fn) => fn(), inOtherColumn: (fn) => fn(),
+    listState: () => ({ backlog: 0, rowsGathered: false }),
+    listedMessages: () => [{ id: "m1" }],
+    markHeldDone: () => null, messageText: () => "", nextUndoAt: () => 0,
+    pinsView: () => ({ only: false }), readSpeaksFor: () => true, refreshAfterLiveMutation: noop,
+    renderCachedTimeline: noop, renderChannelRows: noop, renderChannelSeam: noop,
+    renderReadModeControl: noop, renderReplyLinks: noop, renderScrollTools: noop, renderSideColumn: noop,
+    retryingWrite: (fn) => fn(), rowMessages: () => [], saveChannelScope: noop,
+    selectedChannelId: () => "c1", selection: () => ({ view: "flat" }), sendBookmark: noop,
+    setStatus: noop, settleHeldDone: noop, singleDoneBump: () => null, stageBookmark: () => null,
+    statusSays: () => false, syncUnreadReplies: noop, threadForMessageId: () => null,
+    timeOf: () => 0, token: () => "t", tokenFingerprint: () => "f",
+    undoLabel: () => "Undo", undoName: () => "", voiceTranscript: () => ({ CLEAR_ARMED_MS: 100 }),
+    writeInBatches: async (route, ids) => [...ids], channelStore: () => ({ current: () => ({ channel: "c1", dismissed: new Set() }) }),
+    providerFacts: { threading: () => false },
+    columnWork: () => ({ active: () => ({ done: state }), side: () => false }),
+    columns: () => ({ side: { mode: "thread" } }),
+    readModes: () => ({ hiding: () => false, mode: () => "show" }),
+    readLedger: () => ({ writtenIds: () => [] }),
+    lastDismissal: () => ({ current: () => null, set: noop }),
+    inboxLedger: () => ({ add: () => 1, settle: noop, beat: noop, takeLeftOver: () => [] }),
+    onReadStateChanged: () => { notices += 1; },
+  });
+  await owner.dismissMessages({ messages: ["m1"] });
+  assert.equal(state.archived.has("m1"), true, "the Done did not take");
+  assert.ok(notices >= 1, "a Done from the row did not notify the read set's watchers at once");
+  const afterDone = notices;
+  await owner.restoreMessages(["m1"]);
+  assert.equal(state.archived.has("m1"), false, "the put back did not take");
+  assert.ok(notices > afterDone, "a put back from the row did not notify the read set's watchers at once");
+  const afterBack = notices;
+  owner.noteArchived({ dismissed: ["m1"] }, false);
+  assert.equal(state.archived.has("m1"), true, "landed read state did not take");
+  assert.ok(notices > afterBack, "read state landing with a read did not notify the read set's watchers");
 });
 
 test("`#624 voice-page-modularity`: a thread's count comes from its summary before its own record, and Main is inherited from All's cover", () => {

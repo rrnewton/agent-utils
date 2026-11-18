@@ -2094,6 +2094,10 @@ const doneAct = createDoneAct({
   columnWork: () => columnWork, columns: () => columns, readModes: () => readModes, readLedger: () => readLedger,
   lastDismissal: () => lastDismissal, inboxLedger: () => inboxLedger,
   dismissStatus: () => dismissStatus(), setStatus: (text) => setStatus(text), statusSays: (text) => statusSays(text),
+  // `#1820 vibe-talk-summary-strikethrough-live`: the row's own Done, archive
+  // and put back, and read state a read brings, restate an open summary's
+  // strike in the same turn — the event the row itself moves on.
+  onReadStateChanged: () => refreshDiscussStrikes(),
   doneHeldHere: (ids) => doneHeldHere(ids), doneSettlesHere: () => doneSettlesHere(),
   followDoneEverywhere: (ids, column) => followDoneEverywhere(/** @type {any} */ (ids), /** @type {any} */ (column)),
   guardQuietly: (fn) => guardQuietly(fn), heldDonePart: (held, ids) => heldDonePart(/** @type {any} */ (held), /** @type {any} */ (ids)),

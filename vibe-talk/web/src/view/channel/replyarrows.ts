@@ -388,6 +388,31 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
     // `#239 single-selection`. The message the reader asked for is the one every key now acts on, and
     // the flash is on it: never a lit row beside a selected one.
     deps.selectLanded(row);
+    // `#1820 vibe-talk-summary-strikethrough-live`. The nudge above is
+    // measured once, but the landing's own turn is not the last word on
+    // layout: the Discuss sheet's animated drop to partial, a row above
+    // expanding, or content still loading can move the row off screen
+    // after it — the owner's one-time "clicked back and it was NOT on
+    // screen". Re-assert over the next frames, each frame the condition
+    // check (no wall-clock budget): stop the moment the row is on
+    // screen, leaves the list, or a newer landing replaces this one.
+    if (typeof requestAnimationFrame === "function") {
+      let frames = 0;
+      const reassert = (): void => {
+        frames += 1;
+        if (replyArrows().landed !== landed) return;
+        if (!row.isConnected) return;
+        if (rowOnScreen(row)) return;
+        if (frames > 30) return;
+        const again = deps.el("scroll-area");
+        const clearAgain = floatingClearance(again) + REPLY_LANDING_GAP_PX;
+        const heightAgain = row.getBoundingClientRect().bottom - drawnTop(row);
+        const leadAgain = center ? Math.max(clearAgain, (clearAgain + again.getBoundingClientRect().bottom - heightAgain) / 2) : clearAgain;
+        deps.nudge(again, drawnTop(row) - leadAgain);
+        if (!rowOnScreen(row) && frames <= 30) requestAnimationFrame(reassert);
+      };
+      requestAnimationFrame(reassert);
+    }
   }
 
   /** Put out the flash of the last landing, unless it is on `row`. See `drawSelection`. */

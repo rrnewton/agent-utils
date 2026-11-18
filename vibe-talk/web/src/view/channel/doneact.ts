@@ -102,6 +102,14 @@ export interface DoneActDependencies {
   columns(): { side: { mode: string } };
   readModes(): { hiding(): boolean; mode(): string };
   readLedger(): { writtenIds(): Iterable<string> };
+  /**
+   * `#1820 vibe-talk-summary-strikethrough-live`. The page's read set changed
+   * here — a Done, a put back, or server read state a read just brought — in
+   * the same turn the message row changes. Optional: a host with nothing
+   * watching the read set (a summary's live strike is the page's watcher)
+   * omits it.
+   */
+  onReadStateChanged?(): void;
   lastDismissal(): DismissalOffer;
   inboxLedger(): DoneLedger;
 }
@@ -225,6 +233,10 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
         else doneState().archived.delete(id);
       }
     }
+    // `#1820`: server read state landed with this read (a poll, a live
+    // refresh, another device's mark): watchers of the read set move now,
+    // as the rows this read draws do.
+    deps.onReadStateChanged?.();
   }
 
 
@@ -905,6 +917,10 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
     for (const id of requested) {
       doneState().archived.add(id);
     }
+    // `#1820`: Done here from now on, drawn on the row at once: the read
+    // set's watchers (an open summary's strike) move in this same turn,
+    // not when the write below is answered or a refresh redraws.
+    deps.onReadStateChanged?.();
     // Done here from now on, and saved only once the write below is (`doneSaved`).
     const saved = noteDoneSaving(requested);
     // `#229 desktop-two-column`. Done is the message's, so the other column shows it Done as well.
@@ -1002,6 +1018,8 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       // column when it was made in the left one and the right one shows its thread again since. The
       // other column's line above reaches neither. `#306 done-stale-across-views`.
       deps.followDoneEverywhere(requested, column);
+      // `#1820`: the take-back changed the read set again.
+      deps.onReadStateChanged?.();
       renderTodoControls();
       if (landed.length > 0) (error as { landed?: number }).landed = landed.length;
       throw error;
@@ -1067,6 +1085,9 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
     for (const id of restored) {
       doneState().archived.delete(id);
     }
+    // `#1820`: back here from now on, as the row draws it at once: the
+    // read set's watchers move in this same turn.
+    deps.onReadStateChanged?.();
     // On its way from now on, for what waits on a Done of these messages to be saved (`doneSaved`,
     // `#327 done-races-remaining`): settled once the write has been answered and a refusal taken back.
     const saving = noteDoneSaving(restored);
@@ -1153,6 +1174,8 @@ export function createDoneAct(deps: DoneActDependencies): DoneAct {
       // column when it was made in the left one and the right one shows its thread again since. The
       // other column's line above reaches neither. `#306 done-stale-across-views`.
       deps.followDoneEverywhere(restored, column);
+      // `#1820`: the take-back changed the read set again.
+      deps.onReadStateChanged?.();
       renderTodoControls();
       if (landed.length > 0) (error as { landed?: number }).landed = landed.length;
       throw error;
