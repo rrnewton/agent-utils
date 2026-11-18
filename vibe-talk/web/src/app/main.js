@@ -2917,6 +2917,7 @@ const searchRows = createSearchRows({
   gatheredParent,
   putRepliesBack,
   pinsOnly: () => pinsView().only,
+  isPinnedId: (id) => isPinnedId(id),
   showRowLinks: (row) => showRowLinks(row),
   takeDownRowLinks: (row) => takeDownRowLinks(row),
   heldLinks: (row) => heldLinks(row),

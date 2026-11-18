@@ -106,6 +106,10 @@ export interface SearchRowsDependencies {
   gatheredParent(): unknown;
   putRepliesBack(): void;
   pinsOnly(): boolean;
+  /** `#1853`: whether a message id is in the channel's pin set, read fresh at
+   * match time (pinning never replaces the message object, so the cached
+   * subject cannot carry it). Optional for test doubles. */
+  isPinnedId?(id: unknown): boolean;
   showRowLinks(row: Element): number;
   takeDownRowLinks(row: Element): number;
   heldLinks(row: Element): Array<{ kind: string }>;
@@ -229,8 +233,12 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     return subject;
   }
 
-  const messageMatches = (node: unknown, message: unknown): boolean =>
-    deps.language.searchQueryMatches(node, messageSubject(message as Message) as never, searchDayStart as never);
+  const messageMatches = (node: unknown, message: unknown): boolean => {
+    // `#1853`: `pinned` is read fresh (see `isPinnedId`), never from the cache.
+    const base = messageSubject(message as Message) as { pinned?: boolean };
+    const subject = { ...base, pinned: deps.isPinnedId ? deps.isPinnedId((message as Message).id) : false };
+    return deps.language.searchQueryMatches(node, subject as never, searchDayStart as never);
+  };
 
   function rowMatches(row: Element, node: unknown, text: string | null): boolean {
     const messages = rowMessages(row);

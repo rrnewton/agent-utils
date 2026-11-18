@@ -43,6 +43,8 @@ export interface SearchSubject {
   readonly hasLink: boolean;
   /** Its hashtag labels, folded (`#1825`). */
   readonly labels: readonly string[];
+  /** Whether it is in its channel's pin set: what `label:pinned` matches (`#1853`). */
+  readonly pinned: boolean;
 }
 
 /** What `searchSubject` folds: each part of a message the haystack is made of. */
@@ -54,6 +56,7 @@ export interface SearchSubjectInput {
   readonly createdMs?: number;
   readonly inThread?: boolean;
   readonly labels?: readonly string[];
+  readonly pinned?: boolean;
 }
 
 /** Why some alternative of a query needs a scan of what the server holds, if any does. */
@@ -335,7 +338,8 @@ export function searchQueryMatches(node: SearchNode | null, subject: SearchSubje
     case "has":
       return subject.hasLink;
     case "label":
-      return subject.labels.includes(node.slug);
+      // `#1853`: `pinned` reads the pin set alone, never the hashtag list.
+      return node.slug === "pinned" ? subject.pinned : subject.labels.includes(node.slug);
     case "not":
       return !searchQueryMatches(node.child, subject, dayStartMs);
     case "and":
@@ -346,7 +350,7 @@ export function searchQueryMatches(node: SearchNode | null, subject: SearchSubje
 }
 
 /** A message, folded once for matching: the haystack is the author, the drawn text and each link address, one a line. */
-export function searchSubject({ author = "", authorId = "", text = "", links = [], createdMs = 0, inThread = false, labels = [] }: SearchSubjectInput): SearchSubject {
+export function searchSubject({ author = "", authorId = "", text = "", links = [], createdMs = 0, inThread = false, labels = [], pinned = false }: SearchSubjectInput): SearchSubject {
   return {
     text: searchFold([author, text, ...links].join("\n")),
     author: searchFold(author),
@@ -355,6 +359,7 @@ export function searchSubject({ author = "", authorId = "", text = "", links = [
     inThread,
     hasLink: links.length > 0,
     labels: labels.map((label) => searchFold(label)),
+    pinned,
   };
 }
 
@@ -367,6 +372,8 @@ export function searchQueryExpandLabels(node: SearchNode | null, expand: (slug: 
   if (!node) return null;
   switch (node.kind) {
     case "label": {
+      // `#1853`: the built-in label is never group-expanded.
+      if (node.slug === "pinned") return node;
       const spellings = expand(node.slug);
       if (spellings.length <= 1) return node;
       return { kind: "or", children: spellings.map((slug) => ({ kind: "label" as const, slug })) };

@@ -114,10 +114,33 @@ pub async fn search(
     let below_ms = ask.below_ms.unwrap_or(i64::MAX);
     let limit = ask.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let now_ms = crate::store::now_ms();
+    // `#1853`: only a query naming the built-in label owes each channel its
+    // pin set; other searches pass an empty set and never read the store here.
+    let mut pinned_by_channel: Vec<Arc<std::collections::HashSet<String>>> =
+        Vec::with_capacity(channels.len());
+    for channel in &channels {
+        let ids = if query.mentions_pinned() {
+            state
+                .store
+                .pins(&channel.id)
+                .await
+                .map(|held| {
+                    held.pins
+                        .iter()
+                        .map(|pin| pin.snapshot.message_id.as_str().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        };
+        pinned_by_channel.push(Arc::new(ids));
+    }
     // Every channel at once, each on the blocking pool: the file's readers serve them side by side.
-    let searches = channels.iter().map(|channel| {
+    let searches = channels.iter().enumerate().map(|(index, channel)| {
         let sink = Arc::clone(&state.message_cache);
         let query = Arc::clone(&query);
+        let pinned_ids = Arc::clone(&pinned_by_channel[index]);
         let zone = zone.clone();
         let id = channel.id.clone();
         async move {
@@ -134,6 +157,7 @@ pub async fn search(
                         limit,
                         budget: BUDGET,
                         day_start_ms: &day_start_ms,
+                        pinned_ids: &pinned_ids,
                     },
                 )
             })

@@ -2378,6 +2378,7 @@ impl Sink {
             limit: ask.limit,
             budget: ask.budget,
             day_start_ms: ask.day_start_ms,
+            pinned_ids: ask.pinned_ids,
         };
         let outcome = cache
             .search(&chan, &request)

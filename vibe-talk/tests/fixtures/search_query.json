@@ -968,6 +968,20 @@
      "benchmarking"
     ]
    ]
+  },
+  {
+   "query": "label:pinned",
+   "tree": [
+    "label",
+    "pinned"
+   ]
+  },
+  {
+   "query": "label:Pinned",
+   "tree": [
+    "label",
+    "pinned"
+   ]
   }
  ],
  "match": [
@@ -1542,6 +1556,65 @@
     ]
    },
    "matches": true
+  },
+  {
+   "query": "label:pinned",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "pinned": true
+   },
+   "matches": true
+  },
+  {
+   "query": "label:pinned",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "pinned": false
+   },
+   "matches": false
+  },
+  {
+   "query": "label:pinned",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [
+     "pinned"
+    ],
+    "pinned": false
+   },
+   "matches": false
+  },
+  {
+   "query": "-label:pinned",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [],
+    "pinned": true
+   },
+   "matches": false
+  },
+  {
+   "query": "label:pinned label:kvm",
+   "message": {
+    "author": "Ada",
+    "text": "fixed",
+    "created": "2026-10-24T10:00:00Z",
+    "labels": [
+     "kvm"
+    ],
+    "pinned": true
+   },
+   "matches": true
   }
  ],
  "upstream": [
@@ -1738,6 +1811,11 @@
   },
   {
    "query": "label:kvm",
+   "queries": [],
+   "scan": "no-term"
+  },
+  {
+   "query": "label:pinned",
    "queries": [],
    "scan": "no-term"
   }

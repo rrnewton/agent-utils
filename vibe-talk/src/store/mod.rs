@@ -1473,6 +1473,14 @@ pub fn validate_label_group(
     display: &str,
     spellings: &[String],
 ) -> Result<Vec<String>, StoreError> {
+    // `#1853`: `pinned` is the built-in label's reserved slug; no group may
+    // claim it, or `label:pinned` would stop meaning the pin set alone.
+    if display == "pinned" || spellings.iter().any(|s| s == "pinned") {
+        return Err(StoreError::BadId(
+            "\"pinned\" is reserved for the built-in Pinned label and cannot name a label group"
+                .to_owned(),
+        ));
+    }
     let valid = |slug: &str| {
         !slug.is_empty()
             && slug.len() <= 64

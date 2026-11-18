@@ -256,6 +256,9 @@ pub struct SearchRequest<'a> {
     pub budget: usize,
     /// The start of a calendar day in the reader's time zone, for `before:` and `after:`.
     pub day_start_ms: &'a dyn Fn(Day) -> i64,
+    /// The channel's pin set, by message id: what `label:pinned` matches
+    /// (`#1853`). Empty unless the query names the built-in label.
+    pub pinned_ids: &'a std::collections::HashSet<String>,
 }
 
 /// What a search of the cache found, and how far it can vouch for its absence of hits.
@@ -326,6 +329,8 @@ pub struct SearchAsk<'a> {
     pub budget: usize,
     /// The start of a calendar day in the reader's time zone.
     pub day_start_ms: &'a dyn Fn(Day) -> i64,
+    /// The channel's pin set, by message id (`#1853`). See [`SearchRequest::pinned_ids`].
+    pub pinned_ids: &'a std::collections::HashSet<String>,
 }
 
 /// One channel's copy searched: what was found, over which view, and how far the server's walk
@@ -430,7 +435,9 @@ pub(crate) fn test_rows(
             row.search_text.contains("http://") || row.search_text.contains("https://"),
         )
         // `#1825`: labels derived from the cached text, as they are at serve time.
-        .with_labels(&crate::labels::extract_hashtags(&message.content));
+        .with_labels(&crate::labels::extract_hashtags(&message.content))
+        // `#1853`: the built-in label reads the caller's pin set for the channel.
+        .with_pinned(request.pinned_ids.contains(message.id.as_str()));
         if request.query.matches(&subject, request.day_start_ms) {
             outcome.hits.push(row.message);
         }

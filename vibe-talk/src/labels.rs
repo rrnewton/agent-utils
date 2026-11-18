@@ -32,6 +32,11 @@
 //! kind-prefix precedent in the voice-overview plan §8.5), so they can never
 //! collide with a typed hashtag; nothing here mints `auto:` labels. See
 //! `.minibeads/issues/agent-utils-1825.md`.
+//!
+//! `pinned` is RESERVED (`#1853 vibe-talk-labels-dropdown-pinned-builtin`):
+//! it names the built-in Pinned label (the pin set in the store), never a
+//! hashtag, so a typed `#pinned` yields no label here and `label:pinned`
+//! search can mean the pin set alone.
 
 /// Derive the hashtag labels of one message body, in first-seen order.
 ///
@@ -75,7 +80,8 @@ pub fn extract_hashtags(content: &str) -> Vec<String> {
             label.push(chars[j].to_ascii_lowercase());
             j += 1;
         }
-        if !labels.contains(&label) {
+        // `#1853`: `pinned` is the built-in label's reserved slug, never a hashtag.
+        if label != "pinned" && !labels.contains(&label) {
             labels.push(label);
         }
         i = j;
@@ -147,6 +153,10 @@ impl GroupIndex {
     /// expands a `label:` node to these so any spelling finds the group.
     #[must_use]
     pub fn expand(&self, slug: &str) -> Vec<String> {
+        // `#1853`: the built-in label stands alone; no group ever expands it.
+        if slug == "pinned" {
+            return vec![slug.to_owned()];
+        }
         match self.display_of.get(slug) {
             Some(display) => self
                 .members_of
@@ -387,6 +397,20 @@ mod tests {
         assert_eq!(
             GroupIndex::default().apply(&["kvm".to_owned()]),
             vec!["kvm"]
+        );
+    }
+
+    #[test]
+    fn pinned_is_reserved_and_never_a_hashtag() {
+        // `#1853`: `#pinned` names the built-in label, so the extractor
+        // yields nothing for it, in any case, beside real labels.
+        assert!(labels("kept for later #pinned").is_empty());
+        assert!(labels("#Pinned #PINNED").is_empty());
+        assert_eq!(labels("#pinned #kvm"), vec!["kvm"]);
+        // The built-in never expands through a group either.
+        assert_eq!(
+            GroupIndex::default().expand("pinned"),
+            vec!["pinned".to_owned()]
         );
     }
 

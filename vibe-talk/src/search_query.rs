@@ -72,6 +72,9 @@
 //!   does not). The caller resolves days, because only it knows the zone.
 //! - `has:link` matches a message with a link.
 //! - `label:x` matches a message whose derived hashtag labels (`#1825`) include `x`, folded.
+//!   `label:pinned` is the built-in label (`#1853`): it matches only a message in the
+//!   channel's pin set ([`Subject::pinned`]), never a hashtag — `#pinned` is reserved and
+//!   the extractor yields no such label.
 //! - A query that is only negations matches everything they do not exclude; an empty query (no
 //!   term at all) is no search, and [`Query::is_empty`] says so.
 //!
@@ -357,6 +360,9 @@ pub struct Subject {
     pub has_link: bool,
     /// Its hashtag labels, folded (`#1825`). Empty until [`Subject::with_labels`].
     pub labels: Vec<String>,
+    /// Whether the message is in its channel's pin set: what the built-in
+    /// `label:pinned` matches (`#1853`). False until [`Subject::with_pinned`].
+    pub pinned: bool,
 }
 
 impl Subject {
@@ -379,6 +385,7 @@ impl Subject {
             in_thread,
             has_link,
             labels: Vec::new(),
+            pinned: false,
         }
     }
 
@@ -386,6 +393,13 @@ impl Subject {
     #[must_use]
     pub fn with_labels(mut self, labels: &[String]) -> Self {
         self.labels = labels.iter().map(|label| fold(label)).collect();
+        self
+    }
+
+    /// Say whether the message is in its channel's pin set (`#1853`).
+    #[must_use]
+    pub fn with_pinned(mut self, pinned: bool) -> Self {
+        self.pinned = pinned;
         self
     }
 }
@@ -432,6 +446,21 @@ impl Query {
             .is_none_or(|root| node_matches(root, subject, day_start_ms))
     }
 
+    /// Whether the query names the built-in label (`label:pinned`, `#1853`,
+    /// under a `-` as well): its caller then owes the subjects their pin sets.
+    #[must_use]
+    pub fn mentions_pinned(&self) -> bool {
+        fn walk(node: &Node) -> bool {
+            match node {
+                Node::Label(slug) => slug == "pinned",
+                Node::Not(inner) => walk(inner),
+                Node::And(children) | Node::Or(children) => children.iter().any(walk),
+                _ => false,
+            }
+        }
+        self.root.as_ref().is_some_and(walk)
+    }
+
     /// This query with every `label:` slug expanded through `expand` (`#1825` label
     /// groups: any spelling must find the whole group). A slug expanding to several
     /// spellings becomes an OR of labels; under a `-` it stays negated as a group.
@@ -440,6 +469,8 @@ impl Query {
     pub fn expand_labels(&self, expand: &dyn Fn(&str) -> Vec<String>) -> Self {
         fn walk(node: &Node, expand: &dyn Fn(&str) -> Vec<String>) -> Node {
             match node {
+                // `#1853`: the built-in label is never group-expanded.
+                Node::Label(slug) if slug == "pinned" => Node::Label(slug.clone()),
                 Node::Label(slug) => {
                     let spellings = expand(slug);
                     if spellings.len() <= 1 {
@@ -492,7 +523,15 @@ fn node_matches(node: &Node, subject: &Subject, day_start_ms: &dyn Fn(Day) -> i6
         Node::Before(day) => subject.created_ms < day_start_ms(*day),
         Node::After(day) => subject.created_ms >= day_start_ms(*day),
         Node::HasLink => subject.has_link,
-        Node::Label(slug) => subject.labels.iter().any(|label| label == slug),
+        // `#1853`: `pinned` reads the pin set alone; a hashtag list entry can
+        // never satisfy it (the extractor reserves the slug).
+        Node::Label(slug) => {
+            if slug == "pinned" {
+                subject.pinned
+            } else {
+                subject.labels.iter().any(|label| label == slug)
+            }
+        }
         Node::Not(inner) => !node_matches(inner, subject, day_start_ms),
         Node::And(children) => children
             .iter()
@@ -945,7 +984,8 @@ mod tests {
                 message["in_thread"].as_bool().unwrap_or(false),
                 !hrefs.is_empty(),
             )
-            .with_labels(&msg_labels);
+            .with_labels(&msg_labels)
+            .with_pinned(message["pinned"].as_bool().unwrap_or(false));
             let query = parse(case["query"].as_str().expect("query"));
             let got = query.matches(&subject, &|day| day.start_ms_at_offset(offset));
             assert_eq!(got, case["matches"].as_bool().expect("matches"), "{case}");
