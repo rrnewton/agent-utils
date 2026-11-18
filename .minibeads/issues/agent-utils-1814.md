@@ -1,12 +1,13 @@
 ---
 title: 'vibe-talk-thread-card-title-and-summary-due: a quoted root titles its card from the quote and a 3-message thread goes unsummarised'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-11-17T20:01:53-05:00
-updated_at: 2026-11-17T20:01:53-05:00
+updated_at: 2026-11-17T23:53:32-05:00
+closed_at: 2026-11-17T23:53:32-05:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ updated_at: 2026-11-17T20:01:53-05:00
 # Notes
 
 Owner-priority, deployed on landing. Threshold in code today (to verify and quote): message count, not words; see the report on this issue for the confirmed file:line.
+
+## Resolution
+
+Landed in bc73237a. The cache now counts held replies past an outgrown exact root count (root and thread table, marked not exact), so a three-message thread is queued and summarised; card titles skip a leading quote block in the server helper, the Slack title, and the page fallback. The larger-card / whole-message options were reported to the owner, not built, as this issue's Design required.
