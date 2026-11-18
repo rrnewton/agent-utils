@@ -1,6 +1,6 @@
 ---
 title: 'local-ci-hub-receipt-fields: write and judge terminal records under the agreed receipt contract'
-status: open
+status: closed
 priority: 2
 issue_type: task
 labels:
@@ -51,3 +51,14 @@ judging older records under the rules of their own version.
 The agreed field table is the receipt-field contract document in
 the plans directory. Checkout lifecycle work is a later step;
 the sweeper remains attended-only.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main at 866657ef after four
+consumer review rounds (approve-with-conditions on the last).
+Writers stamp schema_version 6; the predicate enforces every
+agreed clause with per-clause refusal tests and a zero-survivor
+mutation sweep. Era admission is the frozen id-plus-hash pair
+list, generated once with the bounded era-list command; no real
+era list was generated here. The gate evidence is partial only
+in its skipped-unverified cross checks.
