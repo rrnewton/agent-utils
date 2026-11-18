@@ -72,12 +72,24 @@
    the height for. */
 .search-count {
   flex: 0 0 auto;
-  max-width: 8.25ch;
+  /* `#1852`: capped in px as well as ch, so at a large reader's font the count
+     (type, and growing with it) wraps to its third line instead of taking the
+     field's room for its text once a fourth toggle stands on the bar. */
+  max-width: min(8.25ch, 64px);
   color: var(--muted);
   font-size: 0.7rem;
   font-variant-numeric: tabular-nums;
   line-height: 1.15;
   text-align: center;
+}
+
+/* `#1852`: on a line under 340px (a zoomed tiny phone) the count leaves the
+   visual bar — it stays in the DOM as the bar's status line — so the field
+   keeps its room for a query's text beside four toggles and the glass. */
+@media (max-width: 340px) {
+  .search-count {
+    display: none;
+  }
 }
 
 /* The statement a reader gets instead of a blank list. Centred and given room, because it is the

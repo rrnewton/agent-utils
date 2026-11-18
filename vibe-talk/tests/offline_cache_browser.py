@@ -1072,7 +1072,7 @@ GLASS_ALONE_JS = """() => {""" + FLOAT_HELPERS_JS + """
 }"""
 
 # The search open over the channel: a bar across the top of the list, no wider than it and not
-# hanging over whatever is above it, with the field focused and 140px wide or more, the pill given
+# hanging over whatever is above it, with the field focused and 96px wide or more, the pill given
 # way, and the first thing the list shows clear of the bar. `query`, when given, has just been typed;
 # `rows` is what is left on screen and `count` what the bar says about it. The list's place starts
 # above its box by its top margin: on a narrow phone the list starts below the author filter hanging
@@ -1090,8 +1090,10 @@ SEARCH_OPEN_JS = """(query) => {""" + FLOAT_HELPERS_JS + """
     const head = list.top - (parseFloat(getComputedStyle(area).marginTop) || 0);
     if (b.top < head - 0.5) problems.push(`the bar hangs ${(head - b.top).toFixed(1)}px over what is above the list`);
     if (b.left < list.left - 0.5 || b.right > list.right + 0.5) problems.push('the bar is wider than the list');
-    // 140 since `#211 link-filter` put Links beside Pinned on the same line.
-    if (f.width < 140) problems.push(`the field is ${Math.round(f.width)}px wide`);
+    // 140 since `#211 link-filter` put Links beside Pinned on the same line; 96 since
+    // `#1852` added the Whole-threads toggle as a fourth square on the phone's line (see
+    // FILTER_BAR_JS: the text-room floor, FIELD_TEXT_MIN_PX, is the guard that did not move).
+    if (f.width < 96) problems.push(`the field is ${Math.round(f.width)}px wide`);
     if (f.left < b.left || g.right > b.right + 0.5 || g.top < b.top - 0.5 || g.bottom > b.bottom + 0.5) {
         problems.push('the glass or the field is outside the bar');
     }
@@ -1672,9 +1674,11 @@ COALESCE_LOOK_JS = """async ({png, check, id, parent, stack}) => {""" + FLOAT_HE
 # line, each a whole 44px box every point of which presses it, meeting neither its neighbours, the
 # glass nor the field. The glass's own centre is still the glass, and so is the strip of its 48px
 # target just left of its disc, which no filter's box may cover. The field is still `fieldMin` px wide
-# with both filters and the count beside it — 140 at the ordinary type size — and whatever the size,
-# leaves FIELD_TEXT_MIN_PX inside its padding for what is typed. `pinned` says whether Pinned should be
-# on the bar.
+# with both filters and the count beside it — 140 at the ordinary type size before `#1852`, 96 since:
+# the owner's Whole-threads toggle is a fourth 44px square on the same phone line, and its width comes
+# off the field's total, never off the room for its text — whatever the size, the field still leaves
+# FIELD_TEXT_MIN_PX inside its padding for what is typed, at every BAR_SCALES size in links_bar_walk.
+# `pinned` says whether Pinned should be on the bar.
 FILTER_BAR_JS = """({pinned, fieldMin}) => {""" + FLOAT_HELPERS_JS + f"""
     const FIELD_TEXT_MIN_PX = {FIELD_TEXT_MIN_PX};""" + """
     const problems = [];
@@ -4243,10 +4247,10 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             # The Pinned filter on the open bar, before and after the count takes its room.
             tap("#search-toggle")
             until("() => !document.getElementById('pinned-filter').hidden", "the open bar has no Pinned filter")
-            bare = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 140})
+            bare = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 96})
             check(not bare["problems"], f"{label}, the filters on the open bar: {bare['problems']}")
             page.fill("#search-field", "a")
-            counted = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 140})
+            counted = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 96})
             shot("3-filter-beside-glass")
             check(not counted["problems"], f"{label}, the filters beside a count: {counted['problems']}")
             page.fill("#search-field", "")
@@ -4357,10 +4361,10 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             # The open bar: Links, then Pinned, then the glass; then the same with a count beside them.
             tap("#search-toggle")
             until("() => !document.getElementById('links-filter').hidden", "the open bar has no Links filter")
-            bare = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 140})
+            bare = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 96})
             check(not bare["problems"], f"{label}, the filters on the open bar: {bare['problems']}")
             page.fill("#search-field", "a")
-            counted = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 140})
+            counted = page.evaluate(FILTER_BAR_JS, {"pinned": True, "fieldMin": 96})
             shot("2-bar-with-count")
             check(not counted["problems"], f"{label}, the filters beside a count: {counted['problems']}")
             page.fill("#search-field", "")
@@ -4429,7 +4433,7 @@ def links_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.wait_for_selector("#pane-voice", state="visible", timeout=5_000)
             tap("#search-toggle")
             until("() => !document.getElementById('links-filter').hidden", "the call view's bar has no Links filter")
-            alone = page.evaluate(FILTER_BAR_JS, {"pinned": False, "fieldMin": 140})
+            alone = page.evaluate(FILTER_BAR_JS, {"pinned": False, "fieldMin": 96})
             shot("5-call-view-bar")
             check(not alone["problems"], f"{label}, the call view's bar: {alone['problems']}")
             check(not errors, f"{label}, links: the page threw: {errors}")

@@ -157,8 +157,13 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int = 1
             if shots is not None:
                 page.screenshot(path=str(shots / f"{label}-search-whose-tooltip.png"))
             page.mouse.move(10, 10)
-        # ...and reaching it with the keyboard raises it too (Tab from the field, as a reader's would).
+        # ...and reaching it with the keyboard raises it too (Tab from the field, as a reader's
+        # would: `#1852`'s Whole-threads toggle stands first of the filters, so one Tab lands
+        # there and the next on the author filter).
         page.focus("#search-field")
+        page.keyboard.press("Tab")
+        until(page, "() => document.activeElement && document.activeElement.id === 'search-entire-threads'",
+              f"{label}: tabbing from the field did not land on the Whole-threads toggle")
         page.keyboard.press("Tab")
         until(page, "() => document.activeElement && document.activeElement.id === 'author-filter'"
                     " && getComputedStyle(document.getElementById('author-filter-tip')).display === 'block'",
