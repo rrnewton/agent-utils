@@ -81,7 +81,7 @@ test("#1837: an idle confirmation gets the short clock, action words the full on
   assert.equal(el("status-line").hidden, true, "action words outstayed the full clock");
 });
 
-test("#1855: an idle confirmation is marked to wait, action words are not", () => {
+test("#1859: an idle confirmation is marked to wait, action words are not", () => {
   const { notices, el } = makeNotices();
   notices.setStatus("Ready.");
   assert.equal(el("status-line").attrs["data-idle"], "", "Ready. was not marked to wait");

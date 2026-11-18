@@ -63,7 +63,7 @@
   visibility: hidden;
 }
 
-/* `#1855 vibe-talk-ready-toast-covers-text`: an idle confirmation ("Ready.")
+/* `#1859 vibe-talk-ready-toast-covers-text`: an idle confirmation ("Ready.")
    is announced but not floated — it waits out its short clock rather than
    stand over the message text at the foot after a load or reload. */
 #status-line[data-idle] {
