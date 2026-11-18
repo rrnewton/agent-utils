@@ -150,6 +150,8 @@
 #   --profiles LIST Only with --screenshots. Comma-separated device profiles to photograph
 #                  (default: all of them). The gate runs disjoint profile lists as parallel
 #                  steps so no step holds every browser slot.
+#   --only STATE   Only with --screenshots. Photograph only this state (repeatable); the
+#                  standard matrix in scripts/README.md is four --only states. Default: all.
 #   --config FILE  Use exactly this configuration file and no other. Missing file is an error.
 #   --tunnel       Force the cloudflared tunnel check ON for this run.
 #   --no-tunnel    Force the cloudflared tunnel check OFF for this run.
@@ -283,6 +285,7 @@ SCREENSHOTS=0
 SHOTS_OUT=""
 SHOTS_THEME=""
 SHOTS_PROFILES=""
+SHOTS_ONLY=()
 TUNNEL_OVERRIDE=""
 TAG_OVERRIDE=""
 PORT_OVERRIDE=""
@@ -320,6 +323,7 @@ while [ $# -gt 0 ]; do
         --out) SHOTS_OUT="${2:?--out needs a directory}"; shift 2 ;;
         --theme) SHOTS_THEME="${2:?--theme needs dark, light or both}"; shift 2 ;;
         --profiles) SHOTS_PROFILES="${2:?--profiles needs a comma-separated profile list}"; shift 2 ;;
+        --only) SHOTS_ONLY+=("${2:?--only needs a state name}"); shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unrecognized argument: $1" >&2; echo "" >&2; usage >&2; exit 2 ;;
     esac
@@ -374,6 +378,13 @@ if [ -n "$SHOTS_THEME" ] && [ "$SCREENSHOTS" != 1 ]; then
     die "--theme only means something together with --screenshots.
 It picks the colour scheme the app is photographed in. On its own there is nothing to
 photograph, and accepting it silently would leave you believing you had chosen a theme for a run
+that never took a picture."
+fi
+
+if [ "${#SHOTS_ONLY[@]}" -gt 0 ] && [ "$SCREENSHOTS" != 1 ]; then
+    die "--only only means something together with --screenshots.
+It picks which states are photographed. On its own there is nothing to
+photograph, and accepting it silently would leave you believing you had chosen states for a run
 that never took a picture."
 fi
 
@@ -529,6 +540,17 @@ starts. Stop it, or choose another port with --port."
     # the whole run out of the way of anything else instead of half of it.
     SHOTS_MOCK_HTTP_PORT=$((SHOTS_PORT + 1))
     SHOTS_MOCK_WS_PORT=$((SHOTS_PORT + 2))
+    # `#1855 vibe-talk-screenshot-harness-real-states`. A fourth port, for the loopback model
+    # stub (scripts/model_stub.py): Discuss needs a [summaries.llm] backend, and pointing it
+    # at this stub lets preview/Summarize answer through the REAL router with only the model
+    # invented. The three claimed ports above are unchanged (the port tests pin them); this
+    # one is proved free below like the others and the stub dies with the run's trap.
+    SHOTS_MODEL_PORT=$((SHOTS_PORT + 3))
+    if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -Eq "[:.]${SHOTS_MODEL_PORT}[[:space:]]"; then
+        die "something is already listening on port $SHOTS_MODEL_PORT, which is where the
+loopback model stub has to bind (it takes the port three above --port $SHOTS_PORT). Stop it, or
+choose another port with --port."
+    fi
     for shots_extra_port in "$SHOTS_MOCK_HTTP_PORT" "$SHOTS_MOCK_WS_PORT"; do
         if [ "$shots_extra_port" = 8080 ] || [ "$shots_extra_port" = 18081 ]; then
             die "--port $SHOTS_PORT puts the offline ElevenLabs mock on port $shots_extra_port,
@@ -563,11 +585,12 @@ stale binary serves last build's markup. Install Rust, or build the binary yours
     SHOTS_TMP="$(mktemp -d)"
     SHOTS_PID=""
     SHOTS_MOCK_PID=""
+    SHOTS_MODEL_PID=""
     shots_cleanup() {
         # BOTH processes, and the mock as carefully as the server. It holds two ports of its own,
         # so an orphaned one makes the NEXT run refuse to start for a reason that names a port and
         # not the run that leaked it -- which is exactly how the six-day orphan below was found.
-        for shots_leftover in "$SHOTS_PID" "$SHOTS_MOCK_PID"; do
+        for shots_leftover in "$SHOTS_PID" "$SHOTS_MOCK_PID" "$SHOTS_MODEL_PID"; do
             if [ -n "$shots_leftover" ] && kill -0 "$shots_leftover" 2>/dev/null; then
                 kill "$shots_leftover" 2>/dev/null || true
                 wait "$shots_leftover" 2>/dev/null || true
@@ -644,7 +667,13 @@ reply_timeout_seconds = 3
 [storage]
 EOF
         printf 'path = "%s/state/vibe-talk.sqlite3"\n' "$SHOTS_TMP"
+        # `#1855`: Discuss through the real router. Without a [summaries.llm] section the
+        # catchup endpoint refuses by name; with one pointed at the loopback model stub
+        # (started below), preview and Summarize really answer and only the model is invented.
+        printf '\n[summaries.llm]\nbase_url = "http://127.0.0.1:%s"\n' "$SHOTS_MODEL_PORT"
+        printf 'model = "model-stub"\napi_key_file = "%s/model-key"\n' "$SHOTS_TMP"
     } > "$SHOTS_TMP/vibe-talk.toml"
+    printf 'screenshot-run-model-key-not-a-real-credential' > "$SHOTS_TMP/model-key"
 
     case "${SHOTS_THEME:-dark}" in
         dark|light|both) ;;
@@ -654,6 +683,7 @@ EOF
     step "Screenshots of the app at / — free, offline, no vendor conversation and no microphone."
     note "theme:     ${SHOTS_THEME:-dark} (dark by default — it is the theme the phone is in)"
     note "server:    throwaway, native, --fake-discord, 127.0.0.1:$SHOTS_PORT (never 8080)"
+    note "model:     loopback model stub on 127.0.0.1:$SHOTS_MODEL_PORT (Discuss answers for real)"
     note "vendor:    vibe-talk-mock-elevenlabs on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (mint + control)"
     note "           and 127.0.0.1:$SHOTS_MOCK_WS_PORT (conversations). Offline; nothing is billed."
     note "output:    $SHOTS_OUT"
@@ -662,6 +692,7 @@ EOF
     if [ "$DRY_RUN" = 1 ]; then
         note "(dry run) cargo build --release --manifest-path $VIBE_TALK_DIR/Cargo.toml"
         note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk-mock-elevenlabs --scenario no_tool_call --http-port $SHOTS_MOCK_HTTP_PORT --ws-port $SHOTS_MOCK_WS_PORT --bridge-base http://127.0.0.1:$SHOTS_PORT --bridge-token <write token>"
+        note "(dry run) python3 $SCRIPT_DIR/model_stub.py --port $SHOTS_MODEL_PORT"
         note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk --config $SHOTS_TMP/vibe-talk.toml --fake-discord"
         note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT --theme ${SHOTS_THEME:-dark} --mock-control http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT"
         note "(dry run) nothing was built, started, or photographed."
@@ -722,6 +753,33 @@ Its output is above. Without it every summary state is unreachable."
     fi
     note "mock up on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (pid $SHOTS_MOCK_PID)"
 
+    step "Starting the loopback model stub"
+    # Before the server, for the same reason as the mock: the server's [summaries.llm]
+    # section names this port, and a stub that failed to bind should fail here by name.
+    (
+        cd "$SHOTS_TMP" || exit 1
+        exec python3 "$SCRIPT_DIR/model_stub.py" --port "$SHOTS_MODEL_PORT" \
+            > "$SHOTS_TMP/model-stub.log" 2>&1
+    ) &
+    SHOTS_MODEL_PID=$!
+    SHOTS_MODEL_UP=0
+    for _ in $(seq 1 40); do
+        if ! kill -0 "$SHOTS_MODEL_PID" 2>/dev/null; then break; fi
+        if curl -fsS -o /dev/null "http://127.0.0.1:$SHOTS_MODEL_PORT/" 2>/dev/null; then
+            SHOTS_MODEL_UP=1
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$SHOTS_MODEL_UP" != 1 ]; then
+        echo "" >&2
+        echo "--- loopback model stub output ---" >&2
+        cat "$SHOTS_TMP/model-stub.log" >&2 || true
+        die "the loopback model stub never answered on 127.0.0.1:$SHOTS_MODEL_PORT.
+Its output is above. Without it Discuss cannot answer and its states are unreachable."
+    fi
+    note "model stub up on 127.0.0.1:$SHOTS_MODEL_PORT (pid $SHOTS_MODEL_PID)"
+
     step "Starting the throwaway server"
     (
         cd "$SHOTS_TMP" || exit 1
@@ -757,6 +815,10 @@ Its output is above. Without it every summary state is unreachable."
             SHOTS_PROFILE_ARGS+=(--profile "$shot_profile")
         done
     fi
+    SHOTS_ONLY_ARGS=()
+    for shots_state in "${SHOTS_ONLY[@]}"; do
+        SHOTS_ONLY_ARGS+=(--only "$shots_state")
+    done
     rc=0
     "$SHOTS_SCRIPT" \
         --url "http://127.0.0.1:$SHOTS_PORT" \
@@ -764,6 +826,7 @@ Its output is above. Without it every summary state is unreachable."
         --out "$SHOTS_OUT" \
         --theme "${SHOTS_THEME:-dark}" \
         "${SHOTS_PROFILE_ARGS[@]}" \
+        "${SHOTS_ONLY_ARGS[@]}" \
         --mock-control "http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT" || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "" >&2

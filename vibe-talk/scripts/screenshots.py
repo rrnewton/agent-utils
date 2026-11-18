@@ -547,6 +547,10 @@ WAIT_PATIENCE = 3
 #: How long a scene's expectations are looked at again, all together, before it is called unreached.
 EXPECT_WAIT_S = 5.0
 
+#: `#1855 vibe-talk-screenshot-harness-real-states`. The height an on-screen keyboard takes, in
+#: CSS pixels: the shrink every keyboard-open shot must really have (the owner's standing matrix).
+KEYBOARD_PX = 336
+
 
 def _patient_waits(page: Page) -> None:
     """Stretch every explicit `wait_for_function` deadline on `page` by `WAIT_PATIENCE`."""
@@ -1070,6 +1074,10 @@ class Scene:
     # server, so a message one profile's walk marked Done would be drawn read in every later
     # profile's pictures, under names that do not say so. `#245 done-feedback` added it for its Done.
     after: Callable[["Driver"], None] | None = None
+    # `#1855 vibe-talk-screenshot-harness-real-states`. True only for a scene whose SUBJECT is
+    # transient UI (the switcher cards, a menu): `capture` otherwise settles that UI away first,
+    # so a shot never shows a popup the scene did not ask for.
+    keep_transient: bool = False
 
 
 class Driver:
@@ -1225,6 +1233,10 @@ class Driver:
                 raise Unreachable(scene.name, unmet[0], f"check: {unmet[1]}")
             self.page.wait_for_timeout(100)
 
+        # `#1855`: no transient UI over a shot that did not ask for it.
+        if not scene.keep_transient:
+            settle_ui(self)
+
         animations: Literal["allow", "disabled"]
         if scene.animation_offset_ms is not None:
             # Freeze the pulse at a chosen point of its cycle rather than at whatever instant the
@@ -1257,6 +1269,83 @@ class Driver:
             settled.append((name, path, pending.verdict()))
         self.results.extend(settled)
         return settled
+
+
+# -- shared shot helpers (`#1855 vibe-talk-screenshot-harness-real-states`) -------------------------
+#
+# The three helpers every lane's matrix used to re-invent (badly): Discuss through the real server
+# (the scenes below; the server side is run.sh's loopback model stub), a keyboard that really
+# shrinks, and a settle that puts transient UI away. They live here so there is ONE copy.
+
+
+def keyboard_shrink_problem(closed: int, opened: int) -> str | None:
+    """Why a keyboard-open height is not a real shrink, or None when it is.
+
+    Pure, so `--self-test` can prove the check goes red: an "open" height equal to the closed
+    one is the rejected shot every lane kept producing, and any other wrong height is a shrink
+    that did not land at the size the matrix promises.
+    """
+    if opened == closed:
+        return (
+            f"the keyboard-open viewport height ({opened}) equals the closed one — "
+            "the shot is not shrunk at all"
+        )
+    if opened != closed - KEYBOARD_PX:
+        return (
+            f"the keyboard-open viewport height ({opened}) is not the closed height "
+            f"({closed}) minus {KEYBOARD_PX}"
+        )
+    return None
+
+
+def shrink_keyboard(driver: Driver, scene_name: str) -> tuple[int, int]:
+    """Shrink the viewport by KEYBOARD_PX and wait until the page really reports it.
+
+    Returns (closed, opened) visual-viewport heights. Raises `Unreachable` — failing the run
+    by name — when the open height equals the closed one or misses the promised shrink: a
+    keyboard-open shot identical to the closed one is rejected, never filed.
+    """
+    closed = int(cast(float, driver.js("(window.visualViewport ? window.visualViewport.height : window.innerHeight)")))
+    shrunk = closed - KEYBOARD_PX
+    driver.page.set_viewport_size({"width": driver.profile.width, "height": shrunk})
+    driver.page.wait_for_function(
+        f"() => (window.visualViewport ? window.visualViewport.height : window.innerHeight) === {shrunk}",
+        timeout=20_000,
+    )
+    opened = int(cast(float, driver.js("(window.visualViewport ? window.visualViewport.height : window.innerHeight)")))
+    problem = keyboard_shrink_problem(closed, opened)
+    if problem is not None:
+        raise Unreachable(scene_name, "the keyboard really shrinks the viewport", problem)
+    return closed, opened
+
+
+def restore_keyboard(driver: Driver) -> None:
+    """Put the viewport back to the profile's full height after a keyboard shot."""
+    driver.page.set_viewport_size({"width": driver.profile.width, "height": driver.profile.height})
+    driver.page.wait_for_function(
+        f"() => (window.visualViewport ? window.visualViewport.height : window.innerHeight) === {driver.profile.height}",
+        timeout=20_000,
+    )
+
+
+def settle_ui(driver: Driver) -> None:
+    """Put transient UI away before a capture: switcher cards, open menus, transient status.
+
+    Uses the page's own dismissal (any key press puts the view cards away; Escape closes
+    menus), then waits — on conditions, never a fixed sleep — until none of it is on screen.
+    Escape also closes the Discuss panel, so with that panel open the cards are put away
+    with a key that dismisses nothing else. Scenes whose subject IS transient UI set
+    `keep_transient` and skip this. Error banners are deliberately untouched: they are
+    evidence, not clutter.
+    """
+    if bool(driver.js("window.__visible('discuss-panel')")):
+        driver.page.keyboard.press("F1")
+    else:
+        driver.page.keyboard.press("Escape")
+    driver.page.wait_for_function(
+        "() => !window.__visible('view-cards') && !window.__visible('docs-fetch-menu')",
+        timeout=5_000,
+    )
 
 
 # -- the scenes ------------------------------------------------------------------------------------
@@ -4248,6 +4337,59 @@ REPLY_HEAD_JS = (
 )
 
 
+def _open_discuss(driver: Driver) -> None:
+    """Open Discuss on the channel, through the page's own controls.
+
+    Self-contained (loads the page itself) so the Discuss states run with `--only`. Everything
+    is the real server: the fake upstream serves the timeline, the loopback model stub serves
+    the summary, and no catchup route is intercepted — the failure this replaces answered
+    those routes "not served by this check" at the fixture edge.
+    """
+    driver.load(with_token=True)
+    _ensure_pane(driver, "pane-discord")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    driver.page.wait_for_function("() => window.__visible('discuss-open')", timeout=15_000)
+    driver.click("discuss-open")
+    driver.page.wait_for_function("() => window.__visible('discuss-panel')", timeout=15_000)
+    # The preview really answered: the bound names a count the server computed.
+    driver.page.wait_for_function(
+        "() => Number(document.getElementById('discuss-count').value) > 0",
+        timeout=15_000,
+    )
+
+
+def _act_discuss_preview(driver: Driver) -> None:
+    _open_discuss(driver)
+
+
+def _act_discuss_summary(driver: Driver) -> None:
+    _open_discuss(driver)
+    driver.click("discuss-summarize")
+    driver.page.wait_for_function(
+        "() => document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
+        timeout=30_000,
+    )
+
+
+def _act_discuss_keyboard_closed(driver: Driver) -> None:
+    _open_discuss(driver)
+
+
+def _act_discuss_keyboard_open(driver: Driver) -> None:
+    _open_discuss(driver)
+    shrink_keyboard(driver, "76-discuss-keyboard-open")
+
+
+def _after_discuss_keyboard(driver: Driver) -> None:
+    restore_keyboard(driver)
+
+
+MATRIX_PROFILES = ("android-412", "laptop-1280")
+
 SCENES: tuple[Scene, ...] = (
     Scene(
         name="01-signed-out",
@@ -6905,6 +7047,77 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    # `#1855 vibe-talk-screenshot-harness-real-states`. The standard matrix states: Discuss
+    # really answering through the real router (preview, then the model stub's summary), and
+    # the keyboard pair at the matrix sizes. Before the summary-failure state, which must
+    # stay last (it empties the store the other summary states rely on).
+    Scene(
+        name="73-discuss-preview",
+        what="Discuss open on the channel: the preview really answered through the real server",
+        act=_act_discuss_preview,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            (
+                "the preview bound names a real count from the server",
+                "Number(document.getElementById('discuss-count').value) > 0",
+            ),
+            (
+                "no fixture refusal is showing for Discuss",
+                "!document.getElementById('discuss-panel').textContent.includes('not served by this check') "
+                "&& !document.getElementById('discuss-panel').textContent.includes('not_found')",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+            ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
+        ),
+    ),
+    Scene(
+        name="74-discuss-summary",
+        what="Discuss summarized: the loopback model stub's answer, served by the real route",
+        act=_act_discuss_summary,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            (
+                "the summary on screen is the model stub's answer",
+                "document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
+            ),
+            (
+                "no fixture refusal is showing for Discuss",
+                "!document.getElementById('discuss-panel').textContent.includes('not served by this check') "
+                "&& !document.getElementById('discuss-panel').textContent.includes('not_found')",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="75-discuss-keyboard-closed",
+        what="Discuss open, keyboard closed: the full-height half of the keyboard pair",
+        act=_act_discuss_keyboard_closed,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            (
+                "the viewport is at the profile's full height",
+                "(window.visualViewport ? window.visualViewport.height : window.innerHeight) > 500",
+            ),
+        ),
+    ),
+    Scene(
+        name="76-discuss-keyboard-open",
+        what="Discuss open, keyboard open: the viewport really shrunk by 336px",
+        act=_act_discuss_keyboard_open,
+        after=_after_discuss_keyboard,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            (
+                "the viewport really shrank (not the closed height under an open name)",
+                "(window.visualViewport ? window.visualViewport.height : window.innerHeight) <= 579",
+            ),
+            ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -8273,7 +8486,38 @@ SELF_TEST_CHECKS = (
     "the fake socket still provides everything web/voice.js uses",
     "an uncaught page error is reported instead of being photographed",
     "the microphone and audio graph are NOT stubbed",
+    "a keyboard-open height equal to the closed one fails the shrink check",
+    "the standard matrix states stay restricted to the phone and laptop matrix profiles",
+    "capture settles transient UI before the shutter opens",
 )
+
+
+def check_keyboard_controls() -> list[str]:
+    """`#1855`: the keyboard check must go red on the shot lanes kept producing, and the
+    matrix scenes must still call the one shared helper and settle before capture."""
+    problems: list[str] = []
+    if keyboard_shrink_problem(915, 915) is None:
+        problems.append(
+            "a keyboard-open height equal to the closed one passes the shrink check — "
+            "the identical open/closed shot would be filed as evidence again."
+        )
+    if keyboard_shrink_problem(915, 700) is None:
+        problems.append("a shrink by the wrong amount passes the keyboard check.")
+    if keyboard_shrink_problem(915, 915 - KEYBOARD_PX) is not None:
+        problems.append("a real 336px shrink fails the keyboard check.")
+    for name in ("73-discuss-preview", "74-discuss-summary",
+                 "75-discuss-keyboard-closed", "76-discuss-keyboard-open"):
+        scene = next((s for s in SCENES if s.name == name), None)
+        if scene is None:
+            problems.append(f"the standard matrix state '{name}' is gone from the scene table.")
+        elif scene.profiles != MATRIX_PROFILES:
+            problems.append(f"matrix state '{name}' is no longer restricted to the matrix profiles.")
+    source = pathlib.Path(__file__).read_text() if "__file__" in globals() else ""
+    if "settle_ui(self)" not in source:
+        problems.append("capture no longer settles transient UI before the shutter opens.")
+    if "shrink_keyboard(driver" not in source:
+        problems.append("no scene shrinks the keyboard through the shared helper.")
+    return problems
 
 
 def run_self_test(tmp: Path) -> int:
@@ -8295,6 +8539,7 @@ def run_self_test(tmp: Path) -> int:
         + check_page_error_controls()
         + check_popout_dim_controls()
         + check_popout_covered_controls()
+        + check_keyboard_controls()
     )
     if problems:
         for problem in problems:
