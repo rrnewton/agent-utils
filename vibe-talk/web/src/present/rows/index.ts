@@ -35,6 +35,7 @@ export {
   foldedCardText,
   proxyLinesOf,
   threadChoice,
+  titleLineOf,
   threadFacts,
   wrapCardLine,
 } from "./cards.ts";

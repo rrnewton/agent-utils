@@ -225,19 +225,41 @@ pub fn title_from_line(line: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// A thread's title from its root, as Slack's thread list titles one: the root's first non-empty
-/// line, each mention written as the person's name. For a thread list the message cache puts
-/// together (`#614 timeline-read-failures`).
+/// The line of a root its title is taken from: the first non-empty line that is not part of
+/// a leading quote block. `#1814 vibe-talk-thread-card-title-and-summary-due`.
+///
+/// A root that opens by quoting an earlier message (lines starting with `>`, as Slack writes
+/// them and as the markdown the server holds keeps them) and then states its own subject on
+/// the next line is titled by that line, not by the quote it opens with: the owner, quoting
+/// a thread that began "Not Started: ..." and writing "PROVENANCE THREAD 2026-11-17 TRY2"
+/// under it, found the card titled from the quote. A root that is only a quote is titled
+/// from its first quoted line, with the quote marks taken off.
+#[must_use]
+pub fn title_line(text: &str) -> &str {
+    let mut first_quoted = "";
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('>') {
+            if first_quoted.is_empty() {
+                first_quoted = line.trim_start_matches('>').trim_start();
+            }
+            continue;
+        }
+        return line;
+    }
+    first_quoted
+}
+
+/// A thread's title from its root, as Slack's thread list titles one: the root's first
+/// non-empty line that is not a leading quote ([`title_line`]), each mention written as the
+/// person's name. For a thread list the message cache puts together (`#614
+/// timeline-read-failures`).
 #[must_use]
 pub fn root_title(root: &Message) -> String {
     let named = crate::model::MentionName::write_names(&root.content, &root.mentions, "@");
-    title_from_line(
-        named
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or(""),
-    )
+    title_from_line(title_line(&named))
 }
 
 /// The fewest messages a thread holds before it is named or summarised at all: the root and
@@ -521,9 +543,59 @@ pub struct TimelineDelta {
 #[cfg(test)]
 mod summary_schedule_tests {
     use super::{
-        card_lines, card_max_lines, root_overflows_card, thread_summary_shown, CARD_LINE_CHARS,
-        DEFAULT_CARD_MAX_LINES, MAX_CARD_MAX_LINES, MIN_CARD_MAX_LINES,
+        card_lines, card_max_lines, root_overflows_card, root_title, thread_summary_shown,
+        title_line, CARD_LINE_CHARS, DEFAULT_CARD_MAX_LINES, MAX_CARD_MAX_LINES,
+        MIN_CARD_MAX_LINES,
     };
+
+    #[test]
+    fn a_title_skips_a_leading_quote_block() {
+        // `#1814 vibe-talk-thread-card-title-and-summary-due`.
+        assert_eq!(
+            title_line(
+                "> Not Started: the earlier thread about provenance\n\
+                 > quoted second line\n\
+                 PROVENANCE THREAD 2026-11-17 TRY2"
+            ),
+            "PROVENANCE THREAD 2026-11-17 TRY2"
+        );
+        assert_eq!(
+            title_line("\n\n  > quoted\n\nActual title\nmore"),
+            "Actual title"
+        );
+        assert_eq!(title_line("Plain title\n> quoted later"), "Plain title");
+        // A root that is only a quote is titled from its first quoted line, marks off.
+        assert_eq!(title_line("> Only a quote\n> second line"), "Only a quote");
+        assert_eq!(title_line(""), "");
+        assert_eq!(title_line("\n  \n"), "");
+        let root = |content: &str| crate::model::Message {
+            edited_timestamp: None,
+            thread: None,
+            id: crate::model::MessageId("1".to_owned()),
+            channel_id: crate::model::ChannelId("c".to_owned()),
+            author: "a".to_owned(),
+            author_id: crate::model::UserId("7".to_owned()),
+            author_is_bot: false,
+            timestamp: "t".to_owned(),
+            spoken_time: String::new(),
+            reply_to: None,
+            content: content.to_owned(),
+            spoken_content: String::new(),
+            content_html: String::new(),
+            noise: false,
+            reactions: None,
+            heading: None,
+            mentions: Vec::new(),
+            upstream_url: None,
+            upstream_app_url: None,
+            op_key: None,
+            observed_ms: None,
+        };
+        assert_eq!(
+            root_title(&root("> Not Started: x\nPROVENANCE THREAD 2026-11-17 TRY2")),
+            "PROVENANCE THREAD 2026-11-17 TRY2"
+        );
+    }
 
     fn thread_summary_due(messages: u64, last: Option<u64>) -> bool {
         super::thread_summary_due(messages, last, false)

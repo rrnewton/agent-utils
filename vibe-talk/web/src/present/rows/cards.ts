@@ -70,6 +70,24 @@ function firstLineOf(text: unknown, chars: number): string {
 }
 
 /**
+ * The line a thread's title is taken from, as src/threads.rs `title_line` takes it (`#1814`):
+ * the first non-empty line that is not part of a leading quote block (lines starting with
+ * `>`), else the first quoted line with its quote marks taken off, else "".
+ */
+function titleLineOf(text: unknown): string {
+  let firstQuoted = "";
+  for (const part of String(text || "").split("\n").map((line) => line.trim())) {
+    if (part === "") continue;
+    if (part.startsWith(">")) {
+      if (!firstQuoted) firstQuoted = part.replace(/^>+\s*/, "");
+      continue;
+    }
+    return part;
+  }
+  return firstQuoted;
+}
+
+/**
  * One thread as the page knows it: its summary and first message when the store holds them, when
  * it started and was last active, and its reply count. What every place that names a thread is
  * handed, so none of them can reach for a different field.
@@ -103,5 +121,5 @@ function threadFacts(choice: Pick<ThreadChoice, "at" | "started" | "count">): st
     .filter((part) => part !== "").join(" · ");
 }
 
-export { CARD_INDENTED_CHARS, CARD_LINE_CHARS, cardProxyLines, firstLineOf, foldedCardText, proxyLinesOf, threadChoice, threadFacts, wrapCardLine };
+export { CARD_INDENTED_CHARS, CARD_LINE_CHARS, cardProxyLines, firstLineOf, foldedCardText, proxyLinesOf, threadChoice, threadFacts, titleLineOf, wrapCardLine };
 export type { ThreadChoice };

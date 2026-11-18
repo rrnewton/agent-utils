@@ -533,6 +533,88 @@ fn a_new_reply_counts_on_its_held_root() {
     assert!(exact.reply_count_exact);
 }
 
+#[test]
+fn a_second_held_reply_makes_an_exact_count_a_lower_bound() {
+    // `#1814 vibe-talk-thread-card-title-and-summary-due`: a root whose provider count was
+    // exact at one reply, then a second reply held from the live feed (or a post) before any
+    // fresh copy of the root lands. The held replies prove the thread has three messages;
+    // a count still served as exact at one reply makes the thread look like two messages,
+    // so it is never queued for a summary.
+    let fx = Fixture::new("c1814-exact-count-stale");
+    let mut root = message("1700000000.000100", "ada", "question", T0);
+    root.thread = Some(crate::threads::MessageThread {
+        hue: None,
+        display_name: None,
+        summary: None,
+        id: "1700000000.000100".to_owned(),
+        root_message_id: Some(MessageId("1700000000.000100".to_owned())),
+        is_root: true,
+        broadcast: false,
+        reply_count: Some(1),
+        reply_count_exact: true,
+    });
+    fx.clock.set(T0 + MINUTE);
+    fx.list(
+        vec![root],
+        T0 + MINUTE,
+        Some(newest_proof(ListStart::At(T0))),
+    );
+    for (n, at) in [(1, 2), (2, 3)] {
+        let reply = super::fixtures::reply(
+            &format!("r{n}"),
+            "1700000000.000100",
+            "answer",
+            T0 + at * MINUTE,
+        );
+        fx.clock.set(T0 + at * MINUTE);
+        let chan = fx.chan.clone();
+        fx.offer(
+            &chan,
+            Observation::Rows {
+                rows: vec![Incoming::new(
+                    reply,
+                    Scope::Thread("1700000000.000100".to_owned()),
+                )],
+                scope: Some(Scope::Thread("1700000000.000100".to_owned())),
+                observed_ms: T0 + at * MINUTE,
+            },
+        );
+    }
+    let root_count = fx
+        .cache
+        .message(&fx.chan, &MessageId("1700000000.000100".to_owned()))
+        .served()
+        .expect("served")
+        .expect("held")
+        .message
+        .thread
+        .expect("a thread record");
+    assert_eq!(
+        root_count.reply_count,
+        Some(2),
+        "the held replies are counted on the root"
+    );
+    assert!(
+        !root_count.reply_count_exact,
+        "a count the held replies outgrew is a lower bound, not exact"
+    );
+    let list = fx.cache.thread_list(&fx.chan, 10).served().expect("listed");
+    let (record, _) = list
+        .threads
+        .iter()
+        .find(|(record, _)| record.thread_id == "1700000000.000100")
+        .expect("the thread is listed");
+    assert_eq!(
+        record.reply_count,
+        Some(2),
+        "the thread list counts both replies"
+    );
+    assert!(
+        !record.reply_count_exact,
+        "the thread list does not serve the outgrown count as exact"
+    );
+}
+
 /// The operation key a provider carried on a message is stored with it, and a later copy that
 /// cannot see it (a push, a path that drops metadata) never takes it away. `#465 replication-c6-op-key-marker`.
 #[test]

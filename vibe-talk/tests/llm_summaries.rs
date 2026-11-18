@@ -662,6 +662,34 @@ async fn a_thread_is_not_named_or_shown_named_before_its_third_message() {
     );
 }
 
+#[tokio::test]
+async fn a_quoted_root_with_a_title_line_is_named_at_its_third_message() {
+    // `#1814 vibe-talk-thread-card-title-and-summary-due`: a root that opens with a quote
+    // block, then one line meant as its title, with two replies (three messages in all).
+    let h = harness();
+    h.threads.root_says(
+        0,
+        "> Not Started: the earlier thread about provenance\n\
+         > quoted second line\n\
+         PROVENANCE THREAD 2026-11-17 TRY2",
+    );
+    h.threads.grow(0, 2);
+    h.threads.grow(1, 1);
+    call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    until_named(&h.names, 1).await;
+    let (_, body) = call(&h.app, THREAD_LIST, WRITE_TOKEN).await;
+    let named: Vec<_> = names_of(&body)
+        .into_iter()
+        .filter(|(_, name, sentence)| name.is_some() && sentence.is_some())
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(
+        named,
+        [THREADS[0]],
+        "the quoted root's thread is named at three messages: {body}"
+    );
+}
+
 /// A root of six short lines: one more than the five a card shows by default (`#522`).
 const SIX_LINE_ROOT: &str = "Deploy plan\n1. drain\n2. upgrade\n3. verify\n4. undrain\n5. watch";
 

@@ -7,7 +7,7 @@
 
 import type { Message } from "../../contract/index.ts";
 import { namedRecord, threadOf } from "../../core/channels/index.ts";
-import { firstLineOf, threadChoice, threadFacts } from "../../present/rows/index.ts";
+import { firstLineOf, threadChoice, threadFacts, titleLineOf } from "../../present/rows/index.ts";
 import type { ThreadChoice } from "../../present/rows/index.ts";
 import { noteRowBuilt } from "./rows.ts";
 
@@ -174,7 +174,8 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     return threadWords(choice).named;
   }
 
-  /** The readable title beside the slug: the server's title, else the root's first line (80 at most). */
+  /** The readable title beside the slug: the server's title, else the root's title line
+   * (skipping a leading quote block, `#1814`; 80 at most). */
   function threadTitle(choice: ThreadChoice | null): string {
     if (!choice) return "";
     const summary = choice.summary as { title?: unknown } | null;
@@ -185,7 +186,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       const title = firstLineOf(titled, Infinity);
       if (title && title !== slug) return title;
     }
-    const title = firstLineOf(choice.root ? deps.messageText(choice.root) : "", Infinity);
+    const title = titleLineOf(choice.root ? deps.messageText(choice.root) : "");
     return title && title !== slug ? title : "";
   }
 

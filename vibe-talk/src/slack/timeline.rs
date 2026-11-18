@@ -210,7 +210,8 @@ pub(super) fn cursor_micros(id: &MessageId) -> Result<i64, ChatError> {
     })
 }
 
-/// The first line of a root, trimmed to [`crate::threads::THREAD_TITLE_CHARS`]; for a root that is
+/// The first line of a root, trimmed to [`crate::threads::THREAD_TITLE_CHARS`], skipping a
+/// leading quote block ([`crate::threads::title_line`], `#1814`); for a root that is
 /// only files, its first file's name and kind as text (`#313 slack-file-posts`), since a file
 /// line's Markdown would show its address. A mention in it is written as the person's name, `@Ada
 /// Lovelace`, where the read could name it (`#318 slack-mention-names`).
@@ -219,11 +220,7 @@ fn title(raw: &Raw, root: Option<&Message>) -> String {
     let named = root.map(|root| MentionName::write_names(&root.content, &root.mentions, "@"));
     let line = files
         .as_deref()
-        .or_else(|| {
-            named
-                .as_deref()
-                .and_then(|text| text.lines().map(str::trim).find(|l| !l.is_empty()))
-        })
+        .or_else(|| named.as_deref().map(crate::threads::title_line))
         .unwrap_or("");
     crate::threads::title_from_line(line)
 }

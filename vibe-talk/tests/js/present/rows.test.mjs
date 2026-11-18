@@ -146,7 +146,12 @@ test("fold incremental expansion: peeling 5 from either edge shrinks the run and
 });
 
 test("`#624 voice-page-modularity`: a card's lines by the server's proxy, and a thread's facts, from the module alone", () => {
-  const { wrapCardLine, cardProxyLines, proxyLinesOf, foldedCardText, firstLineOf, threadChoice, threadFacts, CARD_LINE_CHARS } = ROWS;
+  const { wrapCardLine, cardProxyLines, proxyLinesOf, foldedCardText, firstLineOf, titleLineOf, threadChoice, threadFacts, CARD_LINE_CHARS } = ROWS;
+  // `#1814`: a title skips a leading quote block, as the server's `title_line` does.
+  assert.equal(titleLineOf("> Not Started: x\n> quoted\nPROVENANCE THREAD 2026-11-17 TRY2"), "PROVENANCE THREAD 2026-11-17 TRY2");
+  assert.equal(titleLineOf("> Only a quote\n> second"), "Only a quote");
+  assert.equal(titleLineOf("Plain title\n> quoted later"), "Plain title");
+  assert.equal(titleLineOf("\n \n"), "");
   assert.equal(CARD_LINE_CHARS, 36);
   assert.deepStrictEqual(wrapCardLine("x".repeat(73)).map(({ text, cut }) => [text.length, cut]), [[36, true], [36, true], [1, false]]);
   assert.equal(cardProxyLines(proxyLinesOf("one\n\n  two   words  \n")), 2);

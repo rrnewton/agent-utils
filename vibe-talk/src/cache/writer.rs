@@ -2223,13 +2223,18 @@ impl Writer<'_> {
         super::search_text::build(&message.author, &rendered)
     }
 
-    /// A reply the file did not hold proves its root has at least one reply. `#470 replication-c8-root-count`.
+    /// A reply the file did not hold proves its root has at least that many replies. `#470 replication-c8-root-count`.
     ///
-    /// Where the held root's own thread record still says none — its copy predates the reply: a
-    /// reply this server just posted, or one a read of the thread brought before the root was read
-    /// again — it is raised to one, marked not exact, so a root served from the file is not drawn
-    /// unanswered beside its own reply. Only ever up from none, never a count: the provider's own
-    /// count comes with the next copy of the root, which replaces this as any newer copy does.
+    /// Where the held root's own thread record says fewer — its copy predates the reply: a
+    /// reply this server just posted, one the live feed brought, or one a read of the thread
+    /// brought before the root was read again — it is raised to the number of replies the
+    /// file holds, marked not exact, so a root served from the file is not drawn unanswered
+    /// beside its own reply, and a thread list served from the file does not serve a count
+    /// the held replies have outgrown as still exact (`#1814
+    /// vibe-talk-thread-card-title-and-summary-due`: an exact count of one reply, kept while
+    /// a second reply was held, made a three-message thread look like two and it was never
+    /// queued for a summary). Only ever up, never a count of the provider's: its own count
+    /// comes with the next copy of the root, which replaces this as any newer copy does.
     fn count_reply_on_root(
         &mut self,
         chan_id: i64,
@@ -2258,6 +2263,37 @@ impl Writer<'_> {
             return Ok(());
         };
         if record.reply_count.unwrap_or(0) > 0 {
+            // The held replies may still outgrow the recorded count: count them, as
+            // `root_count_floor` counts them for a root that says none.
+            let held: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM message AS reply, message AS root \
+                 WHERE root.row_id = ?1 AND reply.chan = root.chan AND reply.thread_id = ?2 \
+                   AND reply.is_root = 0 AND reply.row_id != root.row_id",
+                params![root.row_id, thread.id],
+                |row| row.get(0),
+            )?;
+            let held = u64::try_from(held).unwrap_or(0);
+            if held <= record.reply_count.unwrap_or(0) {
+                return Ok(());
+            }
+            record.reply_count = Some(held);
+            record.reply_count_exact = false;
+            let Ok(extra) = serde_json::to_string(&extra) else {
+                return Ok(());
+            };
+            self.conn.execute(
+                "UPDATE message SET extra = ?1, thread_id = ?2 WHERE row_id = ?3",
+                params![extra, thread.id, root.row_id],
+            )?;
+            // The thread table keeps its own copy of the count, served by a thread list put
+            // together from the file: raise it the same way, or the list would go on
+            // serving the outgrown count as exact beside the raised root.
+            self.conn.execute(
+                "UPDATE thread SET reply_count = ?1, reply_count_exact = 0 \
+                 WHERE chan = ?2 AND thread_id = ?3 \
+                   AND (reply_count IS NULL OR reply_count < ?1)",
+                params![i64::try_from(held).unwrap_or(i64::MAX), chan_id, thread.id],
+            )?;
             return Ok(());
         }
         record.reply_count = Some(1);
