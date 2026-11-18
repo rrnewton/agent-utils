@@ -10,13 +10,32 @@ variants that contain them and must vanish under the variants
 that fix them.  Candidate wedges are confirmed or refuted the
 same way; see ai_docs/reports/research/
 2026-11-18-wrkslots-model-check.md for the full reading.
+
+Cost split (owner rule: fast, high-signal gating tests).  The
+default run is the fast subset (target <= ~20 s): both
+acceptance oracles, fix closure, the C1 wedge shapes, happy
+paths, and a one-step smoke over every battery scenario.  The
+full exploration battery (remaining scenarios and candidates)
+is opt-in for a developer run by hand:
+
+    WRKSLOTS_MODEL_FULL=1 python3 -m pytest \
+        py/wrkslots/tests/test_transition_model.py -q
+
+or, without assertions, ``python3 py/wrkslots/transitionmodel.py``.
 """
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from wrkslots import transitionmodel as tm
+
+FULL = pytest.mark.skipif(
+    os.environ.get("WRKSLOTS_MODEL_FULL") != "1",
+    reason="full model battery is opt-in (WRKSLOTS_MODEL_FULL=1)",
+)
 
 CURRENT = tm.Scenario()
 CURRENT_FOREIGN = tm.Scenario(reg_a="foreign")
@@ -32,16 +51,6 @@ def current() -> tm.Exploration:
 
 
 @pytest.fixture(scope="module")
-def current_foreign() -> tm.Exploration:
-    return tm.explore(CURRENT_FOREIGN)
-
-
-@pytest.fixture(scope="module")
-def prefix_own() -> tm.Exploration:
-    return tm.explore(PREFIX_OWN)
-
-
-@pytest.fixture(scope="module")
 def prefix_foreign() -> tm.Exploration:
     return tm.explore(PREFIX_FOREIGN)
 
@@ -49,6 +58,16 @@ def prefix_foreign() -> tm.Exploration:
 @pytest.fixture(scope="module")
 def allfix_own() -> tm.Exploration:
     return tm.explore(ALLFIX_OWN)
+
+
+@pytest.fixture(scope="module")
+def current_foreign() -> tm.Exploration:
+    return tm.explore(CURRENT_FOREIGN)
+
+
+@pytest.fixture(scope="module")
+def prefix_own() -> tm.Exploration:
+    return tm.explore(PREFIX_OWN)
 
 
 @pytest.fixture(scope="module")
@@ -89,7 +108,7 @@ def _crash_free(ex: tm.Exploration, states: list[tm.State]) -> list[tm.State]:
     ]
 
 
-# --- #1807: forked revision chain on current main -----------------
+# --- Fast gating subset: acceptance oracles and smoke ------------
 
 def test_1807_fork_found_on_current_main(current: tm.Exploration) -> None:
     forks = current.violations("forked-chain")
@@ -146,37 +165,27 @@ def test_1807_append_after_capture_always_defers(
     )
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        tm.Scenario(fixes=tm.ALL_FIXES, reg_a="own"),
-        tm.Scenario(fixes=tm.CURRENT_MAIN | {tm.STALEREF}),
-        tm.Scenario(fixes=tm.CURRENT_MAIN | {tm.REVCHECK}),
-        tm.Scenario(fixes=tm.CURRENT_MAIN | {tm.REBASE}),
-        tm.Scenario(retained_writer=True),
-    ],
-    ids=["all-fix", "stale-refusal", "revcheck", "rebase", "retained-writer"],
-)
-def test_1807_each_fix_closes_the_fork(scenario: tm.Scenario) -> None:
-    ex = tm.explore(scenario)
-    assert ex.violations() == []
-    assert ex.wedges() == []
-
-
-def test_bare_fork_heals_via_tail_recovery(
-    current: tm.Exploration,
+def test_fix_variants_close_both_defects(
+    allfix_own: tm.Exploration,
 ) -> None:
-    # A fork at the tip with nothing else outstanding is what
-    # recover-tail-event exists for: some forked history rests
-    # clean afterwards (the ghost keeps the testimony).
-    healed = [
-        s for s in current.states
-        if tm.is_clean(s) and s.viol == "forked-chain"
-    ]
-    assert healed
-    assert any(
-        "RecTailTruncate" in current.trace(s) for s in healed
+    assert allfix_own.violations() == []
+    assert allfix_own.wedges() == []
+    defence_only = tm.explore(
+        tm.Scenario(fixes=tm.CURRENT_MAIN | {tm.STALEREF})
     )
+    assert defence_only.violations() == []
+    assert defence_only.wedges() == []
+
+
+def test_1766_prefix_deletes_while_locked(
+    prefix_foreign: tm.Exploration, current: tm.Exploration
+) -> None:
+    hits = _resting(
+        prefix_foreign, prefix_foreign.violations("deleted-while-locked")
+    )
+    assert hits
+    assert any(s.storage[tm.A] == "deleted" for s in hits)
+    assert current.violations("deleted-while-locked") == []
 
 
 def test_fork_with_journal_or_seal_is_a_true_wedge(
@@ -205,27 +214,92 @@ def test_fork_with_journal_or_seal_is_a_true_wedge(
     assert all(s.ok == 0 for s in current.wedges())
 
 
-# --- #1766: deleted while its registration is locked -------------
-
-def test_1766_prefix_deletes_while_locked(
-    prefix_own: tm.Exploration, prefix_foreign: tm.Exploration
-) -> None:
-    for ex in (prefix_own, prefix_foreign):
-        hits = _resting(ex, ex.violations("deleted-while-locked"))
-        assert hits
-        assert any(s.storage[tm.A] == "deleted" for s in hits)
-
-
-def test_1766_fixed_never_deletes_while_locked(
+def test_bare_fork_heals_via_tail_recovery(
     current: tm.Exploration,
-    current_foreign: tm.Exploration,
-    allfix_own: tm.Exploration,
-    allfix_foreign: tm.Exploration,
 ) -> None:
-    for ex in (current, current_foreign, allfix_own, allfix_foreign):
-        assert ex.violations("deleted-while-locked") == []
+    # A fork at the tip with nothing else outstanding is what
+    # recover-tail-event exists for: some forked history rests
+    # clean afterwards (the ghost keeps the testimony).
+    healed = [
+        s for s in current.states
+        if tm.is_clean(s) and s.viol == "forked-chain"
+    ]
+    assert healed
+    assert any(
+        "RecTailTruncate" in current.trace(s) for s in healed
+    )
 
 
+def test_happy_path_archives_clean(current: tm.Exploration) -> None:
+    archived_a = [
+        s for s in current.states if tm.is_clean(s) and s.arch[tm.A] == 1
+    ]
+    assert archived_a
+    trace = current.trace(archived_a[0])
+    assert trace and all(isinstance(step, str) for step in trace)
+
+
+def test_every_battery_scenario_steps_cleanly() -> None:
+    # Smoke, not search: every battery configuration's start
+    # state must step without error for two plies.  Full
+    # explorations of these scenarios are the opt-in battery.
+    scenarios = [
+        CURRENT,
+        CURRENT_FOREIGN,
+        PREFIX_OWN,
+        PREFIX_FOREIGN,
+        ALLFIX_OWN,
+        ALLFIX_FOREIGN,
+        tm.Scenario(fixes=tm.CURRENT_MAIN | {tm.REVCHECK}),
+        tm.Scenario(retained_writer=True),
+        tm.Scenario(b_present=False),
+        tm.Scenario(misjudged_a=True),
+        tm.Scenario(
+            contention=True,
+            b_unbound=True,
+            max_heartbeats=4,
+            disable=frozenset({"rm", "cr", "vb"}),
+        ),
+    ]
+    for sc in scenarios:
+        start = tm.initial_states(sc)[0]
+        first = tm.successors(start, sc)
+        assert first, sc
+        for _name, _kind, nxt in first:
+            assert tm.successors(nxt, sc) is not None
+
+
+# --- Full battery (opt-in): remaining scenarios and candidates ---
+
+@FULL
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        tm.Scenario(fixes=tm.CURRENT_MAIN | {tm.REVCHECK}),
+        tm.Scenario(fixes=tm.CURRENT_MAIN | {tm.REBASE}),
+        tm.Scenario(retained_writer=True),
+    ],
+    ids=["revcheck", "rebase", "retained-writer"],
+)
+def test_1807_each_remaining_fix_closes_the_fork(
+    scenario: tm.Scenario,
+) -> None:
+    ex = tm.explore(scenario)
+    assert ex.violations() == []
+    assert ex.wedges() == []
+
+
+@FULL
+def test_1766_prefix_own_deletes_while_locked(
+    prefix_own: tm.Exploration, allfix_foreign: tm.Exploration
+) -> None:
+    hits = _resting(prefix_own, prefix_own.violations("deleted-while-locked"))
+    assert hits
+    assert any(s.storage[tm.A] == "deleted" for s in hits)
+    assert allfix_foreign.violations("deleted-while-locked") == []
+
+
+@FULL
 def test_1766_foreign_lock_is_manual_with_storage_intact(
     current_foreign: tm.Exploration, prefix_foreign: tm.Exploration
 ) -> None:
@@ -245,8 +319,7 @@ def test_1766_foreign_lock_is_manual_with_storage_intact(
     assert any(s.storage[tm.A] == "deleted" for s in stranded)
 
 
-# --- Candidate wedges: confirmed or refuted -----------------------
-
+@FULL
 def test_c2_config_ttl_edit_strands_create_recovery(
     create_run: tm.Exploration,
 ) -> None:
@@ -267,6 +340,7 @@ def test_c2_config_ttl_edit_strands_create_recovery(
     assert all(s.ok == 0 for s in create_run.wedges())
 
 
+@FULL
 def test_c3_renewed_heartbeat_delays_but_never_wedges(
     misjudged: tm.Exploration,
 ) -> None:
@@ -283,6 +357,7 @@ def test_c3_renewed_heartbeat_delays_but_never_wedges(
     assert not ({*renewed} & stuck)
 
 
+@FULL
 def test_c4_hold_and_finish_journal_never_coexist(
     current: tm.Exploration, misjudged: tm.Exploration,
     create_run: tm.Exploration,
@@ -295,6 +370,7 @@ def test_c4_hold_and_finish_journal_never_coexist(
         ]
 
 
+@FULL
 def test_c5_snapshot_divergence_heals_without_a_fork(
     current: tm.Exploration,
 ) -> None:
@@ -306,10 +382,11 @@ def test_c5_snapshot_divergence_heals_without_a_fork(
         != (s.tip, s.log_hb, s.log_pres)
     ]
     assert divergent, "crash between append and snapshot must show"
-    clean_reachable = set(current._reaching_clean(None))
+    clean_reachable = current._reaching_clean(None)
     assert all(s in clean_reachable for s in divergent)
 
 
+@FULL
 def test_contention_retry_budget_can_be_exhausted(
     contention: tm.Exploration,
 ) -> None:
@@ -323,15 +400,8 @@ def test_contention_retry_budget_can_be_exhausted(
     assert contention.wedges() == []
 
 
-# --- Happy paths and trace sanity ---------------------------------
-
-def test_happy_paths_reach_clean_terminals(
-    current: tm.Exploration, create_run: tm.Exploration
-) -> None:
-    archived_a = [
-        s for s in current.states if tm.is_clean(s) and s.arch[tm.A] == 1
-    ]
-    assert archived_a
+@FULL
+def test_create_happy_path(create_run: tm.Exploration) -> None:
     created_b = [
         s
         for s in create_run.states
@@ -340,11 +410,3 @@ def test_happy_paths_reach_clean_terminals(
         and s.actors[2].pc == tm.DONE
     ]
     assert created_b
-
-
-def test_counterexample_traces_name_actions(
-    current: tm.Exploration,
-) -> None:
-    forks = current.violations("forked-chain")
-    trace = current.trace(forks[0])
-    assert trace and all(isinstance(step, str) for step in trace)

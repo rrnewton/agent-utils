@@ -33,13 +33,24 @@ the phase tables below are the temporal reading of the model.
 ## Run it
 
 ```bash
-# Full battery: 13 scenarios, counterexample traces included
-# (a few minutes; states per scenario are printed first)
-python3 py/wrkslots/transitionmodel.py
-
-# The gated assertions (what validation runs)
+# The gated assertions (what validation runs): the fast subset —
+# both acceptance oracles, fix closure, the fork-wedge shapes,
+# happy paths, and a one-step smoke over every scenario (~13 s)
 python3 -m pytest py/wrkslots/tests/test_transition_model.py -q
+
+# Full battery, opt-in, run by hand: every scenario explored
+# exhaustively with the candidate assertions (~95 s)
+WRKSLOTS_MODEL_FULL=1 python3 -m pytest \
+    py/wrkslots/tests/test_transition_model.py -q
+
+# Same explorations without assertions, traces printed
+python3 py/wrkslots/transitionmodel.py
 ```
+
+The split is deliberate (fast, high-signal gating tests): if a
+transcription stops matching the code, the fast oracles redden
+first; the full battery exists to re-derive the report's
+counts and to search wider after a model change.
 
 One scenario from a REPL or a scratch script:
 

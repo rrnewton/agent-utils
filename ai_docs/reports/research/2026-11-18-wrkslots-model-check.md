@@ -7,10 +7,9 @@ modelling time, so current main *is* the #1807 pre-fix code
 path). Artefacts: `py/wrkslots/transitionmodel.py` (model and
 checker), `py/wrkslots/tests/test_transition_model.py` (gated
 assertions), `py/wrkslots/TRANSITIONMODEL.md` (how to run it,
-coverage, bounds). No product code was changed. Confirmed
-findings are drafted as candidate issues at the end for the
-coordinator to file; nothing was filed from this lane except
-#1828 itself.
+coverage, bounds). No product code was changed. The four
+candidate findings were filed from this lane at the
+coordinator's instruction as #1830–#1833 (§8).
 
 ## Verdicts
 
@@ -87,9 +86,10 @@ contention heartbeats (capped). Scenario battery and sizes:
 | contention (isolated) | 94,362 | 0 | 0 | 0 (busy: 630) |
 
 Reproduce with `python3 py/wrkslots/transitionmodel.py`
-(prints minimal traces per class) and
-`python3 -m pytest py/wrkslots/tests/test_transition_model.py -q`
-(20 tests, ~95 s at modelling time). Wedge counts include
+(prints minimal traces per class) and the checked tests:
+the gating fast subset by default (~13 s: both acceptance
+oracles, fix closure, wedge shapes, smoke), the full battery
+under `WRKSLOTS_MODEL_FULL=1` (~95 s). Wedge counts include
 mid-flight states whose every future is wedged; the report
 quotes *resting* end states (no lock held, no actor
 mid-program) as the operator-visible forms.
@@ -401,12 +401,15 @@ labelled as reading rather than search results.
   execution and is worth one targeted check before anyone
   files it. Not drafted as a candidate.
 
-## 8. Candidate issues (for the coordinator to file)
+## 8. Candidate issues (filed as #1830–#1833)
 
-Drafted in the four-section shape; slugs follow the naming
-rule. None of these were filed from this lane.
+Filed from this lane at the coordinator's instruction, in the
+four-section shape, after checking no existing issue covers
+each (the nearest neighbours are #1373, recover-tail-event's
+origin, for candidate 1 and #1276 adopt-lock-narrow for
+candidate 3; both cross-linked there).
 
-**Candidate 1 — `wrkslots-forked-log-journal-no-exit`:
+**Candidate 1 — #1830 `wrkslots-forked-log-journal-no-exit`:**
 recover-tail-event cannot run while any journal or seal is
 outstanding, and recover cannot replay.** Description: §4.1
 (the four resting shapes, both traces, verb-by-verb refusal
@@ -421,7 +424,7 @@ event and journal it relied on. Notes: found by #1828's
 model; requires a fork source today (see #1807), filed as
 defence in depth so the repair exists before a second source.
 
-**Candidate 2 — `wrkslots-create-recovery-ttl-drift-loop`:
+**Candidate 2 — #1831 `wrkslots-create-recovery-ttl-drift-loop`:**
 a config heartbeat-TTL edit strands create recovery in a
 refusal loop.** Description: §4.2 (trace, the three refusals,
 the unnamed config-revert exit). Design: the journal's
@@ -433,7 +436,7 @@ abort completes (each with the drift noted), quarantine still
 available for genuinely stranded journals; eden twin
 (cli.py:41541) covered. Notes: #1828 model, candidate C2.
 
-**Candidate 3 — `wrkslots-prevalidated-starvation-under-churn`:
+**Candidate 3 — #1832 `wrkslots-prevalidated-starvation-under-churn`** (cross-linking #1276 adopt-lock-narrow, #1808, and #1829 stage 1):
 whole-registry identity retries can be starved by unrelated
 writes.** Description: §6. Design: document/implement a
 jittered whole-command retry for `_RegistryBusy` callers, or
@@ -443,7 +446,7 @@ shows adopt/create completing within a bounded number of
 whole-command attempts at a stated heartbeat rate. Notes:
 liveness only; the busy refusal itself is correct behaviour.
 
-**Candidate 4 — `wrkslots-reopen-coordinator-reassert`:
+**Candidate 4 — #1833 `wrkslots-reopen-coordinator-reassert`:**
 transfer-owner --reopen never re-asserts its captured
 coordinator under the lock.** Description: §7. Design: mirror
 the sibling captures (`_assert_caller_process` under the
