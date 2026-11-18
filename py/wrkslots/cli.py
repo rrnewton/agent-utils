@@ -6659,7 +6659,7 @@ def _enter_registry_turnstile(
 
 
 @contextlib.contextmanager
-def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[None]:
+def _locked(subject: Path, *, exclusive: bool, wait_seconds: float | None) -> Iterator[None]:
     path = _lock_path(subject)
     fd = _open_lock_file(path, "state lock")
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
@@ -6927,7 +6927,7 @@ def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int
 
 @contextlib.contextmanager
 def _locked_config(
-    path: Path, wait_seconds: float, *, exclusive: bool = True
+    path: Path, wait_seconds: float | None, *, exclusive: bool = True
 ) -> Iterator[None]:
     lock_path = path.parent
     claim = _held_config_lock_claim
