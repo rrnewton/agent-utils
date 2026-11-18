@@ -349,6 +349,22 @@ PLACE_JS = """(arg) => {
 }"""
 
 TOP_JS = "() => document.getElementById('scroll-area').scrollTop"
+# `#1866`: the lit sentence against the reader strip: an intersection while reading.
+COVER_JS = """() => {
+  const strip = document.getElementById('read-steer');
+  if (!strip || strip.hidden) return null;
+  const s = strip.getBoundingClientRect();
+  if (s.height <= 0) return null;
+  try {
+    const ranges = CSS.highlights && CSS.highlights.get('read-aloud-sentence');
+    if (!ranges) return null;
+    for (const range of ranges) {
+      const r = range.getBoundingClientRect();
+      if (r.height > 0 && r.bottom > s.top && r.top < s.bottom) return {sentence: [r.top, r.bottom], strip: [s.top, s.bottom]};
+    }
+  } catch (e) {}
+  return null;
+}"""
 ROW_ON_SCREEN_JS = f"""() => {{
   const row = document.querySelector('#discord-log > li[data-id="{ANCHOR}"]');
   if (!row) return false;
@@ -450,9 +466,13 @@ def reader_follow_walk(walk: Walk, api: FakeApi) -> None:
     other = page.context.new_page()
     other.goto("about:blank")
     tops: list[float] = []
+    covered: list[object] = []
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         tops.append(float(page.evaluate(TOP_JS)))
+        hit = page.evaluate(COVER_JS)
+        if hit is not None:
+            covered.append(hit)
         if page.evaluate("() => (document.getElementById('read-steer-count')?.textContent || '')"
                          ".startsWith('5 of')"):
             break
@@ -466,6 +486,9 @@ def reader_follow_walk(walk: Walk, api: FakeApi) -> None:
         other.bring_to_front()
         page.wait_for_timeout(400)
         tops.append(float(page.evaluate(TOP_JS)))
+        hit = page.evaluate(COVER_JS)
+        if hit is not None:
+            covered.append(hit)
         page.bring_to_front()
         walk.wait_for("() => document.visibilityState === 'visible'", "the tab did not come back")
         page.wait_for_timeout(400)
@@ -478,6 +501,8 @@ def reader_follow_walk(walk: Walk, api: FakeApi) -> None:
     walk.check(down_at is not None, f"the follow never scrolled down: tops {tops[:5]}...{tops[-3:]}")
     assert down_at is not None
     after_down = tops[down_at:]
+    walk.check(not covered,
+               f"the lit sentence stood under the reader strip while reading: {covered[:2]}")
     drops = [(a, b) for a, b in zip(tops, tops[1:]) if b < a - 4]
     walk.check(not drops,
                f"scrollTop was yanked up while following: {[(round(a), round(b)) for a, b in drops[:3]]}")
@@ -495,6 +520,8 @@ def reader_follow_walk(walk: Walk, api: FakeApi) -> None:
     walk.check(tops[-1] > tops[down_at] + 40 or sentence_on_screen,
                f"the follow did not keep the reading on screen: {tops[down_at]:.0f} to {tops[-1]:.0f}, "
                f"sentence on screen: {sentence_on_screen}")
+    walk.check(not covered,
+               f"the lit sentence stood under the reader strip after a live arrival: {covered[:2]}")
     walk.notes.append(f"following: scrollTop moved down {tops[down_at]:.0f} -> {tops[-1]:.0f} "
                       f"and never moved up across live repaints")
     walk.shot("2-thread-following")

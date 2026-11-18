@@ -2163,6 +2163,20 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // The client box, as the jump-to-reading centre is measured: the border box
     // would centre a few pixels off where scrollIntoView puts a row.
     const port = { top: rect0.top + (area.clientTop || 0), bottom: rect0.top + (area.clientTop || 0) + area.clientHeight };
+    // `#1866 vibe-talk-read-follow-clears-reader-strip`: the reader strip and the reading
+    // notice float over the list's foot, so a sentence kept in the port's band can still
+    // stand under them (the desktop shots of #1856). They cover the port's bottom:
+    // measured live at every follow, because the strip can be dragged and the notice
+    // comes and goes.
+    for (const coverId of ["read-steer", "status-line"]) {
+      let cover: HTMLElement | null = null;
+      try { cover = deps.el(coverId); } catch (_error) { cover = null; }
+      if (!cover || cover.hidden || typeof cover.getBoundingClientRect !== "function") continue;
+      const coverRect = cover.getBoundingClientRect();
+      if (coverRect.height > 0 && coverRect.top < port.bottom && coverRect.bottom > port.top) {
+        port.bottom = Math.min(port.bottom, coverRect.top);
+      }
+    }
     if (port.bottom <= port.top) return;
     const band = followBand(port.top, port.bottom);
     const rect = target.getBoundingClientRect();
