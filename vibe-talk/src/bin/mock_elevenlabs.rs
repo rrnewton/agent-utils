@@ -44,6 +44,8 @@ OPTIONS:
                           socket_drop | unsupported_audio | no_reply (default: full)
     --ping-ms MS          send the JSON ping event every MS milliseconds (default: never)
     --trace-file PATH     write the redacted event trace as JSON Lines on shutdown
+    --ports-file PATH     write {\"http_port\": N, \"ws_port\": M} (the bound ports) as JSON
+                          to PATH once listening; how a caller that passed port 0 learns them
     --help                print this message and exit
 
 CONTROL PLANE (on the HTTP half):
@@ -64,6 +66,7 @@ struct Args {
     scenario: Scenario,
     ping_every: Option<Duration>,
     trace_file: Option<PathBuf>,
+    ports_file: Option<PathBuf>,
 }
 
 fn parse_args() -> anyhow::Result<Option<Args>> {
@@ -78,6 +81,7 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
         scenario: Scenario::Full,
         ping_every: None,
         trace_file: None,
+        ports_file: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -106,6 +110,7 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
                 args.ping_every = Some(Duration::from_millis(ms));
             }
             "--trace-file" => args.trace_file = Some(PathBuf::from(value()?)),
+            "--ports-file" => args.ports_file = Some(PathBuf::from(value()?)),
             other => anyhow::bail!("unrecognized argument {other:?}\n\n{USAGE}"),
         }
     }
@@ -149,6 +154,22 @@ async fn main() -> anyhow::Result<()> {
         ..MockOptions::default()
     })
     .await?;
+
+    if let Some(path) = &args.ports_file {
+        // Written once the listeners are bound, atomically by rename, so
+        // a caller that asked the kernel for ports (0) can learn them
+        // without racing anyone for a precomputed number.
+        let ports = format!(
+            "{{\"http_port\": {}, \"ws_port\": {}}}\n",
+            mock.http_addr().port(),
+            mock.ws_addr().port()
+        );
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, ports)
+            .with_context(|| format!("writing the ports file {}", temporary.display()))?;
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("publishing the ports file {}", path.display()))?;
+    }
 
     tracing::warn!(
         "this is a MOCK ElevenLabs. It mints conversations for an agent nobody owns; it is bound \

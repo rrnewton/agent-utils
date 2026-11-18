@@ -525,24 +525,17 @@ starts. Stop it, or choose another port with --port."
     # unreachable page. vibe-talk-mock-elevenlabs is this repository's own loopback vendor: a real
     # mint endpoint and a real conversation WebSocket, free, offline, and answering canned prose.
     #
-    # Two ports, derived from the one the caller chose rather than fixed, so `--port` still moves
-    # the whole run out of the way of anything else instead of half of it.
-    SHOTS_MOCK_HTTP_PORT=$((SHOTS_PORT + 1))
-    SHOTS_MOCK_WS_PORT=$((SHOTS_PORT + 2))
-    for shots_extra_port in "$SHOTS_MOCK_HTTP_PORT" "$SHOTS_MOCK_WS_PORT"; do
-        if [ "$shots_extra_port" = 8080 ] || [ "$shots_extra_port" = 18081 ]; then
-            die "--port $SHOTS_PORT puts the offline ElevenLabs mock on port $shots_extra_port,
-which is either the LIVE vibe-talk (8080) or the unrelated vibe-talk:ci container (18081). The
-mock takes the TWO PORTS ABOVE the one you chose, so choose one whose two successors are neither.
-Leave --port off to use 18091, 18092 and 18093, or three free ports when any is taken."
-        fi
-        if command -v ss >/dev/null 2>&1 &&
-            ss -ltn 2>/dev/null | grep -Eq "[:.]${shots_extra_port}[[:space:]]"; then
-            die "something is already listening on port $shots_extra_port, which is where the
-offline ElevenLabs mock has to bind (it takes the two ports above --port $SHOTS_PORT). Stop it, or
-choose another port with --port."
-        fi
-    done
+    # The mock binds NO precomputed ports: it asks the kernel for both
+    # of its ports (0) and publishes them in its ports file once it is
+    # listening, and this run reads them from there. Deriving them from
+    # the caller's port (P+1, P+2) put the mock on a fixed number --
+    # 41826 on a kernel-picked run -- chosen and checked free long
+    # before a release build finished, so anything on the host could
+    # take it in between and the mock died at bind. Binding 0 leaves
+    # nothing to steal: the kernel assigns at bind time, and the ports
+    # file hands the numbers to the server config below.
+    SHOTS_MOCK_HTTP_PORT=""
+    SHOTS_MOCK_WS_PORT=""
 
     command -v cargo >/dev/null 2>&1 || die "--screenshots needs cargo, and it is not on PATH.
 The app is compiled INTO the server binary (build.rs builds web/ and embeds the result), so a
@@ -626,7 +619,10 @@ EOF
 agent_id = "agent_mock00000000000000000000000"
 api_key = "xi-mock-api-key-not-a-real-one"
 EOF
-        printf 'api_base = "http://127.0.0.1:%s/v1"\n' "$SHOTS_MOCK_HTTP_PORT"
+        # A placeholder: the mock binds a kernel port when it starts
+        # (after the build), and its real port replaces this below,
+        # before the server is started.
+        printf 'api_base = "http://127.0.0.1:%s/v1"\n' "__SHOTS_MOCK_HTTP_PORT__"
         cat <<'EOF'
 
 # Three seconds, not the default thirty, and it is the whole reason the FAILURE state is
@@ -654,16 +650,16 @@ EOF
     step "Screenshots of the app at / — free, offline, no vendor conversation and no microphone."
     note "theme:     ${SHOTS_THEME:-dark} (dark by default — it is the theme the phone is in)"
     note "server:    throwaway, native, --fake-discord, 127.0.0.1:$SHOTS_PORT (never 8080)"
-    note "vendor:    vibe-talk-mock-elevenlabs on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (mint + control)"
-    note "           and 127.0.0.1:$SHOTS_MOCK_WS_PORT (conversations). Offline; nothing is billed."
+    note "vendor:    vibe-talk-mock-elevenlabs on kernel-picked loopback ports (mint + control"
+    note "           and conversations), read from its ports file. Offline; nothing is billed."
     note "output:    $SHOTS_OUT"
     note "the running vibe-talk, its config and its logs are not touched."
 
     if [ "$DRY_RUN" = 1 ]; then
         note "(dry run) cargo build --release --manifest-path $VIBE_TALK_DIR/Cargo.toml"
-        note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk-mock-elevenlabs --scenario no_tool_call --http-port $SHOTS_MOCK_HTTP_PORT --ws-port $SHOTS_MOCK_WS_PORT --bridge-base http://127.0.0.1:$SHOTS_PORT --bridge-token <write token>"
+        note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk-mock-elevenlabs --scenario no_tool_call --http-port 0 --ws-port 0 --ports-file <tmp>/mock-ports.json --bridge-base http://127.0.0.1:$SHOTS_PORT --bridge-token <write token>"
         note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk --config $SHOTS_TMP/vibe-talk.toml --fake-discord"
-        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT --theme ${SHOTS_THEME:-dark} --mock-control http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT"
+        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT --theme ${SHOTS_THEME:-dark} --mock-control http://127.0.0.1:<mock http port from its ports file>"
         note "(dry run) nothing was built, started, or photographed."
         exit 0
     fi
@@ -696,13 +692,44 @@ without it: summaries come from a conversation with an agent and from nothing el
         cd "$SHOTS_TMP" || exit 1
         exec "$SHOTS_MOCK_BIN" \
             --scenario no_tool_call \
-            --http-port "$SHOTS_MOCK_HTTP_PORT" \
-            --ws-port "$SHOTS_MOCK_WS_PORT" \
+            --http-port 0 \
+            --ws-port 0 \
+            --ports-file "$SHOTS_TMP/mock-ports.json" \
             --bridge-base "http://127.0.0.1:$SHOTS_PORT" \
             --bridge-token "$SHOTS_WRITE_TOKEN" \
             > "$SHOTS_TMP/mock-elevenlabs.log" 2>&1
     ) &
     SHOTS_MOCK_PID=$!
+
+    # The mock publishes its kernel-picked ports once it is listening;
+    # only then can the server config point at it and the control plane
+    # be polled, so wait for the ports file, then for an answer.
+    SHOTS_PORTS_FILE="$SHOTS_TMP/mock-ports.json"
+    for _ in $(seq 1 60); do
+        if ! kill -0 "$SHOTS_MOCK_PID" 2>/dev/null; then break; fi
+        if [ -f "$SHOTS_PORTS_FILE" ]; then
+            SHOTS_MOCK_PORTS="$(python3 -c 'import json, sys
+ports = json.load(open(sys.argv[1]))
+print(ports["http_port"], ports["ws_port"])' "$SHOTS_PORTS_FILE" 2>/dev/null)" || SHOTS_MOCK_PORTS=""
+            if [ -n "$SHOTS_MOCK_PORTS" ]; then
+                SHOTS_MOCK_HTTP_PORT="${SHOTS_MOCK_PORTS%% *}"
+                SHOTS_MOCK_WS_PORT="${SHOTS_MOCK_PORTS##* }"
+                break
+            fi
+        fi
+        sleep 0.5
+    done
+    if [ -z "$SHOTS_MOCK_HTTP_PORT" ] || [ -z "$SHOTS_MOCK_WS_PORT" ]; then
+        echo "" >&2
+        echo "--- offline ElevenLabs mock output ---" >&2
+        cat "$SHOTS_TMP/mock-elevenlabs.log" >&2 || true
+        die "the offline ElevenLabs mock never published its ports file.
+Its output is above. Without it every summary state is unreachable."
+    fi
+    sed -i "s/__SHOTS_MOCK_HTTP_PORT__/$SHOTS_MOCK_HTTP_PORT/" "$SHOTS_TMP/vibe-talk.toml"
+    grep -q "api_base = \"http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT/v1\"" "$SHOTS_TMP/vibe-talk.toml" || \
+        die "the server config still names no mock api_base after the ports file arrived."
+    note "mock bound 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (http) and 127.0.0.1:$SHOTS_MOCK_WS_PORT (ws)"
 
     SHOTS_MOCK_UP=0
     for _ in $(seq 1 60); do
