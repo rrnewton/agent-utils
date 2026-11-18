@@ -397,7 +397,7 @@
             <div id="discuss-resize" role="separator" aria-orientation="vertical" tabindex="0"
                  aria-label="Discuss panel width" aria-valuemin="320" aria-valuemax="960" aria-valuenow="560"></div>
             <!-- `#1531 discuss-top-bar-slim-fixed`: a slim fixed top bar —
-                 the title "Discuss agent" and the layout/close icons — over
+                 the scope title ("Discuss: main channel", or the thread's) and the layout/close icons — over
                  the Summarize control (`#1382 discuss-summarize-control-oneline`,
                  `#1383 discuss-header-icons`). The Summarize control is one
                  line — [Summarize] last [N] unread since [HH:MM picker].
@@ -414,7 +414,7 @@
                    grip is part of the drag target. Its visibility in
                    22-discuss.css mirrors exactly where that drag is live. -->
               <span class="discuss-grip" aria-hidden="true"></span>
-              <span class="discuss-title">Discuss agent</span>
+              <span id="discuss-title" class="discuss-title">Discuss: main channel</span>
               <div id="discuss-actions" class="discuss-actions">
                 <button id="discuss-dock-toggle" class="discuss-icon-button" type="button" aria-pressed="false" aria-label="Dock panel" title="Dock panel">
                   <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></svg>

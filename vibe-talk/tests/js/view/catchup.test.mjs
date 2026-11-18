@@ -103,7 +103,7 @@ const IDS = [
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
   "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline",
   "discuss-followup", "discuss-send",
-  "discuss-actions", "discuss-resize", "discuss-head",
+  "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
   "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours",
   // `#1531 discuss-top-bar-slim-fixed`: no #discuss-read in the top bar; the
@@ -507,11 +507,15 @@ test("catchup: Main posts view main; a thread posts its thread_id", async () => 
   } finally { fx.restore(); }
 });
 
-test("catchup: the bar button opens and closes; narrowing keeps the bound label (#1395)", async () => {
-  // Old expectation (sync relabels to the new scope) was the #1395 bug: an
-  // open global Discuss narrowed into a thread stays bound and labelled
-  // global (`narrowing-stays-open`); it closes only from its own button.
-  const fx = fixture();
+test("catchup: the bar button opens and closes; entering a thread re-scopes Discuss to it (#1811)", async () => {
+  // #1811: an open channel Discuss entered into a thread must count and
+  // summarize that thread alone, titled for it; it closes only from its button.
+  const fx = fixture({
+    previewBodies: [
+      preview(),
+      preview({ window: { count: 3, unread_count: 1 }, unread: [{ id: "m9", at_ms: T2, label: "09:52 · Ben" }] }),
+    ],
+  });
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
@@ -519,10 +523,21 @@ test("catchup: the bar button opens and closes; narrowing keeps the bound label 
     assert.equal(view.isOpen(), true);
     assert.equal(fx.calls.posts.length, 0, "opening asked the model");
     await flush();
-    fx.setSelection({ view: "thread", threadId: "t2", thread: { title: "Other thread" } });
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: main channel");
+    assert.equal(fx.els["discuss-count"].value, "2");
+    fx.setSelection({ view: "thread", threadId: "t2", thread: { display_name: "foo-bar-baz", title: "Other thread" } });
     view.sync();
-    assert.equal(view.isOpen(), true, "narrowing closed the panel");
-    assert.equal(fx.els["discuss-scope"].textContent, "Channel chan-1", "narrowing relabelled the bound scope");
+    await flush();
+    assert.equal(view.isOpen(), true, "entering a thread closed the panel");
+    assert.equal(view.boundScope().kind, "thread", "entering a thread did not rebind Discuss");
+    assert.equal(fx.calls.previews.at(-1).scope.threadId, "t2", "the preview did not re-read for the thread");
+    assert.equal(fx.els["discuss-scope"].textContent, "foo-bar-baz");
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: thread foo-bar-baz");
+    assert.equal(fx.els["discuss-count"].value, "1", "the unread count stayed channel-wide");
+    assert.equal(fx.els["discuss-status"].textContent, "1 unread ready.");
+    click(fx.els["discuss-summarize"]);
+    assert.deepEqual(fx.calls.posts.at(-1).body.thread_id, "t2", "Summarize did not scope to the thread");
+    await flush();
     click(fx.els["discuss-open"]);
     assert.equal(view.isOpen(), false);
     assert.equal(fx.els["discuss-open"].getAttribute("aria-expanded"), "false");
@@ -751,10 +766,10 @@ test("catchup: the stamp line names chars without tokens and tokens with them", 
 
 // ---- 5. late answers and errors ---------------------------------------------------------------
 
-test("catchup: a late answer after narrowing still lands; after widening it is ignored (#1395)", async () => {
-  // Old expectation (any scope change drops the answer) was the #1395 bug
-  // for narrowing: the panel stays bound to global, so its answer lands.
-  // Widening closes the panel, and a late answer for it is ignored as before.
+test("catchup: a late channel answer after entering a thread is ignored; after widening too (#1811)", async () => {
+  // #1811: entering a thread re-scopes Discuss, so a channel answer still
+  // in flight for the old scope no longer lands. Widening closes the
+  // panel, and a late answer for it is ignored as before.
   const pending = deferred();
   const fx = fixture({ respond: () => pending.promise });
   try {
@@ -765,7 +780,7 @@ test("catchup: a late answer after narrowing still lands; after widening it is i
     view.sync();
     pending.resolve(answer());
     await flush();
-    assert.equal(fx.els["discuss-answer"].textContent, "Two things happened.", "the narrowed answer was dropped");
+    assert.equal(fx.els["discuss-answer"].textContent, "", "the stale channel answer landed in the thread scope");
     assert.equal(view.isOpen(), true);
   } finally { fx.restore(); }
 
@@ -1275,7 +1290,7 @@ test("binding: the rules table names every rule and rule 5 is close", () => {
   assert.deepEqual(DISCUSS_BINDING_RULES.map((rule) => rule.name), [
     "bound-to-open-scope",
     "global-unifies-all-and-main",
-    "narrowing-stays-open",
+    "narrowing-rescopes-to-thread",
     "in-thread-link-jumps-in-place",
     "out-of-thread-link-returns-to-bound",
     "widen-or-sideways-closes",
@@ -1295,7 +1310,7 @@ test("binding: the rules table names every rule and rule 5 is close", () => {
   }).rule, "out-of-window-cite-links-out");
 });
 
-test("binding: narrowing stays open with its answer; All/Main are one scope", async () => {
+test("binding: entering a thread re-scopes an open Discuss; All/Main are one scope", async () => {
   const fx = fixture();
   try {
     const view = createDiscussView(fx.deps);
@@ -1308,15 +1323,17 @@ test("binding: narrowing stays open with its answer; All/Main are one scope", as
     view.sync();
     assert.equal(view.isOpen(), true);
     assert.equal(view.isSameScopeAsCurrent(), true);
-    // Main -> thread: narrowing, panel stays bound and labelled global.
+    // Main -> thread (#1811): the panel stays open but re-scopes to the
+    // thread — bound, labelled and titled for it, with no model call yet.
     fx.setSelection(THREAD_T1);
     view.sync();
-    assert.equal(view.isOpen(), true, "narrowing closed the panel");
-    assert.equal(view.boundScope().kind, "global", "narrowing rebound the panel");
-    assert.equal(fx.els["discuss-scope"].textContent, "Channel chan-1");
-    assert.equal(fx.els["discuss-answer"].textContent, "Two things happened.", "narrowing dropped the answer");
-    assert.equal(fx.calls.posts.length, 1, "narrowing asked the model again");
-    assert.deepEqual(fx.calls.history, [], "narrowing pushed a history entry");
+    await flush();
+    assert.equal(view.isOpen(), true, "entering a thread closed the panel");
+    assert.equal(view.boundScope().kind, "thread", "entering a thread did not rebind the panel");
+    assert.equal(fx.els["discuss-scope"].textContent, "First thread");
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: thread First thread");
+    assert.equal(fx.calls.posts.length, 1, "re-scoping asked the model");
+    assert.deepEqual(fx.calls.history, [], "re-scoping pushed a history entry");
   } finally { fx.restore(); }
 });
 
@@ -1334,7 +1351,7 @@ test("binding: an in-thread citation jumps in place", async () => {
   } finally { fx.restore(); }
 });
 
-test("binding: an out-of-thread citation returns to the bound global view, panel open", async () => {
+test("binding: after entering a thread, its citations jump in place and others close (#1811)", async () => {
   const fx = fixture();
   try {
     const view = createDiscussView(fx.deps);
@@ -1343,16 +1360,15 @@ test("binding: an out-of-thread citation returns to the bound global view, panel
     await flush();
     fx.setSelection(THREAD_T1);
     view.sync();
-    // Another thread's message, then a top-level message: both leave the
-    // current thread for the bound global view, panel still open.
+    await flush();
+    // Discuss is bound to t1 now: its own citation jumps in place.
+    tapCitation(fx, "/?c=chan-1&v=thread&t=t1&m=discord%3Achan-1%3Am1%3At1");
+    assert.equal(view.isOpen(), true, "an in-thread tap closed the panel");
+    assert.deepEqual(fx.calls.jumps, [{ service: "discord", channel: "chan-1", message: "m1", thread: "t1" }]);
+    // Another thread's citation falls back: close and jump, Back restores.
     tapCitation(fx, "/?c=chan-1&v=thread&t=t2&m=discord%3Achan-1%3Am9%3At2");
-    assert.equal(fx.calls.bound.length, 1, "the tap did not return to the bound view");
-    assert.equal(fx.calls.bound[0].scope.threadId, null);
-    assert.deepEqual(fx.calls.bound[0].ref, { service: "discord", channel: "chan-1", message: "m9", thread: "t2" });
-    tapCitation(fx, "/?c=chan-1&v=all&m=discord%3Achan-1%3Am8");
-    assert.equal(fx.calls.bound.length, 2, "a top-level tap did not return to the bound view");
-    assert.equal(view.isOpen(), true, "a return-to-bound tap closed the panel");
-    assert.deepEqual(fx.calls.jumps, [], "a return-to-bound tap jumped in place");
+    assert.equal(view.isOpen(), false, "an out-of-thread tap left the panel open");
+    assert.equal(fx.calls.jumps.length, 2);
   } finally { fx.restore(); }
 });
 
@@ -1971,7 +1987,7 @@ test("discussdrop: maximized drops to the mode it came from; full screen restore
   } finally { fx.restore(); }
 });
 
-test("discussdrop: a return-to-bound tap drops; a tap at partial keeps nothing new", async () => {
+test("discussdrop: an in-thread tap drops; a tap at partial keeps nothing new", async () => {
   const fx = fixture();
   try {
     const view = createDiscussView(fx.deps);
@@ -1984,14 +2000,16 @@ test("discussdrop: a return-to-bound tap drops; a tap at partial keeps nothing n
     tapCitation(fx, "/?c=chan-1&v=all&m=discord%3Achan-1%3Am1");
     assert.equal(fx.kept.sheetKeeps.length, sheetKeeps, "a partial tap kept a sheet choice");
     assert.equal(fx.kept.modeKeeps.length, modeKeeps, "a partial tap kept a mode choice");
-    // Narrowed under the global binding and full: returning to the bound drops.
+    // In the thread Discuss now binds to (#1811) and full: an in-thread
+    // citation drops to partial and jumps in place, panel open.
     fx.setSelection(THREAD_T1);
     view.sync();
+    await flush();
     view.setSheetFull(true);
-    tapCitation(fx, "/?c=chan-1&v=all&m=discord%3Achan-1%3Am8");
-    assert.equal(fx.calls.bound.length, 1, "the tap did not return to the bound view");
-    assert.equal(view.sheetFull(), false, "the return-to-bound tap left the sheet full");
-    assert.equal(view.isOpen(), true, "the return-to-bound tap closed the panel");
+    tapCitation(fx, "/?c=chan-1&v=thread&t=t1&m=discord%3Achan-1%3Am1%3At1");
+    assert.equal(fx.calls.jumps.length, 2, "the in-thread tap did not jump in place");
+    assert.equal(view.sheetFull(), false, "the in-thread tap left the sheet full");
+    assert.equal(view.isOpen(), true, "the in-thread tap closed the panel");
   } finally { fx.restore(); }
 });
 

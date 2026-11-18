@@ -85,6 +85,11 @@ export interface DiscussScope {
   label: string;
 }
 
+/** `#1811`. The panel title for one scope: main channel, or thread slug. */
+export function discussTitle(scope: DiscussScope): string {
+  return scope.threadId !== null ? `Discuss: thread ${scope.label}` : "Discuss: main channel";
+}
+
 /** What the panel asks of the page. Every function is read on use, never at construction. */
 export interface DiscussPanelDependencies {
   byId(id: string): HTMLElement;
@@ -215,11 +220,15 @@ export interface DiscussPanel {
   mount(): { unmount(): void };
   /** Show the panel for `scope` and read its preview; no model is asked. */
   openWith(scope: DiscussScope): void;
+  /** `#1811`. Re-aim an open panel at `scope`: fresh preview and record, no model call. */
+  rescope(scope: DiscussScope): void;
   /** Hide the panel; a late answer for it is then ignored. */
   close(): void;
   isOpen(): boolean;
   /** Rewrite the scope line; nothing else moves. */
   setScopeLabel(label: string): void;
+  /** `#1811`. Rewrite scope line and panel title from one scope. */
+  setScope(scope: DiscussScope): void;
   /** Forget any answer still on its way (the scope changed under it). */
   invalidate(): void;
   /**
@@ -838,6 +847,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
+  /** `#1811`. Name the scope in the panel title; a host without one skips it. */
+  function setTitle(scope: DiscussScope): void {
+    const title = maybe("discuss-title");
+    if (title) title.textContent = discussTitle(scope);
+  }
+
   function clampWidth(value: unknown): number {
     if (deps.clampWidth) return deps.clampWidth(value);
     const px = Math.round(Number(value));
@@ -1348,6 +1363,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const asked = generation;
     lastScope = scope;
     deps.byId("discuss-scope").textContent = scope.label;
+    setTitle(scope);
     deps.byId("discuss-status").textContent = "Updating…";
     deps.byId("discuss-retry").hidden = true;
     // `#1787`: the standing summary's terms are the old one's while it updates.
@@ -1591,6 +1607,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const asked = generation;
     lastScope = scope;
     deps.byId("discuss-scope").textContent = scope.label;
+    setTitle(scope);
     if (!again) deps.byId("discuss-status").textContent = "Checking what to summarize…";
     void deps.catchupPreview(scope.channelId, scope).then(
       (value) => {
@@ -1646,6 +1663,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     lastScope = scope;
     lastAnswer = null;
     deps.byId("discuss-scope").textContent = scope.label;
+    setTitle(scope);
     deps.byId("discuss-status").textContent = "Reading…";
     deps.byId("discuss-answer").textContent = "";
     deps.byId("discuss-footer").hidden = true;
@@ -2009,6 +2027,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     setScopeLabel(label: string) {
       deps.byId("discuss-scope").textContent = label;
     },
+    setScope(scope: DiscussScope) {
+      deps.byId("discuss-scope").textContent = scope.label;
+      setTitle(scope);
+    },
+    rescope(scope: DiscussScope) {
+      previewFor(scope);
+      recordFor(scope);
+    },
     invalidate() {
       generation += 1;
     },
@@ -2033,6 +2059,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       }
       setOpen(true);
       deps.byId("discuss-scope").textContent = scope.label;
+      setTitle(scope);
       const unread = answer.window?.unread_count ?? answer.unread_ids.length;
       const count = answer.window?.count ?? answer.unread_ids.length;
       deps.byId("discuss-status").textContent = `Read ${unread} unread of ${count}`;

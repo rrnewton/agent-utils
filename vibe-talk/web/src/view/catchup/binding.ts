@@ -43,7 +43,7 @@ export interface DiscussBindingRule {
 export const DISCUSS_BINDING_RULES: readonly DiscussBindingRule[] = Object.freeze([
   { name: "bound-to-open-scope", action: "bind on open to the scope then on screen" },
   { name: "global-unifies-all-and-main", action: "All (flat) and Main (main) are one global scope" },
-  { name: "narrowing-stays-open", action: "global -> thread keeps the panel open, bound and labelled global" },
+  { name: "narrowing-rescopes-to-thread", action: "global -> thread keeps the panel open and re-scopes it to the thread: its unread count, summarize bound and context are the thread's alone (#1811)" },
   { name: "in-thread-link-jumps-in-place", action: "a citation inside the current thread jumps, panel open" },
   { name: "out-of-thread-link-returns-to-bound", action: "a citation outside the current thread but inside the bound global returns to the bound global view and jumps, panel open" },
   { name: "widen-or-sideways-closes", action: WIDEN_OR_SIDEWAYS_ACTION },
@@ -83,14 +83,15 @@ export function isSameDiscussScope(
 
 /** What a view change does to an open Discuss. */
 export interface ViewChangeDecision {
-  action: "stay" | "close";
+  action: "stay" | "rescope" | "close";
   rule: string;
 }
 
 /**
  * Decide a view change for an open panel bound to `bound` while the reader
- * now looks at `current`. Same scope (including All <-> Main) and narrowing
- * stay; widening, sideways, and a channel change close (rule 5).
+ * now looks at `current`. Same scope (including All <-> Main) stays;
+ * narrowing into a thread re-scopes the open panel to that thread (#1811);
+ * widening, sideways, and a channel change close (rule 5).
  */
 export function viewChangeDecision(
   bound: NormalizedDiscussScope,
@@ -103,7 +104,7 @@ export function viewChangeDecision(
     return { action: "stay", rule: "bound-to-open-scope" };
   }
   if (bound.kind === "global" && current.kind === "thread") {
-    return { action: "stay", rule: "narrowing-stays-open" };
+    return { action: "rescope", rule: "narrowing-rescopes-to-thread" };
   }
   return { action: "close", rule: "widen-or-sideways-closes" };
 }

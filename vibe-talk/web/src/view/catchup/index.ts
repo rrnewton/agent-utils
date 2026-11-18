@@ -5,7 +5,7 @@
 // Construction is inert: no element is looked up, no listener is added and nothing is
 // fetched until the controls are mounted and the panel opened.
 
-export { DISCUSS_UNAVAILABLE_HINT, HOUR_MS, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, boundForHours, countForHours, countSince, createDiscussPanel, discussReadKey, formatHoursFloor1, formatStampLine, hhmm, hoursFloor1, hoursSinceStart, isDiscussUnavailable, summaryTimeLabel } from "./panel.ts";
+export { DISCUSS_UNAVAILABLE_HINT, HOUR_MS, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, boundForHours, countForHours, countSince, createDiscussPanel, discussReadKey, discussTitle, formatHoursFloor1, formatStampLine, hhmm, hoursFloor1, hoursSinceStart, isDiscussUnavailable, summaryTimeLabel } from "./panel.ts";
 export { FRESH_CLASS, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, applyStrikes, citationIdsOf, hasWord } from "./strikes.ts";
 export type { StrikeElement } from "./strikes.ts";
 export type {
@@ -169,9 +169,10 @@ export interface DiscussView {
   /** Wire the bar button and the panel's controls; the boot tracks the answer. */
   mountControls(): { unmount(): void };
   /**
-   * Apply the binding to the selection now (`#1395`): same scope and
-   * narrowing keep the panel open under its bound label; widening,
-   * sideways, and a channel change close it behind a history entry.
+   * Apply the binding to the selection now (`#1395`): same scope keeps
+   * the panel open under its bound label; entering a thread re-scopes
+   * the open panel to that thread (`#1811`); widening, sideways, and a
+   * channel change close it behind a history entry.
    */
   sync(): void;
   /** Open the panel for the selection now and ask at once. */
@@ -534,7 +535,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         }
         drawAvailability();
         try {
-          panel.setScopeLabel(scopeNow().label);
+          panel.setScope(scopeNow());
         } catch {
           // A host whose selection is not ready yet labels it at the first sync.
         }
@@ -558,15 +559,21 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         if (panel.isOpen() && boundScope !== null && boundRaw !== null) {
           const decision = viewChangeDecision(boundScope, normalizeDiscussScope(currentRaw));
           if (decision.action === "stay") {
-            // Same scope, or narrowing under a global binding: the answer
-            // and its bound label stand; nothing is forgotten.
-            panel.setScopeLabel(boundRaw.label);
+            // Same scope: the answer and its bound label stand.
+            panel.setScope(boundRaw);
+          } else if (decision.action === "rescope") {
+            // `#1811`: entering a thread re-aims Discuss at that thread —
+            // its unread count, summarize bound and context become the
+            // thread's alone; the panel stays open, no model call yet.
+            boundRaw = currentRaw;
+            boundScope = normalizeDiscussScope(currentRaw);
+            panel.rescope(currentRaw);
           } else {
             pushRestoreState();
             panel.close();
           }
         } else {
-          panel.setScopeLabel(currentRaw.label);
+          panel.setScope(currentRaw);
         }
         drawAvailability();
         // `#1388` landing 1: a view change may carry new read state with it.

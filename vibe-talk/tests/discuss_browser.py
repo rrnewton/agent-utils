@@ -300,10 +300,10 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
         page.click("#discuss-open")
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
     # `#1531 discuss-top-bar-slim-fixed`: no Read in the top bar; its slim
-    # fixed bar carries "Discuss agent" beside the layout/close buttons.
+    # fixed bar carries the scope title beside the layout/close buttons.
     check(page.locator("#discuss-read").count() == 0, "the top bar still carries a Read button")
     title_text = page.locator(".discuss-title").text_content() or ""
-    check(title_text == "Discuss agent", f"the top bar title says {title_text!r}")
+    check(title_text == "Discuss: main channel", f"the top bar title says {title_text!r}")
     close_box0 = page.locator("#discuss-close").bounding_box()
     title_box0 = page.locator(".discuss-title").bounding_box()
     check(close_box0 is not None and title_box0 is not None
