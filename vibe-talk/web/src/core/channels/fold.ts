@@ -10,6 +10,17 @@ import { serverVersions } from "./versions.ts";
 import { inTimeOrder, inViewOf, sameMessage, threadOf, timeOf } from "./canon.ts";
 import { placeFromPage } from "./placement.ts";
 import { coverViewOf } from "./views.ts";
+import {
+  insertSorted,
+  messageIndex,
+  noteMessageChanged,
+  noteMessageRemoved,
+  noteThreadChanged,
+  reindexCanon,
+  removeMessage,
+  upsertMessage,
+  upsertThread,
+} from "./incremental.ts";
 
 /** A row of either list the store holds. */
 type Row = Message | ThreadSummary;
@@ -75,18 +86,47 @@ export function mergeIntoCanon(
   const incoming = new Set(arriving.map((item) => String(item.id)));
   const edge = page.length ? timeOf(page[0], timeField) : NaN;
   const removed = (item: Row) => field === "messages" && canon.removed.has(String(item.id));
-  const kept = (canon[field] as Row[]).filter((item) => !incoming.has(String(item.id)) &&
+  const before = canon[field] as Row[];
+  const kept = before.filter((item) => !incoming.has(String(item.id)) &&
     (older || !belongs(item) || (hasMore && Number.isFinite(edge) && timeOf(item, timeField) < edge && !removed(item))));
-  const merged = inTimeOrder(older ? [...arriving, ...kept] : [...kept, ...arriving], timeField);
-  if (field === "messages") canon.messages = merged as Message[];
-  else canon.threads = merged as ThreadSummary[];
+  // `#1846` step 1: merge incrementally — the kept rows are already in time order, so each
+  // arriving row goes in by binary search (one splice) instead of a full-list sort, and a merge
+  // that changes nothing keeps the store's array itself. Only entries whose object changed (or
+  // that arrived/left) advance in version; the rest are untouched by the event.
+  let merged: Row[];
+  if ([...kept, ...arriving].every((item) => Number.isFinite(timeOf(item, timeField)))) {
+    merged = kept.slice();
+    // Before-equals (an older page) inserts in reverse so equal times keep the arriving order.
+    for (const item of older ? [...arriving].reverse() : arriving) insertSorted(merged, item, timeField, !older);
+  } else {
+    merged = inTimeOrder(older ? [...arriving, ...kept] : [...kept, ...arriving], timeField);
+  }
+  if (merged.length === before.length && merged.every((item, at) => item === before[at])) return;
+  const beforeById = new Map(before.map((item) => [String(item.id), item]));
+  const mergedIds = new Set(merged.map((item) => String(item.id)));
+  if (field === "messages") {
+    canon.messages = merged as Message[];
+    reindexCanon(canon);
+    for (const item of merged) {
+      if (beforeById.get(String(item.id)) !== item) noteMessageChanged(canon, String(item.id));
+    }
+    for (const item of before) {
+      if (!mergedIds.has(String(item.id))) noteMessageRemoved(canon, String(item.id));
+    }
+  } else {
+    canon.threads = merged as ThreadSummary[];
+    for (const item of merged) {
+      if (beforeById.get(String(item.id)) !== item) noteThreadChanged(canon, String(item.id));
+    }
+    for (const item of before) {
+      if (!mergedIds.has(String(item.id))) noteThreadChanged(canon, String(item.id));
+    }
+  }
 }
 
 /** A thread's summary, from a thread page or a live reply, replacing the one held by id. */
 export function upsertThreadSummary(canon: ChannelCanon, summary: ThreadSummary): void {
-  const id = String(summary.id);
-  canon.threads = inTimeOrder(
-    [...canon.threads.filter((held) => String(held.id) !== id), summary], "updated_at");
+  upsertThread(canon, summary);
 }
 
 
@@ -183,13 +223,13 @@ export function allPageAnswersFor(canon: ChannelCanon, messages: Message[], boun
   };
 }
 
-/** The store's copies of `messages`, by id, for those it holds. One walk over the store. */
+/** The store's copies of `messages`, by id, for those it holds, from the by-id index. */
 export function heldCopies(canon: ChannelCanon, messages: Message[]): Map<string, Message> {
-  const wanted = new Set(messages.map((message) => String(message.id)));
+  const index = messageIndex(canon);
   const found = new Map<string, Message>();
-  if (wanted.size === 0) return found;
-  for (const held of canon.messages) {
-    if (wanted.has(String(held.id))) found.set(String(held.id), held);
+  for (const message of messages) {
+    const held = index.get(String(message.id));
+    if (held) found.set(String(message.id), held);
   }
   return found;
 }
@@ -413,7 +453,7 @@ export function foldDeltaIn(
   const sideBefore = deltaSideState(canon, payload.thread);
   const gone = new Set((delta.deleted || []).map(String));
   if (gone.size) {
-    canon.messages = canon.messages.filter((message) => !gone.has(String(message.id)));
+    for (const id of gone) removeMessage(canon, id);
     for (const id of gone) {
       canon.dismissed.delete(id);
       deps.removals.noteRemoved(canon, id, deps.readsSent(), typeof payload.observed_ms === "number" ? payload.observed_ms : null);
@@ -434,11 +474,9 @@ export function foldDeltaIn(
       : message;
   });
   const fresh = arriving.filter((message) => !sameMessage(before.get(String(message.id)), message));
-  if (fresh.length) {
-    const ids = new Set(fresh.map((message) => String(message.id)));
-    canon.messages = inTimeOrder(
-      [...canon.messages.filter((held) => !ids.has(String(held.id))), ...fresh], "timestamp");
-  }
+  // `#1846` step 1: each fresh copy goes in by id (binary search, one splice); the rest of the
+  // list — including every off-screen row — is not rebuilt, re-sorted, or re-versioned.
+  for (const message of fresh) upsertMessage(canon, message);
   // What it brought, or found word for word, stands where it was sent (`copyOrder`).
   deps.ledger.orderCopiesRead(canon, arriving, number);
   for (const message of arriving) canon.unplaced.delete(String(message.id));
@@ -446,7 +484,10 @@ export function foldDeltaIn(
   const readChanged = deps.foldReadState();
   for (const summary of payload.threads || []) upsertThreadSummary(canon, summary);
   const removed = new Set((delta.removed_threads || []).map(String));
-  if (removed.size) canon.threads = canon.threads.filter((held) => !removed.has(String(held.id)));
+  if (removed.size) {
+    canon.threads = canon.threads.filter((held) => !removed.has(String(held.id)));
+    for (const id of removed) noteThreadChanged(canon, id);
+  }
   if (payload.thread) upsertThreadSummary(canon, payload.thread);
   for (const summary of [...(payload.threads || []), payload.thread]) {
     if (summary && summary.root) canon.unplaced.delete(String(summary.root.id));

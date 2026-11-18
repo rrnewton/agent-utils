@@ -68,3 +68,22 @@ export { channelPostsOnce, createProviderFacts } from "./providerfacts.ts";
 export type { DescribedProvider, FactsConfig, ProviderFacts } from "./providerfacts.ts";
 export { createThreadPresence } from "./threadpresence.ts";
 export type { ThreadPresence } from "./threadpresence.ts";
+export {
+  cacheDataBytes,
+  changedIdsSince,
+  clockOf,
+  estimateMessageBytes,
+  filterCachedMessages,
+  forgetCanon,
+  insertSorted,
+  messageIndex,
+  noteMessageChanged,
+  noteMessageRemoved,
+  noteThreadChanged,
+  reindexCanon,
+  removeMessage,
+  threadVersionOf,
+  upsertMessage,
+  upsertThread,
+  versionOf,
+} from "./incremental.ts";

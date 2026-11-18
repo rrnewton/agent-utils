@@ -851,3 +851,60 @@ test("channelPostsOnce: each channel answers by its own provider, else the deplo
     "no providers described: the deployment did not speak");
   assert.equal(channelPostsOnce("slack", ofChannel, 0, deployment(false)), false);
 });
+
+test("`#1846 vibe-talk-windowed-rendering` step 1: live and delta updates touch only their ids; the rest keep object, place and version", () => {
+  const { emptyCanon, foldLiveIn, createCopyOrder, createRemovals, foldDeltaIn,
+    clockOf, versionOf, changedIdsSince, upsertMessage, filterCachedMessages, cacheDataBytes } = CHANNELS;
+  const at = (s) => `2026-10-01T00:00:${String(s).padStart(2, "0")}Z`;
+  const m = (id, s, content) => ({ id, timestamp: at(s), content: content || `m${id}`, author: "a" });
+  const canon = emptyCanon("c");
+  for (let i = 1; i <= 50; i += 1) upsertMessage(canon, m(String(i), i % 60));
+  assert.equal(canon.messages.length, 50);
+  const before = clockOf(canon);
+  const untouched = canon.messages.find((x) => String(x.id) === "10");
+  // A word-for-word copy advances nothing and keeps the object (budget B1's data half).
+  const again = upsertMessage(canon, m("10", 10));
+  assert.equal(again, untouched, "a no-change copy replaced the store's object");
+  assert.equal(clockOf(canon), before, "a no-change copy advanced the clock");
+  assert.deepEqual(changedIdsSince(canon, before), []);
+  // One edit touches exactly one id.
+  upsertMessage(canon, m("10", 10, "edited"));
+  assert.deepEqual(changedIdsSince(canon, before), ["10"]);
+  assert.ok(versionOf(canon, "10") > versionOf(canon, "11"));
+  // A live arrival inserts one, in order, leaving neighbours identical.
+  const ledger = createCopyOrder();
+  const deps = { ledger, orderNow: () => 1, nextArrival: () => 1 };
+  const neighbour = canon.messages.find((x) => String(x.id) === "20");
+  foldLiveIn(canon, m("99", 30), true, false, null, deps);
+  assert.equal(canon.messages.filter((x) => String(x.id) === "99").length, 1);
+  assert.equal(canon.messages.find((x) => String(x.id) === "20"), neighbour, "a live arrival rebuilt a neighbour");
+  assert.ok(changedIdsSince(canon, before).includes("99"));
+  // Filtering runs over the cache data, not the DOM: 50 held, one hit, nothing mounted here at all.
+  assert.deepEqual(filterCachedMessages(canon, "edited").map((x) => String(x.id)), ["10"]);
+  assert.deepEqual(filterCachedMessages(canon, "  "), []);
+  assert.ok(cacheDataBytes(canon) > 0);
+});
+
+test("`#1846` step 1: a no-change page merge keeps the array; one changed row bumps one version (5000-row cache)", () => {
+  const { emptyCanon, mergeIntoCanon, clockOf, changedIdsSince } = CHANNELS;
+  const canon = emptyCanon("big");
+  const rows = [];
+  for (let i = 0; i < 5000; i += 1) {
+    rows.push({ id: String(i), timestamp: new Date(1700000000000 + i * 1000).toISOString(), content: `row ${i}`, author: "a" });
+  }
+  mergeIntoCanon(canon, "messages", rows.slice(0, 50), false, true, () => true, rows.slice(0, 50));
+  canon.messages = rows;
+  const { reindexCanon } = CHANNELS;
+  reindexCanon(canon);
+  const arrayBefore = canon.messages;
+  const clockBefore = clockOf(canon);
+  mergeIntoCanon(canon, "messages", rows.slice(100, 150).map((r) => ({ ...r })), true, true, () => true, rows.slice(100, 150));
+  assert.equal(canon.messages, arrayBefore, "a no-change merge replaced the store's array");
+  assert.equal(clockOf(canon), clockBefore, "a no-change merge advanced versions");
+  const changed = rows.slice(100, 150).map((r) => ({ ...r }));
+  changed[0] = { ...changed[0], content: "changed" };
+  mergeIntoCanon(canon, "messages", changed, true, true, () => true, changed);
+  assert.deepEqual(changedIdsSince(canon, clockBefore), [String(changed[0].id)], "one edit bumped more than its row");
+  // Local filtering over the deep desktop cache finds by data alone.
+  assert.deepEqual(CHANNELS.filterCachedMessages(canon, "changed").map((x) => String(x.id)), [String(changed[0].id)]);
+});

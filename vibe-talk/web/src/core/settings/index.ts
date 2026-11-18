@@ -12,6 +12,15 @@ export { THEME_TOKENS, appearanceOf, effectiveTheme, themeColorFor } from "./app
 export type { EffectiveTheme } from "./appearance.ts";
 export {
   DEFAULT_CARD_MAX_LINES,
+  DEFAULT_DATA_REACH_BACK,
+  DEFAULT_RENDER_PREFETCH_PX,
+  DEFAULT_RENDER_ROW_CAP,
+  MAX_DATA_REACH_BACK,
+  MAX_RENDER_PREFETCH_PX,
+  MAX_RENDER_ROW_CAP,
+  MIN_DATA_REACH_BACK,
+  MIN_RENDER_PREFETCH_PX,
+  MIN_RENDER_ROW_CAP,
   DEFAULT_MARK_READ_FIRST_PERCENT,
   DEFAULT_MARK_READ_LONG_WORDS,
   DEFAULT_COLLAPSED_LINES,
@@ -46,9 +55,12 @@ export {
   MIN_READ_SPEED,
   MIN_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
+  clampDataReachBack,
   clampMarkReadFirstPercent,
   clampMarkReadLongWords,
   clampCollapsedLines,
+  clampRenderPrefetchPx,
+  clampRenderRowCap,
   clampDiscussDockedHeight,
   clampDiscussWidth,
   clampMsgScale,
@@ -67,3 +79,19 @@ export { createEnterSends, createSingleKeys } from "./keychoices.ts";
 export type { EnterSends, KeyChoiceDependencies, SingleKeys } from "./keychoices.ts";
 export { createKeptSwitch } from "./switches.ts";
 export type { KeptSwitch, KeptSwitchDependencies } from "./switches.ts";
+export {
+  DATA_BYTES_PER_MESSAGE,
+  DATA_MAX_BYTES_DESKTOP,
+  DATA_MAX_BYTES_PHONE,
+  DATA_REACH_DESKTOP,
+  DATA_REACH_PHONE,
+  RENDER_CAP_DESKTOP,
+  RENDER_CAP_PHONE,
+  RENDER_PREFETCH_DESKTOP_PX,
+  RENDER_PREFETCH_PHONE_PX,
+  SCROLL_MOUNT_BUDGET,
+  WINDOWED_LISTS_HELP,
+  reachBackExcess,
+  windowedConfig,
+} from "./windowed.ts";
+export type { WindowedConfig } from "./windowed.ts";

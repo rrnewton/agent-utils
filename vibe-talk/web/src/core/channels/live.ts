@@ -3,7 +3,8 @@
 
 import type { Message, MessageThread } from "../../contract/index.ts";
 import type { ChannelCanon } from "./canon.ts";
-import { inTimeOrder, threadOf, timeOf } from "./canon.ts";
+import { threadOf, timeOf } from "./canon.ts";
+import { insertSorted, messageIndex, noteMessageChanged } from "./incremental.ts";
 import { upsertThreadSummary } from "./fold.ts";
 import type { CopyOrder } from "./order.ts";
 
@@ -66,7 +67,7 @@ export function foldLiveIn(
   deps: LiveFoldDependencies,
 ): Message {
   const id = String(message.id);
-  const held = canon.messages.find((candidate) => String(candidate.id) === id);
+  const held = messageIndex(canon).get(id);
   let kept: Message = !threadOf(message) && threadOf(held) ? { ...message, thread: (held as Message).thread } : message;
   // `#219 emoji-reactions`. NOR DOES A COPY WITHOUT REACTIONS REPLACE ONE WITH THEM, for the same
   // reason: the stream's copy cannot see them, and the bridge's echo of a message lands after the
@@ -91,8 +92,15 @@ export function foldLiveIn(
       kept.thread.display_name === undefined && kept.thread.summary === undefined) {
     kept = { ...kept, thread: { ...kept.thread, display_name: named.display_name, summary: named.summary } };
   }
-  canon.messages = inTimeOrder(
-    [...canon.messages.filter((candidate) => String(candidate.id) !== id), kept], "timestamp");
+  // `#1846` step 1: by-id splice, not a rebuild — take the held copy out if present, put the
+  // kept one in at its time. Every other entry keeps its object, place, and version.
+  if (held) {
+    const at = canon.messages.indexOf(held);
+    if (at >= 0) canon.messages.splice(at, 1);
+  }
+  insertSorted(canon.messages, kept, "timestamp");
+  messageIndex(canon).set(id, kept);
+  if (held !== kept) noteMessageChanged(canon, id);
   // Where it stands in the order of reads (`copyOrder`, `#310 stale-live-read-flicker`): a copy a read
   // brought (`read`) where that read was sent. A message the store did not hold is newer than every read
   // sent before it arrived, and one it held is as new as the store's copy was (`copyBuiltOn`). Either
@@ -129,7 +137,10 @@ export function foldLiveIn(
     const counted = { ...root, thread: { ...(root.thread as MessageThread), reply_count: count } };
     // As new as the root's copy, the count aside (`copyBuiltOn`).
     deps.ledger.buildCopyOn(counted, root);
-    canon.messages = canon.messages.map((candidate) => (candidate === root ? counted : candidate));
+    const rootAt = canon.messages.indexOf(root);
+    if (rootAt >= 0) canon.messages[rootAt] = counted;
+    messageIndex(canon).set(String(root.id), counted);
+    noteMessageChanged(canon, String(root.id));
   }
   return kept;
 }

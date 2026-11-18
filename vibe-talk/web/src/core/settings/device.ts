@@ -17,7 +17,11 @@ import {
   DEFAULT_READ_PREROLL_MS,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
+  DEFAULT_DATA_REACH_BACK,
+  DEFAULT_RENDER_PREFETCH_PX,
+  DEFAULT_RENDER_ROW_CAP,
   clampCardMaxLines,
+  clampDataReachBack,
   clampMarkReadFirstPercent,
   clampMarkReadLongWords,
   clampQuoteReadPercent,
@@ -27,6 +31,8 @@ import {
   clampMsgScale,
   clampReadKeepAliveMs,
   clampReadPrerollMs,
+  clampRenderPrefetchPx,
+  clampRenderRowCap,
   clampReadSpeed,
   clampReadingWidth,
   clampTwoColumnSplit,
@@ -414,6 +420,33 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (on: boolean) => (on ? "1" : null),
     refused: { value: false },
   } satisfies DeviceSetting<boolean>,
+  /**
+   * `#1846 vibe-talk-windowed-rendering`. Whether the channel/thread lists mount only the
+   * viewport plus a prefetch margin. OFF unless on; default off at S0 (see settings/windowed.ts).
+   * The Settings help for this switch states the browser find-in-page limitation (Q3).
+   */
+  windowedLists: offUnlessOn("vibe-talk.voice.windowed-lists", false),
+  /** `#1846`. Messages held as DATA for local search/filtering; 0 = per-device default. */
+  dataReachBack: {
+    key: "vibe-talk.voice.data-reach-back",
+    read: (raw: string | null) => clampDataReachBack(raw === null ? DEFAULT_DATA_REACH_BACK : raw),
+    write: (n: number) => String(clampDataReachBack(n)),
+    refused: { value: DEFAULT_DATA_REACH_BACK },
+  } satisfies DeviceSetting<number>,
+  /** `#1846`. Render prefetch margin in px; 0 = per-device default (1200 phone / 1600 desktop). */
+  renderPrefetchPx: {
+    key: "vibe-talk.voice.render-prefetch-px",
+    read: (raw: string | null) => clampRenderPrefetchPx(raw === null ? DEFAULT_RENDER_PREFETCH_PX : raw),
+    write: (n: number) => String(clampRenderPrefetchPx(n)),
+    refused: { value: DEFAULT_RENDER_PREFETCH_PX },
+  } satisfies DeviceSetting<number>,
+  /** `#1846`. Mounted-row cap per list; 0 = per-device default (60 phone / 80 desktop). */
+  renderRowCap: {
+    key: "vibe-talk.voice.render-row-cap",
+    read: (raw: string | null) => clampRenderRowCap(raw === null ? DEFAULT_RENDER_ROW_CAP : raw),
+    write: (n: number) => String(clampRenderRowCap(n)),
+    refused: { value: DEFAULT_RENDER_ROW_CAP },
+  } satisfies DeviceSetting<number>,
 });
 
 /** The device's settings, kept in its storage. */
