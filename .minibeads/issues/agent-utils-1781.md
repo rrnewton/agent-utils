@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-first-run-welcome-channel-default: Channel is the default view and a first-run Welcome explains the app'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-firstrun
@@ -35,3 +35,7 @@ A fresh launch (no saved record, no welcome mark) signs in onto the Welcome scre
 Owner usage patterns (from the last 168 hours of owner prompts, ai_docs reports and issue history, summarised 2026-11-17): the owner lives in the Channel view — reading channels and threads, marking Done as they go, asking Discuss to catch them up on what arrived while they were away, opening linked Documents to read properly, and searching for a message or decision. Voice is the occasional hands-free front end to the same channels, not the home screen; Read aloud is paced listening over the same list. The welcome copy above follows that order: Channel first, Voice as one tool among several.
 
 Coordination: the sibling lane documenting installation and pairing (#1780 vibe-talk-setup-docs) receives this welcome copy for reuse so first-run wording stays consistent.
+
+## Resolution
+
+Landed on mu-firstrun/1781 (validate + gate evidence in the lane handoff). The Channel is the default view: `createScreens()` starts on `discord`, and the boot's first `showView` follows only a saved Voice record, so a returning Voice reader sees no flash and no change; deep links (including `?v=docs`) still outrank the default and suppress the Welcome. A new `welcome` screen (Settings "Welcome" button, Help link) explains Channel, Threads, Discuss, Documents, Voice, Read/Pace, Done/Undo and Search in one or two lines each; it is shown once after first sign-in on a device with neither a dismissed mark (`vibe-talk.welcome.dismissed`) nor a saved UI record, dismisses onto the Channel at its newest line, and never blocks a returning reader. While no channel is configured it carries the guided setup from `vibe-talk/SETUP.md` (#1780): the `[[channels]]` snippet with Copy, the restart + `vibe-talk doctor` steps, and Check again over `/api/v1/client-config`, which lands the reader on the channel once configured; nothing new was added on the server. Two latent faults the new default exposed are fixed with it: a reopen already standing on the Channel now owes (and lands) its first read, and bar promotion no longer decides off the main screen nor strands a promoted menu item hidden. `tests/firstrun_browser.py` (registered as `firstrun-browser`) covers every start path at phone and desk sizes in both themes; the existing page suite and browser walks were updated to the new default throughout.
