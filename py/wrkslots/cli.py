@@ -7239,12 +7239,135 @@ _PreparedFacts = TypeVar("_PreparedFacts")
 _CommitResult = TypeVar("_CommitResult")
 
 
+def _heartbeat_only_refresh(
+    config: Config,
+    before: _RegistryIdentity,
+    after: _RegistryIdentity,
+    prepared_states: Sequence[ActiveState],
+    prepared_archives: Sequence[ArchiveState],
+    *,
+    slot: str,
+    agent: str,
+    branches: frozenset[str],
+    paths: frozenset[str],
+) -> tuple[list[ActiveState], list[ArchiveState]] | None:
+    """Refresh prepared states across another slot's heartbeat, or refuse (#1808-B).
+
+    Returns the current states (read as shard snapshots, never by loading an
+    event log) only when every registry change since ``before`` is provably
+    one or more ``ttl-renewed`` heartbeats of other slots: the configuration
+    is unchanged, no journal, seal, quarantine or image record moved, existing
+    event files are untouched, the appended events chain from the prepared
+    tip (each link verified) and name only other slots, the archives are
+    record-identical, and every changed active record differs from its
+    prepared record solely in ``heartbeat_at``. A heartbeating slot that
+    shares the target's agent, a requested branch or a checkout path is
+    refused like any other change. Anything else returns None and the caller
+    revalidates from scratch: fail-closed, always.
+    """
+
+    if before.config_sha256 != after.config_sha256:
+        return None
+    before_map = dict(before.entries)
+    after_map = dict(after.entries)
+    added_events: dict[str, list[str]] = {}
+    for name in before.changed_names(after):
+        if "/" in name:
+            log, _separator, filename = name.partition("/")
+            if not log.startswith("EVENTS.") or name in before_map:
+                return None
+            added_events.setdefault(log[len("EVENTS."):], []).append(filename)
+        elif name.startswith("ACTIVE.") and name.endswith(".json"):
+            continue
+        elif name.startswith("ARCHIVED.") and name.endswith(".json"):
+            continue
+        else:
+            return None
+    heartbeating: set[str] = set()
+    for machine, filenames in added_events.items():
+        prefix = f"EVENTS.{machine}/"
+        prior = sorted(
+            entry[len(prefix):] for entry in before_map if entry.startswith(prefix)
+        )
+        if not prior or prior[-1] != f"{len(prior):020d}.json":
+            return None
+        expected = [
+            f"{sequence:020d}.json"
+            for sequence in range(len(prior) + 1, len(prior) + 1 + len(filenames))
+        ]
+        if sorted(filenames) != expected:
+            return None
+        directory = _event_directory(config, machine)
+        try:
+            tip_path = directory / prior[-1]
+            claimed = _as_mapping(_read_json(tip_path, "append-only event"), "append-only event")
+            tip = _event_from_path(
+                tip_path,
+                machine,
+                len(prior),
+                _as_str(claimed.get("previous_sha256"), "append-only event.previous_sha256"),
+            )
+            previous = _as_str(tip["sha256"], "append-only event.sha256")
+            for sequence, filename in enumerate(sorted(filenames), start=len(prior) + 1):
+                event = _event_from_path(directory / filename, machine, sequence, previous)
+                previous = _as_str(event["sha256"], "append-only event.sha256")
+                if event["kind"] != "active-state-recorded":
+                    return None
+                payload = _as_mapping(event["payload"], "append-only event.payload")
+                if payload.get("action") != "ttl-renewed" or payload.get("slot") == slot:
+                    return None
+                heartbeating.add(_as_str(payload.get("slot"), "append-only event.payload.slot"))
+        except (Refusal, StateError, OSError):
+            return None
+    try:
+        refreshed_states = [
+            _load_active_snapshot(config, machine) for machine in _state_machines(config)
+        ]
+        refreshed_archives = [
+            _load_archive_snapshot(config, machine) for machine in _state_machines(config)
+        ]
+    except (Refusal, StateError, OSError):
+        return None
+    prepared_archive_by_machine = {item.machine: item for item in prepared_archives}
+    if {item.machine for item in refreshed_archives} != set(prepared_archive_by_machine):
+        return None
+    for refreshed in refreshed_archives:
+        if list(prepared_archive_by_machine[refreshed.machine].records) != list(refreshed.records):
+            return None
+    prepared_by_machine = {item.machine: item for item in prepared_states}
+    if {item.machine for item in refreshed_states} != set(prepared_by_machine):
+        return None
+    for refreshed in refreshed_states:
+        prepared_records = {record.slot: record for record in prepared_by_machine[refreshed.machine].slots}
+        refreshed_records = {record.slot: record for record in refreshed.slots}
+        if set(prepared_records) != set(refreshed_records):
+            return None
+        for name, current in refreshed_records.items():
+            prior_record = prepared_records[name]
+            if prior_record == current:
+                continue
+            if name not in heartbeating:
+                return None
+            if dataclasses.replace(prior_record, heartbeat_at=current.heartbeat_at) != current:
+                return None
+            if current.agent == agent:
+                return None
+            for checkout in current.checkouts:
+                if checkout.branch in branches or checkout.path in paths:
+                    return None
+    return refreshed_states, refreshed_archives
+
+
 def _run_prevalidated_mutation(
     config: Config,
     wait_seconds: float,
     command: str,
     prepare: Callable[[], _PreparedFacts | None],
     commit: Callable[[_RegistryIdentity | None, _PreparedFacts | None], _CommitResult],
+    tolerate: Callable[
+        [_RegistryIdentity, _RegistryIdentity, _PreparedFacts], _PreparedFacts | None
+    ]
+    | None = None,
 ) -> _CommitResult:
     """Validate without any lock, then commit under the mutation locks (#1276).
 
@@ -7294,6 +7417,13 @@ def _run_prevalidated_mutation(
                     if facts is None:
                         return commit(None, None)
                     return commit(identity, facts)
+                if tolerate is not None and facts is not None:
+                    # #1808-B: a change the caller's classifier proves is
+                    # only other slots' heartbeats refreshes the prepared
+                    # facts to the current identity instead of revalidating.
+                    refreshed = tolerate(identity, current, facts)
+                    if refreshed is not None:
+                        return commit(current, refreshed)
                 change = _describe_registry_change(identity, current)
         except _JournalBusy as busy:
             # A live journaled mutation (#1367): wait without the locks, so
@@ -44879,13 +45009,21 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     _validate_name(args.agent, "agent")
     owner = _capture_caller_process(args.owner_pid, "owner")
 
-    def prepare() -> _HeartbeatPrevalidated:
-        # Lock-free (#1808-A, following #1276): the fleet validation, the
-        # registry storage scan and the event-log load run here, holding no
-        # lock. A refusal raised here is reported only from a round in which
-        # the registry held still, as _run_prevalidated_mutation arranges.
+    # Notes a validation prints ("proceeding beside ...") are captured per
+    # round and printed once by the caller, never once per round (#1808-A
+    # review). The latest round's notes are the ones that judged the outcome.
+    captured_notes: list[tuple[str, str]] = []
+
+    def validate() -> _HeartbeatPrevalidated:
         states, archives = _validate_global_state(config)
-        state = next(item for item in states if item.machine == config.machine)
+        state = next(
+            (item for item in states if item.machine == config.machine), None
+        )
+        if state is None:
+            raise Refusal(
+                f"missing active state for machine {config.machine!r}; "
+                "no slot registry exists for it on this project"
+            )
         record = _find_record(state, args.slot)
         _assert_owner_auth(record, args.agent, owner, args.expected_generation)
         _assert_validate_batch_seals_disjoint_from_record(
@@ -44947,6 +45085,107 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             states=tuple(states), archives=tuple(archives), warnings=tuple(warnings)
         )
 
+    def prepare() -> _HeartbeatPrevalidated | None:
+        # Lock-free (#1808-A, following #1276): the fleet validation, the
+        # registry storage scan and the event-log load run here, holding no
+        # lock. A refusal raised here is reported only from a round in which
+        # the registry held still, as _run_prevalidated_mutation arranges.
+        # The partial-state refusal is read-only, so it runs first here too,
+        # keeping its old precedence over every other refusal; it is
+        # re-checked under the locks before the write.
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        if _outstanding_journals(config):
+            # An outstanding journal may need dead-actor repair, which only
+            # the locked path may perform (#1808-A review): never repair
+            # without the lock. Returning None defers this round to it.
+            return None
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+                stderr_buffer
+            ):
+                return validate()
+        finally:
+            captured_notes[:] = [
+                (stdout_buffer.getvalue(), stderr_buffer.getvalue())
+            ]
+
+    def locked_body() -> tuple[ActiveRecord, tuple[str, ...]]:
+        """The pre-#1808 heartbeat, run with the mutation locks already held.
+
+        Used when a journal is outstanding (its classification and any
+        dead-actor repair belong under the lock) and as the fallback when
+        every lock-free round was overtaken: a heartbeat must not refuse
+        as busy merely because other lanes kept mutating, so it waits for
+        the lock and does the whole thing there, as it always did.
+        """
+
+        _refuse_partial_state(config, allow_validate_batch_seals=True)
+        states, archives = _validate_global_state(config)
+        state = _load_active(config)
+        record = _find_record(state, args.slot)
+        _assert_owner_auth(record, args.agent, owner, args.expected_generation)
+        _assert_validate_batch_seals_disjoint_from_record(
+            config, record, action="heartbeat"
+        )
+        _assert_validate_cleanup_journals_disjoint_from_record(
+            config,
+            states,
+            archives,
+            record,
+            action="heartbeat",
+        )
+        findings = _assert_command_registry_storage(
+            config, states, args, tolerate_target_git_registrations=True
+        )
+        warnings: list[str] = []
+        for detail in findings.target_git_registrations:
+            marker = " registers "
+            start = detail.find(marker)
+            end = detail.find(" inside", start) if start >= 0 else -1
+            registered = (
+                Path(detail[start + len(marker):end])
+                if start >= 0 and end > start
+                else None
+            )
+            if registered is not None and not registered.exists():
+                raise Refusal(detail)
+            warnings.append(
+                f"WARNING: slot {record.slot} has a nested worktree Git "
+                f"registers without a checkout row: {detail}. "
+                "state: heartbeat recorded anyway; the nested worktree is "
+                "retained and not inspected"
+            )
+        release = _owner_release_in_effect(
+            config, record, _load_events(config, record.machine)
+        )
+        if release is not None:
+            raise Refusal(
+                f"slot {record.slot} generation {record.generation} was released by its "
+                f"owner at {release.recorded_at} (event {release.sequence}), which "
+                "stopped this generation's heartbeat. state: REFUSED -- the heartbeat was "
+                "not renewed and the slot stays released for removal. remedy: stop using "
+                "this slot and leave it; if more work is needed, create a new slot with "
+                "'wrkslots create'"
+            )
+        before = _global_rows(states, archives)
+        updated = dataclasses.replace(record, heartbeat_at=_utc_now())
+        _write_active_state(
+            config,
+            _replace_record(state, updated),
+            action="ttl-renewed",
+            slot=updated.slot,
+            evidence={"heartbeat_at": updated.heartbeat_at},
+        )
+        after_states, after_archives = _validate_global_state(config)
+        _assert_only_slot_changed(
+            before,
+            _global_rows(after_states, after_archives),
+            args.slot,
+        )
+        return updated, tuple(warnings)
+
     def commit(
         reference: _RegistryIdentity | None, prepared: _HeartbeatPrevalidated | None
     ) -> tuple[ActiveRecord, tuple[str, ...]]:
@@ -44955,10 +45194,11 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         # verified tip, and the post-write check that reads only the events
         # this command appended. No fleet validation, storage scan or log
         # load runs here; _run_prevalidated_mutation guarantees the registry
-        # identity still equals the one prepare validated (until #1808-B
-        # teaches it which changes a heartbeat may tolerate).
+        # identity still equals the one prepare validated (or that #1808-B's
+        # classifier refreshed it across other slots' heartbeats).
         _refuse_partial_state(config, allow_validate_batch_seals=True)
-        assert prepared is not None
+        if prepared is None:
+            return locked_body()
         states, archives = list(prepared.states), list(prepared.archives)
         before = _global_rows(states, archives)
         local = (
@@ -44984,9 +45224,49 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         )
         return updated, prepared.warnings
 
-    updated, warnings = _run_prevalidated_mutation(
-        config, args.wait_lock, "heartbeat", prepare, commit
-    )
+    def tolerate(
+        before: _RegistryIdentity,
+        after: _RegistryIdentity,
+        facts: _HeartbeatPrevalidated,
+    ) -> _HeartbeatPrevalidated | None:
+        # #1808-B: other slots' heartbeats refresh this heartbeat too; the
+        # commit re-asserts owner auth against the refreshed record.
+        refreshed = _heartbeat_only_refresh(
+            config,
+            before,
+            after,
+            facts.states,
+            facts.archives,
+            slot=args.slot,
+            agent=args.agent,
+            branches=frozenset(),
+            paths=frozenset(),
+        )
+        if refreshed is None:
+            return None
+        states, archives = refreshed
+        return dataclasses.replace(
+            facts, states=tuple(states), archives=tuple(archives)
+        )
+
+    try:
+        try:
+            updated, warnings = _run_prevalidated_mutation(
+                config, args.wait_lock, "heartbeat", prepare, commit, tolerate=tolerate
+            )
+        except _RegistryBusy:
+            # Every lock-free round was overtaken by writers the classifier
+            # could not tolerate: fall back to the old behaviour — wait for
+            # the lock and validate there — instead of refusing a heartbeat
+            # as busy (#1808-A review).
+            with _mutation_locks(config, args.wait_lock):
+                updated, warnings = locked_body()
+    finally:
+        for stdout_text, stderr_text in captured_notes:
+            if stdout_text:
+                print(stdout_text, end="", file=sys.stdout)
+            if stderr_text:
+                print(stderr_text, end="", file=sys.stderr)
     for warning in warnings:
         print(warning, file=sys.stderr)
     print(

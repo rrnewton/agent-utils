@@ -187,6 +187,136 @@ def test_heartbeat_revalidates_when_a_writer_commits_during_validation(
     assert ledger.count("validate", held=True) == 0
 
 
+def test_heartbeat_revalidates_when_its_own_slot_changes_during_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A heartbeat of the target slot itself is never tolerated (#1808 review)."""
+    project = _project_with_slots(tmp_path)
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+
+    def own_heartbeat() -> None:
+        if writes:
+            return
+        completed = command(
+            project,
+            "heartbeat",
+            "slot01",
+            "--agent",
+            "codex-1",
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+        assert completed.returncode == 0, completed.stderr
+        writes.append(completed.returncode)
+
+    ledger.during_validation = own_heartbeat
+
+    assert cli.main(_heartbeat_argv(project)) == 0, capsys.readouterr().err
+    assert writes == [0]
+    assert ledger.count("validate", held=False) == 2
+
+
+def test_heartbeat_refuses_when_its_slot_is_released_during_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A release landing in the prepare window still refuses (#1808 review)."""
+    project = _project_with_slots(tmp_path)
+    notes = tmp_path / "handoff.md"
+    notes.write_text("done\n", encoding="utf-8")
+    handed = command(
+        project,
+        "write-handoff",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        "--from-file",
+        str(notes),
+    )
+    assert handed.returncode == 0, handed.stderr
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+
+    def release() -> None:
+        if writes:
+            return
+        completed = command(
+            project,
+            "release",
+            "slot01",
+            "--agent",
+            "codex-1",
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+        assert completed.returncode == 0, completed.stderr
+        writes.append(completed.returncode)
+
+    ledger.during_validation = release
+
+    rc = cli.main(_heartbeat_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert "was released by its owner" in captured.err
+
+
+def test_heartbeat_never_repairs_an_outstanding_journal_without_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An interrupted create's journal is classified under the lock or not at all."""
+    project = _project_with_slots(tmp_path)
+    interrupted = create(
+        project,
+        slot="slot09",
+        agent="codex-9",
+        branch="codex/task9",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    journals = list(control_directory(project).glob("CREATE.*.journal"))
+    assert len(journals) == 1
+    journal_bytes = journals[0].read_bytes()
+    events_before = _event_count(project)
+
+    rc = cli.main(_heartbeat_argv(project))
+
+    captured = capsys.readouterr()
+    # The locked path judges the journal exactly as the old code did, and
+    # nothing was repaired or appended on the lock-free path.
+    assert rc == 3, captured.err
+    assert journals[0].read_bytes() == journal_bytes
+    assert _event_count(project) == events_before
+
+
+def test_heartbeat_for_a_machine_without_active_state_refuses_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No ACTIVE file for the machine: exit 3 refusal, never a traceback."""
+    project = _project_with_slots(tmp_path)
+
+    rc = cli.main(
+        [
+            "--project-root", str(project), "--machine", "otherhost",
+            "heartbeat", "slot01", "--agent", "codex-1",
+            "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert rc == 3
+    assert "missing active state" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_heartbeat_at_many_rows_still_counts_zero_fleet_work_under_the_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

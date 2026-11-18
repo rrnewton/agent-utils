@@ -482,6 +482,35 @@ pub(crate) fn heartbeat(
             "owner process generation mismatch for slot {slot}; recorded owner is {state}: {detail}"
         ));
     }
+    // Re-judge every refusal condition that can change in the window
+    // between the lock-free prepare and these locks (#1808-A review): a
+    // release, seal or journal that landed meanwhile must still refuse,
+    // exactly as the pre-split code running wholly under the locks did.
+    refuse_seal_overlap(&cfg, &record)?;
+    if !sealed {
+        let journals = parse_journals(root)?;
+        if let Some(names) = journals.get("journals").and_then(Value::as_array) {
+            if let Some(first) = names.first().and_then(Value::as_str) {
+                return Err(crate::journals_state::journal_blocker_message(
+                    &cfg.control,
+                    first,
+                ));
+            }
+        }
+    }
+    if let EventLogStatus::Derived = event_log_status(&directory) {
+        let events = load_event_chain(&directory, &selected)?;
+        if let Some(event) = release_in_effect(&cfg, &record, &events)? {
+            let recorded_at = event
+                .get("recorded_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let sequence = event.get("sequence").cloned().unwrap_or(json!(0));
+            return Err(format!(
+                "slot {slot} generation {generation} was released by its owner at {recorded_at} (event {sequence}), which stopped this generation's heartbeat. state: REFUSED -- the heartbeat was not renewed and the slot stays released for removal. remedy: stop using this slot and leave it; if more work is needed, create a new slot with 'wrkslots create'"
+            ));
+        }
+    }
     ensure_event_log(root, &cfg, &selected)?;
     let previous_revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
     let mut updated = record.clone();
