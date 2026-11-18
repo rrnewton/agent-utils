@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-read-aloud-follow-not-yanked-up: read-aloud follow is not yanked up by the drill keeper'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-readerdrill
@@ -8,7 +8,8 @@ labels:
 - vibe-talk
 - ui
 created_at: 2026-11-18T12:48:00-05:00
-updated_at: 2026-11-18T12:48:00-05:00
+updated_at: 2026-11-18T16:15:00-05:00
+closed_at: 2026-11-18T16:15:00-05:00
 ---
 
 # Description
@@ -37,3 +38,7 @@ Coordinates with #1839b (rows fix) and #1846 (one anchoring authority), which to
 # Notes
 
 Owner-priority gate: deployed on landing. Lane mu-readerdrill on branch mu-readerdrill/1856, worktree readerfollow. Lands right after #1838 vibe-talk-reader-continues-into-thread.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 1374d80ca7ffb0b8088ed2021c929bec26393ccd (gated head b359a638, owner gate validate: OK, ledger head_sha b359a638b55f7f1ba57aee82f8fcec3284acc6cc; verified-tree route). Read following is a priority in the one scroll owner: while a message plays unheld, holdingRows/restoreScroll restore nothing and the drill keeper, entry landing and keepEntryLanding stand down; a row taller than the port follows by its sentence at block boundaries. The Reading chip (#837) leaves follow when the message is scrolled fully off and returns to the cursor. Re-centre rule for a part-on-screen user scroll, as proposed to the owner: following stays paused until the cursor is about to leave the viewport, then resumes at the next sentence boundary. The Chromium walk (server voice in a thread, live arrivals and hide/show repaints) never moves scrollTop up while following — the base yanks 860 -> 678 — and covers the chip path; shots (phone and desktop, light and dark, lit sentence at 4 of 8) were reviewed by the lane.
