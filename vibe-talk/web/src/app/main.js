@@ -10,6 +10,7 @@ import {createGathering,
   createSearchField,
   createSearchHistory,
   createServerSearch,
+  searchQueryExpandLabels,
   searchQueryMatches,
   searchQueryTree,
   searchSubject,} from "../core/search/index.ts";
@@ -117,6 +118,7 @@ import {CANNED_PROMPTS,
   mountMessagePreferences,
   mountMicrophoneSettings,
   mountNoiseRules,
+  mountLabels,
   mountOwnReadApply,
   mountPairing,
   mountPreferenceSwitches,
@@ -2681,6 +2683,7 @@ const searchField = createSearchField({
 
 const searchRows = createSearchRows({
   searchField,
+  expandLabelQuery: (node) => searchQueryExpandLabels(/** @type {any} */ (node), (slug) => labelsView.expand(slug)),
   language: {
     parsedQueries: createParsedQueries(),
     openedGaps: createOpenedGaps(),
@@ -2767,7 +2770,7 @@ const {
   applySearch, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
   listEmptied, drawSeams, seamsAfterMidnight, openSearchGap, inOpenedGap,
   rowsChosen, rowDay, markSearchHits, messageMatches, threadsWithHits, rowMatches,
-  sayCardCount, openedGaps, placeSeam, seamDrawn,
+  sayCardCount, openedGaps, placeSeam, seamDrawn, setEntireThreads, entireThreads,
 } = searchRows;
 
 // `#1734 vibe-talk-search-view-scroll-default`. The search identity the reader
@@ -5101,6 +5104,14 @@ const ownReadSwitch = createKeptSwitch({
 });
 
 /** Settings' apply-to-existing command owns its confirmation and Undo receipt. */
+/** Settings > Labels (`#1825`): browse, combine into groups, jump to the filter. */
+const labelsView = mountLabels({
+  lookup: (id) => el(id),
+  request: (path, options) => /** @type {any} */ (api(path, options)),
+  openLabel: (label) => { showScreen("main"); filterToLabel(label); },
+  guard: (run) => guardQuietly(run),
+});
+
 const ownReadApply = mountOwnReadApply({
   lookup: (id) => el(id),
   request: (path, options) => /** @type {any} */ (api(path, options)),
@@ -8584,7 +8595,7 @@ application.track(mountPageButtons({
     voiceTranscript().showPostProposal(voiceTranscript().postWatch.shown);
     if (screens.screen() === "main") followIfPinned(pinned, 0, screens.view());
   },
-  openSettings: () => showScreen("settings"),
+  openSettings: () => { showScreen("settings"); void labelsView.refresh(); },
   clearError,
   readOnDevice: readAloudOwner().readOnDevice,
   toggleAudioSource: () =>
@@ -9058,6 +9069,12 @@ application.track(mountListControls({
   serverMore: () => guardQuietly(() => serverSearchOwner.more())(),
   toggleServerHits: () => toggleServerHits(),
   toggleBucket: (id) => toggleBucket(id),
+  toggleEntireThreads: () => {
+    const on = !entireThreads();
+    setEntireThreads(on);
+    el("search-entire-threads").setAttribute("aria-pressed", String(on));
+    applySearch();
+  },
   searchAllChannels: (on) => chooseSearchAllChannels(on),
   searchFurther: () => guardQuietly(searchFurtherPressed)(),
   loadOlderTurns: () => guardQuietly(voiceTranscript().loadOlderTurns)(),

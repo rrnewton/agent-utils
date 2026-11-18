@@ -358,6 +358,29 @@ export function searchSubject({ author = "", authorId = "", text = "", links = [
   };
 }
 
+/**
+ * A query with every `label:` slug expanded through `expand` (`#1825` groups:
+ * any spelling finds the whole group), the twin of `Query::expand_labels` in
+ * src/search_query.rs. Pure: the caller supplies the group knowledge.
+ */
+export function searchQueryExpandLabels(node: SearchNode | null, expand: (slug: string) => readonly string[]): SearchNode | null {
+  if (!node) return null;
+  switch (node.kind) {
+    case "label": {
+      const spellings = expand(node.slug);
+      if (spellings.length <= 1) return node;
+      return { kind: "or", children: spellings.map((slug) => ({ kind: "label" as const, slug })) };
+    }
+    case "not":
+      return { kind: "not", child: searchQueryExpandLabels(node.child, expand)! };
+    case "and":
+    case "or":
+      return { kind: node.kind, children: node.children.map((child) => searchQueryExpandLabels(child, expand)!) };
+    default:
+      return node;
+  }
+}
+
 /** The words and phrases a match may hold, folded, to mark: not those under a minus, nor fields. */
 export function searchPositiveTerms(node: SearchNode | null): string[] {
   const out: string[] = [];

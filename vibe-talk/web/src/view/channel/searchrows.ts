@@ -74,6 +74,8 @@ export interface SearchLanguage {
 export interface SearchRowsDependencies {
   readonly searchField: SearchFieldLike;
   readonly language: SearchLanguage;
+  /** `#1825`: expand a parsed query's `label:` slugs through the label groups. */
+  expandLabelQuery(node: unknown): unknown;
   byId(id: string): HTMLElement;
   leftById(id: string): HTMLElement;
   view(): string;
@@ -177,6 +179,9 @@ export interface SearchRows {
   seamDrawn(row: Element, seam: unknown, below: boolean): boolean;
   threadsWithHits(node: unknown): Set<string>;
   rowMatches(row: Element, node: unknown, text: string | null): boolean;
+  /** `#1825`: "Entire threads" — a thread with any hit shows whole. Off by default. */
+  setEntireThreads(on: boolean): void;
+  entireThreads(): boolean;
 }
 
 /** No search open, no seams drawn. */
@@ -244,6 +249,28 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     return hits;
   }
 
+  // `#1825` "Entire threads": off, individual hits as always; on, every held
+  // message of a thread with a hit stands. It ANDs with the #1797 buckets:
+  // buckets choose which scopes contribute hits, this chooses whether a hit
+  // brings its thread with it.
+  let entireThreadsOn = false;
+
+  /** Every thread (by `threadOf`) holding a held message that matches. */
+  function entireThreadHits(node: unknown): Set<string> {
+    const hits = new Set<string>();
+    if (!node || !deps.threading()) return hits;
+    for (const message of deps.heldMessages()) {
+      const id = deps.threadOf(message);
+      if (id && messageMatches(node, message)) hits.add(String(id));
+    }
+    return hits;
+  }
+
+  const rowInHitThread = (row: Element, hits: Set<string>): boolean => rowMessages(row).some((message) => {
+    const id = deps.threadOf(message);
+    return Boolean(id) && hits.has(String(id));
+  });
+
   const rowHeadsHitThread = (row: Element, hits: Set<string>): boolean => rowMessages(row).some((message) => {
     const id = deps.threadOf(message);
     const thread = (message as { thread?: { is_root?: boolean } }).thread;
@@ -263,10 +290,13 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
   function applySearch(): void {
     deps.applyReadRuns();
     const node = searchField.open() ? searchParsed(searchField.query()).node : null;
+    // `#1825`: matching sees the group-expanded query; identity/terms stay raw.
+    const matchNode = node !== null ? deps.expandLabelQuery(node) : null;
     const typed = node !== null;
     const marking = searchField.open() ? searchParsed(searchField.marked()).terms : [];
     const replyHits = typed && deps.threading() && (deps.selectionView() === "main" || deps.selectionView() === "threads")
-      ? threadsWithHits(node) : null;
+      ? threadsWithHits(matchNode) : null;
+    const wholeThreads = typed && entireThreadsOn ? entireThreadHits(matchNode) : null;
     const links = searchField.open() && searchField.links();
     const author = deps.authorChoosing();
     if (deps.gatheredParent() !== null && (typed || links || deps.pinsOnly() || author !== "everyone")) deps.putRepliesBack();
@@ -293,9 +323,10 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         if (row.getAttribute("data-server-hit") === "quote") continue;
         const text = row.getAttribute("data-search");
         const shown = links && text !== null ? deps.showRowLinks(row) : deps.takeDownRowLinks(row);
-        const said = !typed || (text !== null && (rowMatches(row, node, text) || (replyHits !== null &&
+        const said = !typed || (text !== null && (rowMatches(row, matchNode, text) || (replyHits !== null &&
           (id === "thread-list" ? replyHits.has(String(row.getAttribute("data-context-id")))
-            : id === "discord-log" && rowHeadsHitThread(row, replyHits)))));
+            : id === "discord-log" && rowHeadsHitThread(row, replyHits))) ||
+          (wholeThreads !== null && wholeThreads.size > 0 && rowInHitThread(row, wholeThreads))));
         const hit = said && (!links || shown > 0) && deps.authorPasses(row, author);
         const revealed = !hit && text !== null && (id === "thread-list"
           ? openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-context-id")))
@@ -789,6 +820,8 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     applySearch, searchInAll, renderSearchInAll, renderSearchCount, refreshSearchCount,
     listEmptied, drawSeams, seamsAfterMidnight, openSearchGap, inOpenedGap,
     rowsChosen, rowDay, markSearchHits, messageMatches, threadsWithHits, rowMatches,
+    setEntireThreads: (on: boolean) => { entireThreadsOn = on; },
+    entireThreads: () => entireThreadsOn,
     sayCardCount, openedGaps,
     placeSeam: (row: Element, seam: unknown, below: boolean) => placeSeam(row as never, seam as never, below),
     seamDrawn: (row: Element, seam: unknown, below: boolean) => seamDrawn(row as never, seam as never, below),

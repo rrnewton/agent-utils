@@ -21,6 +21,8 @@ export interface ListControlsDependencies {
   toggleServerHits(): void;
   /** `#1797`. A bucket chip tapped: interleave its hits in the timeline, or put them away. */
   toggleBucket(id: string): void;
+  /** `#1825`. The Entire-threads chip tapped. */
+  toggleEntireThreads(): void;
   searchAllChannels(on: boolean): void;
   /** The search's walk further back. */
   searchFurther(): unknown;
@@ -72,6 +74,7 @@ export function mountListControls(deps: ListControlsDependencies): ListControls 
   listen(el("search-bucket-threads"), "click", () => deps.toggleBucket("threads"));
   // `#1608`: the Agent Transcripts bucket chip, plugged into the same row.
   listen(el("search-bucket-transcripts"), "click", () => deps.toggleBucket("transcripts"));
+  listen(el("search-entire-threads"), "click", () => deps.toggleEntireThreads());
   listen(el("server-more"), "click", () => deps.serverMore());
   listen(el("search-all-channels"), "change", () => deps.searchAllChannels((el("search-all-channels") as HTMLInputElement).checked));
   listen(el("search-further"), "click", () => deps.searchFurther());

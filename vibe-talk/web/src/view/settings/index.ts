@@ -71,3 +71,5 @@ export { mountHelpScreen } from "./helpscreen.ts";
 export type { HelpScreen, HelpScreenDependencies } from "./helpscreen.ts";
 export { createStoredScreen } from "./screen.ts";
 export type { StoredScreen, StoredScreenDependencies } from "./screen.ts";
+export { mountLabels } from "./labels.ts";
+export type { LabelsDependencies, LabelsView } from "./labels.ts";

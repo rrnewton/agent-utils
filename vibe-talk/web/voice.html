@@ -714,6 +714,8 @@
                 <button id="search-bucket-main" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in main</button>
                 <button id="search-bucket-threads" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in threads</button>
                 <button id="search-bucket-transcripts" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in Agent Transcripts</button>
+                <!-- `#1825`: whole threads on any hit, off by default (individual hits as now). -->
+                <button id="search-entire-threads" class="chip search-bucket-chip" type="button" aria-pressed="false" title="Show the whole thread of every hit">Entire threads</button>
               </div>
               <!-- `#1608 agent-transcripts-timeline`: the Transcripts view.
                    Agent-day trace threads and their chunks; never a thread
@@ -2264,6 +2266,37 @@
                           <button id="dismissed-send-close" class="secondary" type="button">Close</button>
                         </div>
                         <p id="dismissed-send-popout-state" class="hint" aria-live="polite"></p>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section class="settings-group" id="labels-group">
+                    <div class="group-head">
+                      <h3 title="Every hashtag label (a literal #kvm - style tag) in the loaded history, with a selection to combine them into groups."><button class="fold-toggle" id="fold-labels" type="button" aria-expanded="false" aria-controls="fold-labels-body">Labels</button></h3>
+                    </div>
+                    <div class="fold-body" id="fold-labels-body" hidden="until-found">
+                      <!-- `#1825 vibe-talk-hashtag-labels`: browse/search, counts in loaded
+                           history only, sort toggle, persistent checkboxes, Combine dialog. -->
+                      <label for="labels-filter">Search labels</label>
+                      <input id="labels-filter" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Filter labels" />
+                      <div class="channel-actions">
+                        <button id="labels-sort" class="secondary" type="button" aria-pressed="false">Sort: most used</button>
+                        <button id="labels-combine" class="secondary" type="button" disabled>Combine (0)</button>
+                      </div>
+                      <p id="labels-state" class="hint" aria-live="polite"></p>
+                      <ol id="labels-list" class="labels-list data-panel" aria-label="Labels in the loaded history"></ol>
+                      <div id="label-group-dialog" class="data-popout" role="dialog" aria-modal="true" aria-labelledby="label-group-title" hidden>
+                        <h4 id="label-group-title">Combine labels</h4>
+                        <label for="label-group-name">Group name</label>
+                        <input id="label-group-name" type="text" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" spellcheck="false" />
+                        <label for="label-group-spellings">Alternate spellings (one per line)</label>
+                        <textarea id="label-group-spellings" rows="5" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" spellcheck="false"></textarea>
+                        <div class="channel-actions">
+                          <button id="label-group-save" class="secondary" type="button">Save group</button>
+                          <button id="label-group-dissolve" class="secondary" type="button" hidden>Dissolve group</button>
+                          <button id="label-group-close" class="secondary" type="button">Close</button>
+                        </div>
+                        <p id="label-group-state" class="hint" aria-live="polite"></p>
                       </div>
                     </div>
                   </section>

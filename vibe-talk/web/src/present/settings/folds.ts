@@ -22,6 +22,7 @@ const SETTINGS_FOLDS: readonly string[] = Object.freeze([
   "auto-read",
   "message-links",
   "dismissed",
+  "labels",
   "settings-channels",
   "hidden-channels",
   "settings-screen",

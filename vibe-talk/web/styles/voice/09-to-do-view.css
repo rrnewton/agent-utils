@@ -174,6 +174,35 @@
   display: none;
 }
 
+/* Settings > Labels (`#1825`): one row per spelling, count in loaded history. */
+.labels-list {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+}
+
+.label-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.2rem;
+}
+
+.label-name {
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.label-count {
+  color: var(--ink-2, inherit);
+  font-size: 0.8rem;
+}
+
+.label-group-marker {
+  font-weight: 700;
+  cursor: pointer;
+}
+
 /* The pin, drawn from the same path as the Pinned filter's icon and filled with the chip's ink. A
    mask rather than an inline <svg> so the row builder makes no element it would have to name. */
 .pin-chip::before {

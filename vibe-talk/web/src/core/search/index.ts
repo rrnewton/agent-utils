@@ -4,6 +4,7 @@
 export {
   searchFold,
   searchPositiveTerms,
+  searchQueryExpandLabels,
   searchQueryMatches,
   searchQueryParse,
   searchQueryTree,
