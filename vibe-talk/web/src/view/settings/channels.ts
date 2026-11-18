@@ -561,7 +561,11 @@ export function mountChannelSettings(deps: ChannelSettingsDependencies) {
     // that can (no chat service that clears unread, or a read token) it was a choice that left nothing to do.
     // `#355 provider-grouped-channels`: with several services, all of the chosen service's channels,
     // "All Slack channels", offered on the same terms within that service.
-    const all = settingsChannels().length >= 2 && upstreamClearAllChannels().length > 0;
+    // `#1815 vibe-talk-settings-density-and-channel-header`: All channels is
+    // the header selector's default whenever there is more than one channel
+    // to choose among, so the controls below are visibly about the selected
+    // channel (or all of them). It is no longer gated on Clear unread alone.
+    const all = settingsChannels().length >= 2;
     if (all) {
       const option = document.createElement("option");
       option.value = deps.allChannels;
@@ -576,7 +580,7 @@ export function mountChannelSettings(deps: ChannelSettingsDependencies) {
     };
     for (const channel of settingsChannels()) select.append(optionFor(channel));
     const order = settingsChannels();
-    const showing = all && chosen === deps.allChannels
+    const showing = all && (chosen === deps.allChannels || !order.some((channel) => String(channel.id) === String(chosen)))
       ? deps.allChannels
       : order.some((channel) => String(channel.id) === String(chosen))
         ? chosen

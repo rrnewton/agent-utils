@@ -336,7 +336,7 @@ def main() -> int:
                         noteSize: style ? parseFloat(style.fontSize) : null,
                         headingSize: parseFloat(getComputedStyle(heading).fontSize),
                         noteOpacity: style ? parseFloat(style.opacity) : null,
-                        collapsedIn: sectionOf('fold-collapsed-lines'),
+                        collapsedIn: sectionOf('collapsed-lines'),
                     };
                 }""")
                 assert isinstance(placed, dict)

@@ -919,6 +919,7 @@ test("the reader's own choice beats every guess, and survives a reload", async (
   assert.equal(whoOf(page, 1), "coder", "the guess under test never happened");
 
   await page.el("open-settings").click();
+  await settingsChannel(page, CHANNEL.id);
   const select = page
     .el("identity-list")
     .descendants()
@@ -1048,7 +1049,9 @@ test("`#402 who-is-who-channel-box`: the list follows the channel box's picker, 
   await readChannel(page, OTHER_CHANNEL.id);
   await readChannel(page, CHANNEL.id);
   await page.el("open-settings").click();
-  assert.equal(page.el("settings-channel").value, CHANNEL.id);
+  // `#1815`: the header selector defaults to All Channels, which asks for one channel.
+  assert.equal(page.el("settings-channel").value, "*");
+  await settingsChannel(page, CHANNEL.id);
   assert.deepStrictEqual(listedNames(page), ["alice"], "the list is not scoped to one channel");
   // The picker is the list's: another channel there lists that channel's cast, and navigates nowhere.
   await settingsChannel(page, OTHER_CHANNEL.id);
@@ -1084,6 +1087,7 @@ test("`#402 who-is-who-channel-box`: on All channels the list asks for one chann
   await readChannel(page, OTHER_CHANNEL.id);
   await readChannel(page, CHANNEL.id);
   await page.el("open-settings").click();
+  await settingsChannel(page, CHANNEL.id);
   assert.deepStrictEqual(listedNames(page), ["alice"]);
   await settingsChannel(page, "*");
   assert.equal(page.el("identity-list").text(), "Pick one channel to see who is who.",
@@ -1192,6 +1196,7 @@ test("`#351 settings-polish`: who is who's line about a choice goes when the box
   await readChannel(page, OTHER_CHANNEL.id);
   await readChannel(page, CHANNEL.id);
   await page.el("open-settings").click();
+  await settingsChannel(page, CHANNEL.id);
   await chooseIdentity(page, "coder");
   assert.match(page.el("identity-state").textContent, /^Saved\./);
   // The same channel, Settings left and opened again: still the report about the list on screen.
@@ -1226,6 +1231,7 @@ test("`#351 settings-polish`: who is who's line about a choice goes when the box
   await readChannel(blind, OTHER_CHANNEL.id);
   await readChannel(blind, CHANNEL.id);
   await blind.el("open-settings").click();
+  await settingsChannel(blind, CHANNEL.id);
   await chooseIdentity(blind, "coder");
   await settingsChannel(blind, OTHER_CHANNEL.id);
   assert.match(blind.el("identity-state").textContent, /^Saved\./, "the negative control cleared the line anyway, so the check above proves nothing");
@@ -1303,6 +1309,7 @@ test("...but a CHOICE is about the account, so it holds in every channel that ac
   assert.equal(whoOf(page, 0), "coder", "the guess under test never happened");
 
   await page.el("open-settings").click();
+  await settingsChannel(page, CHANNEL.id);
   const select = page
     .el("identity-list")
     .descendants()
@@ -1369,7 +1376,7 @@ const SETTINGS_SECTIONS = settingsHeadings(HTML.slice(HTML.indexOf('id="screen-s
 test("`#271 settings-groups`: Settings is a handful of sections, and every group is inside one", () => {
   assert.deepStrictEqual(
     SETTINGS_SECTIONS,
-    ["Server", "Voice agent", "Messages", "Channels", "Screen and keys", "Storage and connection"],
+    ["Server", "Voice agent", "Messages", "Channel Settings:", "Screen and keys", "Storage and connection"],
     "the sections are not the six the screen is arranged around"
   );
   const settings = HTML.slice(HTML.indexOf('id="screen-settings"'), HTML.indexOf('id="screen-help"'));
@@ -1388,17 +1395,17 @@ test("`#271 settings-groups`: Settings is a handful of sections, and every group
 
 test("`#271 settings-groups`: the Voice agent section holds sending, the instructions, resuming and live messages", () => {
   const voice = groupsIn("Voice agent");
-  for (const group of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
-    "Reading full messages in channel view", "Canned prompts", "Microphone"]) {
+  for (const group of ["Reading full messages in channel view", "Canned prompts", "Microphone"]) {
     assert.ok(voice.includes(group), `"${group}" is not in the Voice agent section: ${voice.join(", ")}`);
   }
-  // FIRST, where the owner looks: the switch he could not find.
-  assert.equal(voice[0], "Sending", `the section opens on "${voice[0]}", not on whether the agent asks first`);
-  const sending = settingsGroup("Sending");
-  assert.match(sending, /id="voice-ask-before-send"/);
-  assert.match(sending, /<p id="voice-send-untick" class="hint">Untick it to let the agent send as soon as you ask, with no read-back\.<\/p>/,
+  // `#1815`: Sending and Instructions are inline at the head of the section, where the owner looks.
+  const voiceSection = settingsSection("Voice agent");
+  assert.match(voiceSection, /id="voice-ask-before-send"/);
+  assert.match(voiceSection, /id="voice-instructions"/);
+  assert.match(voiceSection, /<p id="voice-send-untick" class="hint">Untick it to let the agent send as soon as you ask, with no read-back\.<\/p>/,
     "nothing beside the switch says it is the way to let the agent send without asking");
-  assert.equal(voice[1], "Instructions", "the instructions are not beside the switch about sending");
+  assert.ok(voiceSection.indexOf('data-single-setting="sending"') < voiceSection.indexOf('data-single-setting="instructions"'),
+    "the instructions are not beside the switch about sending");
 });
 
 test("`#271 settings-groups`: the Messages section holds the message options, and nothing about the agent", () => {
@@ -1415,8 +1422,7 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // Mark read on reply sits under Your own messages: both say what marks read.
   // `#1321 after-done-setting` put After Done after Message links: what e does after marking
   // is a choice about marking messages, and it syncs as the choices beside it do.
-  assert.deepStrictEqual(messages, ["Your own messages", "Mark read on reply", "Mark-read automatically", "Empty messages", "Combining messages",
-    "Rich headers", "Message links", "After Done", "Summaries", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
+  assert.deepStrictEqual(messages, ["Your own messages", "Mark read on reply", "Mark-read automatically", "Message links", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -1424,16 +1430,15 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // `#481 slack-app-deep-link` put Opening links here, beside the bar that offers the links:
   // whether the Slack app is on this device is the device's own business, so it is one of the
   // per-device choices and is never synced.
-  assert.deepStrictEqual(groupsIn("Screen and keys"),
-    ["Text size", "Reading width", "Control bar", "Opening links", "Typing", "Debug", "Keyboard"]);
+  assert.deepStrictEqual(groupsIn("Screen and keys"), ["Debug"]);
   // `#457 settings-server-side`: the one per-device section says so beside its title.
   assert.match(HTML, /<h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen"[^>]*>Screen and keys<\/button><span class="settings-scope-note">\(client side\)<\/span><\/h2>/,
     "Screen and keys does not say (client side) beside its title");
   assert.deepStrictEqual(groupsIn("Storage and connection"),
-    ["Stored conversations", "Saved messages on this server", "Token", "Connection status"]);
+    ["Saved messages on this server", "Connection status"]);
   // The per-channel box is its own section, with its `?` beside the section's title.
-  const channels = settingsSection("Channels");
-  assert.match(channels, /<h2 id="settings-channels-title"[^>]*>(?:<button class="fold-toggle"[^>]*>)?Channels(?:<\/button>)?<\/h2>\s*<button class="help-link" id="help-link-channel-alias"/);
+  const channels = settingsSection("Channel Settings:");
+  assert.match(channels, /<h2 id="settings-channels-title"[^>]*>(?:<button class="fold-toggle"[^>]*>)?Channel Settings:(?:<\/button>)?<\/h2>\s*<label[^>]*>Channel<\/label>\s*<select id="settings-channel"[^>]*><\/select>\s*<button class="help-link" id="help-link-channel-alias"/);
   assert.match(channels, /<section class="settings-group" id="channel-settings"/);
 });
 
@@ -1478,8 +1483,13 @@ function voiceAgentSectionProblems(html) {
   const code = html.replace(/<!--[\s\S]*?-->/g, " ");
   const settings = code.slice(code.indexOf('id="screen-settings"'), code.indexOf('id="screen-help"'));
   const voice = groupsIn("Voice agent", code);
-  const at = voice.indexOf(READING_GROUPS[0]);
-  if (at < 0 || READING_GROUPS.some((group, i) => voice[at + i] !== group)) {
+  // `#1815`: Resuming and Arriving messages are single controls shown inline, so
+  // togetherness is their controls' order in the section, before Reading's heading.
+  const voiceSection = settingsSection("Voice agent", code);
+  const resumeAt = voiceSection.indexOf('id="resume-toggle"');
+  const relayAt = voiceSection.indexOf('id="relay-to-agent"');
+  const readingAt = voiceSection.indexOf('id="settings-audio-source"');
+  if (!(resumeAt >= 0 && relayAt > resumeAt && readingAt > relayAt && voice[0] === READING_GROUPS[2])) {
     problems.push(`Voice agent does not hold ${READING_GROUPS.join(", ")} together: ${voice.join(", ")}`);
   }
   for (const gone of ["Message audio", "How messages are said"]) {
@@ -1505,7 +1515,7 @@ function voiceAgentSectionProblems(html) {
 test("`#332 settings-voice-agent-section`: Voice agent holds Resuming, Arriving messages during a call and Reading full messages in channel view, together", () => {
   assert.deepStrictEqual(voiceAgentSectionProblems(HTML), []);
   // Still after Sending and Instructions, which `#271` put first, where the owner looks.
-  assert.deepStrictEqual(groupsIn("Voice agent").slice(0, 5), ["Sending", "Instructions", ...READING_GROUPS]);
+  assert.deepStrictEqual(groupsIn("Voice agent").slice(0, 1), [READING_GROUPS[2]]);
   // The picker is the one it always was: the bar's switch keeps it in step by these ids.
   const reading = settingsGroup(READING_GROUPS[2]);
   assert.match(reading, /<label for="settings-audio-source">Read messages with<\/label>/);
@@ -1527,7 +1537,7 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
       `$1${prose}${reading.replace(READING_GROUPS[2], "Message audio").replace(/<p class="help-text-row">[\s\S]*?<\/p>/, "")}`);
   assert.notEqual(before, HTML, "the negative control changed nothing");
   assert.deepStrictEqual(voiceAgentSectionProblems(before), [
-    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Arriving messages during a call, Canned prompts, Microphone, Provider`,
+    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Canned prompts, Microphone`,
     'Settings still says "Message audio"',
     'Settings still says "How messages are said"',
     "the message-reading picker is not in Reading full messages in channel view",
@@ -1538,7 +1548,7 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
   // Each change alone is caught by name: the old name, kept in place.
   const renamed = HTML.replace(new RegExp(`(<h3\\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?)${READING_GROUPS[2]}<`), "$1Message audio<");
   assert.deepStrictEqual(voiceAgentSectionProblems(renamed), [
-    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Arriving messages during a call, Message audio, Canned prompts, Microphone, Provider`,
+    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Message audio, Canned prompts, Microphone`,
     'Settings still says "Message audio"',
     "the message-reading picker is not in Reading full messages in channel view",
     "Reading full messages in channel view has no link to How messages are pre-processed for speech",
@@ -1547,7 +1557,7 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
   const apart = HTML.replace(reading, "").replace('<section class="settings-group" id="agent-settings"',
     `${reading}\n<section class="settings-group" id="agent-settings"`);
   assert.deepStrictEqual(voiceAgentSectionProblems(apart), [
-    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Sending, Instructions, Resuming, Arriving messages during a call, Canned prompts, Microphone, ${READING_GROUPS[2]}, Provider`,
+    `Voice agent does not hold ${READING_GROUPS.join(", ")} together: Canned prompts, Microphone, ${READING_GROUPS[2]}`,
   ]);
   // The link taken away, and nothing else.
   const unlinked = HTML.replace(/<p class="help-text-row">\s*<button[^>]*>How messages are pre-processed for speech<\/button>\s*<\/p>/, "");
@@ -1560,7 +1570,7 @@ test("`#332 settings-voice-agent-section`: the check refuses the Settings from b
  * The Tab stops from Resuming through Reading full messages in channel view, in order. `#346
  * settings-collapsible` made each group's heading the button that folds it, a stop before its `?`.
  */
-const SETTINGS_TAB_STOPS = ["fold-resuming", "help-link-resuming", "resume-toggle", "fold-relay", "help-link-live-messages",
+const SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle", "help-link-live-messages",
   "relay-to-agent", "fold-reading-full", "settings-audio-source", "settings-wit-voice", "help-link-speech-prep"];
 
 /**
@@ -1826,8 +1836,8 @@ function settingsProseProblems(html) {
   const settings = settingsCode(html);
   const help = html.replace(/<!--[\s\S]*?-->/g, " ").slice(html.replace(/<!--[\s\S]*?-->/g, " ").indexOf('id="screen-help"'));
   // How live updates are delivered is a readout: Connection status's, and in no setting's group.
-  const relayAt = new RegExp(settingsHeading(3, "Arriving messages during a call")).exec(settings);
-  const relay = relayAt ? settingsGroup("Arriving messages during a call", settings) : "";
+  const relayAt = settings.includes('data-single-setting="relay"') ? { index: settings.indexOf('data-single-setting="relay"') } : null;
+  const relay = relayAt ? settings.slice(relayAt.index, settings.indexOf("</section>", relayAt.index)) : "";
   const status = new RegExp(settingsHeading(3, "Connection status")).test(settings) ? settingsGroup("Connection status", settings) : "";
   if (!status.includes('id="live-state"')) problems.push("how live updates reach this page is not in Connection status");
   if (settingsSection("Voice agent", settings).includes('id="live-state"')) {
@@ -1840,16 +1850,14 @@ function settingsProseProblems(html) {
   if (!relayAt) {
     problems.push('no group is titled "Arriving messages during a call"');
   } else {
-    const heading = /<h3\b[^>]*>/.exec(relay)[0];
     const fields = [...relay.matchAll(/<(select|input|textarea|label|p)\b[^>]*>/g)].map((m) => m[0]);
-    if (fields.length !== 1 || !/^<select id="relay-to-agent"/.test(fields[0])) {
+    if (fields.length !== 2 || !/^<label for="relay-to-agent">/.test(fields[0]) || !/^<select id="relay-to-agent"/.test(fields[1])) {
       problems.push(`Arriving messages during a call holds more than its drop-down: ${fields.join(" ")}`);
     }
-    const named = (/\bid="([^"]+)"/.exec(heading) || [])[1];
-    if (!named || !new RegExp(`<select id="relay-to-agent" aria-labelledby="${named}"`).test(relay)) {
+    if (!/<select id="relay-to-agent" aria-label="Arriving messages during a call">/.test(relay)) {
       problems.push("the drop-down is not named by the title above it");
     }
-    if ([...relay.matchAll(/<button\b(?! class="fold-toggle")/g)].length !== 1 || !/data-help="live-messages"/.test(relay)) {
+    if ([...relay.matchAll(/<button\b/g)].length !== 1 || !/data-help="live-messages"/.test(relay)) {
       problems.push("Arriving messages during a call has some other button than its own ?");
     }
   }
@@ -1875,7 +1883,7 @@ function settingsProseProblems(html) {
     if (settings.includes(`<p class="hint">${line}</p>`)) problems.push(`"${line}" is still a line under ${heading}`);
     const level = MOVED_SECTION_DESCRIPTIONS.has(heading) ? 2 : 3;
     const tag = new RegExp(settingsHeading(level, literal(heading))).exec(settings);
-    if (!tag || titleOf(tag[0]) !== line) problems.push(`${heading}'s tooltip is not "${line}"`);
+    if ((!tag || titleOf(tag[0]) !== line) && !settings.includes(`title="${line}"`)) problems.push(`${heading}'s tooltip is not "${line}"`);
   }
   // How messages are said is a short link into Help; Car audio is gone, and what it meant is said.
   if (!/<button class="help-link help-link-text" id="help-link-speech-prep"[^>]*>How messages are pre-processed for speech<\/button>/.test(settings)) {
@@ -1894,7 +1902,8 @@ test("`#347 settings-prose`: Settings drops its implementation prose, and its on
 });
 
 test("`#347 settings-prose`: the check refuses each old thing put back, one at a time (negative controls)", () => {
-  const relay = `${settingsGroup("Arriving messages during a call")}</section>`;
+  const relayAt2 = HTML.indexOf('data-single-setting="relay"');
+  const relay = `${HTML.slice(HTML.lastIndexOf('<section class="settings-group"', relayAt2), HTML.indexOf("</section>", relayAt2))}</section>`;
   const cases = [
     // The live-updates line back at the head of the group, and named as it was.
     ["the live line", HTML.replace(/\s*<p id="live-state" class="[^"]*" aria-live="polite"><\/p>/, "")
@@ -1902,17 +1911,15 @@ test("`#347 settings-prose`: the check refuses each old thing put back, one at a
       "how live updates reach this page is not in Connection status",
       "how live updates reach this page is still in the Voice agent section",
       "Arriving messages during a call holds more than its drop-down: " +
-        '<p id="live-state" class="hint" aria-live="polite"> <select id="relay-to-agent" aria-labelledby="relay-to-agent-title">',
+        '<label for="relay-to-agent"> <p id="live-state" class="hint" aria-live="polite"> <select id="relay-to-agent" aria-label="Arriving messages during a call">',
     ]],
     // The #332 group: Live messages, its label with a ? after it, and the line under the picker.
-    ["the old group", HTML.replace(relay, relay
-      .replace(/(<h3\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?)Arriving messages during a call</, "$1Live messages<")
-      .replace('<select id="relay-to-agent" aria-labelledby="relay-to-agent-title">',
-        '<div class="label-help"><label for="relay-to-agent">Arriving messages during a call</label>' +
-        '<button class="help-link" id="help-link-speech-prep-relay" type="button" data-help="speech-prep">?</button></div>' +
-        '<select id="relay-to-agent">')), [
-      'no group is titled "Arriving messages during a call"',
-      `Arriving messages during a call's tooltip is not "${MOVED_DESCRIPTIONS.get("Arriving messages during a call")}"`,
+    ["the old group", HTML.replace('<select id="relay-to-agent" aria-label="Arriving messages during a call">',
+        '<div class="label-help"><label for="relay-to-agent">Arriving messages during a call</label></div>' +
+        '<select id="relay-to-agent">'), [
+      "Arriving messages during a call holds more than its drop-down: " +
+        '<label for="relay-to-agent"> <label for="relay-to-agent"> <select id="relay-to-agent">',
+      "the drop-down is not named by the title above it",
     ]],
     ["the old name", HTML.replace(/(<h3\b[^>]*>(?:<button class="fold-toggle"[^>]*>)?)Mark-read automatically</, "$1Read automatically<"), [
       'the list is still called "Read automatically" on Settings',
@@ -1922,7 +1929,7 @@ test("`#347 settings-prose`: the check refuses each old thing put back, one at a
       `"${MOVED_DESCRIPTIONS.get("Combining messages")}" is still a line under Combining messages`,
     ]],
     ["a ? that says something else", HTML.replace(/(id="help-link-combining"[^>]*title=")[^"]*"/, '$1What this does"'), [
-      `"Combining messages" and its ? do not carry the same one-line description: ${MOVED_DESCRIPTIONS.get("Combining messages")} / What this does`,
+      `Combining messages's tooltip is not "${MOVED_DESCRIPTIONS.get("Combining messages")}"`,
     ]],
     ["Car audio back", HTML.replace('<p class="help-text-row">', '<p class="hint">Car audio: use Agent audio.</p><p class="help-text-row">'), [
       '"Car audio: use Agent audio." is still on Settings',
@@ -1993,8 +2000,8 @@ test("`#349 channel-settings-all`: the picker opens with All channels where ther
   const page = await allChannelsPage();
   assert.deepStrictEqual(pickerChoices(page),
     [["*", "All channels"], [CHANNEL.id, "lead team"], [OTHER_CHANNEL.id, "build noise"]]);
-  // Settings still opens on a channel, as it did: All is a choice, not where the box starts.
-  assert.equal(page.el("settings-channel").value, CHANNEL.id);
+  // `#1815`: Settings opens on All Channels, in the header.
+  assert.equal(page.el("settings-channel").value, "*");
   // The reading picker is about one channel, always.
   assert.ok(!page.el("discord-channel").children.some((option) => option.value === "*"), "the channel view offers All channels");
   // One channel: all of them is that one, and the choice would be a second name for it.
@@ -2002,7 +2009,7 @@ test("`#349 channel-settings-all`: the picker opens with All channels where ther
   assert.deepStrictEqual(pickerChoices(one), [[CHANNEL.id, "lead team"]]);
 });
 
-test("`#351 settings-polish`: All channels is offered only where a channel can take Clear unread with this token", async () => {
+test("`#1815 vibe-talk-settings-density-and-channel-header`: All channels is offered wherever there are two or more channels", async () => {
   const offersAll = (page) => pickerChoices(page).some(([value]) => value === "*");
   // A chat service that cannot clear unread: two channels, and nothing All channels could set.
   const unable = newPage();
@@ -2010,8 +2017,8 @@ test("`#351 settings-polish`: All channels is offered only where a channel can t
   await signIn(unable);
   await unable.el("open-settings").click();
   await unable.settle();
-  assert.deepStrictEqual(pickerChoices(unable), [[CHANNEL.id, "lead team"], [OTHER_CHANNEL.id, "build noise"]],
-    "All channels is offered where no channel's chat service can clear unread");
+  assert.deepStrictEqual(pickerChoices(unable), [["*", "All channels"], [CHANNEL.id, "lead team"], [OTHER_CHANNEL.id, "build noise"]],
+    "All channels is not offered where there are two channels");
   // Providers, none of whose channels can.
   const provider = (key, name) => ({
     key, name, threading_supported: false, live_delivery: "push", live_poll_seconds: 0,
@@ -2023,10 +2030,10 @@ test("`#351 settings-polish`: All channels is offered only where a channel can t
       { id: "C0123ABCDF", label: "other team", writable: true, provider: "slack" }];
     page.providers = [provider("slack", "Slack")];
   });
-  assert.equal(offersAll(neither), false, "All channels is offered where no provider can clear unread");
+  assert.equal(offersAll(neither), true, "All channels is not offered where there are two channels");
   // A read token, where the chat service can: it may change no channel's setting.
   const reader = await allChannelsPage({}, (page) => { page.tokenScope = "read"; });
-  assert.equal(offersAll(reader), false, "All channels is offered to a read token");
+  assert.equal(offersAll(reader), true, "All channels is not offered to a read token with two channels");
   // ...and the same channels with a write token offer it, read from the first answer the server gives.
   const writer = await allChannelsPage();
   assert.equal(offersAll(writer), true, "All channels is not offered where both channels can clear unread");
@@ -2038,18 +2045,17 @@ test("`#351 settings-polish`: All channels is offered only where a channel can t
   await writer.settle();
   if (writer.screen() !== "settings") await writer.el("open-settings").click();
   await writer.settle();
-  assert.equal(offersAll(writer), false, "All channels outlived the write token");
-  assert.equal(writer.el("settings-channel").value, CHANNEL.id);
-  assert.equal(writer.el("rename-channel").hidden, false, "the box stayed on All channels' acts");
-  assert.match(writer.el("channel-facts").textContent, /"lead team"/);
+  assert.equal(offersAll(writer), true, "All channels went with the write token");
+  assert.equal(writer.el("settings-channel").value, "*");
+  assert.equal(writer.el("rename-channel").hidden, true, "the box did not stay on All channels' acts");
   // The negative control: a picker that offers it wherever there are two channels.
   const blind = newPage(new Map(), await brokenModule([{ file: "src/view/settings/channels.ts",
-    find: " && upstreamClearAllChannels().length > 0;", replace: ";" }]));
+    find: "const all = settingsChannels().length >= 2;", replace: "const all = settingsChannels().length >= 99;" }]));
   blind.channels = [{ ...CHANNEL }, { ...OTHER_CHANNEL }];
   await signIn(blind);
   await blind.el("open-settings").click();
   await blind.settle();
-  assert.equal(offersAll(blind), true, "the negative control left All channels out anyway, so the check above proves nothing");
+  assert.equal(offersAll(blind), false, "the negative control offered All channels anyway, so the check above proves nothing");
 });
 
 /**
@@ -2061,21 +2067,14 @@ function allChannelsOfferProblems(text) {
   const flat = text.replace(/<[^>]+>/g, "").replace(/\s+/g, " ");
   const problems = [];
   if (!/two or more channels/.test(flat)) problems.push("two channels or more is not said");
-  if (!/at least one of (them|which) can take Clear unread with (this|your|the) token/.test(flat)) {
-    problems.push("a channel that can take Clear unread with the token is not said to be needed");
-  }
-  if (!/(With|never to) the read token/.test(flat)) problems.push("the read token is not said to go without it");
-  if (!/where no channel's chat service can clear unread/.test(flat)) {
-    problems.push("a chat service that cannot clear unread is not said to go without it");
-  }
   return problems;
 }
 
 test("`#351 settings-polish`: Help, the README and the markup say when All channels is offered, as the picker does", async () => {
-  // The page first: two channels, offered with the write token on a service that can clear unread, and
-  // not with the read token. The test above covers each case; this one holds the words to them.
+  // The page first: two channels, offered and defaulted to in the header. The test above covers
+  // each case; this one holds the words to them.
   assert.equal(pickerChoices(await allChannelsPage())[0][0], "*", "All channels is not offered at all");
-  assert.notEqual(pickerChoices(await allChannelsPage({}, (page) => { page.tokenScope = "read"; }))[0][0], "*");
+  assert.equal(pickerChoices(await allChannelsPage({}, (page) => { page.tokenScope = "read"; }))[0][0], "*");
   const paragraph = (html) => {
     const at = html.indexOf("<strong>All channels</strong>");
     assert.ok(at > 0, "Help no longer describes All channels");
@@ -2087,18 +2086,13 @@ test("`#351 settings-polish`: Help, the README and the markup say when All chann
   const bullet = readme.slice(readme.indexOf("* **All channels at once**"), readme.indexOf("\n* ", readme.indexOf("* **All channels at once**") + 1));
   assert.ok(bullet.length > 0, "the README no longer has its All channels bullet");
   assert.deepStrictEqual(allChannelsOfferProblems(bullet), [], "the README's All channels bullet");
-  const comment = HTML.slice(HTML.indexOf("`#349 channel-settings-all`. The picker's first choice"), HTML.indexOf("-->", HTML.indexOf("`#349 channel-settings-all`. The picker's first choice")));
+  const comment = HTML.slice(HTML.indexOf("The picker's first choice is All channels"), HTML.indexOf("-->", HTML.indexOf("The picker's first choice is All channels")));
   assert.ok(comment.length > 0, "the markup no longer says what the picker's first choice is");
   assert.deepStrictEqual(allChannelsOfferProblems(comment), [], "the markup comment over the channel box");
   // The negative control: the entry as it was, offering it wherever there are two channels.
   const old = "<p class=\"hint\"><strong>All channels</strong>, the picker's first choice when there are two or more, " +
     "is for setting <strong>Clear unread</strong> on every channel at once.</p>";
-  assert.deepStrictEqual(allChannelsOfferProblems(old), [
-    "two channels or more is not said",
-    "a channel that can take Clear unread with the token is not said to be needed",
-    "the read token is not said to go without it",
-    "a chat service that cannot clear unread is not said to go without it",
-  ]);
+  assert.deepStrictEqual(allChannelsOfferProblems(old), ["two channels or more is not said"]);
 });
 
 test("`#349 channel-settings-all`: with All channels, Rename and Remove step aside, Add and Browse stay, and the line says how many", async () => {
@@ -2117,6 +2111,7 @@ test("`#349 channel-settings-all`: with All channels, Rename and Remove step asi
 
 test("`#349 channel-settings-all`: Clear unread for All channels shows their common mode, and Save sets it on every one", async () => {
   const page = await allChannelsPage();
+  await settingsChannel(page, CHANNEL.id);
   page.upstreamClearCalls.length = 0;
   await settingsChannel(page, "*");
   assert.deepStrictEqual(page.upstreamClearCalls, [`GET ${CHANNEL.id}`, `GET ${OTHER_CHANNEL.id}`],
@@ -2181,6 +2176,7 @@ test("`#349 channel-settings-all`: a channel whose service cannot clear unread i
     page.channels = [team, space, other];
     page.providers = [provider("gchat", "Google Chat", true), provider("slack", "Slack", false)];
   });
+  await settingsChannel(page, space.id);
   page.upstreamClearCalls.length = 0;
   await settingsChannel(page, "*");
   assert.deepStrictEqual(page.upstreamClearCalls, [`GET ${space.id}`, `GET ${other.id}`], "the box asked about a channel that cannot");
@@ -2391,7 +2387,7 @@ test("`#348 settings-dynamic-lists` x `#346 settings-collapsible`: folding the g
   const page = await dismissedPage("a message to read whole");
   await page.el("fold-settings-all").click();
   await dismissedOpenerOf(dismissedItems(page)[0]).click();
-  await page.el("fold-typing").click();
+  await page.el("fold-debug").click();
   assert.equal(page.el("dismissed-send-popout").hidden, false, "folding another group closed the pop-out");
   // The negative control: a page whose folds do not know the pop-out leaves it open behind the fold.
   const blind = newPage(new Map(), await brokenModule([{ file: "src/view/settings/folds.ts",
@@ -2482,7 +2478,7 @@ test("`#351 settings-polish`: the pop-out is a modal: marked so, the page behind
   // Behind it: its own group's fold, list, line and Forget, the groups beside it and the sections beside
   // its section, and the row that opened it, inside the list.
   for (const id of ["fold-dismissed", "dismissed-sends", "dismissed-sends-state", "forget-dismissed-sends", "fold-mark-own",
-    "identity-group", "fold-settings-messages", "settings-channels", "fold-settings-voice-agent", "fold-storage"]) {
+    "identity-group", "fold-settings-messages", "settings-channels", "fold-settings-voice-agent", "forget-conversations"]) {
     assert.equal(inertNow(page.el(id)), true, `#${id} can still be reached behind the pop-out`);
   }
   assert.equal(inertNow(dismissedOpenerOf(dismissedItems(page)[0])), true, "the row behind the pop-out can still be reached");
@@ -2578,7 +2574,7 @@ test("`#351 settings-polish`: what the pop-out makes inert beyond the box its sh
     "the elements dimmed are not those beyond Settings' scrolling box");
   for (const id of underDimIds(page)) assert.equal(page.el(id).hasAttribute("inert"), true, `#${id} is dimmed and not inert`);
   // Inside the box the shadow is the dim: what is inert there is not dimmed again.
-  for (const id of ["fold-dismissed", "dismissed-sends", "settings-channels", "fold-settings-voice-agent", "fold-storage"]) {
+  for (const id of ["fold-dismissed", "dismissed-sends", "settings-channels", "fold-settings-voice-agent", "forget-conversations"]) {
     assert.equal(inertNow(page.el(id)), true, `#${id} can still be reached behind the pop-out`);
     assert.equal(page.el(id).hasAttribute("data-under-dim"), false, `#${id}, under the shadow, is dimmed twice`);
   }
@@ -2700,7 +2696,9 @@ function foldProblems(html, css, script) {
     folds.push(slug);
     const toggle = new RegExp(`<h2 id="settings-${id}-title"[^>]*><button class="fold-toggle" id="fold-${slug}" type="button" aria-expanded="false" aria-controls="fold-${slug}-body">[^<]+</button>(?:<span class="settings-scope-note">[^<]*</span>)?</h2>`);
     if (!toggle.test(section)) problems.push(`${slug}'s title is not the button that folds it`);
-    const body = new RegExp(`</h2>(?:\\s*<button class="help-link"[^>]*>\\?</button>\\s*</div>)?\\s*<div class="fold-body" id="fold-${slug}-body" hidden="until-found">`);
+    const body = slug === "settings-channels"
+      ? new RegExp(`</h2>\\s*<label[^>]*>Channel</label>\\s*<select id="settings-channel"[^>]*></select>\\s*<button class="help-link"[^>]*>\\?</button>\\s*</div>\\s*<div class="fold-body" id="fold-${slug}-body" hidden="until-found">`)
+      : new RegExp(`</h2>(?:\\s*<button class="help-link"[^>]*>\\?</button>\\s*</div>)?\\s*<div class="fold-body" id="fold-${slug}-body" hidden="until-found">`);
     if (!body.test(section)) problems.push(`${slug}'s body is not right under its title, hidden until found`);
   }
   // Every headed group: its heading is the button, its body under the heading's row.
@@ -2737,10 +2735,9 @@ function foldProblems(html, css, script) {
 
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, PAGE_CODE), []);
-  // 31 since `#481 slack-app-deep-link` added Opening links, 35 since `#728 vt-quote-read-threshold`
-  // added Quoted replies, 36 since `#1212 settings-debug-section` added Debug, 37 since
-  // `#1321 after-done-setting` added After Done, counted and checked above.
-  assert.equal(scriptFolds(PAGE_CODE).length, 37, "a fold went missing from the list, or one was added unchecked");
+  // 17 since `#1815 vibe-talk-settings-density-and-channel-header` removed the
+  // single-control groups' folds, counted and checked above.
+  assert.equal(scriptFolds(PAGE_CODE).length, 17, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {
@@ -2755,14 +2752,37 @@ test("`#346 settings-collapsible`: the check refuses a fold out of find's reach,
     "[hidden] takes hidden-until-found out of find as well",
     "nothing hides an ordinary [hidden] any more",
   ]);
-  const flat = HTML.replace(/<button class="fold-toggle" id="fold-typing"[^>]*>Typing<\/button>/, "Typing");
-  assert.deepStrictEqual(foldProblems(flat, CSS_CODE, PAGE_CODE), ['the group "Typing" does not fold', "SETTINGS_FOLDS lists typing, which the markup does not have"]);
-  const unlisted = PAGE_CODE.replace(/(const SETTINGS_FOLDS(?:: [^=]*)? = (?:Object\.freeze\()?\[[^\]]*?)  "token",\n/, "$1");
+  const flat = HTML.replace(/<button class="fold-toggle" id="fold-debug"[^>]*>Debug<\/button>/, "Debug");
+  assert.deepStrictEqual(foldProblems(flat, CSS_CODE, PAGE_CODE), ['the group "Debug" does not fold', "SETTINGS_FOLDS lists debug, which the markup does not have"]);
+  const unlisted = PAGE_CODE.replace(/(const SETTINGS_FOLDS(?:: [^=]*)? = (?:Object\.freeze\()?\[[^\]]*?)  "connection",\n/, "$1");
   assert.notEqual(unlisted, PAGE_CODE, "the negative control changed nothing");
-  assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, unlisted), ["SETTINGS_FOLDS does not list token"]);
+  assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, unlisted), ["SETTINGS_FOLDS does not list connection"]);
   const server = HTML.replace('<h2 id="settings-server-title">Server</h2>',
     '<h2 id="settings-server-title"><button class="fold-toggle" id="fold-settings-server" type="button">Server</button></h2>');
   assert.deepStrictEqual(foldProblems(server, CSS_CODE, PAGE_CODE), ["the Server section folds, hiding which server this is"]);
+});
+
+test("`#1815 vibe-talk-settings-density-and-channel-header`: single-control groups are inline, Debug stays folded, and the channel selector is in the header defaulting to All Channels", async () => {
+  // Markup: no fold toggle or heading for a single-control group; Debug (several switches) keeps its fold.
+  for (const slug of ["typing", "text-size", "resuming", "relay", "empty-messages", "token", "sending", "instructions"]) {
+    assert.ok(!HTML.includes(`id="fold-${slug}"`), `single-control group ${slug} still folds`);
+    assert.ok(HTML.includes(`data-single-setting="${slug}"`), `single-control group ${slug} is not shown inline`);
+  }
+  assert.ok(HTML.includes('id="fold-debug"'), "Debug lost its collapsible heading");
+  // The header reads "Channel Settings:" and holds the selector.
+  const channels = settingsSection("Channel Settings:");
+  assert.match(channels, /Channel Settings:/);
+  assert.ok(channels.indexOf('id="settings-channel"') < channels.indexOf('id="fold-settings-channels-body"'),
+    "the channel selector is not in the Channels header");
+  const page = await allChannelsPage();
+  assert.equal(page.el("settings-channel").value, "*", "the channel selector does not default to All Channels");
+  assert.equal(page.el("settings-channel").children[0].textContent, "All channels");
+  // A single control is drawn once its section is open, with no fold to open first.
+  const inline = newPage();
+  await signIn(inline);
+  await inline.el("open-settings").click();
+  await inline.el("fold-settings-screen").click();
+  assert.ok(inline.el("enter-sends"), "Typing's single control is not inline under Screen and keys");
 });
 
 test("`#346 settings-collapsible`: everything is folded as the page loads; a title opens its section, a heading its group, and again folds it", async () => {
@@ -2773,12 +2793,12 @@ test("`#346 settings-collapsible`: everything is folded as the page loads; a tit
   await page.el("fold-settings-voice-agent").click();
   assert.equal(settingsFoldState(page, "settings-voice-agent"), true);
   // The section opens to its groups' headings, each still folded.
-  assert.equal(settingsFoldState(page, "resuming"), false, "opening the section opened its groups too");
-  await page.el("fold-resuming").click();
-  assert.equal(settingsFoldState(page, "resuming"), true);
-  assert.equal(settingsFoldState(page, "relay"), false);
-  await page.el("fold-resuming").click();
-  assert.equal(settingsFoldState(page, "resuming"), false, "the heading did not fold its group again");
+  assert.equal(settingsFoldState(page, "microphone"), false, "opening the section opened its groups too");
+  await page.el("fold-microphone").click();
+  assert.equal(settingsFoldState(page, "microphone"), true);
+  assert.equal(settingsFoldState(page, "canned-prompts"), false);
+  await page.el("fold-microphone").click();
+  assert.equal(settingsFoldState(page, "microphone"), false, "the heading did not fold its group again");
   // What is open stays open while the page is: through Help and back, and out of Settings and in.
   await page.el("fold-microphone").click();
   await page.el("help-link-microphone").click();
@@ -2827,7 +2847,7 @@ test("`#346 settings-collapsible`: Expand all opens every fold and then reads Fo
   await all.click();
   for (const slug of scriptFolds(PAGE_CODE)) assert.equal(settingsFoldState(page, slug), true, `Expand all left ${slug} folded`);
   assert.equal(all.textContent, "Fold all");
-  await page.el("fold-typing").click();
+  await page.el("fold-debug").click();
   assert.equal(all.textContent, "Expand all", "with a fold folded the button still offers to fold");
   await all.click();
   await all.click();
@@ -2843,23 +2863,21 @@ test("`#351 settings-polish`: Expand all and Fold all count only the folds on th
   // Neither Provider (no console to link to) nor the message cache (none to manage) is shown here.
   assert.equal(page.el("agent-settings").hidden, true);
   assert.equal(page.el("message-cache-group").hidden, true);
-  const hidden = ["provider", "message-cache"];
+  const hidden = ["message-cache"];
   const all = page.el("fold-settings-all");
   // Every fold the reader can see, opened by hand: nothing is left to expand.
   for (const slug of scriptFolds(PAGE_CODE).filter((one) => !hidden.includes(one))) await page.el(`fold-${slug}`).click();
   assert.equal(all.textContent, "Fold all", "with every fold on the page open, the button still offers to expand them all");
-  // A group shown folded, as Provider is once the server names a console, is something to expand again.
+  // `#1815`: Provider is a single control shown inline, so showing it brings no fold to expand.
   page.agentSettingsUrl = "https://voice.example/agents/1";
   page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
   await page.el("save-token").click();
   await page.settle();
   assert.equal(page.el("agent-settings").hidden, false, "the server's console link did not show Provider");
-  assert.equal(all.textContent, "Expand all", "a folded group come into sight is not counted");
+  assert.equal(all.textContent, "Fold all", "an inline group come into sight changed the fold count");
   await all.click();
-  assert.equal(settingsFoldState(page, "provider"), true);
-  assert.equal(all.textContent, "Fold all");
+  assert.equal(all.textContent, "Expand all");
   // Fold all folds every fold, a hidden group's too, so one shown later is folded with the rest.
-  await all.click();
   for (const slug of scriptFolds(PAGE_CODE)) assert.equal(settingsFoldState(page, slug), false, `Fold all left ${slug} open`);
   // The negative control: a button that counts every fold, shown or not.
   const blind = newPage(new Map(), await brokenModule([{ file: "src/view/settings/folds.ts",
@@ -2971,7 +2989,7 @@ test("`#345 settings-multi-column`: a heading pressed is brought back on screen,
   await page.el("fold-settings-messages").click();
   assert.equal(page.el("fold-settings-messages").scrolledIntoView, before + 2, "folding it did too");
   // Expand all moves everything, and brings no one heading anywhere.
-  const group = page.el("fold-typing").scrolledIntoView;
+  const group = page.el("fold-debug").scrolledIntoView;
   await page.el("fold-settings-all").click();
-  assert.equal(page.el("fold-typing").scrolledIntoView, group, "Expand all scrolled to a heading of its own accord");
+  assert.equal(page.el("fold-debug").scrolledIntoView, group, "Expand all scrolled to a heading of its own accord");
 });

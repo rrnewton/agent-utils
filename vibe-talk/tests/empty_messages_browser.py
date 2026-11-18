@@ -207,15 +207,15 @@ class Reader:
         """Settings > Messages > Empty messages, set to `on`, and Settings closed."""
         page = self.page
         page.click("#open-settings")
-        for fold in ("fold-settings-messages", "fold-empty-messages"):
+        for fold in ("fold-settings-messages",):
             if page.get_attribute(f"#{fold}", "aria-expanded") != "true":
                 page.click(f"#{fold}")
         page.wait_for_selector("#hide-empty-messages", state="visible", timeout=int(STATE_S * 1000))
         groups = page.evaluate("""() => [...document.querySelectorAll('#fold-settings-messages-body .settings-group h3')]
             .map((h) => h.textContent.trim())""")
-        # `#728 vt-quote-read-threshold` put Quoted replies under Your own messages, before these two.
-        self.check(groups[2:4] == ["Mark-read automatically", "Empty messages"],
-                   f"Empty messages is not beside Mark-read automatically: {groups}")
+        # `#1815`: Empty messages is a single control shown inline, with no heading.
+        self.check(groups[2:3] == ["Mark-read automatically"] and "Empty messages" not in groups,
+                   f"Empty messages still has a heading: {groups}")
         self.shot(f"settings-{'on' if page.is_checked('#hide-empty-messages') else 'off'}")
         page.set_checked("#hide-empty-messages", on)
         page.click("#close-settings")

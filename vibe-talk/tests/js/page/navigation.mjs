@@ -555,7 +555,7 @@ const HIDDEN_THREE = [
 function hiddenFoldProblems(html) {
   const found = [];
   const code = html.replace(/<!--[\s\S]*?-->/g, " ");
-  const section = settingsSection("Channels", code);
+  const section = settingsSection("Channel Settings:", code);
   if (channelBoxCode(code).includes('id="hidden-channel-list"')) found.push("the hidden channels are inside the channel box");
   const fold = new RegExp('<section class="settings-group" id="hidden-channels" hidden>\\s*<div class="group-head">\\s*' +
     '<h3\\b[^>]*><button class="fold-toggle" id="fold-hidden-channels" type="button" aria-expanded="false" ' +
@@ -743,9 +743,9 @@ test("the per-channel settings are all under ONE channel selector", async () => 
   // Read off the MARKUP rather than the fixture's DOM: the fixture knows which ids exist but not
   // how they nest, and nesting is exactly the claim. The group is sliced out of web/voice.html and
   // every per-channel control has to be inside that slice.
-  const start = HTML.indexOf('<section class="settings-group" id="channel-settings"');
+  const start = HTML.indexOf('<section class="settings-section" id="settings-channels"');
   assert.ok(start > 0, "the per-channel group is gone from the markup");
-  const group = HTML.slice(start, HTML.indexOf("</section>", start));
+  const group = HTML.slice(start, HTML.indexOf('<section class="settings-section" id="settings-screen"', start));
   for (const id of ["settings-channel", "channel-alias", "save-alias", "remove-channel", "add-channel"]) {
     assert.ok(group.includes(`id="${id}"`), `${id} is not under the channel selector`);
   }
@@ -3927,7 +3927,7 @@ test("`#355 provider-grouped-channels`: with two services, Settings chooses the 
   assert.match(page.el("service-facts").textContent, /^Slack: New messages are checked for every 15 seconds\. Threads are shown\. Add a channel by pasting its link, or browse its channels\. Unread can be cleared in Slack itself\.$/);
   await chooseService(page, "gchat");
   assert.deepStrictEqual(settingsOptions(page).filter((id) => id !== "*"), [SPACE_A.id, SPACE_B.id]);
-  assert.equal(String(page.el("settings-channel").value), SPACE_A.id);
+  assert.equal(String(page.el("settings-channel").value), "*");
   assert.match(page.el("service-facts").textContent, /^Google Chat: New messages arrive as they are sent\. No threads\. Add a channel by its ID\. Unread cannot be cleared in Google Chat from here\.$/);
   assert.equal(page.el("open-browse-channels").hidden, true, "Browse offered for a service that cannot list channels");
   assert.equal(page.el("new-channel-writable-row").hidden, false, "a direct service hid Let this app post here");
@@ -4052,13 +4052,13 @@ test("`#355 provider-grouped-channels`: with two services, All channels for Clea
     ["All Google Chat channels", SPACE_A.id, SPACE_B.id, space3.id]);
 });
 
-test("`#355 provider-grouped-channels`: All channels is not offered for a service whose channels cannot take Clear unread, though another service's can", async () => {
+test("`#1815 vibe-talk-settings-density-and-channel-header`: All channels is offered for a service with two or more channels, whether or not it can take Clear unread", async () => {
   const page = await servicesPage();
   await page.el("open-settings").click();
   await page.settle();
   await chooseService(page, "gchat");
-  assert.ok(!pickerChoices(page).some(([value]) => value === "*"),
-    "All channels offered for a service none of whose channels can clear unread");
+  assert.ok(pickerChoices(page).some(([value]) => value === "*"),
+    "All channels not offered for a service with two channels");
   await chooseService(page, "slack");
   assert.equal(pickerChoices(page)[0][1], "All Slack channels");
 });

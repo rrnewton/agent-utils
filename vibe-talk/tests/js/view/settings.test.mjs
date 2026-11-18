@@ -80,19 +80,19 @@ test("`#624 voice-page-modularity`: Settings mounts folded, a heading opens and 
   nodes.get("fold-dismissed").fire("click");
   assert.equal(closed(), 1);
   // The browser's find opens a body: the button says so.
-  nodes.get("fold-typing-body").fire("beforematch");
-  assert.equal(folds.open("typing"), true);
+  nodes.get("fold-debug-body").fire("beforematch");
+  assert.equal(folds.open("debug"), true);
   // A group hidden is not on the page, and Expand all does not wait for it.
   nodes.get("fold-settings-all").fire("click");
   assert.equal(all.textContent, "Fold all");
-  folds.set("provider", false);
+  folds.set("message-cache", false);
   assert.equal(all.textContent, "Expand all");
-  nodes.get("fold-provider").parentNode.hidden = true;
-  assert.equal(folds.shown("provider"), true, "a folded body around it is not hiding it");
-  const group = new Node("provider-group", nodes.get("fold-provider").parentNode);
+  nodes.get("fold-message-cache").parentNode.hidden = true;
+  assert.equal(folds.shown("message-cache"), true, "a folded body around it is not hiding it");
+  const group = new Node("message-cache-group", nodes.get("fold-message-cache").parentNode);
   group.hidden = true;
-  nodes.get("fold-provider").parentNode = group;
-  assert.equal(folds.shown("provider"), false);
+  nodes.get("fold-message-cache").parentNode = group;
+  assert.equal(folds.shown("message-cache"), false);
   folds.renderAll();
   assert.equal(all.textContent, "Fold all");
   // Fold all folds every fold, the hidden one's too, and closes the pop-out.

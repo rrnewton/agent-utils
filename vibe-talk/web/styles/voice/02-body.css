@@ -70,8 +70,8 @@
  * to the group below it.
  */
 .settings-group {
-  margin: 0 0 0.75rem;
-  padding: 0.6rem 0.8rem 0.8rem;
+  margin: 0 0 0.5rem;
+  padding: 0.45rem 0.7rem 0.55rem;
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 0.8rem;
@@ -96,8 +96,8 @@
 }
 
 .settings-section {
-  margin: 0 0 1rem;
-  padding: 0.6rem 0.8rem 0.2rem;
+  margin: 0 0 0.65rem;
+  padding: 0.45rem 0.7rem 0.1rem;
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: 0.8rem;
@@ -105,7 +105,7 @@
 
 .settings-section > .fold-body > .settings-group {
   margin: 0;
-  padding: 0.55rem 0 0.7rem;
+  padding: 0.35rem 0 0.45rem;
   background: none;
   border: none;
   border-top: 1px solid var(--edge);
@@ -269,9 +269,9 @@
   gap: 0.55rem;
   box-sizing: border-box;
   width: 100%;
-  min-height: 2.6rem;
+  min-height: 2.5rem;
   margin: 0;
-  padding: 0.15rem 0;
+  padding: 0.1rem 0;
   background: none;
   border: none;
   border-radius: 0.3rem;
@@ -313,6 +313,31 @@
 .fold-body {
   margin: 0;
   padding: 0;
+}
+
+/* `#1815 vibe-talk-settings-density-and-channel-header`: a single-control
+   group is shown inline, with no heading row: its own label is enough. The
+   help link, where the group had one, sits at the row's end. */
+.settings-inline {
+  display: flow-root;
+}
+.settings-inline > .help-link {
+  float: right;
+  margin-left: 0.5rem;
+}
+/* The channel selector lives in the Channels header, so the header reads
+   "Channel Settings: [All Channels]" and the controls below it are
+   visibly about that channel. */
+.channel-settings-head {
+  flex-wrap: wrap;
+}
+.channel-settings-head > h2 {
+  flex: 0 1 auto;
+}
+.channel-settings-head > #settings-channel {
+  flex: 1 1 9rem;
+  min-width: 0;
+  max-width: 16rem;
 }
 
 /* `#347 settings-prose`. A heading whose one-line description is its tooltip says so to a mouse. */

@@ -650,8 +650,8 @@ const FIXTURE_TREE = {
   // deeper in an unnamed box is listed under the nearest named one, which holds it all the same.
   "settings-panes": ["settings-voice-agent", "settings-messages", "settings-channels", "settings-screen", "settings-storage"],
   "settings-voice-agent": ["fold-settings-voice-agent", "fold-settings-voice-agent-body"],
-  "fold-settings-voice-agent-body": ["fold-sending", "agent-settings"],
-  "agent-settings": ["fold-provider", "fold-provider-body"],
+  "fold-settings-voice-agent-body": ["voice-ask-before-send-state", "agent-settings"],
+  "agent-settings": ["agent-console-link"],
   "settings-messages": ["fold-settings-messages", "fold-settings-messages-body"],
   "fold-settings-messages-body": ["fold-mark-own", "dismissed-group"],
   // `#402 who-is-who-channel-box` put Who is who back at the foot of the channel box, and `#401
@@ -673,7 +673,7 @@ const FIXTURE_TREE = {
     "dismissed-send-popout-state",
   ],
   "settings-storage": ["fold-settings-storage", "fold-settings-storage-body"],
-  "fold-settings-storage-body": ["fold-storage", "message-cache-group"],
+  "fold-settings-storage-body": ["forget-conversations", "message-cache-group"],
   "message-cache-group": ["fold-message-cache", "fold-message-cache-body"],
 };
 
@@ -711,7 +711,15 @@ const settingsHeadings = (html, level) => [...html.matchAll(new RegExp(settingsH
  */
 function settingsGroup(heading, html = HTML) {
   const found = new RegExp(settingsHeading(3, literal(heading))).exec(html);
-  const at = found ? found.index : -1;
+  let at = found ? found.index : -1;
+  // `#1815`: a single-control group has no heading; it is found by its inline marker instead.
+  if (at < 0) {
+    const mapped = { "arriving-messages-during-a-call": "relay", "collapsed-message-lines": "collapsed-lines",
+      "thread-card-lines": "card-max-lines", "stored-conversations": "storage" };
+    const slug = mapped[heading.toLowerCase().replace(/[^a-z]+/g, "-").replace(/^-|-$/g, "")] || heading.toLowerCase().replace(/[^a-z]+/g, "-").replace(/^-|-$/g, "");
+    const inline = html.indexOf(`data-single-setting="${slug}"`);
+    if (inline >= 0) at = inline;
+  }
   assert.ok(at > 0, `web/voice.html has no settings group headed "${heading}"`);
   const opens = html.lastIndexOf('<section class="settings-group"', at);
   assert.ok(opens > 0, `"${heading}" is not inside a settings group`);

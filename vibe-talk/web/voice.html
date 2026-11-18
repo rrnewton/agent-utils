@@ -1493,11 +1493,7 @@
                 <h2 id="settings-voice-agent-title" title="What the agent may send and is told, what it hears, and how messages are read out."><button class="fold-toggle" id="fold-settings-voice-agent" type="button" aria-expanded="false" aria-controls="fold-settings-voice-agent-body">Voice agent</button></h2>
                 <div class="fold-body" id="fold-settings-voice-agent-body" hidden="until-found">
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="Whether the voice agent reads a message back and waits for your yes before it sends."><button class="fold-toggle" id="fold-sending" type="button" aria-expanded="false" aria-controls="fold-sending-body">Sending</button></h3>
-                      <button class="help-link" id="help-link-voice-send" type="button" data-help="voice-send" aria-label="About asking before the voice agent sends" title="Whether the voice agent reads a message back and waits for your yes before it sends.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-sending-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="sending"><button class="help-link" id="help-link-voice-send" type="button" data-help="voice-send" aria-label="About asking before the voice agent sends" title="Whether the voice agent reads a message back and waits for your yes before it sends.">?</button>
                       <!--
                         `#271 settings-groups`. FIRST in the Voice agent section, under a heading that says
                         what it is about. It used to be a card called "Voice" near the foot of the screen,
@@ -1565,7 +1561,8 @@
                         </div>
                         <p id="voice-post-prefix-state" class="hint" aria-live="polite"></p>
                       </div>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <!--
@@ -1587,11 +1584,7 @@
                     the setting, which is an older server.
                   -->
                   <section class="settings-group" id="voice-instructions-group">
-                    <div class="group-head">
-                      <h3 title="Your own words for the voice agent, and its system prompt, kept on this server for every call."><button class="fold-toggle" id="fold-instructions" type="button" aria-expanded="false" aria-controls="fold-instructions-body">Instructions</button></h3>
-                      <button class="help-link" id="help-link-voice-instructions" type="button" data-help="voice-instructions" aria-label="About the voice agent's instructions" title="Your own words for the voice agent, and its system prompt, kept on this server for every call.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-instructions-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="instructions"><button class="help-link" id="help-link-voice-instructions" type="button" data-help="voice-instructions" aria-label="About the voice agent's instructions" title="Your own words for the voice agent, and its system prompt, kept on this server for every call.">?</button>
                       <div id="voice-prompt-editor" hidden>
                         <label for="voice-instructions">Additional instructions</label>
                         <textarea
@@ -1624,15 +1617,12 @@
                         </details>
                       </div>
                       <p id="voice-prompt-state" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="Off by default: it re-sends earlier conversation content to the voice vendor."><button class="fold-toggle" id="fold-resuming" type="button" aria-expanded="false" aria-controls="fold-resuming-body">Resuming</button></h3>
-                      <button class="help-link" id="help-link-resuming" type="button" data-help="resuming" aria-label="About resuming" title="Off by default: it re-sends earlier conversation content to the voice vendor.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-resuming-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="resuming"><button class="help-link" id="help-link-resuming" type="button" data-help="resuming" aria-label="About resuming" title="Off by default: it re-sends earlier conversation content to the voice vendor.">?</button>
                       <!--
                         `#46 conversation-replay`. FOUR states, and the screen must be able to say each of
                         them: off on the server, off here, resumed, and resumed IN PART. A single "resuming"
@@ -1656,7 +1646,8 @@
                         Tell a new call what was already said
                       </label>
                       <p id="resume-unavailable" class="toggle-why" hidden></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <!--
@@ -1684,17 +1675,15 @@
                     and not a markup default that disagrees with it after a reload.
                   -->
                   <section class="settings-group" id="relay-group">
-                    <div class="group-head">
-                      <h3 id="relay-to-agent-title" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time."><button class="fold-toggle" id="fold-relay" type="button" aria-expanded="false" aria-controls="fold-relay-body">Arriving messages during a call</button></h3>
-                      <button class="help-link" id="help-link-live-messages" type="button" data-help="live-messages" aria-label="About arriving messages during a call" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-relay-body" hidden="until-found">
-                      <select id="relay-to-agent" aria-labelledby="relay-to-agent-title">
+                    <div class="settings-inline" data-single-setting="relay"><button class="help-link" id="help-link-live-messages" type="button" data-help="live-messages" aria-label="About arriving messages during a call" title="Briefly, by default. Both speaking modes send channel text to the voice vendor and take conversation time.">?</button>
+                      <label for="relay-to-agent">Arriving messages during a call:</label>
+                      <select id="relay-to-agent" aria-label="Arriving messages during a call">
                         <option value="off">Don't tell the agent</option>
                         <option value="gist">Say what each one says, briefly</option>
                         <option value="full">Read them out in full</option>
                       </select>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <!--
@@ -1807,10 +1796,7 @@
                     landing the id is still what is needed to find the agent by hand.
                   -->
                   <section class="settings-group" id="agent-settings" hidden>
-                    <div class="group-head">
-                      <h3><button class="fold-toggle" id="fold-provider" type="button" aria-expanded="false" aria-controls="fold-provider-body">Provider</button></h3>
-                    </div>
-                    <div class="fold-body" id="fold-provider-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="provider">
                       <p class="hint">
                         Its voice and tools are configured at the vendor. Its prompt is too, unless it
                         lets this page replace it; see Instructions above.
@@ -1819,7 +1805,8 @@
                         <a id="agent-console-link" class="external-link" href="#" target="_blank" rel="noopener noreferrer">Open voice provider configuration</a>
                       </p>
                       <p class="hint">Provider id: <code id="agent-id" class="agent-id"></code></p>
-                    </div>
+                    
+                  </div>
                   </section>
                 </div>
               </section>
@@ -2000,11 +1987,7 @@
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="A message with nothing in it to show is left out everywhere."><button class="fold-toggle" id="fold-empty-messages" type="button" aria-expanded="false" aria-controls="fold-empty-messages-body">Empty messages</button></h3>
-                      <button class="help-link" id="help-link-empty-messages" type="button" data-help="empty-messages" aria-label="About hiding empty messages" title="A message with nothing in it to show is left out everywhere.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-empty-messages-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="empty-messages"><button class="help-link" id="help-link-empty-messages" type="button" data-help="empty-messages" aria-label="About hiding empty messages" title="A message with nothing in it to show is left out everywhere.">?</button>
                       <!--
                         `#386 hide-empty-messages`. ON by default. The owner, 2026-10-19: "there is a
                         BLANK message from the coding agent ... I want to have a checked-by-default box
@@ -2023,15 +2006,12 @@
                         <input id="hide-empty-messages" type="checkbox" checked />
                         Hide messages with nothing in them
                       </label>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="Same author, within five seconds. Turn it off to see the raw rows."><button class="fold-toggle" id="fold-combining" type="button" aria-expanded="false" aria-controls="fold-combining-body">Combining messages</button></h3>
-                      <button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="Same author, within five seconds. Turn it off to see the raw rows.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-combining-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="combining"><button class="help-link" id="help-link-combining" type="button" data-help="combining" aria-label="About combining messages" title="Same author, within five seconds. Turn it off to see the raw rows.">?</button>
                       <!--
                         ON by default. An agent writing past Discord's length limit has its post split in
                         two, and the second half continues mid-word a fraction of a second later. Drawn as
@@ -2042,15 +2022,12 @@
                         <input id="combine-messages" type="checkbox" checked />
                         Show messages sent seconds apart as one
                       </label>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="Turn it off to see each message's first line as it was written."><button class="fold-toggle" id="fold-rich-headers" type="button" aria-expanded="false" aria-controls="fold-rich-headers-body">Rich headers</button></h3>
-                      <button class="help-link" id="help-link-rich-headers" type="button" data-help="rich-headers" aria-label="About rich headers" title="Turn it off to see each message's first line as it was written.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-rich-headers-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="rich-headers"><button class="help-link" id="help-link-rich-headers" type="button" data-help="rich-headers" aria-label="About rich headers" title="Turn it off to see each message's first line as it was written.">?</button>
                       <!--
                         `#242 rich-headers`. ON by default. Agents posting through one shared account name
                         themselves at the head of a message — "[build-bot] Status, 9:05 PM ET." — and that
@@ -2063,7 +2040,8 @@
                         <input id="rich-headers" type="checkbox" checked />
                         Show an agent's tag, title and time in the message header
                       </label>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
@@ -2100,10 +2078,7 @@
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="Where the selection goes after e marks a message Done."><button class="fold-toggle" id="fold-after-done" type="button" aria-expanded="false" aria-controls="fold-after-done-body">After Done</button></h3>
-                    </div>
-                    <div class="fold-body" id="fold-after-done-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="after-done">
                       <!--
                         `#1321 after-done-setting`. What e (and Ctrl+E / Cmd+E) does after marking a
                         message Done: Stay on it, by default (the owner, 2026-11-11: once the
@@ -2118,15 +2093,12 @@
                         <option value="next">Next message</option>
                         <option value="unread">Next unread</option>
                       </select>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="A collapsed long message shows a model's one-line summary in place of its opening lines."><button class="fold-toggle" id="fold-summaries" type="button" aria-expanded="false" aria-controls="fold-summaries-body">Summaries</button></h3>
-                      <button class="help-link" id="help-link-summaries" type="button" data-help="summaries" aria-label="About summaries" title="A collapsed long message shows a model's one-line summary in place of its opening lines.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-summaries-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="summaries"><button class="help-link" id="help-link-summaries" type="button" data-help="summaries" aria-label="About summaries" title="A collapsed long message shows a model's one-line summary in place of its opening lines.">?</button>
                       <!--
                         `#564 message-summary-toggle`. OFF by default. The owner, 2026-10-26: "I'm actually
                         really NOT liking the summaries of collapsed messages ... I also want a toggle to turn
@@ -2140,7 +2112,8 @@
                         <input id="summarize-collapsed" type="checkbox" />
                         Summarize collapsed messages
                       </label>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <!--
@@ -2171,11 +2144,7 @@
                     not a Tab stop).
                   -->
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="How many opening lines a collapsed long message shows. 0 is its header alone."><button class="fold-toggle" id="fold-collapsed-lines" type="button" aria-expanded="false" aria-controls="fold-collapsed-lines-body">Collapsed message lines</button></h3>
-                      <button class="help-link" id="help-link-collapsed-lines" type="button" data-help="collapsed-lines" aria-label="About collapsed message lines" title="How many opening lines a collapsed long message shows. 0 is its header alone.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-collapsed-lines-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="collapsed-lines"><button class="help-link" id="help-link-collapsed-lines" type="button" data-help="collapsed-lines" aria-label="About collapsed message lines" title="How many opening lines a collapsed long message shows. 0 is its header alone.">?</button>
                       <!--
                         `#425 collapsed-lines`. How much of a folded long message is on show, in
                         lines of its opening: 3 until the reader says otherwise, 0 to 8. 0 is the
@@ -2189,6 +2158,7 @@
                         device: it decides how much of a message is shown, not how this screen
                         is laid out, so it is not one of Screen and keys' per-device choices.
                       -->
+                      <label for="collapsed-lines">Collapsed message lines:</label>
                       <div class="msg-scale-row">
                         <button
                           id="collapsed-lines-smaller"
@@ -2216,15 +2186,12 @@
                         >+</button>
                       </div>
                       <p id="collapsed-lines-state" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="The most lines a thread card shows of its thread's first message."><button class="fold-toggle" id="fold-card-max-lines" type="button" aria-expanded="false" aria-controls="fold-card-max-lines-body">Thread card lines</button></h3>
-                      <button class="help-link" id="help-link-card-max-lines" type="button" data-help="card-max-lines" aria-label="About thread card lines" title="The most lines a thread card shows of its thread's first message.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-card-max-lines-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="card-max-lines"><button class="help-link" id="help-link-card-max-lines" type="button" data-help="card-max-lines" aria-label="About thread card lines" title="The most lines a thread card shows of its thread's first message.">?</button>
                       <!--
                         `#522 thread-card-max-lines`. K, the most lines a thread card shows of
                         its thread's first message: 5 until the owner says otherwise, 1 to 12.
@@ -2234,6 +2201,7 @@
                         `CARD_LINE_CHARS`). Under Messages and kept on the server for every
                         device (`#457 settings-server-side`): the server reads it.
                       -->
+                      <label for="card-max-lines">Thread card lines:</label>
                       <div class="msg-scale-row">
                         <button
                           id="card-max-lines-smaller"
@@ -2261,7 +2229,8 @@
                         >+</button>
                       </div>
                       <p id="card-max-lines-state" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group" id="dismissed-group">
@@ -2297,8 +2266,10 @@
               </section>
 
               <section class="settings-section" id="settings-channels" aria-labelledby="settings-channels-title">
-                <div class="group-head">
-                  <h2 id="settings-channels-title" title="One channel at a time, or all of them: your own name for one, taking it off the list, clearing unread in its chat service, and who is who in it."><button class="fold-toggle" id="fold-settings-channels" type="button" aria-expanded="false" aria-controls="fold-settings-channels-body">Channels</button></h2>
+                <div class="group-head channel-settings-head">
+                  <h2 id="settings-channels-title" title="One channel at a time, or all of them: your own name for one, taking it off the list, clearing unread in its chat service, and who is who in it."><button class="fold-toggle" id="fold-settings-channels" type="button" aria-expanded="false" aria-controls="fold-settings-channels-body">Channel Settings:</button></h2>
+                  <label class="sr-only" for="settings-channel">Channel</label>
+                  <select id="settings-channel" aria-describedby="channel-facts" aria-label="Channel"></select>
                   <button class="help-link" id="help-link-channel-alias" type="button" data-help="channel-alias" aria-label="About channels" title="One channel at a time, or all of them: your own name for one, taking it off the list, clearing unread in its chat service, and who is who in it.">?</button>
                 </div>
                 <div class="fold-body" id="fold-settings-channels-body" hidden="until-found">
@@ -2342,17 +2313,13 @@
                       <select id="settings-service" aria-describedby="service-facts"></select>
                       <p id="service-facts" class="hint" aria-live="polite"></p>
                     </div>
-                    <label for="settings-channel">Channel</label>
-                    <select id="settings-channel" aria-describedby="channel-facts"></select>
                     <!-- What this channel IS: the name in force, and where it came from. -->
                     <p id="channel-facts" class="hint" aria-live="polite"></p>
 
                     <!--
-                      `#349 channel-settings-all`. The picker's first choice is All channels, offered when
-                      there are two or more channels and, `#351 settings-polish`, at least one of them can
-                      take Clear unread with this token (`upstreamClearAllChannels`: the write token, on a
-                      chat service that can clear unread). So never to the read token, nor where no
-                      channel's chat service can clear unread: it would have nothing to set. The owner,
+                      `#349 channel-settings-all`, `#1815 vibe-talk-settings-density-and-channel-header`.
+                      The picker's first choice is All channels, offered when there are two or more channels,
+                      and the Channel Settings header defaults to it. The owner,
                       2026-10-18: "Clear unread can be set for all at once". With it chosen the line above
                       says how many, Rename and Remove step aside (they name one channel), Add and Browse
                       stay, and Clear unread below shows the channels' common mode, or Mixed, and Save sets
@@ -2606,10 +2573,7 @@
                 <h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen" type="button" aria-expanded="false" aria-controls="fold-settings-screen-body">Screen and keys</button><span class="settings-scope-note">(client side)</span></h2>
                 <div class="fold-body" id="fold-settings-screen-body" hidden="until-found">
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3><button class="fold-toggle" id="fold-text-size" type="button" aria-expanded="false" aria-controls="fold-text-size-body">Text size</button></h3>
-                    </div>
-                    <div class="fold-body" id="fold-text-size-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="text-size">
                       <!--
                         MESSAGE TEXT ONLY, not the whole interface. A reader asking for more words on a
                         phone screen is not asking for a bigger Reply button, and scaling the row would
@@ -2621,6 +2585,7 @@
                         the slider's own step through the slider's own code (the text size's `step` in web/src/view/settings),
                         and each is disabled at the end it moves towards.
                       -->
+                      <label for="msg-scale">Text size:</label>
                       <div class="msg-scale-row">
                         <button
                           id="msg-scale-smaller"
@@ -2648,15 +2613,13 @@
                         >+</button>
                       </div>
                       <p id="msg-scale-state" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="How wide the column of messages is on a wide screen, in characters."><button class="fold-toggle" id="fold-reading-width" type="button" aria-expanded="false" aria-controls="fold-reading-width-body">Reading width</button></h3>
-                      <button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="How wide the column of messages is on a wide screen, in characters.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-reading-width-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="reading-width"><button class="help-link" id="help-link-reading-width" type="button" data-help="reading-width" aria-label="About the reading width" title="How wide the column of messages is on a wide screen, in characters.">?</button>
+                      <label for="reading-width">Reading width:</label>
                       <input
                         id="reading-width"
                         type="range"
@@ -2666,30 +2629,25 @@
                         aria-label="reading width in characters"
                       />
                       <p id="reading-width-state" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top."><button class="fold-toggle" id="fold-control-bar" type="button" aria-expanded="false" aria-controls="fold-control-bar-body">Control bar</button></h3>
-                      <button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-control-bar-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="control-bar"><button class="help-link" id="help-link-control-bar" type="button" data-help="control-bar" aria-label="About the control bar" title="Where the strip with the gear and the Voice/Channel switch sits: at the bottom, by your thumb, or at the top.">?</button>
                       <label for="bar-placement">Where the control bar sits</label>
                       <select id="bar-placement" aria-describedby="bar-placement-state">
                         <option value="bottom">Bottom — above the big buttons</option>
                         <option value="top">Top — under the title</option>
                       </select>
                       <p id="bar-placement-state" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="Whether Open in Slack opens Slack's own app on this device, or the message in the browser."><button class="fold-toggle" id="fold-opening-links" type="button" aria-expanded="false" aria-controls="fold-opening-links-body">Opening links</button></h3>
-                    </div>
-                    <div class="fold-body" id="fold-opening-links-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="opening-links">
                       <!--
                         `#481 slack-app-deep-link`. A Slack permalink opened in a browser hands over
                         to the Slack app where there is one and leaves its tab standing behind. The
@@ -2705,14 +2663,12 @@
                         <option value="app">Slack app — no tab left behind</option>
                       </select>
                       <p id="slack-open-state" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3><button class="fold-toggle" id="fold-typing" type="button" aria-expanded="false" aria-controls="fold-typing-body">Typing</button></h3>
-                    </div>
-                    <div class="fold-body" id="fold-typing-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="typing">
                       <!--
                         `#225 enter-to-send`. One rule for every message box — the channel, a thread, a
                         reply and the call — where each used to have its own. ON by default, which is what
@@ -2725,7 +2681,8 @@
                         Enter to send
                       </label>
                       <p id="enter-sends-hint" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <section class="settings-group">
@@ -2763,11 +2720,7 @@
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="The keys that type a character can be turned off; the ? lists every key."><button class="fold-toggle" id="fold-keyboard" type="button" aria-expanded="false" aria-controls="fold-keyboard-body">Keyboard</button></h3>
-                      <button class="help-link" id="help-link-keyboard" type="button" data-help="keyboard" aria-label="Every keyboard shortcut" title="The keys that type a character can be turned off; the ? lists every key.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-keyboard-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="keyboard"><button class="help-link" id="help-link-keyboard" type="button" data-help="keyboard" aria-label="Every keyboard shortcut" title="The keys that type a character can be turned off; the ? lists every key.">?</button>
                       <!--
                         `#224 keyboard-shortcuts`. The keys that type a character — j, k, e, /, ? and the rest
                         — can be turned off, which is what WCAG 2.1.4 asks of them; Escape, the arrows, Enter
@@ -2780,7 +2733,8 @@
                         Single-key shortcuts
                       </label>
                       <p id="single-keys-hint" class="hint" aria-live="polite"></p>
-                    </div>
+                    
+                  </div>
                   </section>
                 </div>
               </section>
@@ -2789,16 +2743,13 @@
                 <h2 id="settings-storage-title"><button class="fold-toggle" id="fold-settings-storage" type="button" aria-expanded="false" aria-controls="fold-settings-storage-body">Storage and connection</button></h2>
                 <div class="fold-body" id="fold-settings-storage-body" hidden="until-found">
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3 title="The transcript of each call, kept by this server so a reload does not lose it."><button class="fold-toggle" id="fold-storage" type="button" aria-expanded="false" aria-controls="fold-storage-body">Stored conversations</button></h3>
-                      <button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="The transcript of each call, kept by this server so a reload does not lose it.">?</button>
-                    </div>
-                    <div class="fold-body" id="fold-storage-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="storage"><button class="help-link" id="help-link-storage" type="button" data-help="storage" aria-label="About stored conversations" title="The transcript of each call, kept by this server so a reload does not lose it.">?</button>
                       <p id="storage-state" class="hint" aria-live="polite"></p>
                       <button id="forget-conversations" class="secondary" type="button">
                         Forget stored conversations
                       </button>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <!--
@@ -2841,13 +2792,11 @@
                   </section>
 
                   <section class="settings-group">
-                    <div class="group-head">
-                      <h3><button class="fold-toggle" id="fold-token" type="button" aria-expanded="false" aria-controls="fold-token-body">Token</button></h3>
-                    </div>
-                    <div class="fold-body" id="fold-token-body" hidden="until-found">
+                    <div class="settings-inline" data-single-setting="token">
                       <p class="hint">Server: <code id="settings-server-url"></code></p>
                       <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
-                    </div>
+                    
+                  </div>
                   </section>
 
                   <!--
@@ -3608,10 +3557,8 @@
               </p>
               <p class="hint">
                 <strong>All channels</strong> is for setting <strong>Clear unread</strong> on every
-                channel at once. It is the picker's first choice when there are two or more channels
-                and at least one of them can take Clear unread with your token: signed in with the
-                write token, on a chat service that can clear unread. With the read token, or where no
-                channel's chat service can clear unread, it is not offered. Its choice shows the mode
+                channel at once. It is the picker's first choice when there are two or more channels,
+                and the Channel Settings header defaults to it. Its choice shows the mode
                 they all have, or <em>Mixed</em> when they differ, and Save
                 sets the one chosen on every channel whose chat service can clear unread, saying how
                 many it reached. Rename and Remove name one channel, so they step aside; Add and

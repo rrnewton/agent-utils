@@ -276,7 +276,6 @@ def toggle_walk(chromium: BrowserType, args: argparse.Namespace, label: str, wid
     page.click("#open-settings")
     desk.wait_for("() => !document.getElementById('screen-settings').hidden", "Settings did not open")
     page.click("#fold-settings-messages")
-    page.click("#fold-summaries")
     page.click("#summarize-collapsed")
     desk.check(page.evaluate("() => localStorage.getItem('vibe-talk.voice.summarize-collapsed')") == "1",
                "the setting was not kept")

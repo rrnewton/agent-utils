@@ -4729,7 +4729,8 @@ test("`#208 persistent-cache`: every id the group uses is declared in the markup
   for (const id of MESSAGE_CACHE_IDS) assertMarkupContains("message-cache-group", id);
   for (const id of ["message-cache-help-days", "message-cache-help-megabytes"]) assertMarkupContains("help-message-cache", id);
   assertMarkupContains("settings-storage", "message-cache-group");
-  assert.deepStrictEqual(groupsIn("Storage and connection").slice(0, 2), ["Stored conversations", "Saved messages on this server"],
+  // `#1815`: Stored conversations is a single control shown inline, so the first headed group is Saved messages.
+  assert.deepStrictEqual(groupsIn("Storage and connection").slice(0, 2), ["Saved messages on this server", "Connection status"],
     "the group is not straight after Stored conversations");
   assert.equal(PAGE_ELEMENTS.get("message-cache-group").hidden, true, "the group is served showing");
   assert.equal(PAGE_ELEMENTS.get("help-message-cache").hidden, true, "the help entry is served showing");

@@ -1082,6 +1082,8 @@ test("removing the selected channel cannot carry its thread or composer draft in
   page.el("channel-compose-text").value = "belongs only in the original thread";
   await page.el("channel-compose-text").dispatch("input");
   await page.el("open-settings").click();
+  page.el("settings-channel").value = page.channels[0].id;
+  await page.el("settings-channel").dispatch("change");
   await page.el("remove-channel").click();
   await page.settle();
   assert.equal(page.el("discord-channel").value, other.id);
@@ -3326,7 +3328,7 @@ test("`#522 thread-card-max-lines`: under Fold read a link to a read split threa
 });
 
 test("`#522 thread-card-max-lines`: K is Thread card lines in Settings, 1 to 12 and 5 by default, synced, and the cards follow it", async () => {
-  assertMarkupContains("fold-card-max-lines-body", "card-max-lines");
+  assertMarkupContains("settings-messages", "card-max-lines");
   assert.match(/<input\s+id="card-max-lines"[^>]*>/.exec(HTML_CODE.replace(/\n\s*/g, " "))[0], /min="1" max="12"/);
   const { page } = await bigCardPage();
   assert.ok(SETTINGS.SYNCED_SETTING_KEYS.includes(CARD_LINES_STORAGE), "K is not kept on the server");

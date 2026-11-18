@@ -490,7 +490,6 @@ def lines_walk(walk: Walk) -> None:
     walk.wait_for("() => !document.getElementById('screen-settings').hidden", "Settings did not open")
     # Under Messages since `#457 settings-server-side`, where the server keeps it.
     page.click("#fold-settings-messages")
-    page.click("#fold-collapsed-lines")
     page.locator("#collapsed-lines").focus()
     page.keyboard.press("Home")
     walk.wait_for("() => document.getElementById('collapsed-lines-state').textContent === 'Saved — collapsed messages show only their header.'",

@@ -547,7 +547,7 @@ test("the settings screen states which control erases the record and which does 
   const note = HTML.slice(HTML.indexOf('id="continuity-note"'));
   assert.match(note, /leaves the stored record on the server untouched/);
   assert.match(note, /Forget stored conversations/);
-  const settings = HTML.slice(HTML.indexOf("Stored conversations"));
+  const settings = HTML.slice(HTML.indexOf('data-single-setting="storage"'));
   assert.match(settings, /not encrypted/, "an unencrypted record has to say so where it is offered");
   assert.match(settings, /id="forget-conversations"/);
 });

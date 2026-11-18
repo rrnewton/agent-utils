@@ -217,6 +217,8 @@ def walk(context: BrowserContext, url: str, shots: Path | None, where: str) -> s
     read(page, CHANNEL)
     open_channels(page)
     show_section(page)
+    # `#1815`: the header selector defaults to All Channels; pick the first channel for its cast.
+    page.select_option("#settings-channel", str(CHANNEL["id"]))
     # Waited for as both the page before `#402` and after it word it, so that page fails by name below.
     page.wait_for_function("() => document.getElementById('identity-list').textContent.startsWith('In lead team')",
                            timeout=10_000)

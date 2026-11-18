@@ -6,42 +6,28 @@
  * Every fold on Settings, by slug: the five sections (`settings-<id>`) and every headed group in them.
  * Declared in the markup like every id here; the page suite holds this list to it in both directions.
  */
+// `#1815 vibe-talk-settings-density-and-channel-header`: only groups with
+// two or more related controls keep a fold. Single-control groups
+// (Resuming, Typing, Text size and the like) are shown inline with no
+// heading; Debug, with several diagnostic switches, is the model for
+// what stays folded.
 const SETTINGS_FOLDS: readonly string[] = Object.freeze([
   "settings-voice-agent",
-  "sending",
-  "instructions",
-  "resuming",
-  "relay",
   "reading-full",
   "canned-prompts",
   "microphone",
-  "provider",
   "settings-messages",
   "mark-own",
   "mark-read",
   "auto-read",
-  "empty-messages",
-  "combining",
-  "rich-headers",
   "message-links",
-  "after-done",
-  "summaries",
   "dismissed",
   "settings-channels",
   "hidden-channels",
   "settings-screen",
-  "text-size",
-  "reading-width",
-  "collapsed-lines",
-  "card-max-lines",
-  "control-bar",
-  "opening-links",
-  "typing", "debug",
-  "keyboard",
+  "debug",
   "settings-storage",
-  "storage",
   "message-cache",
-  "token",
   "connection",
 ]);
 

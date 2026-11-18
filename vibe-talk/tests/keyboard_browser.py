@@ -767,10 +767,10 @@ def settings_keys(walk: Walk) -> None:
 # settings-prose` took the ? from beside "Arriving messages during a call", now the group's title, and
 # made How messages are said a link under the reading picker. `#346 settings-collapsible` made each
 # group's heading the button that folds it, a stop before its ?; the walk opens the three first.
-SETTINGS_TAB_STOPS = ["fold-resuming", "help-link-resuming", "resume-toggle", "fold-relay",
+SETTINGS_TAB_STOPS = ["help-link-resuming", "resume-toggle",
                       "help-link-live-messages", "relay-to-agent", "fold-reading-full",
                       "settings-audio-source", "help-link-speech-prep"]
-SETTINGS_FOLDS_OPENED = ["fold-settings-voice-agent", "fold-resuming", "fold-relay", "fold-reading-full"]
+SETTINGS_FOLDS_OPENED = ["fold-settings-voice-agent", "fold-reading-full"]
 
 
 def settings_tab_order(walk: Walk) -> None:
@@ -987,7 +987,7 @@ def after_done_choices(walk: Walk, api: FakeApi) -> None:
         walk.key_until(",", "() => !document.getElementById('screen-settings').hidden",
                        "',' did not open Settings", "screen-settings")
         walk.page.evaluate("""() => {
-          for (const id of ['fold-settings-messages', 'fold-after-done']) {
+          for (const id of ['fold-settings-messages']) {
             const body = document.getElementById(id + '-body');
             if (body && body.hidden) document.getElementById(id).click();
           }

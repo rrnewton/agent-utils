@@ -3402,7 +3402,9 @@ POPOUT_FOOT_SLACK_PX = 16
 # The folds of the Messages section above Recently dismissed, in their order: opened by the foot scene
 # where the folded screen is too short to bring the group low (`#372 settings-header-layout`).
 # `#402 who-is-who-channel-box` took Who is who out of Messages, and its fold with it.
-DISMISSED_ABOVE_FOLDS = ("mark-own", "auto-read", "empty-messages", "combining", "rich-headers")
+# `#1815`: Empty messages, Combining and Rich headers are single controls shown inline, so only
+# the folded groups above Recently dismissed can be opened to bring it low.
+DISMISSED_ABOVE_FOLDS = ("mark-own", "mark-read", "auto-read", "message-links")
 
 # Said by the pill while the pop-out stands at the foot: long enough to draw the pill at its widest, as a
 # long channel name or a long error does, so it reaches into the pop-out wherever the column puts it.
@@ -3477,6 +3479,17 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
     Close at the foot is what keeping the shadow off the pill once did.
     """
     _act_settings_dismissed_list(driver)
+    # `#1815`: the single controls above Recently dismissed are inline and taller
+    # than their folded headings were, so scrollIntoView now scrolls the frame
+    # itself and takes the top bar off screen. Put the group a little below the
+    # Settings box's top, in the box's own scroll, as a reader scrolling to it does.
+    driver.js(
+        "(() => { const box = document.getElementById('screen-settings'); "
+        "const group = document.getElementById('dismissed-group'); "
+        "box.scrollTop += group.getBoundingClientRect().top - box.getBoundingClientRect().top - 120; "
+        "window.scrollTo(0, 0); return true; })()"
+    )
+    driver.settle(200)
     driver.js("(() => { setStatus('Ready.'); shellNotices.holdStatus(); return true; })()")
     driver.page.mouse.move(1, 1)
     driver.settle(200)
@@ -3506,7 +3519,7 @@ def _act_settings_dismissed_popout(driver: Driver) -> None:
         if low:
             break
         driver.js(f"(() => {{ const b = document.getElementById('fold-{slug}'); "
-                  "if (b.getAttribute('aria-expanded') !== 'true') b.click(); return true; })()")
+                  "if (b && b.getAttribute('aria-expanded') !== 'true') b.click(); return true; })()")
         driver.settle(200)
     # The group low on the screen, and its row opened where it is: a click by the pointer would scroll it up.
     driver.js(
@@ -3903,7 +3916,7 @@ def _act_channel_settings_all(driver: Driver) -> None:
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.click("open-settings")
     driver.page.wait_for_function("() => window.__visible('close-settings')", timeout=5_000)
-    _unfold(driver, "settings-channel")
+    _unfold(driver, "channel-facts")
     driver.page.select_option("#settings-channel", "*")
     driver.page.wait_for_function(
         "() => /^Mixed:/.test(document.getElementById('upstream-clear-state').textContent || '')", timeout=10_000
@@ -4027,7 +4040,7 @@ def _act_settings_columns_folded(driver: Driver) -> None:
     _act_settings_folded(driver)
     driver.js("(() => { document.getElementById('fold-settings-voice-agent').focus(); window.__tabbed = "
               "[document.activeElement.id]; return true; })()")
-    for _ in range(5):
+    for _ in range(6):
         driver.page.keyboard.press("Tab")
         driver.js("(() => { window.__tabbed.push(document.activeElement.id); return true; })()")
     driver.js("(() => { document.activeElement.blur(); return true; })()")
@@ -6243,11 +6256,9 @@ SCENES: tuple[Scene, ...] = (
             (
                 # THE arrangement: the three, one after another, inside Voice agent.
                 "Voice agent holds Resuming, Arriving messages during a call and Reading full messages in channel view, in a row",
-                "(() => { const heads = [...document.querySelectorAll('#settings-voice-agent .settings-group "
-                ".group-head > h3')].map((h) => h.textContent.trim()); "
-                "const at = heads.indexOf('Resuming'); "
-                "return at >= 0 && heads[at + 1] === 'Arriving messages during a call' "
-                "&& heads[at + 2] === 'Reading full messages in channel view'; })()",
+                "(() => { const ids = ['resume-toggle', 'relay-to-agent', 'settings-audio-source']; "
+                "const at = ids.map((id) => document.getElementById(id).getBoundingClientRect().top); "
+                "return at[0] < at[1] && at[1] < at[2]; })()",
             ),
             (
                 "the three headings and their controls are on the screen at once",
@@ -6267,10 +6278,10 @@ SCENES: tuple[Scene, ...] = (
             (
                 # `#347 settings-prose`: the title, and only its drop-down. Nothing else drawn in the
                 # group: no label, no state line, no line under the picker.
-                "Arriving messages during a call is its title and only its drop-down",
+                "Arriving messages during a call is its inline label and only its drop-down",
                 "(() => { const group = document.getElementById('relay-to-agent').closest('.settings-group'); "
                 "const drawn = [...group.querySelectorAll('p, label, select, input')].filter((e) => e.getClientRects().length > 0); "
-                "return drawn.length === 1 && drawn[0].id === 'relay-to-agent' "
+                "return drawn.length === 2 && drawn[0].getAttribute('for') === 'relay-to-agent' && drawn[1].id === 'relay-to-agent' "
                 "&& !group.contains(document.getElementById('live-state')); })()",
             ),
             (
@@ -6389,8 +6400,9 @@ SCENES: tuple[Scene, ...] = (
                 "Messages holds Your own messages, Mark read on reply, Mark-read automatically, Empty messages, Combining messages and Rich headers",
                 "(() => { const heads = [...document.querySelectorAll('#settings-messages .settings-group .group-head > h3')]"
                 ".map((h) => h.textContent.trim()); "
-                "return ['Your own messages', 'Mark read on reply', 'Mark-read automatically', 'Empty messages', 'Combining messages', 'Rich headers']"
-                ".every((h, i) => heads[i] === h) && !heads.includes('Read automatically'); })()",
+                "return ['Your own messages', 'Mark read on reply', 'Mark-read automatically']"
+                ".every((h, i) => heads[i] === h) && !heads.includes('Read automatically') "
+                "&& ['hide-empty-messages', 'combine-messages', 'rich-headers'].every((id) => document.getElementById(id)); })()",
             ),
             (
                 "the Messages title and its first groups are on the screen",
@@ -6631,7 +6643,7 @@ SCENES: tuple[Scene, ...] = (
                 # `checkVisibility`: a control inside a body hidden until found still answers for its
                 # geometry when asked, though nothing of it is drawn; the bodies themselves are flat.
                 "no setting is drawn: the folded bodies take no room",
-                "['resume-toggle', 'mark-own-read', 'settings-channel', 'msg-scale', 'forget-token']"
+                "['resume-toggle', 'mark-own-read', 'msg-scale', 'forget-token']"
                 ".every((id) => !document.getElementById(id).checkVisibility()) "
                 "&& [...document.querySelectorAll('#screen-settings .fold-body')].every((b) => b.getBoundingClientRect().height === 0)",
             ),
@@ -6689,7 +6701,7 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the switch the search was for is drawn, and nothing else was opened",
                 "window.__visible('mic-noise-suppression') && document.getElementById('mic-noise-suppression').checkVisibility() "
-                "&& document.getElementById('fold-resuming').getAttribute('aria-expanded') === 'false' "
+                "&& document.getElementById('fold-canned-prompts').getAttribute('aria-expanded') === 'false' "
                 "&& document.getElementById('fold-settings-messages').getAttribute('aria-expanded') === 'false'",
             ),
         ),
@@ -6752,7 +6764,7 @@ SCENES: tuple[Scene, ...] = (
                 # THE other half: the focus order is the markup's, whatever the columns did with the boxes.
                 "Tab went through the five section titles in their order, Channels' ? after its title",
                 "JSON.stringify(window.__tabbed) === JSON.stringify(['fold-settings-voice-agent', 'fold-settings-messages', "
-                "'fold-settings-channels', 'help-link-channel-alias', 'fold-settings-screen', 'fold-settings-storage'])",
+                "'fold-settings-channels', 'settings-channel', 'help-link-channel-alias', 'fold-settings-screen', 'fold-settings-storage'])",
             ),
             (
                 "on a desk the titles take two or more columns; on a phone, one",
@@ -7533,11 +7545,11 @@ def check_state_controls() -> list[str]:
         # and, selected, the drawn strength of every row (`data-thread-in`, 0.3) with nothing scrolled.
         "58-all-thread-strip": ("thread-strip", "::before", "data-thread-state"),
         "59-all-thread-selected": ("data-thread-in", "0.3", "__beforeTop"),
-        # Pinned to the three in a row in Voice agent (`heads[at + 2]`), to the old names being gone
+        # Pinned to the three in a row in Voice agent (`at[0] < at[1]`), to the old names being gone
         # with the server's arm in Help (`help-speech-prep`), to Arriving messages during a call
-        # drawing only its drop-down (`drawn.length === 1`, `#347 settings-prose`), to the link under
+        # drawing its inline label and drop-down (`drawn.length === 2`, `#1815`), to the link under
         # the reading picker (`pre-processed for speech`) and to the short lines (`line * 2`).
-        "60-settings-voice-agent": ("heads[at + 2]", "help-speech-prep", "drawn.length === 1",
+        "60-settings-voice-agent": ("at[0] < at[1]", "help-speech-prep", "drawn.length === 2",
                                     "pre-processed for speech", "line * 2"),
         # `#331 resume-on-websocket`. Pinned to the switch being disabled (`t.disabled === true`) with
         # its reason under it (`why.top`), and to the call's line saying it was caught up

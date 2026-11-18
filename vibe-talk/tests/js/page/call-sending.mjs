@@ -3987,7 +3987,7 @@ test("`#272 voice-agent-instructions`: a read token and a store-less server can 
   older.voicePrompt = undefined;
   await signIn(older);
   assert.equal(older.el("voice-prompt-editor").hidden, true);
-  assert.equal(older.el("voice-prompt-state").textContent, "This server does not take instructions for its voice agent.");
+  assert.equal(older.el("voice-prompt-state").textContent, "Instructions: This server does not take instructions for its voice agent.");
 });
 
 /** A hosted agent's session carrying the owner's words, as `/api/v1/voice-session` serializes one. */

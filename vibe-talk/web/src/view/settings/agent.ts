@@ -119,7 +119,7 @@ export function mountAgentSettings(deps: AgentSettingsDependencies): AgentSettin
     el("voice-send-editor").hidden = voiceSendSetting === null;
     if (voiceSendSetting === null) {
       state.textContent =
-        "This server does not report this setting, so its voice agent always asks before it sends.";
+        "Sending: This server does not report this setting, so its voice agent always asks before it sends.";
       return;
     }
     box.checked = voiceSendSetting.ask_before_send;
@@ -256,7 +256,7 @@ export function mountAgentSettings(deps: AgentSettingsDependencies): AgentSettin
     const state = el("voice-prompt-state");
     el("voice-prompt-editor").hidden = voicePromptSettings === null;
     if (voicePromptSettings === null) {
-      state.textContent = "This server does not take instructions for its voice agent.";
+      state.textContent = "Instructions: This server does not take instructions for its voice agent.";
       return;
     }
     const lock = voicePromptLock(voicePromptSettings, deps.writable());
