@@ -380,6 +380,10 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         options.push(["threads", "Thread list"]);
         if (deps.layoutFit()) options.push(["columns", "Two columns"]);
       }
+      // `#1608 agent-transcripts-timeline`: Transcripts, with the views,
+      // before the threads — and only where the service has threads for
+      // traces to sit in.
+      options.push(["transcripts", "Transcripts"]);
       const choices = orderedThreadChoices();
       const shown = choices.slice(0, THREAD_SELECT_LIMIT);
       for (const choice of shown) options.push([`thread:${choice.id}`, threadLabel(choice, Infinity)]);
@@ -388,10 +392,6 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         options.push([`thread:${open.id}`, threadLabel(open, Infinity)]);
       }
     }
-    // `#1608 agent-transcripts-timeline`: Transcripts, beside Main/All/Thread
-    // list — after them, so the standing order of the older views is kept,
-    // and only where the service has threads for traces to sit in.
-    if (deps.threading()) options.push(["transcripts", "Transcripts"]);
     const current = viewChoiceOnScreen();
     const signature = JSON.stringify(options);
     if (select.getAttribute("data-options") !== signature) {

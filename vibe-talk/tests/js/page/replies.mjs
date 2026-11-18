@@ -1623,7 +1623,7 @@ test("a thread nobody has answered yet is tagged Thread with no number, and grow
   await signIn(page);
   await showDiscord(page, [message({ id: "210", content: "nobody has answered this", thread: lone })]);
   assert.equal(threadButton(rowOf(page, "210")), undefined, "Main offered a chip for no replies");
-  assert.deepStrictEqual(threadOptions(page), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"]],
+  assert.deepStrictEqual(threadOptions(page), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"], ["transcripts", "Transcripts"]],
     "the picker offered a thread with nothing in it to read");
 
   await page.el("channel-view-flat").click();

@@ -4237,7 +4237,8 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   const offered = threadOptions(page);
   // `#281 view-keys`: the thread list after them, the third view; two columns only on a desk wide enough.
   assert.deepStrictEqual(offered.slice(0, 3), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"]]);
-  assert.deepStrictEqual(offered.slice(3).map(([value]) => value).sort(),
+  assert.deepStrictEqual(offered[3], ["transcripts", "Transcripts"]);
+  assert.deepStrictEqual(offered.slice(4).map(([value]) => value).sort(),
     ["thread:spaces/A/threads/another", "thread:spaces/A/threads/one & two"]);
   // Age · replies · a short prefix of its first message, so a phone's large picker stays readable.
   // The age is on `briefAge`'s one scale (`#194 thread-picker-polish`): now, 5m, 23h, 1d18h, 12d, 6w, 2y.
@@ -4260,7 +4261,7 @@ test("thread views show roots in Main and the bar's selector offers Main, All, a
   assert.equal(empty.el("channel-view-tabs").hidden, true);
   // Always there, even with no threads yet: Main and All are still choices, and the thread list, which
   // says there are none yet (`#281 view-keys`).
-  assert.deepStrictEqual(threadOptions(empty), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"]]);
+  assert.deepStrictEqual(threadOptions(empty), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"], ["transcripts", "Transcripts"]]);
 });
 
 test("the bar's thread picker opens a thread, All, and Main, and touching it reads the thread list once", async () => {

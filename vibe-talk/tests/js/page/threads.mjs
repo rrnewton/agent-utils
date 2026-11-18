@@ -169,7 +169,7 @@ test("ages read as days and hours, never 42h, on one compact scale", async () =>
     page.threadingSupported = true;
     await signIn(page);
     await showDiscord(page, rows.map(([age], i) => agedRoot(page, i, age)));
-    const labels = threadOptions(page).slice(3).map(([, label]) => label);
+    const labels = threadOptions(page).slice(4).map(([, label]) => label);
     assert.deepStrictEqual(labels, rows.map(([, said], i) => `${said} · 1 · root number ${i}`));
   }
 });
@@ -183,10 +183,11 @@ test("the picker lists the views, then one screenful of threads, newest first; t
   const offered = threadOptions(page);
   const cap = sourceConstant("THREAD_SELECT_LIMIT");
   assert.deepStrictEqual(offered.slice(0, 3), [["main", "Main"], ["flat", "All"], ["threads", "Thread list"]]);
-  assert.deepStrictEqual(offered.slice(3, 3 + cap).map(([value]) => value),
+  assert.deepStrictEqual(offered[3], ["transcripts", "Transcripts"]);
+  assert.deepStrictEqual(offered.slice(4, 4 + cap).map(([value]) => value),
     Array.from({ length: cap }, (_, i) => `thread:spaces/A/threads/r${11 - i}`),
     "the picker did not list the newest threads first, one screenful of them");
-  assert.equal(offered.length, 3 + cap, "the picker listed more than one screenful");
+  assert.equal(offered.length, 4 + cap, "the picker listed more than one screenful");
   // `#281 view-keys`. No "… Older threads" opening a screen of its own: the thread list has them all.
   assert.ok(!offered.some(([value]) => value === "older"), "the picker still offers a way to the Threads screen");
   // A desk wide enough is offered two columns too, the fourth view, before the threads.
