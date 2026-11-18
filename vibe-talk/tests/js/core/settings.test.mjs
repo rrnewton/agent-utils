@@ -371,6 +371,8 @@ test("`#1845 vibe-talk-appearance-setting`: Appearance defaults to System, resol
   assert.equal(themeColorFor("light"), "#f6f7f9");
   assert.equal(DEVICE_SETTINGS.appearance.key, "vibe-talk.voice.appearance");
   assert.ok(SYNCED_SETTING_KEYS.includes(DEVICE_SETTINGS.appearance.key), "the choice is not synced");
+});
+
 test("`#1846 vibe-talk-windowed-rendering`: two knobs apart — data reach-back deep on a desk, render window small everywhere, both overridable", () => {
   const { createDeviceSettings, windowedConfig, reachBackExcess, WINDOWED_LISTS_HELP,
     DATA_REACH_DESKTOP, DATA_REACH_PHONE, RENDER_CAP_DESKTOP, RENDER_CAP_PHONE } = SETTINGS;
