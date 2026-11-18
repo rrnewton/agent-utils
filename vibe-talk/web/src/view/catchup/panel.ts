@@ -30,6 +30,8 @@ export interface CatchupRequestBody {
   view: "flat" | "main";
   /** The bound's start (Unix ms): only messages at/after it are covered. */
   since_ms: number | null;
+  /** `#1843`: exactly these messages are covered (the uncovered set); absent uses the bound. */
+  message_ids?: string[];
 }
 
 /** One unread message in a preview, oldest first in its list. */
@@ -226,6 +228,25 @@ export interface DiscussCoverageRange {
 /** `#1842`. The ranges one scope's summaries have covered, oldest first. */
 export interface DiscussCoverage {
   ranges: DiscussCoverageRange[];
+}
+
+/**
+ * `#1843 vibe-talk-discuss-uncovered-messages-line`: what no summary in a
+ * scope covered — the unread messages at or after the first covered range's
+ * start that fall in no covered range; null where the scope has no summary
+ * yet or nothing was missed.
+ */
+export function uncoveredInScope(
+  unread: readonly CatchupUnreadRef[],
+  coverage: DiscussCoverage,
+): { ids: string[]; firstStartMs: number; firstMissedMs: number } | null {
+  if (coverage.ranges.length === 0) return null;
+  const firstStartMs = Math.min(...coverage.ranges.map((range) => range.start));
+  const missed = unread.filter((ref) => ref.at_ms !== null && ref.at_ms >= firstStartMs
+    && !coverage.ranges.some((range) => (ref.at_ms as number) >= range.start && (ref.at_ms as number) <= range.end));
+  if (missed.length === 0) return null;
+  const firstMissed = missed[0] as CatchupUnreadRef;
+  return { ids: missed.map((ref) => ref.id), firstStartMs, firstMissedMs: firstMissed.at_ms as number };
 }
 
 /**
@@ -714,6 +735,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (termsList) termsList.textContent = "";
     const timeline = maybe("discuss-timeline");
     if (timeline) timeline.textContent = "";
+    const uncovered = maybe("discuss-uncovered");
+    if (uncovered) uncovered.hidden = true;
   }
 
   // `#1842`: the covered ranges per scope, in memory over the device's kept
@@ -1771,6 +1794,22 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     button.textContent = "Summarize";
   }
 
+  /**
+   * `#1843`: the uncovered line at the pane's foot — what no summary in
+   * this scope covered since its first summary, and the cleanup for it.
+   */
+  function drawUncovered(): void {
+    const line = maybe("discuss-uncovered");
+    if (line === null || lastScope === null) return;
+    const missed = uncoveredInScope(previewUnread, coverageOf(lastScope));
+    line.hidden = missed === null || pending;
+    if (missed === null) return;
+    const when = new Date(missed.firstStartMs);
+    const since = `${when.getMonth() + 1}/${when.getDate()}`;
+    const text = maybe("discuss-uncovered-text");
+    if (text) text.textContent = `${missed.ids.length} message${missed.ids.length === 1 ? "" : "s"} not included since ${since}`;
+  }
+
   /** Read the scope's preview and offer its bound; no model is asked. */
   function previewFor(scope: DiscussScope, again = false): void {
     generation += 1;
@@ -1813,18 +1852,20 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           sayStatus(`${previewUnread.length} unread ready.`);
         }
         drawBound();
+        drawUncovered();
       },
       (error: unknown) => {
         if (asked !== generation || !isOpen()) return;
         previewUnread = [];
         drawBound();
+        drawUncovered();
         sayError(error instanceof Error ? error.message : String(error));
       },
     );
   }
 
   /** One catch-up for `scope` at the chosen bound; nothing starts another meanwhile. */
-  function fetchFor(scope: DiscussScope, sinceMs: number | null): void {
+  function fetchFor(scope: DiscussScope, sinceMs: number | null, messageIds?: string[]): void {
     if (pending) return;
     // `#1501`: a new Summarize stops the summary it replaces, by its key.
     stopOwnReading();
@@ -1852,7 +1893,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     deps.byId("discuss-stale").hidden = true;
     markTermsStale();
     setPending(true);
-    const body: CatchupRequestBody = { thread_id: scope.threadId, view: scope.view, since_ms: sinceMs };
+    const body: CatchupRequestBody = { thread_id: scope.threadId, view: scope.view, since_ms: sinceMs, ...(messageIds && messageIds.length ? { message_ids: messageIds } : {}) };
     void deps.catchupPost(scope.channelId, body).then(
       (value) => {
         setPending(false);
@@ -1862,6 +1903,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         scopeAnswers.set(scopeKeyOf(scope), { scope, answer, readCreatedMs });
         const coveredTimes = previewUnread.filter((ref) => answer.unread_ids.includes(ref.id) && ref.at_ms !== null).map((ref) => ref.at_ms as number);
         recordCoverage(scope, sinceMs ?? (coveredTimes.length ? Math.min(...coveredTimes) : null), coveredTimes.length ? Math.max(...coveredTimes) : nowMs());
+        drawUncovered();
         const unread = answer.window?.unread_count ?? answer.unread_ids.length;
         const count = answer.window?.count ?? answer.unread_ids.length;
         // `#1761`: a window cut short of the thread's start says so, visibly —
@@ -1992,6 +2034,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         });
         listening.listen(deps.byId("discuss-retry"), "click", () => {
           if (lastScope !== null) fetchFor(lastScope, lastSinceMs);
+        });
+        listening.listen(deps.byId("discuss-uncovered-go"), "click", () => {
+          if (pending || lastScope === null) return;
+          const missed = uncoveredInScope(previewUnread, coverageOf(lastScope));
+          if (missed === null) return;
+          fetchFor(lastScope, missed.firstMissedMs, missed.ids);
         });
         listening.listen(deps.byId("discuss-summarize"), "click", () => {
           if (pending || lastScope === null || previewUnread.length === 0) return;

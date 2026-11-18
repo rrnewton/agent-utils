@@ -80,6 +80,9 @@ enum PostFailure {
 struct State {
     /// Keep no reply pointer on a post, as Slack keeps none. `#934 voice-page-reply-parent-arrow`.
     pointerless: bool,
+    /// Whether a test fixture has seeded thread-bearing messages, at which
+    /// point this fake advertises the timeline views it now serves (`#1843`).
+    threading_enabled: bool,
     known: BTreeSet<ChannelId>,
     fetches: usize,
     messages: Vec<Message>,
@@ -513,6 +516,53 @@ impl FakeDiscord {
         at
     }
 
+    /// Seed one message in a thread, optionally at an exact instant, and
+    /// advertise threading from then on (`#1843`).
+    ///
+    /// # Panics
+    ///
+    /// Panics only through [`FakeDiscord::seed_at`]'s own fixture misuse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_thread_at(
+        &self,
+        channel: &ChannelId,
+        author: &str,
+        content: &str,
+        thread_id: &str,
+        is_root: bool,
+        root_message_id: Option<&MessageId>,
+        at_ms: Option<i64>,
+    ) -> MessageId {
+        let id = match at_ms {
+            Some(at) => self.seed_at(channel, author, content, at),
+            None => self.seed(channel, author, content),
+        };
+        let mut state = self.lock();
+        state.threading_enabled = true;
+        let message = state
+            .messages
+            .iter_mut()
+            .find(|message| message.id == id)
+            .expect("the message just seeded is present");
+        message.thread = Some(crate::threads::MessageThread {
+            class: None,
+            id: thread_id.to_owned(),
+            root_message_id: Some(if is_root {
+                id.clone()
+            } else {
+                root_message_id.cloned().unwrap_or_else(|| id.clone())
+            }),
+            is_root,
+            broadcast: false,
+            reply_count: None,
+            reply_count_exact: false,
+            hue: None,
+            display_name: None,
+            summary: None,
+        });
+        id
+    }
+
     /// Rewrite the content of a message already seeded, as an upstream EDIT would.
     ///
     /// Discord messages are editable and the id does not change, so anything derived from a
@@ -750,6 +800,10 @@ impl ChatClient for FakeDiscord {
         "Discord"
     }
 
+    fn supports_threading(&self) -> bool {
+        self.lock().threading_enabled
+    }
+
     fn defuses_mentions(&self, _channel: &ChannelId) -> bool {
         self.lock().defuses_mentions
     }
@@ -893,75 +947,6 @@ impl ChatClient for FakeDiscord {
             .await
     }
 
-    async fn fetch_page(
-        &self,
-        channel: &ChannelId,
-        limit: u16,
-        before: Option<&MessageId>,
-        after: Option<&MessageId>,
-    ) -> Result<Vec<Message>, ChatError> {
-        // Share the real client's refusal, so a caller cannot get away here with a request
-        // Discord would not define. OUTSIDE the retry loop: a request this server refuses to
-        // build was never going to be sent, so it neither spends an attempt nor counts as a fetch.
-        let request =
-            super::http::page_request(DEFAULT_DISCORD_API_BASE, channel, limit, before, after)?;
-        self.limiter
-            .run(request.method, &request.url, || async {
-                // Everything below here is ONE SENT REQUEST, which is what makes `fetch_count`
-                // able to prove that a preempted request really was not sent.
-                self.lock().fetches += 1;
-                if let Some(limit) = self.take_rate_limit() {
-                    return Ok(Attempt::Limited(limit));
-                }
-                if let Some(failure) = self.take_failure() {
-                    return Err(failure);
-                }
-                // BEFORE the channel lookup, exactly as Discord orders it: a rejected credential
-                // must never be reported as a channel that does not exist, or the operator is
-                // sent to check a snowflake that was right all along.
-                if let Some(rejected) = self.rejected_token() {
-                    return Err(rejected);
-                }
-                if let Some(unknown) = self.unknown_channel(channel) {
-                    return Err(unknown);
-                }
-                let cursor = |id: Option<&MessageId>| id.and_then(MessageId::numeric);
-                let (before, after) = (cursor(before), cursor(after));
-                let state = self.lock();
-                let mut messages: Vec<Message> = state
-                    .messages
-                    .iter()
-                    .filter(|m| &m.channel_id == channel)
-                    .filter(|m| {
-                        let Some(id) = m.id.numeric() else {
-                            // An unparseable id cannot be placed relative to a cursor, so it is
-                            // only ever returned by an uncursored fetch. Guessing would fabricate
-                            // an ordering.
-                            return before.is_none() && after.is_none();
-                        };
-                        before.is_none_or(|b| id < b) && after.is_none_or(|a| id > a)
-                    })
-                    .cloned()
-                    .collect();
-                drop(state);
-                sort_oldest_first(&mut messages);
-                let limit = usize::from(limit.clamp(1, super::http::DISCORD_MAX_LIMIT));
-                if messages.len() > limit {
-                    if after.is_some() {
-                        // `after` walks FORWARD: Discord answers with the OLDEST messages
-                        // following the cursor, not the newest ones. Taking the newest here would
-                        // make a forward walk skip everything in between and still look correct
-                        // in a test.
-                        messages.truncate(limit);
-                    } else {
-                        messages.drain(..messages.len() - limit);
-                    }
-                }
-                Ok(Attempt::Done(messages, self.success_headers()))
-            })
-            .await
-    }
-
     /// One timeline page from the same held messages [`Self::fetch_page`]
     /// serves. `#1844`: without this the fake refused every timeline read, so
     /// a `--fake-discord` server could never fill the message cache's held
@@ -1032,6 +1017,75 @@ impl ChatClient for FakeDiscord {
             messages: page,
             ..crate::threads::TimelinePage::default()
         })
+    }
+
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, ChatError> {
+        // Share the real client's refusal, so a caller cannot get away here with a request
+        // Discord would not define. OUTSIDE the retry loop: a request this server refuses to
+        // build was never going to be sent, so it neither spends an attempt nor counts as a fetch.
+        let request =
+            super::http::page_request(DEFAULT_DISCORD_API_BASE, channel, limit, before, after)?;
+        self.limiter
+            .run(request.method, &request.url, || async {
+                // Everything below here is ONE SENT REQUEST, which is what makes `fetch_count`
+                // able to prove that a preempted request really was not sent.
+                self.lock().fetches += 1;
+                if let Some(limit) = self.take_rate_limit() {
+                    return Ok(Attempt::Limited(limit));
+                }
+                if let Some(failure) = self.take_failure() {
+                    return Err(failure);
+                }
+                // BEFORE the channel lookup, exactly as Discord orders it: a rejected credential
+                // must never be reported as a channel that does not exist, or the operator is
+                // sent to check a snowflake that was right all along.
+                if let Some(rejected) = self.rejected_token() {
+                    return Err(rejected);
+                }
+                if let Some(unknown) = self.unknown_channel(channel) {
+                    return Err(unknown);
+                }
+                let cursor = |id: Option<&MessageId>| id.and_then(MessageId::numeric);
+                let (before, after) = (cursor(before), cursor(after));
+                let state = self.lock();
+                let mut messages: Vec<Message> = state
+                    .messages
+                    .iter()
+                    .filter(|m| &m.channel_id == channel)
+                    .filter(|m| {
+                        let Some(id) = m.id.numeric() else {
+                            // An unparseable id cannot be placed relative to a cursor, so it is
+                            // only ever returned by an uncursored fetch. Guessing would fabricate
+                            // an ordering.
+                            return before.is_none() && after.is_none();
+                        };
+                        before.is_none_or(|b| id < b) && after.is_none_or(|a| id > a)
+                    })
+                    .cloned()
+                    .collect();
+                drop(state);
+                sort_oldest_first(&mut messages);
+                let limit = usize::from(limit.clamp(1, super::http::DISCORD_MAX_LIMIT));
+                if messages.len() > limit {
+                    if after.is_some() {
+                        // `after` walks FORWARD: Discord answers with the OLDEST messages
+                        // following the cursor, not the newest ones. Taking the newest here would
+                        // make a forward walk skip everything in between and still look correct
+                        // in a test.
+                        messages.truncate(limit);
+                    } else {
+                        messages.drain(..messages.len() - limit);
+                    }
+                }
+                Ok(Attempt::Done(messages, self.success_headers()))
+            })
+            .await
     }
 
     async fn post_message(
@@ -1307,6 +1361,107 @@ mod tests {
                 .is_err(),
             "both cursors at once must be refused here exactly as the real client refuses them"
         );
+    }
+
+    #[tokio::test]
+    async fn timeline_pages_follow_the_same_cursor_rules_as_fetch_page() {
+        let fake = FakeDiscord::new();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            ids.push(fake.seed(&channel(), "a", &format!("m{i}")));
+        }
+        let request = |before: Option<String>, after: Option<String>| {
+            crate::threads::TimelineRequest {
+                view: crate::threads::TimelineView::Main,
+                thread_id: None,
+                before,
+                after,
+                limit: 2,
+            }
+        };
+        let contents = |page: &crate::threads::TimelinePage| {
+            page.messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let newest = fake
+            .fetch_timeline(&channel(), &request(None, None))
+            .await
+            .expect("timeline");
+        assert_eq!(contents(&newest), vec!["m4", "m5"]);
+        assert!(newest.has_more);
+        assert_eq!(newest.next_before.as_deref(), Some(ids[4].as_str()));
+
+        let back = fake
+            .fetch_timeline(
+                &channel(),
+                &request(Some(ids[4].to_string()), None),
+            )
+            .await
+            .expect("timeline before");
+        assert_eq!(contents(&back), vec!["m2", "m3"]);
+
+    }
+
+    #[tokio::test]
+    async fn a_seeded_thread_is_read_back_as_a_thread_timeline() {
+        let fake = FakeDiscord::new();
+        let root = fake.seed_thread_at(
+            &channel(),
+            "a",
+            "thread root",
+            "thread-1",
+            true,
+            None,
+            Some(1_787_233_800_000),
+        );
+        fake.seed_thread_at(
+            &channel(),
+            "b",
+            "thread reply",
+            "thread-1",
+            false,
+            Some(&root),
+            Some(1_787_233_860_000),
+        );
+        assert!(fake.supports_threading());
+        let page = fake
+            .fetch_timeline(
+                &channel(),
+                &crate::threads::TimelineRequest {
+                    view: crate::threads::TimelineView::Thread,
+                    thread_id: Some("thread-1".to_owned()),
+                    before: None,
+                    after: None,
+                    limit: 50,
+                },
+            )
+            .await
+            .expect("thread timeline");
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread root", "thread reply"]
+        );
+        // The thread-list view stays refused on this fake (`#1844`): it
+        // holds no thread summaries to list.
+        assert!(fake
+            .fetch_timeline(
+                &channel(),
+                &crate::threads::TimelineRequest {
+                    view: crate::threads::TimelineView::Threads,
+                    thread_id: None,
+                    before: None,
+                    after: None,
+                    limit: 50,
+                },
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

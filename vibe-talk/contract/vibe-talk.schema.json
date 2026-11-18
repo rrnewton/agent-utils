@@ -283,6 +283,17 @@
     "CatchupRequest": {
       "description": "The body of `POST /api/v1/channels/{channel_id}/catchup`: one Discuss read.\n`catchup-side-agent`.",
       "properties": {
+        "message_ids": {
+          "default": null,
+          "description": "`#1843 vibe-talk-discuss-uncovered-messages-line`: only these messages are\ncovered — the scope's uncovered set, named exactly, which need not be\ncontiguous. Absent covers the bound's window as `since_ms` shapes it.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "since_ms": {
           "default": null,
           "description": "Only messages at or after this instant (Unix milliseconds) are covered: the\npanel's \"last N unread since HH:MM\" bound. Absent covers the whole window.",
@@ -312,7 +323,8 @@
       "required": [
         "thread_id",
         "view",
-        "since_ms"
+        "since_ms",
+        "message_ids"
       ],
       "type": "object"
     },

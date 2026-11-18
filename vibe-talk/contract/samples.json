@@ -254,11 +254,15 @@
   ],
   "CatchupRequest": [
     {
+      "message_ids": [
+        "1000"
+      ],
       "since_ms": 1700000000000,
       "thread_id": "thread-1",
       "view": "main"
     },
     {
+      "message_ids": null,
       "since_ms": null,
       "thread_id": null,
       "view": null

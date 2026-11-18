@@ -59,6 +59,10 @@ impl std::fmt::Debug for ProviderEntry {
 
 /// Routes every channel-scoped call to the provider that owns the channel.
 pub struct ChatRouter {
+    // `#1843 vibe-talk-discuss-uncovered-messages-line`: the in-memory fake
+    // backend, where this router serves one (test instances only), so a
+    // browser walk can seed non-owner messages through the seed route.
+    fake: Option<Arc<crate::discord::fake::FakeDiscord>>,
     entries: Vec<ProviderEntry>,
     default: Option<usize>,
     routes: RwLock<BTreeMap<ChannelId, usize>>,
@@ -133,6 +137,7 @@ impl ChatRouter {
         };
         let display_name = join_names(&entries);
         Self {
+            fake: None,
             entries,
             default,
             routes: RwLock::new(BTreeMap::new()),
@@ -140,6 +145,58 @@ impl ChatRouter {
             profile,
             access,
         }
+    }
+
+    /// This router, serving the in-memory fake backend it was built over
+    /// (`#1843`): the seed route's handle. Only a test instance built with
+    /// `--fake-discord` has one; every real deployment answers None.
+    #[must_use]
+    pub fn with_fake(mut self, fake: Arc<crate::discord::fake::FakeDiscord>) -> Self {
+        self.fake = Some(fake);
+        self
+    }
+
+    /// Seed one non-owner message into the fake backend (`#1843`), as a test
+    /// walk's inject; None where this router serves no fake.
+    /// Seed one message through the fake handle, where there is one.
+    pub fn seed_fake_message(
+        &self,
+        channel: &crate::model::ChannelId,
+        author: &str,
+        text: &str,
+        at_ms: Option<i64>,
+    ) -> Option<crate::model::MessageId> {
+        let fake = self.fake.as_ref()?;
+        Some(match at_ms {
+            Some(at) => fake.seed_at(channel, author, text, at),
+            None => fake.seed(channel, author, text),
+        })
+    }
+
+    /// Seed one non-owner message in a named thread of the fake backend
+    /// (`#1843`); None where this router serves no fake.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_fake_thread_message(
+        &self,
+        channel: &crate::model::ChannelId,
+        author: &str,
+        text: &str,
+        at_ms: Option<i64>,
+        thread_id: &str,
+        is_root: bool,
+        root_message_id: Option<&crate::model::MessageId>,
+    ) -> Option<crate::model::MessageId> {
+        self.fake.as_ref().map(|fake| {
+            fake.seed_thread_at(
+                channel,
+                author,
+                text,
+                thread_id,
+                is_root,
+                root_message_id,
+                at_ms,
+            )
+        })
     }
 
     /// A router with a single provider under the legacy key, as every pre-router deployment had:

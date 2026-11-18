@@ -2989,6 +2989,11 @@ pub async fn catchup(
             .messages
             .retain(|message| message.created_ms().is_none_or(|at_ms| at_ms >= since_ms));
     }
+    // `#1843`: an explicitly named uncovered set covers exactly those messages.
+    if let Some(ids) = &body.message_ids {
+        let named: std::collections::HashSet<&str> = ids.iter().map(|id| id.0.as_str()).collect();
+        fetched.messages.retain(|message| named.contains(message.id.0.as_str()));
+    }
     let owner = crate::owner::Owner::of(&state);
     let mut built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
     let (warmup, warmup_fingerprint) = crate::catchup::load_warmup_for_window(
@@ -7236,6 +7241,71 @@ pub struct ThreadHueSeedResponse {
 /// device sees from then on. First writer wins — a second device's different memory recolours
 /// nothing — and the answer hands back the colours as they stand, so the offering page adopts
 /// the server's where it had decided first.
+/// `#1843 vibe-talk-discuss-uncovered-messages-line`: one seeded message's
+/// request and answer for the fake-seed route.
+#[derive(Debug, Deserialize)]
+pub struct FakeSeedRequest {
+    /// The seeded message's author display name (never the owner).
+    pub author: String,
+    /// The seeded message's text.
+    pub text: String,
+    /// When it was posted, Unix milliseconds; absent mints it at the fake's next instant.
+    #[serde(default)]
+    pub at_ms: Option<i64>,
+    /// The thread this message belongs to, where a walk seeds one (`#1843`).
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Whether this message is the named thread's root.
+    #[serde(default)]
+    pub thread_root: bool,
+    /// The named thread's root message, for a reply in it.
+    #[serde(default)]
+    pub root_message_id: Option<crate::model::MessageId>,
+}
+
+/// What the fake-seed route answers: the seeded message's id.
+#[derive(Debug, Serialize)]
+pub struct FakeSeedResponse {
+    /// The seeded message.
+    pub id: crate::model::MessageId,
+}
+
+/// Seed one non-owner message into a test instance's fake backend (`#1843`).
+/// Only an instance serving the in-memory fake has anything to seed; every
+/// other deployment answers 404, as if the route were not there.
+pub async fn fake_seed(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(request): Json<FakeSeedRequest>,
+) -> Result<Json<FakeSeedResponse>, ApiError> {
+    let channel = crate::model::ChannelId(channel_id);
+    let seeded = match &request.thread_id {
+        Some(thread_id) => state.providers.seed_fake_thread_message(
+            &channel,
+            &request.author,
+            &request.text,
+            request.at_ms,
+            thread_id,
+            request.thread_root,
+            request.root_message_id.as_ref(),
+        ),
+        None => state
+            .providers
+            .seed_fake_message(&channel, &request.author, &request.text, request.at_ms),
+    };
+    match seeded {
+        Some(id) => Ok(Json(FakeSeedResponse { id })),
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "this instance serves no fake backend to seed",
+        )),
+    }
+}
+
+/// Offer the thread colours a browser remembers for the threads the server
+/// has not coloured (`#427 server-thread-hues`): first writer wins.
 pub async fn seed_thread_hues(
     State(state): State<AppState>,
     _scope: WriteScope,

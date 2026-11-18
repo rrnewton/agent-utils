@@ -1422,6 +1422,7 @@ fn samples() -> Value {
                 thread_id: Some("thread-1".into()),
                 view: Some("main".into()),
                 since_ms: Some(1_700_000_000_000),
+                message_ids: Some(vec![MessageId("1000".into())]),
             }),
             to(&CatchupRequest::default()),
         ],

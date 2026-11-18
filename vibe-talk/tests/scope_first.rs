@@ -695,6 +695,15 @@ fn inventory() -> Vec<Route> {
         ),
         // `#427 server-thread-hues`: a browser offers the thread colours it remembers, at write
         // scope only — it files durable state every device reads back.
+        // `#1843 vibe-talk-discuss-uncovered-messages-line`: seed one
+        // non-owner message into a test instance's fake backend, at write
+        // scope only — it refuses where no fake is served.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/fake-seed",
+            Write,
+            Json(r#"{"author":"alice","text":"seeded for a walk"}"#),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/thread-hues",

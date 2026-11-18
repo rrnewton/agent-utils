@@ -599,6 +599,14 @@ fn routes(state: AppState) -> Router {
         // before the server decided them, once, for the threads the server has not coloured.
         // WRITE scope and NO MCP TOOL, for the `#39` reason above. Reading the colours needs no
         // route of its own: every message and thread summary carries its thread's hue.
+        // `#1843 vibe-talk-discuss-uncovered-messages-line`. Seed one
+        // non-owner message into the fake backend of a test instance, so a
+        // browser walk can make unread messages through the real router.
+        // Write scope; the handler itself refuses where no fake is served.
+        .route(
+            "/api/v1/channels/{channel_id}/fake-seed",
+            post(api::fake_seed),
+        )
         .route(
             "/api/v1/channels/{channel_id}/thread-hues",
             post(api::seed_thread_hues)

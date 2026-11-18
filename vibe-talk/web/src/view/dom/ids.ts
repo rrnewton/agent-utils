@@ -160,6 +160,9 @@ export interface ElementById {
   "discuss-terms-summary": HTMLElement;
   "discuss-timeline": HTMLDivElement;
   "discuss-title": HTMLSpanElement;
+  "discuss-uncovered": HTMLParagraphElement;
+  "discuss-uncovered-go": HTMLButtonElement;
+  "discuss-uncovered-text": HTMLSpanElement;
   "discuss-unmarkable": HTMLParagraphElement;
   "discuss-update": HTMLButtonElement;
   "dismiss-banner": HTMLButtonElement;

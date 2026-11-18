@@ -21,7 +21,7 @@ const {
   DISCUSS_BINDING_RULES, WIDEN_OR_SIDEWAYS_ACTION, discussScopeKey, isSameDiscussScope,
   linkDecision, normalizeDiscussScope, viewChangeDecision,
   applyStrikes, citationIdsOf, hasWord, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, FRESH_CLASS,
-  hoursSinceStart, countForHours, boundForHours, hoursFloor1, formatHoursFloor1, summaryTimeLabel, withoutTimestampCitations,
+  hoursSinceStart, countForHours, boundForHours, hoursFloor1, formatHoursFloor1, summaryTimeLabel, withoutTimestampCitations, uncoveredInScope,
 } = VIEW;
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -102,7 +102,7 @@ const IDS = [
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
   "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline",
-  "discuss-followup", "discuss-send",
+  "discuss-followup", "discuss-send", "discuss-uncovered", "discuss-uncovered-go", "discuss-uncovered-text",
   "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
   "discuss-summarize", "discuss-count", "discuss-since", "discuss-hours",
@@ -719,6 +719,71 @@ test("catchup: a scope's covered ranges survive a reload through the kept covera
       assert.equal(reloadedFx.els["discuss-since"].value, "09:52", "the reloaded default did not start at the last summary's end");
     } finally { reloadedFx.restore(); }
   } finally { fx.restore(); }
+});
+
+
+test("catchup: a gap in a scope's summaries shows the uncovered line and its press cleans up exactly the missed messages (#1843)", async () => {
+  const T25 = new Date(2026, 8, 20, 9, 52, 30).getTime();
+  const T3 = new Date(2026, 8, 20, 9, 53).getTime();
+  const early = preview();
+  const later = preview({ unread: [
+    { id: "m1", at_ms: T1, label: "09:51 · Ada" },
+    { id: "m2", at_ms: T2, label: "09:52 · Ben" },
+    { id: "mx", at_ms: T25, label: "09:52 · Cy" },
+    { id: "m3", at_ms: T3, label: "09:53 · Di" },
+  ] });
+  const fx = fixture({
+    selection: THREAD_T1,
+    previewBodies: [early, early, later, later, later],
+    respond: (channelId, body) => Promise.resolve(answer({
+      unread_ids: body.message_ids ?? (body.since_ms === T3 ? ["m3"] : body.since_ms === T25 ? ["mx"] : ["m1", "m2"]),
+      markable_ids: body.message_ids ?? ["m1", "m2"],
+    })),
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(fx.els["discuss-uncovered"].hidden, true, "the line showed before any summary");
+    // First summary covers the early pair; the second covers only the newest.
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    fx.setSelection({ view: "flat", threadId: null, thread: null });
+    view.sync();
+    await flush();
+    fx.setSelection(THREAD_T1);
+    view.sync();
+    await flush();
+    fx.els["discuss-count"].value = "1";
+    fireInput(fx.els["discuss-count"]);
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(fx.calls.posts.at(-1).body.since_ms, T3, "the second summary did not take only the newest");
+    // Back again: the message between the two ranges is reported, dated by
+    // the first summary.
+    fx.setSelection({ view: "flat", threadId: null, thread: null });
+    view.sync();
+    await flush();
+    fx.setSelection(THREAD_T1);
+    view.sync();
+    await flush();
+    assert.equal(fx.els["discuss-uncovered"].hidden, false, "the gap showed no uncovered line");
+    assert.equal(fx.els["discuss-uncovered-text"].textContent, "1 message not included since 9/20");
+    // Pressing it asks for exactly the missed message; afterwards none remain.
+    click(fx.els["discuss-uncovered-go"]);
+    await flush();
+    assert.deepEqual(fx.calls.posts.at(-1).body.message_ids, ["mx"], "the cleanup did not name exactly the missed messages");
+    assert.equal(fx.calls.posts.at(-1).body.since_ms, T25);
+    assert.equal(fx.els["discuss-uncovered"].hidden, true, "the line stayed after the cleanup");
+  } finally { fx.restore(); }
+  // The pure rule, for a main (global) scope too.
+  assert.equal(uncoveredInScope([{ id: "a", at_ms: 10, label: "" }], { ranges: [] }), null);
+  assert.deepEqual(
+    uncoveredInScope(
+      [{ id: "a", at_ms: 15, label: "" }, { id: "b", at_ms: 25, label: "" }, { id: "c", at_ms: 5, label: "" }],
+      { ranges: [{ start: 10, end: 20 }, { start: 30, end: 40 }] }),
+    { ids: ["b"], firstStartMs: 10, firstMissedMs: 25 });
 });
 
 test("catchup: Documents disables Discuss with its tooltip, closes the panel, and switching back restores it (#1812)", async () => {

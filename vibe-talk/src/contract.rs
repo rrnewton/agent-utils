@@ -1624,6 +1624,11 @@ pub struct CatchupRequest {
     /// panel's "last N unread since HH:MM" bound. Absent covers the whole window.
     #[serde(default)]
     pub since_ms: Option<i64>,
+    /// `#1843 vibe-talk-discuss-uncovered-messages-line`: only these messages are
+    /// covered — the scope's uncovered set, named exactly, which need not be
+    /// contiguous. Absent covers the bound's window as `since_ms` shapes it.
+    #[serde(default)]
+    pub message_ids: Option<Vec<MessageId>>,
 }
 
 /// One unread message in a Discuss preview, for the panel's N/since choice.

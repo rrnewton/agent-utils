@@ -54,6 +54,9 @@
   container-type: inline-size;
   height: var(--discuss-docked-height, 50dvh);
   overflow-y: auto;
+  /* The uncovered line at the pane's foot must be able to scroll clear of
+     the phone's pinned ask bar (`#1843`). */
+  scroll-padding-bottom: calc(3.5rem + env(safe-area-inset-bottom));
   /* `#1531 discuss-top-bar-slim-fixed`: no top padding — the sticky head
    * carries its own, so the fixed bar sits flush with the panel's top. */
   padding: 0 calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));

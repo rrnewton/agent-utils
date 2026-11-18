@@ -206,6 +206,12 @@ export interface CatchupRecordResponse {
  */
 export interface CatchupRequest {
   /**
+   * `#1843 vibe-talk-discuss-uncovered-messages-line`: only these messages are
+   * covered — the scope's uncovered set, named exactly, which need not be
+   * contiguous. Absent covers the bound's window as `since_ms` shapes it.
+   */
+  message_ids: MessageId[] | null;
+  /**
    * Only messages at or after this instant (Unix milliseconds) are covered: the
    * panel's "last N unread since HH:MM" bound. Absent covers the whole window.
    */
