@@ -610,6 +610,26 @@ impl SqliteStore {
         // before. A future ladder step that touches them must CREATE IF NOT
         // EXISTS and adopt them, never assume their absence.
         ensure_label_group_tables(&connection)?;
+        // `#1840 vibe-talk-draft-sync-across-devices`: synced composer drafts
+        // live OUTSIDE the migration ladder for the thread_class reason above:
+        // purely additive, so a rolled-back binary opens the database and
+        // simply never reads them. One row per (channel, thread, scope): the
+        // owner's unsent words, kept only on their own server.
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS composer_drafts (
+                    channel_id   TEXT    NOT NULL,
+                    thread_id    TEXT    NOT NULL,
+                    scope        TEXT    NOT NULL,
+                    text         TEXT    NOT NULL,
+                    device_id    TEXT    NOT NULL,
+                    device_label TEXT    NOT NULL,
+                    updated_ms   INTEGER NOT NULL,
+                    version      INTEGER NOT NULL,
+                    PRIMARY KEY (channel_id, thread_id, scope)
+                ) STRICT;",
+            )
+            .map_err(backend)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             retention,
@@ -650,6 +670,45 @@ fn hex(content_hash: u64) -> String {
 
 fn backend(error: rusqlite::Error) -> StoreError {
     StoreError::Backend(error.to_string())
+}
+
+/// How long a synced composer draft is kept, in milliseconds: seven days.
+/// `#1840 vibe-talk-draft-sync-across-devices`.
+const DRAFT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The most synced composer drafts kept at once; the oldest go first. `#1840`.
+const MAX_COMPOSER_DRAFTS: i64 = 200;
+
+/// The largest synced draft text accepted, in bytes. `#1840`.
+pub const MAX_DRAFT_BYTES: usize = 32 * 1024;
+
+/// One stored composer draft, when the scope holds one. `#1840`.
+fn read_composer_draft(
+    connection: &Connection,
+    channel: &ChannelId,
+    thread: &str,
+    scope: crate::contract::DraftScope,
+) -> Result<Option<crate::contract::ComposerDraft>, StoreError> {
+    connection
+        .query_row(
+            "SELECT text, device_id, device_label, updated_ms, version FROM composer_drafts \
+             WHERE channel_id = ?1 AND thread_id = ?2 AND scope = ?3",
+            rusqlite::params![channel.as_str(), thread, scope.as_str()],
+            |row| {
+                Ok(crate::contract::ComposerDraft {
+                    channel_id: channel.as_str().to_owned(),
+                    thread_id: thread.to_owned(),
+                    scope,
+                    text: row.get(0)?,
+                    device_id: row.get(1)?,
+                    device_label: row.get(2)?,
+                    updated_ms: row.get(3)?,
+                    version: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(backend)
 }
 
 /// The whole synced-settings document, by key. `#457 settings-server-side`. One reader
@@ -2585,6 +2644,186 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn composer_drafts(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<Vec<crate::contract::ComposerDraft>, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let cutoff = now_ms().saturating_sub(DRAFT_RETENTION_MS);
+            connection
+                .execute(
+                    "DELETE FROM composer_drafts WHERE updated_ms < ?1",
+                    rusqlite::params![cutoff],
+                )
+                .map_err(backend)?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT thread_id, scope, text, device_id, device_label, updated_ms, version \
+                     FROM composer_drafts WHERE channel_id = ?1 ORDER BY updated_ms ASC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map(rusqlite::params![channel.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .map_err(backend)?;
+            let mut found = Vec::new();
+            for row in rows {
+                let (thread_id, scope, text, device_id, device_label, updated_ms, version) =
+                    row.map_err(backend)?;
+                let Some(scope) = crate::contract::DraftScope::parse(&scope) else {
+                    continue;
+                };
+                found.push(crate::contract::ComposerDraft {
+                    channel_id: channel.as_str().to_owned(),
+                    thread_id,
+                    scope,
+                    text,
+                    device_id,
+                    device_label,
+                    updated_ms,
+                    version,
+                });
+            }
+            Ok(found)
+        })
+        .await
+    }
+
+    async fn put_composer_draft(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        scope: crate::contract::DraftScope,
+        text: &str,
+        device_id: &str,
+        device_label: &str,
+    ) -> Result<
+        (
+            Option<crate::contract::ComposerDraft>,
+            Option<crate::contract::ComposerDraft>,
+        ),
+        StoreError,
+    > {
+        let (channel, thread, text, device_id, device_label) = (
+            channel.clone(),
+            thread.to_owned(),
+            text.to_owned(),
+            device_id.to_owned(),
+            device_label.to_owned(),
+        );
+        self.with_connection(move |connection| {
+            let previous = read_composer_draft(connection, &channel, &thread, scope)?;
+            if text.trim().is_empty() {
+                connection
+                    .execute(
+                        "DELETE FROM composer_drafts \
+                         WHERE channel_id = ?1 AND thread_id = ?2 AND scope = ?3",
+                        rusqlite::params![channel.as_str(), thread, scope.as_str()],
+                    )
+                    .map_err(backend)?;
+                return Ok((None, previous.filter(|held| !held.text.trim().is_empty())));
+            }
+            let stamp = match &previous {
+                Some(held) => now_ms().max(held.updated_ms + 1),
+                None => now_ms(),
+            };
+            let version = previous.as_ref().map_or(1, |held| held.version + 1);
+            connection
+                .execute(
+                    "INSERT INTO composer_drafts \
+                     (channel_id, thread_id, scope, text, device_id, device_label, updated_ms, version) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     ON CONFLICT(channel_id, thread_id, scope) DO UPDATE SET \
+                       text = excluded.text, device_id = excluded.device_id, \
+                       device_label = excluded.device_label, \
+                       updated_ms = excluded.updated_ms, version = excluded.version",
+                    rusqlite::params![
+                        channel.as_str(),
+                        thread,
+                        scope.as_str(),
+                        text,
+                        device_id,
+                        device_label,
+                        stamp,
+                        version
+                    ],
+                )
+                .map_err(backend)?;
+            let cutoff = stamp.saturating_sub(DRAFT_RETENTION_MS);
+            connection
+                .execute(
+                    "DELETE FROM composer_drafts WHERE updated_ms < ?1",
+                    rusqlite::params![cutoff],
+                )
+                .map_err(backend)?;
+            connection
+                .execute(
+                    "DELETE FROM composer_drafts WHERE rowid IN \
+                     (SELECT rowid FROM composer_drafts ORDER BY updated_ms DESC \
+                      LIMIT -1 OFFSET ?1)",
+                    rusqlite::params![MAX_COMPOSER_DRAFTS],
+                )
+                .map_err(backend)?;
+            let stored = crate::contract::ComposerDraft {
+                channel_id: channel.as_str().to_owned(),
+                thread_id: thread,
+                scope,
+                text,
+                device_id,
+                device_label,
+                updated_ms: stamp,
+                version,
+            };
+            let replaced = previous.filter(|held| held.text != stored.text);
+            Ok((Some(stored), replaced))
+        })
+        .await
+    }
+
+    async fn delete_composer_draft(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        scope: crate::contract::DraftScope,
+    ) -> Result<(), StoreError> {
+        let (channel, thread) = (channel.clone(), thread.to_owned());
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM composer_drafts \
+                     WHERE channel_id = ?1 AND thread_id = ?2 AND scope = ?3",
+                    rusqlite::params![channel.as_str(), thread, scope.as_str()],
+                )
+                .map_err(backend)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn clear_channel_drafts(&self, channel: &ChannelId) -> Result<(), StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM composer_drafts WHERE channel_id = ?1",
+                    rusqlite::params![channel.as_str()],
+                )
+                .map_err(backend)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn post_prefix(&self) -> Result<Option<String>, StoreError> {
         self.with_connection(|connection| {
             connection
@@ -3799,6 +4038,10 @@ impl StateStore for SqliteStore {
             // afresh, by the same policy in the order threads arrive. `#427 server-thread-hues`.
             transaction
                 .execute("DELETE FROM discuss_records", [])
+                .map_err(backend)?;
+            // The owner's unsent words go with everything else. `#1840`.
+            transaction
+                .execute("DELETE FROM composer_drafts", [])
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM thread_hues", [])
@@ -5433,6 +5676,140 @@ mod tests {
                 .agent,
             "owner-pick"
         );
+    }
+
+    #[tokio::test]
+    async fn composer_drafts_round_trip_expire_and_purge() {
+        // `#1840 vibe-talk-draft-sync-across-devices`.
+        let dir = TempDir::new("sqlite-composer-drafts");
+        let file = dir.path().join("vibe-talk.sqlite3");
+        let channel = ChannelId("C1".to_owned());
+        let store = SqliteStore::open(&file, Retention::default()).expect("open");
+        // A draft typed on device A is stored with its device and version.
+        let (stored, replaced) = store
+            .put_composer_draft(
+                &channel,
+                "",
+                crate::contract::DraftScope::Main,
+                "half written on the phone",
+                "dev-a",
+                "phone",
+            )
+            .await
+            .expect("put");
+        let stored = stored.expect("stored");
+        assert_eq!(stored.text, "half written on the phone");
+        assert_eq!(stored.device_label, "phone");
+        assert_eq!(stored.version, 1);
+        assert!(replaced.is_none());
+        // Device B's newer words replace them, and the answer names the loss.
+        let (stored, replaced) = store
+            .put_composer_draft(
+                &channel,
+                "",
+                crate::contract::DraftScope::Main,
+                "continued on the laptop",
+                "dev-b",
+                "laptop",
+            )
+            .await
+            .expect("put again");
+        assert_eq!(stored.expect("stored").version, 2);
+        assert_eq!(
+            replaced.expect("replaced").text,
+            "half written on the phone"
+        );
+        // The Discuss scope is its own row beside the main one.
+        store
+            .put_composer_draft(
+                &channel,
+                "1700.0001",
+                crate::contract::DraftScope::Discuss,
+                "a follow-up question",
+                "dev-a",
+                "phone",
+            )
+            .await
+            .expect("discuss put");
+        assert_eq!(
+            store.composer_drafts(&channel).await.expect("list").len(),
+            2
+        );
+        // Sending clears: an empty write stores nothing.
+        let (stored, _) = store
+            .put_composer_draft(
+                &channel,
+                "",
+                crate::contract::DraftScope::Main,
+                "",
+                "dev-b",
+                "laptop",
+            )
+            .await
+            .expect("clear");
+        assert!(stored.is_none());
+        assert_eq!(
+            store.composer_drafts(&channel).await.expect("list").len(),
+            1
+        );
+        // An expired draft is never offered: age the row past seven days.
+        {
+            let connection = Connection::open(&file).expect("raw open");
+            connection
+                .execute(
+                    "UPDATE composer_drafts SET updated_ms = ?1",
+                    rusqlite::params![now_ms().saturating_sub(8 * 24 * 60 * 60 * 1000)],
+                )
+                .expect("age");
+        }
+        assert!(store
+            .composer_drafts(&channel)
+            .await
+            .expect("list")
+            .is_empty());
+        // The table is outside the ladder: the file still reports its version.
+        {
+            let connection = Connection::open(&file).expect("raw open");
+            let version: i64 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("version");
+            assert_eq!(version, i64::try_from(MIGRATIONS.len()).expect("small"));
+        }
+        // The purge drops drafts, and clearing a channel drops only its own.
+        store
+            .put_composer_draft(
+                &channel,
+                "",
+                crate::contract::DraftScope::Main,
+                "purge me",
+                "dev-a",
+                "phone",
+            )
+            .await
+            .expect("put");
+        store.purge_everything().await.expect("purge");
+        assert!(store
+            .composer_drafts(&channel)
+            .await
+            .expect("list")
+            .is_empty());
+        store
+            .put_composer_draft(
+                &channel,
+                "",
+                crate::contract::DraftScope::Main,
+                "channel clear",
+                "dev-a",
+                "phone",
+            )
+            .await
+            .expect("put");
+        store.clear_channel_drafts(&channel).await.expect("clear");
+        assert!(store
+            .composer_drafts(&channel)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     #[tokio::test]

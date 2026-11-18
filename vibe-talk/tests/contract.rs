@@ -17,7 +17,8 @@ use vibe_talk::contract::{
     ApiErrorBody, BookmarkResponse, CatchupFollowupRequest, CatchupFollowupResponse,
     CatchupFooterLink, CatchupPreview, CatchupRecordResponse, CatchupRequest, CatchupResponse,
     CatchupStamp, CatchupUnreadRef, CatchupUpdateRequest, CatchupWindow, ClientConfigResponse,
-    ClientSettings, CommittedPostResponse, LabelCount, LabelGroupRequest, LabelGroupsResponse,
+    ClientSettings, CommittedPostResponse, ComposerDraft, ComposerDrafts,
+    DeleteComposerDraftRequest, DraftScope, LabelCount, LabelGroupRequest, LabelGroupsResponse,
     LabelsResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent,
     MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules,
     PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
@@ -29,6 +30,7 @@ use vibe_talk::contract::{
 };
 use vibe_talk::contract::{ChannelHistoryState, HistoryModeChoice, HistoryModeRequest};
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
+use vibe_talk::contract::{PutComposerDraftRequest, PutComposerDraftResponse};
 use vibe_talk::conversation::{VoiceDescription, VoiceSession};
 use vibe_talk::model::{ChannelId, ChannelInfo, Heading, Message, MessageId, Reaction, UserId};
 use vibe_talk::post_gate::ProposalFate;
@@ -1174,6 +1176,57 @@ fn samples() -> Value {
                 },
             ]}),
             to(&ClientSettings { settings: vec![] }),
+        ],
+        // `#1840 vibe-talk-draft-sync-across-devices`: one held draft, and none.
+        "ComposerDrafts": [
+            to(&ComposerDrafts { drafts: vec![ComposerDraft {
+                channel_id: "1111111111".into(),
+                thread_id: "".into(),
+                scope: DraftScope::Main,
+                text: "a long half-written message".into(),
+                device_id: "device-a".into(),
+                device_label: "phone".into(),
+                updated_ms: 1_700_000_000_000,
+                version: 1,
+            }] }),
+            to(&ComposerDrafts { drafts: vec![] }),
+        ],
+        "PutComposerDraftRequest": [
+            to(&PutComposerDraftRequest {
+                thread_id: None,
+                scope: DraftScope::Main,
+                text: "a long half-written message".into(),
+                device_id: "device-a".into(),
+                device_label: "phone".into(),
+                base_version: None,
+            }),
+            to(&PutComposerDraftRequest {
+                thread_id: Some("1700.0001".into()),
+                scope: DraftScope::Discuss,
+                text: "a follow-up in progress".into(),
+                device_id: "device-b".into(),
+                device_label: "laptop".into(),
+                base_version: Some(2),
+            }),
+        ],
+        "PutComposerDraftResponse": [
+            to(&PutComposerDraftResponse {
+                draft: Some(ComposerDraft {
+                    channel_id: "1111111111".into(),
+                    thread_id: "".into(),
+                    scope: DraftScope::Main,
+                    text: "a long half-written message".into(),
+                    device_id: "device-a".into(),
+                    device_label: "phone".into(),
+                    updated_ms: 1_700_000_000_000,
+                    version: 1,
+                }),
+                replaced: None,
+            }),
+            to(&PutComposerDraftResponse { draft: None, replaced: None }),
+        ],
+        "DeleteComposerDraftRequest": [
+            to(&DeleteComposerDraftRequest { thread_id: None, scope: DraftScope::Main }),
         ],
         "VoiceSettings": [
             to(&VoiceSettings { ask_before_send: true, changeable: true }),

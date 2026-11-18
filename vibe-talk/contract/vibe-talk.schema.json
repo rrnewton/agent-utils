@@ -1209,6 +1209,94 @@
       ],
       "type": "object"
     },
+    "ComposerDraft": {
+      "description": "One synced composer draft: the owner's unsent words for one channel/thread\nscope, last written by one device. `#1840 vibe-talk-draft-sync-across-devices`.",
+      "properties": {
+        "channel_id": {
+          "description": "The channel the draft belongs to.",
+          "type": "string"
+        },
+        "device_id": {
+          "description": "The device that last wrote the draft.",
+          "type": "string"
+        },
+        "device_label": {
+          "description": "The writing device's coarse label, for the continue offer.",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/DraftScope",
+          "description": "Which composer the draft belongs to."
+        },
+        "text": {
+          "description": "The unsent words, exactly as typed.",
+          "type": "string"
+        },
+        "thread_id": {
+          "description": "The thread the draft belongs to; empty for the channel itself.",
+          "type": "string"
+        },
+        "updated_ms": {
+          "description": "When the server took this write, on the server's clock.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "version": {
+          "description": "How many accepted writes this scope has taken; grows every write.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "channel_id",
+        "thread_id",
+        "scope",
+        "text",
+        "device_id",
+        "device_label",
+        "updated_ms",
+        "version"
+      ],
+      "type": "object"
+    },
+    "ComposerDrafts": {
+      "description": "What `GET /api/v1/channels/{id}/drafts` answers. `#1840`.",
+      "properties": {
+        "drafts": {
+          "description": "Every live draft in the channel, oldest first.",
+          "items": {
+            "$ref": "#/$defs/ComposerDraft"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "drafts"
+      ],
+      "type": "object"
+    },
+    "DeleteComposerDraftRequest": {
+      "description": "The body of `DELETE /api/v1/channels/{id}/drafts`. `#1840`.",
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/DraftScope",
+          "description": "Which composer the draft belongs to."
+        },
+        "thread_id": {
+          "default": null,
+          "description": "The thread the draft belongs to; absent is the channel itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "thread_id",
+        "scope"
+      ],
+      "type": "object"
+    },
     "Description": {
       "description": "Public capabilities of the selected read-aloud provider; never contains credentials.",
       "properties": {
@@ -1418,6 +1506,21 @@
         "at_ms"
       ],
       "type": "object"
+    },
+    "DraftScope": {
+      "description": "Which composer a synced draft belongs to. `#1840 vibe-talk-draft-sync-across-devices`.",
+      "oneOf": [
+        {
+          "const": "main",
+          "description": "The channel/thread message box.",
+          "type": "string"
+        },
+        {
+          "const": "discuss",
+          "description": "The Discuss follow-up box for the same channel/thread.",
+          "type": "string"
+        }
+      ]
     },
     "Heading": {
       "description": "What a message's first line says about it, lifted out for the row's header. `#242\nrich-headers`.\n\nEvery piece is UNTRUSTED plain text out of `content`, to be drawn as text. Flat and optional\nthroughout, so the contract can grow without an older page refusing the row.",
@@ -2752,6 +2855,85 @@
         "live_poll_seconds",
         "self_author_id",
         "owner_author_id"
+      ],
+      "type": "object"
+    },
+    "PutComposerDraftRequest": {
+      "description": "The body of `PUT /api/v1/channels/{id}/drafts`. `#1840`.",
+      "properties": {
+        "base_version": {
+          "default": null,
+          "description": "The version the writer last saw, when it saw one.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "device_id": {
+          "description": "The writing device's stable id.",
+          "type": "string"
+        },
+        "device_label": {
+          "description": "The writing device's coarse label.",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/DraftScope",
+          "description": "Which composer the draft belongs to."
+        },
+        "text": {
+          "description": "The unsent words; empty clears the draft.",
+          "type": "string"
+        },
+        "thread_id": {
+          "default": null,
+          "description": "The thread the draft belongs to; absent is the channel itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "thread_id",
+        "scope",
+        "text",
+        "device_id",
+        "device_label",
+        "base_version"
+      ],
+      "type": "object"
+    },
+    "PutComposerDraftResponse": {
+      "description": "What `PUT /api/v1/channels/{id}/drafts` answers. `#1840`.",
+      "properties": {
+        "draft": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComposerDraft"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The draft as now stored; absent when the write cleared it."
+        },
+        "replaced": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComposerDraft"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The draft this write replaced, when it held different words."
+        }
+      },
+      "required": [
+        "draft",
+        "replaced"
       ],
       "type": "object"
     },
@@ -4760,6 +4942,18 @@
     },
     {
       "$ref": "#/$defs/LabelGroupRequest"
+    },
+    {
+      "$ref": "#/$defs/ComposerDrafts"
+    },
+    {
+      "$ref": "#/$defs/PutComposerDraftRequest"
+    },
+    {
+      "$ref": "#/$defs/PutComposerDraftResponse"
+    },
+    {
+      "$ref": "#/$defs/DeleteComposerDraftRequest"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

@@ -80,6 +80,7 @@ export interface ElementById {
   "channel-newline": HTMLButtonElement;
   "channel-raw": HTMLInputElement;
   "channel-raw-row": HTMLLabelElement;
+  "channel-save-draft": HTMLButtonElement;
   "channel-send": HTMLButtonElement;
   "channel-settings": HTMLElement;
   "channel-summary": HTMLOListElement;
@@ -126,6 +127,12 @@ export interface ElementById {
   "discuss-count": HTMLInputElement;
   "discuss-covers": HTMLParagraphElement;
   "discuss-dock-toggle": HTMLButtonElement;
+  "discuss-draft-discard": HTMLButtonElement;
+  "discuss-draft-keep": HTMLButtonElement;
+  "discuss-draft-note": HTMLParagraphElement;
+  "discuss-draft-offer": HTMLDivElement;
+  "discuss-draft-offer-text": HTMLParagraphElement;
+  "discuss-draft-use": HTMLButtonElement;
   "discuss-followup": HTMLTextAreaElement;
   "discuss-footer": HTMLDivElement;
   "discuss-full-toggle": HTMLButtonElement;
@@ -139,6 +146,7 @@ export interface ElementById {
   "discuss-panel": HTMLDivElement;
   "discuss-resize": HTMLDivElement;
   "discuss-retry": HTMLButtonElement;
+  "discuss-save-draft": HTMLButtonElement;
   "discuss-scope": HTMLParagraphElement;
   "discuss-send": HTMLButtonElement;
   "discuss-since": HTMLInputElement;
@@ -203,8 +211,14 @@ export interface ElementById {
   "docs-since-hours": HTMLInputElement;
   "docs-since-title": HTMLParagraphElement;
   "documents-list": HTMLDivElement;
+  "draft-autosync": HTMLInputElement;
   "draft-chip": HTMLButtonElement;
   "draft-chip-label": HTMLSpanElement;
+  "draft-sync-discard": HTMLButtonElement;
+  "draft-sync-keep": HTMLButtonElement;
+  "draft-sync-offer": HTMLDivElement;
+  "draft-sync-offer-text": HTMLParagraphElement;
+  "draft-sync-use": HTMLButtonElement;
   "empty-line": HTMLParagraphElement;
   "empty-state": HTMLDivElement;
   "enter-sends": HTMLInputElement;

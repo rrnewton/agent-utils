@@ -42,6 +42,23 @@ export { createUnconfirmedSends } from "./unconfirmed.ts";
 export type { UnconfirmedSends, UnconfirmedSendsDependencies } from "./unconfirmed.ts";
 export { createOutboxLoads } from "./loads.ts";
 export type { LiveOutgoingEntry, OutboxLoads, OutboxLoadsDependencies } from "./loads.ts";
+export {
+  DRAFT_AUTOSYNC_IDLE_MS,
+  createDraftSync,
+  decideDraftOffer,
+  draftAgeWords,
+  draftDeviceId,
+  draftDeviceLabel,
+} from "./draftsync.ts";
+export type {
+  DraftOffer,
+  DraftSync,
+  DraftSyncDependencies,
+  DraftSyncTransport,
+  SyncedDraft,
+  SyncedDraftKey,
+  SyncedDraftScope,
+} from "./draftsync.ts";
 export { createDraftQueries } from "./draftqueries.ts";
 export type { DraftLedgerLike, DraftQueries, DraftQueriesDependencies } from "./draftqueries.ts";
 export { createOutboxDispatch } from "./dispatch.ts";

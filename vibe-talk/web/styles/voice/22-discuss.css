@@ -421,8 +421,13 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 .discuss-compose {
   display: flex;
   align-items: flex-end;
+  flex-wrap: nowrap;
   gap: 8px;
   margin-top: 12px;
+}
+
+.discuss-compose button {
+  flex: none;
 }
 
 #discuss-followup {

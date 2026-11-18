@@ -1315,6 +1315,76 @@ pub async fn set_client_settings(
     Ok(no_store(Json(crate::contract::ClientSettings { settings })))
 }
 
+/// `GET /api/v1/channels/{channel_id}/drafts` — the channel's synced composer
+/// drafts. `#1840 vibe-talk-draft-sync-across-devices`.
+///
+/// WRITE scope, reads included: a draft is the owner's unsent words, not
+/// channel content, so a read token gets 403 and no MCP tool reaches this.
+pub async fn composer_drafts(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let channel = crate::model::ChannelId(channel_id);
+    let drafts = state.store.composer_drafts(&channel).await?;
+    Ok(no_store(Json(crate::contract::ComposerDrafts { drafts })))
+}
+
+/// `PUT /api/v1/channels/{channel_id}/drafts` — store one scope's draft.
+/// `#1840`. WRITE scope, no MCP tool: the words are the owner's, unsent.
+/// An empty text clears the scope. The answer names what was replaced when
+/// it held different words, so the page can say whose edit it replaced.
+pub async fn put_composer_draft(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(request): Json<crate::contract::PutComposerDraftRequest>,
+) -> Result<Response, ApiError> {
+    if request.text.len() > crate::store::sqlite::MAX_DRAFT_BYTES {
+        return Err(ApiError::bad_request("that draft is too long to sync"));
+    }
+    if request.device_id.trim().is_empty() || request.device_id.len() > 128 {
+        return Err(ApiError::bad_request("a device id is required"));
+    }
+    if request.device_label.len() > 128 {
+        return Err(ApiError::bad_request("that device label is too long"));
+    }
+    let channel = crate::model::ChannelId(channel_id);
+    let thread = request.thread_id.unwrap_or_default();
+    let (draft, replaced) = state
+        .store
+        .put_composer_draft(
+            &channel,
+            &thread,
+            request.scope,
+            &request.text,
+            &request.device_id,
+            &request.device_label,
+        )
+        .await?;
+    Ok(no_store(Json(crate::contract::PutComposerDraftResponse {
+        draft,
+        replaced,
+    })))
+}
+
+/// `DELETE /api/v1/channels/{channel_id}/drafts` — forget one scope's draft.
+/// `#1840`. WRITE scope. Idempotent: sending or discarding twice is fine.
+pub async fn delete_composer_draft(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(request): Json<crate::contract::DeleteComposerDraftRequest>,
+) -> Result<Response, ApiError> {
+    let channel = crate::model::ChannelId(channel_id);
+    let thread = request.thread_id.unwrap_or_default();
+    state
+        .store
+        .delete_composer_draft(&channel, &thread, request.scope)
+        .await?;
+    Ok(no_store(Json(serde_json::json!({ "deleted": true }))))
+}
+
 /// The noise rules for client-config, or `None` when a configured store cannot say what they are.
 ///
 /// Absent rather than an error: client-config is what signs the page in, and a store fault must
@@ -5778,6 +5848,8 @@ pub const PURGED: &[&str] = &[
     "discuss_records",
     // `#1608 agent-transcripts-timeline`.
     "thread_class",
+    // `#1840 vibe-talk-draft-sync-across-devices`.
+    "composer_drafts",
     "message_cache",
 ];
 
@@ -8798,6 +8870,12 @@ pub async fn remove_channel(
     state
         .store
         .remove_added_channel(&added_channel.channel)
+        .await?;
+    // `#1840`: a channel forgotten for good takes its synced drafts with it.
+    // A hidden configured channel keeps them: unhiding brings the channel back.
+    state
+        .store
+        .clear_channel_drafts(&added_channel.channel)
         .await?;
     if let Ok(mut added) = state.added_channels.write() {
         added.retain(|channel| channel.channel != added_channel.channel);

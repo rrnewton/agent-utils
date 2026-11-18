@@ -45,6 +45,11 @@ import {DISMISSED_SENDS_DAYS,
   QUICK_DRAFTS_KEY,
   createChannelDrafts,
   createDraftLedger,
+  createDraftSync,
+  decideDraftOffer,
+  draftAgeWords,
+  draftDeviceId,
+  draftDeviceLabel,
   createDraftRound,
   createInboxWriteLedger,
   createOutboxComposition,
@@ -1311,6 +1316,19 @@ const discussView = createDiscussView({
   },
   dismissMessages: (body) => dismissMessages(body),
   restoreMessages: (ids) => restoreMessages(ids),
+  onFollowupTyped: (text, scope) => {
+    discussDraftKey = { channel: scope.channelId, thread: String(scope.threadId ?? ""), scope: "discuss" };
+    draftSync.noteTyped(discussDraftKey, text);
+  },
+  onFollowupCleared: (scope) => {
+    el("discuss-draft-offer").hidden = true;
+    discussDraftOffer = null;
+    void draftSync.clear({ channel: scope.channelId, thread: String(scope.threadId ?? ""), scope: "discuss" });
+  },
+  onDiscussOpened: (scope) => {
+    discussDraftKey = { channel: scope.channelId, thread: String(scope.threadId ?? ""), scope: "discuss" };
+    void offerSyncedDraft(discussDraftKey, el("discuss-followup"), el("discuss-draft-offer"), el("discuss-draft-offer-text"), () => {});
+  },
   // `#1388` landing 1: the strike reads the page's read (Done) set — the
   // Done marks made here at once, and the store's folded dismissals.
   isReadNow: (id) => doneState().archived.has(String(id)) || channelStore.current().dismissed.has(String(id)),
@@ -1579,6 +1597,82 @@ const quickDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoo
  * @type {import("../core/outbox/index.ts").DraftLedger}
  */
 const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache(), now: () => Date.now() });
+
+/**
+ * `#1840 vibe-talk-draft-sync-across-devices`. The composers' words on the
+ * owner's other devices: idle typing syncs to their own server (behind the
+ * synced draft-autosync setting, on unless off), Save draft syncs at once,
+ * and a draft from another device is offered, never overwritten onto typing.
+ *
+ * @type {import("../core/outbox/index.ts").DraftSync}
+ */
+const draftSync = createDraftSync({
+  transport: {
+    getDrafts: (channel) => /** @type {Promise<{drafts: import("../core/outbox/index.ts").SyncedDraft[]}>} */ (api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`)),
+    putDraft: (channel, body) => /** @type {Promise<{draft: import("../core/outbox/index.ts").SyncedDraft | null, replaced: import("../core/outbox/index.ts").SyncedDraft | null}>} */ (api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "PUT", body })),
+    deleteDraft: (channel, body) => api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "DELETE", body }),
+  },
+  deviceId: () => draftDeviceId(deviceStorageOnUse(), () => globalThis.crypto?.randomUUID?.() ?? `device-${Date.now()}-${Math.random()}`),
+  deviceLabel: () => draftDeviceLabel(String(globalThis.navigator?.userAgent ?? "")),
+  autosync: () => deviceSettings().get(DEVICE_SETTINGS.draftAutosync) !== false,
+  schedule: (run, ms) => setTimeout(run, ms),
+  cancel: (handle) => clearTimeout(/** @type {any} */ (handle)),
+  onSaved: (key, replaced) => {
+    const note = replaced
+      ? `Draft saved · replaced a draft from ${replaced.device_label} (${draftAgeWords(replaced.updated_ms, Date.now())})`
+      : "Draft saved";
+    if (key.scope === "discuss") {
+      const line = el("discuss-draft-note");
+      line.textContent = note;
+      line.hidden = false;
+    } else {
+      el("channel-compose-state").textContent = note;
+    }
+  },
+});
+
+/** The main composer's synced-draft address, from the current selection. */
+function mainDraftKey() {
+  return {
+    channel: String(selectedChannelId() ?? ""),
+    thread: String(selection().threadId ?? ""),
+    scope: /** @type {"main"} */ ("main"),
+  };
+}
+
+let mainDraftOffer = /** @type {import("../core/outbox/index.ts").SyncedDraft | null} */ (null);
+let discussDraftOffer = /** @type {import("../core/outbox/index.ts").SyncedDraft | null} */ (null);
+let discussDraftKey = /** @type {import("../core/outbox/index.ts").SyncedDraftKey | null} */ (null);
+
+/** Fetch the channel's synced drafts and offer the one for `key`, if any. */
+async function offerSyncedDraft(key, box, offerBar, offerText, remember) {
+  if (!key.channel) return;
+  let drafts;
+  try {
+    drafts = await draftSync.fetchChannel(key.channel);
+  } catch {
+    return; // Offline or refused: the device copy stands, nothing is offered.
+  }
+  const remote = drafts.find((draft) => draft.thread_id === key.thread && draft.scope === key.scope) ?? null;
+  const decision = decideDraftOffer(remote, box.value, draftSyncDeviceId());
+  if (decision.kind === "adopt") {
+    box.value = decision.draft.text;
+    remember(decision.draft.text);
+    offerBar.hidden = true;
+  } else if (decision.kind === "offer") {
+    offerText.textContent = `Continue draft from ${decision.draft.device_label} (${draftAgeWords(decision.draft.updated_ms, Date.now())})?`;
+    offerBar.hidden = false;
+    if (key.scope === "discuss") discussDraftOffer = decision.draft;
+    else mainDraftOffer = decision.draft;
+  } else {
+    offerBar.hidden = true;
+  }
+}
+
+/** This device's draft id, for telling its own echo from another's words. */
+function draftSyncDeviceId() {
+  return draftDeviceId(deviceStorageOnUse(), () => `device-${Date.now()}-${Math.random()}`);
+}
 
 
 
@@ -7641,10 +7735,75 @@ const channelSend = createChannelSend({
   knownWritable: (channel) => knownChannel(channel)?.writable !== false,
   rootThisStarts: (channel, threadId) => (markReadOnReplySwitch.on() ? rootThisStarts(channel, threadId) : null), queueOutgoingMessage,
   channelDrafts: { get: (key) => channelDrafts.get(key), set: (key, text) => channelDrafts.set(key, text), delete: (key) => channelDrafts.delete(key), save: () => channelDrafts.save() },
+  onDraftTyped: (text) => draftSync.noteTyped(mainDraftKey(), text),
+  onComposerRestored: () => {
+    void offerSyncedDraft(mainDraftKey(), el("channel-compose-text"), el("draft-sync-offer"), el("draft-sync-offer-text"), (text) => {
+      channelDrafts.set(channelComposerKey(), text);
+      saveChannelDrafts();
+    });
+  },
+  onDraftCleared: () => {
+    el("draft-sync-offer").hidden = true;
+    mainDraftOffer = null;
+    void draftSync.clear(mainDraftKey());
+  },
   storageOkay: () => outbox.storageOkay(), noteDraft, fitBox: (box) => fitGrowingBox(box),
   draftRefusedWords: CHANNEL_DRAFT_REFUSED, scrollToNewest, renderChannelNavigation, renderDraftChip,
 });
 const { sendChannelMessage, cancelChannelMessage, answerChannelDiscard, rememberChannelDraft, restoreChannelComposer, saveChannelDrafts, channelComposerKey, onComposerKey } = channelSend;
+// `#1840`: the Save draft buttons, the continue offers, and the setting.
+el("channel-save-draft").addEventListener("click", () => {
+  void draftSync.saveNow(mainDraftKey(), el("channel-compose-text").value);
+});
+el("draft-sync-use").addEventListener("click", () => {
+  if (!mainDraftOffer) return;
+  el("channel-compose-text").value = mainDraftOffer.text;
+  rememberChannelDraft();
+  el("draft-sync-offer").hidden = true;
+  mainDraftOffer = null;
+});
+el("draft-sync-keep").addEventListener("click", () => {
+  el("draft-sync-offer").hidden = true;
+  mainDraftOffer = null;
+});
+el("draft-sync-discard").addEventListener("click", () => {
+  el("draft-sync-offer").hidden = true;
+  mainDraftOffer = null;
+  void draftSync.clear(mainDraftKey());
+});
+el("discuss-save-draft").addEventListener("click", () => {
+  if (discussDraftKey) void draftSync.saveNow(discussDraftKey, el("discuss-followup").value);
+});
+el("discuss-draft-use").addEventListener("click", () => {
+  if (!discussDraftOffer) return;
+  el("discuss-followup").value = discussDraftOffer.text;
+  el("discuss-draft-offer").hidden = true;
+  discussDraftOffer = null;
+});
+el("discuss-draft-keep").addEventListener("click", () => {
+  el("discuss-draft-offer").hidden = true;
+  discussDraftOffer = null;
+});
+el("discuss-draft-discard").addEventListener("click", () => {
+  el("discuss-draft-offer").hidden = true;
+  discussDraftOffer = null;
+  if (discussDraftKey) void draftSync.clear(discussDraftKey);
+});
+{
+  const box = el("draft-autosync");
+  box.checked = deviceSettings().get(DEVICE_SETTINGS.draftAutosync) !== false;
+  box.addEventListener("change", () => {
+    try {
+      deviceSettings().keep(DEVICE_SETTINGS.draftAutosync, box.checked);
+    } catch {
+      // A browser that refuses storage honours the choice for this session.
+    }
+  });
+}
+globalThis.addEventListener?.("online", () => void draftSync.flushPending());
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void draftSync.flushPending();
+});
 /**
  * Which drafts are held, and whether one is live (web/src/core/outbox `createDraftQueries`,
  * `#624 voice-page-modularity`). Writing the ledger stays with each writer.

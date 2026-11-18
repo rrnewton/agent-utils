@@ -815,6 +815,31 @@
       "serial": 3
     }
   ],
+  "ComposerDrafts": [
+    {
+      "drafts": [
+        {
+          "channel_id": "1111111111",
+          "device_id": "device-a",
+          "device_label": "phone",
+          "scope": "main",
+          "text": "a long half-written message",
+          "thread_id": "",
+          "updated_ms": 1700000000000,
+          "version": 1
+        }
+      ]
+    },
+    {
+      "drafts": []
+    }
+  ],
+  "DeleteComposerDraftRequest": [
+    {
+      "scope": "main",
+      "thread_id": null
+    }
+  ],
   "HistoryModeRequest": [
     {
       "mode": "recent"
@@ -1441,6 +1466,43 @@
       "pins_notice": "pins are this server's own",
       "revision": 0,
       "untrusted_content_notice": "third-party text"
+    }
+  ],
+  "PutComposerDraftRequest": [
+    {
+      "base_version": null,
+      "device_id": "device-a",
+      "device_label": "phone",
+      "scope": "main",
+      "text": "a long half-written message",
+      "thread_id": null
+    },
+    {
+      "base_version": 2,
+      "device_id": "device-b",
+      "device_label": "laptop",
+      "scope": "discuss",
+      "text": "a follow-up in progress",
+      "thread_id": "1700.0001"
+    }
+  ],
+  "PutComposerDraftResponse": [
+    {
+      "draft": {
+        "channel_id": "1111111111",
+        "device_id": "device-a",
+        "device_label": "phone",
+        "scope": "main",
+        "text": "a long half-written message",
+        "thread_id": "",
+        "updated_ms": 1700000000000,
+        "version": 1
+      },
+      "replaced": null
+    },
+    {
+      "draft": null,
+      "replaced": null
     }
   ],
   "SearchResponse": [

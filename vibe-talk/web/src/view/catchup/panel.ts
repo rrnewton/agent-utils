@@ -112,6 +112,12 @@ export interface DiscussPanelDependencies {
   isReadNow?(id: string): boolean;
   /** Whether a bare Enter sends (the reader's "Enter to send"), for the composer keys. */
   enterSends?(): boolean;
+  /** `#1840`: the follow-up box's words as typed, for cross-device sync. */
+  onFollowupTyped?(text: string, scope: DiscussScope): void;
+  /** `#1840`: a follow-up went out; its synced draft is done. */
+  onFollowupCleared?(scope: DiscussScope): void;
+  /** `#1840`: the panel opened on a scope; offer its synced draft. */
+  onDiscussOpened?(scope: DiscussScope): void;
   /** A request started or settled, so the page can disable its entry points too. */
   onBusy?(busy: boolean): unknown;
   /** The chat service `channelId` is read through, for a footer's jump refs. */
@@ -1555,6 +1561,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         setPending(false);
         if (asked !== generation || !isOpen()) return;
         box.value = "";
+        deps.onFollowupCleared?.(scope);
         sayStatus("Answered below.");
         recordFor(scope, true);
       },
@@ -1973,6 +1980,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         });
         listening.listen(followupBox, "beforeinput", (event) => composerKeys.noteInsertion(followupBox, event));
         listening.listen(followupBox, "input", (event) => composerKeys.noteInsertion(followupBox, event));
+        listening.listen(followupBox, "input", () => {
+          if (lastScope !== null) {
+            deps.onFollowupTyped?.((followupBox as HTMLTextAreaElement).value, lastScope);
+          }
+        });
         listening.listen(deps.byId("discuss-send"), "click", () => sendFollowup());
         listening.listen(deps.byId("discuss-update"), "click", () => {
           if (pending || lastScope === null) return;
@@ -2254,6 +2266,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         // No panel in this host yet: the open below says so, as before.
       }
       setOpen(true);
+      deps.onDiscussOpened?.(scope);
       deps.byId("discuss-scope").textContent = scope.label;
       setTitle(scope);
       const unread = answer.window?.unread_count ?? answer.unread_ids.length;

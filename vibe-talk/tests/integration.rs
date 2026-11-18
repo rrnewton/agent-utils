@@ -55,6 +55,9 @@ mod chat_provider;
 #[path = "client_settings.rs"]
 mod client_settings;
 
+#[path = "drafts.rs"]
+mod drafts;
+
 #[path = "containerfile.rs"]
 mod containerfile;
 

@@ -2501,6 +2501,65 @@ pub trait StateStore: Send + Sync {
         record: &crate::contract::DiscussRecord,
     ) -> Result<(), StoreError>;
 
+    /// Every live synced composer draft in one channel, oldest first.
+    /// `#1840 vibe-talk-draft-sync-across-devices`. Expired drafts are absent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn composer_drafts(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<Vec<crate::contract::ComposerDraft>, StoreError>;
+
+    /// Store one scope's synced draft, returning it as stored and the draft it
+    /// replaced when that held different words. An empty `text` clears the
+    /// scope and stores nothing. `#1840`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn put_composer_draft(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        scope: crate::contract::DraftScope,
+        text: &str,
+        device_id: &str,
+        device_label: &str,
+    ) -> Result<
+        (
+            Option<crate::contract::ComposerDraft>,
+            Option<crate::contract::ComposerDraft>,
+        ),
+        StoreError,
+    >;
+
+    /// Forget one scope's synced draft, if it has one. Idempotent. `#1840`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn delete_composer_draft(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        scope: crate::contract::DraftScope,
+    ) -> Result<(), StoreError>;
+
+    /// Forget every synced draft in one channel. `#1840`: a channel taken off
+    /// the server for good takes its drafts with it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn clear_channel_drafts(&self, channel: &ChannelId) -> Result<(), StoreError>;
+
     /// The owner's own tag for what the voice agent posts, or `None` when he has never saved one.
     /// `#303 voice-post-prefix`.
     ///

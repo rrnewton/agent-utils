@@ -310,6 +310,26 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{}"#),
         ),
+        // `#1840`: synced drafts are the owner's unsent words, so write scope,
+        // reads included.
+        route(
+            "GET",
+            "/api/v1/channels/{channel_id}/drafts",
+            Write,
+            Nothing,
+        ),
+        route(
+            "PUT",
+            "/api/v1/channels/{channel_id}/drafts",
+            Write,
+            Json(r#"{"scope":"main","text":"hi","device_id":"d1","device_label":"phone"}"#),
+        ),
+        route(
+            "DELETE",
+            "/api/v1/channels/{channel_id}/drafts",
+            Write,
+            Json(r#"{"scope":"main"}"#),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/resolve",

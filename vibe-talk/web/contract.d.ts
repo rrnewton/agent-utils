@@ -983,6 +983,69 @@ declare namespace VibeTalk {
   }
 
   /**
+   * One synced composer draft: the owner's unsent words for one channel/thread
+   * scope, last written by one device. `#1840 vibe-talk-draft-sync-across-devices`.
+   */
+  interface ComposerDraft {
+    /**
+     * The channel the draft belongs to.
+     */
+    channel_id: string;
+    /**
+     * The device that last wrote the draft.
+     */
+    device_id: string;
+    /**
+     * The writing device's coarse label, for the continue offer.
+     */
+    device_label: string;
+    /**
+     * Which composer the draft belongs to.
+     */
+    scope: DraftScope;
+    /**
+     * The unsent words, exactly as typed.
+     */
+    text: string;
+    /**
+     * The thread the draft belongs to; empty for the channel itself.
+     */
+    thread_id: string;
+    /**
+     * When the server took this write, on the server's clock.
+     */
+    updated_ms: number;
+    /**
+     * How many accepted writes this scope has taken; grows every write.
+     */
+    version: number;
+  }
+
+  /**
+   * What `GET /api/v1/channels/{id}/drafts` answers. `#1840`.
+   */
+  interface ComposerDrafts {
+    /**
+     * Every live draft in the channel, oldest first.
+     */
+    drafts: ComposerDraft[];
+  }
+
+  /**
+   * The body of `DELETE /api/v1/channels/{id}/drafts`. `#1840`.
+   */
+  interface DeleteComposerDraftRequest {
+    /**
+     * Which composer the draft belongs to.
+     */
+    scope: DraftScope;
+    /**
+     * The thread the draft belongs to; absent is the channel itself.
+     */
+    thread_id: string | null;
+  }
+
+  /**
    * Public capabilities of the selected read-aloud provider; never contains credentials.
    */
   interface Description {
@@ -1119,6 +1182,11 @@ declare namespace VibeTalk {
      */
     text_html: string;
   }
+
+  /**
+   * Which composer a synced draft belongs to. `#1840 vibe-talk-draft-sync-across-devices`.
+   */
+  type DraftScope = "main" | "discuss";
 
   /**
    * What a message's first line says about it, lifted out for the row's header. `#242
@@ -2218,6 +2286,50 @@ declare namespace VibeTalk {
      * Whether this provider exposes a write-through read cursor.
      */
     upstream_read_mark_supported: boolean;
+  }
+
+  /**
+   * The body of `PUT /api/v1/channels/{id}/drafts`. `#1840`.
+   */
+  interface PutComposerDraftRequest {
+    /**
+     * The version the writer last saw, when it saw one.
+     */
+    base_version: number | null;
+    /**
+     * The writing device's stable id.
+     */
+    device_id: string;
+    /**
+     * The writing device's coarse label.
+     */
+    device_label: string;
+    /**
+     * Which composer the draft belongs to.
+     */
+    scope: DraftScope;
+    /**
+     * The unsent words; empty clears the draft.
+     */
+    text: string;
+    /**
+     * The thread the draft belongs to; absent is the channel itself.
+     */
+    thread_id: string | null;
+  }
+
+  /**
+   * What `PUT /api/v1/channels/{id}/drafts` answers. `#1840`.
+   */
+  interface PutComposerDraftResponse {
+    /**
+     * The draft as now stored; absent when the write cleared it.
+     */
+    draft: ComposerDraft | null;
+    /**
+     * The draft this write replaced, when it held different words.
+     */
+    replaced: ComposerDraft | null;
   }
 
   /**
@@ -3510,6 +3622,10 @@ declare namespace VibeTalk {
     LabelsResponse: LabelsResponse;
     LabelGroupsResponse: LabelGroupsResponse;
     LabelGroupRequest: LabelGroupRequest;
+    ComposerDrafts: ComposerDrafts;
+    PutComposerDraftRequest: PutComposerDraftRequest;
+    PutComposerDraftResponse: PutComposerDraftResponse;
+    DeleteComposerDraftRequest: DeleteComposerDraftRequest;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

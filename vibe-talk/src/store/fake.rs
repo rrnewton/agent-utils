@@ -105,6 +105,8 @@ struct State {
     next_pin_seq: u64,
     /// Channel to its pin revision; absent is `0`, as a missing row is in the real store.
     pin_revisions: BTreeMap<String, i64>,
+    /// `(channel, thread, scope)` to its synced composer draft. `#1840`.
+    composer_drafts: BTreeMap<(String, String, String), crate::contract::ComposerDraft>,
     /// `(channel, thread)` to its transcript class. `#1608 agent-transcripts-timeline`.
     thread_classes: BTreeMap<(String, String), crate::transcripts::ThreadClass>,
     /// Label groups by id, and their shared revision. `#1825`.
@@ -1168,6 +1170,96 @@ impl StateStore for FakeStore {
         Ok(())
     }
 
+    async fn composer_drafts(
+        &self,
+        channel: &ChannelId,
+    ) -> Result<Vec<crate::contract::ComposerDraft>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let cutoff = super::now_ms().saturating_sub(7 * 24 * 60 * 60 * 1000);
+        state
+            .composer_drafts
+            .retain(|_, draft| draft.updated_ms >= cutoff);
+        let mut found: Vec<crate::contract::ComposerDraft> = state
+            .composer_drafts
+            .values()
+            .filter(|draft| draft.channel_id == channel.as_str())
+            .cloned()
+            .collect();
+        found.sort_by_key(|draft| draft.updated_ms);
+        Ok(found)
+    }
+
+    async fn put_composer_draft(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        scope: crate::contract::DraftScope,
+        text: &str,
+        device_id: &str,
+        device_label: &str,
+    ) -> Result<
+        (
+            Option<crate::contract::ComposerDraft>,
+            Option<crate::contract::ComposerDraft>,
+        ),
+        StoreError,
+    > {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let key = (
+            channel.as_str().to_owned(),
+            thread.to_owned(),
+            scope.as_str().to_owned(),
+        );
+        let previous = state.composer_drafts.get(&key).cloned();
+        if text.trim().is_empty() {
+            state.composer_drafts.remove(&key);
+            return Ok((None, previous.filter(|held| !held.text.trim().is_empty())));
+        }
+        let stamp = previous.as_ref().map_or_else(super::now_ms, |held| {
+            super::now_ms().max(held.updated_ms + 1)
+        });
+        let stored = crate::contract::ComposerDraft {
+            channel_id: channel.as_str().to_owned(),
+            thread_id: thread.to_owned(),
+            scope,
+            text: text.to_owned(),
+            device_id: device_id.to_owned(),
+            device_label: device_label.to_owned(),
+            updated_ms: stamp,
+            version: previous.as_ref().map_or(1, |held| held.version + 1),
+        };
+        let replaced = previous.filter(|held| held.text != stored.text);
+        state.composer_drafts.insert(key, stored.clone());
+        Ok((Some(stored), replaced))
+    }
+
+    async fn delete_composer_draft(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        scope: crate::contract::DraftScope,
+    ) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.composer_drafts.remove(&(
+            channel.as_str().to_owned(),
+            thread.to_owned(),
+            scope.as_str().to_owned(),
+        ));
+        Ok(())
+    }
+
+    async fn clear_channel_drafts(&self, channel: &ChannelId) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state
+            .composer_drafts
+            .retain(|(held, _, _), _| held != channel.as_str());
+        Ok(())
+    }
+
     async fn post_prefix(&self) -> Result<Option<String>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -1980,6 +2072,7 @@ impl StateStore for FakeStore {
         state.owner_prompt = None;
         state.post_prefix = None;
         state.client_settings.clear();
+        state.composer_drafts.clear();
         state.noise_exemptions.clear();
         state.pins.clear();
         state.pin_revisions.clear();

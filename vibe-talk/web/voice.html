@@ -482,11 +482,19 @@
             </details>
             <p id="discuss-stale" hidden><span id="discuss-stale-text"></span> <button id="discuss-update" type="button">Update</button></p>
             <div id="discuss-timeline"></div>
+            <div id="discuss-draft-offer" class="draft-sync-offer" role="group" aria-labelledby="discuss-draft-offer-text" hidden>
+              <p id="discuss-draft-offer-text"></p>
+              <button id="discuss-draft-use" type="button">Use draft</button>
+              <button id="discuss-draft-keep" class="secondary" type="button">Keep mine</button>
+              <button id="discuss-draft-discard" class="secondary" type="button">Discard</button>
+            </div>
             <!-- `discuss-followup-composer`: the main composer's box and keys. -->
             <div class="discuss-compose">
               <textarea id="discuss-followup" enterkeyhint="send" rows="2" data-lpignore="true" data-1p-ignore="true" data-form-type="other" autocomplete="off" placeholder="Ask about this…" aria-label="Ask a follow-up"></textarea>
+              <button id="discuss-save-draft" class="secondary" type="button">Save draft</button>
               <button id="discuss-send" type="button">Send</button>
             </div>
+            <p id="discuss-draft-note" class="hint" role="status" aria-live="polite" hidden></p>
             <div id="discuss-footer" hidden>
               <p id="discuss-covers"></p>
               <ul id="discuss-links"></ul>
@@ -807,6 +815,13 @@
                 </div>
               </section>
               <div id="channel-composer">
+                <!-- `#1840 vibe-talk-draft-sync-across-devices`: a draft another device synced. -->
+                <div id="draft-sync-offer" class="draft-sync-offer" role="group" aria-labelledby="draft-sync-offer-text" hidden>
+                  <p id="draft-sync-offer-text"></p>
+                  <button id="draft-sync-use" type="button">Use draft</button>
+                  <button id="draft-sync-keep" class="secondary" type="button">Keep mine</button>
+                  <button id="draft-sync-discard" class="secondary" type="button">Discard</button>
+                </div>
                 <!-- No heading line: it read like one more message. The box says where the message
                      goes in its placeholder, and names itself to a screen reader the same way. -->
                 <textarea id="channel-compose-text" enterkeyhint="send" data-lpignore="true" data-1p-ignore="true" data-form-type="other" rows="3" placeholder="Message the main channel…" aria-label="Message the main channel" aria-describedby="channel-compose-state"></textarea>
@@ -824,6 +839,7 @@
                     Send raw message
                   </label>
                   <button id="channel-cancel" class="secondary" type="button">Cancel</button>
+                  <button id="channel-save-draft" class="secondary" type="button">Save draft</button>
                   <button id="channel-send" type="button">Send</button>
                   <!-- `#340 composer-grow-box`: see #compose-grow. After Send in the markup, so Tab
                        goes from the box to the row's buttons first; drawn at the row's start. -->
@@ -2180,6 +2196,11 @@
                       <label class="toggle">
                         <input id="summarize-collapsed" type="checkbox" />
                         Summarize collapsed messages
+                      </label>
+                      <!-- `#1840 vibe-talk-draft-sync-across-devices`. Synced switch, on unless off. -->
+                      <label class="toggle">
+                        <input id="draft-autosync" type="checkbox" />
+                        Sync drafts across devices automatically
                       </label>
                     
                   </div>

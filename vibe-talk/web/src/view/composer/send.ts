@@ -25,6 +25,12 @@ export interface ChannelSendDependencies {
     save(): boolean;
   };
   storageOkay(): boolean;
+  /** `#1840`: the box's words as typed, for cross-device sync; absent, no sync. */
+  onDraftTyped?(text: string): void;
+  /** `#1840`: the composer was restored for a channel/thread. */
+  onComposerRestored?(): void;
+  /** `#1840`: the draft went out or was discarded. */
+  onDraftCleared?(): void;
   noteDraft(kind: string, key: string, channel: string, held: boolean): void;
   fitBox(box: HTMLElement): void;
   draftRefusedWords: string;
@@ -87,6 +93,7 @@ async function sendChannelMessage() {
     ...(raw ? { raw: true } : {}),
   });
   channelDrafts.delete(key);
+  deps.onDraftCleared?.();
   // A failed outbox write leaves the previous durable draft available as a last resort.
   if (outbox.storageOkay()) saveChannelDrafts();
   noteDraft("composer", key, String(channel), false);
@@ -132,6 +139,7 @@ function discardChannelDraft() {
   deps.setHiddenIfChanged(el("channel-discard"), true);
   el("channel-compose-text").value = "";
   channelDrafts.delete(key);
+  deps.onDraftCleared?.();
   // As `rememberChannelDraft`: a save the browser refuses is said where the box is, on failure only —
   // without it, what the device still holds would come back on a reload as if never discarded.
   const saved = saveChannelDrafts();
@@ -159,6 +167,7 @@ function rememberChannelDraft() {
   }
   // `#819 voice-page-quoted-reply-and-draft-chip`. Found again by the Draft chip; no newer for being unchanged.
   if (text !== before) noteDraft("composer", composerState().key, String(selectedChannelId() || ""), Boolean(text.trim()));
+  deps.onDraftTyped?.(text);
 }
 
 function restoreChannelComposer() {
@@ -178,6 +187,7 @@ function restoreChannelComposer() {
   fitGrowingBox(el("channel-compose-text"));
   // `#819 voice-page-quoted-reply-and-draft-chip`. Another channel's drafts, or this one's again.
   renderDraftChip();
+  deps.onComposerRestored?.();
 }
 
 function saveChannelDrafts() {

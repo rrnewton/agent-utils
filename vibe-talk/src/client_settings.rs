@@ -125,6 +125,10 @@ pub const SYNCED_KEYS: &[&str] = &[
     // Per-document starred/hidden state (`#1265 documents-star-hide`): a JSON map
     // by canonical document key, kept per item as the thread-card states are.
     "vibe-talk.voice.doc-states",
+    // Whether composer drafts auto-sync across devices (`#1840
+    // vibe-talk-draft-sync-across-devices`). On unless turned off; the
+    // Save draft button syncs either way.
+    "vibe-talk.draft-autosync",
 ];
 
 /// Summarize collapsed messages: `"1"` is on; anything else, or nothing held, is off.

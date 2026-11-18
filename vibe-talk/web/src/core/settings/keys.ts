@@ -58,6 +58,8 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   "vibe-talk.voice.identities",
   // `#1265 documents-star-hide`. Per-document starred/hidden state, as JSON by document key.
   "vibe-talk.voice.doc-states",
+  // `#1840 vibe-talk-draft-sync-across-devices`. Whether drafts auto-sync.
+  "vibe-talk.draft-autosync",
 ];
 
 /** `#488 slack-app-agents`. Who is who: which account is the owner, the coding agent, a person or

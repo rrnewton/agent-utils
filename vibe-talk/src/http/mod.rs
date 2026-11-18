@@ -342,6 +342,14 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/catchup/update",
             post(api::catchup_update),
         )
+        // `#1840 vibe-talk-draft-sync-across-devices`. WRITE scope all three,
+        // reads included: a draft is the owner's unsent words. NO MCP TOOL.
+        .route(
+            "/api/v1/channels/{channel_id}/drafts",
+            get(api::composer_drafts)
+                .put(api::put_composer_draft)
+                .delete(api::delete_composer_draft),
+        )
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))

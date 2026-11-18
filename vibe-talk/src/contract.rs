@@ -1904,6 +1904,105 @@ pub struct CatchupFollowupResponse {
     pub stamp: CatchupStamp,
 }
 
+/// Which composer a synced draft belongs to. `#1840 vibe-talk-draft-sync-across-devices`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftScope {
+    /// The channel/thread message box.
+    #[default]
+    Main,
+    /// The Discuss follow-up box for the same channel/thread.
+    Discuss,
+}
+
+impl DraftScope {
+    /// The stored name of this scope.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Discuss => "discuss",
+        }
+    }
+
+    /// The scope stored under `name`, when it is one.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "main" => Some(Self::Main),
+            "discuss" => Some(Self::Discuss),
+            _ => None,
+        }
+    }
+}
+
+/// One synced composer draft: the owner's unsent words for one channel/thread
+/// scope, last written by one device. `#1840 vibe-talk-draft-sync-across-devices`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ComposerDraft {
+    /// The channel the draft belongs to.
+    pub channel_id: String,
+    /// The thread the draft belongs to; empty for the channel itself.
+    pub thread_id: String,
+    /// Which composer the draft belongs to.
+    pub scope: DraftScope,
+    /// The unsent words, exactly as typed.
+    pub text: String,
+    /// The device that last wrote the draft.
+    pub device_id: String,
+    /// The writing device's coarse label, for the continue offer.
+    pub device_label: String,
+    /// When the server took this write, on the server's clock.
+    pub updated_ms: i64,
+    /// How many accepted writes this scope has taken; grows every write.
+    pub version: i64,
+}
+
+/// What `GET /api/v1/channels/{id}/drafts` answers. `#1840`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ComposerDrafts {
+    /// Every live draft in the channel, oldest first.
+    pub drafts: Vec<ComposerDraft>,
+}
+
+/// The body of `PUT /api/v1/channels/{id}/drafts`. `#1840`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct PutComposerDraftRequest {
+    /// The thread the draft belongs to; absent is the channel itself.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Which composer the draft belongs to.
+    pub scope: DraftScope,
+    /// The unsent words; empty clears the draft.
+    pub text: String,
+    /// The writing device's stable id.
+    pub device_id: String,
+    /// The writing device's coarse label.
+    pub device_label: String,
+    /// The version the writer last saw, when it saw one.
+    #[serde(default)]
+    pub base_version: Option<i64>,
+}
+
+/// What `PUT /api/v1/channels/{id}/drafts` answers. `#1840`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PutComposerDraftResponse {
+    /// The draft as now stored; absent when the write cleared it.
+    pub draft: Option<ComposerDraft>,
+    /// The draft this write replaced, when it held different words.
+    pub replaced: Option<ComposerDraft>,
+}
+
+/// The body of `DELETE /api/v1/channels/{id}/drafts`. `#1840`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct DeleteComposerDraftRequest {
+    /// The thread the draft belongs to; absent is the channel itself.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Which composer the draft belongs to.
+    pub scope: DraftScope,
+}
+
 /// Every root of the contract: each value that crosses a boundary on its own, by the name the
 /// generated code gives it.
 ///
@@ -1971,6 +2070,11 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<LabelsResponse>(),
         generator.subschema_for::<LabelGroupsResponse>(),
         generator.subschema_for::<LabelGroupRequest>(),
+        // `#1840 vibe-talk-draft-sync-across-devices`. Appended, for the same reason.
+        generator.subschema_for::<ComposerDrafts>(),
+        generator.subschema_for::<PutComposerDraftRequest>(),
+        generator.subschema_for::<PutComposerDraftResponse>(),
+        generator.subschema_for::<DeleteComposerDraftRequest>(),
     ]
 }
 

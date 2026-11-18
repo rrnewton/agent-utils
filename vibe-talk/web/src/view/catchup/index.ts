@@ -110,6 +110,12 @@ export interface DiscussViewDependencies {
   isReadNow?(id: string): boolean;
   /** Whether a bare Enter sends, handed to the panel's composer keys. */
   enterSends?(): boolean;
+  /** `#1840`: the follow-up box's words as typed, for cross-device sync. */
+  onFollowupTyped?(text: string, scope: DiscussScope): void;
+  /** `#1840`: a follow-up went out; its synced draft is done. */
+  onFollowupCleared?(scope: DiscussScope): void;
+  /** `#1840`: the panel opened on a scope; offer its synced draft. */
+  onDiscussOpened?(scope: DiscussScope): void;
   /** The channel on screen: the parent channel even in a thread. */
   selectedChannelId(): string;
   /** Which list the left column shows, and its thread where it shows one. */
@@ -484,6 +490,9 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     },
     isReadNow: (id: string) => deps.isReadNow?.(id) ?? false,
     enterSends: () => deps.enterSends?.() ?? true,
+    onFollowupTyped: (text, scope) => deps.onFollowupTyped?.(text, scope),
+    onFollowupCleared: (scope) => deps.onFollowupCleared?.(scope),
+    onDiscussOpened: (scope) => deps.onDiscussOpened?.(scope),
     onBusy(on) {
       busy = on;
       drawAvailability();

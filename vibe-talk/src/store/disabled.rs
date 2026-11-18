@@ -277,6 +277,44 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn composer_drafts(
+        &self,
+        _: &ChannelId,
+    ) -> Result<Vec<crate::contract::ComposerDraft>, StoreError> {
+        refuse()
+    }
+
+    async fn put_composer_draft(
+        &self,
+        _: &ChannelId,
+        _: &str,
+        _: crate::contract::DraftScope,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<
+        (
+            Option<crate::contract::ComposerDraft>,
+            Option<crate::contract::ComposerDraft>,
+        ),
+        StoreError,
+    > {
+        refuse()
+    }
+
+    async fn delete_composer_draft(
+        &self,
+        _: &ChannelId,
+        _: &str,
+        _: crate::contract::DraftScope,
+    ) -> Result<(), StoreError> {
+        refuse()
+    }
+
+    async fn clear_channel_drafts(&self, _: &ChannelId) -> Result<(), StoreError> {
+        refuse()
+    }
+
     async fn post_prefix(&self) -> Result<Option<String>, StoreError> {
         // A refusal, not `Ok(None)`, for the noise rules' reason: Settings must not believe it
         // could save. `post_prefix::current` applies the shipped tag by name.

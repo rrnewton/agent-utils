@@ -127,6 +127,8 @@ export const DEVICE_SETTINGS = Object.freeze({
   autoplay: offUnlessOn("vibe-talk.voice.autoplay", false),
   /** Whether Enter in the reply box sends. */
   enterSends: onUnlessOff("vibe-talk.voice.enter-sends"),
+  /** `#1840 vibe-talk-draft-sync-across-devices`. Whether drafts auto-sync. */
+  draftAutosync: onUnlessOff("vibe-talk.draft-autosync"),
   /** `#224 keyboard-shortcuts`. Whether single keys are shortcuts. */
   singleKeys: onUnlessOff("vibe-talk.voice.single-keys", true),
   /** `#242 rich-headers`. Whether a message's rich header is drawn as one. */
