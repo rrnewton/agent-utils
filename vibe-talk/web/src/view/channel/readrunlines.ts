@@ -13,6 +13,7 @@ export type ReadRunPeelEdge = "first" | "last";
 /** A row carrying its read-run line and days. */
 type RunRow = HTMLElement & {
   readRunLine?: HTMLButtonElement | null;
+  readRunPins?: HTMLButtonElement | null;
   readRunPeels?: HTMLElement | null;
   readRunPeelFirst?: HTMLButtonElement | null;
   readRunPeelLast?: HTMLButtonElement | null;
@@ -33,6 +34,7 @@ export interface ReadRunLinesDependencies {
   threadIdOf(message: unknown): string | null;
   selectionThread(): { root?: { id: unknown } | null } | null;
   openReadRun(row: Element): void;
+  openPinnedRun(row: Element): void;
   peelReadRun(row: Element, edge: ReadRunPeelEdge): void;
   readRunRows(row: Element): Element[];
 }
@@ -45,7 +47,7 @@ export interface ReadRunLines {
   readRunWords(row: Element): string;
   runDaysOf(row: Element): string;
   readRunCount(row: Element): number;
-  placeInReadRun(row: Element, role: string | null, count: number): void;
+  placeInReadRun(row: Element, role: string | null, count: number, pinned?: number): void;
   /** Show or hide `row`'s peel buttons for a still-folded count of `count` (the cards' own wording). */
   placeReadRunPeel(row: Element, count: number): void;
   isOpenThreadRoot(row: Element, rootId: string): boolean;
@@ -110,7 +112,36 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
     row.replaceChildren(line, ...row.children);
     held.readRunLine = line;
     ensurePeels(row as HTMLElement);
+    ensurePinsButton(row as HTMLElement);
     return line;
+  }
+
+  function pinsButton(row: HTMLElement): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.className = "read-run-pins";
+    button.setAttribute("type", "button");
+    button.hidden = true;
+    button.addEventListener("click", deps.inThisColumn((event: Event) => {
+      if (event) event.stopPropagation();
+      const focused = document.activeElement === button && button.matches(":focus-visible");
+      deps.openPinnedRun(row);
+      if (!focused) return;
+      const anchor = (row as Element).parentNode ? row as HTMLElement : liveUnpackedRow(row) || liveCardRow(row);
+      if (anchor) {
+        anchor.setAttribute("tabindex", "-1");
+        anchor.focus({ preventScroll: true });
+      }
+    }));
+    return button;
+  }
+
+  function ensurePinsButton(row: HTMLElement): HTMLButtonElement {
+    const held = row as RunRow;
+    if (held.readRunPins) return held.readRunPins;
+    const button = pinsButton(row);
+    held.readRunPins = button;
+    row.append(button);
+    return button;
   }
 
   function peelButton(row: HTMLElement, edge: ReadRunPeelEdge): HTMLButtonElement {
@@ -181,26 +212,37 @@ export function createReadRunLines(deps: ReadRunLinesDependencies): ReadRunLines
   const readRunCount = (row: Element): number =>
     deps.readRunRows(row).reduce((sum, one) => sum + idsOf(one).length, 0);
 
-  function placeInReadRun(row: Element, role: string | null, count: number): void {
+  function placeInReadRun(row: Element, role: string | null, count: number, pinned = 0): void {
     const held = row as RunRow;
     if (role === null) {
       if (row.hasAttribute("data-read-run")) row.removeAttribute("data-read-run");
       if (held.hidden) held.hidden = false;
       if (held.readRunLine && !held.readRunLine.hidden) held.readRunLine.hidden = true;
+      if (held.readRunPins && !held.readRunPins.hidden) held.readRunPins.hidden = true;
       if (held.readRunPeels && !held.readRunPeels.hidden) held.readRunPeels.hidden = true;
       return;
     }
     row.setAttribute("data-read-run", role);
     held.hidden = role === "member";
     if (role !== "head") {
+      if (held.readRunPins && !held.readRunPins.hidden) held.readRunPins.hidden = true;
       if (held.readRunPeels && !held.readRunPeels.hidden) held.readRunPeels.hidden = true;
       return;
     }
     const line = readRunLine(row);
-    const words = readRunText(count, runDaysOf(row)) as string;
+    const words = readRunText(count, runDaysOf(row), pinned) as string;
     if (line.textContent !== words) line.textContent = words;
     line.setAttribute("title", `Show ${count === 1 ? "this read message" : `these ${count} read messages`}`);
+    line.setAttribute("aria-label", `Show ${count} read message${count === 1 ? "" : "s"}`);
     line.hidden = false;
+    const pins = ensurePinsButton(row as HTMLElement);
+    if (pinned > 0) {
+      const label = `${pinned} pinned`;
+      if (pins.textContent !== label) pins.textContent = label;
+      pins.setAttribute("aria-label", `Show ${pinned} pinned message${pinned === 1 ? "" : "s"} in this folded run`);
+      pins.setAttribute("title", `Show only the ${pinned} pinned message${pinned === 1 ? "" : "s"} in this run`);
+      if (pins.hidden) pins.hidden = false;
+    } else if (!pins.hidden) pins.hidden = true;
     placeReadRunPeel(row, count);
   }
 

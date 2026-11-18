@@ -60,6 +60,7 @@ export interface ReadActsDependencies {
   threading(): boolean;
   eachColumnRenderCached(): void;
   openReadRun(row: Element): void;
+  openPinnedRun(row: Element): void;
   peelReadRun(row: Element, edge: "first" | "last"): void;
   readRunRows(row: Element): Element[];
   threadIdOf(message: unknown): string | null;
@@ -133,6 +134,7 @@ export function createReadActs(deps: ReadActsDependencies): ReadActs {
     threading: deps.threading,
     eachColumnRenderCached: deps.eachColumnRenderCached,
     openReadRun: deps.openReadRun,
+    openPinnedRun: deps.openPinnedRun,
     peelReadRun: deps.peelReadRun,
     readRunRows: deps.readRunRows,
     threadIdOf: deps.threadIdOf,

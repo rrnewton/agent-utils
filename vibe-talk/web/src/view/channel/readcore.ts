@@ -269,7 +269,8 @@ export interface TimelineViewDependencies {
   openThreadRootId(): string | null;
   isOpenThreadRoot(row: Element, rootId: string | null): boolean;
   readRunWords(row: Element): string;
-  placeInReadRun(row: Element, role: string, count: number): void;
+  placeInReadRun(row: Element, role: string, count: number, pinned?: number): void;
+  isPinnedId(id: unknown): boolean;
   runDaysOf(row: Element): string;
   renderReplyLinks(): void;
   leftEl(id: string): HTMLElement;
@@ -295,7 +296,7 @@ export interface TimelineViewDependencies {
   noiseRenderCount(): void;
   foldedOneIds(key: string): Set<string>;
   foldedOnes: Map<string, Set<string>>;
-  readRuns: { plan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>): Map<Element, { role: string; count: number }>; open(key: string, ids: string[]): void; peel(key: string, ids: string[]): void };
+  readRuns: { plan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>, isPinned?: (id: string) => boolean): Map<Element, { role: string; count: number; pinned: number }>; open(key: string, ids: string[]): void; peel(key: string, ids: string[]): void };
   /** Fold every revealed row back to its head line: a message out of a fold starts collapsed. */
   collapseRevealed(rows: readonly Element[]): void;
   setReadMode(mode: string): void;
@@ -351,9 +352,10 @@ export interface TimelineView {
   appendChannelRow(arriving: Message, live?: boolean, folded?: boolean): void;
   appendToColumns(arriving: Message, live?: boolean, replayed?: boolean): Message;
   applyReadRuns(): void;
-  readRunPlan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>): Map<Element, { role: string; count: number }>;
+  readRunPlan(rows: unknown, key: string, joins: unknown, idsFor?: unknown, forcedIds?: Set<string>): Map<Element, { role: string; count: number; pinned: number }>;
   readRunRows(row: Element): Element[];
   openReadRun(row: Element): void;
+  openPinnedRun(row: Element): void;
   peelReadRun(row: Element, edge: "first" | "last"): void;
   renderReadModeControl(): void;
   readRunsSuspended(): boolean;
@@ -2261,8 +2263,8 @@ function appendToColumns(arriving: Message, live = false, replayed = false): Mes
  * of what the gesture means.
  */
 
-function readRunPlan(rows: unknown, key: string, joins: unknown, idsFor: unknown = idsOf, forcedIds: Set<string> = new Set<string>()): Map<Element, { role: string; count: number }> {
-  return readRuns.plan(rows, key, joins, idsFor, forcedIds);
+function readRunPlan(rows: unknown, key: string, joins: unknown, idsFor: unknown = idsOf, forcedIds: Set<string> = new Set<string>()): Map<Element, { role: string; count: number; pinned: number }> {
+  return readRuns.plan(rows, key, joins, idsFor, forcedIds, (id: string) => deps.isPinnedId(id));
 }
 
 /**
@@ -2302,17 +2304,17 @@ function applyReadRuns(): void {
     ((readModes.mode() === "fold" && rowIsRead(row)) || idsOf(row).some((id) => forced.has(id))),
     idsOf, forced) : new Map();
   listState().runRows = placed.size;
-  const want = (row: Element) => placed.get(row) || { role: null, count: 0 };
+  const want = (row: Element) => placed.get(row) || { role: null, count: 0, pinned: 0 };
   const changed = rows.some((row: Element) => {
-    const { role, count } = want(row);
+    const { role, count, pinned } = want(row);
     return (row.getAttribute("data-read-run") || null) !== role ||
-      (role === "head" && readRunWords(row) !== readRunText(count, runDaysOf(row)));
+      (role === "head" && readRunWords(row) !== readRunText(count, runDaysOf(row), pinned));
   });
   if (!changed) return;
   const apply = () => {
     for (const row of rows) {
-      const { role, count } = want(row);
-      placeInReadRun(row, role, count);
+      const { role, count, pinned } = want(row);
+      placeInReadRun(row, role, count, pinned);
     }
   };
   // Only where the list is the one on screen: anywhere else there is no reader in it to hold.
@@ -2399,6 +2401,37 @@ function peelReadRun(row: Element, edge: "first" | "last"): void {
   const folded = foldedOnes.get(key);
   if (folded) for (const id of ids) folded.delete(id);
   if (folded && folded.size === 0) foldedOnes.delete(key);
+  if (thread !== null) {
+    cardsDrawn.forget();
+    renderSideColumn();
+    keepSelection();
+    return;
+  }
+  applyReadRuns();
+  renderScrollTools();
+  requestVisibleSummaries();
+}
+
+function openPinnedRun(row: Element): void {
+  if (!row || !row.hasAttribute("data-read-run")) return;
+  const thread = row.getAttribute("data-unpack-thread");
+  if (thread === null && row.parentNode === leftEl("side-cards")) {
+    const runRows = cardRunRows(row);
+    const ids = runRows.flatMap(cardRunIds).filter((id) => deps.isPinnedId(id));
+    if (ids.length === 0) return;
+    readRuns.peel(cardRunKey(), ids);
+    cardsDrawn.forget();
+    renderSideColumn();
+    keepSelection();
+    return;
+  }
+  const key = thread === null ? viewKey() : viewKey("thread", thread);
+  const runRows = readRunRows(row);
+  const ids = runRows.flatMap(idsOf).filter((id) => deps.isPinnedId(id));
+  if (ids.length === 0) return;
+  const revealed = runRows.filter((one) => idsOf(one).some((id) => deps.isPinnedId(id)));
+  deps.collapseRevealed(revealed);
+  readRuns.peel(key, ids);
   if (thread !== null) {
     cardsDrawn.forget();
     renderSideColumn();
@@ -2546,7 +2579,7 @@ function readRunsSuspended() {
     queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage,
     renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage,
     loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta,
-    loadDiscord, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition,
+    loadDiscord, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition,
     dispose() { disposed = true; },
   };
 }

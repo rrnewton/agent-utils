@@ -21,6 +21,11 @@ test("`#624 voice-page-modularity`: what a fold hides, and the lines for gaps an
   assert.equal(lineLabel(readRunText(12, "Oct 3 – 5")), "12 read messages · Oct 3 – 5");
   assert.equal(cardGapWords(3, 2, false, true), "… at least 3 unmatched messages in 2 threads …");
   assert.equal(cardRunText(1, 2), "… 1 read thread and 2 read messages");
+  // #1850: a run holding pins names them; without pins the words are unchanged.
+  assert.equal(readRunText(5), "… 5 read messages …");
+  assert.equal(readRunText(5, "", 1), "… 5 read messages, 1 pinned …");
+  assert.equal(readRunText(5, "", 2), "… 5 read messages, 2 pinned …");
+  assert.equal(lineLabel(readRunText(5, "", 2)), "5 read messages, 2 pinned");
 });
 
 test("`#624 voice-page-modularity`: the Undo chip's words and a reaction's face, from the module alone", () => {

@@ -67,7 +67,8 @@ const reactionText = (tally: ReactionFace): string => (tally.custom ? `:${tally.
  * What a collapsed run's line says: how many, and the days it brings (`#250 date-separators`), held
  * together as a gap's line is (`lineWords`) so a narrow line breaks only between the two.
  */
-const readRunText = (count: number, days = ""): string => lineWords(`… ${count} read message${count === 1 ? "" : "s"}`, days);
+const readRunText = (count: number, days = "", pinned = 0): string => lineWords(
+  `… ${count} read message${count === 1 ? "" : "s"}${pinned > 0 ? `, ${pinned} pinned` : ""}`, days);
 
 /**
  * `#245 done-feedback`. What the Undo chip calls the message it would put back: the message's first

@@ -1236,6 +1236,14 @@ body .side-card-row[data-linked="true"] {
   display: none !important;
 }
 
+/* ...but the pinned count beside the line (`#1850`): a second target on the
+   head row, shown only while the run holds pins. */
+#side-log li.discord-message[data-read-run="head"] > .read-run-pins:not([hidden]),
+#side-cards li.discord-message[data-read-run="head"] > .read-run-pins:not([hidden]),
+#discord-log li.discord-message[data-read-run="head"] > .read-run-pins:not([hidden]) {
+  display: block !important;
+}
+
 /* ...but the bookmark's line, which a run can start right under. Equal weight and later, so it
    wins. `#240 reading-bookmark`. */
 #side-log li.discord-message[data-read-run="head"] > .bookmark-line,
@@ -1300,6 +1308,38 @@ body .side-card-row[data-linked="true"] {
 #side-log .read-run:focus-visible,
 #side-cards .read-run:focus-visible,
 #discord-log .read-run:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+#side-log .read-run-pins,
+#side-cards .read-run-pins,
+#discord-log .read-run-pins {
+  order: 1;
+  align-self: center;
+  margin: 0;
+  padding: 0.25rem 0.4rem;
+  background: none;
+  border: none;
+  border-radius: 0.6rem;
+  color: var(--accent);
+  font: inherit;
+  font-size: calc(0.82rem * var(--msg-scale));
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#side-log .read-run-pins[hidden],
+#side-cards .read-run-pins[hidden],
+#discord-log .read-run-pins[hidden] {
+  display: none !important;
+}
+
+#side-log .read-run-pins:focus-visible,
+#side-cards .read-run-pins:focus-visible,
+#discord-log .read-run-pins:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }

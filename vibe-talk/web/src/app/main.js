@@ -2801,7 +2801,7 @@ const searchRows = createSearchRows({
   searchKey: () => searchKey(),
   viewKey: () => viewKey(),
   runDaysOf: (row) => runDaysOf(row),
-  placeInReadRun: (row, role, count) => placeInReadRun(row, role, count),
+  placeInReadRun: (row, role, count, pinned) => placeInReadRun(row, role, count, pinned),
   readRunCount: (row) => readRunCount(row),
   changing: () => filterChanges.changing(),
   currentFilterHold,
@@ -5839,6 +5839,7 @@ const readActs = createReadActs({
   threading: () => providerFacts.threading(),
   eachColumnRenderCached: () => eachColumn(renderCachedTimeline),
   openReadRun: (row) => openReadRun(/** @type {any} */ (row)),
+  openPinnedRun: (row) => openPinnedRun(/** @type {any} */ (row)),
   peelReadRun: (row, edge) => peelReadRun(/** @type {any} */ (row), edge),
   readRunRows: (row) => readRunRows(row),
   threadIdOf: (message) => threadOf(message),
@@ -5923,6 +5924,7 @@ const pinnedMessagesOwner = createPinnedMessages({
   eachColumn,
   preservingScroll,
   renderChannelRows: () => renderChannelRows(),
+  refreshReadRuns: () => applyReadRuns(),
   renderScrollTools,
   threading: () => providerFacts.threading(),
   heldThreads: () => channelStore.current().threads,
@@ -6422,7 +6424,7 @@ const cardRuns = createCardRuns({
   rowIsRead: (row) => rowIsRead(row),
   readRunPlan: (items, key, isRead, ids) => /** @type {any} */ (readRunPlan(/** @type {any} */ (items), key, /** @type {any} */ (isRead), /** @type {any} */ (ids))),
   readRunLine: (row) => readRunLine(row),
-  placeInReadRun: (row, role, count) => placeInReadRun(row, /** @type {any} */ (role), count),
+  placeInReadRun: (row, role, count, pinned) => placeInReadRun(row, /** @type {any} */ (role), count, pinned),
   placeReadRunPeel: (row, count) => placeReadRunPeel(row, count),
   keepingCardPlace: (change) => keepingCardPlace(change),
   makeColumnLinksDeps: () => ({
@@ -7119,14 +7121,14 @@ const timelineView = createTimelineView({
   selectionIn: (area) => textSelectionIn(area),
   restoreSelectionIn: (area, selection) => restoreTextSelectionIn(area, selection),
   combineOn: () => combineSwitch.on(), columns, sideShowing, openThreadRootId,
-  isOpenThreadRoot, readRunWords, placeInReadRun, runDaysOf, renderReplyLinks, leftEl,
+  isOpenThreadRoot, readRunWords, placeInReadRun, runDaysOf, renderReplyLinks, leftEl, isPinnedId,
   cardRunKey, cardRunRows, screensScreen: () => screens.screen(), searchField, authorChosen: () => authorFilters.chosen(), searchTyped, stillToDo, cardsDrawnForget: () => cardsDrawn.forget(), renderSideColumn, keepSelection,
   syncCanonDismissed, olderTriggerPx: OLDER_TRIGGER_PX, threadPresence, openThreadName,
   captureScroll, restoreScroll, screensView: () => screens.view(), renderJumpNewest,
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
 });
-const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
+const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, openPinnedRun, peelReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
 /**
  * Walking back for older rows, and for a search (web/src/view/channel `mountOlderWalks`,
  * `#624 voice-page-modularity`): the step-back control, the search's bounded walk, the server

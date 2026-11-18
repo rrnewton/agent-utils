@@ -1411,6 +1411,56 @@ test("Fold read collapses runs of two rows or more, split by unread messages, ne
   assert.equal(page.pageReads, reads, "Fold read read the channel again; Show and Fold are one read");
 });
 
+test("Fold read: a fold with a pin names it, and tapping the pin count shows only the pinned rows (#1850)", async () => {
+  const page = newPage();
+  await signIn(page);
+  const at = (minutes) => new Date(MESSAGE_EPOCH + minutes * 60000).toISOString();
+  const ids = ["1850000000000000001", "1850000000000000002", "1850000000000000003",
+    "1850000000000000004", "1850000000000000005", "1850000000000000006", "1850000000000000007"];
+  const messages = ids.map((id, atIndex) => {
+    if (atIndex < 6) page.dealtWith.add(id);
+    return message({ id, timestamp: at(atIndex), content: `message ${atIndex + 1}`, ...CODER });
+  });
+  page.pinned.set(ids[2], storedPin(messages[2], 1));
+  page.servePinsRevision = true;
+  page.pinsRevision = 1;
+  const rows = await showDiscord(page, messages);
+  void rows;
+  await chooseReadMode(page, "Fold read");
+  const head = () => page.el("discord-log").children.find((li) => li.getAttribute("data-read-run") === "head");
+  const pinsButton = (li) => li.children.find((node) => node.className === "read-run-pins");
+  assert.match(readRunLineOf(head()).textContent.replace(/\u00a0/g, " "), /^… 6 read messages, 1 pinned( · .+)? …$/);
+  const button = pinsButton(head());
+  assert.ok(button && !button.hidden, "the pinned count is not a separate target");
+  assert.equal(button.getAttribute("aria-label"), "Show 1 pinned message in this folded run");
+  assert.equal(readRunLineOf(head()).getAttribute("aria-label"), "Show 6 read messages");
+  // Tapping the pinned count reveals only the pinned row, splitting the fold.
+  await button.click();
+  await page.settle();
+  const visible = page.el("discord-log").children.filter((li) => !li.hidden);
+  assert.deepStrictEqual(visible.map((li) => li.getAttribute("data-id")), [ids[0], ids[2], ids[3], ids[6]],
+    "the pinned split did not leave separators before and after the pinned row");
+  assert.match(readRunLineOf(rowWithId(page, ids[0])).textContent.replace(/\u00a0/g, " "), /^… 2 read messages( · .+)? …$/);
+  assert.match(readRunLineOf(rowWithId(page, ids[3])).textContent.replace(/\u00a0/g, " "), /^… 3 read messages( · .+)? …$/);
+  // A pin added elsewhere inside a still-folded segment updates its count in
+  // place, on the same row elements (no rebuild).
+  const segmentHead = rowWithId(page, ids[3]);
+  const rowsBefore = [...page.el("discord-log").children];
+  page.pinned.set(ids[4], storedPin(messages[4], 2));
+  page.pinsRevision = 2;
+  await pollOnce(page);
+  await page.settle();
+  assert.match(readRunLineOf(segmentHead).textContent.replace(/\u00a0/g, " "), /^… 3 read messages, 1 pinned( · .+)? …$/,
+    "an external pin did not update the folded segment's count");
+  assert.ok([...page.el("discord-log").children].every((li, atIndex) => li === rowsBefore[atIndex]),
+    "a pin change rebuilt the rows instead of updating the line in place");
+  // Tapping the rest of a separator expands the whole fold, as today.
+  await readRunLineOf(rowWithId(page, ids[0])).click();
+  await page.settle();
+  assert.ok(page.el("discord-log").children.every((li) => !li.hidden && !li.hasAttribute("data-read-run")),
+    "the main line did not expand the whole fold");
+});
+
 test("Fold read: a message marked Done joins the runs around it, and the reader does not move", async () => {
   const page = newPage();
   const messages = joiningChannel(page);

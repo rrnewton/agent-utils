@@ -276,6 +276,7 @@ export interface PinnedMessagesDependencies {
   eachColumn(fn: () => void): void;
   preservingScroll(fn: () => void): void;
   renderChannelRows(): void;
+  refreshReadRuns(): void;
   renderScrollTools(): void;
   threading(): boolean;
   heldThreads(): Array<{ root?: Message | null }>;
@@ -388,10 +389,20 @@ export function createPinnedMessages(deps: PinnedMessagesDependencies): PinnedMe
   }
 
   function renderPins(): void {
-    deps.eachColumn(() => {
-      deps.preservingScroll(deps.renderChannelRows);
-      deps.renderScrollTools();
-    });
+    if (pinsView().only) {
+      deps.eachColumn(() => {
+        deps.preservingScroll(deps.renderChannelRows);
+        deps.renderScrollTools();
+      });
+    } else {
+      // #1850: a pin change updates each row's chip and the fold lines in place,
+      // without rebuilding the rows (#1839 row reuse).
+      deps.eachColumn(() => {
+        for (const row of el("discord-log").children) drawRowPin(row);
+        deps.refreshReadRuns();
+        deps.renderScrollTools();
+      });
+    }
     for (const row of leftEl("side-cards").children) {
       if (row.hasAttribute("data-main-row") || row.hasAttribute("data-unpack-thread")) drawRowPin(row);
     }

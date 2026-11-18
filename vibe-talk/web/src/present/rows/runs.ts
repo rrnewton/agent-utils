@@ -20,6 +20,7 @@ const READ_RUN_PEEL_MIN = 10;
 interface RunPlace {
   role: string;
   count: number;
+  pinned: number;
 }
 
 /** The runs of read messages, and the ones the reader opened (`createReadRuns`). */
@@ -55,7 +56,7 @@ interface ReadRuns {
    * it themselves — and the last row may join for one, where a read run never takes it.
    */
   plan<Row>(rows: readonly Row[], key: string, joins: (row: Row) => boolean, idsFor: (row: Row) => string[],
-    forcedIds?: ReadonlySet<string>): Map<Row, RunPlace>;
+    forcedIds?: ReadonlySet<string>, isPinned?: (id: string) => boolean): Map<Row, RunPlace>;
 }
 
 /** The read runs' owner, with no run opened. */
@@ -96,14 +97,15 @@ function createReadRuns(): ReadRuns {
       peeledReadRuns.clear();
     },
     plan<Row>(rows: readonly Row[], key: string, joins: (row: Row) => boolean, idsFor: (row: Row) => string[],
-      forcedIds: ReadonlySet<string> = new Set<string>()): Map<Row, RunPlace> {
+      forcedIds: ReadonlySet<string> = new Set<string>(), isPinned: (id: string) => boolean = () => false): Map<Row, RunPlace> {
       const opened = openedReadRuns.get(key) || new Set<string>();
       const peeled = peeledReadRuns.get(key) || new Set<string>();
       const placed = new Map<Row, RunPlace>();
       let run: Row[] = [];
       const place = (part: Row[]): void => {
         const ids = part.flatMap(idsFor);
-        part.forEach((row, index) => placed.set(row, { role: index === 0 ? "head" : "member", count: ids.length }));
+        const pinned = ids.filter((id) => isPinned(id)).length;
+        part.forEach((row, index) => placed.set(row, { role: index === 0 ? "head" : "member", count: ids.length, pinned }));
       };
       const close = (): void => {
         const ids = run.flatMap(idsFor);
