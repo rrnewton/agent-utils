@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-route-health-alert: alert when an /api route fails 100% of a window'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -31,3 +31,7 @@ updated_at: 2026-11-18T10:30:00-05:00
 # Notes
 
 Follow-up to #1844, filed at the coordinator's request (owner thread 185). Design sent to the coordinator before building; this issue does not block the #1844 fix.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 1066b089 (gate pass; combined tree verified against the api.rs/integration.rs overlap, 48 focused tests there). The access layer counts every /api/ answer per folded route into a one-hour in-process registry; a minute tick closes each window and raises an ERROR line for any route with at least five requests and no success; /healthz carries the top-20 route counts and the last window's alerts.
