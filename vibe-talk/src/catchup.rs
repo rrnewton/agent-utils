@@ -1313,9 +1313,7 @@ mod tests {
         // configured `[render] reference_links` rule links an id the model
         // wrote bare, with no link of its own. The rule here is test
         // configuration only; vibe-talk ships no project rule.
-        use crate::render::references::{
-            ReferenceLinkRule, ReferenceLinks, ReferenceLinksGuard,
-        };
+        use crate::render::references::{ReferenceLinkRule, ReferenceLinks, ReferenceLinksGuard};
         let _links = ReferenceLinksGuard::set(
             ReferenceLinks::compile(&[ReferenceLinkRule {
                 pattern: r"\bagent-utils-([0-9]+)\b".to_owned(),
@@ -1347,7 +1345,10 @@ mod tests {
             ),
             "configured id not linked in Discuss output: {html}"
         );
-        assert!(html.contains(">agent-utils-1807</a>"), "link label wrong: {html}");
+        assert!(
+            html.contains(">agent-utils-1807</a>"),
+            "link label wrong: {html}"
+        );
     }
 
     #[test]

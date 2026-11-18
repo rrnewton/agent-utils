@@ -206,7 +206,11 @@ pub fn for_speech_with(content: &str, now_ms: i64, zone: &Zone, names: &mut Name
 /// `(09:51 ↗)` out of scope (`#1823 vibe-talk-tts-skip-timestamps-and-auto-link-ids`).
 /// The time is `H:MM` or `H:MM:SS`; anything else in the parentheses is prose.
 fn is_timestamp_citation(label: &str) -> bool {
-    let Some(inner) = label.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+    let Some(inner) = label
+        .trim()
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+    else {
         return false;
     };
     let Some((time, mark)) = inner.trim().rsplit_once(' ') else {
@@ -217,7 +221,9 @@ fn is_timestamp_citation(label: &str) -> bool {
     }
     let parts: Vec<&str> = time.split(':').collect();
     (parts.len() == 2 || parts.len() == 3)
-        && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         && parts[0].len() <= 2
         && parts[1..].iter().all(|p| p.len() == 2)
 }
@@ -261,7 +267,10 @@ fn drop_timestamp_citations(content: &str) -> String {
 /// be left floating after a space: trim the space already written when
 /// the next character is sentence punctuation.
 fn drop_before_punctuation(out: &mut String, chars: &[char], end: usize) {
-    if chars.get(end).is_some_and(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?')) {
+    if chars
+        .get(end)
+        .is_some_and(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
+    {
         while out.ends_with(' ') {
             out.pop();
         }
@@ -1319,7 +1328,10 @@ mod tests {
             "Ada shipped the fix."
         );
         assert_eq!(say("Ada shipped the fix (13:33 ↩)"), "Ada shipped the fix");
-        assert_eq!(say("Ada shipped the fix (13:33:07 ↗). Next."), "Ada shipped the fix. Next.");
+        assert_eq!(
+            say("Ada shipped the fix (13:33:07 ↗). Next."),
+            "Ada shipped the fix. Next."
+        );
         // Not citations: a bare time, a time with words, and a link whose
         // label merely contains a time are all still spoken.
         assert_eq!(say("at 13:33 we ship"), "at 13:33 we ship");
