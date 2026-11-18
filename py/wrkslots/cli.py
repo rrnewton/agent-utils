@@ -6810,11 +6810,16 @@ def _pidfd_getfd(pidfd: int, target_fd: int) -> int:
     return int(result)
 
 
-def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int:
-    """Prove the coordinator holds the lock and return a duplicate of its lock descriptor.
+def _adopt_held_config_lock(
+    claim: _HeldConfigLockClaim, lock_path: Path, file_path: Path | None = None
+) -> tuple[int, Path]:
+    """Prove the coordinator holds the lock and return its lock descriptor.
 
-    The caller holds the returned descriptor for the locked section, then closes it without
-    unlocking.
+    The held descriptor may name the legacy lock directory or, from an
+    upgraded coordinator, the dedicated config lock file (#1808-D); the
+    second return value says which object it proved. The caller holds
+    the returned descriptor for the locked section, then closes it
+    without unlocking.
     """
 
     raw = claim.raw
@@ -6845,6 +6850,12 @@ def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int
             refuse(f"coordinator PID {pid} is not authenticated: {exc}")
     coordinator = claim.coordinator
     expected = _directory_identity_for_lock(lock_path)
+    file_expected: os.stat_result | None = None
+    if file_path is not None:
+        try:
+            file_expected = file_path.stat()
+        except OSError:
+            file_expected = None
     try:
         pidfd = os.pidfd_open(pid)
     except OSError as exc:
@@ -6877,7 +6888,17 @@ def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int
             observed = os.fstat(held)
         except OSError as exc:
             refuse(f"cannot inspect descriptor {fd} of coordinator PID {pid} ({exc.strerror})")
-        if not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != (
+        adopted = lock_path
+        matched = expected
+        if (
+            file_expected is not None
+            and stat.S_ISREG(observed.st_mode)
+            and (observed.st_dev, observed.st_ino)
+            == (file_expected.st_dev, file_expected.st_ino)
+        ):
+            adopted = file_path  # type: ignore[assignment]
+            matched = file_expected
+        elif not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != (
             expected.st_dev,
             expected.st_ino,
         ):
@@ -6899,7 +6920,7 @@ def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int
         modes: set[str] = set()
         for line in fdinfo.splitlines():
             match = _FDINFO_FLOCK_LINE.match(line)
-            if match is not None and int(match["inode"]) == expected.st_ino:
+            if match is not None and int(match["inode"]) == matched.st_ino:
                 modes.add(match["mode"])
         if "WRITE" not in modes:
             refuse(
@@ -6907,14 +6928,17 @@ def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int
                 + (" (only a shared one)" if "READ" in modes else "")
             )
         probe_fd = os.open(
-            lock_path,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            adopted,
+            os.O_RDONLY
+            | (os.O_DIRECTORY if adopted == lock_path else 0)
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
         )
         try:
             try:
                 fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return held
+                return held, adopted
             fcntl.flock(probe_fd, fcntl.LOCK_UN)
         finally:
             os.close(probe_fd)
@@ -6925,17 +6949,85 @@ def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int
         raise
 
 
+CONFIG_LOCK_NAME = "config.lock"
+
+
+def _open_config_lock_file(file_path: Path) -> int:
+    """Open (creating with mode 0600) the dedicated config lock file."""
+
+    try:
+        fd = os.open(
+            file_path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as exc:
+        raise Refusal(f"cannot open configuration lock {file_path}: {exc}") from exc
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError as exc:
+        os.close(fd)
+        raise Refusal(f"cannot inspect configuration lock {file_path}: {exc}") from exc
+    if not stat.S_ISREG(mode):
+        os.close(fd)
+        raise Refusal(f"configuration lock is not a regular file: {file_path}")
+    return fd
+
+
 @contextlib.contextmanager
 def _locked_config(
-    path: Path, wait_seconds: float | None, *, exclusive: bool = True
+    path: Path,
+    wait_seconds: float | None,
+    *,
+    exclusive: bool = True,
+    control: Path | None = None,
 ) -> Iterator[None]:
+    """Hold the configuration locks in their fixed order (#1808-D).
+
+    First the legacy flock on the project root directory (the lock every
+    released version takes, so upgraded and legacy processes stay
+    mutually exclusive), then the dedicated ``<control>/config.lock``
+    file. The legacy flock is dropped only in a later stage, once no
+    legacy binary remains. Without a control directory (config writes
+    before it exists) the legacy lock alone is taken.
+    """
+
     lock_path = path.parent
+    file_path = None if control is None else control / CONFIG_LOCK_NAME
+    deadline = time.monotonic() + _resolved_wait_seconds(wait_seconds)
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     claim = _held_config_lock_claim
     if claim is not None:
-        held = _adopt_held_config_lock(claim, lock_path)
+        held, adopted = _adopt_held_config_lock(claim, lock_path, file_path)
+        other_fd: int | None = None
         try:
+            # Take whichever lock the coordinator did not delegate, in the
+            # same fixed order relative to the adopted one: the adopted
+            # lock is already held, so acquiring the other cannot cycle.
+            if file_path is not None and adopted == lock_path:
+                other_fd = _open_config_lock_file(file_path)
+                if not _flock_until(other_fd, operation, deadline):
+                    raise _LockBusy(
+                        f"configuration lock is busy for {file_path}; retry after the "
+                        "other wrkslots mutation exits"
+                    )
+            elif adopted != lock_path:
+                other_fd = os.open(
+                    lock_path,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                )
+                if not _flock_until(other_fd, operation, deadline):
+                    raise _LockBusy(
+                        f"configuration lock is busy for {lock_path}; retry after the "
+                        "other wrkslots mutation exits"
+                    )
             yield
         finally:
+            if other_fd is not None:
+                try:
+                    _flock_release(other_fd)
+                finally:
+                    os.close(other_fd)
             # Close, never unlock: the duplicate shares the coordinator's open file description,
             # so flock(LOCK_UN) here would release the coordinator's lock as well.
             os.close(held)
@@ -6955,20 +7047,33 @@ def _locked_config(
     if not stat.S_ISDIR(mode):
         os.close(fd)
         raise Refusal(f"configuration lock is not a directory: {lock_path}")
-    deadline = time.monotonic() + _resolved_wait_seconds(wait_seconds)
-    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    file_fd: int | None = None
     try:
         if not _flock_until(fd, operation, deadline):
             raise _LockBusy(
                 f"configuration lock is busy for {lock_path}; retry after the "
                 "other wrkslots mutation exits"
             )
+        if file_path is not None:
+            file_fd = _open_config_lock_file(file_path)
+            if not _flock_until(file_fd, operation, deadline):
+                raise _LockBusy(
+                    f"configuration lock is busy for {file_path}; retry after the "
+                    "other wrkslots mutation exits"
+                )
         yield
     finally:
         try:
-            _flock_release(fd)
+            if file_fd is not None:
+                try:
+                    _flock_release(file_fd)
+                finally:
+                    os.close(file_fd)
         finally:
-            os.close(fd)
+            try:
+                _flock_release(fd)
+            finally:
+                os.close(fd)
 
 
 def _remaining_lock_wait(deadline: float) -> float:
@@ -6995,6 +7100,7 @@ def _mutation_locks(
             config.config_path,
             _remaining_lock_wait(effective_deadline),
             exclusive=not shared,
+            control=config.control,
         ):
             current = _load_config(str(config.root), config.machine)
             if current != config:
@@ -7025,6 +7131,7 @@ def _mutation_locks(
         config.config_path,
         _remaining_lock_wait(effective_deadline),
         exclusive=not shared,
+        control=config.control,
     ):
         current = _load_config(str(config.root), config.machine)
         if current != config:
@@ -92567,7 +92674,7 @@ def _cmd_config_help(args: argparse.Namespace) -> int:
 def _cmd_config_convert(args: argparse.Namespace) -> int:
     # Loading validates the whole configuration first: an invalid file is not rewritten.
     config = _load_config(args.project_root, args.machine)
-    with _locked_config(config.config_path, args.wait_lock):
+    with _locked_config(config.config_path, args.wait_lock, control=config.control):
         raw, current = _read_config_document(config.config_path)
         _write_config(config.config_path, raw, args.target)
     backup = config.config_path.with_name(config.config_path.name + ".bak")

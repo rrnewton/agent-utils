@@ -7163,3 +7163,45 @@ fn append_refuses_an_active_record_from_a_stale_previous_revision() {
     assert_eq!(event_names(&events), before);
     replay(&events).expect("the log still replays");
 }
+
+#[test]
+fn config_lock_dual_locks_the_legacy_root_and_the_config_file() {
+    // #1808-D: an upgraded mutation holds BOTH the legacy project-root
+    // flock and <control>/config.lock, in that order, until it drops.
+    let scratch = Scratch::new();
+    let cfg = flat_cfg(&scratch);
+    fs::create_dir_all(&cfg.root).expect("project root");
+    fs::create_dir_all(&cfg.control).expect("control directory");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let locks = crate::hold_write::acquire_config_lock_with_deadline(&cfg, deadline)
+        .expect("acquire config locks");
+    let lock_file = cfg.control.join("config.lock");
+    assert!(lock_file.is_file(), "config.lock must be created");
+    let probe_file = std::fs::File::open(&lock_file).unwrap();
+    assert!(
+        rustix::fs::flock(
+            &probe_file,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        )
+        .is_err(),
+        "config.lock must be held"
+    );
+    let probe_root = std::fs::File::open(&cfg.root).unwrap();
+    assert!(
+        rustix::fs::flock(
+            &probe_root,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        )
+        .is_err(),
+        "the legacy root flock must be held"
+    );
+    drop(locks);
+    assert!(
+        rustix::fs::flock(
+            &probe_file,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        )
+        .is_ok(),
+        "config.lock must be free after the drop"
+    );
+}

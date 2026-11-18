@@ -1968,7 +1968,7 @@ def _cmd_image_set_default(args: argparse.Namespace) -> int:
     from wrkslots import cli
 
     config = _config(args)
-    with cli._locked_config(config.config_path, args.wait_lock):
+    with cli._locked_config(config.config_path, args.wait_lock, control=config.control):
         raw = cli._read_config(config.config_path)
         updated = dict(raw)
         if args.representation == "worktree":
@@ -2564,7 +2564,7 @@ def _cmd_sandbox_write_defaults(args: argparse.Namespace) -> int:
     from wrkslots import cli
 
     config = _config(args)
-    with cli._locked_config(config.config_path, args.wait_lock):
+    with cli._locked_config(config.config_path, args.wait_lock, control=config.control):
         raw = cli._read_config(config.config_path)
         existing = raw.get("sandbox", {})
         if not isinstance(existing, dict):

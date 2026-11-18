@@ -6,6 +6,7 @@
 //! atomic HOLD record write. Fixture registries only until the
 //! edition cutover (see `ensure_states::require_fixture`).
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -408,6 +409,7 @@ pub(crate) fn refuse_target_storage_except_nested(
 
 pub(crate) struct ConfigLock {
     _file: std::fs::File,
+    _config_file: Option<std::fs::File>,
 }
 
 pub(crate) fn acquire_config_lock(cfg: &Cfg) -> Result<ConfigLock> {
@@ -425,17 +427,43 @@ pub(crate) fn acquire_config_lock_with_deadline(
     cfg: &Cfg,
     deadline: std::time::Instant,
 ) -> Result<ConfigLock> {
+    // Dual lock in the fixed order (#1808-D): the legacy flock on the
+    // project root directory first (the lock every released version
+    // takes), then the dedicated config.lock file, one shared deadline.
     let file = std::fs::File::open(&cfg.root).map_err(|error| {
         format!(
             "cannot open configuration lock {}: {error}",
             cfg.root.display()
         )
     })?;
-    match crate::ensure_states::flock_wait(&file, deadline) {
-        Ok(()) => Ok(ConfigLock { _file: file }),
-        Err(_) => Err(format!(
+    crate::ensure_states::flock_wait(&file, deadline).map_err(|_| {
+        format!(
             "configuration lock is busy for {}; retry after the other wrkslots mutation exits",
             cfg.root.display()
+        )
+    })?;
+    let lock_file_path = cfg.control.join("config.lock");
+    let config_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_file_path)
+        .map_err(|error| {
+            format!(
+                "cannot open configuration lock {}: {error}",
+                lock_file_path.display()
+            )
+        })?;
+    match crate::ensure_states::flock_wait(&config_file, deadline) {
+        Ok(()) => Ok(ConfigLock {
+            _file: file,
+            _config_file: Some(config_file),
+        }),
+        Err(_) => Err(format!(
+            "configuration lock is busy for {}; retry after the other wrkslots mutation exits",
+            lock_file_path.display()
         )),
     }
 }
