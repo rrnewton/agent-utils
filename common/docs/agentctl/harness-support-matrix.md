@@ -77,7 +77,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Effort control | supported | supported | supported | none | supported (Claude only) |
 | Model selection | supported | supported | supported | none | supported (Claude only) |
 | Launch-env replay | supported | supported | supported | partial | supported |
-| Permission bypass at launch | supported | supported | supported | n/a | supported (wrapper-mediated) |
+| Permission bypass at launch | supported | supported | supported | n/a | supported |
 | Chat-bridge delivery | supported | supported | supported | partial | supported (Claude only) |
 | Watcher notices (DONE / BLOCKED / idle / stalled) | supported | supported | supported | partial | none (skipped) |
 | Raw messages (no sender header) | supported | supported | supported | partial | supported (Claude only) |
@@ -565,16 +565,19 @@ and `py/agentctl/cli.py`, `py/agentctl/revive.py`).
   `muse --help`).
 - **Unknown TUI**: n/a — agentctl knows no launch arguments for the
   program it drives, so there is no flag to require.
-- **Headless**: supported (wrapper-mediated) — headless profiles carry
-  no raw argv for codex/agy (empty by rule) and need no flag: the Rust
-  headless Claude wrapper mediates permissions itself with
-  `--permission-prompts` (owner-held approvals, or denied at once;
-  `effective_arguments` in `rs/claude-stream-session/src/protocol.rs`),
-  and the Python foreign runner appends the Codex bypass flag itself
-  (`py/agentctl/foreign/agent_runner.py`). The brief for #1822 said the headless Claude path passes
-  `--permission-mode bypassPermissions` itself; the code does not — it
-  mediates instead — and that mediation, not a bypass flag, is what the
-  headless cells above record.
+- **Headless**: supported — headless profiles carry no raw argv for
+  codex/agy (empty by rule), but headless Claude has no carve-out
+  (coordb, #1822): a headless Claude start, `run-headless`, revive, or
+  restart whose harness args lack `--permission-mode bypassPermissions`
+  (or `--dangerously-skip-permissions`) refuses with the same message
+  (`start_headless` and the wrapper launch in
+  `rs/agentctl/src/subagents/headless.rs`). `--permission-prompts host`
+  keeps working alongside the bypass, so hook "ask" decisions still
+  route to chat (`effective_arguments` in
+  `rs/claude-stream-session/src/protocol.rs`); the Python foreign runner
+  appends the Codex bypass flag itself
+  (`py/agentctl/foreign/agent_runner.py`), and this edition runs no
+  headless Claude at all.
 - **agentcloud** (not a column; see [agentcloud](#agentcloud)): no
   bypass flag known — `agentcloudctl create` offers only
   `--dangerously-skip-sandbox`, a sandbox switch, not permissions, so

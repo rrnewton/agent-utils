@@ -16803,6 +16803,7 @@ esac
                 &fixture.root,
                 crate::subagents::HeadlessStart {
                     harness: "claude".to_owned(),
+                    arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                     ..crate::subagents::HeadlessStart::default()
                 },
             )
@@ -17071,6 +17072,7 @@ esac
                 &fixture.root,
                 crate::subagents::HeadlessStart {
                     harness: "claude".to_owned(),
+                    arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                     ..crate::subagents::HeadlessStart::default()
                 },
             )

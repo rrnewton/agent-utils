@@ -13,6 +13,7 @@ fn headless_agent(fixture: &Fixture) -> ManagedAgents<'_, Fake> {
             &fixture.root,
             HeadlessStart {
                 harness: "claude".to_owned(),
+                arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                 launch: false,
                 ..HeadlessStart::default()
             },

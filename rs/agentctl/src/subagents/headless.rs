@@ -301,6 +301,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         adapter
             .validate_arguments(&options.arguments)
             .map_err(fail)?;
+        // #1822 (coordb): headless Claude has no bypass carve-out; the
+        // launch's own harness args must carry it, alongside the wrapper's
+        // --permission-prompts mediation.
+        if options.harness == "claude" {
+            crate::profiles::require_permission_bypass(
+                &format!("agent {agent_name:?} launch"),
+                &options.harness,
+                &options.arguments,
+            )?;
+        }
         let cwd = fs::canonicalize(cwd)
             .map_err(|error| fail(format!("working directory {}: {error}", cwd.display())))?;
         {
@@ -690,6 +700,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             config.command = vec![launcher.display().to_string()];
         }
         config.arguments = declared_arguments(&record);
+        // #1822 (coordb): a wrapper (re)launch — run-headless, restart,
+        // revive — refuses when the recorded harness args lack the bypass.
+        if record.harness == "claude" {
+            crate::profiles::require_permission_bypass(
+                &format!("agent {agent_name:?} launch"),
+                &record.harness,
+                &config.arguments,
+            )?;
+        }
         // The recorded launch environment, re-read from the launch profile by name
         // (#1412 revive-profile-env); a headless record that names no profile and
         // recorded no names carries none, as its first launch did.

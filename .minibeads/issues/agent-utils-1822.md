@@ -38,14 +38,13 @@ loading the config refuses; the interactive start path (profile and
 ad-hoc `--harness` with `--harness-arg` alike) checks the effective
 arguments; revive, restart, restore, and `--refresh-profile` relaunches
 check the replayed or refreshed arguments the same way. Headless
-launches are exempt from the profile-argv check: headless profiles carry
-no raw argv for codex/agy (empty by rule), the Rust headless Claude
-wrapper mediates permissions itself with `--permission-prompts`
-(owner-held approvals, or denied at once), and the task brief's claim
-that it passes `--permission-mode bypassPermissions` itself does not
-hold in the code (verified: `protocol.rs` `effective_arguments`); the
-exemption and the discrepancy are recorded here and in the harness
-support matrix rather than changing approval semantics. agentcloud
+Claude has no carve-out (coordb review): a headless Claude start,
+`run-headless`, revive, or restart whose harness args lack
+`--permission-mode bypassPermissions` (or
+`--dangerously-skip-permissions`) refuses with the same message, while
+`--permission-prompts host` keeps routing hook "ask" decisions to the
+wrapper. Other headless profiles stay exempt at load (codex/agy argv is
+empty by rule; the runners mediate or append the flag themselves). agentcloud
 profiles gain a `permission_bypass_warning` ("no bypass flag known") in
 the public profile listing, mirroring `blocking_question_warning`, and
 the matrix gains a permission-bypass row in the same commit (harness

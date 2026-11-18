@@ -248,11 +248,18 @@ mod tests {
     }
 
     #[test]
-    fn headless_claude_mediates_permissions_without_a_bypass_flag() {
-        // #1822: the headless wrapper needs no profile bypass flag: it
-        // mediates permissions itself (--permission-prompts host, answered
-        // by the wrapper for the owner; or none, denied at once).
-        assert!(asks_wrapper(&[], true));
+    fn headless_claude_keeps_wrapper_prompts_alongside_the_bypass() {
+        // #1822 (coordb): a headless Claude launch must carry the bypass
+        // in its own harness args, and --permission-prompts host still
+        // routes hook "ask" decisions to the wrapper alongside it.
+        let bypass = vec![
+            "--permission-mode".to_owned(),
+            "bypassPermissions".to_owned(),
+        ];
+        let effective = effective_arguments(&bypass, true);
+        assert!(effective.contains(&"--permission-mode".to_owned()));
+        assert!(effective.contains(&"bypassPermissions".to_owned()));
+        assert!(asks_wrapper(&bypass, true));
         assert_eq!(
             prompts_target(&effective_arguments(&[], true)),
             Some("host".to_owned())

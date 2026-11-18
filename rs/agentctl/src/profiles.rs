@@ -1205,8 +1205,9 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
     }
     let required_env = required_names(raw.required_env.as_ref(), &format!("profile {name:?}"))?;
     // #1822: every interactive launch carries its harness's bypass flag.
-    // Headless profiles are exempt: codex/agy headless argv is empty by rule
-    // and the headless runners mediate permissions themselves.
+    // Headless profiles are exempt at load: codex/agy headless argv is
+    // empty by rule, and headless Claude is refused at start/run-headless
+    // unless its harness args carry the bypass (no carve-out).
     if raw.mode == "interactive" {
         require_permission_bypass(&format!("profile {name:?}"), &raw.harness, &raw.argv)?;
     }

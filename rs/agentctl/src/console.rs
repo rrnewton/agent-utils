@@ -1057,6 +1057,7 @@ mod console_override_tests {
                 &fixture.root,
                 HeadlessStart {
                     harness: "claude".to_owned(),
+                    arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                     reasoning_effort: Some("xhigh".to_owned()),
                     launch: false,
                     ..HeadlessStart::default()
@@ -1133,6 +1134,7 @@ mod console_override_tests {
                 &fixture.root,
                 HeadlessStart {
                     harness: "claude".to_owned(),
+                    arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                     reasoning_effort: Some("high".to_owned()),
                     launch: false,
                     ..HeadlessStart::default()

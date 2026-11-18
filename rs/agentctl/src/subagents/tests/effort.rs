@@ -106,6 +106,7 @@ fn headless_start_records_its_effort_and_set_effort_switches_it() {
             &fixture.root,
             HeadlessStart {
                 harness: "claude".to_owned(),
+                arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                 reasoning_effort: Some("xhigh".to_owned()),
                 launch: false,
                 ..HeadlessStart::default()
@@ -144,6 +145,7 @@ fn run_headless_declared_refuses_an_agent_with_no_declared_effort() {
             &fixture.root,
             HeadlessStart {
                 harness: "claude".to_owned(),
+                arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                 launch: false,
                 ..HeadlessStart::default()
             },
@@ -166,6 +168,29 @@ fn run_headless_declared_refuses_an_agent_with_no_declared_effort() {
 }
 
 #[test]
+fn headless_claude_start_refuses_without_the_bypass() {
+    // #1822 (coordb): no headless carve-out; the same message as interactive.
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let error = manager
+        .start_headless(
+            "lead",
+            &fixture.root,
+            HeadlessStart {
+                harness: "claude".to_owned(),
+                reasoning_effort: Some("high".to_owned()),
+                launch: false,
+                ..HeadlessStart::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("has no permission-bypass flag: add --dangerously-skip-permissions (or --permission-mode bypassPermissions)"),
+        "{error}"
+    );
+}
+
+#[test]
 fn headless_start_refuses_an_unsupported_effort() {
     let fixture = Fixture::new();
     let manager = fixture.manager();
@@ -175,6 +200,7 @@ fn headless_start_refuses_an_unsupported_effort() {
             &fixture.root,
             HeadlessStart {
                 harness: "claude".to_owned(),
+                arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                 reasoning_effort: Some("ultra".to_owned()),
                 launch: false,
                 ..HeadlessStart::default()
@@ -194,6 +220,7 @@ fn set_model_records_an_override_that_wins_and_refuses_bad_names() {
             &fixture.root,
             HeadlessStart {
                 harness: "claude".to_owned(),
+                arguments: vec!["--permission-mode=bypassPermissions".to_owned()],
                 model: Some("claude-first-1".to_owned()),
                 reasoning_effort: Some("high".to_owned()),
                 launch: false,

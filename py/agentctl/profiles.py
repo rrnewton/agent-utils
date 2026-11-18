@@ -668,8 +668,8 @@ def _profile(name: str, raw: object) -> LaunchProfile:
         environment.append(f"{key}={value}")
     required = _required_names(raw.get("required_env"), f"profile {name!r}")
     # #1822: every interactive launch carries its harness's bypass flag.
-    # Headless profiles are exempt: codex/agy headless argv is empty by rule
-    # and the headless runners mediate permissions themselves.
+    # Headless profiles are exempt at load: codex/agy headless argv is
+    # empty by rule, and this edition runs no headless Claude.
     if mode == "interactive":
         require_permission_bypass(f"profile {name!r}", harness, argv)
     return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud, required)
