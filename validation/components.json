@@ -519,6 +519,7 @@
         "py/wrkslots/tests/test_sandbox_show_config_rust.py",
         "py/wrkslots/tests/test_schema_skew.py",
         "py/wrkslots/tests/test_scoped_journal_episodes.py",
+        "py/wrkslots/tests/test_seal_fallback_scan.py",
         "py/wrkslots/tests/test_shared_submodules.py",
         "py/wrkslots/tests/test_shell_command_cli_rust.py",
         "py/wrkslots/tests/test_slot_images.py",
