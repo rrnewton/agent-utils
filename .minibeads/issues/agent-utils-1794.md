@@ -26,3 +26,5 @@ Audit findings are byte-identical to the old implementation on fixtures (differe
 [watermelon-full-preview] Filed by mu-auditcost. Overlap: mu-rescuetips (#1785 wrkslots-remove-silently-skips-unresolvable-rescue-tips) is batching git calls in the private-history scan; reuse its batching helpers. Rebase right before the gate.
 
 [watermelon-full-preview] Review note (F4, accepted): when two failures are present at once, the audit pre-check reads durable repositories before the full scan's reflog/pseudoref refusals, so the first refusal an audit row reports can differ from the pre-change order. Verdicts do not change; only which refusal is named first when several apply.
+
+[watermelon-full-preview] Follow-up (not in this change): cache-planning listings (about 60 CPU-s and about 96k directory listings at 80 rows on the consumer, most subjects exhausting their listing share) still walk each slot's own tree per subject. Planning a shared repository's cache subjects once and reusing the plan across its rows, or charging a listing shared by several subjects once against the work budget, is the remaining audit cost that scales with row count after this change.
