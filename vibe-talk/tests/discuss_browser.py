@@ -454,6 +454,15 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
           and posts[0].get("view") in ("flat", "main")
           and posts[0].get("since_ms") == 1760000000000,
           f"the panel posted {posts}, not one bounded channel catch-up")
+    # `#1813` follow-up: five digits fit in the hours field (9715 was cut off).
+    page.fill("#discuss-hours", "9715")
+    page.wait_for_function(
+        "() => document.getElementById('discuss-hours').value === '9715'",
+        timeout=20_000)
+    fits = page.evaluate(
+        "() => { const el = document.getElementById('discuss-hours');"
+        " return el.scrollWidth <= el.clientWidth + 1; }")
+    check(fits, "the hours field cuts off a five-digit value")
     heading = page.locator("#discuss-answer h2").first.text_content() or ""
     check(heading == "Progress", f"the answer did not render its heading: {heading!r}")
     # `#1525 fold-marker-on-heading-line`: the chevron shares the heading's

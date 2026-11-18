@@ -243,6 +243,26 @@ def desk_walk(desk: Desk) -> None:
     desk.shot("2-desk-shorter-window")
     check_inside(desk, found, "desk, Discuss docked, shorter window")
     desk.page.set_viewport_size({"width": desk.width, "height": desk.height})
+    # Floating again and reloaded (`#1821` restores it): the sheet stands clear
+    # of the composer's row, so its Send stays reachable.
+    desk.page.click("#discuss-dock-toggle")
+    desk.wait_for("() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
+                  "Discuss did not float again")
+    desk.page.reload(wait_until="load")
+    desk.wait_for("() => { const p = document.getElementById('discuss-panel'); "
+                  "return Boolean(p) && !p.hidden && p.getClientRects().length > 0; }",
+                  "Discuss did not come back floating after the reload")
+    desk.page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+    desk.settled()
+    desk.settled()
+    desk.shot("3-desk-floating-after-reload")
+    hit = desk.page.evaluate("""() => { const s = document.getElementById('channel-send');
+        const r = s.getBoundingClientRect();
+        const found = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return found === s || s.contains(found); }""")
+    desk.check(hit is True,
+               "desk, Discuss floating after reload: the floating sheet covers the composer's Send")
+    desk.notes.append("desk, Discuss floating after reload: the sheet stands clear of the composer's Send")
 
 
 def walk(chromium: "BrowserType", args: argparse.Namespace, label: str, width: int, height: int,

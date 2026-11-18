@@ -252,10 +252,11 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   text-align: center;
 }
 
-/* `#1524`: the hours end, in the count's dress; never dropped on a narrow row. */
+/* `#1524`: the hours end, in the count's dress; never dropped on a narrow row.
+ * `#1813` follow-up: at least five digits show (`9715` was cut to `971…`). */
 #discuss-hours {
   width: 3.4rem;
-  min-width: 0;
+  min-width: 8ch;
   padding: 2px 4px;
   text-align: center;
 }
@@ -586,6 +587,17 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
   body:has(#screen-main[data-discuss="docked"][data-columns="two"]:not([hidden])) #status-line {
     inset-inline-end: calc(50% + var(--channel-pane-end) / 2);
+  }
+
+  /* `#1813` follow-up: floating (neither docked nor maximized), the sheet stands
+   * on the chips' foot, clear of the channel composer's row, so its Send stays
+   * reachable while the sheet is up (`--chips-foot` follows the box's top edge,
+   * and is the bare half rem while no box stands under the sheet). */
+  #screen-main:not([data-discuss]) > #discuss-panel:not([hidden]) {
+    bottom: var(--chips-foot, 0.5rem);
+    /* The lift spends the sheet's height room too, or a tall answer pushes its
+     * head (and Close) off the top of the window. */
+    max-height: max(12rem, calc(100vh - 6rem - var(--chips-foot, 0.5rem)));
   }
 
   /* Maximized: the panel fills the main area, to just talk to Discuss. */
