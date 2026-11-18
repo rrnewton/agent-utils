@@ -5171,6 +5171,9 @@ const TRANSCRIPT_PAGE_LIMIT = sourceConstant("TRANSCRIPT_PAGE_LIMIT");
 // boundary between a judgement and a different behaviour wearing the same name.
 
 const TUNING_BANDS = {
+  // `#1816 vibe-talk-search-history-up-arrow`. Search terms kept for Up and Down to recall:
+  // enough for a sitting's back-and-forth, few enough that the device holds nothing much.
+  SEARCH_HISTORY_LIMIT: [10, 500, "search terms kept for Up and Down in the search box"],
   // `#1800 vibe-talk-read-aloud-chunk-start-clipping`. The silence before a cold chunk and how
   // long the output stays alive after a read: enough to wake a sleeping Bluetooth sink and to
   // bridge back-to-back reads, never so long that a cold chunk waits seconds or the output is

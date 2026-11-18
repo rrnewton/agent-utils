@@ -8962,6 +8962,15 @@ take the chord before the page sees it. `?` alone and the Help link still open t
 Settings, Help, the right column, past a listener that stops the key, the box of a reply open in the
 list and with single keys off, then on an emulated Mac.
 
+`#1816 vibe-talk-search-history-up-arrow`. The owner: "when I Cmd-/ to pop search I want to press
+up and have my previous search terms there." In the search box, Up and Down now cycle through the
+searches already run, newest first, like shell history: Enter holds the term (fifty at most, once
+each, kept on the device), Up from an empty box recalls the last one, and Down past the newest
+gives back whatever was typed before the walk began. Typing ends the walk; Escape closes as it
+always did. The owner believed this had been asked before; no earlier issue, comment, plan or
+commit asks for it — `#344` above is the nearest, the chord it builds on — so this is its first
+tracked form.
+
 `make -C vibe-talk keyboard-browser` presses these keys through CDP `Input.dispatchKeyEvent` in a
 real Chromium at 1280x800, so the browser's own default scrolling runs, and measures the list on
 screen after each one: on load, after a view switch, in the search, on Settings and in the message
