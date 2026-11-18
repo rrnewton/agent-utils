@@ -18,7 +18,10 @@ const STATUS_DISMISS_MS = 6000;
 const STATUS_IDLE_DISMISS_MS = 2500;
 
 /** The idle confirmations: words that only say the page is ready, nothing to act on. */
-const IDLE_STATUS_WORDS: ReadonlySet<string> = new Set(["Ready.", "ready"]);
+const IDLE_STATUS_WORDS: ReadonlySet<string> = new Set(["Ready.", "ready",
+  // `#1862 vibe-talk-floaters-off-text`: the device-voice confirmations at a
+  // read's start say nothing to act on either; announced, not floated.
+  "Reading with the device voice.", "Reading with Device voice."]);
 
 /** How long the connection banner stays before it takes itself away, in ms. */
 const BANNER_DISMISS_MS = 8000;

@@ -90,6 +90,11 @@ test("#1859: an idle confirmation is marked to wait, action words are not", () =
   assert.equal(el("status-line").attrs["data-idle"], undefined, "action words were marked to wait");
   notices.setStatus("ready");
   assert.equal(el("status-line").attrs["data-idle"], "", "the lowercase twin was not marked");
+  // `#1862`: the device-voice confirmations at a read's start wait too.
+  notices.setStatus("Reading with Device voice.");
+  assert.equal(el("status-line").attrs["data-idle"], "", "the reading notice was not marked to wait");
+  notices.setStatus("Reading with the device voice.");
+  assert.equal(el("status-line").attrs["data-idle"], "", "the device-voice notice was not marked to wait");
   notices.dismissStatus();
   assert.equal(el("status-line").attrs["data-idle"], undefined, "a taken-away line kept the idle mark");
 });

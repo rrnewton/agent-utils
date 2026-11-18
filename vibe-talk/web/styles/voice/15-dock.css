@@ -144,6 +144,16 @@
   display: none;
 }
 
+/* `#1862 vibe-talk-floaters-off-text`: a strip standing for React alone floats
+   with no row of its own, over the foot of the list. While it stands the
+   scrollers keep its room at their foot as scroll room, so a landing — the
+   read's own follow among them — never puts the sentence being read under
+   it. No layout moves: the room is an inset of the scroll, not of the box. */
+#frame-body:has(#read-steer[data-react-only]:not([hidden])) #scroll-area,
+#frame-body:has(#read-steer[data-react-only]:not([hidden])) #side-scroll {
+  scroll-padding-bottom: calc(var(--read-steer-height, 3.5rem) + 1rem);
+}
+
 /* `#380 read-aloud-timeline`. A second line of the strip: the read's blocks, each as wide as it is
    long, with a gap between. Tall enough to tap, though a block of a few words is narrow. */
 #read-steer {

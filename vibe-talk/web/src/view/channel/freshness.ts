@@ -106,6 +106,11 @@ export function createFreshness(deps: FreshnessDependencies): Freshness {
       (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || deps.searchOpen();
     // `#1837`: a current pill takes itself away like "Ready." does; a warning stays.
     const isCurrent = !pill.hidden && text !== "" && text === current && !refreshing;
+    // `#1862 vibe-talk-floaters-off-text`: while what it says is current the pill
+    // is waited out like the idle "Ready." — announced, not floated over the
+    // first card. A warning draws.
+    if (isCurrent) pill.setAttribute("data-idle", "");
+    else pill.removeAttribute("data-idle");
     if (!isCurrent) cancelFreshHide();
     else if (freshTimer === null || freshArmedFor !== text) {
       cancelFreshHide();

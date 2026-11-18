@@ -728,6 +728,13 @@
   pointer-events: none;
 }
 
+/* `#1862 vibe-talk-floaters-off-text`: a current pill is waited out, as the
+   idle status confirmation is (`#1859`): announced, not floated over the
+   first card. Warnings carry no mark and draw. */
+#channel-freshness[data-idle] {
+  visibility: hidden;
+}
+
 #channel-freshness[data-state="offline"],
 #channel-freshness[data-state="slow"] {
   color: var(--warn);
