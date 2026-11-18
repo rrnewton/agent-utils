@@ -238,7 +238,7 @@ def main() -> int:
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
             page.evaluate(kb.RECORD_KEYS_JS)
             walk.settled()

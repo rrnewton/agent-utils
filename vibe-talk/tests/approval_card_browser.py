@@ -748,6 +748,10 @@ def open_call(page: Page, url: str, voice: FakeVoice, api: FakeApi, rows: int, b
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+    # `#1781`: sign-in lands on the Channel; the call this walk opens is two presses away.
+    page.click("#view-switch")
+    page.click("#view-switch")
+    page.wait_for_selector("#pane-voice", state="visible", timeout=10_000)
     page.fill("#compose-text", "question 0")
     page.click("#send-text")
     until(page, lambda: len(voice.routes) == 1, "the first send to open a conversation")
@@ -1147,6 +1151,10 @@ def recap_case(page: Page, url: str, hosted: FakeHosted, api: FakeApi, size: tup
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+    # `#1781`: sign-in lands on the Channel; the call this walk opens is two presses away.
+    page.click("#view-switch")
+    page.click("#view-switch")
+    page.wait_for_selector("#pane-voice", state="visible", timeout=10_000)
     page.fill("#compose-text", "question 0")
     page.click("#send-text")
     until(page, lambda: len(hosted.routes) == 1, "the first send to open a conversation")

@@ -166,6 +166,10 @@ def open_page(browser: Browser, url: str, width: int, height: int, mobile: bool 
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+    # `#1781`: sign-in lands on the channel already; this walk measures the bar as an
+    # entry renders it, so enter it the way a reader arriving does — away and back.
+    page.click("#view-switch")
+    page.click("#view-switch")
     page.click("#view-switch")
     page.wait_for_selector(FIRST_ROW, state="visible", timeout=10_000)
     return page
