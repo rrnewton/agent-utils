@@ -1271,6 +1271,34 @@ class Driver:
 # this table's expectations exist to prevent, so they are the part that had to be rechecked hardest.
 
 
+_PANES = ("pane-voice", "pane-discord", "pane-docs")
+
+
+def _ensure_pane(driver: Driver, pane: str) -> None:
+    """Press the view switch until `pane` is the pane on screen.
+
+    `#1781 vibe-talk-first-run-welcome-channel-default`: a fresh load now lands
+    on the Channel, not the call, so a single switch press no longer names the
+    pane it lands on (from the Channel it reaches Documents). Scenes name the
+    pane they photograph instead of counting presses around the rotation.
+    """
+    for _ in range(len(_PANES)):
+        if bool(driver.js(f"window.__visible('{pane}')")):
+            return
+        before = driver.js(
+            "['pane-voice', 'pane-discord', 'pane-docs']"
+            ".find((id) => window.__visible(id)) || ''"
+        )
+        driver.click("view-switch")
+        driver.page.wait_for_function(
+            "(before) => { const now = ['pane-voice', 'pane-discord', 'pane-docs']"
+            ".find((id) => window.__visible(id)); return !!now && now !== before; }",
+            arg=before,
+            timeout=5_000,
+        )
+    raise Unreachable(pane, "the named pane is on screen after rotating the view switch", "three presses")
+
+
 def _act_signed_out(driver: Driver) -> None:
     driver.load(with_token=False)
     driver.settle()
@@ -1282,6 +1310,8 @@ def _act_idle(driver: Driver) -> None:
     # real server. Waiting on the element rather than a timeout keeps a slow box from reading as a
     # broken page.
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    # This scene is the call at rest; a fresh load lands on the Channel (`#1781`).
+    _ensure_pane(driver, "pane-voice")
     # Settle past the transient message's own life. `#63 status-line-placement` is about a strip
     # that used to hold a row of a phone screen on every frame; THIS is the picture that shows it
     # gone, and a capture taken while "Ready." was still up would show the thing the issue is
@@ -1294,6 +1324,7 @@ def _act_idle(driver: Driver) -> None:
 
 
 def _act_live(driver: Driver) -> None:
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -1308,12 +1339,14 @@ def _act_live(driver: Driver) -> None:
 
 
 def _act_muted(driver: Driver) -> None:
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function("() => window.__text('talk-label') === 'Muted'", timeout=5_000)
     driver.settle()
 
 
 def _act_speaker_silenced(driver: Driver) -> None:
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")  # unmute, so this shows the speaker control alone, not two states at once
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=5_000
@@ -1386,7 +1419,7 @@ def _act_settings(driver: Driver) -> None:
 def _act_discord(driver: Driver) -> None:
     driver.click("close-settings")
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=5_000)
-    driver.click("view-switch")
+    _ensure_pane(driver, "pane-discord")
     # A real read of the real server's channel; --fake-discord seeds it.
     driver.page.wait_for_function(
         "() => document.querySelectorAll('#discord-log > li').length > 0 "
@@ -1501,6 +1534,7 @@ def _act_long_scroll(driver: Driver) -> None:
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -1666,6 +1700,7 @@ def _act_desktop_seed(driver: Driver) -> None:
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -1704,6 +1739,7 @@ def _act_desktop_wide(driver: Driver) -> None:
 def _act_call_for_drop(driver: Driver) -> None:
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -1750,7 +1786,7 @@ def _act_connection_failed(driver: Driver) -> None:
 def _act_open_channel(driver: Driver) -> None:
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
-    driver.click("view-switch")
+    _ensure_pane(driver, "pane-discord")
     # Cached rows are deliberately painted before the request answers. They are useful to a reader,
     # but they cannot certify a scene that says it read the real throwaway server. Wait for both the
     # rows and the end of the live read, so a saved snapshot alone never satisfies this precondition.
@@ -2713,6 +2749,7 @@ def _act_restored_conversation(driver: Driver) -> None:
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.page.wait_for_function(
         "() => [...document.querySelectorAll('#transcript .seam-label')]"
         ".some((n) => (n.textContent || '').trim() === 'earlier conversation')",
@@ -2732,6 +2769,7 @@ def _act_typed_turn(driver: Driver) -> None:
     the box under it and the bar, switch and all, below the big controls rather than over
     them. What the box looks like at idle, focused, is `26-voice-composer`.
     """
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -2785,6 +2823,7 @@ def _act_voice_composer(driver: Driver) -> None:
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.page.click("#compose-text")
     # `fill`, not typing: the scene before left a draft in the box (`#193 compose-draft-loss` keeps
     # it across the reload), and keys would add to it rather than replace it.
@@ -2887,6 +2926,7 @@ def _act_desktop_dock_call(driver: Driver) -> None:
     Sound, Clear, Hang up and Listening beside it."""
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function("() => window.__text('talk-label') === 'Listening'", timeout=10_000)
     driver.settle(300)
@@ -2938,6 +2978,7 @@ def _act_resume_partial(driver: Driver) -> None:
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -2966,6 +3007,7 @@ def _act_resume_partial(driver: Driver) -> None:
         "() => /next call/.test(window.__text('resume-state') || '')", timeout=5_000
     )
 
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -3572,6 +3614,7 @@ def _act_settings_connection_panel(driver: Driver) -> None:
     """`#348 settings-dynamic-lists`: Connection status after a call, as the dark readout, a fact a line."""
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function("() => window.__text('talk-label') === 'Listening'", timeout=10_000)
     driver.js("window.__agentSays('Hello, I am listening.')")
@@ -3715,7 +3758,7 @@ def _act_thread_card_header(driver: Driver) -> None:
     page.route("**/api/v1/channels/*/timeline*", _threaded_timeline)
     driver.load(with_token=True)
     page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
-    driver.click("view-switch")
+    _ensure_pane(driver, "pane-discord")
     page.wait_for_function(
         "() => document.querySelectorAll('#discord-log > li[data-id]').length > 0 "
         "&& !window.__visible('channel-loading') && window.__visible('column-toggle')",
@@ -3750,7 +3793,7 @@ def _act_thread_card_header_list(driver: Driver) -> None:
     page.route("**/api/v1/channels/*/timeline*", _threaded_timeline)
     driver.load(with_token=True)
     page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
-    driver.click("view-switch")
+    _ensure_pane(driver, "pane-discord")
     page.wait_for_function(
         "() => document.querySelectorAll('#discord-log > li[data-id]').length > 0 && !window.__visible('channel-loading')",
         timeout=15_000,
@@ -3787,7 +3830,7 @@ def _open_threaded_all(driver: Driver) -> None:
     page.route("**/api/v1/channels/*/timeline*", _threaded_timeline)
     driver.load(with_token=True)
     page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
-    driver.click("view-switch")
+    _ensure_pane(driver, "pane-discord")
     page.wait_for_function(
         "() => document.querySelectorAll('#discord-log > li[data-id]').length > 0 && !window.__visible('channel-loading')",
         timeout=15_000,
@@ -4022,8 +4065,28 @@ def _act_settings_find_opens(driver: Driver) -> None:
     and the section's around it, and fires `beforematch` on each. So Settings is opened folded, and the
     page then navigates to its own address with `#:~:text=Noise suppression`.
     """
+    # A FRESH TAB of the same context, and that is the reader this state is about: one who opens
+    # the app and follows a text-fragment link while in Settings. The walk's own tab cannot be
+    # that reader any more. Since `#1781` every load lands on the Channel, whose history
+    # mirroring (`#423`) fills the tab's history as the walk goes; by this state the tab is at
+    # the browser's entry cap, where the page cannot tell the link's new entry from a Back and
+    # closes Settings before the find can run. No reader carries seventy scenes of history into
+    # this link, and the fresh tab — same context, so the same device, storage and sign-in —
+    # carries only its own.
+    stale = driver.page
+    fresh = stale.context.new_page()
+    _patient_waits(fresh)
+    fresh.on(
+        "pageerror",
+        lambda error: driver.page_errors.append(str(error).splitlines()[0]),
+    )
+    driver.page = fresh
+    stale.close()
     _act_settings_folded(driver)
-    driver.page.goto(f"{driver.base_url}/#:~:text=Noise%20suppression", wait_until="load")
+    # Its own CURRENT address, query included: since `#1781` a load lands on the Channel, which
+    # writes `?c=…&v=main` into the address, and navigating to the bare origin would reload the
+    # page and close Settings instead of searching the one on screen.
+    driver.page.goto(f"{driver.page.url.split('#')[0]}#:~:text=Noise%20suppression", wait_until="load")
     driver.page.wait_for_function(
         "() => document.getElementById('fold-microphone').getAttribute('aria-expanded') === 'true'", timeout=5_000
     )
@@ -4113,6 +4176,7 @@ def _act_call_caught_up(driver: Driver) -> None:
     """
     driver.load(with_token=True)
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -4139,6 +4203,7 @@ def _act_call_caught_up(driver: Driver) -> None:
         "() => /next call/.test(window.__text('resume-state') || '')", timeout=5_000
     )
     driver.page.route("**/api/v1/voice-session", _v1_voice_session)
+    _ensure_pane(driver, "pane-voice")
     driver.click("talk")
     driver.page.wait_for_function(
         "() => /^Caught the agent up with/.test(window.__text('call-recap') || '')", timeout=10_000
