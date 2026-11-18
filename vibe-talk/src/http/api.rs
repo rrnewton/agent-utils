@@ -3735,6 +3735,14 @@ impl crate::summarize::discuss::DiscussExecutor for DiscussTools {
     }
 }
 
+/// How far past the summary's window a follow-up's step-back may reach, in
+/// held messages, and how much of each gap message the model reads.
+/// `#1865`: enough to find in, small enough that a long gap cannot triple
+/// the prompt (the live check that found this measured 60k -> 146k chars
+/// when the step-back ran to the recap bound untrimmed).
+const FOLLOWUP_GAP_MESSAGES: usize = 192;
+const FOLLOWUP_GAP_MESSAGE_CHARS: usize = 320;
+
 /// `POST /api/v1/channels/{channel_id}/catchup/messages` — one follow-up
 /// (`discuss-followup-composer`): the side agent answers with the cached window plus
 /// the transcript so far, and both turns join the record's timeline. Cache-only, one
@@ -3804,27 +3812,61 @@ pub async fn catchup_followup(
     // newest held message. A message the owner asks to find can sit after
     // the summary's through_id yet older than the newest window, where a
     // newest-only fetch never shows it; when the through message is not in
-    // what was fetched, step the (still cache-only) walk back until it is
-    // or the recap bound is reached.
-    let fetched = match summary.window.through_id.as_ref() {
+    // what was fetched, step the (still cache-only) walk back — bounded,
+    // `#1865`: a capped number of gap messages, each trimmed, never the
+    // whole recap bound the first version of this step-back used.
+    let window = state.config.summaries.catchup_window_messages;
+    let (fetched, widened) = match summary.window.through_id.as_ref() {
         Some(through)
             if thread_id.is_none() && !fetched.messages.iter().any(|held| &held.id == through) =>
         {
-            crate::read_reason::ReadReason::Discuss
-                .scope(ops::catchup_fetch(
-                    &state,
-                    Scope::Write,
-                    &channel_id,
-                    view,
-                    thread_id,
-                    ops::MAX_RECAP_MESSAGES,
-                ))
-                .await?
+            (
+                crate::read_reason::ReadReason::Discuss
+                    .scope(ops::catchup_fetch(
+                        &state,
+                        Scope::Write,
+                        &channel_id,
+                        view,
+                        thread_id,
+                        window.saturating_add(FOLLOWUP_GAP_MESSAGES),
+                    ))
+                    .await?,
+                true,
+            )
         }
-        _ => fetched,
+        _ => (fetched, false),
+    };
+    // The gap's messages are there to be found, not summarized: each rides
+    // trimmed to a cap, while the newest window (what a follow-up is
+    // ordinarily about) rides whole. Citation still resolves against the
+    // untrimmed fetch below; only the model's reading copy is cut.
+    let reading: Vec<Message> = if widened {
+        let full_from = fetched.messages.len().saturating_sub(window);
+        fetched
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, held)| {
+                if index >= full_from {
+                    return held.clone();
+                }
+                let mut trimmed = held.clone();
+                if trimmed.content.chars().count() > FOLLOWUP_GAP_MESSAGE_CHARS {
+                    trimmed.content = trimmed
+                        .content
+                        .chars()
+                        .take(FOLLOWUP_GAP_MESSAGE_CHARS)
+                        .collect::<String>()
+                        + "…";
+                }
+                trimmed
+            })
+            .collect()
+    } else {
+        fetched.messages.clone()
     };
     let owner = crate::owner::Owner::of(&state);
-    let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+    let built = crate::catchup::build_context(&reading, &fetched.read, &owner);
     let context_ms = u64::try_from(context_began.elapsed().as_millis()).unwrap_or(u64::MAX);
     // The transcript after the window: the current summary, then the turns so far.
     let mut prompt = built.prompt;
@@ -3848,9 +3890,10 @@ pub async fn catchup_followup(
     // instruction is.
     prompt.push_str(
         "\n\nIf the question asks you to find a specific message — \"find the message where I ask ...\" \
-         or similar — answer SHORT: name that one message first and cite it, quote its key line, and \
-         stop. Do not re-summarize the window. When the owner says \"where I ask\", the message wanted \
-         is the owner's own [OWNER] message that matches, not a reply about it.",
+         or similar — answer SHORT: name that one message first and cite it, quote its key line. Then, \
+         if the question asks anything more, answer that part in one short line, citing the message it \
+         comes from. Do not re-summarize the window. When the owner says \"where I ask\", the message \
+         wanted is the owner's own [OWNER] message that matches, not a reply about it.",
     );
     // `#1356 discuss-readonly-tools`: a follow-up may pull more context with the
     // read-only tools, cache only. The channel id rides in the prompt (not the

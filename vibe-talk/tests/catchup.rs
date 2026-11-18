@@ -1373,4 +1373,84 @@ async fn a_followup_find_reaches_the_askers_message_after_the_summary_window() {
         prompt.contains("answer SHORT") && prompt.contains("[OWNER]"),
         "the find rule is missing from the prompt: {prompt}"
     );
+    assert!(
+        prompt.contains("answer that part in one short line, citing the message it"),
+        "the rule does not require answering the rest in one cited line: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn a_followup_find_over_a_long_gap_stays_bounded_and_still_reaches_the_asker() {
+    // `#1865`: hundreds of held messages between the summary window and the
+    // newest; the step-back is bounded in count and each gap message trimmed,
+    // so the context stays under a cap — and the asker's message, inside the
+    // bounded reach, is still shown and cited.
+    let text = testing::config_toml() + "\n[summaries]\ncatchup_window_messages = 2\n";
+    let mut target = message(250, None, false);
+    target.content = "what is the upshot of the transitive provenance closure work?".to_owned();
+    let target_id = target.id.as_str().to_owned();
+    let mut messages: Vec<Message> = (0..3).map(|seq| message(seq, None, false)).collect();
+    let mut later: Vec<Message> = (3..303)
+        .map(|seq| {
+            let mut held = message(seq, None, false);
+            held.content = format!("gap message {seq} {}", "detail ".repeat(60));
+            held
+        })
+        .collect();
+    later[247] = target;
+    messages.extend(later);
+    let later: Vec<Message> = messages.split_off(3);
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) = cached_state(&text, backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state.clone());
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    summarizer.answer_with("first point");
+    let (status, _summary) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    backend
+        .messages
+        .lock()
+        .expect("messages")
+        .extend(later.iter().cloned());
+    fill(&state, TimelineView::Flat, None).await;
+
+    summarizer.answer_with(&format!("You asked that here [m:{target_id}]."));
+    let reads = backend.reads();
+    let wire = "{\"thread_id\":null,\"text\":\"Find the message where I ask about upshot of the transitive provenance closure work.  What's the binary TCB\"}";
+    let (status, _content_type, raw) = post_raw(
+        &app,
+        &format!("{channel_path}/messages"),
+        Some(WRITE_TOKEN),
+        wire,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raw}");
+    assert_eq!(backend.reads(), reads, "the follow-up read upstream");
+    let calls = summarizer.prompt_calls();
+    let prompt = &calls.last().expect("a follow-up call").1;
+    let context_lines = prompt.matches("[m:").count();
+    assert!(
+        context_lines <= 194,
+        "the widened context is unbounded: {context_lines} message lines"
+    );
+    assert!(
+        prompt.chars().count() < 90_000,
+        "the widened context is untrimmed: {} chars",
+        prompt.chars().count()
+    );
+    assert!(
+        prompt.contains("transitive provenance closure"),
+        "the asker's message never reached the model"
+    );
+    let body: Value = serde_json::from_str(&raw).expect("json answer");
+    let answer = body["agent"]["text"].as_str().expect("agent text");
+    assert!(
+        answer.contains(&format!("m=discord:{WRITE_CHANNEL}:{target_id}")),
+        "the answer does not link the asker's message: {answer}"
+    );
 }
