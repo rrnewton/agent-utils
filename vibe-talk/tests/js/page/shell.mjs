@@ -2201,7 +2201,7 @@ function searchCorpusDisagreements(language) {
   }
   for (const { query, message, matches: expected, tz_offset_minutes: offset = 0 } of SEARCH_CORPUS.match) {
     const folded = subject({ author: message.author ?? "", authorId: message.author_id ?? "", text: message.text ?? "",
-      links: message.links ?? [], createdMs: Date.parse(message.created), inThread: message.in_thread ?? false, labels: message.labels ?? [] });
+      links: message.links ?? [], createdMs: Date.parse(message.created), inThread: message.in_thread ?? false, labels: message.labels ?? [], pinned: message.pinned ?? false });
     const dayStart = (day) => Date.UTC(day.year, day.month - 1, day.day) - offset * 60_000;
     if (matches(parse(query), folded, dayStart) !== expected) wrong.push(`match ${JSON.stringify(query)} on ${JSON.stringify(message.text)}`);
   }

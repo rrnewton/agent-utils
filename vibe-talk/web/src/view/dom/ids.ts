@@ -357,10 +357,15 @@ export interface ElementById {
   "label-group-spellings": HTMLTextAreaElement;
   "label-group-state": HTMLParagraphElement;
   "label-group-title": HTMLHeadingElement;
+  "labels-button": HTMLButtonElement;
   "labels-combine": HTMLButtonElement;
   "labels-filter": HTMLInputElement;
+  "labels-filter-input": HTMLInputElement;
   "labels-group": HTMLElement;
   "labels-list": HTMLOListElement;
+  "labels-listbox": HTMLOListElement;
+  "labels-panel": HTMLDivElement;
+  "labels-panel-state": HTMLParagraphElement;
   "labels-sort": HTMLButtonElement;
   "labels-state": HTMLParagraphElement;
   "link-kind-action": HTMLButtonElement;
@@ -447,11 +452,6 @@ export interface ElementById {
   "pane-discord": HTMLDivElement;
   "pane-docs": HTMLDivElement;
   "pane-voice": HTMLDivElement;
-  "labels-button": HTMLButtonElement;
-  "labels-filter-input": HTMLInputElement;
-  "labels-listbox": HTMLOListElement;
-  "labels-panel": HTMLDivElement;
-  "labels-panel-state": HTMLParagraphElement;
   "pinned-log": HTMLOListElement;
   "post-confirm": HTMLElement;
   "post-confirm-cancel": HTMLButtonElement;
