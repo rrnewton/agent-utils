@@ -753,6 +753,7 @@
   /* `#1840 vibe-talk-draft-sync-across-devices`: the continue offer spans the
      desk's row like the state line; what it and the actions row hold is laid
      out by them, and says so here for the same reason. */
+  #screen-main:not([data-draft]) #channel-composer > .composer-box-wrap,
   #screen-main:not([data-draft]) #draft-sync-offer,
   #screen-main:not([data-draft]) #draft-sync-offer-text,
   #screen-main:not([data-draft]) #draft-sync-use,

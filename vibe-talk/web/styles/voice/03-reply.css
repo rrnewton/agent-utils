@@ -111,20 +111,23 @@
 }
 
 /* `#1840 vibe-talk-draft-sync-across-devices`: Save draft stands over the
-   box's top corner, in its grid cell like the new-line key, so the composer
-   keeps exactly the height it always had. With the continue offer up, the
-   box is a row down and the chip follows it. */
-#channel-save-draft {
-  grid-row: 1;
-  grid-column: 1;
-  justify-self: end;
-  align-self: start;
-  z-index: 1;
-  margin: 0.4rem 0.4rem 0 0;
+   box's top corner, out of the layout, so the composer keeps exactly the
+   height it always had. The box's cell is the positioning parent. */
+.composer-box-wrap {
+  position: relative;
 }
 
-#channel-composer:has(> #draft-sync-offer:not([hidden])) #channel-save-draft {
-  grid-row: 2;
+.composer-box-wrap > .newline-key {
+  position: absolute;
+  bottom: 0.35rem;
+  inset-inline-end: 0.35rem;
+}
+
+#channel-save-draft {
+  position: absolute;
+  top: 0.4rem;
+  inset-inline-end: 0.4rem;
+  z-index: 1;
 }
 
 .composer-actions > button {
