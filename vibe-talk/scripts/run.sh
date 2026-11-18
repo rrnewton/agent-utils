@@ -106,8 +106,9 @@
 #
 #                  The two SUMMARY states cannot use a page-local fake: a summary is a real
 #                  conversation with the ElevenLabs agent, so this also starts
-#                  vibe-talk-mock-elevenlabs -- this repository's own loopback vendor -- on the two
-#                  ports above the server's, and points the throwaway config at it. One state gets
+#                  vibe-talk-mock-elevenlabs -- this repository's own loopback vendor -- bound
+#                  to port 0 on both halves, and points the throwaway config at the ports it
+#                  reports back. One state gets
 #                  a working summariser; the other wedges the same mock and photographs the red
 #                  failed row. Still offline, still free, still nothing billed.
 #
@@ -118,7 +119,8 @@
 #
 #                  It starts its OWN throwaway server, native (not a container), with
 #                  --fake-discord, on port 18091 by default — never 8080, and it refuses to use it.
-#                  The mock vendor takes 18092 and 18093 beside it. When any of those is taken, or
+#                  The mocks bind port 0 and report their bound ports back, so they take no
+#                  chosen port at all. When the server's port is taken, or
 #                  claimed by another run, it takes four free ports the kernel picks instead.
 #                  Each run claims its three ports (lock files under
 #                  ${XDG_RUNTIME_DIR:-/tmp}/vibe-talk-shots-ports) for as long as it runs, so runs
@@ -537,35 +539,14 @@ starts. Stop it, or choose another port with --port."
     # unreachable page. vibe-talk-mock-elevenlabs is this repository's own loopback vendor: a real
     # mint endpoint and a real conversation WebSocket, free, offline, and answering canned prose.
     #
-    # Two ports, derived from the one the caller chose rather than fixed, so `--port` still moves
-    # the whole run out of the way of anything else instead of half of it.
-    SHOTS_MOCK_HTTP_PORT=$((SHOTS_PORT + 1))
-    SHOTS_MOCK_WS_PORT=$((SHOTS_PORT + 2))
-    # `#1855 vibe-talk-screenshot-harness-real-states`. A fourth port, for the loopback model
-    # stub (scripts/model_stub.py): Discuss needs a [summaries.llm] backend, and pointing it
-    # at this stub lets preview/Summarize answer through the REAL router with only the model
-    # invented. The three claimed ports above are unchanged (the port tests pin them); this
-    # one is proved free below like the others and the stub dies with the run's trap.
-    SHOTS_MODEL_PORT=$((SHOTS_PORT + 3))
-    if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -Eq "[:.]${SHOTS_MODEL_PORT}[[:space:]]"; then
-        die "something is already listening on port $SHOTS_MODEL_PORT, which is where the
-loopback model stub has to bind (it takes the port three above --port $SHOTS_PORT). Stop it, or
-choose another port with --port."
-    fi
-    for shots_extra_port in "$SHOTS_MOCK_HTTP_PORT" "$SHOTS_MOCK_WS_PORT"; do
-        if [ "$shots_extra_port" = 8080 ] || [ "$shots_extra_port" = 18081 ]; then
-            die "--port $SHOTS_PORT puts the offline ElevenLabs mock on port $shots_extra_port,
-which is either the LIVE vibe-talk (8080) or the unrelated vibe-talk:ci container (18081). The
-mock takes the TWO PORTS ABOVE the one you chose, so choose one whose two successors are neither.
-Leave --port off to use 18091, 18092 and 18093, or four free ports when any is taken."
-        fi
-        if command -v ss >/dev/null 2>&1 &&
-            ss -ltn 2>/dev/null | grep -Eq "[:.]${shots_extra_port}[[:space:]]"; then
-            die "something is already listening on port $shots_extra_port, which is where the
-offline ElevenLabs mock has to bind (it takes the two ports above --port $SHOTS_PORT). Stop it, or
-choose another port with --port."
-        fi
-    done
+    # `#1863 vibe-talk-run-sh-mocks-bind-port-zero`. The mocks no longer take ports derived
+    # from the server's: each binds port 0 and writes its bound port to a file in the
+    # throwaway directory, and run.sh learns the ports from those files after the mocks are
+    # up. There is no probe-then-bind window for a non-claiming process to win — the claim
+    # above now only guards the server's own port, which the walk must know in advance.
+    SHOTS_MOCK_HTTP_PORT=0
+    SHOTS_MOCK_WS_PORT=0
+    SHOTS_MODEL_PORT=0
 
     command -v cargo >/dev/null 2>&1 || die "--screenshots needs cargo, and it is not on PATH.
 The app is compiled INTO the server binary (build.rs builds web/ and embeds the result), so a
@@ -610,6 +591,128 @@ stale binary serves last build's markup. Install Rust, or build the binary yours
     # process group.
     trap shots_cleanup EXIT INT TERM HUP
 
+
+    case "${SHOTS_THEME:-dark}" in
+        dark|light|both) ;;
+        *) die "--theme must be dark, light or both; got: $SHOTS_THEME" ;;
+    esac
+
+    step "Screenshots of the app at / — free, offline, no vendor conversation and no microphone."
+    note "theme:     ${SHOTS_THEME:-dark} (dark by default — it is the theme the phone is in)"
+    note "server:    throwaway, native, --fake-discord, 127.0.0.1:$SHOTS_PORT (never 8080)"
+    note "model:     loopback model stub, port 0 (kernel-assigned; Discuss answers for real)"
+    note "vendor:    vibe-talk-mock-elevenlabs, port 0 on both halves (mint + control,"
+    note "           conversations). Kernel-assigned; run.sh learns them from the ports"
+    note "           files the mocks write once listening. Offline; nothing is billed."
+    note "output:    $SHOTS_OUT"
+    note "the running vibe-talk, its config and its logs are not touched."
+
+    if [ "$DRY_RUN" = 1 ]; then
+        note "(dry run) cargo build --release --manifest-path $VIBE_TALK_DIR/Cargo.toml"
+        note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk-mock-elevenlabs --scenario no_tool_call --http-port 0 --ws-port 0 --ports-file <tmp>/mock-ports --bridge-base http://127.0.0.1:$SHOTS_PORT --bridge-token <write token>"
+        note "(dry run) python3 $SCRIPT_DIR/model_stub.py --port 0 --port-file <tmp>/model-port"
+        note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk --config $SHOTS_TMP/vibe-talk.toml --fake-discord"
+        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT --theme ${SHOTS_THEME:-dark} --mock-control http://127.0.0.1:<mock bound port>"
+        note "(dry run) nothing was built, started, or photographed."
+        exit 0
+    fi
+
+    step "Rebuilding the server, because web/ is compiled into it"
+    [ -f "$VIBE_TALK_DIR/contract/node_modules/esbuild/package.json" ] || die "--screenshots rebuilds the
+server, and its build needs the page build's pinned tools, which are not installed. Run
+npm ci --prefix $VIBE_TALK_DIR/contract and re-run."
+    cargo build --release --manifest-path "$VIBE_TALK_DIR/Cargo.toml" \
+        || die "the build failed, so there is no binary serving today's web/ to photograph."
+    SHOTS_BIN="$VIBE_TALK_DIR/target/release/vibe-talk"
+    [ -x "$SHOTS_BIN" ] || die "the build reported success but $SHOTS_BIN is not there."
+    SHOTS_MOCK_BIN="$VIBE_TALK_DIR/target/release/vibe-talk-mock-elevenlabs"
+    [ -x "$SHOTS_MOCK_BIN" ] || die "the build reported success but $SHOTS_MOCK_BIN is not there.
+That binary is the offline ElevenLabs substitute, and the summary states cannot be photographed
+without it: summaries come from a conversation with an agent and from nothing else."
+
+    step "Starting the offline ElevenLabs mock"
+    # BEFORE the server, so the server's own configuration points at something that is already
+    # listening. It costs nothing either way -- vibe-talk opens no vendor connection at startup --
+    # but a mock that failed to bind is then a failure with its own message rather than a summary
+    # state timing out four minutes later.
+    #
+    # `no_tool_call` is the scenario that answers canned prose without calling anything, so this
+    # needs no MCP traffic back to the bridge. --bridge-base and --bridge-token are still required
+    # by the binary, and are given the throwaway server and its throwaway token: the token is on a
+    # command line, which everything else here refuses to do, and that is acceptable only because
+    # this particular credential is invented per run and authenticates nothing that exists.
+    (
+        cd "$SHOTS_TMP" || exit 1
+        exec "$SHOTS_MOCK_BIN" \
+            --scenario no_tool_call \
+            --http-port 0 \
+            --ws-port 0 \
+            --ports-file "$SHOTS_TMP/mock-ports" \
+            --bridge-base "http://127.0.0.1:$SHOTS_PORT" \
+            --bridge-token "$SHOTS_WRITE_TOKEN" \
+            > "$SHOTS_TMP/mock-elevenlabs.log" 2>&1
+    ) &
+    SHOTS_MOCK_PID=$!
+
+    # The bound ports arrive in the ports file; only then can anything be curled or
+    # written into a config. The wait is on that file appearing with both ports.
+    SHOTS_MOCK_UP=0
+    for _ in $(seq 1 60); do
+        if ! kill -0 "$SHOTS_MOCK_PID" 2>/dev/null; then break; fi
+        if [ -s "$SHOTS_TMP/mock-ports" ]; then
+            SHOTS_MOCK_HTTP_PORT="$(sed -n 's/^http=//p' "$SHOTS_TMP/mock-ports")"
+            SHOTS_MOCK_WS_PORT="$(sed -n 's/^ws=//p' "$SHOTS_TMP/mock-ports")"
+            if [ -n "$SHOTS_MOCK_HTTP_PORT" ] && [ -n "$SHOTS_MOCK_WS_PORT" ] && \
+                curl -fsS -o /dev/null "http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT/_mock/trace" 2>/dev/null; then
+                SHOTS_MOCK_UP=1
+                break
+            fi
+        fi
+        sleep 0.5
+    done
+    if [ "$SHOTS_MOCK_UP" != 1 ]; then
+        echo "" >&2
+        echo "--- offline ElevenLabs mock output ---" >&2
+        cat "$SHOTS_TMP/mock-elevenlabs.log" >&2 || true
+        die "the offline ElevenLabs mock never answered on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT.
+Its output is above. Without it every summary state is unreachable."
+    fi
+    note "mock up on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (pid $SHOTS_MOCK_PID)"
+
+    step "Starting the loopback model stub"
+    # Before the server, for the same reason as the mock: the server's [summaries.llm]
+    # section names this port, and a stub that failed to bind should fail here by name.
+    (
+        cd "$SHOTS_TMP" || exit 1
+        exec python3 "$SCRIPT_DIR/model_stub.py" --port 0 \
+            --port-file "$SHOTS_TMP/model-port" \
+            > "$SHOTS_TMP/model-stub.log" 2>&1
+    ) &
+    SHOTS_MODEL_PID=$!
+    SHOTS_MODEL_UP=0
+    for _ in $(seq 1 40); do
+        if ! kill -0 "$SHOTS_MODEL_PID" 2>/dev/null; then break; fi
+        if [ -s "$SHOTS_TMP/model-port" ]; then
+            SHOTS_MODEL_PORT="$(cat "$SHOTS_TMP/model-port")"
+            if [ -n "$SHOTS_MODEL_PORT" ] && \
+                curl -fsS -o /dev/null "http://127.0.0.1:$SHOTS_MODEL_PORT/" 2>/dev/null; then
+                SHOTS_MODEL_UP=1
+                break
+            fi
+        fi
+        sleep 0.5
+    done
+    if [ "$SHOTS_MODEL_UP" != 1 ]; then
+        echo "" >&2
+        echo "--- loopback model stub output ---" >&2
+        cat "$SHOTS_TMP/model-stub.log" >&2 || true
+        die "the loopback model stub never answered on 127.0.0.1:$SHOTS_MODEL_PORT.
+Its output is above. Without it Discuss cannot answer and its states are unreachable."
+    fi
+    note "model stub up on 127.0.0.1:$SHOTS_MODEL_PORT (pid $SHOTS_MODEL_PID)"
+
+    # The throwaway server's config, written only now: it names the mocks' bound
+    # ports, which exist only after their port-0 binds report them (#1863).
     # Static prose is in QUOTED heredocs. Backticks in these TOML comments are deliberate
     # regression inputs: an unquoted heredoc treats them as command substitutions, which once ran
     # the screenshot state names as shell commands before the server even started. Dynamic values
@@ -697,111 +800,6 @@ EOF
         fi
     } > "$SHOTS_TMP/vibe-talk.toml"
     printf 'screenshot-run-model-key-not-a-real-credential' > "$SHOTS_TMP/model-key"
-
-    case "${SHOTS_THEME:-dark}" in
-        dark|light|both) ;;
-        *) die "--theme must be dark, light or both; got: $SHOTS_THEME" ;;
-    esac
-
-    step "Screenshots of the app at / — free, offline, no vendor conversation and no microphone."
-    note "theme:     ${SHOTS_THEME:-dark} (dark by default — it is the theme the phone is in)"
-    note "server:    throwaway, native, --fake-discord, 127.0.0.1:$SHOTS_PORT (never 8080)"
-    note "model:     loopback model stub on 127.0.0.1:$SHOTS_MODEL_PORT (Discuss answers for real)"
-    note "vendor:    vibe-talk-mock-elevenlabs on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (mint + control)"
-    note "           and 127.0.0.1:$SHOTS_MOCK_WS_PORT (conversations). Offline; nothing is billed."
-    note "output:    $SHOTS_OUT"
-    note "the running vibe-talk, its config and its logs are not touched."
-
-    if [ "$DRY_RUN" = 1 ]; then
-        note "(dry run) cargo build --release --manifest-path $VIBE_TALK_DIR/Cargo.toml"
-        note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk-mock-elevenlabs --scenario no_tool_call --http-port $SHOTS_MOCK_HTTP_PORT --ws-port $SHOTS_MOCK_WS_PORT --bridge-base http://127.0.0.1:$SHOTS_PORT --bridge-token <write token>"
-        note "(dry run) python3 $SCRIPT_DIR/model_stub.py --port $SHOTS_MODEL_PORT"
-        note "(dry run) $VIBE_TALK_DIR/target/release/vibe-talk --config $SHOTS_TMP/vibe-talk.toml --fake-discord"
-        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT --theme ${SHOTS_THEME:-dark} --mock-control http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT"
-        note "(dry run) nothing was built, started, or photographed."
-        exit 0
-    fi
-
-    step "Rebuilding the server, because web/ is compiled into it"
-    [ -f "$VIBE_TALK_DIR/contract/node_modules/esbuild/package.json" ] || die "--screenshots rebuilds the
-server, and its build needs the page build's pinned tools, which are not installed. Run
-npm ci --prefix $VIBE_TALK_DIR/contract and re-run."
-    cargo build --release --manifest-path "$VIBE_TALK_DIR/Cargo.toml" \
-        || die "the build failed, so there is no binary serving today's web/ to photograph."
-    SHOTS_BIN="$VIBE_TALK_DIR/target/release/vibe-talk"
-    [ -x "$SHOTS_BIN" ] || die "the build reported success but $SHOTS_BIN is not there."
-    SHOTS_MOCK_BIN="$VIBE_TALK_DIR/target/release/vibe-talk-mock-elevenlabs"
-    [ -x "$SHOTS_MOCK_BIN" ] || die "the build reported success but $SHOTS_MOCK_BIN is not there.
-That binary is the offline ElevenLabs substitute, and the summary states cannot be photographed
-without it: summaries come from a conversation with an agent and from nothing else."
-
-    step "Starting the offline ElevenLabs mock"
-    # BEFORE the server, so the server's own configuration points at something that is already
-    # listening. It costs nothing either way -- vibe-talk opens no vendor connection at startup --
-    # but a mock that failed to bind is then a failure with its own message rather than a summary
-    # state timing out four minutes later.
-    #
-    # `no_tool_call` is the scenario that answers canned prose without calling anything, so this
-    # needs no MCP traffic back to the bridge. --bridge-base and --bridge-token are still required
-    # by the binary, and are given the throwaway server and its throwaway token: the token is on a
-    # command line, which everything else here refuses to do, and that is acceptable only because
-    # this particular credential is invented per run and authenticates nothing that exists.
-    (
-        cd "$SHOTS_TMP" || exit 1
-        exec "$SHOTS_MOCK_BIN" \
-            --scenario no_tool_call \
-            --http-port "$SHOTS_MOCK_HTTP_PORT" \
-            --ws-port "$SHOTS_MOCK_WS_PORT" \
-            --bridge-base "http://127.0.0.1:$SHOTS_PORT" \
-            --bridge-token "$SHOTS_WRITE_TOKEN" \
-            > "$SHOTS_TMP/mock-elevenlabs.log" 2>&1
-    ) &
-    SHOTS_MOCK_PID=$!
-
-    SHOTS_MOCK_UP=0
-    for _ in $(seq 1 60); do
-        if ! kill -0 "$SHOTS_MOCK_PID" 2>/dev/null; then break; fi
-        if curl -fsS -o /dev/null "http://127.0.0.1:$SHOTS_MOCK_HTTP_PORT/_mock/trace" 2>/dev/null; then
-            SHOTS_MOCK_UP=1
-            break
-        fi
-        sleep 0.5
-    done
-    if [ "$SHOTS_MOCK_UP" != 1 ]; then
-        echo "" >&2
-        echo "--- offline ElevenLabs mock output ---" >&2
-        cat "$SHOTS_TMP/mock-elevenlabs.log" >&2 || true
-        die "the offline ElevenLabs mock never answered on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT.
-Its output is above. Without it every summary state is unreachable."
-    fi
-    note "mock up on 127.0.0.1:$SHOTS_MOCK_HTTP_PORT (pid $SHOTS_MOCK_PID)"
-
-    step "Starting the loopback model stub"
-    # Before the server, for the same reason as the mock: the server's [summaries.llm]
-    # section names this port, and a stub that failed to bind should fail here by name.
-    (
-        cd "$SHOTS_TMP" || exit 1
-        exec python3 "$SCRIPT_DIR/model_stub.py" --port "$SHOTS_MODEL_PORT" \
-            > "$SHOTS_TMP/model-stub.log" 2>&1
-    ) &
-    SHOTS_MODEL_PID=$!
-    SHOTS_MODEL_UP=0
-    for _ in $(seq 1 40); do
-        if ! kill -0 "$SHOTS_MODEL_PID" 2>/dev/null; then break; fi
-        if curl -fsS -o /dev/null "http://127.0.0.1:$SHOTS_MODEL_PORT/" 2>/dev/null; then
-            SHOTS_MODEL_UP=1
-            break
-        fi
-        sleep 0.5
-    done
-    if [ "$SHOTS_MODEL_UP" != 1 ]; then
-        echo "" >&2
-        echo "--- loopback model stub output ---" >&2
-        cat "$SHOTS_TMP/model-stub.log" >&2 || true
-        die "the loopback model stub never answered on 127.0.0.1:$SHOTS_MODEL_PORT.
-Its output is above. Without it Discuss cannot answer and its states are unreachable."
-    fi
-    note "model stub up on 127.0.0.1:$SHOTS_MODEL_PORT (pid $SHOTS_MODEL_PID)"
 
     step "Starting the throwaway server"
     (

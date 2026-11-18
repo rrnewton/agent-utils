@@ -44,6 +44,7 @@ OPTIONS:
                           socket_drop | unsupported_audio | no_reply (default: full)
     --ping-ms MS          send the JSON ping event every MS milliseconds (default: never)
     --trace-file PATH     write the redacted event trace as JSON Lines on shutdown
+    --ports-file PATH     write the bound ports (http=PORT, ws=PORT) here once listening
     --help                print this message and exit
 
 CONTROL PLANE (on the HTTP half):
@@ -64,6 +65,7 @@ struct Args {
     scenario: Scenario,
     ping_every: Option<Duration>,
     trace_file: Option<PathBuf>,
+    ports_file: Option<PathBuf>,
 }
 
 fn parse_args() -> anyhow::Result<Option<Args>> {
@@ -78,6 +80,7 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
         scenario: Scenario::Full,
         ping_every: None,
         trace_file: None,
+        ports_file: None,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -106,6 +109,7 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
                 args.ping_every = Some(Duration::from_millis(ms));
             }
             "--trace-file" => args.trace_file = Some(PathBuf::from(value()?)),
+            "--ports-file" => args.ports_file = Some(PathBuf::from(value()?)),
             other => anyhow::bail!("unrecognized argument {other:?}\n\n{USAGE}"),
         }
     }
@@ -149,6 +153,16 @@ async fn main() -> anyhow::Result<()> {
         ..MockOptions::default()
     })
     .await?;
+
+    // The bound-port handshake: with port 0 asked, the launcher cannot know the ports
+    // until the listeners exist, so they are written where it can read them.
+    if let Some(path) = &args.ports_file {
+        std::fs::write(
+            path,
+            format!("http={}\nws={}\n", mock.http_addr().port(), mock.ws_addr().port()),
+        )
+        .with_context(|| format!("writing the bound ports to {}", path.display()))?;
+    }
 
     tracing::warn!(
         "this is a MOCK ElevenLabs. It mints conversations for an agent nobody owns; it is bound \

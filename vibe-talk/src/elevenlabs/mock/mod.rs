@@ -450,6 +450,12 @@ impl MockHandle {
         self.ws_addr
     }
 
+    /// Where the HTTP half is listening: with port 0 asked, the port the kernel gave.
+    #[must_use]
+    pub fn http_addr(&self) -> SocketAddr {
+        self.http_addr
+    }
+
     /// The shared state, for a caller that wants to drive the mock in-process.
     #[must_use]
     pub fn state(&self) -> &Arc<MockState> {

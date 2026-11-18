@@ -21,7 +21,8 @@ not text the page made up.
 USAGE
 =====
 
-    model_stub.py --port PORT        (binds 127.0.0.1 only)
+    model_stub.py --port PORT        (binds 127.0.0.1 only; 0 asks the kernel)
+    model_stub.py --port 0 --port-file PATH   (also writes the bound port to PATH)
 """
 
 from __future__ import annotations
@@ -79,10 +80,15 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Loopback Messages API stub for screenshot runs.")
-    parser.add_argument("--port", type=int, required=True, help="loopback port to bind")
+    parser.add_argument("--port", type=int, required=True, help="loopback port to bind (0 asks the kernel)")
+    parser.add_argument("--port-file", default="", help="write the bound port to this file once listening")
     args = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"model stub on 127.0.0.1:{args.port}", flush=True)
+    bound = server.server_address[1]
+    if args.port_file:
+        with open(args.port_file, "w", encoding="utf-8") as handle:
+            handle.write(f"{bound}\n")
+    print(f"model stub on 127.0.0.1:{bound}", flush=True)
     server.serve_forever()
     return 0
 
