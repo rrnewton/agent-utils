@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-schema-level-version-skew: a newer writer bricks every older reader on the append-only log'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -29,3 +29,7 @@ Approved design (coordinator review): decision-relevance is decided per command 
 # Notes
 
 Coordinator confirmations (on c4e83d0c): (1) When `reader_floor`/`writer_ceiling` are unset, defaults are floor 1 and ceiling this build's schema level (2), so every field written today is at or below the ceiling: nothing is refused, omitted, or changed for any existing project; the gate only bites after a project deliberately sets a lower ceiling or a future field exceeds it. (2) The summary-plus-manifest replacement for the per-file ignored list is in the per-field writer table at the same level as the accounting it replaces: under a ceiling below that level the finish refuses rather than falling back to the unbounded per-file list, and any writer of the summary must assert the level first. Unknown-key presence stands in for a stamped level integer, because stamping a new top-level key would itself brick already-deployed readers.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as bd68415c. Load and replay preserve unknown keys raw and warn once in both editions; only remove/finish of the affected slot refuse, with a typed NEWER WRITER message naming the slot and fields. `reader_floor`/`writer_ceiling` gate writers without less-safe fallbacks (defaults change nothing for existing projects), and doctor reports the floor, ceiling, and newer records. Gate: 282 passed with one solo-rerun flake waiver (python.wrkslots.shard-4, release-frozen census, untouched); the overlap landing verified the replayed tree 2027c8fc with the focused skew, mutation, config, doctor, and active-state checks.
