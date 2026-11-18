@@ -49,50 +49,75 @@ export function mountLabels(deps: LabelsDependencies): LabelsView {
   const el = (id: string): HTMLElement => deps.lookup(id);
   const input = (id: string): HTMLInputElement => deps.lookup(id) as HTMLInputElement;
 
-  function groupOf(row: LabelRow): LabelGroupRow | undefined {
-    return row.group_id == null ? undefined : groups.find((group) => group.id === row.group_id);
+  /** One list entry: a plain spelling, or a whole group under its display. */
+  interface Entry {
+    name: string;
+    count: number;
+    group?: LabelGroupRow;
+  }
+
+  function entries(): Entry[] {
+    const grouped = new Set(groups.flatMap((group) => group.spellings as string[]));
+    const out: Entry[] = [];
+    for (const group of groups) {
+      const count = labels
+        .filter((row) => (group.spellings as string[]).includes(row.name))
+        .reduce((sum, row) => sum + row.count, 0);
+      out.push({ name: group.display, count, group });
+    }
+    for (const row of labels) {
+      if (!grouped.has(row.name)) out.push({ name: row.name, count: row.count });
+    }
+    return out;
   }
 
   function draw(): void {
     const filter = input("labels-filter").value.trim().toLowerCase();
-    const shown = labels
-      .filter((row) => filter === "" || row.name.includes(filter))
+    const shown = entries()
+      .filter((entry) =>
+        filter === "" || entry.name.includes(filter) ||
+        entry.group?.spellings.some((spelling) => spelling.includes(filter)))
       .sort((a, b) =>
         sortByCount ? b.count - a.count || a.name.localeCompare(b.name) : a.name.localeCompare(b.name),
       );
     const list = el("labels-list");
     list.replaceChildren(
-      ...shown.map((row) => {
+      ...shown.map((entry) => {
         const item = document.createElement("li");
         item.className = "label-row";
         const box = document.createElement("input");
         box.type = "checkbox";
-        box.checked = checked.has(row.name);
-        box.setAttribute("aria-label", `Select #${row.name} to combine`);
+        box.checked = checked.has(entry.name);
+        box.disabled = entry.group !== undefined;
+        box.title = entry.group
+          ? `#${entry.name} is grouped; edit the group to change it`
+          : "";
+        box.setAttribute("aria-label", `Select #${entry.name} to combine`);
         box.addEventListener("change", () => {
-          if (box.checked) checked.add(row.name);
-          else checked.delete(row.name);
+          if (box.checked) checked.add(entry.name);
+          else checked.delete(entry.name);
           drawCombine();
         });
         const name = document.createElement("button");
         name.type = "button";
         name.className = "label-name";
-        name.textContent = `#${row.name}`;
-        name.title = `Show only #${row.name}`;
-        name.addEventListener("click", () => deps.openLabel(row.name));
+        name.textContent = `#${entry.name}`;
+        name.title = entry.group
+          ? `Show only #${entry.name} (spellings: ${entry.group.spellings.join(", ")})`
+          : `Show only #${entry.name}`;
+        name.addEventListener("click", () => deps.openLabel(entry.name));
         const count = document.createElement("span");
         count.className = "label-count";
-        count.textContent = `${row.count} in loaded history`;
+        count.textContent = `${entry.count} in loaded history`;
         item.append(box, name, count);
-        const group = groupOf(row);
-        if (group) {
+        if (entry.group) {
           const marker = document.createElement("button");
           marker.type = "button";
           marker.className = "label-group-marker";
           marker.textContent = "(G)";
-          marker.title = `In the group "${group.display}" — edit it`;
-          marker.setAttribute("aria-label", `Edit the label group ${group.display}`);
-          marker.addEventListener("click", () => openDialog(group));
+          marker.title = `Group "${entry.group.display}": ${entry.group.spellings.join(", ")} — edit it`;
+          marker.setAttribute("aria-label", `Edit the label group ${entry.group.display}`);
+          marker.addEventListener("click", () => openDialog(entry.group));
           item.append(marker);
         }
         return item;

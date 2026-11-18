@@ -408,8 +408,14 @@ def walk_through(walk: Walk) -> None:
     page.fill("#label-group-name", "benchmarking")
     walk.shot("7-combine-dialog")
     page.click("#label-group-save")
-    walk.until("() => document.querySelectorAll('#labels-list .label-group-marker').length >= 1",
-               "no (G) row after combining")
+    walk.until("() => document.getElementById('label-group-dialog').hidden",
+               "the Combine dialog did not close after Save")
+    walk.until("() => document.querySelectorAll('#labels-list .label-group-marker').length === 1",
+               "not exactly one (G) row after combining")
+    grouped = page.evaluate("""() => [...document.querySelectorAll('#labels-list .label-name')]
+      .map((n) => n.textContent)""")
+    walk.check(grouped == ["#benchmarking", "#kvm", "#perf"],
+               f"after combining the list says {grouped}")
     walk.shot("8-grouped")
 
     # 6. From a grouped row, (G) edits; from the name, the filtered view.
@@ -434,10 +440,6 @@ def main() -> None:
     args = arguments()
     if args.screenshots is not None:
         args.screenshots.mkdir(parents=True, exist_ok=True)
-    api = LabelsApi()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), labels_handler(api))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    origin = f"http://127.0.0.1:{server.server_port}"
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -446,27 +448,35 @@ def main() -> None:
     with sync_playwright() as playwright:
         for label, width, height, touch in sizes:
             for theme in ("light", "dark"):
-                with tempfile.TemporaryDirectory() as profile:
-                    context = playwright.chromium.launch_persistent_context(
-                        profile, headless=True, executable_path=args.browser_executable,
-                        viewport={"width": width, "height": height},
-                        device_scale_factor=2.6 if touch else 1,
-                        has_touch=touch, is_mobile=touch,
-                        color_scheme=theme,
-                    )
-                    page = context.pages[0] if context.pages else context.new_page()
-                    page.add_init_script(IOS_VIEWPORT_JS)
-                    page.goto(origin)
-                    walk = Walk(page, f"{label}-{theme}", touch, args.screenshots)
-                    if touch:
-                        walk.page.evaluate(f"() => window.__iosKeyboard({KEYBOARD_PX})")
-                    walk_through(walk)
-                    if touch:
-                        walk.shot("9-keyboard")
-                        walk.page.evaluate("() => window.__iosClose()")
-                    context.close()
-                    print(f"{label}-{theme}: labels walk passed")
-    server.shutdown()
+                # A fresh fixture per walk: groups made by one walk must not
+                # leak into the next (they did, and shot 8 lied about it).
+                api = LabelsApi()
+                server = ThreadingHTTPServer(("127.0.0.1", 0), labels_handler(api))
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                origin = f"http://127.0.0.1:{server.server_port}"
+                try:
+                    with tempfile.TemporaryDirectory() as profile:
+                        context = playwright.chromium.launch_persistent_context(
+                            profile, headless=True, executable_path=args.browser_executable,
+                            viewport={"width": width, "height": height},
+                            device_scale_factor=2.6 if touch else 1,
+                            has_touch=touch, is_mobile=touch,
+                            color_scheme=theme,
+                        )
+                        page = context.pages[0] if context.pages else context.new_page()
+                        page.add_init_script(IOS_VIEWPORT_JS)
+                        page.goto(origin)
+                        walk = Walk(page, f"{label}-{theme}", touch, args.screenshots)
+                        if touch:
+                            walk.page.evaluate(f"() => window.__iosKeyboard({KEYBOARD_PX})")
+                        walk_through(walk)
+                        if touch:
+                            walk.shot("9-keyboard")
+                            walk.page.evaluate("() => window.__iosClose()")
+                        context.close()
+                        print(f"{label}-{theme}: labels walk passed")
+                finally:
+                    server.shutdown()
     print("labels browser: all walks passed")
 
 

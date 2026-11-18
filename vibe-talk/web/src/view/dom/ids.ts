@@ -224,6 +224,8 @@ export interface ElementById {
   "fold-help": HTMLButtonElement;
   "fold-hidden-channels": HTMLButtonElement;
   "fold-hidden-channels-body": HTMLDivElement;
+  "fold-labels": HTMLButtonElement;
+  "fold-labels-body": HTMLDivElement;
   "fold-mark-own": HTMLButtonElement;
   "fold-mark-own-body": HTMLDivElement;
   "fold-mark-read": HTMLButtonElement;
@@ -326,6 +328,20 @@ export interface ElementById {
   "keyboard-debug-readout": HTMLPreElement;
   "keyboard-keys": HTMLDivElement;
   "keyboard-send": HTMLButtonElement;
+  "label-group-close": HTMLButtonElement;
+  "label-group-dialog": HTMLDivElement;
+  "label-group-dissolve": HTMLButtonElement;
+  "label-group-name": HTMLInputElement;
+  "label-group-save": HTMLButtonElement;
+  "label-group-spellings": HTMLTextAreaElement;
+  "label-group-state": HTMLParagraphElement;
+  "label-group-title": HTMLHeadingElement;
+  "labels-combine": HTMLButtonElement;
+  "labels-filter": HTMLInputElement;
+  "labels-group": HTMLElement;
+  "labels-list": HTMLOListElement;
+  "labels-sort": HTMLButtonElement;
+  "labels-state": HTMLParagraphElement;
   "link-kind-action": HTMLButtonElement;
   "link-kind-action-count": HTMLSpanElement;
   "link-kind-commit": HTMLButtonElement;
@@ -529,6 +545,7 @@ export interface ElementById {
   "search-bucket-transcripts": HTMLButtonElement;
   "search-count": HTMLSpanElement;
   "search-empty": HTMLParagraphElement;
+  "search-entire-threads": HTMLButtonElement;
   "search-field": HTMLInputElement;
   "search-float": HTMLDivElement;
   "search-further": HTMLButtonElement;
