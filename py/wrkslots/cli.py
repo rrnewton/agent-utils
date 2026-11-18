@@ -90605,17 +90605,26 @@ def _recover_absent_validate_rows(
         if key[2] not in target_slots
     }
     writer = _event_writer(config, config.machine)
-    missing_archives = [
-        (item, entry) for item, _record, entry in items[archived_prefix:]
-    ]
-    if missing_archives:
+    # Bounded commits (#1701): archives land in chunks and the
+    # journal cursor advances per chunk, so a process killed by a
+    # memory cap mid-batch leaves a resumable journal whose durable
+    # archive prefix the next run revalidates and continues, instead
+    # of one all-or-nothing append held in memory.  The prefix
+    # invariants above are per-chunk identical.
+    chunk = 64
+    index = archived_prefix
+    while index < len(items):
+        part = items[index : index + chunk]
         archive_state = _append_absent_validate_archives(
-            config, archive_state, missing_archives, writer
+            config,
+            archive_state,
+            [(item, entry) for item, _record, entry in part],
+            writer,
         )
-        for item, _record, archive_entry in items[archived_prefix:]:
+        for item, _record, archive_entry in part:
             archived_by_slot[item.slot] = (archive_state, archive_entry)
-    if cursor != len(items):
-        journal["cursor"] = len(items)
+        index += len(part)
+        journal["cursor"] = index
         _write_journal(config, journal, event_writer=writer)
         _interrupt_for_test("after-absent-validate-row")
     _atomic_write_json(_archive_path(config, archive_state.machine), _archive_to_obj(archive_state))
@@ -90646,6 +90655,11 @@ def _recover_absent_validate_rows(
     # views before declaring the journal complete.
     _atomic_write_json(_archive_path(config, archive_state.machine), _archive_to_obj(archive_state))
     _atomic_write_json(_active_path(config, active_state.machine), _active_to_obj(active_state))
+    # Verification folds the authoritative chain: the recovery
+    # evidence it must match (absent_validate_recoveries) exists
+    # only in the fold, not in the snapshot files, so a snapshot
+    # readback cannot prove it (#1701; the streamed fold of #1794
+    # is the path to cheapen this load, not a snapshot shortcut).
     states, archives = _validate_global_state(config)
     active_by_identity = {
         (state.machine, record.slot): record for state in states for record in state.slots
@@ -90684,7 +90698,10 @@ def _recover_absent_validate_rows(
 
 
 def _emit_absent_validate_outcomes(
-    rows: Sequence[tuple[AbsentValidateRow, str, str]], output_format: str
+    rows: Sequence[tuple[AbsentValidateRow, str, str]],
+    output_format: str,
+    *,
+    lock_seconds: float | None = None,
 ) -> None:
     output_rows: list[dict[str, object]] = [
         {
@@ -90700,9 +90717,16 @@ def _emit_absent_validate_outcomes(
         "schema": 1,
         "rows": output_rows,
     }
+    if lock_seconds is not None:
+        # How long the registry locks were held (#1701): a long
+        # hold stalls every other wrkslots command on the host,
+        # so it is reported, not just endured.
+        payload["lock_seconds"] = round(lock_seconds, 3)
     if output_format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
+    if lock_seconds is not None:
+        print(f"lock_seconds={lock_seconds:.3f}")
     for row in output_rows:
         print(
             f"ROW machine={row['machine']} slot={row['slot']} "
@@ -90769,6 +90793,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
             except Exception:
                 pass
         census_prechecked = False
+        lock_started = time.monotonic()
         with _mutation_locks(config, args.wait_lock):
             _refuse_partial_state(config)
             journals = _outstanding_journals(config)
@@ -90845,6 +90870,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                         for item in requested
                     ],
                     args.format,
+                    lock_seconds=time.monotonic() - lock_started,
                 )
                 return 0
             states, archives = _validate_global_state(config)
@@ -90927,6 +90953,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     for item in requested
                 ],
                 args.format,
+                lock_seconds=time.monotonic() - lock_started,
             )
     except Refusal as exc:
         _emit_absent_validate_outcomes(

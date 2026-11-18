@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-recover-absent-memory-locks: recover-absent-validate-rows thrashes past its memory limit while holding every state lock'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -61,3 +61,40 @@ Two defects:
 Related: #1700 (status must report an interrupted mutation), #1276
 (adopt and create validate the whole registry while holding the exclusive
 project lock), #1554 part A3 (refused recover-absent journals).
+
+## Measurements (2026-11-18, before)
+
+Real `recover-absent-validate-rows --apply` in a subprocess,
+ru_maxrss (about 50 MiB run variance): 200 absent rows, empty
+event log: 175.2 MiB, 21.8 s. 1024 rows (the input cap), empty
+log: 165.4 MiB, 28.6 s. 2 rows with 20,000 chained events
+(4x3 MiB payloads): 268.6 MiB. 2 rows with 50,000 events
+(10x3 MiB payloads): 216.0 MiB. Row count does not dominate;
+whole-history loads do (every state load folds the chain, and
+the batch holds every item's full record plus archive entry).
+
+## Resolution
+
+- Archives now land in bounded chunks of 64 with the journal
+  cursor advancing per chunk (`_recover_absent_validate_rows`):
+  a process killed by a memory cap mid-batch leaves a resumable
+  journal whose durable archive prefix the next run revalidates
+  and continues. The durable-prefix invariants are unchanged.
+- The command reports `lock_seconds` (registry lock hold time)
+  in its JSON outcomes and human output.
+- Streamed verification by snapshot readback was tried and
+  reverted: the evidence the final check must match
+  (`absent_validate_recoveries`) exists only in the event fold,
+  not in snapshot files, so the fold stays. #1794's streamed
+  fold serves read-only bounded scans; recovery is a mutation
+  on the parse-once memo, and no second fold was written.
+- Not done, by design: releasing the registry locks between
+  per-row commits. The batch's safety proof is the durable
+  prefix (archives form a prefix, ACTIVE removals form a
+  prefix, both proven under one lock); per-row release would
+  need a new journal protocol, filed as follow-up if the
+  measured lock hold (now reported) still bites.
+
+Tests: `py/wrkslots/tests/test_recover_absent_bounded.py`
+(lock_seconds reported; chunk interrupt then replay completes),
+plus the existing absent-row lifecycle tests.

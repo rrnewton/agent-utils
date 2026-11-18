@@ -52705,7 +52705,9 @@ def test_absent_validate_recovery_parses_event_history_in_bounded_passes_at_127_
     assert archive_rows_parsed <= 24 * len(records)
     assert active_rows_parsed <= 24 * len(records)
     events = original_load_events(config)
-    assert sum(event["kind"] == "operation-progress-recorded" for event in events) == 2
+    # Batch journal plus one progress record per bounded chunk
+    # (127 rows in 64-row chunks = 2 chunks) (#1701).
+    assert sum(event["kind"] == "operation-progress-recorded" for event in events) == 3
     assert sum(event["kind"] == "archive-state-recorded" for event in events) == len(records)
     assert sum(event["kind"] == "active-state-recorded" for event in events) == len(records)
     archive_events = [
