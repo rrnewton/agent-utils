@@ -836,6 +836,8 @@
 #labels-button {
   position: relative;
   display: flex;
+  flex: 0 0 auto;
+  width: auto;
   align-items: center;
   gap: 0.3rem;
   height: var(--toggle-hit);
@@ -960,7 +962,7 @@
   clip-path: inset(50%);
 }
 
-#labels-button-input {
+#labels-filter-input {
   position: sticky;
   top: 0;
   width: 100%;
