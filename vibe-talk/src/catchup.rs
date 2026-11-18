@@ -761,6 +761,85 @@ pub fn load_warmup(paths: &[String], max_chars: usize) -> (String, u64) {
     (text, fingerprint)
 }
 
+/// The warm-up in force for one window: like [`load_warmup`], except a file
+/// that parses as a glossary contributes only the entries relevant to
+/// `window_text`, most relevant first, within the same whole budget
+/// (`discuss-glossary-preamble`, simple version).
+///
+/// Selection is recomputed per window from the files as they stand — it is
+/// cheap and deterministic — while the returned fingerprint still combines
+/// [`warmup_fingerprint`] with the selected text, so any glossary edit that
+/// changes what Discuss sees moves the fingerprint and invalidates the
+/// warm-up. A file with no glossary entries keeps the plain
+/// [`assemble_warmup`] behaviour, in order, under the same budget.
+#[must_use]
+pub fn load_warmup_for_window(paths: &[String], max_chars: usize, window_text: &str) -> (String, u64) {
+    let files_fingerprint = warmup_fingerprint(paths);
+    if paths.is_empty() || max_chars == 0 {
+        return (String::new(), crate::glossary::selection_fingerprint(files_fingerprint, ""));
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    for path in paths {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                files.push((name, text));
+            }
+            Err(error) => {
+                tracing::warn!(path = %path, error = %error, "discuss warm-up file unreadable, left out");
+            }
+        }
+    }
+    if files.is_empty() {
+        return (String::new(), crate::glossary::selection_fingerprint(files_fingerprint, ""));
+    }
+    // Fast path: one glossary file is the shipped shape; select directly.
+    if files.len() == 1 {
+        let entries = crate::glossary::parse_glossary(&files[0].1);
+        if !entries.is_empty() {
+            let (text, _) =
+                crate::glossary::assemble_glossary_warmup(&entries, window_text, &[], max_chars);
+            let fingerprint = crate::glossary::selection_fingerprint(files_fingerprint, &text);
+            return (text, fingerprint);
+        }
+    }
+    let mut out = String::from(
+        "Reference material for the work this channel discusses (background only; \
+         the messages after it are the news):\n",
+    );
+    for (name, text) in &files {
+        let heading = format!("\n## Reference: {name}\n");
+        let entries = crate::glossary::parse_glossary(text);
+        if entries.is_empty() {
+            out.push_str(&heading);
+            out.push_str(text.trim_end());
+            out.push('\n');
+            continue;
+        }
+        out.push_str(&heading);
+        for entry in crate::glossary::ranked_entries(&entries, window_text, &[]) {
+            let line = entry.prompt_line();
+            if out.chars().count() + line.chars().count() + 1 > max_chars {
+                continue;
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    let out = out.trim_end().to_owned();
+    let text = if out.chars().count() <= max_chars {
+        out
+    } else {
+        let kept: String = out.chars().take(max_chars).collect();
+        format!("{}\n[warm-up cut here by this server to fit its budget]", kept.trim_end())
+    };
+    let fingerprint = crate::glossary::selection_fingerprint(files_fingerprint, &text);
+    (text, fingerprint)
+}
+
 /// The system prompt in force: the owner's override when he has written one, else the shipped one.
 ///
 /// The override is tidied the way a textarea's text needs: line endings made `\n`, NULs taken
@@ -1379,6 +1458,33 @@ mod tests {
             warmup_fingerprint(&["no/such/file.md".to_owned()]),
             warmup_fingerprint(&["no/such/other.md".to_owned()])
         );
+    }
+
+    #[test]
+    fn window_warmup_selects_relevant_terms_within_budget_deterministically() {
+        let dir = crate::testing::TempDir::new("warmup-window");
+        let path = dir.path().join("discuss-glossary.md");
+        let mut text = String::from("# glossary\n");
+        for i in 0..40 {
+            text.push_str(&format!("- **term{i:02}**: definition number {i}.\n"));
+        }
+        std::fs::write(&path, &text).unwrap();
+        let paths = vec![path.to_string_lossy().into_owned()];
+        let window = "term00 and term01, term00 again";
+        let (first, first_fp) = load_warmup_for_window(&paths, 400, window);
+        let (second, second_fp) = load_warmup_for_window(&paths, 400, window);
+        assert_eq!(first, second, "same glossary and window must inject identically");
+        assert_eq!(first_fp, second_fp);
+        assert!(
+            first.chars().count() <= 400,
+            "{} chars over budget: {first}",
+            first.chars().count()
+        );
+        assert!(first.contains("term00"), "most relevant term kept first: {first}");
+        // A glossary edit changes what Discuss sees, so the fingerprint moves.
+        std::fs::write(&path, text.replace("definition number 0.", "renamed gloss.")).unwrap();
+        let (_, edited_fp) = load_warmup_for_window(&paths, 400, window);
+        assert_ne!(first_fp, edited_fp, "glossary change must move the fingerprint");
     }
 
     #[test]

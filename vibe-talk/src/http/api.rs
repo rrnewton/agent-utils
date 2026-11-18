@@ -2683,9 +2683,10 @@ pub async fn catchup(
     }
     let owner = crate::owner::Owner::of(&state);
     let mut built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
-    let (warmup, warmup_fingerprint) = crate::catchup::load_warmup(
+    let (warmup, warmup_fingerprint) = crate::catchup::load_warmup_for_window(
         &state.config.summaries.catchup_warmup_files,
         state.config.summaries.catchup_warmup_max_chars,
+        &built.prompt,
     );
     let warmup_chars = warmup.chars().count();
     if !warmup.is_empty() {

@@ -406,6 +406,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some("unknown-terms-report") => return unknown_terms_report(argv),
+        Some("glossary-report") => return glossary_report(argv),
         Some("cache-stats") => return cache_stats(argv),
         _ => {}
     }
@@ -1266,6 +1267,15 @@ fn check_heads_in_background(
             }
         }
     });
+}
+
+/// `vibe-talk glossary-report`. `discuss-glossary-preamble`.
+fn glossary_report(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(options) = vibe_talk::glossary::parse_glossary_report_args(args)? else {
+        return Ok(());
+    };
+    print!("{}", vibe_talk::glossary::run_glossary_report(&options));
+    Ok(())
 }
 
 /// `vibe-talk unknown-terms-report`. `discuss-unknown-terms-log`.

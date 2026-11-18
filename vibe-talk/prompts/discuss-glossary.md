@@ -12,3 +12,26 @@
 - **P0**: highest priority.
 - **wrkslots**: the tool managing isolated git worktree slots, one per agent.
 - **dagrun**: the validation DAG runner; `make validate` selects the checks a change can affect.
+- **lane**: one coding-agent workstream with its own slot, branch, and task.
+- **slot**: an isolated git worktree assigned to exactly one lane at a time.
+- **worktree**: a linked checkout that shares one repository history with the main checkout.
+- **pane**: one terminal pane inside Herdr hosting a single agent session.
+- **catch-up**: a Discuss read that briefs the messages a reader has not yet marked read.
+- **Discuss**: the catch-up side agent in vibe-talk that briefs a channel window on request.
+- **warm-up**: reference files prepended to a Discuss request as background, cut to a character budget.
+- **glossary**: this file: one short line per term, shown to Discuss as warm-up reference.
+- **unknown terms**: the trailing "Terms I didn't understand" list a Discuss answer reports for debugging.
+- **unknown-terms log**: the optional server-side JSONL record of those terms, counted by frequency offline.
+- **fingerprint**: a hash naming the exact warm-up files in force, logged beside each Discuss run.
+- **gate**: the validation run that must pass on the exact final tree before a change lands.
+- **validate**: `make validate`, which runs only the checks a change can affect and skips the rest by name.
+- **merge-queue**: the serialized queue that lands validated changes one at a time without overlap.
+- **donor**: a worker that takes queued validation jobs and runs them for the merge-queue.
+- **slug**: the lowercase hyphenated feature name that prefixes an issue title and never changes.
+- **minibeads**: the local issue files under `.minibeads/issues`, one file per issue.
+- **wrkviz**: the suite tool that draws a zoomable timeline of coordinator and lane work.
+- **cache-only**: a read answered from the local cache alone, with no provider fetch to fill it.
+- **side agent**: the model called separately from the main chat to brief, summarise, or name threads.
+- **half-pane**: the Discuss panel shown beside the message list instead of replacing it.
+- **summary cache key**: the inputs that decide whether a stored summary still matches its message.
+- **landing**: merging a validated change onto the shared main branch.

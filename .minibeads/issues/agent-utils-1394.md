@@ -23,10 +23,13 @@ Write `ai_docs/plans/2026-11-12-discuss-glossary-preamble.md` covering the agent
 - (b) Weekly top-terms glossary: deterministic candidate selection from the #1393 frequencies plus docs/commits/issues, model-written reviewed definitions, size budget, consumer-state location; primer content stays out of agent-utils.
 - Both layers feed #1352 `catchup_warmup_files`, primer first; the note proposes turning the warm-up on with the starter glossary.
 - (c) Prefix caching answered from the gateway wire shape, or stated as not cheaply checkable.
+- Simple version (owner GO, thread 169): proactive glossary through the #1352 warm-up slot within 6,000 chars, deterministic relevance selection, reported size and before/after coverage; tool-call retrieval NOT built.
 
 # Design
 
 See the plan file. Layer 1 (stable systems primer, ~2,000 chars, consumer-held) precedes Layer 2 (weekly project glossary plus agents, ~4,000 chars) inside the existing 6,000-char warm-up budget.
+
+Simple version built (owner GO, thread 169): the committed `vibe-talk/prompts/discuss-glossary.md` is the single source of truth for definitions (human-reviewed, one line per term), because a generated file with invented definitions would be served unreviewed and a wrong gloss is worse than an unknown term. Generation is the deterministic per-window selection in `vibe-talk/src/glossary.rs`: unknown-term tallies rank candidates offline, window occurrences rank entries at request time, and the fingerprint combines the files fingerprint with the selected text so any glossary edit invalidates the warm-up. No second generated file is committed; `vibe-talk glossary-report` regenerates the measurement on demand. Tool-call retrieval of definitions is the follow-up, not built here.
 
 # Notes
 
