@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-discuss-followup-422: follow-up questions in the Discuss panel return 422 non-JSON'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - discuss
 - ui
 created_at: 2026-11-18T10:00:00-05:00
-updated_at: 2026-11-18T10:00:00-05:00
+updated_at: 2026-11-18T13:00:00-05:00
 ---
 
 # Description
@@ -33,3 +33,7 @@ updated_at: 2026-11-18T10:00:00-05:00
 # Notes
 
 Owner-priority, deployed on landing. Liaison plans one live read-only check after the deploy; the follow-up route's side effects must be answered to the coordinator before that.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 9fdd0c94 (gate pass on 1553d34b; combined-tree verified against #1839b's overlap). Root cause: the page pre-stringified the follow-up and Update bodies and the api wrapper serialised them again, so the extractor refused a JSON string with a plain-text 422 on every live follow-up. The page now sends the object; an innermost layer answers every non-JSON /api/ 4xx in the JSON error contract; Discuss failures stand red with role=alert in both themes; follow-up answers render citations as links like summaries do. Router tests send the page's exact wire bytes with only the model stubbed; a dynamic drive on a test instance asked the owner's follow-up question end to end and captured the 10-image matrix in /tmp/mu-followup-shots. Side effects reported to the coordinator before the live check: one model call and two turns appended to the Discuss record, nothing else.
