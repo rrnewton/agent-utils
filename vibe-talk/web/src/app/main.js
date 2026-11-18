@@ -1607,19 +1607,21 @@ const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom:
  * @type {import("../core/outbox/index.ts").DraftSync}
  */
 const draftSync = createDraftSync({
-  // As the offer is: no draft traffic before the token is proven. A refused
-  // call is kept as pending words and flushed once the page is signed in.
+  // As the offer is: no draft traffic before the token is proven, and none
+  // on a read-scope sign-in — drafts are the owner's unsent words and the
+  // server refuses a reader for them. A refused call is kept as pending
+  // words and flushed once the page may sync.
   transport: {
     getDrafts: async (channel) => {
-      if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
+      if (!serverFacts.configApplied() || serverFacts.tokenScope() !== "write") throw new Error("draft sync is not available yet");
       return /** @type {Promise<{drafts: import("../core/outbox/index.ts").SyncedDraft[]}>} */ (api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`));
     },
     putDraft: async (channel, body) => {
-      if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
+      if (!serverFacts.configApplied() || serverFacts.tokenScope() !== "write") throw new Error("draft sync is not available yet");
       return /** @type {Promise<{draft: import("../core/outbox/index.ts").SyncedDraft | null, replaced: import("../core/outbox/index.ts").SyncedDraft | null}>} */ (api(`/api/v1/channels/${encodeURIComponent(channel)}/drafts`, { method: "PUT", body }));
     },
     deleteDraft: async (channel, body) => {
-      if (!serverFacts.configApplied()) throw new Error("the token is not proven yet");
+      if (!serverFacts.configApplied() || serverFacts.tokenScope() !== "write") throw new Error("draft sync is not available yet");
       const query = body.thread_id
         ? `?scope=${encodeURIComponent(body.scope)}&thread_id=${encodeURIComponent(body.thread_id)}`
         : `?scope=${encodeURIComponent(body.scope)}`;
@@ -1669,7 +1671,7 @@ async function offerSyncedDraft(key, box, offerBar, offerText, remember, attempt
   // reopen is sign-in's story to tell, and a draft read must not race it.
   // The restore can run first, so an unproven page asks again shortly; a
   // refused token never proves, and the asking simply runs out.
-  if (!serverFacts.configApplied()) {
+  if (!serverFacts.configApplied() || serverFacts.tokenScope() !== "write") {
     if (attempts > 0) {
       setTimeout(() => void offerSyncedDraft(key, box, offerBar, offerText, remember, attempts - 1), 500);
     }
