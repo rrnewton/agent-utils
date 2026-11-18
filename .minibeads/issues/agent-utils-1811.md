@@ -1,12 +1,12 @@
 ---
 title: 'vibe-talk-discuss-thread-scope-and-title: scope Discuss and its Summarize count to the open thread, title names the scope'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-11-17T20:01:00-05:00
-updated_at: 2026-11-17T20:01:00-05:00
+updated_at: 2026-11-18T03:30:00-05:00
 ---
 
 # Description
@@ -28,3 +28,7 @@ Finding: a fresh open inside a thread already scopes (the preview and POST carry
 - Page tests at phone and desktop sizes cover the defect; screenshot matrix captured and inspected.
 
 # Notes
+
+## Resolution
+
+Landed 972439e26241c25a93c0c0bc41b09c766853d56b on github/main. Entering a thread re-scopes an open Discuss to that thread (and returning to main re-scopes back), via the new narrowing-rescopes-to-thread / widening-rescopes-to-main binding rules and syncDiscussView wired into in-channel view renders; the panel title reads "Discuss: main channel" or "Discuss: thread <slug>" and truncates with an ellipsis at narrow widths. Verified: catchup and channel JS suites, typecheck, discuss-browser and discuss-dock-browser solo on the combined tree, and a 12-image screenshot matrix (phone 412x915 and desktop 1280x800, light and dark, keyboard open and closed) inspected by the lane and confirmed by the coordinator. mention-jump-browser passed 3x solo on this tree and 3x on unmodified main; its one gate failure was host-load flake.
