@@ -544,6 +544,7 @@ fn a_second_held_reply_makes_an_exact_count_a_lower_bound() {
     let fx = Fixture::new("c1814-exact-count-stale");
     let mut root = message("1700000000.000100", "ada", "question", T0);
     root.thread = Some(crate::threads::MessageThread {
+        class: None,
         hue: None,
         display_name: None,
         summary: None,
