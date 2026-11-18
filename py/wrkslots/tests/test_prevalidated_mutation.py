@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fcntl
+import json
 import os
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -687,3 +688,138 @@ def test_post_write_check_accepts_only_the_slots_own_image_record(
     other.write_text("{}\n", encoding="utf-8")
     cli._assert_registry_change_limited_to_slot(config, reference, before, "slot01", local)
     assert validations == ["validate"]
+
+
+def _concurrent_heartbeat(
+    project: Path, writes: list[int], *, slot: str = "slot02", agent: str = "codex-2"
+) -> Callable[[], None]:
+    """A real heartbeat in another process, fired once during lock-free validation."""
+
+    def write() -> None:
+        if writes:
+            return
+        completed = command(
+            project,
+            "heartbeat",
+            slot,
+            "--agent",
+            agent,
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+        assert completed.returncode == 0, completed.stderr
+        writes.append(completed.returncode)
+
+    return write
+
+
+@pytest.mark.parametrize("operation", ("adopt", "create"))
+def test_a_concurrent_heartbeat_no_longer_burns_a_validation_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+) -> None:
+    """#1808-B: another slot's ttl-renewed heartbeat is tolerated, not a re-round."""
+    project = _three_slot_project(tmp_path)
+    _treat_every_event_as_settled(monkeypatch)
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+    ledger.during_validation = _concurrent_heartbeat(project, writes)
+    heartbeat_before = _row(project, "slot02")
+    assert heartbeat_before is not None
+    argv = _adopt_argv(project) if operation == "adopt" else _create_argv(project)
+
+    rc = cli.main(argv)
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert writes == [0]
+    # One validation round only: the heartbeat did not send the command back.
+    assert ledger.count("validate", held=False) == 1
+    assert ledger.count("validate", held=True) == 0
+    assert ledger.exclusive_rounds == 1
+    # The heartbeat was not reverted by the mutation's write: the shard's
+    # heartbeat_at is exactly the one the concurrent heartbeat event recorded.
+    heartbeat_after = _row(project, "slot02")
+    assert heartbeat_after is not None
+    renewed = []
+    for event_path in (control_directory(project) / "EVENTS.testhost").glob("*.json"):
+        event = json.loads(event_path.read_text(encoding="utf-8"))
+        payload = event.get("payload", {})
+        if (
+            event.get("kind") == "active-state-recorded"
+            and payload.get("action") == "ttl-renewed"
+            and payload.get("slot") == "slot02"
+        ):
+            renewed.append(payload["evidence"]["heartbeat_at"])
+    assert renewed == [heartbeat_after["heartbeat_at"]]
+    if operation == "adopt":
+        row = _row(project, "slot01")
+        assert row is not None and isinstance(row["owner"], dict)
+    else:
+        assert _row(project, "slot03") is not None
+
+
+def test_a_tolerated_heartbeat_plus_another_change_revalidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#1808-B: a tolerated heartbeat and a non-tolerated change in one round re-round."""
+    project = _three_slot_project(tmp_path)
+    _treat_every_event_as_settled(monkeypatch)
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+
+    def mixed() -> None:
+        if writes:
+            return
+        heartbeat = command(
+            project,
+            "heartbeat",
+            "slot02",
+            "--agent",
+            "codex-2",
+            "--owner-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+        )
+        assert heartbeat.returncode == 0, heartbeat.stderr
+        hold = command(project, "hold", "slot02", "--reason", "concurrent writer")
+        assert hold.returncode == 0, hold.stderr
+        writes.append(heartbeat.returncode)
+
+    ledger.during_validation = mixed
+
+    rc = cli.main(_create_argv(project))
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert ledger.count("validate", held=False) == 2
+    assert ledger.count("validate", held=True) == 0
+    assert _row(project, "slot03") is not None
+
+
+def test_a_heartbeat_from_the_target_agent_is_not_tolerated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#1808-B: a heartbeat for a slot of the target agent stays fail-closed."""
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project, slot="slot02", agent="codex-3", branch="codex/task2")
+    assert made.returncode == 0, made.stderr
+    _treat_every_event_as_settled(monkeypatch)
+    ledger = _LockLedger(monkeypatch, project)
+    writes: list[int] = []
+    ledger.during_validation = _concurrent_heartbeat(
+        project, writes, slot="slot02", agent="codex-3"
+    )
+
+    rc = cli.main(_create_argv(project))
+
+    captured = capsys.readouterr()
+    # Revalidation judged the current registry: codex-3 already owns a slot.
+    assert rc == 3
+    assert "already owns slot" in captured.err
+    assert _row(project, "slot03") is None

@@ -39908,6 +39908,10 @@ class _CreatePrevalidated:
     # path still classifies it, but reuses this lock-free storage report
     # instead of recomputing the fleet scan under the lock (#1287).
     journals_outstanding: bool = False
+    # True when the states were refreshed across other slots' heartbeats
+    # under the lock (#1808-B): the slot and agent are re-checked against
+    # the refreshed rows before the write, never trusted from validation.
+    rebased: bool = False
 
 
 def _create_plan_repositories(config: Config, args: argparse.Namespace) -> tuple[Path, ...]:
@@ -42739,6 +42743,33 @@ def _cmd_create(args: argparse.Namespace) -> int:
             # and the slot and agent were free.
             assert prepared is not None
             states, archives = list(prepared.states), list(prepared.archives)
+            if prepared.rebased:
+                # Refreshed across other slots' heartbeats (#1808-B): the
+                # fleet facts may have aged, so the slot-specific facts this
+                # create depends on are re-judged against the refreshed rows.
+                for refreshed_state in states:
+                    for record in refreshed_state.slots:
+                        if record.slot == args.slot:
+                            raise Refusal(
+                                f"slot {args.slot!r} is already active on {refreshed_state.machine}"
+                            )
+                        if (
+                            args.slot_type == "agent"
+                            and record.slot_type == "agent"
+                            and record.import_source is None
+                            and record.agent == args.agent
+                        ):
+                            raise Refusal(
+                                f"agent {args.agent!r} already owns slot {record.slot!r} "
+                                f"on {refreshed_state.machine}"
+                            )
+                for refreshed_archive in archives:
+                    for archived_record in refreshed_archive.records:
+                        if archived_record.get("slot") == args.slot:
+                            raise Refusal(
+                                f"slot {args.slot!r} is archived on {refreshed_archive.machine}; "
+                                "finished slots are never reused"
+                            )
         before = _global_rows(states, archives)
         local = (
             None
@@ -43233,8 +43264,35 @@ def _cmd_create(args: argparse.Namespace) -> int:
             )
         return record, storage_inconsistencies
 
+    def tolerate(
+        before: _RegistryIdentity,
+        after: _RegistryIdentity,
+        facts: _CreatePrevalidated,
+    ) -> _CreatePrevalidated | None:
+        # #1808-B: only other slots' heartbeats may pass; anything else
+        # (including a journal appearing) revalidates from scratch.
+        if facts.journals_outstanding:
+            return None
+        refreshed = _heartbeat_only_refresh(
+            config,
+            before,
+            after,
+            facts.states,
+            facts.archives,
+            slot=args.slot,
+            agent=args.agent,
+            branches=frozenset(_assignments(args.branch, "branch").values()),
+            paths=frozenset({str(_slot_directory(config, args.slot, args.slot_type))}),
+        )
+        if refreshed is None:
+            return None
+        states, archives = refreshed
+        return dataclasses.replace(
+            facts, states=tuple(states), archives=tuple(archives), rebased=True
+        )
+
     record, storage_inconsistencies = _run_prevalidated_mutation(
-        config, args.wait_lock, "create", prepare, commit
+        config, args.wait_lock, "create", prepare, commit, tolerate=tolerate
     )
     # The slot is registered and every checkout is materialized, including the
     # post-provision hooks' submodules; installers run outside the lock and
@@ -44319,7 +44377,39 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         _assert_registry_change_limited_to_slot(config, reference, before, args.slot, local)
         return adopted
 
-    adopted = _run_prevalidated_mutation(config, args.wait_lock, "adopt", prepare, commit)
+    def tolerate(
+        before: _RegistryIdentity,
+        after: _RegistryIdentity,
+        facts: tuple[list[ActiveState], list[ArchiveState]],
+    ) -> tuple[list[ActiveState], list[ArchiveState]] | None:
+        # #1808-B: only other slots' heartbeats may pass. The commit
+        # re-judges this slot's record from the refreshed state, so a
+        # heartbeat of the target slot itself is never tolerated either.
+        states, archives = facts
+        target = next(
+            (record for state in states for record in state.slots if record.slot == args.slot),
+            None,
+        )
+        refreshed = _heartbeat_only_refresh(
+            config,
+            before,
+            after,
+            states,
+            archives,
+            slot=args.slot,
+            agent=args.agent,
+            branches=frozenset(
+                checkout.branch for checkout in (target.checkouts if target else ())
+            ),
+            paths=frozenset(
+                checkout.path for checkout in (target.checkouts if target else ())
+            ),
+        )
+        return refreshed
+
+    adopted = _run_prevalidated_mutation(
+        config, args.wait_lock, "adopt", prepare, commit, tolerate=tolerate
+    )
     if adopted is None:
         return 0
     print(
