@@ -373,15 +373,15 @@ def walk(page: Page, size: str, phone: bool, shots: Path | None) -> list[str]:
     page.emulate_media(color_scheme="dark")
     settled(page)
     slugged = badge(page, "201")
-    check(slugged["text"] == "🧵 my-thread-slug (57)", f"{size}: slugged tag says {slugged['text']!r}")
-    check(slugged["slugAttr"] == "my-thread-slug" and slugged["slugDrawn"], f"{size}: slug not drawn: {slugged}")
-    check(slugged["emoji"] == "🧵" and slugged["emojiDrawn"], f"{size}: emoji not drawn: {slugged}")
+    check(str(slugged["text"]) == "🧵 my-thread-slug (57)", f"{size}: slugged tag says {slugged['text']!r}")
+    check(str(slugged["slugAttr"]) == "my-thread-slug" and bool(slugged["slugDrawn"]), f"{size}: slug not drawn: {slugged}")
+    check(str(slugged["emoji"]) == "🧵" and bool(slugged["emojiDrawn"]), f"{size}: emoji not drawn: {slugged}")
     check("grayscale" in str(slugged["filter"]), f"{size}: emoji is not greyed: {slugged['filter']}")
-    check(slugged["inside"] and float(str(slugged["overflow"])) <= 0, f"{size}: tag escapes its row: {slugged}")
+    check(bool(slugged["inside"]) and float(str(slugged["overflow"])) <= 0, f"{size}: tag escapes its row: {slugged}")
     plain = badge(page, "205")
-    check(plain["text"] == "Thread(2)" and plain["slugAttr"] is None, f"{size}: plain tag changed: {plain}")
+    check(str(plain["text"]) == "Thread(2)" and plain["slugAttr"] is None, f"{size}: plain tag changed: {plain}")
     fresh = badge(page, "207")
-    check(fresh["text"] == "Thread" and fresh["state"] == "start", f"{size}: grey tag changed: {fresh}")
+    check(str(fresh["text"]) == "Thread" and str(fresh["state"]) == "start", f"{size}: grey tag changed: {fresh}")
     notes.append("the slugged tag reads 🧵 my-thread-slug (57) with a greyed emoji; without a slug it is Thread(2)")
 
     # The full matrix for this size: scheme × keyboard, Discuss open on the phone.
@@ -397,7 +397,7 @@ def walk(page: Page, size: str, phone: bool, shots: Path | None) -> list[str]:
                 open_discuss(page)
             settled(page)
             state = badge(page, "201")
-            check(state["inside"] and float(str(state["overflow"])) <= 0,
+            check(bool(state["inside"]) and float(str(state["overflow"])) <= 0,
                   f"{size} {scheme} keyboard={keyboard}: tag escapes: {state}")
             if shots is not None:
                 name = f"{size}-{scheme}-{'kbopen' if keyboard else 'kbclosed'}-after.png"
@@ -431,8 +431,8 @@ def walk(page: Page, size: str, phone: bool, shots: Path | None) -> list[str]:
                  "the narrowed list did not settle")
         settled(page)
         long = badge(page, "203")
-        check(long["slug"] == LONG_SLUG and long["count"] == "(12)", f"desk narrowed: long tag: {long}")
-        check(long["inside"] and float(str(long["overflow"])) <= 0, f"desk narrowed: long tag escapes: {long}")
+        check(str(long["slug"]) == LONG_SLUG and str(long["count"]) == "(12)", f"desk narrowed: long tag: {long}")
+        check(bool(long["inside"]) and float(str(long["overflow"])) <= 0, f"desk narrowed: long tag escapes: {long}")
         if shots is not None:
             page.screenshot(path=str(shots / "1280x800-narrow-long-slug.png"), full_page=False)
         notes.append("a long slug truncates in a narrowed list without escaping its row")
@@ -441,7 +441,7 @@ def walk(page: Page, size: str, phone: bool, shots: Path | None) -> list[str]:
         page.set_viewport_size({"width": 360, "height": 740})
         settled(page)
         narrow = badge(page, "201")
-        check(not narrow["slugDrawn"] and not narrow["emojiDrawn"],
+        check(not bool(narrow["slugDrawn"]) and not bool(narrow["emojiDrawn"]),
               f"phone narrowed: the fallback did not hide the slug: {narrow}")
         if shots is not None:
             page.screenshot(path=str(shots / "412x915-narrow-fallback.png"), full_page=False)
