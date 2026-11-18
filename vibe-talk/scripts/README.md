@@ -17,6 +17,7 @@ scripts/run.sh --screenshots --theme both \
   --profiles android-412,laptop-1280 \
   --only 73-discuss-preview --only 74-discuss-summary \
   --only 75-discuss-keyboard-closed --only 76-discuss-keyboard-open \
+  --only 77-composer-keyboard-open \
   --out /tmp/<lane>-shots
 ```
 

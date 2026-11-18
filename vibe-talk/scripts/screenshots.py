@@ -1302,13 +1302,37 @@ def keyboard_shrink_problem(closed: int, opened: int) -> str | None:
     return None
 
 
-def shrink_keyboard(driver: Driver, scene_name: str) -> tuple[int, int]:
+def focused_inside_problem(top: float, bottom: float, viewport_height: float) -> str | None:
+    """Why a focused field is not inside the shrunk viewport, or None when it is.
+
+    Pure, so `--self-test` can prove it goes red: a keyboard only opens because an input
+    has focus, so an "open" shot whose focused field sits below the shrunk viewport is
+    a shot of a keyboard that would have covered the very box it opened for.
+    """
+    if top < 0 or bottom > viewport_height:
+        return (
+            f"the focused field ({top:.0f}..{bottom:.0f}) is outside the shrunk "
+            f"viewport (0..{viewport_height:.0f}) — the keyboard would cover it"
+        )
+    return None
+
+
+def shrink_keyboard(driver: Driver, scene_name: str, focus: str | None = None) -> tuple[int, int]:
     """Shrink the viewport by KEYBOARD_PX and wait until the page really reports it.
 
-    Returns (closed, opened) visual-viewport heights. Raises `Unreachable` — failing the run
-    by name — when the open height equals the closed one or misses the promised shrink: a
-    keyboard-open shot identical to the closed one is rejected, never filed.
+    When `focus` names an element (the composer, the Discuss box), it is focused FIRST:
+    a real keyboard only opens because an input has focus, and after the shrink the
+    focused element must sit inside the visual viewport. Returns (closed, opened)
+    visual-viewport heights. Raises `Unreachable` — failing the run by name — when the
+    open height equals the closed one, misses the promised shrink, or leaves the
+    focused field outside the shrunk viewport: such a shot is rejected, never filed.
     """
+    if focus is not None:
+        driver.page.locator(focus).click()
+        driver.page.wait_for_function(
+            f"() => document.activeElement === document.querySelector({json.dumps(focus)})",
+            timeout=10_000,
+        )
     closed = int(cast(float, driver.js("(window.visualViewport ? window.visualViewport.height : window.innerHeight)")))
     shrunk = closed - KEYBOARD_PX
     driver.page.set_viewport_size({"width": driver.profile.width, "height": shrunk})
@@ -1320,6 +1344,21 @@ def shrink_keyboard(driver: Driver, scene_name: str) -> tuple[int, int]:
     problem = keyboard_shrink_problem(closed, opened)
     if problem is not None:
         raise Unreachable(scene_name, "the keyboard really shrinks the viewport", problem)
+    if focus is not None:
+        rect = cast(
+            dict[str, float],
+            driver.js(
+                "(() => { const r = document.activeElement.getBoundingClientRect(); "
+                "return {top: r.top, bottom: r.bottom}; })()"
+            ),
+        )
+        inside = focused_inside_problem(
+            float(rect["top"]), float(rect["bottom"]), float(opened)
+        )
+        if inside is not None:
+            raise Unreachable(
+                scene_name, "the focused field stays inside the shrunk viewport", inside
+            )
     return closed, opened
 
 
@@ -4432,11 +4471,29 @@ def _act_discuss_keyboard_closed(driver: Driver) -> None:
 
 def _act_discuss_keyboard_open(driver: Driver) -> None:
     _open_discuss(driver)
-    shrink_keyboard(driver, "76-discuss-keyboard-open")
+    shrink_keyboard(driver, "76-discuss-keyboard-open", focus="#discuss-followup")
 
 
 def _after_discuss_keyboard(driver: Driver) -> None:
     restore_keyboard(driver)
+
+
+def _act_composer_keyboard_open(driver: Driver) -> None:
+    """The channel composer focused, then the keyboard opens over it (`#1863`).
+
+    The liaison's rejected desktop shots shrank the viewport with nothing focused, so
+    the box the keyboard exists for was off screen. Here the box is focused first and
+    the helper refuses the shot if the shrink leaves it outside the viewport.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-discord")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log > li').length > 0 "
+        "&& !window.__visible('channel-loading')",
+        timeout=15_000,
+    )
+    shrink_keyboard(driver, "77-composer-keyboard-open", focus="#channel-compose-text")
 
 
 MATRIX_PROFILES = ("android-412", "laptop-1280")
@@ -7170,6 +7227,23 @@ SCENES: tuple[Scene, ...] = (
             ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
         ),
     ),
+    Scene(
+        name="77-composer-keyboard-open",
+        what="the channel composer focused with the keyboard really open over it",
+        act=_act_composer_keyboard_open,
+        after=_after_discuss_keyboard,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the composer holds the focus", "document.activeElement === document.getElementById('channel-compose-text')"),
+            (
+                "the focused composer is inside the shrunk viewport",
+                "(() => { const r = document.getElementById('channel-compose-text').getBoundingClientRect(); "
+                "const h = window.visualViewport ? window.visualViewport.height : window.innerHeight; "
+                "return r.top >= 0 && r.bottom <= h; })()",
+            ),
+            ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
+        ),
+    ),
     # LAST IN THE WALK, and not by accident: it empties the server's durable store on the way in,
     # so that the summary the state above cached is really regenerated and can really fail. Nothing
     # after it in this profile would miss what it deletes, and the next profile purges anyway.
@@ -8600,6 +8674,7 @@ SELF_TEST_CHECKS = (
     "an uncaught page error is reported instead of being photographed",
     "the microphone and audio graph are NOT stubbed",
     "a keyboard-open height equal to the closed one fails the shrink check",
+    "a focused field outside the shrunk viewport fails the keyboard check",
     "the standard matrix states stay restricted to the phone and laptop matrix profiles",
     "capture settles transient UI before the shutter opens",
 )
@@ -8618,8 +8693,16 @@ def check_keyboard_controls() -> list[str]:
         problems.append("a shrink by the wrong amount passes the keyboard check.")
     if keyboard_shrink_problem(915, 915 - KEYBOARD_PX) is not None:
         problems.append("a real 336px shrink fails the keyboard check.")
+    if focused_inside_problem(600, 700, 579) is None:
+        problems.append(
+            "a focused field below the shrunk viewport passes the keyboard check — "
+            "the composer-less open shot would be filed as evidence again."
+        )
+    if focused_inside_problem(100, 300, 579) is not None:
+        problems.append("a focused field inside the shrunk viewport fails the keyboard check.")
     for name in ("73-discuss-preview", "74-discuss-summary",
-                 "75-discuss-keyboard-closed", "76-discuss-keyboard-open"):
+                 "75-discuss-keyboard-closed", "76-discuss-keyboard-open",
+                 "77-composer-keyboard-open"):
         scene = next((s for s in SCENES if s.name == name), None)
         if scene is None:
             problems.append(f"the standard matrix state '{name}' is gone from the scene table.")
