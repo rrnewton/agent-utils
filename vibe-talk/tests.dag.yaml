@@ -1980,6 +1980,23 @@ steps:
   # count an empty reply unread, while a file posted with no words and a message with only a reaction
   # are drawn; Settings > Messages > Empty messages, beside Mark-read automatically, turned off draws
   # every empty message again, kept across a reload, and on hides them again.
+  # `#1861 vibe-talk-dark-bar-icon-invisible`: the thread picker's glyph contrasts with its
+  # button under every Appearance choice and device scheme, in current Chromium.
+  - group: check
+    job: appearance-icon-browser
+    desc: the thread picker glyph contrasts with its button in Dark forced, Light forced and System on dark and light devices, in current Chromium at 412x915
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/appearance_icon_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   - group: check
     job: empty-messages-browser
     desc: empty messages drawn nowhere and counted nowhere while the Settings switch is on, by default, and drawn again when it is off, kept across a reload, a file alone and a reaction alone still drawn, in current Chromium at 1280x800 and 393x852 in both schemes

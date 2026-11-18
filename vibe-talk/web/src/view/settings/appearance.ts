@@ -33,8 +33,10 @@ export interface AppearanceControl {
 /** Words under the control for each choice, naming what will happen next. */
 export function appearanceStateWords(choice: Appearance, kept: boolean): string {
   const base = choice === "system"
-    ? "Following your system. It changes when your system does."
-    : choice === "light" ? "Light, whatever your system says." : "Dark, whatever your system says.";
+    ? "Follows your device's light or dark setting."
+    : choice === "light"
+      ? "Always light, even when your device is set to dark."
+      : "Always dark, even when your device is set to light.";
   return kept ? base : `${base} This device did not keep it, so it lasts only until you leave.`;
 }
 
@@ -72,10 +74,6 @@ export function mountAppearance(deps: AppearanceDependencies): AppearanceControl
         for (const [name, value] of Object.entries(THEME_TOKENS[theme])) root.style.setProperty(name, value);
       }
     }
-    try {
-      const picker = deps.lookup("thread-select") as HTMLElement | null;
-      if (picker) picker.style.backgroundImage = choice === "dark" ? "none" : "";
-    } catch (_error) { /* no picker on this surface */ }
     try {
       const meta = typeof document.querySelector === "function" ? document.querySelector('meta[name="theme-color"]') : null;
       if (meta) meta.setAttribute("content", themeColorFor(theme));
