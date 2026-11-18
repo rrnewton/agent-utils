@@ -1002,7 +1002,7 @@ test("PRs, Commits, Actions, Issues, Files and Other come up under Links, all on
   assert.match(row, /top: calc\(100% \+ 1px \+ var\(--kinds-gap\)\)/, "the kinds are not below the bar");
   assert.match(row, /right: var\(--links-mid\)/);
   assert.match(row, /transform: translateX\(min\(50%, var\(--links-mid\)\)\)/, "the kinds are not centred under Links, or not kept to the bar's end");
-  assert.match(row, /--links-mid: calc\(2px \+ var\(--search-disc\) \+ var\(--glass-clear\) \+ var\(--bar-gap\) \+ 1\.5 \* var\(--toggle-hit\) \+ 1\.7rem\)/, "the kinds are not centred under Links");
+  assert.match(row, /--links-mid: calc\(2px \+ var\(--search-disc\) \+ var\(--glass-clear\) \+ var\(--bar-gap\) \+ 1\.5 \* var\(--toggle-hit\) \+ 4.5rem\)/, "the kinds are not centred under Links");
   // `#266 link-filter-kinds`. Six are wider than a phone: never wider than the bar, the row scrolls
   // sideways inside it, no button squeezed narrower than its words, and with no scrollbar to make it
   // taller than the room the list leaves it. A focus ring is drawn inside the button the row clips.

@@ -281,6 +281,12 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
         else:
             page.mouse.click(x, y)
 
+    def pick_label(selector: str) -> None:
+        press("#labels-button")
+        until("() => !document.getElementById('labels-panel').hidden", "the Labels panel did not open")
+        page.locator(selector).click()
+        settled()
+
     def top(list_id: str, message: str) -> float | None:
         found = page.evaluate(ROW_TOP_JS, [list_id, message])
         return None if found is None else float(found)
@@ -339,8 +345,7 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
         return float(after or 0)
 
     def pinned_on() -> None:
-        press("#labels-button")
-        press("#labels-option-pinned")
+        pick_label("#labels-option-pinned")
         until("() => document.getElementById('pane-discord').hasAttribute('data-pinned-only')",
               "choosing Pinned in the Labels drop-down did not turn it on")
         until(f"() => document.querySelectorAll('#pinned-log > li[data-ids]').length === {len(PINNED)}",
@@ -374,8 +379,7 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
         check(page.evaluate("(id) => document.querySelector(`#pinned-log > li[data-id='${id}']`)"
                             ".getAttribute('data-selected')", LOADED_PIN) == "true",
               f"{label}: the click did not select pin {LOADED_PIN}")
-    press("#labels-button")
-    press("#labels-option-all")
+    pick_label("#labels-option-all")
     after = kept(LOADED_PIN, before, "Pinned cleared over a loaded pin")
     if not touch:
         check(page.evaluate("(id) => document.querySelector(`#discord-log > li[data-id='${id}']`)"
@@ -389,8 +393,7 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
     old_before = choose(OLD_PIN)
     api.timeline_gate.clear()
     if touch:
-        press("#labels-button")
-        press("#labels-option-all")
+        pick_label("#labels-option-all")
     else:
         page.keyboard.press("Escape")
     until("() => document.getElementById('pinned-log').hidden", "clearing the filter left the Pinned list up")
@@ -416,8 +419,7 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
     pinned_on()
     choose(COMBINED_PIN, 0.6)
     text_before = block_top("pinned-log", COMBINED_PIN)
-    press("#labels-button")
-    press("#labels-option-all")
+    pick_label("#labels-option-all")
     back_with(COMBINED_PIN, "Pinned off over the second part of a combined row")
     combined_top, _, _, ids = row_box("discord-log", COMBINED_PIN)
     check(ids == f"{200 + COMBINED - 1} {COMBINED_PIN}",

@@ -857,6 +857,22 @@
   height: 14px;
 }
 
+/* On a phone the bar's line is spoken for: the button is the pin square the
+   Pinned toggle was (the active label still names itself to a screen reader,
+   in the panel, and in the field for a hashtag), and the field keeps its room. */
+@media (max-width: 480px) {
+  #labels-button {
+    width: var(--toggle-hit);
+    justify-content: center;
+    padding: 0;
+  }
+
+  #labels-button .labels-filter-word,
+  #labels-button .labels-filter-chevron {
+    display: none;
+  }
+}
+
 /* A filter in force says so on the button: Pinned in gold as ever, a hashtag
    label in the accent. */
 #labels-button[data-active-label="pinned"] {
@@ -1180,7 +1196,7 @@
    wide, it spans the bar exactly. No scrollbar is drawn, because one would add to its height and
    cover the first row; the button cut off at its end says there is more. */
 #link-kinds {
-  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit) + 1.7rem);
+  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit) + 4.5rem);
   position: absolute;
   top: calc(100% + 1px + var(--kinds-gap));
   right: var(--links-mid);
@@ -1195,6 +1211,14 @@
 
 #link-kinds::-webkit-scrollbar {
   display: none;
+}
+
+/* `#1853` on a phone: the Labels button is a square again, so the kinds keep
+   their landed offset (the wide-button delta above is the desk's alone). */
+@media (max-width: 480px) {
+  #link-kinds {
+    --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit));
+  }
 }
 
 /* Over the call view there are no pins, and Links stands next to the glass. */
