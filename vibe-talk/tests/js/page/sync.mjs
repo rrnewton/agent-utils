@@ -2616,7 +2616,11 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   // #scroll-area entirely, so it cannot hang off the list either.
   assert.match(cssBlock(".discuss-head"), /position:\s*sticky/, "the Discuss top bar is not fixed in its pane");
   const withoutBars = withoutAskBar.replace(/\.discuss-head\s*\{[^}]*\}/, " ");
-  assert.doesNotMatch(withoutBars, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+  // The Labels panel's exception (`#1853`): its filter box sticks inside
+  // #labels-panel's own scroller, and the panel floats from #search-float
+  // outside #scroll-area, so it hangs off the list no more than Discuss's do.
+  const withoutLabelsFilter = withoutBars.replace(/#labels-filter-input\s*\{[^}]*position:\s*sticky[^}]*\}/, " ");
+  assert.doesNotMatch(withoutLabelsFilter, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
 });
 
 test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {
