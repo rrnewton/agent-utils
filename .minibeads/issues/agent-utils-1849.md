@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-reload-keeps-view-and-place: a reload keeps the view, the linked message and the scroll anchor'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -33,3 +33,7 @@ Coordinate: scroll restoration must go through the single scroll-anchoring autho
 # Notes
 
 Owner-priority gate, deployed on landing. Scroll work goes through scrollkeep's owner only; no new scroll writer.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 38e81fc9 on main (gated 9d2796ec, owner-priority gate pass; replay verified on the combined tree). A reload now keeps the view and the place: the reader's scroll place is noted as they scroll (throttled, measured by scrollkeep's `captureScroll` through `holdChannelPlace`) into the window's own UI-state record in sessionStorage, not only when the page hides, and put back by scrollkeep's `restoreScroll` — the scroll position never enters the URL. The Threads view is honoured from its deep link and its top card's place is held and put back. Proof: two new page-suite reload tests (with a broken-module control), the real-server browser test at phone and desktop (threadless channel, search filter, reload), and the inspected screenshot matrix in /tmp/mu-reloadplace-shots-1849/. Pending with the owner: whether an active search filter should also survive a reload.
