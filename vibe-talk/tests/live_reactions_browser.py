@@ -210,7 +210,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str) -> tuple[str
         except Exception:
             pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
         page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-        page.click("#view-switch")
+        # `#1781`: sign-in lands on the channel already.
         row = '#discord-log > li[data-id="201"]'
         page.wait_for_selector(row, timeout=10_000)
         check(page.locator(f"{row} .reactions").count() == 0,

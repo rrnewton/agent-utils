@@ -83,7 +83,7 @@ def walk(playwright: Playwright, web_root: Path, shots: Path, width: int, height
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-            page.click("#view-switch")
+            # `#1781`: sign-in lands on the channel already.
             desk.wait_for(
                 "() => document.querySelectorAll('.md li').length === 2",
                 "the re-rendered bullets are not separate list items")

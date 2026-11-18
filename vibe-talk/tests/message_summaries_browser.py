@@ -186,7 +186,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel, open in All.
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24", "the channel did not open in All")
     page.evaluate(f"() => document.querySelector('#discord-log > li[data-id=\"{WIDE_ROW}\"]').scrollIntoView({{block: 'center'}})")
     desk.settled()
@@ -271,7 +271,7 @@ def toggle_walk(chromium: BrowserType, args: argparse.Namespace, label: str, wid
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel, open in All.
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24", "the channel did not open in All")
     desk.settled()
     page.wait_for_timeout(400)
