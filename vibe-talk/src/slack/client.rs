@@ -462,13 +462,16 @@ impl HttpSlackClient {
                     self.count(|tally, now| tally.limited(method, priority, now));
                     self.note_limited(method, retry_after);
                     // `#1847 vibe-talk-slack-communication-audit`: teach the
-                    // learned ceiling this method's limit was actually hit at.
-                    if let Some(configured) = self.calls_per_minute.get(method).copied() {
-                        self.sent
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .note_limited(method, configured, tokio::time::Instant::now());
-                    }
+                    // learned ceiling this method's limit was actually hit
+                    // at — on every path, backfill included, configured or not.
+                    self.sent
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .note_limited(
+                            method,
+                            self.calls_per_minute.get(method).copied(),
+                            tokio::time::Instant::now(),
+                        );
                     // The provider is limiting now: a read that makes one try meanwhile gives up
                     // here rather than waiting out the `Retry-After` and being paused after it.
                     let one_try = super::budget::gives_way(method)
@@ -608,10 +611,10 @@ impl HttpSlackClient {
                     .sent
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match ceiling.and_then(|configured| {
-                    let effective = sent.effective_ceiling(method, configured, priority, now);
-                    sent.ceiling_wait(method, priority, effective, now)
-                }) {
+                match sent
+                    .effective_ceiling(method, ceiling, priority, now)
+                    .and_then(|effective| sent.ceiling_wait(method, priority, effective, now))
+                {
                     Some(wait) => wait,
                     None if !sent.admits(method, priority, now) => {
                         return Some(refusal(*waited, Duration::ZERO));
@@ -1591,9 +1594,18 @@ impl ChatClient for HttpSlackClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for method in CRAWL_METHODS {
-            let ceiling = self.calls_per_minute.get(method).and_then(|ceiling| {
-                sent.ceiling_wait(method, super::budget::Priority::Crawl, *ceiling, now)
-            });
+            // The learned ceiling too (`#1847`): backfill is held by what
+            // limiting actually taught, not only by what was configured.
+            let ceiling = sent
+                .effective_ceiling(
+                    method,
+                    self.calls_per_minute.get(method).copied(),
+                    super::budget::Priority::Crawl,
+                    now,
+                )
+                .and_then(|ceiling| {
+                    sent.ceiling_wait(method, super::budget::Priority::Crawl, ceiling, now)
+                });
             if let Some(wait) = sent.crawl_wait(method, now).max(ceiling) {
                 let until = now + wait;
                 latest = Some(latest.map_or(until, |at| at.max(until)));

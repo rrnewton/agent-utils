@@ -1968,6 +1968,60 @@ async fn background_reads_give_way_while_slack_is_limiting() {
         .expect("not limiting");
 }
 
+/// `#1847 vibe-talk-slack-communication-audit`: a limited answer on the
+/// backfill path teaches the shared learned ceiling, and the next background
+/// read is held by it without being sent — while a person's read still goes.
+/// The client here has no configured `calls_per_minute` at all, as the live
+/// deployment that showed no ceiling-change lines: learning starts from the
+/// base ceiling (20), so one 429 halves the background ceiling to 10.
+#[tokio::test]
+async fn a_backfill_429_lowers_the_shared_ceiling_for_the_next_background_read() {
+    use vibe_talk::read_reason::ReadReason;
+    let (mut state, _) = linear(5);
+    state
+        .rate_limit_many
+        .insert("conversations.history".to_owned(), (1, usize::MAX));
+    let fake = Fake::start(state, 20).await;
+    let client = fake.client();
+
+    // Backfill gives up at the first limit; that answer teaches the ceiling.
+    let limited = ReadReason::Backfill
+        .scope(client.fetch_page(&channel(), 5, None, None))
+        .await;
+    assert!(
+        limited
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("RATE LIMIT")),
+        "{limited:?}"
+    );
+    assert_eq!(fake.calls("conversations.history"), 1);
+
+    // The next background reads — refresh and backfill alike — are held by
+    // the shared budget the 429 fed, without being sent (the client refuses
+    // them itself: no further call reaches the fake). The learned ceiling
+    // this teaches (20 halved to 10) is asserted in `slack::budget`'s tests.
+    fake.with(|state| state.rate_limit_many.clear());
+    for reason in [ReadReason::Refresh, ReadReason::Backfill] {
+        let held = reason
+            .scope(client.fetch_page(&channel(), 5, None, None))
+            .await;
+        assert!(held.is_err(), "{reason} was not held after the 429");
+        assert_eq!(
+            fake.calls("conversations.history"),
+            1,
+            "a held {reason} read must not be sent"
+        );
+    }
+
+    // A person's read is never held by what background work taught: it waits
+    // out the one-second Retry-After and goes through.
+    ReadReason::Enter
+        .scope(client.fetch_page(&channel(), 5, None, None))
+        .await
+        .expect("a person's read goes through");
+    assert_eq!(fake.calls("conversations.history"), 2);
+}
+
 /// `#699 vt-send-priority`. A reply into a thread a read has just returned goes in without reading
 /// the thread again first; one into a thread nobody has read lately is still proved first.
 #[tokio::test]

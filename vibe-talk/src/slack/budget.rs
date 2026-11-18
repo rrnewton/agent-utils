@@ -243,6 +243,11 @@ impl Priority {
 /// ceiling — never the configured one — is what refresh and background work are
 /// held to, and it never learns below a small floor that still lets them run.
 pub const OBSERVED_CEILING_FLOOR: usize = 4;
+/// The ceiling learning starts from (and recovers to) for a method with no
+/// configured `calls_per_minute`: the example deployment's figure for the two
+/// history methods. A deployment that configures its own is learned against
+/// that instead.
+pub const OBSERVED_BASE_CEILING: usize = 20;
 /// Quiet time after a method's last limited answer before its learned ceiling
 /// recovers by one request a minute, per this much quiet again.
 pub const OBSERVED_RECOVERY_AFTER: Duration = Duration::from_secs(600);
@@ -324,17 +329,21 @@ impl Sent {
     }
 
     /// Note a limited answer of `method`: its learned ceiling halves, to
-    /// [`OBSERVED_CEILING_FLOOR`] at lowest, starting from `configured` when
-    /// nothing was learned yet. `#1847 vibe-talk-slack-communication-audit`.
-    pub fn note_limited(&mut self, method: &str, configured: usize, now: Instant) {
+    /// [`OBSERVED_CEILING_FLOOR`] at lowest, starting from `configured` (or
+    /// [`OBSERVED_BASE_CEILING`] when none is configured) when nothing was
+    /// learned yet. Any path's limited answer teaches it — a person's, live
+    /// work's, and backfill's alike: the ceiling is the provider's, not one
+    /// reader's. `#1847 vibe-talk-slack-communication-audit`.
+    pub fn note_limited(&mut self, method: &str, configured: Option<usize>, now: Instant) {
+        let base = configured
+            .unwrap_or(OBSERVED_BASE_CEILING)
+            .max(OBSERVED_CEILING_FLOOR);
         let entry = self.observed.entry(method.to_owned()).or_insert(Observed {
-            ceiling: configured,
+            ceiling: base,
             limited_at: now,
             recovered: 0,
         });
-        let learned = (entry.ceiling / 2)
-            .max(OBSERVED_CEILING_FLOOR)
-            .min(configured.max(1));
+        let learned = (entry.ceiling / 2).max(OBSERVED_CEILING_FLOOR).min(base);
         if learned != entry.ceiling {
             tracing::info!(
                 method,
@@ -347,21 +356,30 @@ impl Sent {
         entry.recovered = 0;
     }
 
-    /// The ceiling a request of `method` at `priority` is held to: the learned
-    /// one for refresh and background work (recovered by one per
-    /// [`OBSERVED_RECOVERY_AFTER`] of quiet, never above `configured`), and the
-    /// configured one for everyone else. A person's read and a write are never
-    /// refused because refresh work taught the ceiling down.
+    /// The ceiling a request of `method` at `priority` is held to, when there
+    /// is one: the learned one for refresh, background and crawl (backfill)
+    /// work — recovered by one per [`OBSERVED_RECOVERY_AFTER`] of quiet, never
+    /// above the configured ceiling or [`OBSERVED_BASE_CEILING`] — and the
+    /// configured one for everyone else. `None` when nothing is configured
+    /// and nothing was learned. A person's read and a write are never refused
+    /// because background work taught the ceiling down; crawl work, the
+    /// lowest priority, is held first and hardest.
     pub fn effective_ceiling(
         &mut self,
         method: &str,
-        configured: usize,
+        configured: Option<usize>,
         priority: Priority,
         now: Instant,
-    ) -> usize {
-        if !matches!(priority, Priority::Refresh | Priority::Background) {
+    ) -> Option<usize> {
+        if !matches!(
+            priority,
+            Priority::Refresh | Priority::Background | Priority::Crawl
+        ) {
             return configured;
         }
+        let base = configured
+            .unwrap_or(OBSERVED_BASE_CEILING)
+            .max(OBSERVED_CEILING_FLOOR);
         let Some(entry) = self.observed.get_mut(method) else {
             return configured;
         };
@@ -370,7 +388,7 @@ impl Sent {
         if quiet_steps > entry.recovered {
             let learned = (entry.ceiling
                 + usize::try_from(quiet_steps - entry.recovered).unwrap_or(usize::MAX))
-            .min(configured.max(1));
+            .min(base);
             if learned != entry.ceiling {
                 tracing::info!(
                     method,
@@ -381,7 +399,7 @@ impl Sent {
             }
             entry.recovered = quiet_steps;
         }
-        entry.ceiling.min(configured.max(1))
+        Some(entry.ceiling.min(base))
     }
 
     /// Count one request of `method` at `priority`, sent now.
@@ -656,40 +674,66 @@ mod tests {
         let now = Instant::now();
         let mut sent = Sent::default();
         assert_eq!(
-            sent.effective_ceiling(METHOD, 20, Priority::Refresh, now),
-            20
+            sent.effective_ceiling(METHOD, Some(20), Priority::Refresh, now),
+            Some(20)
         );
-        sent.note_limited(METHOD, 20, now);
+        sent.note_limited(METHOD, Some(20), now);
         assert_eq!(
-            sent.effective_ceiling(METHOD, 20, Priority::Refresh, now),
-            10
+            sent.effective_ceiling(METHOD, Some(20), Priority::Refresh, now),
+            Some(10)
         );
         assert_eq!(
-            sent.effective_ceiling(METHOD, 20, Priority::Background, now),
-            10
+            sent.effective_ceiling(METHOD, Some(20), Priority::Background, now),
+            Some(10)
         );
         // Interactive reads and writes keep the configured ceiling.
         assert_eq!(
-            sent.effective_ceiling(METHOD, 20, Priority::Interactive, now),
-            20
+            sent.effective_ceiling(METHOD, Some(20), Priority::Interactive, now),
+            Some(20)
         );
-        assert_eq!(sent.effective_ceiling(METHOD, 20, Priority::Write, now), 20);
-        sent.note_limited(METHOD, 20, now);
-        sent.note_limited(METHOD, 20, now);
         assert_eq!(
-            sent.effective_ceiling(METHOD, 20, Priority::Refresh, now),
-            OBSERVED_CEILING_FLOOR
+            sent.effective_ceiling(METHOD, Some(20), Priority::Write, now),
+            Some(20)
+        );
+        sent.note_limited(METHOD, Some(20), now);
+        sent.note_limited(METHOD, Some(20), now);
+        assert_eq!(
+            sent.effective_ceiling(METHOD, Some(20), Priority::Refresh, now),
+            Some(OBSERVED_CEILING_FLOOR)
         );
         // Ten quiet minutes recover one request a minute, never past configured.
         let later = now + OBSERVED_RECOVERY_AFTER;
         assert_eq!(
-            sent.effective_ceiling(METHOD, 20, Priority::Refresh, later),
-            OBSERVED_CEILING_FLOOR + 1
+            sent.effective_ceiling(METHOD, Some(20), Priority::Refresh, later),
+            Some(OBSERVED_CEILING_FLOOR + 1)
         );
         let much_later = now + OBSERVED_RECOVERY_AFTER * 100;
         assert_eq!(
-            sent.effective_ceiling(METHOD, 20, Priority::Refresh, much_later),
-            20
+            sent.effective_ceiling(METHOD, Some(20), Priority::Refresh, much_later),
+            Some(20)
+        );
+        // Crawl (backfill) is held by the same learned ceiling, hardest: with
+        // nothing configured it learns against the base ceiling, and a limited
+        // answer on the crawl path itself teaches it.
+        let mut crawl = Sent::default();
+        assert_eq!(
+            crawl.effective_ceiling(METHOD, None, Priority::Crawl, now),
+            None
+        );
+        crawl.note_limited(METHOD, None, now);
+        assert_eq!(
+            crawl.effective_ceiling(METHOD, None, Priority::Crawl, now),
+            Some(OBSERVED_BASE_CEILING / 2)
+        );
+        assert_eq!(
+            crawl.effective_ceiling(METHOD, None, Priority::Refresh, now),
+            Some(OBSERVED_BASE_CEILING / 2),
+            "a backfill limit holds refresh too: one shared ceiling"
+        );
+        assert_eq!(
+            crawl.effective_ceiling(METHOD, None, Priority::Interactive, now),
+            None,
+            "a person's read is never held by the learned ceiling"
         );
     }
 
