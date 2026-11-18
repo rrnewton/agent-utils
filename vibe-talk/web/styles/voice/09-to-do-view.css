@@ -174,6 +174,12 @@
   display: none;
 }
 
+/* `#1835 label-dialog-placement`: the pop-out anchors to its own group, as
+   `#dismissed-group` does, so the dialog sits over the Settings column. */
+#labels-group {
+  position: relative;
+}
+
 /* Settings > Labels (`#1825`): checkbox in a fixed left column, then the chip,
    then "N in loaded history", (G) right-aligned, in the page's normal font. */
 .labels-list {

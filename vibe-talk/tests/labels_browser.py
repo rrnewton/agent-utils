@@ -329,8 +329,14 @@ def walk_through(walk: Walk) -> None:
     page = walk.page
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
+    try:
+        page.wait_for_function("() => !document.getElementById('screen-welcome').hidden || !document.getElementById('screen-main').hidden", timeout=3_000)
+        if page.evaluate("() => !document.getElementById('screen-welcome').hidden"):
+            page.click("#welcome-start")
+    except Exception:
+        pass  # no first-run Welcome on this path (#1781)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel in All already; no view switch.
     walk.until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 7",
                "the channel did not open with its seven messages")
     walk.settled()
