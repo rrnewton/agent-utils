@@ -232,12 +232,12 @@ class Drill:
             "profiles": {
                 "fakework": {
                     "harness": "muse", "mode": "interactive",
-                    "reasoning_effort": "high",
+                    "reasoning_effort": "high", "argv": ["--approval-mode=never"],
                     "env": {"FAKE_HARNESS_LOG_DIR": str(self.log_dir)},
                 },
                 "profwork": {
                     "harness": "muse", "mode": "interactive",
-                    "reasoning_effort": "xhigh",
+                    "reasoning_effort": "xhigh", "argv": ["--approval-mode=never"],
                     "env": {
                         "FAKE_HARNESS_LOG_DIR": str(self.log_dir),
                         "DRILL_PROFILE_VALUE": PROFILE_VALUE,

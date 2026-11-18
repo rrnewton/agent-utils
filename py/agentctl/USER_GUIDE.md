@@ -418,12 +418,26 @@ is reported there, not refused.
       "mode": "interactive",
       "model": "provider-model-id",
       "reasoning_effort": "high",
-      "argv": [],
+      "argv": ["--approval-mode=never"],
       "env": {"ROUTING_SELECTOR": "provider-route"}
     }
   }
 }
 ```
+
+Every interactive profile must carry its harness's permission-bypass flag
+in `argv`, and a profile without one refuses to load; an ad-hoc start
+(`--harness` with `--harness-arg`) without one refuses the same way, as
+does a revive, restart, restore, or turnover relaunch from recorded
+arguments that lack it. The refusal names the profile (or agent), the
+harness, and the exact flag to add: Claude Code takes
+`--dangerously-skip-permissions` (or `--permission-mode bypassPermissions`),
+Codex takes `--dangerously-bypass-approvals-and-sandbox` (or `--yolo`), and
+Muse takes `--approval-mode never`. Headless profiles need no flag (the
+headless runners mediate permissions themselves), and agentcloud profiles
+cannot carry one: agentcloudctl has no permission-bypass option, so the
+profile listing reports `permission_bypass_warning` ("no bypass flag
+known") instead of refusing.
 
 The top-level `workspace` is optional. When present, it is the required Herdr
 workspace label for every interactive session in the project. Starts resolve or

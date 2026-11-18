@@ -97,7 +97,7 @@ fn profile_less_start_is_refused_and_profile_start_launches() {
         &fixture,
         json!({"schema": "agentctl-profiles/v1",
                "required_env": {"codex": ["EXAMPLE_GATEWAY"]},
-               "profiles": {"gw": {"harness": "codex", "mode": "interactive",
+               "profiles": {"gw": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"],
                                    "env": {"EXAMPLE_GATEWAY": "https://example.invalid"}}}}),
     );
     std::env::remove_var("EXAMPLE_GATEWAY");
@@ -108,6 +108,7 @@ fn profile_less_start_is_refused_and_profile_start_launches() {
             &fixture.root,
             StartOptions {
                 workspace_id: Some("workspace".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -123,6 +124,7 @@ fn profile_less_start_is_refused_and_profile_start_launches() {
                 workspace_id: Some("workspace".to_owned()),
                 profile: Some("gw".to_owned()),
                 environment: vec!["EXAMPLE_GATEWAY=https://example.invalid".to_owned()],
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )

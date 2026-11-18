@@ -21,6 +21,7 @@ from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.profiles import (
     AGENTCLOUD_HARNESS,
     configuration_root, effort_levels, load_configuration, load_profiles,
+    require_permission_bypass as profiles_require_bypass,
     validate_raw_harness_arguments,
 )
 from agentctl.killpid import SIGNALS as _KILL_SIGNALS
@@ -692,6 +693,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             harness_args = list(profile.argv) if profile else args.harness_arg
             environment = list(profile.environment) if profile else args.env
+            # #1822: an interactive launch with no bypass flag refuses here,
+            # profile and ad-hoc alike (a profile was already refused at load).
+            if mode == "interactive":
+                label = f"profile {profile.name!r}" if profile else f"agent {name!r} launch"
+                profiles_require_bypass(label, harness, harness_args)
             brief = Path(args.file).read_text(encoding="utf-8") if args.file else args.brief
             result = sessions.start_session(name, cwd=args.cwd, mode=mode, backend=args.backend,
                 harness=harness, model=model, brief=brief, purpose=args.purpose, resume=args.resume,

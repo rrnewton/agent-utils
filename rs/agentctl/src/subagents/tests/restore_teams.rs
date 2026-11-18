@@ -78,6 +78,11 @@ fn dead_agent(fixture: &Fixture, name: &str, harness: &str) -> AgentRecord {
             &fixture.root,
             StartOptions {
                 harness: harness.to_owned(),
+                harness_args: match harness {
+                    "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                    "codex" => vec!["--yolo".to_owned()],
+                    _ => vec!["--approval-mode=never".to_owned()],
+                },
                 ..StartOptions::default()
             },
         )

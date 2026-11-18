@@ -19,7 +19,7 @@ from typing import cast
 from agentctl import agent, launch_spec, registry_layout, sender_header
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable, RecoveryAction, _with_recovery
-from agentctl.profiles import LaunchProfile, check_required_env, configuration_root, effective_environment, load_profiles, reasoning_arguments, required_env_for_launch, validate_structured_harness_argument_conflicts
+from agentctl.profiles import LaunchProfile, check_required_env, configuration_root, effective_environment, load_profiles, reasoning_arguments, require_permission_bypass, required_env_for_launch, validate_structured_harness_argument_conflicts
 from agentctl.subagents import (
     AgentRecord, ManagedAgents, _MAX_AGENT_RECORD_BYTES, _NAME, _SHA256,
     _PinnedAgentDirectory, _missing_target, _name, _native_session,
@@ -390,6 +390,11 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
     check_required_env(record.harness, effective_environment(environment),
                        registry_required=_req_registry, profile=_req_profile, profiles=_req_profiles)
     arguments = _expected_arguments(record)
+    # #1822: a relaunch from arguments with no bypass flag refuses, as a
+    # start would; headless records are exempt (runner-mediated approvals).
+    if record.mode == "interactive":
+        label = f"profile {record.profile!r}" if record.profile else f"agent {record.name!r} launch"
+        require_permission_bypass(label, record.harness, arguments)
     slot_command = relay_command = relay_executable = healed_slot_project = None
     if record.slot is not None:
         if record.slot_project is None or record.slot_isolation is None:

@@ -27,7 +27,8 @@ from agentctl.profiles import (
     check_required_env,
     configuration_root,
     effective_environment,
-    load_configuration, load_profiles, reasoning_arguments, required_env_for_launch,
+    load_configuration, load_profiles, permission_bypass_flag, reasoning_arguments,
+    require_permission_bypass, required_env_for_launch,
     validate_muse_headless_arguments,
     validate_raw_harness_arguments, validate_structured_harness_argument_conflicts,
     workspace_for_registry,
@@ -278,6 +279,48 @@ def test_a_muse_profile_without_the_question_kill_flag_warns() -> None:
     assert blocking_question_warning("codex", bare.argv) is None
 
 
+def test_interactive_profiles_require_a_permission_bypass_flag(tmp_path: Path) -> None:
+    # #1822: without the flag the profile refuses to load, naming the
+    # profile, the harness, and the exact flag to add.
+    for harness, flag in (
+        ("claude", "--dangerously-skip-permissions"),
+        ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+        ("muse", "--approval-mode never"),
+    ):
+        root = tmp_path / harness
+        root.mkdir()
+        _write_profiles(root, {"lane": {"harness": harness, "mode": "interactive"}})
+        with pytest.raises(AgentDeliveryError) as refused:
+            load_profiles(root)
+        message = str(refused.value)
+        assert "lane" in message and harness in message and flag in message
+    # Either accepted spelling, split or =-joined, loads.
+    for harness, argv in (
+        ("claude", ["--dangerously-skip-permissions"]),
+        ("claude", ["--permission-mode", "bypassPermissions"]),
+        ("claude", ["--permission-mode=bypassPermissions"]),
+        ("codex", ["--dangerously-bypass-approvals-and-sandbox"]),
+        ("codex", ["--yolo"]),
+        ("muse", ["--approval-mode", "never"]),
+        ("muse", ["--approval-mode=never"]),
+    ):
+        assert permission_bypass_flag(harness, argv) is None
+        require_permission_bypass("agent 'lane' launch", harness, argv)
+    with pytest.raises(AgentDeliveryError):
+        require_permission_bypass("agent 'lane' launch", "codex", ["--model", "m"])
+    # Headless profiles carry no raw argv for codex and stay loadable.
+    headless = tmp_path / "headless"
+    headless.mkdir()
+    _write_profiles(headless, {"lane": {"harness": "codex", "mode": "headless"}})
+    load_profiles(headless)
+    # agentcloud loads and only warns: no bypass flag is known for it.
+    cloudy = tmp_path / "cloudy"
+    cloudy.mkdir()
+    _write_profiles(cloudy, {"cloud": {"harness": "agentcloud", "mode": "interactive"}})
+    _path, profiles = load_profiles(cloudy)
+    assert "no bypass flag known" in profiles["cloud"].public()["permission_bypass_warning"]
+
+
 def test_project_configuration_exposes_a_bounded_workspace_policy(tmp_path: Path) -> None:
     _write_project_configuration(tmp_path, "project-agents")
     path, profiles, workspace = load_configuration(tmp_path)
@@ -326,7 +369,7 @@ def test_project_configuration_ignores_unknown_top_level_keys_with_one_warning(
         "know: a_future, zz_future; ignoring them (a newer agentctl may use them)\n"
     )
     monkeypatch.setattr(profiles_module, "_warned_unknown_keys", False)
-    document["profiles"] = {"worker": {"harness": "codex", "mode": "interactive", "surprise": 1}}
+    document["profiles"] = {"worker": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"], "surprise": 1}}
     path.write_text(json.dumps(document), encoding="utf-8")
     path.chmod(0o600)
     assert "worker" in load_configuration(tmp_path)[1]
@@ -666,7 +709,7 @@ def test_agentcloud_profile_is_listed_as_rust_only_without_breaking_other_profil
 ) -> None:
     _write_profiles(tmp_path, {
         "cloud": _CLOUD_PROFILE,
-        "local": {"harness": "codex", "mode": "interactive", "argv": [], "env": {}},
+        "local": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"], "env": {}},
     })
     _path, profiles = load_profiles(tmp_path)
     assert profiles["local"].harness == "codex"
@@ -702,7 +745,7 @@ def test_agentcloud_title_and_placeholders_are_listed_as_written(
 
 def test_explicit_null_agentcloud_on_a_local_profile_means_absent(tmp_path: Path) -> None:
     _write_profiles(tmp_path, {
-        "local": {"harness": "codex", "mode": "interactive", "agentcloud": None},
+        "local": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"], "agentcloud": None},
     })
     _path, profiles = load_profiles(tmp_path)
     assert profiles["local"].agentcloud is None
@@ -712,7 +755,7 @@ def test_explicit_null_agentcloud_on_a_local_profile_means_absent(tmp_path: Path
 def test_a_profile_role_and_protocol_are_checked_like_the_rust_edition(tmp_path: Path) -> None:
     # The Rust chat bridge stamps requests with them; this edition only checks them.
     _write_profiles(tmp_path, {
-        "lead": {"harness": "codex", "mode": "interactive", "role": "liaison",
+        "lead": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"], "role": "liaison",
                  "protocol": "hands-delegating"},
     })
     _path, profiles = load_profiles(tmp_path)
@@ -1193,6 +1236,7 @@ def test_profiles_come_from_the_registry_project_when_cwd_has_none(
     project.mkdir()
     _write_profiles(project, {"local": {
         "harness": "codex", "mode": "interactive", "reasoning_effort": "medium",
+        "argv": ["--yolo"],
     }})
     slot = tmp_path / "worktrees" / "slot-a"
     slot.mkdir(parents=True)
@@ -1219,7 +1263,7 @@ def test_profiles_come_from_the_registry_project_when_cwd_has_none(
 def test_cwd_profiles_win_and_missing_profiles_name_both_paths(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
-    _write_profiles(project, {"local": {"harness": "codex", "mode": "interactive"}})
+    _write_profiles(project, {"local": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"]}})
     other = tmp_path / "other"
     other.mkdir()
     _write_profiles(other, {"own": {"harness": "claude", "mode": "interactive"}})
@@ -1370,6 +1414,12 @@ def _profile_resume_setup(
     *, argv: tuple[str, ...] = (),
 ) -> tuple[Sessions, FakeManagedClient]:
     sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    bypass = {
+        "claude": "--dangerously-skip-permissions",
+        "codex": "--dangerously-bypass-approvals-and-sandbox",
+        "muse": "--approval-mode=never",
+    }[harness]
+    argv = (*argv, bypass) if bypass not in argv else argv
     _write_profiles(tmp_path, {"owner-policy": {
         "harness": harness, "mode": "interactive", "model": "chosen-model",
         "reasoning_effort": "high", "argv": list(argv),
@@ -1414,6 +1464,7 @@ def _profile_resume_native_report(
     ("codex", "--ask-for-approval=never", (
         "resume", "selected-conversation", "--no-alt-screen", "--model", "chosen-model",
         "--config", "model_reasoning_effort=high", "--ask-for-approval=never",
+        "--dangerously-bypass-approvals-and-sandbox",
     )),
     ("claude", "--dangerously-skip-permissions", (
         "--resume", "selected-conversation", "--model", "chosen-model", "--effort", "high",
@@ -1421,7 +1472,7 @@ def _profile_resume_native_report(
     )),
     ("muse", "--image=profile attachment.png", (
         "--model", "chosen-model", "--reasoning-effort", "high",
-        "--image=profile attachment.png", "--disable-sandbox",
+        "--image=profile attachment.png", "--approval-mode=never", "--disable-sandbox",
         "resume", "selected-conversation",
     )),
 ])
@@ -1644,7 +1695,10 @@ def test_profile_resume_raw_only_selectors_remain_allowed_without_structured_res
         if harness != "muse"
         else f"agentctl: warning: worker: this launch {blocking_question_warning('muse', ())}\n"
     )
-    assert captured.err == expected_err and fake.launched[0][3][-2:] == arguments
+    launched = fake.launched[0][3]
+    assert captured.err == expected_err and any(
+        launched[index:index + 2] == arguments for index in range(len(launched) - 1)
+    ) and permission_bypass_flag(harness, launched) is None
     record = sessions.get("worker")
     assert record.resume is None and record.native_session == {
         "schema": "agentctl-native-session/v1", "agent": harness,
@@ -1788,7 +1842,7 @@ def test_required_env_registry_and_profile_parse_and_check(tmp_path: Path) -> No
         "schema": "agentctl-profiles/v1",
         "required_env": {"codex": ["EXAMPLE_GATEWAY"]},
         "profiles": {
-            "gw": {"harness": "codex", "mode": "interactive",
+            "gw": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"],
                    "env": {"EXAMPLE_GATEWAY": "https://example.invalid"},
                    "required_env": ["EXAMPLE_EXTRA"]},
         },
@@ -1835,7 +1889,7 @@ def test_start_refuses_missing_required_env_and_launches_with_it(
     _write_required_env_config(tmp_path, {
         "schema": "agentctl-profiles/v1",
         "required_env": {"codex": ["EXAMPLE_GATEWAY"]},
-        "profiles": {"gw": {"harness": "codex", "mode": "interactive",
+        "profiles": {"gw": {"harness": "codex", "mode": "interactive", "argv": ["--yolo"],
                             "env": {"EXAMPLE_GATEWAY": "https://example.invalid"}}},
     })
     sessions, fake, _calls = setup(tmp_path, monkeypatch)

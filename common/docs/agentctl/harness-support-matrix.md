@@ -77,6 +77,7 @@ Every cell names its code path. Paths are relative to this repository;
 | Effort control | supported | supported | supported | none | supported (Claude only) |
 | Model selection | supported | supported | supported | none | supported (Claude only) |
 | Launch-env replay | supported | supported | supported | partial | supported |
+| Permission bypass at launch | supported | supported | supported | n/a | supported (wrapper-mediated) |
 | Chat-bridge delivery | supported | supported | supported | partial | supported (Claude only) |
 | Watcher notices (DONE / BLOCKED / idle / stalled) | supported | supported | supported | partial | none (skipped) |
 | Raw messages (no sender header) | supported | supported | supported | partial | supported (Claude only) |
@@ -540,6 +541,45 @@ private profiles) and re-applied on relaunch
   arguments.
 - **Headless**: supported — the wrapper's launch environment is part of
   its recorded launch spec.
+
+### Permission bypass at launch
+
+Every agent runs on bypass permissions (owner rule, 2026-11-17; #1822
+agentctl-profile-requires-bypass). An interactive profile whose argv
+carries no bypass flag refuses to load, and an interactive start,
+revive, restart, restore, or turnover relaunch from arguments with no
+flag refuses the same way; the refusal names the profile (or agent),
+the harness, and the exact flag to add (`permission_bypass_flag` /
+`require_permission_bypass` in `rs/agentctl/src/profiles.rs`, mirrored
+in `py/agentctl/profiles.py`; launch checks in `rs/agentctl/src/cli.rs`,
+`rs/agentctl/src/subagents/revive.rs`, `rs/agentctl/src/subagents.rs`,
+and `py/agentctl/cli.py`, `py/agentctl/revive.py`).
+
+- **Claude Code**: supported — `--dangerously-skip-permissions` or
+  `--permission-mode bypassPermissions` (either spelling, split or
+  `=`-joined; both verified against `claude --help`).
+- **Codex**: supported — `--dangerously-bypass-approvals-and-sandbox`
+  or `--yolo` (the first verified against `codex --help` on the filing
+  host; `--yolo` is accepted as the documented alias).
+- **Muse**: supported — `--approval-mode never` (verified against
+  `muse --help`).
+- **Unknown TUI**: n/a — agentctl knows no launch arguments for the
+  program it drives, so there is no flag to require.
+- **Headless**: supported (wrapper-mediated) — headless profiles carry
+  no raw argv for codex/agy (empty by rule) and need no flag: the Rust
+  headless Claude wrapper mediates permissions itself with
+  `--permission-prompts` (owner-held approvals, or denied at once;
+  `effective_arguments` in `rs/claude-stream-session/src/protocol.rs`),
+  and the Python foreign runner appends the Codex bypass flag itself
+  (`py/agentctl/foreign/agent_runner.py`). The brief for #1822 said the headless Claude path passes
+  `--permission-mode bypassPermissions` itself; the code does not — it
+  mediates instead — and that mediation, not a bypass flag, is what the
+  headless cells above record.
+- **agentcloud** (not a column; see [agentcloud](#agentcloud)): no
+  bypass flag known — `agentcloudctl create` offers only
+  `--dangerously-skip-sandbox`, a sandbox switch, not permissions, so
+  agentctl requires nothing and invents no flag; the profile listing
+  carries `permission_bypass_warning` ("no bypass flag known") instead.
 
 ### Chat-bridge delivery
 

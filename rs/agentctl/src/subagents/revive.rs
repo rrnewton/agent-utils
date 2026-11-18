@@ -1861,6 +1861,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         native: NativeSession,
         cwd: PathBuf,
     ) -> Result<LaunchPlan> {
+        // #1822: a relaunch (revive, restore, restart in a fresh tab,
+        // turnover) from arguments with no bypass flag refuses, as a start
+        // would; headless records are exempt (wrapper-mediated approvals).
+        if !record.is_headless() {
+            let label = match record.profile.as_deref() {
+                Some(profile) => format!("profile {profile:?}"),
+                _ => format!("agent {:?} launch", record.name),
+            };
+            crate::profiles::require_permission_bypass(&label, &record.harness, &arguments)?;
+        }
         {
             let (registry_required, selected, profiles) = crate::profiles::required_env_for_launch(
                 &cwd,

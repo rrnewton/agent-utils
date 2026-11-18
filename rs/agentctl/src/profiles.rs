@@ -66,6 +66,81 @@ pub(crate) const PROTOCOLS: [&str; 2] = ["self-tooling", "hands-delegating"];
 /// AskUserQuestion is denied in its own settings files and Codex's
 /// request_user_input in its host config (`tools.experimental_request_user_input`),
 /// neither of which a profile's arguments show; the userguide names both.
+/// The permission-bypass flag each harness must carry (#1822
+/// agentctl-profile-requires-bypass, owner rule 2026-11-17), as verified
+/// against the harness's real `--help`: claude takes
+/// `--dangerously-skip-permissions` or `--permission-mode bypassPermissions`,
+/// codex takes `--dangerously-bypass-approvals-and-sandbox` or `--yolo`, and
+/// muse takes `--approval-mode never`. `None` means no requirement is known
+/// for the harness: agentcloud has no permission-bypass equivalent
+/// (`agentcloudctl create --dangerously-skip-sandbox` is a sandbox switch,
+/// not permissions), and agy/unknown launches are not judged here.
+pub(crate) fn permission_bypass_flag(harness: &str, argv: &[String]) -> Option<&'static str> {
+    let has_value = |option: &str, wanted: &str| {
+        argv.windows(2)
+            .any(|pair| pair[0] == option && pair[1] == wanted)
+            || argv.iter().any(|item| {
+                item.strip_prefix(option)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .is_some_and(|value| value == wanted)
+            })
+    };
+    match harness {
+        "claude" => {
+            if argv
+                .iter()
+                .any(|item| item == "--dangerously-skip-permissions")
+                || has_value("--permission-mode", "bypassPermissions")
+            {
+                None
+            } else {
+                Some("--dangerously-skip-permissions (or --permission-mode bypassPermissions)")
+            }
+        }
+        "codex" => {
+            if argv.iter().any(|item| {
+                item == "--dangerously-bypass-approvals-and-sandbox" || item == "--yolo"
+            }) {
+                None
+            } else {
+                Some("--dangerously-bypass-approvals-and-sandbox (or --yolo)")
+            }
+        }
+        "muse" => {
+            if has_value("--approval-mode", "never") {
+                None
+            } else {
+                Some("--approval-mode never")
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Refuse a launch whose arguments carry no permission-bypass flag (#1822).
+/// The message names the launch, the harness, and the exact flag to add.
+pub(crate) fn require_permission_bypass(
+    label: &str,
+    harness: &str,
+    argv: &[String],
+) -> Result<(), AgentError> {
+    match permission_bypass_flag(harness, argv) {
+        Some(flag) => Err(fail(format!(
+            "{label} (harness {harness:?}) has no permission-bypass flag: add {flag} to its argv (every agent runs on bypass permissions; without it the harness can park on a permission prompt with nobody answering)"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Why no permission-bypass flag can be required of this harness (#1822):
+/// a warning, never a refusal. Only agentcloud is known to have no
+/// equivalent; other unlisted harnesses return `None`.
+pub(crate) fn permission_bypass_warning(harness: &str) -> Option<&'static str> {
+    (harness == "agentcloud").then_some(
+        "no bypass flag known: agentcloudctl has no permission-bypass or approval-off option (--dangerously-skip-sandbox is a sandbox switch, not permissions), so agentctl cannot require one for this harness",
+    )
+}
+
 pub(crate) fn blocking_question_warning(harness: &str, argv: &[String]) -> Option<&'static str> {
     if harness == "muse"
         && !argv
@@ -101,6 +176,9 @@ pub(crate) struct PublicProfile {
     /// The profile can park on a blocking question tool (#1158), when detectable.
     #[serde(skip_serializing_if = "Option::is_none")]
     blocking_question_warning: Option<&'static str>,
+    /// No permission-bypass flag is known for this harness (#1822); a warning, never a refusal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permission_bypass_warning: Option<&'static str>,
     required_env: Vec<String>,
 }
 
@@ -122,6 +200,7 @@ impl LaunchProfile {
             agentcloud: self.cloud.clone(),
             requires_edition: self.cloud.as_ref().map(|_| "rust"),
             blocking_question_warning: blocking_question_warning(&self.harness, &self.argv),
+            permission_bypass_warning: permission_bypass_warning(&self.harness),
             required_env: self.required_env.clone(),
         }
     }
@@ -1125,6 +1204,12 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         )));
     }
     let required_env = required_names(raw.required_env.as_ref(), &format!("profile {name:?}"))?;
+    // #1822: every interactive launch carries its harness's bypass flag.
+    // Headless profiles are exempt: codex/agy headless argv is empty by rule
+    // and the headless runners mediate permissions themselves.
+    if raw.mode == "interactive" {
+        require_permission_bypass(&format!("profile {name:?}"), &raw.harness, &raw.argv)?;
+    }
     Ok(LaunchProfile {
         name,
         harness: raw.harness,
@@ -2196,13 +2281,22 @@ mod tests {
                 error.to_string(),
                 "launch cannot repeat the structured resume selector in raw arguments"
             );
+            let mut profile_arguments = arguments.clone();
+            profile_arguments.push(
+                if harness == "codex" {
+                    "--yolo"
+                } else {
+                    "--approval-mode=never"
+                }
+                .to_owned(),
+            );
             let profile = parse(serde_json::json!({
                 "harness": harness,
                 "mode": "interactive",
-                "argv": arguments,
+                "argv": profile_arguments,
             }))
             .expect("raw-only profile remains valid");
-            assert_eq!(profile.argv, arguments);
+            assert_eq!(profile.argv, profile_arguments);
         }
     }
 
@@ -2403,7 +2497,7 @@ mod tests {
         let path = registry.join("profiles.json");
         fs::write(
             &path,
-            r#"{"schema":"agentctl-profiles/v1","profiles":{"local":{"harness":"codex","mode":"interactive"}}}"#,
+            r#"{"schema":"agentctl-profiles/v1","profiles":{"local":{"harness":"codex","mode":"interactive","argv":["--yolo"]}}}"#,
         )
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2450,7 +2544,8 @@ mod tests {
         // #897 chat-latency-stamps: the chat bridge stamps requests with them.
         for (role, protocol) in [("liaison", "hands-delegating"), ("worker", "self-tooling")] {
             parse(serde_json::json!({
-                "harness": "claude", "mode": "interactive", "role": role, "protocol": protocol
+                "harness": "claude", "mode": "interactive", "role": role, "protocol": protocol,
+                "argv": ["--dangerously-skip-permissions"]
             }))
             .expect("known role and protocol");
         }
@@ -2468,12 +2563,12 @@ mod tests {
     #[test]
     fn write_sandbox_is_opt_in_and_validates_isolation() {
         // #1205 lane-write-sandbox: default off, Muse may opt in.
-        let plain = parse(serde_json::json!({"harness": "muse", "mode": "interactive"}))
+        let plain = parse(serde_json::json!({"harness": "muse", "mode": "interactive", "argv": ["--approval-mode=never"]}))
             .expect("plain muse profile");
         assert!(!plain.write_sandbox);
         assert_eq!(plain.slot_isolation, None);
         let boxed = parse(serde_json::json!({
-            "harness": "muse", "mode": "interactive",
+            "harness": "muse", "mode": "interactive", "argv": ["--approval-mode=never"],
             "write_sandbox": true, "slot_isolation": "userns"
         }))
         .expect("opted-in muse profile");
@@ -2576,5 +2671,58 @@ mod tests {
                 "{expected:?} not in {message:?}"
             );
         }
+    }
+
+    #[test]
+    fn interactive_profiles_require_a_permission_bypass_flag() {
+        // #1822: without the flag the profile refuses to load, naming the
+        // profile, the harness, and the exact flag to add.
+        for (harness, flag) in [
+            ("claude", "--dangerously-skip-permissions"),
+            ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+            ("muse", "--approval-mode never"),
+        ] {
+            let message = parse(serde_json::json!({"harness": harness, "mode": "interactive"}))
+                .expect_err("refused profile")
+                .to_string();
+            assert!(message.contains("sub-cloud"), "{message}");
+            assert!(message.contains(harness), "{message}");
+            assert!(message.contains(flag), "{message}");
+        }
+        // Either accepted spelling, split or =-joined, loads.
+        for (harness, argv) in [
+            ("claude", vec!["--dangerously-skip-permissions"]),
+            ("claude", vec!["--permission-mode", "bypassPermissions"]),
+            ("claude", vec!["--permission-mode=bypassPermissions"]),
+            ("codex", vec!["--dangerously-bypass-approvals-and-sandbox"]),
+            ("codex", vec!["--yolo"]),
+            ("muse", vec!["--approval-mode", "never"]),
+            ("muse", vec!["--approval-mode=never"]),
+        ] {
+            parse(serde_json::json!({"harness": harness, "mode": "interactive", "argv": argv}))
+                .unwrap_or_else(|error| panic!("{harness} {argv:?} refused: {error}"));
+        }
+        // Headless profiles carry no raw argv for codex and stay loadable.
+        parse(serde_json::json!({"harness": "codex", "mode": "headless"}))
+            .expect("headless codex profile");
+        // agentcloud loads and only warns: no bypass flag is known for it.
+        let cloud = parse(serde_json::json!({"harness": "agentcloud", "mode": "interactive"}))
+            .expect("agentcloud profile");
+        let public = serde_json::to_value(cloud.public()).expect("public profile");
+        assert!(
+            public["permission_bypass_warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("no bypass flag known")),
+            "{public}"
+        );
+        // The ad-hoc check the start path uses agrees with the loader.
+        require_permission_bypass(
+            "agent \"lane\" launch",
+            "codex",
+            &["--model".to_owned(), "m".to_owned()],
+        )
+        .expect_err("ad-hoc launch refused");
+        require_permission_bypass("agent \"lane\" launch", "codex", &["--yolo".to_owned()])
+            .expect("ad-hoc launch with flag");
     }
 }

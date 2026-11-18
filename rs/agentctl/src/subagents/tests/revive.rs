@@ -30,6 +30,11 @@ fn recoverable(harness: &str, reports_session: bool) -> (Fixture, AgentRecord) {
             &fixture.root,
             StartOptions {
                 harness: harness.to_owned(),
+                harness_args: match harness {
+                    "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                    "codex" => vec!["--yolo".to_owned()],
+                    _ => vec!["--approval-mode=never".to_owned()],
+                },
                 ..StartOptions::default()
             },
         )
@@ -347,16 +352,23 @@ fn hand_restarted(fixture: &Fixture, old: &AgentRecord, session: &str) {
             executable_inode: 6,
         },
     );
-    fixture.client.command_lines.lock().unwrap().insert(
-        new_pid,
-        vec![
-            "/usr/local/bin/muse".to_owned(),
-            "--model".to_owned(),
-            "m".to_owned(),
-            "resume".to_owned(),
-            session.to_owned(),
-        ],
-    );
+    // The hand-restarted process runs the recorded launch argv resumed.
+    let mut command_line = vec!["/usr/local/bin/muse".to_owned()];
+    if let Some(spec) = old.launch_spec.as_ref() {
+        if let Some(argv) = spec["argv"].as_array() {
+            command_line.extend(
+                argv.iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned)),
+            );
+        }
+    }
+    command_line.extend(["resume".to_owned(), session.to_owned()]);
+    fixture
+        .client
+        .command_lines
+        .lock()
+        .unwrap()
+        .insert(new_pid, command_line);
 }
 
 #[test]
@@ -563,7 +575,10 @@ fn revive_resumes_without_reports_using_independent_process_and_terminal_anchors
     let new = fixture.manager().load("worker").unwrap();
     assert!(new.harness_anchor().is_some());
     assert!(new.terminal_id.is_some());
-    assert_eq!(new.arguments, ["--resume", &native.value]);
+    assert_eq!(
+        new.arguments,
+        ["--resume", &native.value, "--dangerously-skip-permissions"]
+    );
     assert_eq!(new.extra["revived_from"], old.token);
     assert!(
         !new.extra.contains_key("former_tokens"),
@@ -769,6 +784,7 @@ fn revive_archived_completes_while_this_process_already_holds_the_queue_locks() 
             &fixture.root,
             StartOptions {
                 harness: "codex".to_owned(),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -1311,7 +1327,11 @@ fn revive_muse_preserves_globals_before_the_resume_subcommand() {
     let new = fixture.manager().load("worker").unwrap();
     assert_eq!(
         new.arguments,
-        ["resume", &old.native_session.unwrap().value]
+        [
+            "--approval-mode=never",
+            "resume",
+            &old.native_session.unwrap().value
+        ]
     );
     assert!(new.custom_process_identity.is_some());
     assert_eq!(
@@ -1427,7 +1447,7 @@ fn revive_with_profile_environment_never_reuses_the_pane_and_delivers_the_values
     agent::atomic_json(
         &directory.join("profiles.json"),
         &json!({"schema":"agentctl-profiles/v1","profiles":{
-            "muse-env": {"harness":"muse","mode":"interactive", "env":{"RECOVERY_MODE":"on"}}
+            "muse-env": {"harness":"muse","mode":"interactive","argv":["--approval-mode=never"], "env":{"RECOVERY_MODE":"on"}}
         }}),
     )
     .unwrap();
@@ -1440,6 +1460,7 @@ fn revive_with_profile_environment_never_reuses_the_pane_and_delivers_the_values
                 harness: "muse".to_owned(),
                 profile: Some("muse-env".to_owned()),
                 environment: vec!["RECOVERY_MODE=on".to_owned()],
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -2234,6 +2255,7 @@ fn revive_staged_pane_and_session_stay_reserved_across_archive_publication_gap()
                     .native_session
                     .as_ref()
                     .map(|native| native.value.clone()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             }
         )
@@ -2530,7 +2552,7 @@ fn profile_fixture() -> (Fixture, AgentRecord, PathBuf) {
     let path = directory.join("profiles.json");
     agent::atomic_json(&path, &json!({"schema":"agentctl-profiles/v1","profiles":{
         "claude-recovery": {"harness":"claude","mode":"interactive","model":"opus","reasoning_effort":"high",
-            "argv":["--allowedTools","Read"], "env":{"RECOVERY_MODE":"profile-private-value"}}
+            "argv":["--allowedTools","Read","--dangerously-skip-permissions"], "env":{"RECOVERY_MODE":"profile-private-value"}}
     }})).unwrap();
     fixture
         .manager()
@@ -2542,7 +2564,11 @@ fn profile_fixture() -> (Fixture, AgentRecord, PathBuf) {
                 harness: "claude".to_owned(),
                 profile: Some("claude-recovery".to_owned()),
                 model: Some("opus".to_owned()),
-                harness_args: vec!["--allowedTools".to_owned(), "Read".to_owned()],
+                harness_args: vec![
+                    "--allowedTools".to_owned(),
+                    "Read".to_owned(),
+                    "--dangerously-skip-permissions".to_owned(),
+                ],
                 environment: vec!["RECOVERY_MODE=profile-private-value".to_owned()],
                 ..StartOptions::default()
             },
@@ -2587,7 +2613,13 @@ fn revive_replays_a_spec_through_profile_drift_but_not_environment_name_drift() 
         match field {
             "model" => profile["model"] = json!("different"),
             "effort" => profile["reasoning_effort"] = json!("medium"),
-            "argv" => profile["argv"] = json!(["--allowedTools", "Read,Write"]),
+            "argv" => {
+                profile["argv"] = json!([
+                    "--allowedTools",
+                    "Read,Write",
+                    "--dangerously-skip-permissions"
+                ])
+            }
             _ => profile["env"] = json!({"DIFFERENT_MODE":"profile-private-value"}),
         }
         agent::atomic_json(&path, &config).unwrap();
@@ -2643,7 +2675,11 @@ fn revive_without_a_spec_refuses_profile_model_effort_argv_and_environment_name_
 fn edit_profile(path: &Path) {
     let mut config = agent::read_private_json(path).unwrap();
     let profile = &mut config["profiles"]["claude-recovery"];
-    profile["argv"] = json!(["--allowedTools", "Read,Write"]);
+    profile["argv"] = json!([
+        "--allowedTools",
+        "Read,Write",
+        "--dangerously-skip-permissions"
+    ]);
     profile["env"] = json!({"RECOVERY_MODE": "profile-private-value", "ULTRA_MODE": "on"});
     agent::atomic_json(path, &config).unwrap();
 }
@@ -2723,6 +2759,7 @@ fn a_profile_refresh_refuses_a_running_harness_and_a_profile_that_changed_harnes
     kill_owned(&fixture, &old);
     let mut config = agent::read_private_json(&path).unwrap();
     config["profiles"]["claude-recovery"]["harness"] = json!("codex");
+    config["profiles"]["claude-recovery"]["argv"] = json!(["--yolo"]);
     agent::atomic_json(&path, &config).unwrap();
     let error = manager.refresh_profile("worker").unwrap_err().to_string();
     assert!(error.contains("another harness or mode"), "{error}");
@@ -3112,6 +3149,11 @@ fn start_worker(fixture: &Fixture, harness: &str) -> Value {
             &fixture.root,
             StartOptions {
                 harness: harness.to_owned(),
+                harness_args: match harness {
+                    "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                    "codex" => vec!["--yolo".to_owned()],
+                    _ => vec!["--approval-mode=never".to_owned()],
+                },
                 ..StartOptions::default()
             },
         )
@@ -3158,7 +3200,7 @@ fn a_muse_lane_records_the_session_its_runtime_holds_and_revives_from_the_archiv
     let revived = stop_and_revive_archived(&fixture).unwrap();
     assert_eq!(revived["revived"], true, "{revived}");
     let new = fixture.manager().load("worker").unwrap();
-    assert_eq!(new.arguments, ["resume", id]);
+    assert_eq!(new.arguments, ["--approval-mode=never", "resume", id]);
 }
 
 #[test]
@@ -3179,6 +3221,7 @@ fn a_second_lane_holding_the_same_session_is_recorded_as_unknown_naming_the_firs
             &fixture.root,
             StartOptions {
                 harness: "muse".to_owned(),
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3309,7 +3352,7 @@ fn a_muse_lane_with_no_native_id_is_flagged_live_and_revives_through_the_single_
     let revived = stop_and_revive_archived(&fixture).unwrap();
     assert_eq!(revived["revived"], true, "{revived}");
     let new = fixture.manager().load("worker").unwrap();
-    assert_eq!(new.arguments, ["resume", id]);
+    assert_eq!(new.arguments, ["--approval-mode=never", "resume", id]);
     assert_eq!(
         new.native_session
             .as_ref()
@@ -3418,12 +3461,22 @@ fn a_claude_lane_carries_the_id_it_was_launched_with_and_revives_from_the_archiv
     let record = fixture.manager().load("worker").unwrap();
     let native = record.native_session.clone().expect("assigned at launch");
     assert_eq!(native.source, "asserted");
-    assert_eq!(record.arguments, ["--session-id", &native.value]);
+    assert_eq!(
+        record.arguments,
+        [
+            "--session-id",
+            &native.value,
+            "--dangerously-skip-permissions"
+        ]
+    );
 
     let revived = stop_and_revive_archived(&fixture).unwrap();
     assert_eq!(revived["revived"], true, "{revived}");
     let new = fixture.manager().load("worker").unwrap();
-    assert_eq!(new.arguments, ["--resume", &native.value]);
+    assert_eq!(
+        new.arguments,
+        ["--resume", &native.value, "--dangerously-skip-permissions"]
+    );
 }
 
 #[test]
@@ -3497,6 +3550,7 @@ fn a_codex_lane_whose_rollout_appears_with_its_brief_records_it_after_delivery()
             StartOptions {
                 harness: "codex".to_owned(),
                 brief: Some("first task".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3527,6 +3581,11 @@ fn stop_revive_cycles(harness: &str, cycles: usize) -> Fixture {
             &fixture.root,
             StartOptions {
                 harness: harness.to_owned(),
+                harness_args: match harness {
+                    "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                    "codex" => vec!["--yolo".to_owned()],
+                    _ => vec!["--approval-mode=never".to_owned()],
+                },
                 ..StartOptions::default()
             },
         )
@@ -3594,6 +3653,7 @@ fn stop_asks_a_muse_lane_to_exit_before_closing_its_pane() {
             &fixture.root,
             StartOptions {
                 harness: "muse".to_owned(),
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3736,6 +3796,7 @@ fn revive_replays_the_synthesized_ultra_gate_from_the_recorded_effort() {
         &fixture,
         "muse-ultra",
         json!({"harness": "muse", "mode": "interactive", "reasoning_effort": "ultra",
+               "argv": ["--approval-mode=never"],
                "env": {"RECOVERY_MODE": "on"}}),
     );
     fixture
@@ -3748,6 +3809,7 @@ fn revive_replays_the_synthesized_ultra_gate_from_the_recorded_effort() {
                 harness: "muse".to_owned(),
                 profile: Some("muse-ultra".to_owned()),
                 environment: vec!["RECOVERY_MODE=on".to_owned()],
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3834,7 +3896,7 @@ fn restart_with_profile_environment_relaunches_in_a_fresh_tab_with_it() {
     write_profile(
         &fixture,
         "muse-env",
-        json!({"harness": "muse", "mode": "interactive", "env": {"RECOVERY_MODE": "on"}}),
+        json!({"harness": "muse", "mode": "interactive", "argv": ["--approval-mode=never"], "env": {"RECOVERY_MODE": "on"}}),
     );
     fixture
         .manager()
@@ -3845,6 +3907,7 @@ fn restart_with_profile_environment_relaunches_in_a_fresh_tab_with_it() {
                 harness: "muse".to_owned(),
                 profile: Some("muse-env".to_owned()),
                 environment: vec!["RECOVERY_MODE=on".to_owned()],
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )

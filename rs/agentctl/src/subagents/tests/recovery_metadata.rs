@@ -11,6 +11,12 @@ fn loaded_resume_profile(
         .status()
         .unwrap()
         .success());
+    let flag = match harness {
+        "claude" => "--dangerously-skip-permissions",
+        "codex" => "--yolo",
+        _ => "--approval-mode=never",
+    };
+    let arguments: Vec<&str> = arguments.iter().copied().chain([flag]).collect();
     fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
     let directory = fixture.root.join(".agentctl");
     agent::create_private_directory(&directory, "test launch profiles", false, false).unwrap();
@@ -80,6 +86,7 @@ fn profile_resume_preserves_loaded_policy_and_literal_conversation_for_each_loca
                 "--effort",
                 "high",
                 policy,
+                "--dangerously-skip-permissions",
             ],
             "codex" => vec![
                 "resume",
@@ -90,6 +97,7 @@ fn profile_resume_preserves_loaded_policy_and_literal_conversation_for_each_loca
                 "--config",
                 "model_reasoning_effort=high",
                 policy,
+                "--yolo",
             ],
             "muse" => vec![
                 "--model",
@@ -97,6 +105,7 @@ fn profile_resume_preserves_loaded_policy_and_literal_conversation_for_each_loca
                 "--reasoning-effort",
                 "high",
                 policy,
+                "--approval-mode=never",
                 "resume",
                 conversation,
             ],
@@ -295,6 +304,7 @@ fn fresh_claude_records_an_assigned_conversation_and_safe_launch_metadata() {
                     "REVIEW_MODE=private-value".to_owned(),
                     "REVIEW_MODE=another-private-value".to_owned(),
                 ],
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -343,6 +353,7 @@ fn fresh_claude_accepts_only_the_assigned_observed_conversation() {
             &fixture.root,
             StartOptions {
                 harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -368,6 +379,11 @@ fn resume_preserves_the_requested_conversation_without_assigning_a_new_one() {
                 StartOptions {
                     harness: harness.to_owned(),
                     resume: Some("requested-conversation".to_owned()),
+                    harness_args: match harness {
+                        "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                        "codex" => vec!["--yolo".to_owned()],
+                        _ => vec!["--approval-mode=never".to_owned()],
+                    },
                     ..StartOptions::default()
                 },
             )
@@ -396,6 +412,7 @@ fn a_different_reported_resume_id_or_provider_refuses_before_the_brief() {
                 StartOptions {
                     resume: Some("requested-id".to_owned()),
                     brief: Some("must not be sent".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -430,6 +447,7 @@ fn malformed_reported_sessions_leave_a_loadable_failed_record_without_a_brief() 
                 &fixture.root,
                 StartOptions {
                     brief: Some("never send this".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -455,6 +473,11 @@ fn empty_or_nul_resume_ids_refuse_before_registry_or_runtime_effects() {
                     StartOptions {
                         harness: harness.to_owned(),
                         resume: Some(resume.to_owned()),
+                        harness_args: match harness {
+                            "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                            "codex" => vec!["--yolo".to_owned()],
+                            _ => vec!["--approval-mode=never".to_owned()],
+                        },
                         ..StartOptions::default()
                     },
                 )
@@ -515,6 +538,11 @@ fn codex_and_muse_capture_reported_sessions_without_inventing_one() {
                     &fixture.root,
                     StartOptions {
                         harness: harness.to_owned(),
+                        harness_args: match harness {
+                            "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                            "codex" => vec!["--yolo".to_owned()],
+                            _ => vec!["--approval-mode=never".to_owned()],
+                        },
                         ..StartOptions::default()
                     },
                 )
@@ -544,6 +572,7 @@ fn an_asserted_conversation_never_substitutes_for_a_routing_anchor() {
             &fixture.root,
             StartOptions {
                 harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -689,6 +718,7 @@ fn asserted_conversations_participate_in_duplicate_session_checks() {
             &fixture.root,
             StartOptions {
                 resume: Some("shared-conversation".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -699,6 +729,7 @@ fn asserted_conversations_participate_in_duplicate_session_checks() {
             &fixture.root,
             StartOptions {
                 resume: Some("shared-conversation".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -722,6 +753,7 @@ fn bind_session_cannot_replace_recovery_or_legacy_resume_provenance() {
                 &fixture.root,
                 StartOptions {
                     resume: Some("original-conversation".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -765,6 +797,7 @@ fn adoption_refuses_a_session_held_only_as_recovery_provenance() {
             &fixture.root,
             StartOptions {
                 resume: Some("thread".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )

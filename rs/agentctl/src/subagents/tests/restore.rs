@@ -128,6 +128,7 @@ fn dead_agent(fixture: &Fixture) -> AgentRecord {
             &fixture.root,
             StartOptions {
                 harness: "codex".to_owned(),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -157,6 +158,7 @@ fn dead_named(fixture: &Fixture, name: &str) -> AgentRecord {
             StartOptions {
                 harness: "codex".to_owned(),
                 resume: Some(format!("{name}-conversation")),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -524,6 +526,11 @@ fn restore_refuses_an_ambiguous_muse_lane_per_lane_and_carries_on() {
                 &fixture.root,
                 StartOptions {
                     harness: harness.to_owned(),
+                    harness_args: match harness {
+                        "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                        "codex" => vec!["--yolo".to_owned()],
+                        _ => vec!["--approval-mode=never".to_owned()],
+                    },
                     ..StartOptions::default()
                 },
             )
@@ -736,6 +743,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
             StartOptions {
                 workspace_id: Some("workspace".to_owned()),
                 brief: Some("task".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -847,6 +855,7 @@ fn a_second_boots_catch_up_supersedes_the_first_boots_undelivered_one() {
             StartOptions {
                 workspace_id: Some("workspace".to_owned()),
                 brief: Some("task".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -1528,6 +1537,7 @@ fn restore_revives_the_coordinator_first_re_registers_it_and_queues_one_notice()
             &fixture.root,
             StartOptions {
                 harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -1610,6 +1620,7 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
             &fixture.root,
             StartOptions {
                 harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -2047,6 +2058,7 @@ fn promotable_slotted(fixture: &Fixture, name: &str, slot: &str) -> AgentRecord 
             StartOptions {
                 harness: "codex".to_owned(),
                 resume: Some(format!("{name}-conversation")),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -2437,6 +2449,7 @@ fn a_restore_on_the_boot_its_agents_were_pinned_on_says_no_restart_and_keeps_cro
             &fixture.root,
             StartOptions {
                 harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -2482,6 +2495,7 @@ fn after_a_restart_restore_holds_boxed_slots_then_hands_each_to_its_back_agent()
             StartOptions {
                 harness: "codex".to_owned(),
                 resume: Some("goal-conversation".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -2786,6 +2800,7 @@ fn watch_never_repairs_or_alerts_on_a_unit_it_could_not_check() {
             &fixture.root,
             StartOptions {
                 harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3210,6 +3225,7 @@ fn dead_claude_agent(fixture: &Fixture) -> AgentRecord {
             &fixture.root,
             StartOptions {
                 harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3390,6 +3406,7 @@ fn restore_labels_an_orphan_of_a_parked_lane_instead_of_closing_it() {
             &fixture.root,
             StartOptions {
                 harness: "codex".to_owned(),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3452,6 +3469,7 @@ fn watch_unit_repair_off_skips_units_but_still_drains_queues() {
             &fixture.root,
             StartOptions {
                 harness: "codex".to_owned(),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3579,6 +3597,7 @@ fn watch_notify_off_and_tab_hygiene_off_report_skipped_in_health() {
             &fixture.root,
             StartOptions {
                 harness: "claude".to_owned(),
+                harness_args: vec!["--dangerously-skip-permissions".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -3657,7 +3676,7 @@ fn restore_revives_with_the_recorded_profile_environment() {
     agent::atomic_json(
         &directory.join("profiles.json"),
         &json!({"schema": "agentctl-profiles/v1", "profiles": {
-            "muse-env": {"harness": "muse", "mode": "interactive", "env": {"RECOVERY_MODE": "on"}}
+            "muse-env": {"harness": "muse", "mode": "interactive", "argv": ["--approval-mode=never"], "env": {"RECOVERY_MODE": "on"}}
         }}),
     )
     .unwrap();
@@ -3671,6 +3690,7 @@ fn restore_revives_with_the_recorded_profile_environment() {
                 profile: Some("muse-env".to_owned()),
                 environment: vec!["RECOVERY_MODE=on".to_owned()],
                 resume: Some("lane-conversation".to_owned()),
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )

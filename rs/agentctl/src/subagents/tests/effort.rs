@@ -31,6 +31,7 @@ fn codex_max_and_ultra_start_with_their_config_argument() {
                 level,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -65,6 +66,7 @@ fn codex_max_and_ultra_start_with_their_config_argument() {
             "bogus",
             StartOptions {
                 workspace_id: Some("workspace".to_owned()),
+                harness_args: vec!["--yolo".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -247,7 +249,7 @@ fn overrides_survive_a_profile_refresh_and_status_agrees() {
         &directory.join("profiles.json"),
         &json!({"schema":"agentctl-profiles/v1","profiles":{
             "claude-recovery": {"harness":"claude","mode":"interactive","model":"opus","reasoning_effort":"high",
-                "argv":["--allowedTools","Read"], "env":{}}
+                "argv":["--allowedTools","Read","--dangerously-skip-permissions"], "env":{}}
         }}),
     )
     .unwrap();
@@ -261,7 +263,11 @@ fn overrides_survive_a_profile_refresh_and_status_agrees() {
                 harness: "claude".to_owned(),
                 profile: Some("claude-recovery".to_owned()),
                 model: Some("opus".to_owned()),
-                harness_args: vec!["--allowedTools".to_owned(), "Read".to_owned()],
+                harness_args: vec![
+                    "--allowedTools".to_owned(),
+                    "Read".to_owned(),
+                    "--dangerously-skip-permissions".to_owned(),
+                ],
                 ..StartOptions::default()
             },
         )

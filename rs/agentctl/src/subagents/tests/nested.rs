@@ -100,7 +100,7 @@ fn launch_only_v2_record_is_read_and_rewritten_without_flat_duplicates() {
 
     let record = fixture.manager().read_record("worker").unwrap();
     assert_eq!(record.harness, "codex");
-    assert_eq!(record.arguments, ["--no-alt-screen"]);
+    assert_eq!(record.arguments, ["--no-alt-screen", "--yolo"]);
     assert_eq!(
         fixture.manager().status("worker").unwrap()["launch"],
         nested["launch"]
@@ -428,6 +428,7 @@ fn running_nested_muse_without_process_identity_cannot_close_pane() {
             &fixture.root,
             StartOptions {
                 harness: "muse".to_owned(),
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -538,7 +539,7 @@ fn anchor_migrates_a_v2_row_to_flat_schema_1() {
     let flat = stored(&fixture);
     assert_eq!(flat["schema"], 1);
     assert_eq!(flat["harness"], "codex");
-    assert_eq!(flat["arguments"], json!(["--no-alt-screen"]));
+    assert_eq!(flat["arguments"], json!(["--no-alt-screen", "--yolo"]));
     assert_eq!(flat["session_value"], nested["session_value"]);
     assert_eq!(flat["anchor_rule"], ANCHOR_RULE);
     assert_eq!(flat["terminal_id"], anchored["terminal_id"]);
@@ -622,6 +623,7 @@ fn revive_starts_a_flat_generation_and_archives_the_nested_row() {
             &fixture.root,
             StartOptions {
                 harness: "muse".to_owned(),
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )
@@ -647,7 +649,10 @@ fn revive_starts_a_flat_generation_and_archives_the_nested_row() {
     assert_eq!(new["schema"], 1);
     assert_eq!(new["revived_from"], old.token);
     let session = old.session_value.clone().unwrap();
-    assert_eq!(new["arguments"], json!(["resume", session]));
+    assert_eq!(
+        new["arguments"],
+        json!(["--approval-mode=never", "resume", session])
+    );
     let archive = fixture
         .root
         .join("registry/archive")

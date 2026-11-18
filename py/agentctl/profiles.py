@@ -58,6 +58,63 @@ _MAX_CONFIG_BYTES = 256 * 1024
 _SYSTEM_GIT = Path("/usr/bin/git")
 
 
+def permission_bypass_flag(harness: str, argv: Sequence[str]) -> str | None:
+    """The bypass flag to add for *harness*, or None when *argv* carries one (#1822).
+
+    Verified against each harness's real ``--help``: claude takes
+    ``--dangerously-skip-permissions`` or ``--permission-mode bypassPermissions``,
+    codex takes ``--dangerously-bypass-approvals-and-sandbox`` or ``--yolo``, and
+    muse takes ``--approval-mode never``. Harnesses with no known requirement
+    (agentcloud, agy, unknown) return None here; agentcloud's gap is reported
+    by :func:`permission_bypass_warning` instead.
+    """
+    arguments = tuple(argv)
+
+    def has_value(option: str, wanted: str) -> bool:
+        return any(
+            arguments[index] == option and arguments[index + 1] == wanted
+            for index in range(len(arguments) - 1)
+        ) or any(item == f"{option}={wanted}" for item in arguments)
+
+    if harness == "claude":
+        if "--dangerously-skip-permissions" in arguments or has_value(
+            "--permission-mode", "bypassPermissions"
+        ):
+            return None
+        return "--dangerously-skip-permissions (or --permission-mode bypassPermissions)"
+    if harness == "codex":
+        if "--dangerously-bypass-approvals-and-sandbox" in arguments or "--yolo" in arguments:
+            return None
+        return "--dangerously-bypass-approvals-and-sandbox (or --yolo)"
+    if harness == "muse":
+        if has_value("--approval-mode", "never"):
+            return None
+        return "--approval-mode never"
+    return None
+
+
+def require_permission_bypass(label: str, harness: str, argv: Sequence[str]) -> None:
+    """Refuse a launch whose arguments carry no permission-bypass flag (#1822)."""
+    flag = permission_bypass_flag(harness, argv)
+    if flag is not None:
+        raise AgentDeliveryError(
+            f"{label} (harness {harness!r}) has no permission-bypass flag: add {flag} "
+            "to its argv (every agent runs on bypass permissions; without it the "
+            "harness can park on a permission prompt with nobody answering)"
+        )
+
+
+def permission_bypass_warning(harness: str) -> str | None:
+    """Why no bypass flag can be required of *harness* (#1822): warning only."""
+    if harness == "agentcloud":
+        return (
+            "no bypass flag known: agentcloudctl has no permission-bypass or "
+            "approval-off option (--dangerously-skip-sandbox is a sandbox switch, "
+            "not permissions), so agentctl cannot require one for this harness"
+        )
+    return None
+
+
 def blocking_question_warning(harness: str, argv: Sequence[str]) -> str | None:
     """Why this launch can park on a blocking question tool, if detectable (#1158).
 
@@ -113,6 +170,9 @@ class LaunchProfile:
         if self.agentcloud is not None:
             result["agentcloud"] = dict(self.agentcloud)
             result["requires_edition"] = "rust"
+        bypass = permission_bypass_warning(self.harness)
+        if bypass is not None:
+            result["permission_bypass_warning"] = bypass
         warning = blocking_question_warning(self.harness, self.argv)
         if warning is not None:
             result["blocking_question_warning"] = warning
@@ -607,6 +667,11 @@ def _profile(name: str, raw: object) -> LaunchProfile:
             raise AgentDeliveryError(f"profile {name!r} environment values must be NUL-free strings")
         environment.append(f"{key}={value}")
     required = _required_names(raw.get("required_env"), f"profile {name!r}")
+    # #1822: every interactive launch carries its harness's bypass flag.
+    # Headless profiles are exempt: codex/agy headless argv is empty by rule
+    # and the headless runners mediate permissions themselves.
+    if mode == "interactive":
+        require_permission_bypass(f"profile {name!r}", harness, argv)
     return LaunchProfile(name, harness, mode, model, effort, argv, tuple(environment), agentcloud, required)
 
 

@@ -13432,6 +13432,15 @@ its drain would also type, so it was not queued",
             // A session anchor recorded only in the launch spec (or the
             // top-level field bind-session wrote) still resumes (#948).
             .or_else(|| record.effective_native_session().map(|native| native.value));
+        // #1822: refuse before ending anything when the recorded launch
+        // carries no bypass flag, as a start would.
+        if !record.is_headless() {
+            let label = match record.profile.as_deref() {
+                Some(profile) => format!("profile {profile:?}"),
+                _ => format!("agent {agent_name:?} launch"),
+            };
+            crate::profiles::require_permission_bypass(&label, &record.harness, &record.arguments)?;
+        }
         // The whole tree, runtime first: a TERM to a wrapper alone (Muse's) orphans the
         // runtime, which then keeps the session while the relaunch resumes it (#920).
         if !self.client.end_harness(identity, Duration::from_secs(15))? {
@@ -16925,6 +16934,7 @@ pub(crate) mod tests {
                     StartOptions {
                         workspace_id: Some("workspace".to_owned()),
                         brief,
+                        harness_args: vec!["--yolo".to_owned()],
                         ..StartOptions::default()
                     },
                 )
@@ -18730,6 +18740,7 @@ pub(crate) mod tests {
                     workspace_id: Some("workspace".to_owned()),
                     brief: Some("brief line".to_owned()),
                     purpose: Some("explicit purpose".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -18801,6 +18812,7 @@ pub(crate) mod tests {
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     environment: entries.clone(),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -18845,6 +18857,7 @@ pub(crate) mod tests {
                 &fixture.root,
                 StartOptions {
                     environment: vec!["BAD-NAME=value".to_owned()],
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -18872,6 +18885,7 @@ pub(crate) mod tests {
                 &fixture.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -18905,6 +18919,7 @@ pub(crate) mod tests {
                 &fixture.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -18926,6 +18941,7 @@ pub(crate) mod tests {
                 &plain.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -18953,6 +18969,7 @@ pub(crate) mod tests {
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -18992,6 +19009,7 @@ pub(crate) mod tests {
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19040,6 +19058,7 @@ pub(crate) mod tests {
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19127,6 +19146,7 @@ pub(crate) mod tests {
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19174,6 +19194,7 @@ pub(crate) mod tests {
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19295,6 +19316,7 @@ fi
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19330,6 +19352,7 @@ fi
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19386,6 +19409,7 @@ fi
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19439,6 +19463,7 @@ fi
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19565,6 +19590,11 @@ fi
                             executable: Some(executable),
                             ..SlotLaunch::default()
                         }),
+                        harness_args: match harness {
+                            "claude" => vec!["--dangerously-skip-permissions".to_owned()],
+                            "codex" => vec!["--yolo".to_owned()],
+                            _ => vec!["--approval-mode=never".to_owned()],
+                        },
                         ..StartOptions::default()
                     },
                 )
@@ -19710,6 +19740,7 @@ fi
                 &named.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -19758,6 +19789,7 @@ fi
                 &mismatched.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -20216,6 +20248,7 @@ fi
                 &custom.root,
                 StartOptions {
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -20703,6 +20736,7 @@ fi
                 &fixture.root,
                 StartOptions {
                     environment: vec![secret.to_owned()],
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -20731,6 +20765,7 @@ fi
                 &fixture.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -22865,6 +22900,7 @@ fi
                 &fixture.root,
                 StartOptions {
                     resume: Some("thread".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -22893,6 +22929,7 @@ fi
                 &fixture.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -22929,6 +22966,7 @@ fi
                 &fixture.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23131,6 +23169,7 @@ fi
                 &fixture.root,
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
+                    harness_args: vec!["--yolo".to_owned()],
                     ..StartOptions::default()
                 }
             )
@@ -23158,6 +23197,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23184,6 +23224,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23210,6 +23251,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23232,6 +23274,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23257,6 +23300,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23285,6 +23329,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23319,6 +23364,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23391,6 +23437,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )
@@ -23420,6 +23467,7 @@ fi
                 StartOptions {
                     workspace_id: Some("workspace".to_owned()),
                     harness: "muse".to_owned(),
+                    harness_args: vec!["--approval-mode=never".to_owned()],
                     ..StartOptions::default()
                 },
             )

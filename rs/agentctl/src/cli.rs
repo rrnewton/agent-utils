@@ -5042,6 +5042,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     "no reasoning effort declared for harness {harness:?} (mode {mode}): declare reasoning_effort in the launch profile or pass --effort LEVEL (accepted levels: {levels})"
                 )));
             }
+            // #1822: an interactive launch with no bypass flag refuses here,
+            // profile and ad-hoc alike (a profile was already refused at load).
+            if mode == "interactive" {
+                let label = match value.profile.as_deref() {
+                    Some(profile) => format!("profile {profile:?}"),
+                    None => format!("agent {:?} launch", value.agent.name),
+                };
+                crate::profiles::require_permission_bypass(&label, &harness, &harness_args)
+                    .map_err(|error| Failure::Usage(error.to_string()))?;
+                if let Some(warning) = crate::profiles::permission_bypass_warning(&harness) {
+                    eprintln!("agentctl: warning: {label}: {warning}");
+                }
+            }
             if mode == "headless"
                 && crate::headless::adapter::adapter_for(&harness).is_some()
                 && value.profile.is_none()

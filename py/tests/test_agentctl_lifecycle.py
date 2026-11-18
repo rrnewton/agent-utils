@@ -1740,6 +1740,14 @@ def prepare_revive(
             return identity
 
         monkeypatch.setattr(fake, "start_pane_agent", custom)
+    # #1822: a revivable launch carries its harness's bypass flag.
+    bypass = {
+        "claude": ("--dangerously-skip-permissions",),
+        "codex": ("--yolo",),
+        "muse": ("--approval-mode=never",),
+    }.get(harness, ())
+    if not any(flag in harness_args for flag in bypass):
+        harness_args = (*harness_args, *bypass)
     manager.start("worker", cwd=str(tmp_path), harness=harness, profile=profile,
                   model=model, harness_args=harness_args, environment=environment)
     old = manager.get("worker")
@@ -2229,7 +2237,7 @@ def test_revive_reloads_matching_private_profile_and_preserves_literal_policy(
     if change == "missing":
         path.rename(configuration / "profiles-held.json")
     elif change is not None:
-        profile[change] = "different" if change == "model" else []
+        profile[change] = "different" if change == "model" else ["--dangerously-skip-permissions", "--changed"]
         agent._atomic_json(str(path), {"schema": "agentctl-profiles/v1", "profiles": {"owner-policy": profile}})
     if change == "missing":
         # The launch spec names the environment, whose values only the profile holds.
@@ -2260,7 +2268,7 @@ def test_revive_without_a_launch_spec_still_refuses_a_changed_profile(
         model="chosen", harness_args=("--dangerously-skip-permissions",))
     old.set_launch_spec(None)
     manager._save(old)
-    profile[change] = "different" if change == "model" else []
+    profile[change] = "different" if change == "model" else ["--dangerously-skip-permissions", "--changed"]
     agent._atomic_json(str(tmp_path / ".agentctl" / "profiles.json"),
                        {"schema": "agentctl-profiles/v1", "profiles": {"owner-policy": profile}})
     assert manager.revive("worker", dry_run=True)["action"] == "blocked"
@@ -2287,6 +2295,7 @@ def test_revive_replays_the_synthesized_ultra_gate_from_the_recorded_effort(
     from .test_agentctl_sessions import _write_profiles
     _write_profiles(tmp_path, {"muse-ultra": {
         "harness": "muse", "mode": "interactive", "reasoning_effort": "ultra",
+        "argv": ["--approval-mode=never"],
         "env": {"RECOVERY_MODE": "on"}}})
     manager, fake, old = prepare_revive(
         tmp_path, monkeypatch, harness="muse", profile="muse-ultra",

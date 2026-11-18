@@ -248,6 +248,22 @@ mod tests {
     }
 
     #[test]
+    fn headless_claude_mediates_permissions_without_a_bypass_flag() {
+        // #1822: the headless wrapper needs no profile bypass flag: it
+        // mediates permissions itself (--permission-prompts host, answered
+        // by the wrapper for the owner; or none, denied at once).
+        assert!(asks_wrapper(&[], true));
+        assert_eq!(
+            prompts_target(&effective_arguments(&[], true)),
+            Some("host".to_owned())
+        );
+        assert_eq!(
+            prompts_target(&effective_arguments(&[], false)),
+            Some("none".to_owned())
+        );
+    }
+
+    #[test]
     fn reserved_arguments_are_refused() {
         assert!(validate_arguments(&["--model".to_owned(), "x".to_owned()]).is_ok());
         assert!(validate_arguments(&["-p".to_owned()]).is_err());
