@@ -738,6 +738,9 @@ def handler_for(api: FakeApi) -> type[BaseHTTPRequestHandler]:
             self.pin_write(json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}"))
 
         def do_DELETE(self) -> None:  # noqa: N802
+            # Read whole, as do_POST does: a body left in this kept-alive
+            # socket is parsed as the next request and desyncs the check.
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             self.pin_write(None)
 
         def pin_write(self, body: Json | None) -> None:
