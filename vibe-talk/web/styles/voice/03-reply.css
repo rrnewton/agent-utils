@@ -110,11 +110,21 @@
   min-width: 0;
 }
 
-/* `#1840 vibe-talk-draft-sync-across-devices`: the Save draft chip shares
-   the actions row; a tighter gap keeps the row at the lines it always had
-   at a large type size, where it wraps. */
-.composer-actions {
-  column-gap: 0.4rem;
+/* `#1840 vibe-talk-draft-sync-across-devices`: Save draft stands over the
+   box's top corner, in its grid cell like the new-line key, so the composer
+   keeps exactly the height it always had. With the continue offer up, the
+   box is a row down and the chip follows it. */
+#channel-save-draft {
+  grid-row: 1;
+  grid-column: 1;
+  justify-self: end;
+  align-self: start;
+  z-index: 1;
+  margin: 0.4rem 0.4rem 0 0;
+}
+
+#channel-composer:has(> #draft-sync-offer:not([hidden])) #channel-save-draft {
+  grid-row: 2;
 }
 
 .composer-actions > button {
