@@ -155,7 +155,13 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   font-weight: 600;
   line-height: 1;
   white-space: nowrap;
-  flex: 0 0 auto;
+  /* `#1811`: a scoped title ("Discuss: thread <slug>") truncates with an
+     ellipsis at narrow widths instead of wrapping the bar and pushing
+     the grip off centre. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .discuss-actions {
@@ -627,7 +633,9 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
  * line takes the full width under them rather than run underneath. */
 @media not ((min-width: 900px) and (pointer: fine)) {
   .discuss-head {
-    flex-wrap: wrap;
+    /* `#1811`: one row always — the scoped title truncates with an
+       ellipsis rather than wrapping the bar and decentring the grip. */
+    flex-wrap: nowrap;
     gap: 4px;
   }
 
