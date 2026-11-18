@@ -326,7 +326,6 @@ class Walk:
         except Exception:
             pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
         page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-        page.click("#view-switch")
         page.select_option("#thread-select", "main")
         self.wait_for("() => !!document.querySelector('#discord-log > li[data-id=\"600\"]')",
                       "Main did not open")

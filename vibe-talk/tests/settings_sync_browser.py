@@ -283,6 +283,12 @@ def main() -> int:
                     script += "localStorage.setItem(%s, %s);" % (json.dumps(key), json.dumps(value))
                 page.add_init_script(script)
                 page.goto(url, wait_until="load")
+                # `#1781`: a token-seeded first run meets the Welcome; dismiss it.
+                try:
+                    page.wait_for_function("() => !document.getElementById('screen-welcome').hidden", timeout=3_000)
+                    page.click("#welcome-start")
+                except Exception:
+                    pass
                 return context, page, errors
 
             with tempfile.TemporaryDirectory(prefix="vibe-talk-device-a-") as profile_a, \

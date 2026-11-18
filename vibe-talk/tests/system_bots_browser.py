@@ -311,7 +311,6 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-            page.click("#view-switch")
             last = "303" if named else "302"
             page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=10_000)
             for scheme in ("dark", "light"):

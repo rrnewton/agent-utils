@@ -410,7 +410,6 @@ def thread_button_walk(walk: Walk) -> None:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
-    page.click("#view-switch")
     walk.wait_for(f"() => !!document.querySelector('#discord-log > li[data-id=\"{OTHER}\"] .thread-badge')",
                   "the channel did not open")
     page.select_option("#thread-select", "main")
