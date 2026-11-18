@@ -371,7 +371,14 @@ def test_launch_sigterm_exits_within_a_few_seconds(fixture: Fixture) -> None:
     # stop the termination guard had to abandon logs "did not stop
     # within". Exit plus those lines are the conditions; every bound
     # here only reports a hang (owner rule 346: no wall-clock verdict).
-    process = fixture.launch()
+    # The stop grace is set generously (AGENTCTL_CHAT_STOP_GRACE_S), as
+    # in the sibling startup-stop test (#1750): with the production 4 s
+    # grace the verdict was which line the guard logged, and a bridge
+    # whose loop thread a loaded host starved past 4 s was abandoned
+    # despite being parked in an interruptible wait, so the test failed
+    # on host speed. With the grace wide, "did not stop within" can only
+    # mean the loop truly never stopped, which is the regression above.
+    process = fixture.launch(extra_env={"AGENTCTL_CHAT_STOP_GRACE_S": "120"})
     assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 300)
     # The bridge itself, not any process naming the state: the
     # launcher's own argv carries --bridge-state too.
