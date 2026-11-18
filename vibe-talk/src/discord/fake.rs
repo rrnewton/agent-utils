@@ -962,6 +962,78 @@ impl ChatClient for FakeDiscord {
             .await
     }
 
+    /// One timeline page from the same held messages [`Self::fetch_page`]
+    /// serves. `#1844`: without this the fake refused every timeline read, so
+    /// a `--fake-discord` server could never fill the message cache's held
+    /// timelines and Discuss (cache-only by design) had no window to read —
+    /// every Discuss browser walk had to intercept the routes instead of
+    /// exercising them. The thread-list view stays refused, as before: this
+    /// fake holds no thread summaries to list.
+    async fn fetch_timeline(
+        &self,
+        channel: &ChannelId,
+        request: &crate::threads::TimelineRequest,
+    ) -> Result<crate::threads::TimelinePage, ChatError> {
+        use crate::threads::TimelineView;
+        if let Some(unknown) = self.unknown_channel(channel) {
+            return Err(unknown);
+        }
+        let state = self.lock();
+        let all: Vec<Message> = state
+            .messages
+            .iter()
+            .filter(|held| &held.channel_id == channel)
+            .cloned()
+            .collect();
+        drop(state);
+        let mut messages: Vec<Message> = match request.view {
+            TimelineView::Flat => all.clone(),
+            TimelineView::Main => all
+                .iter()
+                .filter(|held| held.thread.as_ref().is_none_or(|thread| thread.is_root))
+                .cloned()
+                .collect(),
+            TimelineView::Thread => {
+                let thread = request.thread_id.as_deref().unwrap_or("");
+                all.iter()
+                    .filter(|held| {
+                        held.id.as_str() == thread
+                            || held
+                                .thread
+                                .as_ref()
+                                .is_some_and(|held_thread| held_thread.id == thread)
+                    })
+                    .cloned()
+                    .collect()
+            }
+            TimelineView::Threads => {
+                return Err(ChatError::Refused(
+                    "thread timelines are not supported by this backend".to_owned(),
+                ));
+            }
+        };
+        sort_oldest_first(&mut messages);
+        let limit = usize::from(request.limit.max(1));
+        let end = match &request.before {
+            Some(cursor) => messages
+                .iter()
+                .position(|held| held.id.as_str() == cursor.as_str())
+                .unwrap_or(messages.len()),
+            None => messages.len(),
+        };
+        let start = end.saturating_sub(limit);
+        let page = messages[start..end].to_vec();
+        Ok(crate::threads::TimelinePage {
+            has_threads: all.iter().any(|held| held.thread.is_some()),
+            has_more: start > 0,
+            next_before: (start > 0)
+                .then(|| page.first().map(|held| held.id.as_str().to_owned()))
+                .flatten(),
+            messages: page,
+            ..crate::threads::TimelinePage::default()
+        })
+    }
+
     async fn post_message(
         &self,
         channel: &ChannelId,
