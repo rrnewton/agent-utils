@@ -131,6 +131,63 @@ def main() -> int:
                     print(f"{label} at {width}x{height}: chip clear of the text area {chip} vs {text}")
                     ctx.close()
                     browser.close()
+                # `#1871`: the compact keyboard layout on a phone — the
+                # viewport shrunk as a keyboard shrinks it, the box focused.
+                browser = pw.chromium.launch(executable_path=args.browser_executable)
+                ctx = browser.new_context(
+                    viewport={"width": 412, "height": 915},
+                    color_scheme="dark", has_touch=True, is_mobile=True)
+                page = ctx.new_page()
+                page.add_init_script(
+                    f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE)}); }} catch(e) {{}}")
+                page.goto(base + "/", wait_until="load")
+                try:
+                    page.wait_for_selector("#welcome-start", state="visible", timeout=5_000)
+                    page.click("#welcome-start")
+                except Exception:
+                    pass
+                page.wait_for_selector("#channel-compose-text", state="visible", timeout=20_000)
+                box = page.locator("#channel-compose-text")
+                box.click()
+                box.fill(LONG_LINE)
+                page.set_viewport_size({"width": 412, "height": 915 - 336})
+                page.wait_for_function(
+                    "() => (window.visualViewport ? window.visualViewport.height : window.innerHeight) === 579",
+                    timeout=20_000)
+                page.wait_for_selector("#keyboard-send:not([hidden])", state="visible", timeout=20_000)
+                rects = page.evaluate("""() => {
+                  const read = (id) => {
+                    const e = document.getElementById(id);
+                    if (!e) return null;
+                    const b = e.getBoundingClientRect();
+                    return {left: b.left, right: b.right, top: b.top, bottom: b.bottom};
+                  };
+                  const chip = read('channel-save-draft');
+                  const send = read('keyboard-send');
+                  const area = document.getElementById('channel-compose-text');
+                  const b = area.getBoundingClientRect();
+                  const cs = getComputedStyle(area);
+                  const text = {
+                    left: b.left + parseFloat(cs.borderLeftWidth) + parseFloat(cs.paddingLeft),
+                    right: b.right - parseFloat(cs.borderRightWidth) - parseFloat(cs.paddingRight),
+                    top: b.top + parseFloat(cs.borderTopWidth) + parseFloat(cs.paddingTop),
+                    bottom: b.bottom - parseFloat(cs.borderBottomWidth) - parseFloat(cs.paddingBottom),
+                  };
+                  return { chip, send, text };
+                }""")
+                text = rects["text"]
+                for name in ("chip", "send"):
+                    rect = rects[name]
+                    check(rect is not None, f"phone keyboard open: no {name} stands over the box")
+                    overlap = not (
+                        rect["right"] <= text["left"] or rect["left"] >= text["right"]
+                        or rect["bottom"] <= text["top"] or rect["top"] >= text["bottom"])
+                    check(not overlap,
+                          f"phone keyboard open: the {name} covers typed text: {rect} vs {text}")
+                page.screenshot(path=str(args.screenshots / "phone-kbopen-chip-clear.png"))
+                print(f"phone keyboard open: chip and keyboard Send clear of the text area {rects}")
+                ctx.close()
+                browser.close()
             print(f"save-draft chip browser: passed; shots in {args.screenshots}")
             return 0
         finally:

@@ -439,6 +439,15 @@
     resize: none;
   }
 
+  /* `#1871 vibe-talk-save-chip-compact-layout`: the channel box keeps the
+     Save draft chip's room in this layout too (7rem, covering the new-line
+     key's 3.25rem), so a long line wraps before the chip and before the
+     floating keyboard Send stands. The side box has no chip and keeps its
+     own. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #channel-compose-text[enterkeyhint="send"]:focus {
+    padding-right: 7rem;
+  }
+
   :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #reply-text[enterkeyhint="send"]:focus {
     grid-row: 2;
     grid-column: 1 / -1;
