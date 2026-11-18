@@ -14,7 +14,7 @@ use crate::active_state::{load_cfg, parse_state_ordered, Cfg};
 use crate::archive_state::parse_archive;
 use crate::config_validate::validate_name;
 use crate::ensure_states::{
-    acquire_lock, append_event, atomic_write_json, ensure_event_log, refuse_partial_state,
+    append_event, atomic_write_json, ensure_event_log, refuse_partial_state,
     require_fixture, utc_now,
 };
 use crate::git_storage_state::parse_storage_git;

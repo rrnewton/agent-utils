@@ -7423,7 +7423,9 @@ def _heartbeat_only_refresh(
                 for checkout in folded_record.checkouts:
                     if checkout.branch in branches or checkout.path in paths:
                         return None
-                if payload.get("revision") == revision + 1 and payload.get("previous_revision") == revision:
+                event_revision = payload.get("revision")
+                event_previous = payload.get("previous_revision")
+                if event_revision == revision + 1 and event_previous == revision:
                     # Not yet in the prepared state: fold it forward, and
                     # only a heartbeat_at change may separate it from its
                     # predecessor.
@@ -7433,7 +7435,7 @@ def _heartbeat_only_refresh(
                         return None
                     records[heartbeating_slot] = folded_record
                     revision += 1
-                elif payload.get("revision") is not None and payload.get("revision") <= revision:
+                elif isinstance(event_revision, int) and event_revision <= revision:
                     # The prepared validation already read this heartbeat
                     # (it landed while the validation ran): the prepared
                     # record must be exactly the event's record.

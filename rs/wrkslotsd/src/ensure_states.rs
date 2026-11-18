@@ -1219,9 +1219,14 @@ mod lock_wait_tests {
         // A descriptor flock cannot act on (an O_PATH fd) fails both the
         // non-blocking attempt and the blocking waiter; that error must
         // reach the caller, never an Ok that writes without the lock.
+        let target = std::env::temp_dir().join(format!(
+            "wrkslots-opath-target-{}",
+            std::process::id()
+        ));
+        std::fs::write(&target, b"").unwrap();
         let path_fd = rustix::fs::openat(
             rustix::fs::CWD,
-            "Cargo.toml",
+            target.as_path(),
             rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
             rustix::fs::Mode::empty(),
         )

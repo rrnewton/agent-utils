@@ -11,6 +11,7 @@ on events, never on elapsed-time verdicts.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import fcntl
 import os
@@ -71,7 +72,7 @@ def test_a_waiter_blocks_instead_of_polling_and_acquires_on_release(
                 third_attempt.set()
         return real_flock(fd, operation)
 
-    monkeypatch.setattr(cli.fcntl, "flock", counting_flock)
+    monkeypatch.setattr(fcntl, "flock", counting_flock)
     config_path = project / ".wrkslots.yml"
     with _held_config_lock(project) as release:
         acquired = threading.Event()
@@ -116,19 +117,16 @@ def test_heartbeat_wait_is_bounded_well_below_the_ttl(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
     assert create(project).returncode == 0
     config = cli._load_config(str(project), "testhost")
-
-    class _Args:
-        wait_lock = 30.0
-        wait_lock_defaulted = True
+    assert config.heartbeat_ttl_seconds == 600
 
     # The bound comes from the slot record's TTL (600 s in fixtures).
-    assert cli._heartbeat_wait_seconds(_Args(), 600.0) == pytest.approx(10.0)
-    assert cli._heartbeat_wait_seconds(_Args(), 24.0) == pytest.approx(8.0)
-    _Args.wait_lock_defaulted = False
-    _Args.wait_lock = 0.0
-    assert cli._heartbeat_wait_seconds(_Args(), 600.0) == 0.0
-    _Args.wait_lock = 45.0
-    assert cli._heartbeat_wait_seconds(_Args(), 600.0) == 45.0
+    defaulted = argparse.Namespace(wait_lock=30.0, wait_lock_defaulted=True)
+    assert cli._heartbeat_wait_seconds(defaulted, 600.0) == pytest.approx(10.0)
+    assert cli._heartbeat_wait_seconds(defaulted, 24.0) == pytest.approx(8.0)
+    explicit = argparse.Namespace(wait_lock=0.0, wait_lock_defaulted=False)
+    assert cli._heartbeat_wait_seconds(explicit, 600.0) == 0.0
+    explicit.wait_lock = 45.0
+    assert cli._heartbeat_wait_seconds(explicit, 600.0) == 45.0
 
 
 def test_the_timeout_race_never_leaks_the_duplicate_descriptor(
@@ -143,11 +141,9 @@ def test_the_timeout_race_never_leaks_the_duplicate_descriptor(
     lock_path = tmp_path / "intent.lock"
     holder = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(holder, fcntl.LOCK_EX)
-    real_event = threading.Event
-
-    class SlowEvent(real_event):  # type: ignore[valid-type]
+    class SlowEvent(threading.Event):
         def wait(self, timeout: float | None = None) -> bool:
-            got = super().wait(timeout)
+            got: bool = super().wait(timeout)
             if not got and timeout is not None:
                 time_module.sleep(0.5)
             return got
