@@ -62725,9 +62725,10 @@ def _assert_prepared_removal_current(
 
     Compares only cheap identities under the lock: the registry identity
     (one lstat per registry file), the journal fingerprint, and this
-    slot's lock-scope fingerprint (one rev-parse per checkout). A change
-    to this slot defers it by name; the batch goes on to its next
-    candidate.
+    slot's lock-scope fingerprint (one rev-parse per checkout). Foreign
+    event-log growth alone never defers (#1857): only this slot's own
+    record or fingerprint changing does, by name, and the batch goes on
+    to its next candidate.
 
     Returns the state the commit must advance (#1807). The prepared
     state was loaded lock-free before salvage, so another slot's event
@@ -62739,15 +62740,37 @@ def _assert_prepared_removal_current(
     """
 
     slot = prepared.record.slot
-    if (
-        _registry_identity(config) != prepared.identity
-        or _journal_fingerprint(config) != prepared.journals
-    ):
-        raise _RetirementDeferred(
-            f"slot {slot} changed between the lock-free validation and the "
-            "configuration lock; nothing was written for it from the stale "
-            "validation"
+    current_identity = _registry_identity(config)
+    if current_identity != prepared.identity:
+        # Another slot's event may have landed during the lock-free
+        # validation (#1857): the identity covers every EVENTS file, so
+        # refusing here made the advance below unreachable and stalled
+        # every prepared removal on a busy registry. Tolerate only shard
+        # rewrites and appended event files (never a modified or removed
+        # one, never the configuration, a journal, a seal, a quarantine
+        # entry or an image record); the target record check below stays
+        # the fail-closed judge of anything that touched this slot.
+        before_entries = dict(prepared.identity.entries)
+        tolerated = current_identity.config_sha256 == prepared.identity.config_sha256 and all(
+            name.startswith(("ACTIVE.", "ARCHIVED."))
+            or (name.startswith("EVENTS.") and "/" not in name)
+            or (name.startswith("EVENTS.") and name not in before_entries)
+            for name in prepared.identity.changed_names(current_identity)
         )
+        # The journal fingerprint also covers every event file; those are
+        # the tolerated growth above, so only its journal entries judge.
+        journal_entries = tuple(
+            entry for entry in _journal_fingerprint(config) if "/" not in entry[0]
+        )
+        prepared_journal_entries = tuple(
+            entry for entry in prepared.journals if "/" not in entry[0]
+        )
+        if not tolerated or journal_entries != prepared_journal_entries:
+            raise _RetirementDeferred(
+                f"slot {slot} changed between the lock-free validation and the "
+                "configuration lock; nothing was written for it from the stale "
+                "validation"
+            )
     try:
         current_state = _load_active(config, require_repository=False)
         current = _find_record(current_state, slot)
@@ -62757,8 +62780,21 @@ def _assert_prepared_removal_current(
             "configuration lock; nothing was written for it from the stale "
             "validation"
         ) from exc
+    current_fingerprint = _lock_scope_fingerprint(config, current, _GitVcs())
+    # The fingerprint's whole-shard hash changes with any foreign slot's
+    # write, so it cannot gate the advance (#1857): this slot's generation,
+    # record digest, checkout heads and the configuration are the facts
+    # the prepared validation actually depended on.
     if _record_to_obj(current) != _record_to_obj(prepared.record) or (
-        _lock_scope_fingerprint(config, current, _GitVcs()) != prepared.fingerprint
+        current_fingerprint.generation,
+        current_fingerprint.record_sha256,
+        current_fingerprint.heads,
+        current_fingerprint.config_sha256,
+    ) != (
+        prepared.fingerprint.generation,
+        prepared.fingerprint.record_sha256,
+        prepared.fingerprint.heads,
+        prepared.fingerprint.config_sha256,
     ):
         raise _RetirementDeferred(
             f"slot {slot} changed between the lock-free validation and the "

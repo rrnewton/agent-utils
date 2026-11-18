@@ -4318,7 +4318,7 @@ struct PreparedRemove {
 /// validation, the state-home reclaim preparation, the storage and
 /// handoff gates, the salvage gates and the process-use census all run
 /// here, before the mutation locks are taken. The locked commit only
-/// re-checks that this slot's record and the event tip are unchanged.
+/// re-checks that this slot's record is unchanged (#1857).
 #[allow(clippy::too_many_arguments)]
 fn prepare_remove(
     root: Option<&Path>,
@@ -4666,15 +4666,11 @@ pub(crate) fn remove_slot(
         ));
     }
     assert_caller(&coordinator, "coordinator")?;
-    // Locked commit (#1287): the slot's record was re-checked above and
-    // its event chain must not have grown since the lock-free validation.
-    if load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), &selected)?.len()
-        != prepared.events.len()
-    {
-        return Err(format!(
-            "slot {slot} changed between the lock-free validation and the registry lock; preserve it and retry"
-        ));
-    }
+    // Locked commit (#1287): the slot's record was re-checked above.
+    // Foreign event-log growth alone never refuses (#1857): another
+    // slot's event does not change this slot's re-read record, and the
+    // appends below position at the current chain tip. A change to
+    // this slot is already caught by the record comparison.
     let heartbeat_age = prepared.heartbeat_age;
     let owner_state = prepared.owner_state;
     let release: Option<Value> = if prepared.release_present {

@@ -314,3 +314,49 @@ def test_retire_pending_defers_slot_changed_after_lock_free_prepare(
     assert not checkout(project, "slot02").exists()
     for label in _NEVER_HELD:
         assert ledger.count(label, held=True) == 0, (label, ledger.calls)
+
+
+def test_retire_pending_survives_foreign_events_during_lock_free_prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#1857: another slot's create + heartbeat during the lock-free phase
+    must not defer a prepared removal whose own record is unchanged."""
+    project = _two_retireable_slots(tmp_path)
+    real_prepare = cli._prepare_retirement_removal
+    injected: list[str] = []
+
+    def prepare_with_foreign_events(*args: object, **kwargs: object) -> object:
+        prepared = real_prepare(*args, **kwargs)  # type: ignore[arg-type]
+        if prepared is not None and not injected:
+            injected.append("foreign")
+            made = create(
+                project, slot="slot09", agent="codex-9", branch="codex/task9"
+            )
+            assert made.returncode == 0, made.stderr
+            beaten = raw_command(
+                project,
+                "heartbeat",
+                "slot09",
+                "--agent",
+                "codex-9",
+                "--owner-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            )
+            assert beaten.returncode == 0, beaten.stderr
+        return prepared
+
+    monkeypatch.setattr(
+        cli, "_prepare_retirement_removal", prepare_with_foreign_events
+    )
+
+    payload = _retire_pending(project, capsys, limit=1)
+
+    assert injected == ["foreign"]
+    removed = [
+        item["slot"] for item in cast(list[dict[str, object]], payload["removed"])
+    ]
+    assert removed == ["slot01"], json.dumps(payload, indent=2)
+    assert not checkout(project, "slot01").exists()
+    assert checkout(project, "slot09").exists()
