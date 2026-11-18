@@ -366,6 +366,16 @@
                   <path d="M12 13.5v7" />
                 </svg>
               </button>
+              <!--
+                `#1852 vibe-talk-search-whole-threads-toggle`. Whole threads, a fixed-width toggle
+                icon on this bar beside the others (it stood as an "Entire threads" chip in the
+                results bucket row since `#1825`; the owner asked for it here, as one control).
+                Off, the thread emoji stands greyed; on, a highlighted coloured circle stands
+                around it, worn from `aria-pressed` as the bar's other toggles wear theirs.
+              -->
+              <button id="search-entire-threads" class="icon-button" type="button" aria-pressed="false" aria-label="Whole threads: if any msg matches" title="Whole threads: if any msg matches" hidden>
+                <span class="whole-threads-emoji" aria-hidden="true">🧵</span>
+              </button>
               <button id="search-toggle" class="icon-button" type="button" aria-label="Search messages" title="Search messages" aria-pressed="false" hidden>
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="10.5" cy="10.5" r="6.5" />
@@ -741,8 +751,7 @@
                 <button id="search-bucket-main" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in main</button>
                 <button id="search-bucket-threads" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in threads</button>
                 <button id="search-bucket-transcripts" class="chip search-bucket-chip" type="button" aria-pressed="false" hidden>in Agent Transcripts</button>
-                <!-- `#1825`: whole threads on any hit, off by default (individual hits as now). -->
-                <button id="search-entire-threads" class="chip search-bucket-chip" type="button" aria-pressed="false" title="Show the whole thread of every hit">Entire threads</button>
+                <!-- `#1852`: Whole threads lives on the search bar as a toggle icon, not here; one control. -->
               </div>
               <!-- `#1608 agent-transcripts-timeline`: the Transcripts view.
                    Agent-day trace threads and their chunks; never a thread

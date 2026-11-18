@@ -1182,9 +1182,10 @@ function renderServerSearch() {
     if (chip.getAttribute("aria-pressed") !== pressed) chip.setAttribute("aria-pressed", pressed);
   }
   const bucketRow = el("search-bucket-row");
-  // `#1825`: the row also carries the Entire-threads chip, which is about the
-  // loaded hits, so the row stands whenever a search is typed — not only
-  // when a server bucket has fresh hits (`anyChip`).
+  // The row stands whenever a search is typed, at the stable height
+  // web/voice.css gives it, so a pending answer's empty row and the chips
+  // that replace it move nothing (`#243`). (`#1852`: Whole threads moved to
+  // the search bar, so the row carries buckets alone.)
   if (bucketRow.hidden) bucketRow.hidden = false;
   placeServerHits(grouped);
   if (!serverExpanded) return;

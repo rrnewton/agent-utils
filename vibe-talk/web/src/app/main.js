@@ -2926,6 +2926,7 @@ const searchOpenControl = createSearchOpenControl({
   el,
   setLinksOnly: (on) => setLinksOnly(on),
   setPinnedOnly: (on) => setPinnedOnly(on),
+  setEntireThreads: (on) => { setEntireThreads(on); el("search-entire-threads").setAttribute("aria-pressed", String(on)); },
   setAuthorFilter: (author) => setAuthorFilter(author),
   hidingRead: () => hidingRead(),
   holdingReader,

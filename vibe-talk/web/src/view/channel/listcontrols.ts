@@ -21,7 +21,7 @@ export interface ListControlsDependencies {
   toggleServerHits(): void;
   /** `#1797`. A bucket chip tapped: interleave its hits in the timeline, or put them away. */
   toggleBucket(id: string): void;
-  /** `#1825`. The Entire-threads chip tapped. */
+  /** `#1825`, on the search bar since `#1852`. The Whole-threads toggle icon tapped. */
   toggleEntireThreads(): void;
   searchAllChannels(on: boolean): void;
   /** The search's walk further back. */

@@ -10,7 +10,7 @@ phone:
 
   cards show `#kvm`-style chips beside Pinned's place, and a hashtag-only
   body line is hidden while its chips stand -> typing `label:kvm` filters
-  -> the Entire-threads chip brings a hit's whole thread -> a chip tap
+  -> the Whole-threads toggle brings a hit's whole thread -> a chip tap
   filters with the tapped message kept in place -> Settings > Labels in
   both sort orders -> Combine two spellings, the (G) row, the filtered
   jump from Settings. `--screenshots DIR` keeps one PNG per stage.
@@ -387,11 +387,11 @@ def walk_through(walk: Walk) -> None:
     walk.check(walk.shown() == ["201", "205"], f"label:kvm shows {walk.shown()}")
     walk.shot("2-label-search")
 
-    # 3. Entire threads: the lane thread of the 205 hit stands whole.
+    # 3. Whole threads (the search-bar toggle, #1852): the lane thread of the 205 hit stands whole.
     walk.press("#search-entire-threads")
     walk.until("() => document.querySelectorAll('#discord-log > li[data-id=\"204\"]').length === 1 && "
                "document.querySelector('#discord-log > li[data-id=\"204\"]').getClientRects().length > 0",
-               "Entire threads did not show the hit's thread root")
+               "Whole threads did not show the hit's thread root")
     walk.check(walk.shown() == ["201", "204", "205"], f"entire threads shows {walk.shown()}")
     walk.shot("3-entire-threads")
     walk.press("#search-entire-threads")

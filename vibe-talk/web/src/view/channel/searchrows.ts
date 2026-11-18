@@ -179,7 +179,7 @@ export interface SearchRows {
   seamDrawn(row: Element, seam: unknown, below: boolean): boolean;
   threadsWithHits(node: unknown): Set<string>;
   rowMatches(row: Element, node: unknown, text: string | null): boolean;
-  /** `#1825`: "Entire threads" — a thread with any hit shows whole. Off by default. */
+  /** `#1825`, on the search bar since `#1852`: "Whole threads" — a thread with any hit shows whole. Off by default. */
   setEntireThreads(on: boolean): void;
   entireThreads(): boolean;
 }
@@ -249,10 +249,12 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
     return hits;
   }
 
-  // `#1825` "Entire threads": off, individual hits as always; on, every held
-  // message of a thread with a hit stands. It ANDs with the #1797 buckets:
-  // buckets choose which scopes contribute hits, this chooses whether a hit
-  // brings its thread with it.
+  // `#1825` "Whole threads" (the search-bar toggle since `#1852`): off,
+  // individual hits as always; on, every held message of a thread with a hit
+  // stands. It ANDs with the #1797 buckets: buckets choose which scopes
+  // contribute hits, this chooses whether a hit brings its thread with it.
+  // The one parsed query drives it, so a plain word and a `label:` search
+  // (group-expanded in `applySearch`) behave the same.
   let entireThreadsOn = false;
 
   /** Every thread (by `threadOf`) holding a held message that matches. */
@@ -326,7 +328,9 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
         const said = !typed || (text !== null && (rowMatches(row, matchNode, text) || (replyHits !== null &&
           (id === "thread-list" ? replyHits.has(String(row.getAttribute("data-context-id")))
             : id === "discord-log" && rowHeadsHitThread(row, replyHits))) ||
-          (wholeThreads !== null && wholeThreads.size > 0 && rowInHitThread(row, wholeThreads))));
+          (wholeThreads !== null && wholeThreads.size > 0 &&
+            (id === "thread-list" ? wholeThreads.has(String(row.getAttribute("data-context-id")))
+              : rowInHitThread(row, wholeThreads)))));
         const hit = said && (!links || shown > 0) && deps.authorPasses(row, author);
         const revealed = !hit && text !== null && (id === "thread-list"
           ? openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-context-id")))

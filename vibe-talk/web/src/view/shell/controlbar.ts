@@ -213,6 +213,9 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     // `#251 author-filter`. Whose messages, left of Links, over the call view as well: a turn is yours
     // or the agent's as a channel message is.
     deps.el("author-filter").hidden = deps.el("search-field").hidden;
+    // `#1852 vibe-talk-search-whole-threads-toggle`. Whole threads beside Pinned while the bar is
+    // open, and over the channel only: it widens a hit to its thread, and the call has no threads.
+    deps.el("search-entire-threads").hidden = deps.el("search-field").hidden || deps.view() !== "discord";
     // `#212 link-filter`. The kinds of link under it go with it.
     deps.renderLinkKinds();
     // The bar used to yield the header row to an open search field when the reader had moved it up

@@ -815,7 +815,8 @@
    width the gap would have cost is the field's. */
 #author-filter,
 #links-filter,
-#pinned-filter {
+#pinned-filter,
+#search-entire-threads {
   position: relative;
   width: var(--toggle-hit);
   height: var(--toggle-hit);
@@ -829,9 +830,15 @@
   margin-left: calc(-1 * var(--bar-gap));
 }
 
+/* `#1852`: Whole threads abuts Pinned the same way, on the channel where both stand. */
+#search-entire-threads {
+  margin-left: calc(-1 * var(--bar-gap));
+}
+
 #author-filter::before,
 #links-filter::before,
-#pinned-filter::before {
+#pinned-filter::before,
+#search-entire-threads::before {
   content: "";
   position: absolute;
   inset: calc((var(--toggle-hit) - var(--search-disc)) / 2);
@@ -845,6 +852,28 @@
   position: relative;
   width: 21px;
   height: 21px;
+}
+
+/* `#1852 vibe-talk-search-whole-threads-toggle`. Whole threads: the thread emoji
+   greyed at rest; on, the highlighted coloured circle stands around it (the
+   ::before disc above, in the accent as Links on wears it) and the emoji stands
+   in full colour. */
+#search-entire-threads .whole-threads-emoji {
+  position: relative;
+  font-size: 19px;
+  line-height: 1;
+  filter: grayscale(1);
+  opacity: 0.45;
+}
+
+#search-entire-threads[aria-pressed="true"] .whole-threads-emoji {
+  filter: none;
+  opacity: 1;
+}
+
+#search-entire-threads[aria-pressed="true"]::before {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 
 /* ON says so twice, from the one attribute that says it to a screen reader: the pin fills in and
@@ -1028,7 +1057,8 @@
    wide, it spans the bar exactly. No scrollbar is drawn, because one would add to its height and
    cover the first row; the button cut off at its end says there is more. */
 #link-kinds {
-  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 1.5 * var(--toggle-hit));
+  /* `#1852`: one more square (Whole threads) stands between Pinned and the glass. */
+  --links-mid: calc(2px + var(--search-disc) + var(--glass-clear) + var(--bar-gap) + 2.5 * var(--toggle-hit));
   position: absolute;
   top: calc(100% + 1px + var(--kinds-gap));
   right: var(--links-mid);

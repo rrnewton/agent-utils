@@ -468,6 +468,10 @@
   flex-wrap: wrap;
   gap: 0.4rem;
   margin: 0.35rem 1rem;
+  /* `#1852`: one chip tall even while a server answer is pending, so the row
+     the Whole-threads chip used to fill keeps the height its chips give it
+     and the reader's place never moves for it (`#243`). */
+  min-height: 2.5rem;
 }
 
 .search-bucket-chip {

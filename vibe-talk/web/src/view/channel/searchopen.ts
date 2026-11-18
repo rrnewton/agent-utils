@@ -21,6 +21,8 @@ export interface SearchOpenDependencies {
   el<K extends string>(id: K): K extends keyof ElementById ? ElementById[K] : HTMLElement;
   setLinksOnly(on: boolean): void;
   setPinnedOnly(on: boolean): void;
+  /** `#1852`: Whole threads lives in this bar too, and goes with it on close. */
+  setEntireThreads(on: boolean): void;
   setAuthorFilter(author: string): void;
   hidingRead(): boolean;
   holdingReader(act: () => void): void;
@@ -66,6 +68,9 @@ export function createSearchOpenControl(deps: SearchOpenDependencies): SearchOpe
       // closing, by `keepingFilterPlace`.
       deps.setLinksOnly(false);
       deps.setPinnedOnly(false);
+      // `#1852`: so does Whole threads — reading or replying never touches it,
+      // only closing the bar (or the toggle itself) turns it off.
+      deps.setEntireThreads(false);
       // `#251 author-filter`. And whose messages.
       deps.setAuthorFilter("everyone");
     }
