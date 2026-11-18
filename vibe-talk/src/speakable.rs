@@ -194,10 +194,99 @@ pub fn for_speech(content: &str, now_ms: i64, zone: &Zone) -> String {
 /// [`for_speech`], but naming into a table the caller keeps.
 #[must_use]
 pub fn for_speech_with(content: &str, now_ms: i64, zone: &Zone, names: &mut Names) -> String {
-    let text = strip_markdown(content);
+    let text = drop_timestamp_citations(content);
+    let text = strip_markdown(&text);
     let text = speak_times(&text, now_ms, zone);
     let text = name_opaque_strings(&text, names);
     collapse_whitespace(&text)
+}
+
+/// Whether `label` is one timestamp citation, as the page renders one: a
+/// parenthesized clock time and a scope arrow, `(09:51 ↩)` in scope or
+/// `(09:51 ↗)` out of scope (`#1823 vibe-talk-tts-skip-timestamps-and-auto-link-ids`).
+/// The time is `H:MM` or `H:MM:SS`; anything else in the parentheses is prose.
+fn is_timestamp_citation(label: &str) -> bool {
+    let Some(inner) = label.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    let Some((time, mark)) = inner.trim().rsplit_once(' ') else {
+        return false;
+    };
+    if mark != "↩" && mark != "↗" {
+        return false;
+    }
+    let parts: Vec<&str> = time.split(':').collect();
+    (parts.len() == 2 || parts.len() == 3)
+        && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && parts[0].len() <= 2
+        && parts[1..].iter().all(|p| p.len() == 2)
+}
+
+/// Drop timestamp citation links before speech: the Markdown form
+/// `[(09:51 ↩)](<address>)` the Discuss shaper writes, and the plain
+/// rendered form `(09:51 ↩)` a message may quote. Reading the time out
+/// adds nothing a listener can use. A following sentence stop keeps its
+/// place (`fix [(09:51 ↩)](…).` is said "fix.").
+fn drop_timestamp_citations(content: &str) -> String {
+    if !content.contains('↩') && !content.contains('↗') {
+        return content.to_owned();
+    }
+    let chars: Vec<char> = content.chars().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    while i < chars.len() {
+        // Markdown citation link: `[(… ↩)](address)`.
+        if chars[i] == '[' {
+            if let Some(end) = scan_citation_link(&chars, i) {
+                drop_before_punctuation(&mut out, &chars, end);
+                i = end;
+                continue;
+            }
+        }
+        // Plain citation: `(… ↩)`.
+        if chars[i] == '(' {
+            if let Some(end) = scan_plain_citation(&chars, i) {
+                drop_before_punctuation(&mut out, &chars, end);
+                i = end;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// After a dropped citation, a sentence stop that followed it must not
+/// be left floating after a space: trim the space already written when
+/// the next character is sentence punctuation.
+fn drop_before_punctuation(out: &mut String, chars: &[char], end: usize) {
+    if chars.get(end).is_some_and(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?')) {
+        while out.ends_with(' ') {
+            out.pop();
+        }
+    }
+}
+
+/// The end (exclusive) of a Markdown citation link at `[`, or `None`.
+fn scan_citation_link(chars: &[char], start: usize) -> Option<usize> {
+    let close = start + 1 + chars[start + 1..].iter().position(|&c| c == ']')?;
+    if chars.get(close + 1) != Some(&'(') {
+        return None;
+    }
+    let label: String = chars[start + 1..close].iter().collect();
+    if !is_timestamp_citation(&label) {
+        return None;
+    }
+    let end = close + 2 + chars[close + 2..].iter().position(|&c| c == ')')?;
+    Some(end + 1)
+}
+
+/// The end (exclusive) of a plain `(… ↩)` citation at `(`, or `None`.
+fn scan_plain_citation(chars: &[char], start: usize) -> Option<usize> {
+    let close = start + 1 + chars[start + 1..].iter().position(|&c| c == ')')?;
+    let label: String = chars[start..=close].iter().collect();
+    is_timestamp_citation(&label).then_some(close + 1)
 }
 
 // --- markdown -----------------------------------------------------------------------------------
@@ -1213,6 +1302,32 @@ mod tests {
         assert_eq!(say("## A heading"), "A heading.");
         assert_eq!(say("> quoted text"), "quoted text");
         assert_eq!(say("run `make validate` now"), "run make validate now");
+    }
+
+    #[test]
+    fn timestamp_citation_links_are_not_read_out() {
+        // `#1823 vibe-talk-tts-skip-timestamps-and-auto-link-ids`: the
+        // Discuss shaper writes `[(HH:MM ↩)](<address>)` in scope and
+        // `[(HH:MM ↗)](<address>&scope=out)` out of scope; a message may
+        // quote the plain rendered `(HH:MM ↩)`. None is spoken.
+        assert_eq!(
+            say("Ada shipped the fix [(09:51 ↩)](?c=C9&v=all&m=slack:C9:111)"),
+            "Ada shipped the fix"
+        );
+        assert_eq!(
+            say("Ada shipped the fix [(09:52 ↗)](?c=C9&v=all&m=slack:C9:222&scope=out)."),
+            "Ada shipped the fix."
+        );
+        assert_eq!(say("Ada shipped the fix (13:33 ↩)"), "Ada shipped the fix");
+        assert_eq!(say("Ada shipped the fix (13:33:07 ↗). Next."), "Ada shipped the fix. Next.");
+        // Not citations: a bare time, a time with words, and a link whose
+        // label merely contains a time are all still spoken.
+        assert_eq!(say("at 13:33 we ship"), "at 13:33 we ship");
+        assert_eq!(say("meet (13:33 sharp)"), "meet (13:33 sharp)");
+        assert_eq!(
+            say("see [the 13:33 run](https://example.com/x)"),
+            "see the 13:33 run"
+        );
     }
 
     #[test]

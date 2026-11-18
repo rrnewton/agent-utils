@@ -614,7 +614,7 @@ def walk(page: Page, base: str, width: int, height: int, scheme: str = "dark") -
     wait_read_count("2 of 4")
     page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=20_000)
     said = page.evaluate("() => window.deviceSpeech.map((u) => u.text)")
-    check(said[-1] == "Ada shipped the fix (09:51 ↩)", f"Next said {said}, not the second block")
+    check(said[-1] == "Ada shipped the fix", f"Next said {said}, not the second block")
     page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
     wait_read_stopped()

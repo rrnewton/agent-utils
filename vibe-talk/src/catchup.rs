@@ -1307,6 +1307,50 @@ mod tests {
     }
 
     #[test]
+    fn a_discuss_answer_links_a_configured_reference_id() {
+        // `#1823 vibe-talk-tts-skip-timestamps-and-auto-link-ids`: a Discuss
+        // answer renders through the same pass as a channel message, so a
+        // configured `[render] reference_links` rule links an id the model
+        // wrote bare, with no link of its own. The rule here is test
+        // configuration only; vibe-talk ships no project rule.
+        use crate::render::references::{
+            ReferenceLinkRule, ReferenceLinks, ReferenceLinksGuard,
+        };
+        let _links = ReferenceLinksGuard::set(
+            ReferenceLinks::compile(&[ReferenceLinkRule {
+                pattern: r"\bagent-utils-([0-9]+)\b".to_owned(),
+                url: "https://github.com/rrnewton/agent-utils/blob/main/.minibeads/issues/agent-utils-$1.md"
+                    .to_owned(),
+            }])
+            .expect("the minibeads-shaped rule compiles"),
+        );
+        let sent = read_set(&["111"]);
+        let cite = |id: &MessageId| {
+            Some((
+                "09:51".to_owned(),
+                message_link("slack", "C9", "flat", None, id, None),
+                true,
+            ))
+        };
+        let (shaped, cited) = shape_answer("Fixed in agent-utils-1807 [m:111]", &sent, cite);
+        let trusted: HashSet<String> = cited
+            .iter()
+            .filter_map(|id| {
+                cite(id).map(|(_, address, in_scope)| trusted_cite_address(&address, in_scope))
+            })
+            .collect();
+        let html =
+            crate::render::body_html_catchup(&shaped, crate::render::Markup::Discord, &trusted);
+        assert!(
+            html.contains(
+                "<a href=\"https://github.com/rrnewton/agent-utils/blob/main/.minibeads/issues/agent-utils-1807.md\""
+            ),
+            "configured id not linked in Discuss output: {html}"
+        );
+        assert!(html.contains(">agent-utils-1807</a>"), "link label wrong: {html}");
+    }
+
+    #[test]
     fn an_out_of_scope_cite_renders_as_an_anchor_and_a_model_link_is_refused() {
         // `#1395` over `#1392`: the out-of-window address (with scope=out)
         // joins the same trusted set, built by the server through the same
