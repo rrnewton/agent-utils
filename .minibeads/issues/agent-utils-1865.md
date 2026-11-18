@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-followup-find-answers-rest: a find answer also answers the rest, in one line'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -30,3 +30,7 @@ updated_at: 2026-11-18T15:50:00-05:00
 # Notes
 
 Owner-priority, from the #1858 live check (liaison, 2026-11-18). Runs in parallel with #1848 vibe-talk-route-health-alert. Test instances only.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 390857c5 (gate pass on be93ede6; combined tree verified against the draft-sync overlap in api.rs, catchup suite 40/40 there). The find rule now answers any remaining part of the question in one short cited line, and the step-back is bounded to 192 gap messages trimmed to 320 chars, with the asker's message inside the bounded reach.
