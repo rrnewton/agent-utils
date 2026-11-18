@@ -121,12 +121,14 @@ def test_heartbeat_wait_is_bounded_well_below_the_ttl(tmp_path: Path) -> None:
         wait_lock = 30.0
         wait_lock_defaulted = True
 
-    assert cli._heartbeat_wait_seconds(_Args(), config) == pytest.approx(10.0)
+    # The bound comes from the slot record's TTL (600 s in fixtures).
+    assert cli._heartbeat_wait_seconds(_Args(), 600.0) == pytest.approx(10.0)
+    assert cli._heartbeat_wait_seconds(_Args(), 24.0) == pytest.approx(8.0)
     _Args.wait_lock_defaulted = False
     _Args.wait_lock = 0.0
-    assert cli._heartbeat_wait_seconds(_Args(), config) == 0.0
+    assert cli._heartbeat_wait_seconds(_Args(), 600.0) == 0.0
     _Args.wait_lock = 45.0
-    assert cli._heartbeat_wait_seconds(_Args(), config) == 45.0
+    assert cli._heartbeat_wait_seconds(_Args(), 600.0) == 45.0
 
 
 def test_the_timeout_race_never_leaks_the_duplicate_descriptor(

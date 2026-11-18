@@ -7472,7 +7472,7 @@ def _heartbeat_only_refresh(
     for machine, folded in folded_by_machine.items():
         if shard_by_machine[machine] != folded:
             return None
-    return [folded_by_machine[item.machine] for item in prepared_states], refreshed_archives
+    return [folded_by_machine[item.machine] for item in prepared_states], list(prepared_archives)
 
 
 def _run_prevalidated_mutation(
@@ -45223,23 +45223,29 @@ def _wait_or_default(args: argparse.Namespace, default: float) -> float:
     return float(args.wait_lock)
 
 
-def _heartbeat_wait_seconds(args: argparse.Namespace, config: Config) -> float:
+def _heartbeat_wait_seconds(args: argparse.Namespace, ttl_seconds: float) -> float:
     """The lock wait a heartbeat uses (#1808-C).
 
     Explicit ``--wait-lock`` wins. By default a heartbeat blocks for the
-    shorter of 10 seconds and a third of the configured TTL, so it can
-    never queue long enough to lapse a healthy lease (a 600 s TTL leaves
-    roughly 590 s of margin).
+    shorter of 10 seconds and a third of the slot record's TTL (the safer
+    bound, matching the Rust edition), so it can never queue long enough
+    to lapse a healthy lease (a 600 s TTL leaves roughly 590 s of margin).
     """
 
     if not getattr(args, "wait_lock_defaulted", False):
         return float(args.wait_lock)
-    return max(1.0, min(10.0, config.heartbeat_ttl_seconds / 3.0))
+    return max(1.0, min(10.0, ttl_seconds / 3.0))
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
-    wait_seconds = _heartbeat_wait_seconds(args, config)
+    try:
+        ttl_seconds = float(
+            _find_record(_load_active_snapshot(config), args.slot).heartbeat_ttl_seconds
+        )
+    except (Refusal, StateError, OSError):
+        ttl_seconds = float(config.heartbeat_ttl_seconds)
+    wait_seconds = _heartbeat_wait_seconds(args, ttl_seconds)
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
     owner = _capture_caller_process(args.owner_pid, "owner")
@@ -45426,12 +45432,13 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         # journal or fallback path never prints them twice (#1808 review).
         stdout_buffer = io.StringIO()
         stderr_buffer = io.StringIO()
-        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
-            stderr_buffer
-        ):
-            result = locked_body()
-        captured_notes[:] = [(stdout_buffer.getvalue(), stderr_buffer.getvalue())]
-        return result
+        try:
+            with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+                stderr_buffer
+            ):
+                return locked_body()
+        finally:
+            captured_notes[:] = [(stdout_buffer.getvalue(), stderr_buffer.getvalue())]
 
     def commit(
         reference: _RegistryIdentity | None, prepared: _HeartbeatPrevalidated | None
@@ -92736,8 +92743,9 @@ usage or audit gate unknown, 3 fail-closed refusal.
         metavar="SECONDS",
         help="wait up to this many seconds for a state lock, blocking until "
         "the deadline (default: 30 seconds for mutations, and for heartbeat "
-        "the shorter of 10 seconds and a third of the heartbeat TTL; an "
-        "explicit 0 fails immediately)",
+        "the shorter of 10 seconds and a third of the heartbeat TTL; "
+        "retire-pending, finisher and agent-remove batches keep their own "
+        "5-second default when unset; an explicit 0 fails immediately)",
     )
     parser.add_argument(
         "--allow-existing-unregistered-worktrees",

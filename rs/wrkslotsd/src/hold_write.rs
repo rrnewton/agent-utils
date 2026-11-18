@@ -126,7 +126,11 @@ pub(crate) fn acquire_mutation_locks_with_wait(
     selected: &str,
     wait: std::time::Duration,
 ) -> Result<MutationLocks> {
-    let config = acquire_config_lock_with_wait(cfg, wait)?;
+    // One shared deadline across the config, global and machine locks
+    // (#1808 review), as in the Python edition's _mutation_locks: the
+    // caller's wait bounds the whole acquisition, never each lock.
+    let deadline = std::time::Instant::now() + wait;
+    let config = acquire_config_lock_with_deadline(cfg, deadline)?;
     let (reloaded, reloaded_selected) = load_cfg(root, machine_override)?;
     if reloaded_selected != selected
         || reloaded.root != cfg.root
@@ -140,13 +144,15 @@ pub(crate) fn acquire_mutation_locks_with_wait(
                 .to_string(),
         );
     }
-    let global = acquire_lock(
+    let global = crate::ensure_states::acquire_lock_with_deadline(
         &cfg.control.join("ACTIVE.global.lock"),
         &cfg.control.join("ACTIVE"),
+        deadline,
     )?;
-    let machine = acquire_lock(
+    let machine = crate::ensure_states::acquire_lock_with_deadline(
         &cfg.control.join(format!("ACTIVE.{selected}.json.lock")),
         &cfg.control.join(format!("ACTIVE.{selected}.json")),
+        deadline,
     )?;
     Ok(MutationLocks {
         _config: config,
@@ -412,13 +418,19 @@ pub(crate) fn acquire_config_lock_with_wait(
     cfg: &Cfg,
     wait: std::time::Duration,
 ) -> Result<ConfigLock> {
+    acquire_config_lock_with_deadline(cfg, std::time::Instant::now() + wait)
+}
+
+pub(crate) fn acquire_config_lock_with_deadline(
+    cfg: &Cfg,
+    deadline: std::time::Instant,
+) -> Result<ConfigLock> {
     let file = std::fs::File::open(&cfg.root).map_err(|error| {
         format!(
             "cannot open configuration lock {}: {error}",
             cfg.root.display()
         )
     })?;
-    let deadline = std::time::Instant::now() + wait;
     match crate::ensure_states::flock_wait(&file, deadline) {
         Ok(()) => Ok(ConfigLock { _file: file }),
         Err(_) => Err(format!(

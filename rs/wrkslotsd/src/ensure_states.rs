@@ -246,8 +246,15 @@ fn enter_turnstile(
 }
 
 pub(crate) fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
+    acquire_lock_with_deadline(path, subject, std::time::Instant::now() + lock_wait())
+}
+
+pub(crate) fn acquire_lock_with_deadline(
+    path: &Path,
+    subject: &Path,
+    deadline: std::time::Instant,
+) -> Result<Flock> {
     let file = open_lock_file(path, subject)?;
-    let deadline = std::time::Instant::now() + lock_wait();
     // Hold the writer-intent turnstile while polling, then close
     // it once the registry lock is acquired (#1199).
     let _intent = enter_turnstile(path, subject, true, deadline)?;
@@ -1167,6 +1174,43 @@ mod lock_wait_tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(free, "a late acquisition leaked the lock");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_deadline_bounds_every_lock_in_a_mutation() {
+        // #1808 review: heartbeat's locks share one deadline, so three
+        // held locks cost one wait, not one wait each.
+        let dir = std::env::temp_dir().join(format!(
+            "wrkslots-shared-deadline-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let subject_a = dir.join("ACTIVE");
+        let subject_b = dir.join("ACTIVE.node.json");
+        let lock_a = dir.join("a.lock");
+        let lock_b = dir.join("b.lock");
+        let holders: Vec<std::fs::File> = [&lock_a, &lock_b]
+            .iter()
+            .map(|path| {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)
+                    .unwrap();
+                rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+                file
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        assert!(acquire_lock_with_deadline(&lock_a, &subject_a, deadline).is_err());
+        assert!(acquire_lock_with_deadline(&lock_b, &subject_b, deadline).is_err());
+        // The second acquisition had no fresh wait left to spend.
+        assert!(started.elapsed() < std::time::Duration::from_millis(550));
+        drop(holders);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
