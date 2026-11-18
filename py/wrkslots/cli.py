@@ -10647,12 +10647,25 @@ def _resume_replay(
     the whole log is folded, on a resumed replay exactly as on a cold one.
     """
 
-    cached = _ACTIVE_EVENT_MEMO[-1].replays.get(key) if _ACTIVE_EVENT_MEMO else None
+    cached = _cached_replay(key)
     if cached is None:
         return 0, _ReplayFold()
     count, tip, fold = cached
     if count > len(events) or events[count - 1].get("sha256") != tip:
         return 0, _ReplayFold()
+    _recheck_replay_repositories(config, fold)
+    return count, fold.copy()
+
+
+def _cached_replay(
+    key: tuple[Config, str, bool],
+) -> tuple[int, str, _ReplayFold] | None:
+    if not _ACTIVE_EVENT_MEMO:
+        return None
+    return _ACTIVE_EVENT_MEMO[-1].replays.get(key)
+
+
+def _recheck_replay_repositories(config: Config, fold: _ReplayFold) -> None:
     # The reference-only _assert_record_paths is lexical except for
     # _stored_repository_reference, whose result depends only on the
     # repository string.  Recheck each distinct repository in log order so a
@@ -10664,7 +10677,6 @@ def _resume_replay(
         if checkout.vcs != "eden"
     ):
         _stored_repository_reference(config, repository)
-    return count, fold.copy()
 
 
 def _remember_replay(
@@ -10672,17 +10684,24 @@ def _remember_replay(
     events: Sequence[Mapping[str, object]],
     fold: _ReplayFold,
 ) -> None:
+    _remember_replay_fold(
+        key,
+        len(events),
+        _as_str(events[-1]["sha256"], "append-only event.sha256"),
+        fold,
+    )
+
+
+def _remember_replay_fold(
+    key: tuple[Config, str, bool], count: int, tip: str, fold: _ReplayFold
+) -> None:
     if not _ACTIVE_EVENT_MEMO:
         return
     replays = _ACTIVE_EVENT_MEMO[-1].replays
     replays.pop(key, None)
     if len(replays) >= _REPLAY_MEMO_ENTRIES_LIMIT:
         replays.pop(next(iter(replays)))
-    replays[key] = (
-        len(events),
-        _as_str(events[-1]["sha256"], "append-only event.sha256"),
-        fold,
-    )
+    replays[key] = (count, tip, fold)
 
 
 def _fold_active_record_event(
@@ -10952,45 +10971,19 @@ def _fold_archive_record_event(
     return revision
 
 
-def _states_from_events(
+def _fold_events_into(
     config: Config,
     machine: str,
-    *,
-    require_repository: bool = True,
-    events: Sequence[Mapping[str, object]] | None = None,
-) -> tuple[ActiveState, ArchiveState] | None:
-    """Derive one machine's active and archive state from its event log.
+    events: Iterable[Mapping[str, object]],
+    fold: _ReplayFold,
+) -> None:
+    """Fold verified events into ``fold``, in chain order."""
 
-    ``events`` replays an already verified chain instead of the log on disk,
-    without the replay memo; recover-tail-event judges a log with and without
-    its tail this way (#1373).
-    """
-
-    memoize = events is None
-    if events is None:
-        events = _load_events(config, machine)
-    if not events:
-        return None
-    memo_key = (config, machine, require_repository)
-    start, fold = (
-        _resume_replay(config, memo_key, events) if memoize else (0, _ReplayFold())
-    )
-    active_revision = fold.active_revision
-    active_records = fold.active_records
-    active_agents = fold.active_agents
-    archive_revision = fold.archive_revision
-    archive_records = fold.archive_records
-    archive_ids = fold.archive_ids
-    archived_slots = fold.archived_slots
-    absent_validate_recoveries = fold.absent_validate_recoveries
-    absent_agent_recoveries = fold.absent_agent_recoveries
-    quarantined_records = fold.quarantined_records
-    path_checks = fold.path_checks
-    for event in events[start:]:
+    for event in events:
         payload = _as_mapping(event["payload"], "append-only event.payload")
         kind = _as_str(event["kind"], "append-only event.kind")
         if kind == "state-imported":
-            if active_revision is not None or archive_revision is not None:
+            if fold.active_revision is not None or fold.archive_revision is not None:
                 raise StateError("append-only event log imports state more than once")
             # Reference-only, like every replayed record: an imported row that a
             # later event replaces or removes is history, and the rows still
@@ -11009,18 +11002,18 @@ def _states_from_events(
                 "append-only imported archive state",
             )
             for record in active.slots:
-                path_checks.setdefault(_record_path_check_key(record), record)
-            active_revision = active.revision
-            active_records = {record.slot: record for record in active.slots}
-            active_agents = {
+                fold.path_checks.setdefault(_record_path_check_key(record), record)
+            fold.active_revision = active.revision
+            fold.active_records = {record.slot: record for record in active.slots}
+            fold.active_agents = {
                 record.agent: record.slot
                 for record in active.slots
                 if record.slot_type == "agent" and record.import_source is None
             }
-            archive_revision = archive.revision
-            archive_records = [dict(record) for record in archive.records]
-            quarantined_records = list(archive.quarantined_records)
-            archive_ids = {
+            fold.archive_revision = archive.revision
+            fold.archive_records = [dict(record) for record in archive.records]
+            fold.quarantined_records = list(archive.quarantined_records)
+            fold.archive_ids = {
                 _as_str(record.get("archive_id"), "archive record archive_id")
                 for record in archive.records
             } | {
@@ -11028,7 +11021,7 @@ def _states_from_events(
                 for entry in archive.quarantined_records
                 if isinstance(entry.get("archive_id"), str)
             }
-            archived_slots = {
+            fold.archived_slots = {
                 _as_str(record.get("slot"), "archive record slot")
                 for record in archive.records
             } | {
@@ -11037,33 +11030,226 @@ def _states_from_events(
                 if isinstance(entry.get("slot"), str)
             }
         elif kind == "active-state-recorded":
-            if active_revision is None:
-                raise StateError("append-only event records active state before its import")
-            active_revision = _fold_active_record_event(
+            if fold.active_revision is None:
+                raise StateError(
+                    "append-only event records active state before its import"
+                )
+            fold.active_revision = _fold_active_record_event(
                 config,
                 machine,
                 payload,
-                active_revision,
-                active_records,
-                active_agents,
-                path_checks,
+                fold.active_revision,
+                fold.active_records,
+                fold.active_agents,
+                fold.path_checks,
             )
         elif kind == "archive-state-recorded":
-            if archive_revision is None:
-                raise StateError("append-only event records archive state before its import")
-            archive_revision = _fold_archive_record_event(
+            if fold.archive_revision is None:
+                raise StateError(
+                    "append-only event records archive state before its import"
+                )
+            fold.archive_revision = _fold_archive_record_event(
                 config,
                 machine,
                 payload,
-                archive_revision,
-                archive_records,
-                archive_ids,
-                archived_slots,
-                absent_validate_recoveries,
-                absent_agent_recoveries,
-                quarantined_records,
+                fold.archive_revision,
+                fold.archive_records,
+                fold.archive_ids,
+                fold.archived_slots,
+                fold.absent_validate_recoveries,
+                fold.absent_agent_recoveries,
+                fold.quarantined_records,
             )
-    if active_revision is None or archive_revision is None:
+
+
+def _states_from_fold(
+    machine: str, fold: _ReplayFold
+) -> tuple[ActiveState, ArchiveState]:
+    assert fold.active_revision is not None and fold.archive_revision is not None
+    return (
+        ActiveState(machine, fold.active_revision, tuple(fold.active_records.values())),
+        ArchiveState(
+            machine,
+            fold.archive_revision,
+            tuple(fold.archive_records),
+            frozenset(fold.absent_validate_recoveries),
+            frozenset(fold.absent_agent_recoveries),
+            tuple(fold.quarantined_records),
+        ),
+    )
+
+
+def _replay_stream_wanted(config: Config, machine: str) -> bool:
+    """Whether a read-only bounded scan folds this log by streaming.
+
+    Only a scan that already bounds its event retention
+    (_bound_event_retention: audit, status, doctor and their kin)
+    streams, and only when the memo holds no verified chain for the
+    log: mutations keep the parse-once memo _load_events provides
+    (#1247), and a kept chain answers without re-parsing (#1794).
+    """
+
+    if not _ACTIVE_EVENT_MEMO:
+        return False
+    memo = _ACTIVE_EVENT_MEMO[-1]
+    if memo.bytes_limit is None:
+        return False
+    directory = _event_directory(config, machine)
+    return (str(directory), machine) not in memo.chains
+
+
+def _memoize_verified_event(
+    path: Path,
+    machine: str,
+    identity: _EventFileIdentity | None,
+    sequence: int,
+    previous: str,
+    event: dict[str, object],
+    observed_ns: int,
+) -> None:
+    """Keep one streamed verified event in the memo, as _verify_event_paths does."""
+
+    if not _ACTIVE_EVENT_MEMO or identity is None:
+        return
+    if identity[4] + _EVENT_MEMO_STABLE_NS > observed_ns:
+        return
+    if _event_file_identity(path) != identity:
+        return
+    memo_scope = _ACTIVE_EVENT_MEMO[-1]
+    memo = memo_scope.files
+    if len(memo) >= _EVENT_MEMO_ENTRIES_LIMIT or (
+        memo_scope.bytes_limit is not None
+        and memo_scope.file_bytes + identity[2] > memo_scope.bytes_limit
+    ):
+        memo.clear()
+        memo_scope.file_bytes = 0
+    memo[(str(path), machine)] = (identity, sequence, previous, event)
+    memo_scope.file_bytes += identity[2]
+
+
+def _states_from_event_stream(
+    config: Config,
+    machine: str,
+    *,
+    require_repository: bool,
+    memo_key: tuple[Config, str, bool],
+) -> tuple[ActiveState, ArchiveState] | None:
+    """Derive state by folding _iter_events, retaining no history.
+
+    Same fold, verification and refusals as the list form in
+    _states_from_events; a remembered prefix is skipped by chain
+    position after its tip digest matches, exactly as _resume_replay
+    trusts it, and the finished fold is remembered the same way.
+    """
+
+    cached = _cached_replay(memo_key)
+    fold = _ReplayFold()
+    total = 0
+    tip: str | None = None
+    resumed = False
+    if cached is not None:
+        count, cached_tip, cached_fold = cached
+        directory = _event_directory(config, machine)
+        names = _event_file_names(directory)
+        if count <= len(names):
+            try:
+                raw_tip = _as_str(
+                    _as_mapping(
+                        _read_json(directory / names[count - 1], "append-only event"),
+                        "append-only event",
+                    )["sha256"],
+                    "append-only event.sha256",
+                )
+            except StateError:
+                raw_tip = None
+            if raw_tip == cached_tip:
+                # The remembered tip still ends the prefix: the hash
+                # chain makes that digest cover every earlier event,
+                # so only what follows it is verified and folded, as
+                # _resume_replay trusts the same digest in list form.
+                _recheck_replay_repositories(config, cached_fold)
+                fold = cached_fold.copy()
+                previous = cached_tip
+                total = count
+                tip = cached_tip
+                resumed = True
+                observed_ns = _event_memo_clock_ns()
+                for sequence in range(count + 1, len(names) + 1):
+                    path = directory / names[sequence - 1]
+                    identity = _event_file_identity(path)
+                    event = _event_from_path(path, machine, sequence, previous)
+                    _memoize_verified_event(
+                        path, machine, identity, sequence, previous, event, observed_ns
+                    )
+                    previous = _as_str(
+                        event["sha256"], "append-only event.sha256"
+                    )
+                    total = sequence
+                    tip = previous
+                    _fold_events_into(config, machine, (event,), fold)
+    if not resumed:
+        # No prefix was trusted (no memory, an empty log, or its tip
+        # moved): fold the whole log cold, as a cache miss does, and
+        # keep each verified event in the memo so a later locked load
+        # of the same log reads no file again (#1247 contract).
+        fold = _ReplayFold()
+        total = 0
+        tip = None
+        directory = _event_directory(config, machine)
+        previous = "0" * 64
+        observed_ns = _event_memo_clock_ns()
+        for sequence, name in enumerate(_event_file_names(directory), start=1):
+            path = directory / name
+            identity = _event_file_identity(path)
+            event = _event_from_path(path, machine, sequence, previous)
+            _memoize_verified_event(
+                path, machine, identity, sequence, previous, event, observed_ns
+            )
+            previous = _as_str(event["sha256"], "append-only event.sha256")
+            total = sequence
+            tip = previous
+            _fold_events_into(config, machine, (event,), fold)
+    if total == 0:
+        return None
+    if fold.active_revision is None or fold.archive_revision is None:
+        raise StateError("append-only event log has no complete imported state")
+    if require_repository:
+        for record in fold.active_records.values():
+            _assert_record_paths(config, record, require_repository=True)
+    assert tip is not None
+    _remember_replay_fold(memo_key, total, tip, fold)
+    return _states_from_fold(machine, fold)
+
+
+def _states_from_events(
+    config: Config,
+    machine: str,
+    *,
+    require_repository: bool = True,
+    events: Sequence[Mapping[str, object]] | None = None,
+) -> tuple[ActiveState, ArchiveState] | None:
+    """Derive one machine's active and archive state from its event log.
+
+    ``events`` replays an already verified chain instead of the log on disk,
+    without the replay memo; recover-tail-event judges a log with and without
+    its tail this way (#1373).
+    """
+
+    memoize = events is None
+    memo_key = (config, machine, require_repository)
+    if events is None and _replay_stream_wanted(config, machine):
+        return _states_from_event_stream(
+            config, machine, require_repository=require_repository, memo_key=memo_key
+        )
+    if events is None:
+        events = _load_events(config, machine)
+    if not events:
+        return None
+    start, fold = (
+        _resume_replay(config, memo_key, events) if memoize else (0, _ReplayFold())
+    )
+    _fold_events_into(config, machine, events[start:], fold)
+    if fold.active_revision is None or fold.archive_revision is None:
         raise StateError("append-only event log has no complete imported state")
     if require_repository:
         # Only the derived rows must name storage that exists now.  A record a
@@ -11073,37 +11259,11 @@ def _states_from_events(
         # once the old directory is gone, which relocate-repository explicitly
         # allows.  Checked before the fold is remembered, so a refused replay
         # leaves the memo as it was.
-        for record in active_records.values():
+        for record in fold.active_records.values():
             _assert_record_paths(config, record, require_repository=True)
     if memoize:
-        _remember_replay(
-            memo_key,
-            events,
-            _ReplayFold(
-                active_revision,
-                active_records,
-                active_agents,
-                archive_revision,
-                archive_records,
-                archive_ids,
-                archived_slots,
-                absent_validate_recoveries,
-                absent_agent_recoveries,
-                quarantined_records,
-                path_checks,
-            ),
-        )
-    return (
-        ActiveState(machine, active_revision, tuple(active_records.values())),
-        ArchiveState(
-            machine,
-            archive_revision,
-            tuple(archive_records),
-            frozenset(absent_validate_recoveries),
-            frozenset(absent_agent_recoveries),
-            tuple(quarantined_records),
-        ),
-    )
+        _remember_replay(memo_key, events, fold)
+    return _states_from_fold(machine, fold)
 
 
 _UNREPLAYABLE_PREFIX = "refusing to append an event the registry loader would reject: "

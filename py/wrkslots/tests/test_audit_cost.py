@@ -222,6 +222,37 @@ def test_audit_repository_facts_shared_per_repository(tmp_path: Path) -> None:
     assert sum("for-each-ref" in call for call in calls) == 1
 
 
+def test_streamed_replay_matches_list_replay(tmp_path: Path) -> None:
+    """A bounded scan's streamed fold derives the list fold's state."""
+
+    root = _fixture(tmp_path / "case")
+    config = wrkslots_cli._load_config(str(root), None)
+    active_doc = json.loads(
+        (root / "worktrees" / "ACTIVE.node-a.json").read_text()
+    )
+    archive_doc = json.loads(
+        (root / "worktrees" / "ARCHIVED.node-a.json").read_text()
+    )
+    with wrkslots_cli._event_memo_scope():
+        writer = wrkslots_cli._event_writer(config, "node-a")
+        writer.append(
+            "state-imported",
+            {"active": active_doc, "archive": archive_doc, "holds": []},
+        )
+        listed = wrkslots_cli._states_from_events(
+            config, "node-a", events=wrkslots_cli._load_events(config, "node-a")
+        )
+    with wrkslots_cli._event_memo_scope():
+        wrkslots_cli._bound_event_retention()
+        streamed = wrkslots_cli._states_from_events(config, "node-a")
+        # A second derivation in the same bounded scope resumes from
+        # the remembered fold and derives the same state.
+        resumed = wrkslots_cli._states_from_events(config, "node-a")
+    assert listed is not None and streamed is not None
+    assert streamed == listed
+    assert resumed == listed
+
+
 def test_audit_grouped_publications_match_per_record(tmp_path: Path) -> None:
     """One grouped fold equals the per-record publication fold."""
 
