@@ -110,7 +110,23 @@ pub(crate) fn acquire_mutation_locks(
     cfg: &Cfg,
     selected: &str,
 ) -> Result<MutationLocks> {
-    let config = acquire_config_lock(cfg)?;
+    acquire_mutation_locks_with_wait(
+        root,
+        machine_override,
+        cfg,
+        selected,
+        crate::ensure_states::lock_wait(),
+    )
+}
+
+pub(crate) fn acquire_mutation_locks_with_wait(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    cfg: &Cfg,
+    selected: &str,
+    wait: std::time::Duration,
+) -> Result<MutationLocks> {
+    let config = acquire_config_lock_with_wait(cfg, wait)?;
     let (reloaded, reloaded_selected) = load_cfg(root, machine_override)?;
     if reloaded_selected != selected
         || reloaded.root != cfg.root
@@ -389,13 +405,20 @@ pub(crate) struct ConfigLock {
 }
 
 pub(crate) fn acquire_config_lock(cfg: &Cfg) -> Result<ConfigLock> {
+    acquire_config_lock_with_wait(cfg, crate::ensure_states::lock_wait())
+}
+
+pub(crate) fn acquire_config_lock_with_wait(
+    cfg: &Cfg,
+    wait: std::time::Duration,
+) -> Result<ConfigLock> {
     let file = std::fs::File::open(&cfg.root).map_err(|error| {
         format!(
             "cannot open configuration lock {}: {error}",
             cfg.root.display()
         )
     })?;
-    let deadline = std::time::Instant::now() + crate::ensure_states::lock_wait();
+    let deadline = std::time::Instant::now() + wait;
     match crate::ensure_states::flock_wait(&file, deadline) {
         Ok(()) => Ok(ConfigLock { _file: file }),
         Err(_) => Err(format!(

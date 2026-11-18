@@ -20,7 +20,7 @@ use crate::ensure_states::{
 };
 use crate::global_state::{event_log_status, load_event_chain, EventLogStatus};
 use crate::hold_write::{
-    acquire_mutation_locks, active_document, refuse_target_storage_except_nested, validate_global,
+    active_document, refuse_target_storage_except_nested, validate_global,
 };
 use crate::journals_state::parse_journals;
 use crate::status_state::{process_state, read_process_identity, Identity};
@@ -338,12 +338,15 @@ pub(crate) fn heartbeat(
     validate_name(agent, "agent")?;
     let supplied = read_process_identity(owner_pid)?;
     assert_caller(&supplied, "owner")?;
-    // Lock-free prepare (#1808-A, following the Python edition): the fleet
-    // validation, the storage scan and the event-log load run here, holding
-    // no lock. Under the locks below only the touched record is re-checked
-    // and written. This edition has no registry-identity compare yet, so a
-    // change that lands between prepare and the locks is caught by the
-    // under-lock record re-check (generation, agent, owner), never trusted.
+    // Lock-free prepare (#1808-A, following the Python edition): the
+    // partial-state refusal first (it is read-only, keeping its old
+    // precedence), then the fleet validation, the storage scan and the
+    // event-log load, holding no lock. Under the locks below only the
+    // touched record is re-checked and written. This edition has no
+    // registry-identity compare yet, so a change that lands between
+    // prepare and the locks is caught by the under-lock record re-check
+    // (generation, agent, owner), never trusted.
+    refuse_partial_state_allow_seals(&cfg.control)?;
     validate_global(root, &cfg)?;
     let prepared_active = active_document(root, &cfg, &selected)?;
     let record = prepared_active
@@ -442,9 +445,38 @@ pub(crate) fn heartbeat(
         }
     }
     // Commit (#1808-A): take the locks, refuse partial state, and re-check
-    // only the touched record before the one write.
-    let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    // only the touched record before the one write. The wait is bounded
+    // like the Python edition's heartbeat: an explicit WRKSLOTS_WAIT_LOCK
+    // wins, otherwise the shorter of 10 s and a third of the record's TTL.
+    let ttl_seconds = record
+        .get("heartbeat_ttl_seconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(600) as f64;
+    let heartbeat_wait = if std::env::var_os("WRKSLOTS_WAIT_LOCK").is_some() {
+        crate::ensure_states::lock_wait()
+    } else {
+        std::time::Duration::from_secs_f64((ttl_seconds / 3.0).clamp(1.0, 10.0))
+    };
+    let _locks = crate::hold_write::acquire_mutation_locks_with_wait(
+        root,
+        machine_override,
+        &cfg,
+        &selected,
+        heartbeat_wait,
+    )?;
     refuse_partial_state_allow_seals(&cfg.control)?;
+    // The seal picture may have changed since prepare; judge it fresh.
+    let sealed = matches!(event_log_status(&directory), EventLogStatus::Derived)
+        && std::fs::read_dir(&cfg.control)
+            .map(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("VALIDATE-BATCH-SEAL.")
+                })
+            })
+            .unwrap_or(false);
     let active = active_document(root, &cfg, &selected)?;
     let record = active
         .get("slots")

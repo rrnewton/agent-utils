@@ -127,3 +127,57 @@ def test_heartbeat_wait_is_bounded_well_below_the_ttl(tmp_path: Path) -> None:
     assert cli._heartbeat_wait_seconds(_Args(), config) == 0.0
     _Args.wait_lock = 45.0
     assert cli._heartbeat_wait_seconds(_Args(), config) == 45.0
+
+
+def test_the_timeout_race_never_leaks_the_duplicate_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Force the interleaving where the helper acquires just after the
+    caller's wait times out (#1808 review): ownership was already decided,
+    so the helper releases and nothing stays registered or held."""
+    import time as time_module
+
+    project, _repository, _remote = make_project(tmp_path)
+    lock_path = tmp_path / "intent.lock"
+    holder = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    real_event = threading.Event
+
+    class SlowEvent(real_event):  # type: ignore[valid-type]
+        def wait(self, timeout: float | None = None) -> bool:
+            got = super().wait(timeout)
+            if not got and timeout is not None:
+                time_module.sleep(0.5)
+            return got
+
+    class Shim:
+        def __getattr__(self, name: str) -> object:
+            return SlowEvent if name == "Event" else getattr(threading, name)
+
+    monkeypatch.setattr(cli, "threading", Shim())
+    threading.Timer(0.3, lambda: fcntl.flock(holder, fcntl.LOCK_UN)).start()
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        acquired = cli._flock_until(fd, fcntl.LOCK_EX, time_module.monotonic() + 0.2)
+        assert acquired is False
+        assert cli._FLOCK_DUPS.get(fd) is None
+    finally:
+        os.close(fd)
+        os.close(holder)
+    # Condition, not a clock: the lock becomes free (the helper's late
+    # acquisition was released) within a bounded number of probes.
+    probe = os.open(lock_path, os.O_RDWR)
+    try:
+        free = False
+        for _attempt in range(200):
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                time_module.sleep(0.01)
+                continue
+            fcntl.flock(probe, fcntl.LOCK_UN)
+            free = True
+            break
+        assert free, "the timed-out wait leaked its duplicate's lock"
+    finally:
+        os.close(probe)

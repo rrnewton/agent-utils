@@ -6561,43 +6561,47 @@ def _flock_blocking(fd: int, operation: int, deadline: float) -> bool:
     except OSError:
         return False
     acquired = threading.Event()
-    cancelled = threading.Event()
     errors: list[OSError] = []
+    # Ownership of the duplicated descriptor is decided exactly once, under
+    # this lock: whichever side takes it first — the helper registering the
+    # duplicate for the caller, or the caller cancelling after its deadline
+    # — the other side then knows whether it must release. There is no
+    # window in which both believe the caller owns it or neither releases.
+    decision_lock = threading.Lock()
+    decision: dict[str, bool] = {"cancelled": False}
 
     def wait_in_kernel() -> None:
         try:
             fcntl.flock(duplicate, operation)
         except OSError as exc:
             errors.append(exc)
+            os.close(duplicate)
             acquired.set()
             return
-        with _FLOCK_DUPS_LOCK:
-            late = cancelled.is_set()
-            if not late:
+        with decision_lock:
+            if decision["cancelled"]:
+                try:
+                    fcntl.flock(duplicate, fcntl.LOCK_UN)
+                finally:
+                    os.close(duplicate)
+                return
+            with _FLOCK_DUPS_LOCK:
                 _FLOCK_DUPS[fd] = duplicate
-        if late:
-            try:
-                fcntl.flock(duplicate, fcntl.LOCK_UN)
-            finally:
-                os.close(duplicate)
-            return
         acquired.set()
 
     thread = threading.Thread(target=wait_in_kernel, daemon=True)
     thread.start()
     if acquired.wait(max(0.0, deadline - time.monotonic())) and not errors:
         return True
-    cancelled.set()
-    if not acquired.is_set():
-        # The helper may still be blocked in flock; it releases on acquire.
-        # If it already registered the duplicate, take it back instead.
+    with decision_lock:
+        decision["cancelled"] = True
         with _FLOCK_DUPS_LOCK:
             registered = _FLOCK_DUPS.pop(fd, None)
-        if registered is not None:
-            try:
-                fcntl.flock(registered, fcntl.LOCK_UN)
-            finally:
-                os.close(registered)
+    if registered is not None:
+        try:
+            fcntl.flock(registered, fcntl.LOCK_UN)
+        finally:
+            os.close(registered)
     return False
 
 
@@ -45206,6 +45210,19 @@ class _HeartbeatPrevalidated:
     warnings: tuple[str, ...]
 
 
+def _wait_or_default(args: argparse.Namespace, default: float) -> float:
+    """A bounded command's own default wait, kept from before #1808-C.
+
+    Commands that historically mapped an unset ``--wait-lock`` to their own
+    short default keep it when the option is unset; an explicit value,
+    including 0, now means exactly what it says everywhere.
+    """
+
+    if getattr(args, "wait_lock_defaulted", False):
+        return default
+    return float(args.wait_lock)
+
+
 def _heartbeat_wait_seconds(args: argparse.Namespace, config: Config) -> float:
     """The lock wait a heartbeat uses (#1808-C).
 
@@ -45404,6 +45421,18 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         )
         return updated, tuple(warnings)
 
+    def locked_body_captured() -> tuple[ActiveRecord, tuple[str, ...]]:
+        # The locked body's own notes join the once-only printing, so a
+        # journal or fallback path never prints them twice (#1808 review).
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(
+            stderr_buffer
+        ):
+            result = locked_body()
+        captured_notes[:] = [(stdout_buffer.getvalue(), stderr_buffer.getvalue())]
+        return result
+
     def commit(
         reference: _RegistryIdentity | None, prepared: _HeartbeatPrevalidated | None
     ) -> tuple[ActiveRecord, tuple[str, ...]]:
@@ -45416,7 +45445,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         # classifier refreshed it across other slots' heartbeats).
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         if prepared is None:
-            return locked_body()
+            return locked_body_captured()
         states, archives = list(prepared.states), list(prepared.archives)
         before = _global_rows(states, archives)
         local = (
@@ -45478,7 +45507,7 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
             # the lock and validate there — instead of refusing a heartbeat
             # as busy (#1808-A review).
             with _mutation_locks(config, wait_seconds):
-                updated, warnings = locked_body()
+                updated, warnings = locked_body_captured()
     finally:
         for stdout_text, stderr_text in captured_notes:
             if stdout_text:
@@ -46898,7 +46927,7 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             f"--limit must be between 1 and {RETIRE_PENDING_LIMIT}"
         )
     wait_seconds = min(
-        args.wait_lock if args.wait_lock > 0 else RETIRE_PENDING_WAIT_LOCK_SECONDS,
+        _wait_or_default(args, RETIRE_PENDING_WAIT_LOCK_SECONDS),
         RETIRE_PENDING_MAX_WAIT_LOCK_SECONDS,
     )
     deadline = time.monotonic() + wait_seconds
@@ -47419,7 +47448,7 @@ def _cmd_finisher(args: argparse.Namespace) -> int:
         if args.now is not None
         else dt.datetime.now(dt.timezone.utc)
     )
-    wait_seconds = args.wait_lock if args.wait_lock > 0 else 5.0
+    wait_seconds = _wait_or_default(args, 5.0)
     plan = _finisher_plan(config, wait_seconds, thresholds, now)
     would_retire = cast(list[dict[str, object]], plan["would_retire"])
     if not args.apply:
@@ -67855,7 +67884,7 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
                 refuse(later_slot, later_generation, reason)
 
     wait_seconds = (
-        args.wait_lock if args.wait_lock > 0 else AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS
+        _wait_or_default(args, AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS)
     )
     # Read-only preflight.  It selects the paths the shared scan must cover;
     # every item is decided again under the registry lock by ordinary remove.
@@ -82436,7 +82465,7 @@ def _recover_absent_agent_rows(args: argparse.Namespace) -> dict[str, object]:
     apply = bool(args.apply)
     order = {row.slot: position for position, row in enumerate(requested)}
     wait_seconds = (
-        args.wait_lock if args.wait_lock > 0 else AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS
+        _wait_or_default(args, AGENT_REMOVE_BATCH_WAIT_LOCK_SECONDS)
     )
     started = time.monotonic()
     rows: list[dict[str, object]] = []

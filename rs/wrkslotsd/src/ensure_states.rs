@@ -74,24 +74,32 @@ fn flock_blocking(
     };
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread_cancelled = cancelled.clone();
-    let (sender, receiver) = std::sync::mpsc::channel::<()>();
+    let (sender, receiver) =
+        std::sync::mpsc::channel::<std::result::Result<(), rustix::io::Errno>>();
     std::thread::spawn(move || {
         let blocking = if shared {
             rustix::fs::FlockOperation::LockShared
         } else {
             rustix::fs::FlockOperation::LockExclusive
         };
-        if rustix::fs::flock(&waiter_file, blocking).is_ok()
-            && thread_cancelled.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            let _ = rustix::fs::flock(&waiter_file, rustix::fs::FlockOperation::Unlock);
-            return;
+        match rustix::fs::flock(&waiter_file, blocking) {
+            Ok(()) => {
+                if thread_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = rustix::fs::flock(&waiter_file, rustix::fs::FlockOperation::Unlock);
+                    return;
+                }
+                let _ = sender.send(Ok(()));
+            }
+            // A failed flock (EINTR, ENOLCK, ...) is an error, never an
+            // acquisition: the caller must not write without the lock.
+            Err(error) => {
+                let _ = sender.send(Err(error));
+            }
         }
-        let _ = sender.send(());
     });
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     match receiver.recv_timeout(remaining) {
-        Ok(()) => Ok(()),
+        Ok(result) => result,
         Err(_) => {
             cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
             Err(busy)
@@ -1137,7 +1145,10 @@ mod lock_wait_tests {
             std::time::Instant::now() + std::time::Duration::from_millis(150),
         );
         assert!(result.is_err());
-        drop(waiter);
+        // The caller's file stays open, as it does in real callers: only
+        // the waiter's cancel-and-unlock can free the lock now. Without
+        // it, the late acquisition holds through the shared description
+        // and this probe never succeeds.
         drop(holder);
         // Condition, not a clock: the lock becomes free and stays free.
         let probe = std::fs::OpenOptions::new()
@@ -1157,6 +1168,26 @@ mod lock_wait_tests {
         }
         assert!(free, "a late acquisition leaked the lock");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flock_wait_propagates_a_flock_error_instead_of_reporting_acquired() {
+        // A descriptor flock cannot act on (an O_PATH fd) fails both the
+        // non-blocking attempt and the blocking waiter; that error must
+        // reach the caller, never an Ok that writes without the lock.
+        let path_fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            "Cargo.toml",
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let file = std::fs::File::from(path_fd);
+        let result = flock_wait(
+            &file,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        assert!(result.is_err(), "flock on an O_PATH descriptor must not report acquired");
     }
 
     fn turnstile_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
