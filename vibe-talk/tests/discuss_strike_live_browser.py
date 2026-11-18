@@ -126,6 +126,10 @@ def walk(page: Page, base: str, width: int, height: int, scheme: Literal["dark",
     page.route(f"**/api/v1/channels/{CHANNEL}/restore", dismiss)
     page.add_init_script(
         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+    # `#1781 vibe-talk-first-run-welcome-channel-default`. This walk is not the first
+    # run itself (that has its own walk): seed the Welcome seen, as the token is seeded.
+    page.add_init_script(
+        "try { localStorage.setItem('vibe-talk.welcome.dismissed', '1'); } catch (e) {}")
     page.goto(base + "/", wait_until="load")
     page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
     for _ in range(3):
