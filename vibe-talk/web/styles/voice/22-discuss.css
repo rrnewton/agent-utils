@@ -18,6 +18,32 @@
  * decorations poking through around the edges); the header's Maximize stands it
  * at full height, and that choice sticks (`data-sheet`, kept per device). */
 
+/* `#1813 vibe-talk-overlays-center-on-channel-pane`. THE shared positioning helper for
+ * everything floating over the channel: how much of the screen's inline end, and of its
+ * foot, the docked Discuss pane takes from the channel pane. Zero while Discuss is
+ * closed, floating or maximized, so every consumer keeps its whole-screen standing
+ * then; the docked width on a desk, the docked height on a phone. Consumers:
+ * `#scroll-tools` and `#pull-refresh` (09-to-do-view.css), `#status-line` and
+ * `#read-steer` (15-dock.css). The values read `--discuss-width` /
+ * `--discuss-docked-height` at the root, where `applyWidth` / `applyDockedHeight`
+ * (view/catchup/panel.ts) publish them beside the panel's and the screen's copies. */
+:root {
+  --channel-pane-end: 0px;
+  --channel-pane-bottom: 0px;
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  :root:has(#screen-main[data-discuss="docked"]) {
+    --channel-pane-end: max(320px, var(--discuss-width, 560px));
+  }
+}
+
+@media not ((min-width: 900px) and (pointer: fine)) {
+  :root:has(#screen-main > #discuss-panel:not([hidden])[data-sheet="half"]) {
+    --channel-pane-bottom: var(--discuss-docked-height, 50dvh);
+  }
+}
+
 #discuss-panel {
   position: absolute;
   left: 0;
@@ -538,6 +564,24 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
     grid-column: 3;
   }
 
+  /* `#1813`: on a desk the chips row is centred by `left: 50%` (20-desktop-regime.css):
+   * docked, it centres on the channel pane instead, no wider than that pane. */
+  #screen-main[data-discuss="docked"] > #scroll-tools {
+    left: calc((100% - var(--channel-pane-end)) / 2);
+    width: calc(min(var(--reading-width), 100% - var(--channel-pane-end)) - 1.2rem);
+  }
+
+  /* `#1813`: beside two columns the chips over the left list and the status pill keep
+   * the left column's share of what the docked pane leaves, not of the whole desk. */
+  #screen-main[data-discuss="docked"][data-columns="two"] > #scroll-tools {
+    left: calc((100% - var(--channel-pane-end)) / 4);
+    width: calc((100% - var(--channel-pane-end)) / 2 - 1.2rem);
+  }
+
+  body:has(#screen-main[data-discuss="docked"][data-columns="two"]:not([hidden])) #status-line {
+    inset-inline-end: calc(50% + var(--channel-pane-end) / 2);
+  }
+
   /* Maximized: the panel fills the main area, to just talk to Discuss. */
   #screen-main[data-discuss="maximized"] > #discuss-panel {
     top: 8px;
@@ -857,7 +901,6 @@ stay its owner's (#1524). The pane itself already ends above the
     z-index: auto;
   }
 
-  #screen-main:has(> #discuss-panel:not([hidden])[data-sheet="half"]) > #scroll-tools {
-    bottom: calc(var(--discuss-docked-height, 50dvh) + var(--chips-foot, 0.5rem));
-  }
+  /* The chips' lift over the docked pane is `--channel-pane-bottom` now, consumed by
+   * `#scroll-tools`' own `bottom` (09-to-do-view.css, `#1813`), so no rule here. */
 }

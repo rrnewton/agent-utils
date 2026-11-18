@@ -370,9 +370,11 @@
   position: absolute;
   z-index: var(--z-chips);
   left: calc(0.75rem + env(safe-area-inset-left));
-  right: calc(0.75rem + env(safe-area-inset-right));
+  /* `#1813 vibe-talk-overlays-center-on-channel-pane`: the channel pane's own end, so the
+     row ends where the list does while Discuss is docked beside or below it. */
+  right: calc(0.75rem + env(safe-area-inset-right) + var(--channel-pane-end, 0px));
   /* Never lower than the channel's message box: see `--chips-foot` on #frame-body. */
-  bottom: var(--chips-foot, 0.5rem);
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--channel-pane-bottom, 0px));
   display: flex;
   flex-wrap: wrap-reverse;
   justify-content: flex-end;
@@ -470,7 +472,8 @@
   position: absolute;
   z-index: var(--z-chips);
   top: 0.4rem;
-  left: 50%;
+  /* `#1813`: centred on the channel pane, not the whole screen (22-discuss.css). */
+  left: calc((100% - var(--channel-pane-end, 0px)) / 2);
   transform: translate(-50%, var(--pull-rise, 0px));
   display: flex;
   align-items: center;

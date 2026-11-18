@@ -262,7 +262,18 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
       if (show) {
         const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0)
           : deps.innerHeight() || 0;
-        const foot = Math.max(0, Math.floor((deps.innerHeight() || 0) - keysTop)) + KEYBOARD_SEND_GAP_PX;
+        let foot = Math.max(0, Math.floor((deps.innerHeight() || 0) - keysTop)) + KEYBOARD_SEND_GAP_PX;
+        // `#1813 vibe-talk-overlays-center-on-channel-pane`: while Discuss is docked under
+        // the list on a phone, the channel pane's foot is the sheet's top, well above the
+        // keyboard's top: the corner Send stands at the pane's foot, never over the sheet.
+        const area = ["scroll-area", "side-scroll"].map((id) => deps.lookup(id))
+          .find((list) => list && nodeWithin(list, cornerField));
+        if (area && typeof area.getBoundingClientRect === "function") {
+          const paneFoot = area.getBoundingClientRect().bottom + (viewport ? Number(viewport.offsetTop) || 0 : 0);
+          if (paneFoot < keysTop) {
+            foot = Math.max(foot, Math.max(0, Math.floor((deps.innerHeight() || 0) - paneFoot)) + KEYBOARD_SEND_GAP_PX);
+          }
+        }
         const style = (button as HTMLElement).style as { bottom?: string } | undefined;
         if (style) style.bottom = `${foot}px`;
       }

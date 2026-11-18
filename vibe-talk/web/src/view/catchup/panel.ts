@@ -912,6 +912,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const value = `${dockedHeight}dvh`;
     const style = (panel() as HTMLElement).style as { setProperty?: (n: string, v: string) => void } | undefined;
     if (style && typeof style.setProperty === "function") style.setProperty("--discuss-docked-height", value);
+    // `#1813`: the channel pane's foot (22-discuss.css) reads the height at the root.
+    document.documentElement?.style.setProperty("--discuss-docked-height", value);
     const screen = maybe("screen-main");
     const screenStyle = screen ? (screen as HTMLElement).style as { setProperty?: (n: string, v: string) => void } | undefined : undefined;
     if (screenStyle && typeof screenStyle.setProperty === "function") screenStyle.setProperty("--discuss-docked-height", value);
@@ -935,6 +937,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     width = clampWidth(px);
     const style = (panel() as HTMLElement).style as { setProperty?: (name: string, value: string) => void } | undefined;
     if (style && typeof style.setProperty === "function") style.setProperty("--discuss-width", `${width}px`);
+    // `#1813`: the channel pane's end (22-discuss.css) reads the width at the root, where
+    // the overlays anchored to #frame-body can inherit it.
+    document.documentElement?.style.setProperty("--discuss-width", `${width}px`);
     // The docked column is sized by the main screen's grid, which reads the same choice there.
     const screen = maybe("screen-main");
     const screenStyle = screen ? (screen as HTMLElement).style as { setProperty?: (name: string, value: string) => void } | undefined : undefined;

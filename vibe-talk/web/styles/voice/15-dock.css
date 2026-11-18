@@ -52,7 +52,10 @@
 #status-line {
   position: absolute;
   z-index: var(--z-pill);
-  inset-inline: 0;
+  /* `#1813 vibe-talk-overlays-center-on-channel-pane`: centred on the channel pane while
+     Discuss is docked (the shared helper in 22-discuss.css), the whole body otherwise. */
+  inset-inline-start: 0;
+  inset-inline-end: var(--channel-pane-end, 0px);
   /* Follow the actual tool height, including wrapped rows and larger phone fonts. Both layers
      stay outside the scrolling content, so showing a banner never moves the reader's place. On the
      chips, wherever they stand: over the channel's message box they rise with it (`--chips-foot`,
@@ -60,7 +63,7 @@
   /* `#433 read-strip-low`: while the read-aloud strip is up the pill stands on it in turn
      (`--read-steer-clearance`, its measured height), rather than the strip keeping a pill's
      worth of empty room under itself on every frame the pill is not there. */
-  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px));
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-clearance, 0px) + var(--read-steer-clearance, 0px) + var(--channel-pane-bottom, 0px));
   width: max-content;
   max-width: calc(100% - 1.5rem);
   margin-inline: auto;
@@ -95,8 +98,10 @@
 #read-steer {
   position: absolute;
   z-index: var(--z-strip);
-  inset-inline: 0;
-  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-height, 0px));
+  /* `#1813`: centred on the channel pane while Discuss is docked (22-discuss.css). */
+  inset-inline-start: 0;
+  inset-inline-end: var(--channel-pane-end, 0px);
+  bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-height, 0px) + var(--channel-pane-bottom, 0px));
   width: max-content;
   max-width: calc(100% - 1.5rem);
   margin-inline: auto;
