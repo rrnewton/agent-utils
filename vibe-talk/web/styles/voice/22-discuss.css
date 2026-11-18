@@ -301,6 +301,13 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   font-size: 0.85rem;
 }
 
+/* `#1844`: a failure on the status line, in the scheme's failure ink (both
+ * themes declare it) rather than the muted progress ink, with role=alert
+ * set by the panel beside it. */
+#discuss-status.discuss-status--error {
+  color: var(--summary-fail-ink);
+}
+
 /* The model's words: the server's rendered Markdown (`discuss-markdown-render`),
  * or its shaped text plain (newlines kept) when no render came. Only the plain
  * fallback keeps newlines (`discuss-answer--plain`, #1391): with `pre-wrap` on

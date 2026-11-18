@@ -2305,6 +2305,84 @@ test("discusspersist: open keeps its scope, close keeps closed, a fresh view res
   } finally { fx.restore(); }
 });
 
+test("catchup: with no injected calls, a follow-up sends the api one object body (#1844)", async () => {
+  // The seam that never worked live: no `catchupFollowup` is injected, so the
+  // view's own `deps.api` fallback runs — and `deps.api` serialises the body
+  // itself, so the body it is handed must be the object, never a string.
+  const fx = fixture();
+  const apiCalls = [];
+  const deps = { ...fx.deps };
+  delete deps.catchupPost;
+  delete deps.catchupPreview;
+  delete deps.catchupRecord;
+  delete deps.catchupFollowup;
+  delete deps.catchupUpdate;
+  deps.api = (path, options) => {
+    apiCalls.push({ path, options });
+    if (path.includes("/catchup/messages")) {
+      return Promise.resolve({ you: { speaker: "you", text: "q", text_html: "", at_ms: 1 }, agent: { speaker: "agent", text: "a", text_html: "", at_ms: 1 }, stamp: null });
+    }
+    if (path.includes("/catchup/preview")) return Promise.resolve(preview());
+    if (path.includes("/catchup/record")) return Promise.resolve({ exists: false, current_summary: null, timeline: [], staleness: null });
+    return Promise.resolve(answer());
+  };
+  try {
+    const view = createDiscussView(deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    const box = fx.els["discuss-followup"];
+    box.value = "Find the message where I ask about the closure work.";
+    click(fx.els["discuss-send"]);
+    await flush();
+    const sent = apiCalls.filter((call) => call.path.includes("/catchup/messages"));
+    assert.equal(sent.length, 1, `the follow-up never reached the api: ${JSON.stringify(apiCalls.map((call) => call.path))}`);
+    assert.equal(sent[0].options.method, "POST");
+    assert.equal(typeof sent[0].options.body, "object", "the api was handed a pre-stringified body");
+    assert.deepEqual(sent[0].options.body, { thread_id: null, text: "Find the message where I ask about the closure work." });
+    assert.equal(
+      JSON.stringify(sent[0].options.body),
+      "{\"thread_id\":null,\"text\":\"Find the message where I ask about the closure work.\"}",
+      "the wire bytes are one JSON object, not a string inside a string",
+    );
+  } finally { fx.restore(); }
+});
+
+test("catchup: a failed follow-up stands as an error, and the next line clears it (#1844)", async () => {
+  const fx = fixture();
+  let fail = true;
+  fx.deps.catchupFollowup = (channelId, scope, text) => {
+    fx.calls.followups.push({ channelId, scope, text });
+    if (fail) return Promise.reject(new Error("HTTP 422 invalid_request_body: the body was a string"));
+    return Promise.resolve({ you: { speaker: "you", text, text_html: "", at_ms: 1 }, agent: { speaker: "agent", text: "a", text_html: "", at_ms: 1 }, stamp: null });
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    const box = fx.els["discuss-followup"];
+    box.value = "and the deploy?";
+    click(fx.els["discuss-send"]);
+    await flush();
+    const line = fx.els["discuss-status"];
+    assert.match(line.textContent, /HTTP 422/);
+    assert.equal(line.className, "discuss-status--error", "the failure is not styled as an error");
+    assert.equal(line.getAttribute("role"), "alert", "the failure is not announced as one");
+    fail = false;
+    box.value = "and the deploy?";
+    click(fx.els["discuss-send"]);
+    await flush();
+    assert.equal(line.textContent, "Answered below.");
+    assert.equal(line.className, "", "the error styling outlived the failure");
+    assert.equal(line.getAttribute("role"), "status");
+  } finally { fx.restore(); }
+});
+
 test("timestamps: citation links are not handed to the device voice (#1823)", () => {
   assert.equal(withoutTimestampCitations("Ada shipped the fix (09:51 ↩)"), "Ada shipped the fix");
   assert.equal(withoutTimestampCitations("Ada shipped the fix (09:52 ↗). Next."), "Ada shipped the fix. Next.");

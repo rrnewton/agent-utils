@@ -465,9 +465,13 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     catchupFollowup(channelId: string, scope: DiscussScope, text: string): Promise<unknown> {
       if (deps.catchupFollowup) return deps.catchupFollowup(channelId, scope, text);
       if (!deps.api) return Promise.reject(new Error("Discuss has no way to reach the server."));
+      // The body is the object itself: `deps.api` serialises it (as every other
+      // caller relies on). `#1844`: a pre-stringified body was serialised a
+      // second time, and the route's extractor refused the resulting string
+      // with a plain-text 422 on every follow-up ever sent.
       return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/messages`, {
         method: "POST",
-        body: JSON.stringify({ thread_id: scope.threadId, text }),
+        body: { thread_id: scope.threadId, text },
       });
     },
     catchupUpdate(channelId: string, scope: DiscussScope): Promise<unknown> {
@@ -475,7 +479,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       if (!deps.api) return Promise.reject(new Error("Discuss has no way to reach the server."));
       return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/update`, {
         method: "POST",
-        body: JSON.stringify({ thread_id: scope.threadId, view: scope.view }),
+        body: { thread_id: scope.threadId, view: scope.view },
       });
     },
     isReadNow: (id: string) => deps.isReadNow?.(id) ?? false,

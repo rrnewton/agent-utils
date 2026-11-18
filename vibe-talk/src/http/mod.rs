@@ -60,6 +60,7 @@ pub mod access_layer;
 pub mod api;
 pub mod assets;
 pub mod bearer_layer;
+pub mod json_error_layer;
 pub mod redact_layer;
 pub mod voice_socket;
 
@@ -81,7 +82,10 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .fallback_service(routes(state.clone()))
-        // Innermost: what a read-scope caller is sent carries no pairing code, whichever route
+        // Innermost, beside the routes: every `/api/` refusal answers JSON,
+        // extractor refusals included (`#1844`; see `json_error_layer`).
+        .layer(axum::middleware::from_fn(json_error_layer::json_errors))
+        // What a read-scope caller is sent carries no pairing code, whichever route
         // produced it. `#369 pairing-link`; see `redact_layer`.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -1153,3 +1153,148 @@ async fn a_followup_write_shaped_tool_call_changes_nothing() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["agent"]["text"], json!("I cannot post that."));
 }
+
+/// One POST with the body bytes exactly as given: status, content type, raw body.
+/// `#1844 vibe-talk-discuss-followup-422`: the wire shape is the point, so no
+/// `Value` round-trip may normalise it first.
+async fn post_raw(
+    app: &axum::Router,
+    path: &str,
+    token: Option<&str>,
+    body: &str,
+) -> (StatusCode, String, String) {
+    let mut request = Request::builder().method("POST").uri(path);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let request = request
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .expect("request");
+    let response = app.clone().oneshot(request).await.expect("response");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn a_followup_with_the_pages_exact_request_answers_and_cites_the_found_message() {
+    // `#1844`: the page's `deps.api` wrapper serialises the body itself, so the
+    // wire bytes are one JSON object — `{"thread_id":null,"text":"..."}` for a
+    // channel scope. This test sends those exact bytes through the real router
+    // (only the model backend is the fake) and asks the owner's own question:
+    // find the message about the transitive provenance closure.
+    let mut messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    messages[3].content =
+        "what is the upshot of the transitive provenance closure work?".to_owned();
+    let found_id = messages[3].id.as_str().to_owned();
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    summarizer.answer_with("first point");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    summarizer.answer_with(&format!(
+        "That is the message asking about the closure work [m:{found_id}]. The binary TCB is the closure itself."
+    ));
+    let wire = "{\"thread_id\":null,\"text\":\"Find the message where I ask about upshot of the transitive provenance closure work.  What's the binary TCB\"}";
+    let (status, content_type, raw) = post_raw(
+        &app,
+        &format!("{channel_path}/messages"),
+        Some(WRITE_TOKEN),
+        wire,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raw}");
+    assert!(content_type.contains("application/json"), "{content_type}");
+    let body: Value = serde_json::from_str(&raw).expect("json answer");
+    assert_eq!(
+        body["you"]["text"],
+        json!("Find the message where I ask about upshot of the transitive provenance closure work.  What's the binary TCB"),
+        "{body}"
+    );
+    let answer = body["agent"]["text"].as_str().expect("agent text");
+    assert!(
+        answer.contains(&format!("m=discord:{WRITE_CHANNEL}:{found_id}")),
+        "the answer links the found message: {answer}"
+    );
+    assert!(
+        !answer.contains("[m:"),
+        "no raw citation token is printed: {answer}"
+    );
+    assert!(
+        body["agent"]["text_html"]
+            .as_str()
+            .expect("agent html")
+            .contains(&found_id),
+        "{body}"
+    );
+    // Both turns joined the record, and exactly one extra model call was spent.
+    let (status, record) = get(&app, &format!("{channel_path}/record"), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    let timeline = record["timeline"].as_array().expect("timeline");
+    assert_eq!(timeline.len(), 2, "{record}");
+    assert_eq!(summarizer.prompt_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn a_malformed_followup_body_answers_json_never_plain_text() {
+    // `#1844`: whatever is wrong with the body — double-encoded (what the page
+    // sent while the wrapper serialised twice), unparseable, or the wrong
+    // shape — the answer is the JSON error contract, so the page can show the
+    // real reason instead of "returned non-JSON".
+    let backend = backend_with(vec![message(0, None, false)]);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup/messages");
+
+    let double_encoded =
+        serde_json::to_string(&json!({"thread_id": null, "text": "hi"}).to_string())
+            .expect("double-encoded");
+    for wire in [double_encoded.as_str(), "{not json", "{\"text\":123}"] {
+        let (status, content_type, raw) = post_raw(&app, &path, Some(WRITE_TOKEN), wire).await;
+        assert!(status.is_client_error(), "{wire} -> {status}: {raw}");
+        assert!(
+            content_type.contains("application/json"),
+            "{wire} -> {content_type}: {raw}"
+        );
+        let body: Value =
+            serde_json::from_str(&raw).unwrap_or_else(|_| panic!("{wire} -> not JSON: {raw}"));
+        assert!(
+            body["error"].as_str().is_some_and(|code| !code.is_empty()),
+            "{wire} -> {body}"
+        );
+        assert!(
+            body["detail"].as_str().is_some_and(|why| !why.is_empty()),
+            "{wire} -> {body}"
+        );
+    }
+}

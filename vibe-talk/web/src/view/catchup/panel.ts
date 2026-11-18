@@ -1501,7 +1501,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     lastScope = scope;
     deps.byId("discuss-scope").textContent = scope.label;
     setTitle(scope);
-    deps.byId("discuss-status").textContent = "Updating…";
+    sayStatus("Updating…");
     deps.byId("discuss-retry").hidden = true;
     // `#1787`: the standing summary's terms are the old one's while it updates.
     markTermsStale();
@@ -1513,7 +1513,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const answer = asCatchupAnswer(value);
         lastAnswer = answer;
         scopeAnswers.set(scopeKeyOf(scope), { scope, answer, readCreatedMs });
-        deps.byId("discuss-status").textContent = "Updated.";
+        sayStatus("Updated.");
         drawAnswer(answer, null);
         drawTerms(answer);
         drawFooter(answer, scope);
@@ -1528,12 +1528,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         // `#1787`: the old summary stands again, its terms current once more.
         if (lastAnswer !== null) drawTerms(lastAnswer);
         if (isDiscussUnavailable(error)) {
-          deps.byId("discuss-status").textContent = DISCUSS_UNAVAILABLE_HINT;
+          sayError(DISCUSS_UNAVAILABLE_HINT);
           deps.showError?.(DISCUSS_UNAVAILABLE_HINT);
           return;
         }
         const message = error instanceof Error ? error.message : String(error);
-        deps.byId("discuss-status").textContent = message;
+        sayError(message);
         deps.showError?.(message);
       },
     );
@@ -1549,19 +1549,19 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const asked = generation;
     const scope = lastScope;
     setPending(true);
-    deps.byId("discuss-status").textContent = "Reading…";
+    sayStatus("Reading…");
     void deps.catchupFollowup(scope.channelId, scope, text).then(
       () => {
         setPending(false);
         if (asked !== generation || !isOpen()) return;
         box.value = "";
-        deps.byId("discuss-status").textContent = "Answered below.";
+        sayStatus("Answered below.");
         recordFor(scope, true);
       },
       (error: unknown) => {
         setPending(false);
         if (asked !== generation || !isOpen()) return;
-        deps.byId("discuss-status").textContent = error instanceof Error ? error.message : String(error);
+        sayError(error instanceof Error ? error.message : String(error));
         deps.byId("discuss-retry").hidden = true;
       },
     );
@@ -1590,8 +1590,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           deps.byId("discuss-stamp").textContent = stampLine;
           deps.byId("discuss-stamp").hidden = stampLine === "";
           if (!quiet) {
-            deps.byId("discuss-status").textContent =
-              `Saved summary · ${shape.created_ms > 0 ? summaryTimeLabel(shape.created_ms, nowMs()) : "—"}`;
+            sayStatus(`Saved summary · ${shape.created_ms > 0 ? summaryTimeLabel(shape.created_ms, nowMs()) : "—"}`);
           }
         }
         drawStale(shape);
@@ -1685,6 +1684,26 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     return { count: bound.count, sinceMs: bound.sinceMs, hours: hoursFloor1(bound.sinceMs, nowMs()) };
   }
 
+  /** Say one thing on the panel's status line, as progress. */
+  function sayStatus(text: string): void {
+    const line = deps.byId("discuss-status");
+    line.textContent = text;
+    line.className = "";
+    line.setAttribute("role", "status");
+  }
+
+  /**
+   * Say one failure on the status line, as an error: red in both themes and
+   * announced (`role="alert"`). `#1844`: a failure used to stand in the same
+   * muted ink as "Reading…", so it read as progress.
+   */
+  function sayError(text: string): void {
+    const line = deps.byId("discuss-status");
+    line.textContent = text;
+    line.className = "discuss-status--error";
+    line.setAttribute("role", "alert");
+  }
+
   /** Say whether a request is in flight, here and on the page's entry points. */
   function setPending(on: boolean): void {
     pending = on;
@@ -1752,7 +1771,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     lastScope = scope;
     deps.byId("discuss-scope").textContent = scope.label;
     setTitle(scope);
-    if (!again) deps.byId("discuss-status").textContent = "Checking what to summarize…";
+    if (!again) sayStatus("Checking what to summarize…");
     void deps.catchupPreview(scope.channelId, scope).then(
       (value) => {
         if (asked !== generation || !isOpen()) return;
@@ -1774,17 +1793,17 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         // again — each preview fetches one more page — so the held count on
         // screen grows toward the whole thread before Summarize is offered.
         if (scope.threadId !== null && preview.window?.truncated === true && preview.window.fetch_blocked !== true) {
-          deps.byId("discuss-status").textContent = `Fetching older messages… ${previewWindowCount} held so far.`;
+          sayStatus(`Fetching older messages… ${previewWindowCount} held so far.`);
           drawBound();
           previewFor(scope, true);
           return;
         }
         if (previewUnread.length === 0) {
-          deps.byId("discuss-status").textContent = "Nothing unread here.";
+          sayStatus("Nothing unread here.");
         } else if (preview.window?.fetch_blocked === true) {
-          deps.byId("discuss-status").textContent = `${previewUnread.length} unread ready. Older messages could not be fetched, so a summary covers only what is held.`;
+          sayStatus(`${previewUnread.length} unread ready. Older messages could not be fetched, so a summary covers only what is held.`);
         } else {
-          deps.byId("discuss-status").textContent = `${previewUnread.length} unread ready.`;
+          sayStatus(`${previewUnread.length} unread ready.`);
         }
         drawBound();
       },
@@ -1792,7 +1811,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         if (asked !== generation || !isOpen()) return;
         previewUnread = [];
         drawBound();
-        deps.byId("discuss-status").textContent = error instanceof Error ? error.message : String(error);
+        sayError(error instanceof Error ? error.message : String(error));
       },
     );
   }
@@ -1815,7 +1834,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     lastAnswer = null;
     deps.byId("discuss-scope").textContent = scope.label;
     setTitle(scope);
-    deps.byId("discuss-status").textContent = "Reading…";
+    sayStatus("Reading…");
     deps.byId("discuss-answer").textContent = "";
     deps.byId("discuss-footer").hidden = true;
     deps.byId("discuss-stamp").textContent = "";
@@ -1840,9 +1859,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const count = answer.window?.count ?? answer.unread_ids.length;
         // `#1761`: a window cut short of the thread's start says so, visibly —
         // never a partial window presented as the whole.
-        deps.byId("discuss-status").textContent = answer.window?.truncated === true
+        sayStatus(answer.window?.truncated === true
           ? `Read ${unread} unread of ${count}. Older messages are not covered: fetching them did not finish.`
-          : `Read ${unread} unread of ${count}`;
+          : `Read ${unread} unread of ${count}`);
         drawAnswer(answer, null);
         drawTerms(answer);
         drawFooter(answer, scope);
@@ -1871,13 +1890,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         // A deployment with no summarizer refuses the same way every time: say the
         // hint and offer no retry, where a failed attempt gets its error and one.
         if (isDiscussUnavailable(error)) {
-          deps.byId("discuss-status").textContent = DISCUSS_UNAVAILABLE_HINT;
+          sayError(DISCUSS_UNAVAILABLE_HINT);
           deps.byId("discuss-retry").hidden = true;
           deps.showError?.(DISCUSS_UNAVAILABLE_HINT);
           return;
         }
         const message = error instanceof Error ? error.message : String(error);
-        deps.byId("discuss-status").textContent = message;
+        sayError(message);
         deps.byId("discuss-retry").hidden = false;
         deps.showError?.(message);
       },
@@ -2239,7 +2258,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       setTitle(scope);
       const unread = answer.window?.unread_count ?? answer.unread_ids.length;
       const count = answer.window?.count ?? answer.unread_ids.length;
-      deps.byId("discuss-status").textContent = `Read ${unread} unread of ${count}`;
+      sayStatus(`Read ${unread} unread of ${count}`);
       drawAnswer(answer, restoredRecord);
       drawTerms(answer);
       drawFooter(answer, scope);
