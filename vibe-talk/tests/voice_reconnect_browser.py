@@ -615,7 +615,10 @@ def main() -> int:
                         page.click("#welcome-start")
                 except Exception:
                     pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
-                page.wait_for_selector("#talk", state="visible", timeout=10_000)
+                # `#1781`: the call's view is two presses from the Channel sign-in lands on.
+    page.click("#view-switch")
+    page.click("#view-switch")
+    page.wait_for_selector("#talk", state="visible", timeout=10_000)
                 summary = call_a(page, api, voice, args.screenshots)
                 summary += "; " + call_b(page, api, voice, args.screenshots)
                 summary += "; " + call_c(page, api, voice)

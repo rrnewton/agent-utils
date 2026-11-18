@@ -528,7 +528,7 @@ def perf(chromium: BrowserType, args: argparse.Namespace) -> str:
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
     page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
-    page.click("#view-switch")
+    # `#1781`: sign-in lands on the channel already.
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length >= 50", "All did not open")
     page.select_option("#thread-select", "threads")
     desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-card]').length === 40",

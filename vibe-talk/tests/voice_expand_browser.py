@@ -285,6 +285,9 @@ def start_call(walk: Walk) -> None:
             page.click("#welcome-start")
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
+    # `#1781`: the call's view is two presses from the Channel sign-in lands on.
+    page.click("#view-switch")
+    page.click("#view-switch")
     page.wait_for_selector("#talk", state="visible", timeout=10_000)
     page.click("#talk")
     until(page, lambda: len(walk.voice.routes) == 1, "Talk to open the call's socket")

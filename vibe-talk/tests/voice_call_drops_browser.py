@@ -437,6 +437,9 @@ def walk(page: Page, api: FakeApi, voice: FakeVoice) -> str:
             page.click("#welcome-start")
     except Exception:
         pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
+    # `#1781`: the call's view is two presses from the Channel sign-in lands on.
+    page.click("#view-switch")
+    page.click("#view-switch")
     page.wait_for_selector("#talk", state="visible", timeout=10_000)
 
     # 1. A spoken call that greets. Microphone frames wait across the greeting's hand-off.

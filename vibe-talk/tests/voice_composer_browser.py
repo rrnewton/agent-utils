@@ -343,6 +343,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, api: FakeApi
             except Exception:
                 pass  # no first-run Welcome on this path (#1781: a returning reader, a refusal, or a saved choice)
             page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+            # `#1781`: the call's view is two presses from the Channel sign-in lands on.
+            page.click("#view-switch")
+            page.click("#view-switch")
             check(page.evaluate("() => !document.getElementById('pane-voice').hidden") is True,
                   f"{label}: the page did not open on the call's view")
             check(page.locator("#text-entry").count() == 0, f"{label}: the Type toggle is still on the page")
