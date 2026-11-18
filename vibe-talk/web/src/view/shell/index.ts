@@ -7,7 +7,7 @@ export type { Promotion, PromotionCandidate, PromotionDependencies } from "./pro
 export { createChannelDirectoryView } from "./channeldirectory.ts";
 export type { ChannelDirectoryView, ChannelDirectoryViewDependencies } from "./channeldirectory.ts";
 export type { ControlBar, ControlBarDependencies } from "./controlbar.ts";
-export { BANNER_DISMISS_MS, STATUS_DISMISS_MS, createShellNotices } from "./notices.ts";
+export { BANNER_DISMISS_MS, STATUS_DISMISS_MS, STATUS_IDLE_DISMISS_MS, createShellNotices } from "./notices.ts";
 export type { ShellNotices, ShellNoticesDependencies } from "./notices.ts";
 export { CHIPS_PILL_REM, createChipsOverComposer } from "./chips.ts";
 export type { ChipsOverComposer, ChipsOverComposerDependencies } from "./chips.ts";

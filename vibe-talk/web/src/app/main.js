@@ -4192,6 +4192,7 @@ const { syncCanonDismissed, saveChannelScope, hydrateChannelScope, hydrateFromCa
 
 /** How old what is on screen is, said over the list: web/src/view/channel/freshness.ts (`createFreshness`, #624). */
 const freshnessOwner = createFreshness({
+  clock: clockOnUse(),
   loadState,
   side: () => columnWork.side(),
   el,

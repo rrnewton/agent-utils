@@ -1475,6 +1475,22 @@ test("THE STATUS LINE IS A MESSAGE, NOT A FIXTURE", async () => {
   );
 });
 
+test("an idle confirmation leaves sooner than action words (#1837)", async () => {
+  const page = newPage();
+  await signIn(page); // says "Ready.", an idle confirmation
+  assert.equal(page.el("status-line").hidden, false, "sign-in said nothing");
+  assert.equal(page.el("status").textContent, "Ready.");
+  page.expireTimers(2500);
+  assert.equal(page.el("status-line").hidden, true, "Ready. outstayed the idle clock");
+  // Action words keep the full clock: arming Clear at the idle deadline is still up.
+  await page.el("clear-view").click();
+  assert.equal(page.el("status-line").hidden, false, "arming Clear said nothing");
+  page.expireTimers(2500);
+  assert.equal(page.el("status-line").hidden, false, "action words went with the idle clock");
+  page.expireTimers(6000);
+  assert.equal(page.el("status-line").hidden, true, "action words outstayed the full clock");
+});
+
 test("the transient message can be dismissed by hand, without waiting", async () => {
   const page = newPage();
   await signIn(page);

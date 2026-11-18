@@ -10,6 +10,16 @@ import type { ClockPort, TimerHandle } from "../../ports/index.ts";
 /** How long the status line stays before it takes itself away, in ms. */
 const STATUS_DISMISS_MS = 6000;
 
+/**
+ * How long an idle confirmation stays, in ms (`#1837 vibe-talk-status-pill-avoids-text`):
+ * "Ready." and its lowercase twin say nothing the reader must act on, so they leave
+ * sooner than action and progress words, which keep the full `STATUS_DISMISS_MS`.
+ */
+const STATUS_IDLE_DISMISS_MS = 2500;
+
+/** The idle confirmations: words that only say the page is ready, nothing to act on. */
+const IDLE_STATUS_WORDS: ReadonlySet<string> = new Set(["Ready.", "ready"]);
+
 /** How long the connection banner stays before it takes itself away, in ms. */
 const BANNER_DISMISS_MS = 8000;
 
@@ -81,7 +91,8 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
     // text changes announces nothing at all; the order here is what makes it speak.
     el("status-line").hidden = false;
     el("status").textContent = deps.redact(text);
-    statusTimer = deps.clock.setTimeout(dismissStatus, STATUS_DISMISS_MS);
+    const idle = IDLE_STATUS_WORDS.has(deps.redact(text).trim());
+    statusTimer = deps.clock.setTimeout(dismissStatus, idle ? STATUS_IDLE_DISMISS_MS : STATUS_DISMISS_MS);
   }
 
   function statusSays(text: unknown): boolean {
@@ -204,4 +215,4 @@ export function createShellNotices(deps: ShellNoticesDependencies): ShellNotices
 }
 
 // What the page and the tests use of it.
-export { BANNER_DISMISS_MS, STATUS_DISMISS_MS };
+export { BANNER_DISMISS_MS, STATUS_DISMISS_MS, STATUS_IDLE_DISMISS_MS };

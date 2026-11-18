@@ -5,6 +5,16 @@
 // `#1210`'s no-shift holds with nothing held statically). The load state, the words
 // for stale, and the place-keeping are the page's, handed in.
 
+import type { ClockPort, TimerHandle } from "../../ports/index.ts";
+
+/**
+ * How long a current ("Live · updated …") pill stays before it takes itself away, in ms
+ * (`#1837 vibe-talk-status-pill-avoids-text`): current is idle information, the head-of-list
+ * twin of "Ready.", so it leaves on the status line's clock. Stale, offline and failed
+ * wording is a warning and stays while it is true.
+ */
+const FRESHNESS_FRESH_DISMISS_MS = 7000;
+
 /** The load state, as freshness reads it. */
 export interface FreshnessLoadState {
   freshness: string;
@@ -14,6 +24,7 @@ export interface FreshnessLoadState {
 
 /** What saying how fresh the rows are asks of the page. */
 export interface FreshnessDependencies {
+  readonly clock: ClockPort;
   loadState(): FreshnessLoadState;
   side(): boolean;
   el(id: string): HTMLElement;
@@ -47,6 +58,15 @@ export interface Freshness {
 
 /** Freshness over `deps`. */
 export function createFreshness(deps: FreshnessDependencies): Freshness {
+  let freshTimer: TimerHandle | null = null;
+  let freshArmedFor = "";
+
+  function cancelFreshHide(): void {
+    if (freshTimer !== null) deps.clock.clearTimeout(freshTimer);
+    freshTimer = null;
+    freshArmedFor = "";
+  }
+
   function setChannelFreshness(state: string): void {
     deps.loadState().freshness = state;
     renderChannelFreshness();
@@ -84,6 +104,18 @@ export function createFreshness(deps: FreshnessDependencies): Freshness {
     // along that line across the top of the list.
     pill.hidden = text === "" || deps.view() !== "discord" ||
       (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || deps.searchOpen();
+    // `#1837`: a current pill takes itself away like "Ready." does; a warning stays.
+    const isCurrent = !pill.hidden && text !== "" && text === current && !refreshing;
+    if (!isCurrent) cancelFreshHide();
+    else if (freshTimer === null || freshArmedFor !== text) {
+      cancelFreshHide();
+      freshArmedFor = text;
+      freshTimer = deps.clock.setTimeout(() => {
+        freshTimer = null;
+        freshArmedFor = "";
+        pill.hidden = true;
+      }, FRESHNESS_FRESH_DISMISS_MS);
+    }
     // No room is reserved or released here, or anywhere (#1320, keeping #1210): the pill floats
     // over the list on a zero-height anchor and takes no layout room, so the scroller never
     // resizes and no row moves as freshness appears, clears, or is reworded. Callers that land
@@ -128,3 +160,6 @@ export function createFreshness(deps: FreshnessDependencies): Freshness {
 
   return { setChannelFreshness, renderChannelFreshness, renderSideFreshness };
 }
+
+// What the page and the tests use of it.
+export { FRESHNESS_FRESH_DISMISS_MS };

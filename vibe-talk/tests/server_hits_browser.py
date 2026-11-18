@@ -428,6 +428,40 @@ def walk_through(walk: Walk, keyboard: bool, discuss: bool = False) -> None:
     while time.monotonic() < deadline and not api.prioritized:
         page.wait_for_timeout(25)
     walk.check(bool(api.prioritized), "Search further back never asked the server to gather")
+    # `#1837 vibe-talk-status-pill-avoids-text` (d): a search with nothing left on the
+    # server puts the foot line at "No more hits on the server"; with the list scrolled
+    # to that line (the at-hit resting place), the status pill must wait rather than
+    # cover it, as it already waits for the collapsed line (`#1813`).
+    page.fill("#search-field", "quixotic")
+    walk.until("() => document.getElementById('server-line').textContent === 'No more hits on the server'",
+               "the foot line never reached 'No more hits on the server'")
+    page.evaluate("""() => {
+        document.getElementById('server-line').scrollIntoView({block: 'end'});
+        document.getElementById('status').textContent =
+            '1 message marked as dealt with here \u2014 not in the source chat service.';
+        document.getElementById('status-line').hidden = false;
+    }""")
+    walk.settled()
+    measure = page.evaluate("""() => {
+        const pill = document.getElementById('status-line');
+        const line = document.getElementById('server-line');
+        const pr = pill.getBoundingClientRect(), lr = line.getBoundingClientRect();
+        return {vis: getComputedStyle(pill).visibility,
+                overlap: pr.left < lr.right - .5 && lr.left < pr.right - .5 &&
+                         pr.top < lr.bottom - .5 && lr.top < pr.bottom - .5};
+    }""")
+    walk.check(measure["vis"] == "hidden" or not measure["overlap"],
+               f"the status pill covers the 'No more hits' line: {measure}")
+    walk.shot("no-more-hits-pill-clear")
+    page.evaluate("() => { document.getElementById('status-line').hidden = true; }")
+    page.fill("#search-field", "lantern")
+    walk.until("() => document.getElementById('server-line').textContent !== 'No more hits on the server'",
+               "the foot line never left 'No more hits on the server'")
+    # The new search collapsed the details; the collapse check below starts expanded.
+    if page.evaluate("() => document.getElementById('server-detail').hidden"):
+        page.click("#server-line")
+        walk.until("() => !document.getElementById('server-detail').hidden",
+                   "the details did not re-expand for the collapse check")
     # Tap again: collapsed, snippets put away.
     page.click("#server-line")
     walk.check(page.evaluate("() => document.getElementById('server-detail').hidden"),

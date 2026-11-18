@@ -594,6 +594,35 @@ test("the channel pane reserves no room for the freshness pill, whatever it has 
   assert.equal(reserved(), false, "giving way to the pull reserved a band at the list's head");
 });
 
+// `#1837 vibe-talk-status-pill-avoids-text`: a current freshness pill is idle information
+// and takes itself away; a warning stays; and a refresh arriving while the reader is
+// mid-list moves nothing (`#1210`), scroll padding notwithstanding.
+test("a current freshness pill takes itself away, a warning stays, and mid-list nothing moves", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "721", content: "on screen" })]);
+  assertCurrent(page, "a freshly read channel did not say it is current");
+  // The reader is mid-list when the pill takes itself away: nothing may write their
+  // scroll place (the scroll padding that clears with it moves landings only).
+  const area = page.el("scroll-area");
+  let place = 123;
+  let placeWrites = 0;
+  Object.defineProperty(area, "scrollTop", {
+    configurable: true,
+    get: () => place,
+    set: (value) => { placeWrites += 1; place = value; },
+  });
+  page.expireTimers(7000);
+  assert.equal(placeWrites, 0, "the pill taking itself away moved the reader mid-list");
+  assert.equal(freshness(page).hidden, true, "the current pill stayed as furniture over the first card");
+  // A failed refresh is a warning: it stays past the same clock.
+  page.channelPage = errorResponse(502, "discord_error", "the provider is down");
+  await reReadChannel(page);
+  assert.equal(freshness(page).hidden, false, "a failed refresh said nothing");
+  page.expireTimers(7000);
+  assert.equal(freshness(page).hidden, false, "the warning went away on the idle clock");
+});
+
 test("each scope keeps at most MESSAGE_CACHE_ROWS rows, and a reload walks back from the oldest kept", async () => {
   const rows = sourceConstant("MESSAGE_CACHE_ROWS");
   const page = newPage();

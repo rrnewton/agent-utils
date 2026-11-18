@@ -30,7 +30,7 @@ function makeNotices() {
     holdingReader: (mutate) => mutate(),
     detailChanged: () => {},
   });
-  return { notices, el };
+  return { notices, el, timers };
 }
 
 test("#1726: an error with no words still says something, never an empty shell", () => {
@@ -60,6 +60,25 @@ test("#1726: appending a detail to nothing leaves no leading separator", () => {
   notices.showDetail("voice provider");
   notices.addDetail("session valid for about 5 minutes");
   assert.equal(el("connection-detail").textContent, "voice provider · session valid for about 5 minutes");
+});
+
+test("#1837: an idle confirmation gets the short clock, action words the full one", () => {
+  const { notices, el, timers } = makeNotices();
+  const fire = (ms) => {
+    for (let i = timers.length - 1; i >= 0; i -= 1) {
+      if (timers[i].ms === ms) timers.splice(i, 1)[0].fn();
+    }
+  };
+  notices.setStatus("Ready.");
+  assert.equal(el("status-line").hidden, false, "Ready. said nothing");
+  fire(2500);
+  assert.equal(el("status-line").hidden, true, "Ready. outstayed the idle clock");
+  notices.setStatus("1 message marked as dealt with here");
+  assert.equal(el("status-line").hidden, false, "the action words said nothing");
+  fire(2500);
+  assert.equal(el("status-line").hidden, false, "action words went on the idle clock");
+  fire(6000);
+  assert.equal(el("status-line").hidden, true, "action words outstayed the full clock");
 });
 
 test("#1726: a status line with no words takes itself away", () => {

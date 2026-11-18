@@ -42,3 +42,5 @@ Design note sent to coordb before coding (this lane codes only on approval). Sum
 # Notes
 
 Design note first, then implement on coordb approval (owner-priority gate, deployed on landing). Nested worktree on branch mu-pilltext/1837; screenshots and validation follow the standing owner-UI matrix and the lane's validation steps.
+
+Known limit (coordb, 2026-11-18): the freshness line's stale/offline/failed wording is a warning and persists while it is true, so while it stands it can still cover the first card at the head of the list. The current ("Live · updated") wording is idle information and now takes itself away, which covers the common case; app landings already measure the pill while it is up. A scroll-padding clearance was tried and dropped: it fought the list's own place-keeping (the collapsed-lines keeper moved a row by the clearance), and auto-away covers the common case without it.

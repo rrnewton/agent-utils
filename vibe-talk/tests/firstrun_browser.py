@@ -183,6 +183,23 @@ def walk_fresh(context: BrowserContext, url: str, shots: Path | None, where: str
         "() => getComputedStyle(document.getElementById('status-line')).visibility === 'visible'",
         timeout=10_000)
     page.evaluate("() => { document.getElementById('status-line').hidden = true; }")
+    # `#1837` (b): the current freshness pill takes itself away, so at the head of the
+    # list the first card's text and top-row buttons are left clear (app landings
+    # already measure the pill while it is up, `floatingClearance`); and while the
+    # reader sits mid-list, it taking itself away moves nothing.
+    page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = 0; }")
+    mid = page.evaluate("""() => {
+        const area = document.getElementById('scroll-area');
+        area.scrollTop = Math.min(300, Math.max(0, area.scrollHeight - area.clientHeight));
+        return area.scrollTop;
+    }""")
+    if mid > 0:
+        page.wait_for_function(
+            "() => document.getElementById('channel-freshness').hidden", timeout=15_000)
+        after = page.evaluate("() => document.getElementById('scroll-area').scrollTop")
+        check(abs(after - mid) <= 1,
+              f"{where}: the freshness pill taking itself away moved the reader ({mid} -> {after})")
+        page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
     shot(page, shots, f"{where}-{scheme}-03-channel")
     # A reload is a returning reader: no Welcome, still the Channel.
     page.reload(wait_until="load")

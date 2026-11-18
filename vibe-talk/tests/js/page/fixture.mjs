@@ -5488,6 +5488,13 @@ const TUNING_BANDS = {
   STATUS_DISMISS_MS: [2000, 20000,
     "below a couple of seconds the message goes before it can be read; above twenty it is a " +
     "fixture covering a line of the conversation, the thing #63 status-line-placement took away"],
+  STATUS_IDLE_DISMISS_MS: [1000, 6000,
+    "an idle confirmation (Ready.) only has to be noticed, not read: under a second it may not " +
+    "register at all; at the full action time it covers a line as long as words the reader must act on"],
+  FRESHNESS_FRESH_DISMISS_MS: [2000, 20000,
+    "a current freshness pill is idle information like Ready.: under a couple of seconds it goes " +
+    "before it can be read; above twenty it covers the first card as furniture, the thing " +
+    "#1837 takes away, while stale wording, a warning, is not on this clock at all"],
   BANNER_DISMISS_MS: [2000, 30000,
     "the connection banner sits over the top of the screen: too short to read, or long enough " +
     "to be furniture"],

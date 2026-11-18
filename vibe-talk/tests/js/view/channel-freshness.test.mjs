@@ -9,7 +9,14 @@ test("setting freshness draws the pill with the live words", () => {
   const state = { freshness: "fresh", freshAt: 42, refreshing: false };
   const pill = { textContent: "", hidden: true, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k]; } };
   const gesture = { hidden: true, getAttribute: () => null };
+  const timers = new Map();
+  let nextTimer = 1;
+  const clock = {
+    setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: (id) => { timers.delete(id); },
+  };
   const owner = createFreshness({
+    clock,
     loadState: () => state,
     side: () => false,
     el: (id) => (id === "channel-freshness" ? pill : gesture),
@@ -38,4 +45,9 @@ test("setting freshness draws the pill with the live words", () => {
   assert.equal(pill.textContent, "Live · updated at 42");
   assert.equal(pill.attrs["data-state"], "fresh");
   assert.equal(pill.hidden, false);
+  // `#1837`: a current pill takes itself away on its clock (state, not sleep).
+  const armed = [...timers.values()];
+  assert.equal(armed.length, 1, "no auto-away timer was armed for a current pill");
+  armed[0].fn();
+  assert.equal(pill.hidden, true, "the current pill stayed after its clock");
 });
