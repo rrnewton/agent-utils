@@ -43,8 +43,13 @@ def _config(project: Path) -> cli.Config:
 
 
 def _sleeper() -> subprocess.Popen[bytes]:
+    # The actor must stay live for the whole test, however long loaded
+    # setup takes: a two-minute sleep expired before classification in
+    # loaded gates, so the journal's actor was genuinely dead when the
+    # mutation judged it. Every caller terminates this process in a
+    # finally block; its lifetime is not a timing condition.
     return subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(120)"],
+        [sys.executable, "-c", "import time; time.sleep(3600)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
