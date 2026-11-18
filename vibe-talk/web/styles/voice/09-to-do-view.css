@@ -951,6 +951,8 @@
   border-radius: 0.6rem;
   box-shadow: 0 4px 18px rgb(0 0 0 / 35%);
   padding: 0.5rem;
+  /* Rows scrolled to stop below the sticky filter box, never under it. */
+  scroll-padding-top: calc(var(--toggle-hit) + 0.9rem);
   z-index: 30;
 }
 
