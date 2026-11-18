@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-ready-toast-covers-text: the Ready toast after a load covers message text'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -28,3 +28,7 @@ updated_at: 2026-11-18T13:15:00-05:00
 # Notes
 
 Owner-priority, deployed on landing. Builds on #1837 vibe-talk-status-pill-avoids-text (the short idle clock and the Welcome wait).
+
+## Resolution
+
+[watermelon-full-preview] Landed as dc52eb8b on main (gated f3ed0066, owner-priority gate pass). An idle confirmation now carries `data-idle` and is waited out by the stylesheet: announced on its short clock, never floated over message text after a load; action and progress words float as before. A dismissal clears the mark, so the unresponsive fallback can never inherit it unseen.
