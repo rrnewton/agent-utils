@@ -2874,6 +2874,19 @@ const searchOpenControl = createSearchOpenControl({
 });
 const { setSearchOpen, showSearchOpen } = searchOpenControl;
 
+/**
+ * `#1825 vibe-talk-hashtag-labels`: a card's label chip (or a Settings label)
+ * opens the search filtered to that label. The clicked row's message is in
+ * the results; keeping it at the same screen place rides the scroll owner's
+ * place-keeping, as a filter change does.
+ */
+function filterToLabel(label) {
+  setSearchOpen(true);
+  searchField.setQuery(`label:${label}`);
+  searchField.setMarked(`label:${label}`);
+  applySearch();
+}
+
 // The links in what is on screen, whose messages, and the kinds of link are
 // web/src/view/channel's now (`createRowLinks`, `#624 voice-page-modularity`): a row's links
 // shown in place of its text, the author filter, and the kind buttons. The kinds kept on this
@@ -5228,6 +5241,7 @@ const channelRows = createChannelRows({
   markReadUpstream,
   storedSlackOpen: () => deviceSettings().get(DEVICE_SETTINGS.slackOpen),
   isPinnedId: (id) => isPinnedId(id),
+  filterToLabel: (label) => filterToLabel(label),
   togglePin: (messages) => togglePin(messages),
   toggleBookmarkAt,
   copyDeepLink,

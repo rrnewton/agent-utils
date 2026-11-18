@@ -140,6 +140,8 @@ export interface ChannelRowsDependencies extends ChannelRenderPassDependencies {
   replyButtonTitle: string;
   historyReach(): { start: boolean; topLevel: boolean; whole: boolean; threads: number; full: number };
   closeOpenMenu(name: string): boolean;
+  /** `#1825`: a label chip was clicked: open the search filtered to that label. */
+  filterToLabel(label: string, row: HTMLElement): void;
 }
 
 /** The row drawer's commands and questions. */
@@ -264,9 +266,37 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     pinChip.textContent = "Pinned";
     const edited = editedMark(messages);
     meta.append(author, stamp, ...(edited ? [edited] : []), pinChip);
+    // `#1825 vibe-talk-hashtag-labels`: the row's labels as chips in the meta
+    // line, styled like Pinned (gold stays Pinned-only). The labels are the
+    // server's derivation, served with the message; clicking one filters.
+    const rowLabels: string[] = [];
+    for (const message of messages) {
+      for (const label of (message as { labels?: string[] }).labels || []) {
+        if (!rowLabels.includes(label)) rowLabels.push(label);
+      }
+    }
+    for (const label of rowLabels) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "label-chip";
+      chip.textContent = `#${label}`;
+      chip.title = `Show only #${label}`;
+      chip.setAttribute("aria-label", `Filter to label ${label}`);
+      chip.addEventListener("click", (event) => {
+        event.stopPropagation();
+        deps.filterToLabel(label, li);
+      });
+      meta.append(chip);
+    }
     const body = document.createElement("div");
     body.className = "body";
     deps.renderBodyInto(body, messages);
+    // Owner thread 168: a body line of ONLY hashtags is the labels said twice
+    // once the chips stand in the header, so it is hidden at render time (the
+    // stored text, raw view and copy keep it whole). The meta line wraps, so
+    // the chips always have room when they stand; a row served no labels
+    // keeps its line inline.
+    if (rowLabels.length > 0) hideHashtagOnlyLines(body, rowLabels);
     const heading = deps.headingOf(message);
     const firstBody = body.children[0];
     if (heading && firstBody && deps.restatedMarked(firstBody)) {
@@ -279,6 +309,22 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     const reactions = reactionStrip(messages);
     if (reactions) li.append(reactions);
     return { li, meta, body, content: combinedContent(messages), text, reactions };
+  }
+
+  /** Hide each body block whose whole text is hashtags the header chips name (`#1825`). */
+  function hideHashtagOnlyLines(body: HTMLElement, labels: string[]): void {
+    for (const block of [...body.children]) {
+      const tokens = (block.textContent || "").trim().split(/\s+/).filter(Boolean);
+      if (tokens.length === 0) continue;
+      const only = tokens.every((token) => {
+        const match = /^#([A-Za-z][A-Za-z0-9_-]*)$/.exec(token);
+        return match !== null && labels.includes(match[1]!.toLowerCase());
+      });
+      if (only) {
+        (block as HTMLElement).hidden = true;
+        block.classList.add("hashtag-line");
+      }
+    }
   }
 
   function editedMark(messages: Message[]): HTMLElement | null {

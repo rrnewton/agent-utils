@@ -150,6 +150,30 @@
   line-height: 1.35;
 }
 
+/*
+ * `#1825 vibe-talk-hashtag-labels`. A message's labels beside Pinned in the meta
+ * line: the pin chip's geometry, never its gold (the gold edge budget is spent
+ * on Pinned alone). A button, because tapping one filters to that label.
+ */
+.label-chip {
+  flex: 0 0 auto;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--chip-bg, transparent);
+  color: var(--ink-2, inherit);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+/* A hashtag-only body line hidden because its chips stand in the header. */
+.hashtag-line {
+  display: none;
+}
+
 /* The pin, drawn from the same path as the Pinned filter's icon and filled with the chip's ink. A
    mask rather than an inline <svg> so the row builder makes no element it would have to name. */
 .pin-chip::before {
