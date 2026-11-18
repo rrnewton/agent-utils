@@ -47,6 +47,7 @@ export const DISCUSS_BINDING_RULES: readonly DiscussBindingRule[] = Object.freez
   { name: "in-thread-link-jumps-in-place", action: "a citation inside the current thread jumps, panel open" },
   { name: "out-of-thread-link-returns-to-bound", action: "a citation outside the current thread but inside the bound global returns to the bound global view and jumps, panel open" },
   { name: "widening-rescopes-to-main", action: "thread -> main keeps the panel open and re-scopes it to the main channel, titled as such (#1811)" },
+  { name: "sideways-rescopes-to-thread", action: "thread -> another thread keeps the panel open and switches it to the new thread's own Discuss state (#1841)" },
   { name: "widen-or-sideways-closes", action: WIDEN_OR_SIDEWAYS_ACTION },
   { name: "fallback-closes-and-jumps", action: "a citation outside the bound scope closes Discuss and jumps to Thread or Main, Back returns" },
   { name: "out-of-window-cite-links-out", action: "a cache-resolvable citation outside the window links out-of-scope; its tap follows fallback-closes-and-jumps" },
@@ -91,8 +92,9 @@ export interface ViewChangeDecision {
 /**
  * Decide a view change for an open panel bound to `bound` while the reader
  * now looks at `current`. Same scope (including All <-> Main) stays;
- * entering a thread or returning to main re-scopes the open panel to
- * the view on screen (#1811); sideways and a channel change close (rule 5).
+ * entering a thread, returning to main, or moving sideways to another
+ * thread re-scopes the open panel to the view on screen (#1811, #1841);
+ * a channel change closes (rule 5).
  */
 export function viewChangeDecision(
   bound: NormalizedDiscussScope,
@@ -109,6 +111,9 @@ export function viewChangeDecision(
   }
   if (bound.kind === "thread" && current.kind === "global") {
     return { action: "rescope", rule: "widening-rescopes-to-main" };
+  }
+  if (bound.kind === "thread" && current.kind === "thread") {
+    return { action: "rescope", rule: "sideways-rescopes-to-thread" };
   }
   return { action: "close", rule: "widen-or-sideways-closes" };
 }

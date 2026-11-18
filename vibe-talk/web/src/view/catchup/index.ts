@@ -68,6 +68,18 @@ export interface DiscussPanelState {
   channelId: string;
   threadId: string | null;
   view: "flat" | "main";
+  // `#1841`: the bound scope's own name (a thread's slug or first line), so a
+  // restored thread scope is never titled with the channel's name.
+  label?: string;
+}
+
+/** `#1841`: a thread's own name for its Discuss title: its filed slug or its
+ * first line, truncated; "" when the thread is not named yet — never the
+ * channel's name. */
+function threadScopeLabel(thread: { title?: unknown; display_name?: unknown } | null | undefined): string {
+  const named = thread?.display_name ?? thread?.title;
+  const text = typeof named === "string" ? named.trim() : "";
+  return text.length > 48 ? `${text.slice(0, 47)}…` : text;
 }
 
 /** The selection the panel scopes to, as far as Discuss reads it. */
@@ -353,7 +365,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
   function persistPanelState(open: boolean): void {
     if (boundRaw === null) return;
     try {
-      deps.keepPanelState?.({ open, channelId: boundRaw.channelId, threadId: boundRaw.threadId, view: boundRaw.view });
+      deps.keepPanelState?.({ open, channelId: boundRaw.channelId, threadId: boundRaw.threadId, view: boundRaw.view, label: boundRaw.label });
     } catch {
       // Storage refused: openness holds until a reload, as the layout does.
     }
@@ -390,15 +402,19 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     // sync (client-config's, a view change's) retries the restore.
     if (busy || !available()) return false;
     restoreDone = true;
-    let label = deps.channelLabel?.(stored.channelId) ?? stored.channelId;
+    // `#1841`: a thread scope restores under the thread's own name — the kept
+    // label, or the open thread's where it is this thread — never the channel's.
+    let label = stored.threadId === null
+      ? (deps.channelLabel?.(stored.channelId) ?? stored.channelId)
+      : (typeof stored.label === "string" ? stored.label : "");
     try {
       const selection = deps.selection();
       if (stored.threadId !== null && selection.threadId === stored.threadId) {
-        const named = selection.thread?.display_name ?? selection.thread?.title;
-        if (typeof named === "string" && named !== "") label = named;
+        const named = threadScopeLabel(selection.thread);
+        if (named !== "") label = named;
       }
     } catch {
-      // The channel label stands where the selection is not ready.
+      // The kept label stands where the selection is not ready.
     }
     openWith({ channelId: stored.channelId, threadId: stored.threadId, view: stored.view, label });
     return true;
@@ -497,8 +513,9 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     const threadId = selection.view === "thread" && selection.threadId ? String(selection.threadId) : null;
     let label = deps.channelLabel?.(channelId) ?? channelId;
     if (threadId !== null) {
-      const named = selection.thread?.display_name ?? selection.thread?.title;
-      label = typeof named === "string" && named !== "" ? named : label;
+      // `#1841`: the thread's own name, or no name yet — a thread scope must
+      // never borrow the channel's label for its title.
+      label = threadScopeLabel(selection.thread);
     }
     return {
       channelId,
@@ -588,7 +605,13 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         if (panel.isOpen() && boundScope !== null && boundRaw !== null) {
           const decision = viewChangeDecision(boundScope, normalizeDiscussScope(currentRaw));
           if (decision.action === "stay") {
-            // Same scope: the answer and its bound label stand.
+            // Same scope: the answer stands. The label may name itself only
+            // after entry (the thread's summary landing), so a name the
+            // current scope now carries replaces a nameless bound label
+            // (#1841) — never the other way round.
+            if (currentRaw.label !== "" && currentRaw.label !== boundRaw.label) {
+              boundRaw = currentRaw;
+            }
             panel.setScope(boundRaw);
           } else if (decision.action === "rescope") {
             // `#1811`: entering a thread re-aims Discuss at that thread —

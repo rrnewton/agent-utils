@@ -1277,7 +1277,28 @@ const discussView = createDiscussView({
   inDocumentsView: () => screens.view() === "docs",
   enterSends: () => enterSends.current(),
   selectedChannelId: () => String(selectedChannelId() ?? ""),
-  selection: () => selection(),
+  // `#1841 vibe-talk-discuss-title-and-body-match-scope`: a thread entered
+  // from its badge (or before its directory read lands) carries no thread
+  // summary on the selection, so Discuss would name it for the channel;
+  // the store's own summary for the open thread stands in for it.
+  selection: () => {
+    const current = selection();
+    if (current.view === "thread" && current.threadId && !current.thread) {
+      const held = channelStore.current().threads.find((summary) => String(summary.id) === String(current.threadId));
+      if (held) return { ...current, thread: held };
+      // As the thread button names it (`#1819`): the root's filed name,
+      // else its first line.
+      const root = channelStore.current().messages.find((message) => {
+        const thread = /** @type {any} */ (message).thread;
+        return thread && thread.is_root === true && String(thread.id) === String(current.threadId);
+      });
+      if (root) {
+        const record = /** @type {any} */ (root).thread;
+        return { ...current, thread: { display_name: record.display_name ?? null, title: String(/** @type {any} */ (root).content || "").split("\n")[0] } };
+      }
+    }
+    return current;
+  },
   serviceName: (channel) => chatServiceOf(channel),
   channelLabel: (id) => channelLabel(id),
   // `discuss-transcript-persist`: a jump keeps the panel open (it overlays the

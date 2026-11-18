@@ -87,7 +87,9 @@ export interface DiscussScope {
 
 /** `#1811`. The panel title for one scope: main channel, or thread slug. */
 export function discussTitle(scope: DiscussScope): string {
-  return scope.threadId !== null ? `Discuss: thread ${scope.label}` : "Discuss: main channel";
+  if (scope.threadId === null) return "Discuss: main channel";
+  // `#1841`: an unnamed thread scope is still a thread, never the channel.
+  return scope.label ? `Discuss: thread ${scope.label}` : "Discuss: thread";
 }
 
 /** What the panel asks of the page. Every function is read on use, never at construction. */
@@ -657,6 +659,58 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   let lastScope: DiscussScope | null = null;
   let lastAnswer: CatchupAnswer | null = null;
   let marking = false;
+  // `#1841 vibe-talk-discuss-title-and-body-match-scope`: one Discuss state
+  // per scope. The answer each scope last showed, keyed by channel plus
+  // thread (main is its own scope), so switching scope restores that
+  // scope's own summary and never another scope's.
+  const scopeAnswers = new Map<string, { scope: DiscussScope; answer: CatchupAnswer; readCreatedMs: number }>();
+
+  function scopeKeyOf(scope: DiscussScope): string {
+    return `${scope.channelId}\0${scope.threadId ?? ""}`;
+  }
+
+  function stashScopeAnswer(): void {
+    if (lastScope !== null && lastAnswer !== null) {
+      scopeAnswers.set(scopeKeyOf(lastScope), { scope: lastScope, answer: lastAnswer, readCreatedMs });
+    }
+  }
+
+  /** Blank the body for a scope with nothing of its own yet. */
+  function clearScopeBody(): void {
+    deps.byId("discuss-answer").textContent = "";
+    deps.byId("discuss-footer").hidden = true;
+    deps.byId("discuss-stamp").textContent = "";
+    deps.byId("discuss-stamp").hidden = true;
+    deps.byId("discuss-retry").hidden = true;
+    deps.byId("discuss-stale").hidden = true;
+    const terms = maybe("discuss-terms");
+    if (terms) terms.hidden = true;
+    const termsList = maybe("discuss-terms-list");
+    if (termsList) termsList.textContent = "";
+    const timeline = maybe("discuss-timeline");
+    if (timeline) timeline.textContent = "";
+  }
+
+  /** Show `scope`'s own stashed answer, or a blank body; true when shown. */
+  function showStashedScope(scope: DiscussScope): boolean {
+    const cached = scopeAnswers.get(scopeKeyOf(scope)) ?? null;
+    lastScope = scope;
+    lastAnswer = cached?.answer ?? null;
+    readCreatedMs = cached?.readCreatedMs ?? 0;
+    if (cached === null) {
+      clearScopeBody();
+      return false;
+    }
+    drawAnswer(cached.answer, null);
+    drawTerms(cached.answer);
+    drawFooter(cached.answer, scope);
+    const stampLine = formatStampLine(cached.answer.stamp);
+    deps.byId("discuss-stamp").textContent = stampLine;
+    deps.byId("discuss-stamp").hidden = stampLine === "";
+    deps.byId("discuss-retry").hidden = true;
+    deps.byId("discuss-stale").hidden = true;
+    return true;
+  }
   // `#1344 discuss-panel-resize`. The layout in force, kept here rather than read back out
   // of the DOM (a drag would otherwise parse its own output on every move, as the column
   // splitter's split is kept). The stylesheet decides where each applies — the width only
@@ -1396,6 +1450,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         if (asked !== generation || !isOpen()) return;
         const answer = asCatchupAnswer(value);
         lastAnswer = answer;
+        scopeAnswers.set(scopeKeyOf(scope), { scope, answer, readCreatedMs });
         deps.byId("discuss-status").textContent = "Updated.";
         drawAnswer(answer, null);
         drawTerms(answer);
@@ -1460,6 +1515,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         if (shape.summary !== null) {
           lastAnswer = shape.summary;
           readCreatedMs = shape.created_ms;
+          scopeAnswers.set(scopeKeyOf(scope), { scope, answer: shape.summary, readCreatedMs });
           drawAnswer(shape.summary, recordKeyFor(scope, shape.created_ms));
           drawTerms(shape.summary);
           drawFooter(shape.summary, scope);
@@ -1703,6 +1759,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         if (asked !== generation || !isOpen()) return;
         const answer = asCatchupAnswer(value);
         lastAnswer = answer;
+        scopeAnswers.set(scopeKeyOf(scope), { scope, answer, readCreatedMs });
         const unread = answer.window?.unread_count ?? answer.unread_ids.length;
         const count = answer.window?.count ?? answer.unread_ids.length;
         // `#1761`: a window cut short of the thread's start says so, visibly —
@@ -2026,6 +2083,12 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       };
     },
     openWith(scope: DiscussScope) {
+      // `#1841`: opening for another scope switches windows, as a rescope
+      // does — the old scope's body never stands under the new title.
+      if (lastScope === null || scopeKeyOf(lastScope) !== scopeKeyOf(scope)) {
+        stashScopeAnswer();
+        showStashedScope(scope);
+      }
       try {
         applyStoredLayout();
       } catch {
@@ -2039,6 +2102,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       recordFor(scope);
     },
     close() {
+      stashScopeAnswer();
       generation += 1;
       stopOwnReading();
       if (pending) setPending(false);
@@ -2053,6 +2117,20 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       setTitle(scope);
     },
     rescope(scope: DiscussScope) {
+      // `#1841`: switching scope is switching Discuss windows. Stash the
+      // outgoing scope's state, then show the incoming scope's own — its
+      // stashed summary, or a blank body the preview and saved record may
+      // fill for this scope only. `previewFor` bumps the generation, so a
+      // late answer for the outgoing scope is dropped, never drawn here.
+      if (lastScope !== null && scopeKeyOf(lastScope) === scopeKeyOf(scope)) {
+        previewFor(scope);
+        recordFor(scope);
+        return;
+      }
+      stashScopeAnswer();
+      stopOwnReading();
+      if (pending) setPending(false);
+      showStashedScope(scope);
       previewFor(scope);
       recordFor(scope);
     },
@@ -2071,8 +2149,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       const restoredRecord = lastScope !== null && lastScope.channelId === scope.channelId && lastScope.threadId === scope.threadId
         ? lastFoldRecord
         : null;
+      stashScopeAnswer();
       lastScope = scope;
       lastAnswer = answer;
+      scopeAnswers.set(scopeKeyOf(scope), { scope, answer, readCreatedMs });
       try {
         applyStoredLayout();
       } catch {

@@ -547,6 +547,85 @@ test("catchup: the bar button opens and closes; entering a thread re-scopes Disc
   } finally { fx.restore(); }
 });
 
+
+test("catchup: A -> B -> main -> A switches Discuss windows; header and body match the scope (#1841)", async () => {
+  const fx = fixture({
+    selection: { view: "thread", threadId: "tA", thread: { display_name: "thread-a-slug", title: "Thread A first line" } },
+    respond: (channelId, body) => Promise.resolve(answer({
+      text: body.thread_id === "tA" ? "Summary of A." : body.thread_id === "tB" ? "Summary of B." : "Summary of main.",
+    })),
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: thread thread-a-slug");
+    assert.equal(fx.els["discuss-answer"].textContent, "Summary of A.");
+    // Thread A -> thread B: B has no summary yet, so a blank pane with its
+    // own preview and Summarize — never A's summary under B's title.
+    fx.setSelection({ view: "thread", threadId: "tB", thread: { display_name: "thread-b-slug", title: "Thread B first line" } });
+    view.sync();
+    await flush();
+    assert.equal(view.isOpen(), true, "A -> B closed the panel");
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: thread thread-b-slug");
+    assert.equal(fx.els["discuss-answer"].textContent, "", "B showed A's summary");
+    assert.equal(fx.els["discuss-status"].textContent, "2 unread ready.");
+    // B gets its own summary.
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(fx.els["discuss-answer"].textContent, "Summary of B.");
+    // Thread -> main: main has none yet, so blank again under the main title.
+    fx.setSelection({ view: "main", threadId: null, thread: null });
+    view.sync();
+    await flush();
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: main channel");
+    assert.equal(fx.els["discuss-answer"].textContent, "", "main showed B's summary");
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(fx.els["discuss-answer"].textContent, "Summary of main.");
+    // Back to A: A's own state returns, with no new model call.
+    const postsBefore = fx.calls.posts.length;
+    fx.setSelection({ view: "thread", threadId: "tA", thread: { display_name: "thread-a-slug", title: "Thread A first line" } });
+    view.sync();
+    await flush();
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: thread thread-a-slug");
+    assert.equal(fx.els["discuss-answer"].textContent, "Summary of A.", "returning to A did not restore A's summary");
+    assert.equal(fx.calls.posts.length, postsBefore, "returning to A asked the model again");
+    // And main's state is still its own on the way back.
+    fx.setSelection({ view: "main", threadId: null, thread: null });
+    view.sync();
+    await flush();
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: main channel");
+    assert.equal(fx.els["discuss-answer"].textContent, "Summary of main.");
+  } finally { fx.restore(); }
+});
+
+test("catchup: a late answer for A arriving after the switch to B is dropped; an unnamed thread never takes the channel name (#1841)", async () => {
+  const pending = deferred();
+  const fx = fixture({
+    selection: { view: "thread", threadId: "tA", thread: { display_name: "thread-a-slug", title: "Thread A first line" } },
+    respond: () => pending.promise,
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    click(fx.els["discuss-summarize"]);
+    assert.equal(fx.els["discuss-status"].textContent, "Reading…");
+    // Switch to B before A's answer lands; B's thread record is not named yet.
+    fx.setSelection({ view: "thread", threadId: "tB", thread: null });
+    view.sync();
+    await flush();
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: thread", "an unnamed thread took the channel's name");
+    pending.resolve(answer({ text: "Late answer for A." }));
+    await flush();
+    assert.equal(fx.els["discuss-answer"].textContent, "", "the late A answer landed in B's pane");
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: thread");
+  } finally { fx.restore(); }
+});
+
 test("catchup: Documents disables Discuss with its tooltip, closes the panel, and switching back restores it (#1812)", async () => {
   const fx = fixture();
   try {
@@ -1334,6 +1413,7 @@ test("binding: the rules table names every rule and rule 5 is close", () => {
     "in-thread-link-jumps-in-place",
     "out-of-thread-link-returns-to-bound",
     "widening-rescopes-to-main",
+    "sideways-rescopes-to-thread",
     "widen-or-sideways-closes",
     "fallback-closes-and-jumps",
     "out-of-window-cite-links-out",
@@ -1440,23 +1520,34 @@ test("binding: returning to main re-scopes to the channel; no model call, no his
   } finally { fx.restore(); }
 });
 
-test("binding: sideways closes; a fallback tap closes and jumps; an out-of-scope tap follows it", async () => {
+test("binding: sideways switches windows (#1841); a fallback tap closes and jumps; an out-of-scope tap follows it", async () => {
   const fx = fixture({ selection: THREAD_T1 });
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
     await openAndSummarize(view, fx);
     await flush();
-    // Sideways: thread t1 -> thread t2 ends the binding.
+    // Sideways: thread t1 -> thread t2 switches Discuss windows, as the
+    // owner asked (#1841): the panel stays open on t2's own (blank) state.
     fx.setSelection({ view: "thread", threadId: "t2", thread: { title: "Second thread" } });
     view.sync();
-    assert.equal(view.isOpen(), false, "a sideways switch left the panel open");
-    assert.equal(fx.calls.history.length, 1);
-    // Back, then a citation for the other thread: fallback close + jump.
+    await flush();
+    assert.equal(view.isOpen(), true, "a sideways switch closed the panel");
+    assert.equal(view.boundScope().threadId, "t2", "a sideways switch did not rebind to t2");
+    assert.equal(fx.els["discuss-title"].textContent, "Discuss: thread Second thread");
+    assert.equal(fx.els["discuss-answer"].textContent, "", "t2 showed t1's summary");
+    assert.deepEqual(fx.calls.history, [], "a sideways switch pushed a history entry");
+    // Back to t1: its own summary returns, still with no history entry.
     fx.setSelection(THREAD_T1);
-    assert.equal(view.restoreFromHistory(fx.calls.history[0]), true);
+    view.sync();
+    await flush();
+    assert.equal(fx.els["discuss-answer"].textContent, "Two things happened.", "returning to t1 lost its summary");
+    // A citation for the other thread: fallback close + jump, Back restores.
     tapCitation(fx, "/?c=chan-1&v=thread&t=t2&m=discord%3Achan-1%3Am9%3At2");
     assert.equal(view.isOpen(), false, "a fallback tap left the panel open");
+    assert.equal(fx.calls.history.length, 1);
+    fx.setSelection(THREAD_T1);
+    assert.equal(view.restoreFromHistory(fx.calls.history[0]), true);
     assert.deepEqual(fx.calls.jumps, [{ service: "discord", channel: "chan-1", message: "m9", thread: "t2" }]);
     // Back again, then an out-of-scope (scope=out) citation for this very
     // thread: the marker wins, same fallback route.
@@ -2079,10 +2170,10 @@ test("discusspersist: open keeps its scope, close keeps closed, a fresh view res
     view.open();
     await flush();
     assert.equal(view.isOpen(), true);
-    assert.deepEqual(keptPanel, { open: true, channelId: "chan-1", threadId: "t1", view: "flat" },
+    assert.deepEqual(keptPanel, { open: true, channelId: "chan-1", threadId: "t1", view: "flat", label: "First thread" },
       "opening did not keep its thread scope");
     view.close();
-    assert.deepEqual(keptPanel, { open: false, channelId: "chan-1", threadId: "t1", view: "flat" },
+    assert.deepEqual(keptPanel, { open: false, channelId: "chan-1", threadId: "t1", view: "flat", label: "First thread" },
       "closing did not persist as closed");
     // Reload with the closed entry: a fresh view over the same store stays closed.
     const closedFx = fixture({ selection: THREAD_T1 });

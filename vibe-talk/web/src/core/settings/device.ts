@@ -90,6 +90,9 @@ export interface DiscussPanelState {
   readonly channelId: string;
   readonly threadId: string | null;
   readonly view: "flat" | "main";
+  // `#1841`: the bound scope's own name, kept so a restored thread scope is
+  // titled by the thread and never by the channel.
+  readonly label?: string;
 }
 
 /** The device's settings, by name. */
@@ -266,11 +269,11 @@ export const DEVICE_SETTINGS = Object.freeze({
     key: "vibe-talk.voice.discuss-panel",
     read: (raw: string | null): DiscussPanelState | null => {
       try {
-        const held = JSON.parse(raw || "null") as { open?: unknown; channelId?: unknown; threadId?: unknown; view?: unknown } | null;
+        const held = JSON.parse(raw || "null") as { open?: unknown; channelId?: unknown; threadId?: unknown; view?: unknown; label?: unknown } | null;
         if (!held || typeof held.open !== "boolean" || typeof held.channelId !== "string"
           || !(held.threadId === null || typeof held.threadId === "string")
           || (held.view !== "flat" && held.view !== "main")) return null;
-        return { open: held.open, channelId: held.channelId, threadId: held.threadId as string | null, view: held.view };
+        return { open: held.open, channelId: held.channelId, threadId: held.threadId as string | null, view: held.view, ...(typeof held.label === "string" ? { label: held.label } : {}) };
       } catch {
         return null;
       }
