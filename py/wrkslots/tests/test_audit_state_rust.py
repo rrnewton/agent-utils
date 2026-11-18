@@ -236,9 +236,20 @@ def _check(root: Path, tmp_path: Path) -> dict[str, object]:
     # retry and still fail.
     actual: dict[str, object] = {}
     expected: dict[str, object] = {}
+    compared = False
+    bus_refused = False
     for attempt in range(5):
         result = _rust(root, census_state=tmp_path / f"rust-census-{attempt}.json")
+        if result.returncode != 0 and "busctl unit listing failed" in result.stderr:
+            # A transient D-Bus drop refuses the Rust edition's unit
+            # listing before any judgment: host churn of the readable
+            # kind, not a disagreement. Retry the pair through it.
+            bus_refused = True
+            time.sleep(1.0)
+            continue
         assert result.returncode == 0, result.stderr
+        bus_refused = False
+        compared = True
         actual = _scrub(json.loads(result.stdout))
         expected = _scrub(
             _python(root, tmp_path, state_name=f"census-state-{attempt}.json")
@@ -246,6 +257,13 @@ def _check(root: Path, tmp_path: Path) -> dict[str, object]:
         if actual == expected:
             return actual
         time.sleep(1.0)
+    if bus_refused and not compared:
+        # The user bus never answered, so this host cannot read the
+        # evidence the differential compares; skip rather than fail on it.
+        pytest.skip(
+            "the user-systemd bus did not answer the audit's unit listing "
+            "in 5 attempts, so the differential cannot be judged on this host"
+        )
     assert actual == expected
     return actual
 
