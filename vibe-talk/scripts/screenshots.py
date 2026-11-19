@@ -3131,21 +3131,20 @@ def _act_live_message(driver: Driver) -> None:
 
 
 def _act_own_message_read(driver: Driver) -> None:
-    """`#1881`: the owner sends a message; its card is read from the moment it lands.
+    """`#1881`: the owner's own message arrives replayed, as after a reconnect or restart.
 
-    Sent through the real composer and the real post route, against the fake chat
-    service: the confirmed part replaces the outbox entry (the echo, with its real
-    id), and the row must be drawn read at once — Unarchive offered, not Done — with
-    no later pass, restart or settings trip needed to mark it.
+    The frame is the stream's replay shape (`replayed: true`), which used to skip the
+    start-read noting entirely and draw his row unread until a later pass marked it.
     """
     _act_open_channel(driver)
-    driver.page.fill("#channel-compose-text", "my own words — already read")
-    driver.click("channel-send")
+    driver.js(
+        "window.__channelSays('9990000000000000007', 'ada', "
+        "'my own words, replayed after the reconnect — already read', false, null, "
+        "'2000000000000000098', true)"
+    )
     driver.page.wait_for_function(
-        "() => { const rows = [...document.querySelectorAll('#discord-log > li')]; "
-        "const row = rows.find((li) => (li.textContent || '').includes('my own words')); "
-        "return !!row && row.getAttribute('data-archived') === 'true'; }",
-        timeout=15_000,
+        "() => !!document.querySelector('#discord-log > li[data-id=\"9990000000000000007\"]')",
+        timeout=10_000,
     )
     driver.settle(250)
 
@@ -7337,21 +7336,19 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="79-own-messages-read",
-        what="the owner's own message, sent just now, is already marked read",
+        what="the owner's own message, replayed after a reconnect, is already marked read",
         act=_act_own_message_read,
         profiles=("android-412", "laptop-1280"),
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
             (
-                "the sent own row is on screen",
-                "([...document.querySelectorAll('#discord-log > li')].some((li) => "
-                "(li.textContent || '').includes('my own words')))",
+                "the replayed own row is on screen",
+                "!!document.querySelector('#discord-log > li[data-id=\"9990000000000000007\"]')",
             ),
             (
                 "and it is drawn read, not unread",
-                "([...document.querySelectorAll('#discord-log > li')].find((li) => "
-                "(li.textContent || '').includes('my own words'))"
-                ".getAttribute('data-archived') === 'true')",
+                "document.querySelector('#discord-log > li[data-id=\"9990000000000000007\"]')"
+                ".getAttribute('data-archived') === 'true'",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
