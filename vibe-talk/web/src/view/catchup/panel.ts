@@ -1319,7 +1319,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
 
   /** `#1912`: open or close every fold under `root`, nested folds included. */
   function setDetailsDeep(root: HTMLElement, open: boolean): void {
-    for (const kid of Array.from(root.children as ArrayLike<HTMLElement>)) {
+    for (const kid of Array.from(root.children as unknown as ArrayLike<HTMLElement>)) {
       const el = kid as HTMLElement & { open?: boolean };
       if (el.tagName === "DETAILS") el.open = open;
       setDetailsDeep(el, open);

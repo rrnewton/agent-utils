@@ -128,6 +128,7 @@ export interface ElementById {
   "discuss-count": HTMLInputElement;
   "discuss-covers": HTMLParagraphElement;
   "discuss-current-covers": HTMLSpanElement;
+  "discuss-current-heading": HTMLHeadingElement;
   "discuss-dock-toggle": HTMLButtonElement;
   "discuss-draft-discard": HTMLButtonElement;
   "discuss-draft-keep": HTMLButtonElement;
@@ -161,6 +162,7 @@ export interface ElementById {
   "discuss-terms-list": HTMLUListElement;
   "discuss-terms-summary": HTMLElement;
   "discuss-timeline": HTMLDivElement;
+  "discuss-timeline-heading": HTMLHeadingElement;
   "discuss-title": HTMLSpanElement;
   "discuss-uncovered": HTMLParagraphElement;
   "discuss-uncovered-go": HTMLButtonElement;
