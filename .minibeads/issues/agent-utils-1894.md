@@ -13,7 +13,7 @@ updated_at: 2026-11-19T00:34:25-05:00
 
 # Description
 
-[watermelon-full-preview] Owner (thread 216, verbatim): "I am doing a search for a string ("afl") in dev-hermit 014 now... and it looks ok for a second showing me filtered cards (I started at the bottom of the screen), but THEN the hits in threads populate and show by default AND jump me far back in the scrollback to the top. I would NEVER want this kind of extra search result to be on by default. I was able to collapse it... but I didn't want it at all. Before I asked for these "extra" results to be toggled WITH A CHIP under the search bar and to be off by default. And IF they are on they should appear inline in chronological order WITHOUT jumping the scrollback"
+[watermelon-full-preview] Owner (thread 216; one environment name redacted): "I am doing a search for a string ("afl") in a channel now... and it looks ok for a second showing me filtered cards (I started at the bottom of the screen), but THEN the hits in threads populate and show by default AND jump me far back in the scrollback to the top. I would NEVER want this kind of extra search result to be on by default. I was able to collapse it... but I didn't want it at all. Before I asked for these "extra" results to be toggled WITH A CHIP under the search bar and to be off by default. And IF they are on they should appear inline in chronological order WITHOUT jumping the scrollback"
 
 Trace (page build e53c7fee): `placeFilterAnchor` -> nudge wrote 836 -> -376 and 0 -> -297 at 05:10:07Z, and 6615 -> 6330 at 05:08:34Z, when the thread hits arrived.
 
