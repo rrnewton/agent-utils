@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-discuss-summary-timeline-layout: Discuss summary window interleaves collapsible Q/A pairs and earlier summaries under a headed current summary'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - discuss
 - ui
 created_at: 2026-11-19T14:20:38-05:00
-updated_at: 2026-11-19T14:20:38-05:00
+updated_at: 2026-11-19T17:45:05-05:00
+closed_at: 2026-11-19T17:45:05-05:00
 ---
 
 # Description
@@ -42,3 +43,7 @@ Today, in `vibe-talk/web/src/view/catchup/panel.ts`: the current summary's secti
 # Notes
 
 [watermelon-full-preview] mu-discusslayout, owner thread 223, 2026-11-19. Number pre-assigned by coordb; filed before implementation. Related: #1911 vibe-talk-discuss-message-link-opens-new-window (parallel lane, link handling only), #1787 vibe-talk-discuss-resummarize-stale-terms-and-dated-labels (dated labels this extends), #1387 discuss-collapsible-sections and #1525 fold-marker-on-heading-line (the shared fold this restyles), #1497 discuss-fold-state-persist.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 7968ce34 (owner gate PASS, 199 steps, on 3541cc22, replayed over 138e1a71). The Discuss pane now stands as a headed Current summary section ("Current summary", "Covers N messages") then Terms then a Timeline section, separated by horizontal rules; follow-up question and answer collapse together as one "Follow-up question <datetime>" pair interleaved in record order with earlier summaries that share the current summary's real-header collapsible style (thin rules top and bottom when open, headings-first on expand, a small expand all to the right of the Earlier summary header); centred low-key chip Expand all / Collapse all pairs stand above the current summary and above the timeline; Save draft is stacked over Send. Panel tests cover the pairing, both chip pairs, the headings-first expand and the covers line, and scene 84-discuss-timeline-layout (renumbered from 83, which main had taken) exercises the whole flow through the real server and model stub. Evidence: before (9023b5e4) and after from landed main (7968ce34) screenshot folders, BUILD.txt in both, phone 412x915 and desktop 1280x800, light and dark, keyboard open on phone, viewed frame by frame; the folders sit with coordb via the lane handoff. The gate on the pre-rebase tree failed only on scene 59-all-thread-selected, waived by coordb as a known main failure; its exclusive rerun passed and the final gate passed outright.
