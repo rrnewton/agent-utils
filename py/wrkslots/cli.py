@@ -63707,6 +63707,18 @@ def _finish_remove_paths(
         # Absent-slot closure (B2-A): the recorded owner proven dead
         # plus two ordinary reference scans, never the following census.
         _assert_absent_slot_unused(config, record, (fenced_slot,))
+    elif (
+        record.slot_type == "validate"
+        and finish.private_cleanup is not None
+        and record.owner is not None
+        and _process_state(record.owner)[0] == "dead"
+    ):
+        # Validation teardown closure (B2-B), only where its proof is
+        # even available (a proven-dead recorded owner): owner dead,
+        # recorded slice subtree empty, one ordinary reference scan.
+        # Ordinary validate finishes with a live owner keep the
+        # following census below.
+        _assert_validate_teardown_unused(config, record, (fenced_slot,))
     elif private_fence_identity is not None:
         assert finish.private_cleanup is not None
         fresh_census = finish.private_cleanup.fresh_census
@@ -89147,6 +89159,92 @@ def _assert_absent_slot_unused(
                 f"live process {pid} may still use absent slot {record.slot}: "
                 f"{kind}={target}"
             )
+
+
+def _validate_slice_name(slot: str) -> str:
+    """The slice every box of one validation slot runs under (B2-B).
+
+    A pure function of the slot name, recorded by derivation at
+    creation and at teardown alike: no new persisted field, so pinned
+    readers see no change.  ci-hub launches the validation's boxes
+    with ``--slice`` set to this name (gate.py/dagrun step 1).
+    """
+
+    return f"validate-{slot}.slice"
+
+
+def _slice_subtree_empty(
+    slice_name: str, *, cgroup_root: Path = Path("/sys/fs/cgroup")
+) -> bool:
+    """Whether no process remains anywhere under a systemd slice.
+
+    Kernel cgroup membership survives forks and reparenting, so an
+    empty subtree (every ``cgroup.procs`` in it empty, or the slice
+    itself already gone) proves no descendant of the slice's work
+    survives, however often it re-scoped inside the subtree.
+    """
+
+    candidates = [
+        path
+        for path in cgroup_root.rglob(slice_name)
+        if path.is_dir() and not path.is_symlink()
+    ]
+    if not candidates:
+        return True
+    for candidate in candidates:
+        for procs in candidate.rglob("cgroup.procs"):
+            try:
+                if procs.read_text(encoding="ascii").strip():
+                    return False
+            except OSError:
+                continue
+    return True
+
+
+def _assert_validate_teardown_unused(
+    config: Config,
+    record: ActiveRecord,
+    paths: Sequence[Path],
+    *,
+    budget: _ReadOnlyCommandBudget | None = None,
+) -> None:
+    """Validation-slot teardown closure (B2-B).
+
+    The recorded owner proven dead (pidfd), the recorded slice's whole
+    subtree empty (boxes that re-scoped inside it are still members;
+    a box launched WITHOUT the slice is a sibling the subtree check
+    cannot see, which is what the reference scan is for), and one
+    ordinary all-process reference scan finding no holder.
+    """
+
+    owner = record.owner
+    if owner is None:
+        raise Refusal(
+            f"validation slot {record.slot} has no recorded owner "
+            "generation to prove dead; refusing teardown closure"
+        )
+    state, detail = _process_state(owner)
+    if state != "dead":
+        raise Refusal(
+            f"recorded owner for validation slot {record.slot} is not "
+            f"proven dead ({state}: {detail}); refusing teardown closure"
+        )
+    slice_name = _validate_slice_name(record.slot)
+    if not _slice_subtree_empty(slice_name):
+        raise Refusal(
+            f"validation slice {slice_name} still has processes for "
+            f"slot {record.slot}; refusing teardown closure"
+        )
+    census = _capture_process_path_census(paths, budget=budget)
+    live = [
+        match for match in census.matches if not match[3].endswith(" (deleted)")
+    ]
+    if live:
+        pid, _slot, kind, target = live[0]
+        raise Refusal(
+            f"live process {pid} may still use validation slot "
+            f"{record.slot}: {kind}={target}"
+        )
 
 
 def _census_record(record: ActiveRecord | None) -> ActiveRecord | None:
