@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-whole-threads-no-duplicate-hits: Whole threads shows each hit twice — once greyed as thread context, once bright as the hit'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - search
 - ui
 created_at: 2026-11-18T15:31:14-05:00
-updated_at: 2026-11-18T15:31:14-05:00
+updated_at: 2026-11-18T22:45:19-05:00
 ---
 
 # Description
@@ -33,3 +33,7 @@ With Whole threads on, a matching thread renders ONCE in its entirety, in order.
 # Notes
 
 Prior work: #1852 vibe-talk-search-whole-threads-toggle (landed 55dac4d7) — the search-bar Whole-threads toggle, `setEntireThreads`/`entireThreadHits` in `web/src/view/channel/searchrows.ts`.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 7d12238e. The bright second copy was a server-search card: the server-rendered first paint had not folded its rows into the store, so canon-only freshness treated every on-screen hit as new and drew it again. `serverFreshHits` and the transcripts bucket now also treat a hit as held when a real row for its id already stands in the timeline, so each hit renders once and is highlighted in place. Whole-threads rendering keeps non-matching thread messages shown normally. Evidence and gate history are in /tmp/dev-agent-utils-handoffs/mu-wholedup.md; final screenshots are in /tmp/mu-wholedup-shots-final with BUILD.txt for commit 7d12238e.
