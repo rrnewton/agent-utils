@@ -401,6 +401,7 @@ fn console_shows_a_follower_error_instead_of_silence() {
         "claude",
         "--effort",
         "high",
+        "--harness-arg=--permission-mode=bypassPermissions",
         "--cwd",
         &work,
     ]);
@@ -459,6 +460,7 @@ fn console_delivers_typed_lines_as_plain_turns() {
         "claude",
         "--effort",
         "high",
+        "--harness-arg=--permission-mode=bypassPermissions",
         "--cwd",
         &work,
     ]);

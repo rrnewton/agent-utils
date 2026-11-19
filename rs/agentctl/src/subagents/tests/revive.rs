@@ -3857,6 +3857,7 @@ fn ultra_profile_status_reports_only_real_environment_drift() {
         &fixture,
         "muse-ultra",
         json!({"harness": "muse", "mode": "interactive", "reasoning_effort": "ultra",
+               "argv": ["--approval-mode=never"],
                "env": {"RECOVERY_MODE": "on"}}),
     );
     fixture
@@ -3869,6 +3870,7 @@ fn ultra_profile_status_reports_only_real_environment_drift() {
                 harness: "muse".to_owned(),
                 profile: Some("muse-ultra".to_owned()),
                 environment: vec!["RECOVERY_MODE=on".to_owned()],
+                harness_args: vec!["--approval-mode=never".to_owned()],
                 ..StartOptions::default()
             },
         )

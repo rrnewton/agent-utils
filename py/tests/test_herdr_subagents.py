@@ -1477,7 +1477,7 @@ def test_muse_ultra_start_carries_the_gate_and_status_reports_only_real_drift(
     # A real profile change still reports drift, without the gate counted.
     config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
         "watermelon": {"harness": "muse", "mode": "interactive", "model": "chosen",
-                       "reasoning_effort": "ultra", "argv": [],
+                       "reasoning_effort": "ultra", "argv": ["--approval-mode=never"],
                        "env": {"EXTRA_MODE": "on"}},
     }}), encoding="utf-8")
     config.chmod(0o600)
