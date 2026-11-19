@@ -638,6 +638,43 @@ test("`#624 voice-page-modularity`: the reader is left on the message their eye 
   assert.equal(calls.at(-1), "newest");
 });
 
+test("`#1880 vibe-talk-no-programmatic-scroll-after-user-scroll`: a restore does not move a view the reader has scrolled since the capture", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  let shift = 0;
+  const row = (id, top) => ({ id, parentNode: {}, getAttribute: () => null, getBoundingClientRect: () => ({ top: top + shift, bottom: top + shift + 40 }) });
+  const rows = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
+  const log = { id: "discord-log", children: rows };
+  const handlers = {};
+  const area = { scrollTop: 300, getBoundingClientRect: () => ({ top: 0 }),
+    addEventListener: (type, fn) => { handlers[type] = fn; } };
+  const chip = { hidden: true, getBoundingClientRect: () => ({ top: 0 }) };
+  const els = { "discord-log": log, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": chip, transcript: { children: [] } };
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => false,
+    scrollToNewest: () => { throw new Error("the newest line was followed over a scrolled reader"); },
+    renderJumpNewest: () => {}, setJumpNewest: () => {},
+  });
+  // No reader input since the capture: the change above is held as before.
+  keep.preservingScroll(() => { shift = 25; });
+  assert.equal(area.scrollTop, 325, "with no reader input, the reader was not held on their message");
+  shift = 0;
+  area.scrollTop = 300;
+  // The reader wheels up the thread while a live read is in flight; its landing
+  // must not restore the place captured before the wheel.
+  const mark = keep.captureScroll();
+  handlers.wheel();
+  area.scrollTop = 180;
+  keep.restoreScroll(mark);
+  assert.equal(area.scrollTop, 180, "a restore moved a view the reader had scrolled");
+  // And a redraw hold captured before the wheel does not write either.
+  const mark2 = keep.captureScroll();
+  handlers.touchstart();
+  shift = 40;
+  keep.holdingRows(() => {});
+  assert.equal(area.scrollTop, 180, "a redraw hold moved a view the reader had touched");
+});
+
 test("`#1229 keyed-row-patching`: a redraw keeps the node of every row whose messages are the very objects it was drawn from", () => {
   const { patchRows } = CHANNEL_VIEW;
   const list = {
@@ -2412,7 +2449,7 @@ test("`#624 voice-page-modularity`: a sent reply marks what it answers Done on t
 
 test("`#624 voice-page-modularity`: entering a thread lands on its first unread message, opened, and a thread with nothing unread is left where it was", () => {
   const { createThreadEntry, freshEntryState } = CHANNEL_VIEW;
-  assert.deepStrictEqual(freshEntryState(), { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null });
+  assert.deepStrictEqual(freshEntryState(), { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null, drillPlaced: false });
   const record = freshEntryState();
   const log = [];
   const rows = [];
@@ -2545,6 +2582,52 @@ test("`#1856 vibe-talk-read-aloud-follow-not-yanked-up`: while Read is following
   record.drill = { id: "m2", top: 40, thread: "t1" };
   entry.payThreadEntry();
   assert.equal(area.scrollTop, 500, "the drill anchor was re-placed over the read being followed");
+});
+
+test("`#1880 vibe-talk-no-programmatic-scroll-after-user-scroll`: the drill anchor is placed once and never re-placed after the entry settles", () => {
+  const { createThreadEntry, freshEntryState } = CHANNEL_VIEW;
+  const record = freshEntryState();
+  const rows = [];
+  const list = { children: rows };
+  const area = { scrollTop: 0, clientHeight: 100, getBoundingClientRect: () => ({ top: 0, bottom: 100 }) };
+  const entry = createThreadEntry({
+    el: (id) => (id === "discord-log" ? list : id === "scroll-area" ? area : { hidden: true, getBoundingClientRect: () => ({ height: 0, top: 0, bottom: 0 }) }),
+    activeEntry: () => record,
+    channelContextKey: () => "ctx",
+    selection: () => ({ view: "thread", threadId: "t1" }),
+    channelViewsHas: () => true,
+    viewKey: () => "thread:t1",
+    applyReadRuns: () => {},
+    atBottom: () => false,
+    renderScrollTools: () => {},
+    requestVisibleSummaries: () => {},
+    floatingClearance: () => 0,
+    drawnTop: (row) => row.top,
+    openThreadRootId: () => null,
+    isOpenThreadRoot: () => false,
+    rowIsRead: () => true,
+    toFoot: () => {},
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; },
+    setJumpNewest: () => {},
+    screen: () => "main",
+    view: () => "discord",
+    pinsView: () => ({ only: false }),
+  });
+  const row = (id, top) => ({ top, hidden: false, className: "", parentNode: list,
+    getAttribute: (name) => (name === "data-ids" ? id : name === "data-collapsed" ? "false" : null),
+    hasAttribute: () => false, getBoundingClientRect: () => ({ top, height: 20, bottom: top + 20 }) });
+  const anchor = row("m2", 90);
+  rows.push(row("m1", 10), anchor, row("m3", 130));
+  record.drill = { id: "m2", top: 40, thread: "t1" };
+  entry.payThreadEntry();
+  assert.equal(area.scrollTop, 50, "the anchor was not placed at entry (90 - 40)");
+  assert.equal(record.drillPlaced, true, "the placement was not recorded");
+  // The reader has since scrolled to 500 and the rows above grew (the anchor's
+  // drawn top moved): a later read landing must not re-place the anchor.
+  area.scrollTop = 500;
+  anchor.top = -300;
+  entry.payThreadEntry();
+  assert.equal(area.scrollTop, 500, "a settled drill anchor was re-placed over the reader");
 });
 
 

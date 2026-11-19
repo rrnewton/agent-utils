@@ -31,11 +31,13 @@ export interface EntryState {
   backGesture: GestureStart | null;
   /** The drill-in anchor owed by this entry, with the thread it was measured for, or null. */
   drill: (DrillAnchor & { thread: string }) | null;
+  /** Whether the drill-in anchor has been placed and its entry has settled (`#1880`): after that, no read re-places it again. */
+  drillPlaced: boolean;
 }
 
 /** A fresh record of entering a view (`freshEntryState`). */
 export function freshEntryState(): EntryState {
-  return { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null };
+  return { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null, drill: null, drillPlaced: false };
 }
 
 /** The landing a read is about to rebuild the rows under (`entryLandingMark`). */
@@ -165,6 +167,8 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
   }
 
   let drillKeeper: DrillKeeper | null = null;
+  /** The drill this entry placed, by identity (`#1880`): a new drill measured for a new entry settles nothing. */
+  let placedDrill: (DrillAnchor & { thread: string }) | null = null;
 
   function stopDrillKeeper(): void {
     if (drillKeeper?.resize) drillKeeper.resize.disconnect();
@@ -275,8 +279,20 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     if (drill) {
       if (deps.selection().view !== "thread" || String(deps.selection().threadId ?? "") !== drill.thread) {
         entryState().drill = null;
+        entryState().drillPlaced = false;
         stopDrillKeeper();
+      } else if (entryState().drillPlaced && placedDrill === drill) {
+        // `#1880`: the anchor was placed and this read landing settles the entry:
+        // the keeper stops and no later read (a live arrival, a mark-read settle,
+        // the post-send echo) re-places it over a reader who has since scrolled.
+        entryState().threadOwed = null;
+        entryState().threadAwaitsRead = false;
+        stopDrillKeeper();
+        deps.requestVisibleSummaries();
+        return;
       } else if (placeDrillAnchor(drill)) {
+        entryState().drillPlaced = true;
+        placedDrill = drill;
         entryState().threadOwed = null;
         entryState().threadAwaitsRead = false;
         keepDrillAnchor(drill);
@@ -288,6 +304,7 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
         // The thread is fully held and still has no row for the clicked message: the anchor
         // cannot be paid, so the entry lands as any other (`landOnFirstUnread` below).
         entryState().drill = null;
+        entryState().drillPlaced = false;
         stopDrillKeeper();
       }
     }

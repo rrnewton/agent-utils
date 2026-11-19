@@ -598,6 +598,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     // message's measured offset into this entry, for `payThreadEntry` to restore in the thread;
     // any other switch owes no anchor, and Back from the thread is such a switch.
     deps.entryState().drill = view === "thread" && drill ? { id: String(drill.id), top: drill.top, thread: String(threadId ?? "") } : null;
+    deps.entryState().drillPlaced = false;
     // ...and a landing made on an earlier visit is spent: a view this page held comes back with the
     // rows it was made on, at the scroll position it left, and must not hold the reader there again.
     deps.entryState().landing = null;
