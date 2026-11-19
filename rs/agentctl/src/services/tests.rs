@@ -993,7 +993,7 @@ fn dry_run_changes_and_writes_nothing() {
     assert!(!world.root.join("refreshes").exists());
 }
 
-fn add_repair_watch(world: &World, interval: u64) {
+fn add_repair_watch_with_interval(world: &World, interval: u64) {
     let registry = world.registry.to_string_lossy().into_owned();
     world.fake.add_unit_file(
         "repair-watch.service",
@@ -1009,11 +1009,13 @@ fn a_slow_first_watch_pass_gets_a_scaled_health_window() {
     // longer than the plain 120 s window; the window scales from its
     // configured interval (600 + 90), so a healthy slow pass refreshes.
     let world = world();
-    add_repair_watch(&world, 600);
+    add_repair_watch_with_interval(&world, 600);
     world
         .fake
         .watch_pass_delay
         .set(Duration::from_secs(300));
+    // The old daemon has long since completed a pass, so the preflight passes.
+    world.fake.sleep(Duration::from_secs(3600));
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
     let mut only = options(&world);
     only.only = vec!["repair-watch.service".into()];
@@ -1032,11 +1034,15 @@ fn an_explicit_per_unit_health_timeout_wins_over_the_scaled_window() {
     // #1890: --health-timeout-for names the window exactly, even when
     // the scaled window would have waited longer.
     let world = world();
-    add_repair_watch(&world, 600);
+    add_repair_watch_with_interval(&world, 600);
     world
         .fake
         .watch_pass_delay
         .set(Duration::from_secs(300));
+    // No progress proof either: only a completed pass could prove health.
+    world.fake.watch_progress.set(false);
+    // The old daemon has long since completed a pass, so the preflight passes.
+    world.fake.sleep(Duration::from_secs(3600));
     let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
     let mut only = options(&world);
     only.only = vec!["repair-watch.service".into()];
