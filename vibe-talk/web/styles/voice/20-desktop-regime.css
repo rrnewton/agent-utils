@@ -200,7 +200,9 @@
     box-sizing: border-box;
   }
 
-  #control-bar-bottom:has(#view-switch:not([hidden])) + #control-pane {
+  /* `#1909`: `#docs-filter-bar` stands between these two in the markup, so
+     the room is kept over a general sibling, not the adjacent one. */
+  #control-bar-bottom:has(#view-switch:not([hidden])) ~ #control-pane {
     margin-right: calc(var(--dock-switch) + var(--dock-menu) + 0.8rem);
   }
 
@@ -301,6 +303,17 @@
     padding: 0 0.2rem;
   }
 
+  /* The Documents filter bar (`#1909`) takes the dock's full width on its
+     own first row, above the bar and pane row: the dock wraps for it, and
+     order puts it ahead of both whatever the markup order is. */
+  #dock:has(> #docs-filter-bar:not([hidden])) {
+    flex-wrap: wrap;
+  }
+  #docs-filter-bar {
+    order: -1;
+    flex: 1 0 100%;
+  }
+
   /* Outline (reader view) and Fetch (list view) at the bar's right end,
      beside the hamburger: they never show together (`#1544`). */
   #control-bar[data-placement="bottom"] #doc-outline-open,
@@ -309,6 +322,7 @@
     right: calc(var(--dock-inset) + var(--dock-switch) + var(--dock-menu) + 0.8rem);
     bottom: 0.4rem;
   }
+
 
   /* Sound silences a CALL's voice, and the channel view without a call has none. web/voice.js
      leaves it unhidden there, and on a phone that never shows: Hide read is placed in the same

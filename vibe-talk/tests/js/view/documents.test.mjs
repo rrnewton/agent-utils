@@ -2546,7 +2546,7 @@ async function withStateList(run) {
   }
 }
 
-test("documents list: the card star toggles, writes the synced value, and the Starred chip filters", async () => {
+test("documents list: the card star toggles, writes the synced value, and the Starred toggle filters", async () => {
   await withStateList(async ({ list, storage, fire, cards, cardOf, chip, buttonIn }) => {
     await list.refresh();
     const star = buttonIn(cardOf("md-doc"), "doc-star");
@@ -2563,17 +2563,79 @@ test("documents list: the card star toggles, writes the synced value, and the St
     assert.equal(buttonIn(cardOf("md-doc"), "doc-star").getAttribute("aria-pressed"), "true");
     assert.equal(buttonIn(cardOf("md-doc"), "doc-star").textContent, "★",
       "the starred card star is not the filled glyph");
-    fire(chip("starred"), "click", {});
+    // Starred is the bottom bar's toggle now (`#1909`), not a chip: the
+    // list's `setStarredOnly` is what that button drives.
+    assert.equal(chip("starred"), undefined, "the Starred chip still stands in the bucket row");
+    list.setStarredOnly(true);
+    assert.equal(list.starredOnly(), true);
     assert.deepEqual(cards().map((kid) => kid.getAttribute("data-key")), ["md-doc"],
-      "the Starred chip did not show only the starred document");
-    fire(chip("starred"), "click", {});
+      "the Starred toggle did not show only the starred document");
+    list.setStarredOnly(false);
     // Starring composes with the kind bucket: paste has no starred rows.
     list.setStarred("paste-doc", false);
     fire(chip("pastes"), "click", {});
-    fire(chip("starred"), "click", {});
+    list.setStarredOnly(true);
     assert.equal(cardOf("paste-doc"), undefined, "an unstarred paste shows under Starred+Pastes");
     assert.equal(cardOf("md-doc"), undefined, "a markdown row shows under the Pastes bucket");
   });
+});
+
+test("documents list: bucket chips stand in the fixed filter-bar host, exactly one pressed (#1909)", async () => {
+  const listMod = requireModule(LIST, "src/view/documents/list.ts");
+  const rows = [
+    { ...docRow("md-doc", 100), kind: "github_markdown" },
+    { ...docRow("paste-doc", 200), kind: "paste" },
+  ];
+  const listEl = fakeElement("div");
+  const filterBar = fakeElement("div");
+  const scroller = fakeElement("div");
+  scroller.scrollTop = 0;
+  scroller.clientHeight = 100;
+  Object.defineProperty(scroller, "scrollHeight", { get: () => listEl.children.length * 300 });
+  const seen = [];
+  const list = listMod.createDocumentsList({
+    nudge: (s, delta) => { s.scrollTop += delta; }, toPosition: (s, top) => { s.scrollTop = top; }, toFoot: (s) => { s.scrollTop = s.scrollHeight; },
+    api: async () => ({ documents: rows, total: rows.length }),
+    byId: (id) => ({
+      "documents-list": listEl, "scroll-area": scroller,
+      "pane-docs": fakeElement("div"), "docs-list-view": fakeElement("div"),
+      "docs-filter-bar": filterBar,
+    })[id],
+    onOpen: () => {},
+    onStarredOnlyChange: (on) => seen.push(on),
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createElement: (tag) => fakeElement(tag),
+    createElementNS: (_ns, tag) => fakeElement(tag),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+    querySelector: () => null,
+  };
+  const fire = (el, type, event = {}) => {
+    for (const listener of [...(el.listeners[type] || [])]) listener(event);
+  };
+  try {
+    await list.refresh();
+    assert.equal(listEl.children.some((kid) => String(kid.className).includes("doc-buckets")), false,
+      "the bucket chips still stand in the scrolling list");
+    const bucketsNow = () => {
+      const barNow = filterBar.children.find((kid) => String(kid.className).includes("doc-buckets"));
+      assert.ok(barNow, "the fixed filter-bar host holds no bucket chips");
+      return barNow.children.filter((kid) => kid.getAttribute && kid.getAttribute("data-bucket"));
+    };
+    assert.deepEqual(bucketsNow().map((kid) => kid.getAttribute("data-bucket")),
+      ["all", "markdown", "pastes", "issues"], "the bucket row changed its buckets");
+    const pressed = () => bucketsNow().filter((kid) => kid.getAttribute("aria-pressed") === "true")
+      .map((kid) => kid.getAttribute("data-bucket"));
+    assert.deepEqual(pressed(), ["all"], "not exactly one bucket pressed at rest");
+    fire(bucketsNow().find((kid) => kid.getAttribute("data-bucket") === "pastes"), "click", {});
+    assert.deepEqual(pressed(), ["pastes"], "pressing a bucket left another pressed");
+    list.setStarredOnly(true);
+    assert.deepEqual(seen, [false, false, true], "the bar toggle was not told of the starred state");
+    list.unmount();
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
 });
 
 test("documents list: Hide removes the card, Undo puts it back, Show hidden shows it dimmed with Unhide", async () => {

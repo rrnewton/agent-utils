@@ -142,7 +142,7 @@ def walk(page: Page, base: str, grow: object, label: str) -> None:
 
     # The owner's filtered list, parked at its bottom.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
-    page.locator('.doc-buckets [data-bucket="starred"]').click()
+    page.locator('#docs-starred-toggle').click()
     page.wait_for_function(
         f"() => document.querySelectorAll('#documents-list .doc-card').length === {len(STARRED)}",
         timeout=20_000)
@@ -179,7 +179,7 @@ def walk(page: Page, base: str, grow: object, label: str) -> None:
     # Near the bottom, clear Starred: the place is kept, never the top.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
     anchor_name, anchor_top = anchor_now(page)
-    page.locator('.doc-buckets [data-bucket="starred"]').click()
+    page.locator('#docs-starred-toggle').click()
     page.wait_for_function(
         f"() => document.querySelectorAll('#documents-list .doc-card').length === {total}",
         timeout=20_000)

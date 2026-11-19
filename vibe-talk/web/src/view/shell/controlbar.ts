@@ -77,6 +77,10 @@ export const PACK_VIEWS: Record<string, string[]> = {
   // keeps it hidden (the strip is priced to the edge); the menu's Discuss stands
   // there disabled with its reason instead — see `renderControlBar` below.
   "discuss-open": ["discord"],
+  // `#1909`: the Documents list's Starred toggle, in the pack so a narrow
+  // phone scrolls it rather than losing the switch off the edge. The
+  // reader hides it by CSS (`21-documents.css`), as it has no list to filter.
+  "docs-starred-toggle": ["docs"],
 };
 
 /** Make the control bar from the page's screens, menus and search. */

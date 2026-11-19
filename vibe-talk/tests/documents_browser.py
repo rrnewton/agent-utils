@@ -29,7 +29,7 @@ a confirmation spanning the seeded mentions fetches them.
 
 The last steps cover `#1265 documents-star-hide`: starring from a card and
 the reader header, persistence across reload and through the server's
-synced settings to a fresh device, the Starred chip, a real touch swipe to
+synced settings to a fresh device, the Starred toggle, a real touch swipe to
 hide with its Undo chip, the hamburger's Show hidden with dimmed cards and
 Unhide, and the desktop Hide button. At phone and desktop sizes they also
 check `#1306 doc-star-gold`: the starred star is visibly different — its
@@ -828,8 +828,8 @@ def main() -> int:
                 check(held_states.get(paste_key) == {"s": 1},
                       f"the star did not reach the server state: {held_states}")
 
-                # The Starred chip shows only it; a reload keeps the star.
-                spage.locator(".doc-bucket[data-bucket='starred']").tap()
+                # The bottom bar's Starred toggle shows only it; a reload keeps the star.
+                spage.locator("#docs-starred-toggle").tap()
                 spage.wait_for_function(
                     "() => document.querySelectorAll('#documents-list .doc-card').length === 1",
                     timeout=HANG_BACKSTOP_MS)

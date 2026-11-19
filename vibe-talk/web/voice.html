@@ -4544,6 +4544,16 @@ writable = true</pre>
               <svg class="mini-icon discuss-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l1.7 4.8 4.8 1.7-4.8 1.7L12 16.5l-1.7-4.8L5.5 10l4.8-1.7z" /><path d="M19 2.8l.6 1.6 1.6.6-1.6.6L19 7.2l-.6-1.6-1.6-.6 1.6-.6z" /></svg>
               <span class="mini-label">Discuss</span>
             </button>
+
+            <!-- Starred (`#1909 vibe-talk-documents-filter-bar-fixed`): the Documents
+                 list's starred-only filter as a star icon on the bottom bar.
+                 In the pack, so a narrow phone scrolls it with the pack's other
+                 members rather than pushing the switch off the edge; on the
+                 Documents list the pack is otherwise near empty, so it stands
+                 beside the audio toggle. Outline star off, filled gold star on;
+                 `aria-pressed` and the "Starred" label say the state. -->
+            <button id="docs-starred-toggle" class="bar-button" type="button" hidden
+                    aria-pressed="false" aria-label="Starred" title="Starred">☆</button>
           </div>
 
           <!--
@@ -4761,6 +4771,13 @@ writable = true</pre>
           </div>
         </div>
       </div>
+
+      <!-- The Documents type-filter bar (`#1909`): a fixed row in the dock,
+           directly above the bottom control bar (the dock's reversed column
+           draws it there), holding the list's bucket chips. It never scrolls
+           with the list and never wraps; it scrolls sideways instead. Shown
+           only while the Documents list is up; the list fills it. -->
+      <div id="docs-filter-bar" hidden></div>
 
       <!--
         A dense tile: two small controls stacked in the left column to exactly the height of the

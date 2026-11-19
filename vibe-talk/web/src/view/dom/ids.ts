@@ -196,6 +196,7 @@ export interface ElementById {
   "docs-fetch-refresh": HTMLButtonElement;
   "docs-fetch-since": HTMLButtonElement;
   "docs-fetch-visible": HTMLButtonElement;
+  "docs-filter-bar": HTMLDivElement;
   "docs-list-view": HTMLDivElement;
   "docs-mentions": HTMLDivElement;
   "docs-reader": HTMLDivElement;
@@ -214,6 +215,7 @@ export interface ElementById {
   "docs-since-go": HTMLButtonElement;
   "docs-since-hours": HTMLInputElement;
   "docs-since-title": HTMLParagraphElement;
+  "docs-starred-toggle": HTMLButtonElement;
   "documents-list": HTMLDivElement;
   "draft-autosync": HTMLInputElement;
   "draft-chip": HTMLButtonElement;

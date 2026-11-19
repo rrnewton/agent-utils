@@ -1757,6 +1757,8 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     el("pane-discord").hidden = name !== "discord";
     el("pane-docs").hidden = name !== "docs";
     el("docs-fetch").hidden = name !== "docs";
+    el("docs-filter-bar").hidden = name !== "docs";
+    el("docs-starred-toggle").hidden = name !== "docs";
     // `#269 approval-card-inline`. A waiting draft is the next message of the list now on screen, put
     // there BEFORE the place in that list is restored, which counts it.
     deps.placePostCard();

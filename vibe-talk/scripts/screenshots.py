@@ -4788,6 +4788,32 @@ def _act_composer_keyboard_open(driver: Driver) -> None:
     shrink_keyboard(driver, "77-composer-keyboard-open", focus="#channel-compose-text")
 
 
+def _act_documents_filter_bar(driver: Driver) -> None:
+    """`#1909`: the Documents list scrolled to its middle, the filter bar fixed above the bottom bar.
+
+    The star toggle is pressed on the way in, so the frame also shows its
+    filled-gold on state in the bar pack. The harness seeds no documents, so
+    the toggle is left on over the empty starred result, which still
+    shows both bars and the one pressed bucket.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    _ensure_pane(driver, "pane-docs")
+    driver.page.wait_for_function(
+        "() => window.__visible('docs-filter-bar') && window.__visible('docs-starred-toggle')",
+        timeout=10_000,
+    )
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); "
+        "a.scrollTop = Math.round((a.scrollHeight - a.clientHeight) * 0.5); return a.scrollTop; })()"
+    )
+    driver.click("docs-starred-toggle")
+    driver.page.wait_for_function(
+        "() => document.getElementById('docs-starred-toggle').getAttribute('aria-pressed') === 'true'",
+        timeout=5_000,
+    )
+
+
 MATRIX_PROFILES = ("android-412", "laptop-1280")
 
 SCENES: tuple[Scene, ...] = (
@@ -7650,6 +7676,39 @@ SCENES: tuple[Scene, ...] = (
                 f"(document.querySelector('#discord-log > li[data-id=\"{REPLY_SURFACE_ROOT}\"] "
                 "> .thread-unread-preview:not([hidden])')?.textContent || '')"
                 ".includes('Migration fixed')",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="83-documents-filter-bar",
+        what="Documents: the fixed filter bar above the bottom bar, the star toggle on, one bucket pressed",
+        act=_act_documents_filter_bar,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Documents pane is up", "window.__visible('pane-docs')"),
+            (
+                "the filter bar stands directly above the bottom control bar",
+                "(() => { const f = document.getElementById('docs-filter-bar').getBoundingClientRect(); "
+                "const b = document.getElementById('control-bar').getBoundingClientRect(); "
+                "return f.height > 0 && f.bottom <= b.top + 1 && b.top - f.bottom <= 10; })()",
+            ),
+            (
+                "the bucket chips are one row and none of them is the Starred chip",
+                "(() => { const chips = [...document.querySelectorAll('#docs-filter-bar .doc-bucket')]; "
+                "const tops = chips.map((c) => Math.round(c.getBoundingClientRect().top)); "
+                "return chips.length >= 4 && Math.max(...tops) - Math.min(...tops) <= 2 "
+                "&& !chips.some((c) => c.getAttribute('data-bucket') === 'starred'); })()",
+            ),
+            (
+                "exactly one bucket is pressed",
+                "[...document.querySelectorAll('#docs-filter-bar .doc-bucket')]"
+                ".filter((c) => c.getAttribute('aria-pressed') === 'true').length === 1",
+            ),
+            (
+                "the star toggle on the bottom bar is pressed and filled",
+                "document.getElementById('docs-starred-toggle').getAttribute('aria-pressed') === 'true' "
+                "&& document.getElementById('docs-starred-toggle').textContent === '★'",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),

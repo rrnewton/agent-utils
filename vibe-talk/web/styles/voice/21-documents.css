@@ -773,33 +773,71 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   scroll-margin-top: 8px;
 }
 
-/* Type filter buckets (`#1176 doc-kind-buckets`), docked at the bottom of
-   the list (`#1263 documents-list-cards`): the last row of the list, which
-   opens at its bottom, so the chips sit above the bottom bar on open
-   without scrolling. (No sticky/fixed here: the scroller's containment
-   guard forbids positioned escapes from the list.) */
-.doc-buckets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 6px 10px;
-  background: var(--bg, Canvas);
+/* Type filter buckets (`#1176 doc-kind-buckets`) in the fixed filter bar
+   (`#1909`): `#docs-filter-bar` is a dock row directly above the bottom
+   control bar (after it in the markup, which the dock's reversed column
+   draws above it), so the chips stand there however far the list has
+   scrolled, on an opaque ground. One row, never wrapping: past the
+   phone's width the row scrolls sideways, as the bar pack does. */
+#docs-filter-bar {
+  background: var(--dock);
   border-top: 1px solid var(--edge);
 }
+.doc-buckets {
+  display: flex;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--dock);
+}
+.doc-buckets::-webkit-scrollbar {
+  display: none;
+}
 .doc-bucket {
-  border: 1px solid #3a4a61;
+  flex: 0 0 auto;
+  border: 1px solid var(--edge, currentColor);
   border-radius: 999px;
   background: transparent;
-  color: inherit;
+  color: var(--ink, CanvasText);
   padding: 3px 10px;
   font: inherit;
   font-size: 0.85em;
+  white-space: nowrap;
+  cursor: pointer;
 }
+/* Pressed is unambiguous in light and dark (`#1909`): filled with the
+   accent and a check, where unpressed is outline only on the dock
+   ground. The buckets are mutually exclusive, so exactly one chip
+   wears this at a time; Starred is a separate toggle on the bottom
+   bar and can no longer read as a second pressed bucket. */
 .doc-bucket[aria-pressed="true"] {
-  background: #2e3d52;
-  border-color: #5b9dd9;
+  background: var(--accent, Highlight);
+  border-color: var(--accent, Highlight);
   color: #fff;
   font-weight: 700;
+}
+.doc-bucket[aria-pressed="true"]::before {
+  content: "✓ ";
+}
+/* The bottom bar's Starred toggle (`#1909`): the shared star dress
+   (`.doc-star` above) in the bar's own sizing — outline star in muted
+   ink off, filled star in the pin gold on its ground on. */
+#docs-starred-toggle {
+  font-size: 1.15em;
+  color: var(--muted, CanvasText);
+}
+#docs-starred-toggle[aria-pressed="true"] {
+  background: var(--pin-bg, #3a3017);
+  color: var(--pin-ink, #f0c75e);
+  border-color: var(--pin-edge, #d4a63a);
+}
+/* In the pack the toggle's view is decided by `PACK_VIEWS` (Documents), but
+   the reader is a Documents view with no list to filter: while a document
+   is open the toggle stands down, as Fetch does. */
+:root:has(#pane-docs:not([hidden]) #docs-reader:not([hidden])) #docs-starred-toggle {
+  display: none;
 }
 
 /* Issue header (`#1176 doc-kind-buckets`): front matter as a header, not YAML. */

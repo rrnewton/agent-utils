@@ -1225,10 +1225,14 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   assert.ok(docs.shown.includes("docs-fetch"), "this is not the Documents view's bar");
   assert.equal(docs.shown.at(-1), "view-switch", "the switch is not the Documents bar's last button");
   assert.ok(docs.cost <= budget, report("the Documents view", docs));
-  const withOutline = docs.cost + memberPx("doc-outline-open") + lengthPx(cssValue(cssBlock("#control-bar"), "gap"));
+  // In the reader Fetch and the Starred toggle (`#1909`) leave the bar and
+  // Outline stands in their place (`#1544`: never together), so the reader's
+  // bar is the list's bar minus those two and their gap, plus Outline.
+  const withOutline = docs.cost - memberPx("docs-fetch") - memberPx("docs-starred-toggle")
+    - lengthPx(cssValue(cssBlock("#control-bar"), "gap")) + memberPx("doc-outline-open");
   assert.ok(
     withOutline <= budget,
-    `the Documents reader: ${[...docs.shown, "doc-outline-open"].join(" + ")} need ${withOutline.toFixed(1)}px of ` +
+    `the Documents reader: ${[...docs.shown.filter((id) => id !== "docs-fetch" && id !== "docs-starred-toggle"), "doc-outline-open"].join(" + ")} need ${withOutline.toFixed(1)}px of ` +
       `the ${budget.toFixed(1)}px a ${PHONE_PX}px phone leaves, so Outline pushes the switch off the edge`
   );
   // `#1812 vibe-talk-discuss-off-in-documents`: no Discuss on the Documents bar;
@@ -1819,7 +1823,7 @@ test("the desktop dock leaves the phone's declarations as they were", () => {
     "#control-pane:has(#read-aloud:not([hidden])) #speaker",
     "#control-pane button:focus-visible",
     '#control-bar[data-placement="bottom"] #view-switch',
-    "#control-bar-bottom:has(#view-switch:not([hidden])) + #control-pane",
+    "#control-bar-bottom:has(#view-switch:not([hidden])) ~ #control-pane",
     '#control-bar[data-placement="bottom"] .switch-word',
     "#control-pane .control:has(> .control-note:not([hidden])) > svg",
   ]) {
@@ -1861,8 +1865,11 @@ test("the pane's markup runs in the order its buttons are seen, so Tab follows t
         `#${order[i - 1]} is not declared before #${order[i]}`);
     }
   }
+  // `#1909`: the one desktop `order` is the Documents filter bar's, taking
+  // the dock's first row; it holds no pane button, so Tab through the pane
+  // still follows the eye. Any other desktop `order` fails here.
   assert.doesNotMatch(
-    mediaBody(DESKTOP_QUERY),
+    mediaBody(DESKTOP_QUERY).replace(/#docs-filter-bar\s*\{[^}]*\}/, ""),
     /(?:^|[;{\s])order:/,
     "a desktop rule reorders the dock, so Tab and the eye disagree about what comes next"
   );
@@ -1904,7 +1911,7 @@ test("on a desk the view switch has one place, and the pane keeps the room for i
   // The room: the pane's right margin is the switch's width, the hamburger's beside it (`#880
   // voice-page-menu-placement`) and their gaps, and only while the switch is up (text mode takes it down,
   // and the pane does not hold an empty corner for it).
-  const room = cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom:has(#view-switch:not([hidden])) + #control-pane");
+  const room = cssBlockIn(DESKTOP_QUERY, "#control-bar-bottom:has(#view-switch:not([hidden])) ~ #control-pane");
   assert.match(room, /margin-right:\s*calc\(var\(--dock-switch\) \+ var\(--dock-menu\) \+ [\d.]+rem\)/,
     "the pane keeps no room for the switch and the hamburger");
   assert.match(cssValue(cssBlockIn(DESKTOP_QUERY, "#dock"), "--dock-switch") || "", /^[\d.]+rem$/);
@@ -1927,9 +1934,10 @@ test("on a desk the view switch has one place, and the pane keeps the room for i
   // ...and it is the pane that keeps it, the last thing in the dock and so on its last row.
   const dock = HTML_CODE.slice(HTML_CODE.indexOf('id="dock"'), HTML_CODE.indexOf("</footer>"));
   assert.ok(dock.indexOf('id="control-pane"') > dock.indexOf('id="control-bar-bottom"'));
-  // Still no `order`: Tab reaches the switch where the markup has it, at the end of the bar and
+  // Still no `order` but the filter bar's (`#1909`, exempted as in the pane
+  // test above): Tab reaches the switch where the markup has it, at the end of the bar and
   // before the pane, as it does on a phone and in the header. tests/offline_cache_browser.py walks it.
-  assert.doesNotMatch(mediaBody(DESKTOP_QUERY), /(?:^|[;{\s])order:/);
+  assert.doesNotMatch(mediaBody(DESKTOP_QUERY).replace(/#docs-filter-bar\s*\{[^}]*\}/, ""), /(?:^|[;{\s])order:/);
   // The pace popover opens above the dock at the column's edge, not over the row above the pane.
   assert.match(cssBlockIn(DESKTOP_QUERY, "#control-pane"), /position:\s*static/);
   assert.match(cssBlockIn(DESKTOP_QUERY, ".popover"), /right:\s*var\(--dock-inset\)/);

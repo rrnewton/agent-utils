@@ -209,6 +209,15 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     },
     onMentions: (row) => showMentions(row),
     onStatus: deps.onStatus,
+    onStarredOnlyChange: (on) => {
+      try {
+        const toggle = deps.byId("docs-starred-toggle");
+        toggle.setAttribute("aria-pressed", String(on));
+        toggle.textContent = on ? "★" : "☆";
+      } catch {
+        // A host without the bar toggle keeps the filter as it was.
+      }
+    },
   });
   const search = createDocumentsSearch({
     api: deps.api,
@@ -269,6 +278,12 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     deps.byId("docs-list-view").hidden = false;
     deps.byId("docs-fetch").hidden = false;
     try {
+      deps.byId("docs-filter-bar").hidden = false;
+      deps.byId("docs-starred-toggle").hidden = false;
+    } catch {
+      // A host without the fixed bar keeps the list as it was.
+    }
+    try {
       deps.byId("bar-pack").appendChild(deps.byId("audio-source"));
     } catch {
       // A host without the bar pack keeps the toggle where it is.
@@ -327,6 +342,12 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     deps.byId("docs-reader").hidden = false;
     // Fetch is the list's button and Outline the reader's (`#1544`): never both.
     deps.byId("docs-fetch").hidden = true;
+    try {
+      deps.byId("docs-filter-bar").hidden = true;
+      deps.byId("docs-starred-toggle").hidden = true;
+    } catch {
+      // A host without the fixed bar keeps the list as it was.
+    }
     // The audio toggle joins the reader's controls while a document is open
     // (`#1544`); the bar takes it back for the list (in toList, below).
     try {
@@ -384,6 +405,18 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         (error: unknown) => deps.onStatus?.(error instanceof Error ? error.message : String(error)),
       ).finally(() => setBusy(false));
     };
+    // The bottom bar's Starred toggle (`#1909`): the list owns the state;
+    // its render syncs this button's pressed dress through the callback.
+    try {
+      const starredToggle = deps.byId("docs-starred-toggle");
+      starredToggle.setAttribute("aria-pressed", String(list.starredOnly()));
+      starredToggle.textContent = list.starredOnly() ? "★" : "☆";
+      listening.listen(starredToggle, "click", () => {
+        list.setStarredOnly(!list.starredOnly());
+      });
+    } catch {
+      // A host without the bar toggle keeps the filter as it was.
+    }
     listening.listen(button, "click", () => {
       const open = menu.hidden;
       menu.hidden = !open;

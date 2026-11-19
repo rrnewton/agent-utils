@@ -26,6 +26,8 @@ export interface DocumentsListDependencies {
   onStatus?(text: string): unknown;
   /** Per-document starred/hidden state (`#1265 documents-star-hide`); memory alone without one. */
   docStates?: DocStatesStore;
+  /** The bottom bar's Starred toggle (`#1909`): told whenever the starred-only state changes, so its pressed dress follows. */
+  onStarredOnlyChange?(on: boolean): unknown;
 }
 
 /** A list place a return lands on (`#1264 documents-scroll-landings`). */
@@ -66,6 +68,10 @@ export interface DocumentsList {
   undoHide(): boolean;
   /** State from another device landed: reread it and redraw. */
   reloadStates(): void;
+  /** Whether only starred documents are showing (the bottom bar's star toggle, `#1909`). */
+  starredOnly(): boolean;
+  /** Show only starred documents, or all, composed with the current bucket. */
+  setStarredOnly(on: boolean): void;
   /** Narrow the list to documents whose name matches `text`, locally (`#1767`); blank shows all. */
   setNameFilter(text: string): void;
   /** The current local name filter's text. */
@@ -325,7 +331,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   // The type filter's state lives with the list's other view state (no new
   // persistence key): `#1176 doc-kind-buckets`.
   let bucketFilter: DocumentBucket | "all" = "all";
-  // The Starred chip (`#1265`): beside the buckets, and a row must pass both.
+  // Starred-only (`#1265`, on the bottom bar since `#1909`): a row must pass it and the bucket both.
   let starredOnly = false;
   // Hidden documents shown dimmed (the hamburger's "Show hidden"); this device only.
   let showingHidden = false;
@@ -765,20 +771,28 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       });
       bar.appendChild(button);
     }
-    // The Starred chip (`#1265`): the existing chips, reused — a row must pass
-    // it and the bucket both, so Starred narrows whatever bucket is chosen.
-    const starred = document.createElement("button");
-    starred.setAttribute("type", "button");
-    starred.className = "doc-bucket doc-starred-chip";
-    starred.setAttribute("data-bucket", "starred");
-    starred.textContent = "Starred";
-    starred.setAttribute("aria-pressed", String(starredOnly));
-    listening.listen(starred, "click", () => {
-      starredOnly = !starredOnly;
-      render(rowsNow);
-    });
-    bar.appendChild(starred);
+    // Starred is no longer a chip here (`#1909`): it is the star icon
+    // toggle on the bottom control bar, so this row's mutually exclusive
+    // buckets can show exactly one pressed. It still composes: a row must
+    // pass `starredOnly` and the bucket both (see `visibleRows`).
     return bar;
+  }
+
+  /**
+   * Put the bucket bar in the fixed dock host (`#docs-filter-bar`, `#1909`)
+   * where the page provides one, so it stands above the bottom bar and
+   * never scrolls or wraps with the list. A host without that element (the
+   * fake-DOM suites) keeps the bar as the list's last child, as before.
+   */
+  function placeBucketBar(list: HTMLElement): void {
+    let host: HTMLElement | null = null;
+    try {
+      host = deps.byId("docs-filter-bar") ?? null;
+    } catch {
+      host = null;
+    }
+    if (host && host !== list) host.replaceChildren(bucketBar());
+    else list.appendChild(bucketBar());
   }
 
   /** The Undo chip a hide leaves behind, in the Done Undo's shape. */
@@ -876,11 +890,13 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     listening.unmount();
     const list = deps.byId(LIST_ID);
     wireOuter(list);
+    deps.onStarredOnlyChange?.(starredOnly);
     if (rows.length === 0) {
       const note = document.createElement("p");
       note.className = "doc-empty";
       note.textContent = "No documents yet.";
       list.replaceChildren(note);
+      placeBucketBar(list);
       return;
     }
     const shown = visibleRows();
@@ -905,15 +921,16 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
         : starredOnly
           ? "No starred documents."
           : "No documents of this type.";
-      list.replaceChildren(head, note, ...(undo ? [undo] : []), bucketBar());
+      list.replaceChildren(head, note, ...(undo ? [undo] : []));
+      placeBucketBar(list);
       return;
     }
-    // The filter chips dock at the bottom (`#1263 documents-list-cards`):
-    // the list opens at its newest end, so the chips are the last row and
-    // stick above the bottom bar. One `.doc-buckets` bar (see bucketBar),
-    // and the Starred chip (`#1265`) joins this same element. The Undo chip
-    // sits just above it, where the reader's eye already is.
-    list.replaceChildren(head, ...cards, ...(undo ? [undo] : []), bucketBar());
+    // The filter chips stand in the fixed dock bar above the bottom bar
+    // (`#1909`), not as the list's last row: they stay put while the list
+    // scrolls and never wrap onto a second row. The Undo chip stays in
+    // the list, just above where the cards end.
+    list.replaceChildren(head, ...cards, ...(undo ? [undo] : []));
+    placeBucketBar(list);
     // The redraw moved the cards, not the reader (`#1908`): put the place
     // captured above back before anything else reads the scroller. A caller
     // landing somewhere named (a refresh's follow or recorded place) writes
@@ -1237,6 +1254,11 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     undoHide,
     reloadStates(): void {
       states.reload();
+      render(rowsNow);
+    },
+    starredOnly: () => starredOnly,
+    setStarredOnly(on: boolean): void {
+      starredOnly = on === true;
       render(rowsNow);
     },
     setNameFilter(text: string): void {

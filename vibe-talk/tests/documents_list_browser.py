@@ -93,7 +93,7 @@ def check_list(page: Page, *, label: str, narrow: bool) -> None:
           const area = document.getElementById('scroll-area');
           const bar = document.getElementById('control-bar');
           const cards = [...list.querySelectorAll('.doc-card')];
-          const chips = list.querySelector('.doc-buckets');
+          const chips = document.querySelector('#docs-filter-bar .doc-buckets');
           const chipsRect = chips.getBoundingClientRect();
           const barRect = bar.getBoundingClientRect();
           const cardFacts = cards.map((card) => {
@@ -117,7 +117,7 @@ def check_list(page: Page, *, label: str, narrow: bool) -> None:
             cards: cards.length,
             proposalCards: cards.filter((c) => c.textContent.includes('research-proposal')).length,
             cardFacts,
-            chipsIsLast: list.lastElementChild === chips,
+            chipsIsLast: Boolean(chips) && !list.contains(chips),
             chipsTop: chipsRect.top, chipsBottom: chipsRect.bottom,
             barTop: barRect.top, innerHeight,
             scrollTop: area.scrollTop, scrollHeight: area.scrollHeight,
@@ -138,7 +138,7 @@ def check_list(page: Page, *, label: str, narrow: bool) -> None:
     if narrow:
         check(any(card["fileEllipsised"] for card in facts["cardFacts"]),
               f"{label}: no long filename ellipsised on its meta line")
-    check(facts["chipsIsLast"], f"{label}: the filter chips are not the list's last row")
+    check(facts["chipsIsLast"], f"{label}: the filter chips still stand in the scrolling list, not the fixed bar")
     check(facts["scrollTop"] + facts["clientHeight"] >= facts["scrollHeight"] - 24,
           f"{label}: the list did not open at the bottom: {facts}")
     check(facts["chipsBottom"] <= facts["innerHeight"] and facts["chipsBottom"] <= facts["barTop"] + 2,
