@@ -235,7 +235,7 @@ def test_no_step_listens_on_a_fixed_port_unless_it_runs_alone() -> None:
     assert not offenders, f"steps name fixed listening ports: {offenders}"
 
 
-def test_wrkslots_shards_cover_eight_way_partition() -> None:
+def test_wrkslots_shards_cover_sixteen_way_partition() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     shards = sorted(
         shard
@@ -243,7 +243,7 @@ def test_wrkslots_shards_cover_eight_way_partition() -> None:
         if step.tag.startswith("python.wrkslots.")
         for shard in _flag_values(step.cmd, "--shard")
     )
-    assert shards == [f"{index}/8" for index in range(8)]
+    assert shards == sorted(f"{index}/16" for index in range(16))
 
 
 def test_wrkslots_component_selection_includes_every_lifecycle_shard() -> None:

@@ -496,12 +496,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-9
@@ -511,12 +506,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-10
@@ -526,12 +516,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-11
@@ -541,12 +526,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-12
@@ -556,12 +536,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-13
@@ -571,12 +546,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-14
@@ -586,12 +556,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   - group: wrkslots
     job: shard-15
@@ -601,12 +566,7 @@ steps:
     labels: [validation-workspace, validation-python-component-tests, validation-python-namespace-tests, validation-pytest-shards, component-wrkslots]
     timeout: 19200
     cpu_timeout: 2400
-    hint: &wrkslots_test_hint
-      resources: {lifecycle-io: 1}
-      est_duration_s: 300
-      classification: latency-bound
-      preferred_inner_jobs: 2
-      rss_baseline_bytes: 1610612736
+    hint: *wrkslots_test_hint
 
   # Shard count 4 (was 2): at 2 shards each ran ~700 s median in gate logs
   # (2026-11-10 measurement, #1288 validate-10min), so one shard alone
