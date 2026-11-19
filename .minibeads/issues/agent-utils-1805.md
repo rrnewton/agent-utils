@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-eden-remove-resume-and-peer-unmount: resume Eden remove past a not-mounted checkout and unmount the whole peer group'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -23,3 +23,7 @@ updated_at: 2026-11-17T15:30:00-05:00
 - A not-mounted checkout resumes removal without the `sl` precheck; every peer-group FUSE entry is unmounted deepest-first in the host namespace before rmdir.
 
 # Notes
+
+## Resolution
+
+Landed ac5d8d060aa332b43a97d816b9b8d2744d087a10 on github/main (mu-edenfix). A "(not mounted)" checkout skips the `sl` salvage precheck and goes straight to the verified removal sequence; every FUSE entry of the checkout's `shared:<id>` peer group under the managed roots is unmounted deepest-first on the host before `eden remove`, and any peer outside refuses by name with nothing unmounted. Full gate pass; combined-tree overlap verification green. No new persisted field.
