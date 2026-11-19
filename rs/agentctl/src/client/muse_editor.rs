@@ -77,11 +77,13 @@ const HINT_PREFIX_MIN: usize = 20;
 const HINT_BARE_PREFIX_MIN: usize = 34;
 
 /// Whether draft `text` is a truncated hint: an ellipsis-ended prefix, (when
-/// `at_edge` says the text fills its row to the pane edge) a plain prefix, or
-/// a bare prefix long enough under [`HINT_BARE_PREFIX_MIN`], of at least
-/// [`HINT_PREFIX_MIN`] chars of exactly the hint it prefixes. A prefix of
-/// no hint, or a short one, is a draft.
-fn is_hint_prefix(text: &str, at_edge: bool) -> bool {
+/// `at_edge` says the text fills its row to the pane edge) a plain prefix, a
+/// word-wrapped prefix (`clip`: the single editor row's length and the frame
+/// width, when the next word of the hint would cross the frame's inner
+/// edge), or a bare prefix long enough under [`HINT_BARE_PREFIX_MIN`], of
+/// at least [`HINT_PREFIX_MIN`] chars of exactly the hint it prefixes. A
+/// prefix of no hint, or a short one, is a draft.
+fn is_hint_prefix(text: &str, at_edge: bool, clip: Option<(usize, usize)>) -> bool {
     let joined = normalize(text);
     let (core, ellipsis) = match joined
         .strip_suffix('…')
@@ -97,18 +99,35 @@ fn is_hint_prefix(text: &str, at_edge: bool) -> bool {
     MUSE_PROMPT_HINTS.iter().any(|hint| {
         let hint = normalize(hint);
         let hint_count = hint.chars().count();
-        hint_count > count
-            && hint.starts_with(&core)
-            && (ellipsis
-                || at_edge
-                || (count >= HINT_BARE_PREFIX_MIN && count * 3 >= hint_count * 2))
+        if hint_count <= count || !hint.starts_with(&core) {
+            return false;
+        }
+        // A word-wrapped ghost stops at a word boundary because the next
+        // word crosses the editor's inner edge (#1902
+        // agentctl-muse-hint-wordwrap-clip; 33 of 58 chars on a 42-column
+        // pane, the next word taking the row past it).
+        let wrapped = clip.is_some_and(|(row, width)| {
+            let rest = &hint[core.len()..];
+            let next = rest
+                .strip_prefix(' ')
+                .and_then(|rest| rest.split(' ').next())
+                .unwrap_or_default();
+            rest.starts_with(' ')
+                && !next.is_empty()
+                && row + 1 + next.chars().count() > width.saturating_sub(2)
+        });
+        ellipsis
+            || at_edge
+            || wrapped
+            || (count >= HINT_BARE_PREFIX_MIN && count * 3 >= hint_count * 2)
     })
 }
 
 /// Whether generic draft `text` is exactly one hint or an ellipsis-truncated
-/// one (no pane width is known on that path, so a bare prefix never qualifies).
+/// one (no pane width is known on that path, so a bare or wrapped prefix
+/// never qualifies).
 pub(crate) fn is_muse_hint_text(text: &str) -> bool {
-    is_muse_placeholder_hint(text) || is_hint_prefix(text, false)
+    is_muse_placeholder_hint(text) || is_hint_prefix(text, false, None)
 }
 
 /// The pane width a Muse frame shows: the char count of its last rule, or
@@ -142,12 +161,27 @@ fn muse_editor_is_hint_w(editor: &str, width: Option<usize>) -> bool {
     }
     // Truncation shows one partial text (joined either way can be the prefix
     // when the cut falls mid-word across no row break, so try both joins).
+    let lines: Vec<&str> = splitlines(editor).into_iter().collect();
     let at_edge = width.is_some_and(|width| {
-        splitlines(editor)
-            .into_iter()
+        lines
+            .iter()
             .any(|line| line.trim_end().chars().count() + 1 >= width)
     });
-    is_hint_prefix(&spaced, at_edge) || is_hint_prefix(&tight, at_edge)
+    // A word-wrapped ghost is a single row clipped at a word boundary:
+    // hand the prefix check the row and the frame so it can tell that clip
+    // from a person stopping mid-row (#1902).
+    let clip = match (width, segments.len()) {
+        (Some(width), 1) => Some((
+            lines
+                .iter()
+                .map(|line| line.trim_end().chars().count())
+                .max()
+                .unwrap_or(0),
+            width,
+        )),
+        _ => None,
+    };
+    is_hint_prefix(&spaced, at_edge, clip) || is_hint_prefix(&tight, at_edge, clip)
 }
 
 /// Whether the composer region `composer` holds nothing a person typed: no text at
@@ -2029,6 +2063,65 @@ mod tests {
         let screen = idle_frame(&format!("❯ {short}"));
         assert!(!muse_verified_process_idle_composer(&screen), "{screen}");
         assert!(muse_verified_process_editor_draft(&screen).is_some());
+        assert_eq!(muse_verified_pane_status("idle", &screen), "staged");
+    }
+
+    #[test]
+    fn word_wrapped_hints_on_narrow_panes_read_empty() {
+        // #1902: on a narrow pane Muse draws only the first, word-clipped
+        // row of the ghost (33 of 58 chars at 42 columns, 7 short of the
+        // rule). Every hint clipped that way reads empty; the same opening
+        // words stopping mid-row in a wide pane stay a draft.
+        let footer = "m · xhigh · /w · YOLO\n";
+        for width in [30usize, 42, 80] {
+            let rule = "─".repeat(width);
+            let frame =
+                |editor: &str| format!("◆ prior answer\n{rule}\n{editor}\n{rule}\n{footer}");
+            let mut presented = 0;
+            for hint in MUSE_PROMPT_HINTS {
+                let mut prefix = String::new();
+                for word in hint.split(' ') {
+                    let next = if prefix.is_empty() {
+                        word.to_owned()
+                    } else {
+                        format!("{prefix} {word}")
+                    };
+                    if 2 + next.chars().count() > width.saturating_sub(2) {
+                        break;
+                    }
+                    prefix = next;
+                }
+                if prefix.chars().count() < 20 {
+                    continue;
+                }
+                presented += 1;
+                let screen = frame(&format!("❯ {prefix}"));
+                assert!(
+                    muse_verified_process_idle_composer(&screen),
+                    "w{width} {hint}"
+                );
+                assert!(
+                    muse_verified_process_editor_draft(&screen).is_none(),
+                    "w{width} {hint}"
+                );
+                assert_eq!(
+                    muse_verified_pane_status("idle", &screen),
+                    "idle",
+                    "w{width} {hint}"
+                );
+            }
+            assert!(presented > 0, "w{width}");
+        }
+        // The live 42-column frame, and its wide-pane twin as a draft.
+        let rule = "─".repeat(42);
+        let screen =
+            format!("◆ prior answer\n{rule}\n❯ Paste an image with Ctrl+V — file\n{rule}\n{footer}");
+        assert!(muse_verified_process_idle_composer(&screen));
+        assert_eq!(muse_verified_pane_status("idle", &screen), "idle");
+        let wide = "─".repeat(141);
+        let screen =
+            format!("◆ prior answer\n{wide}\n❯ Paste an image with Ctrl+V — file\n{wide}\n{footer}");
+        assert!(!muse_verified_process_idle_composer(&screen));
         assert_eq!(muse_verified_pane_status("idle", &screen), "staged");
     }
 

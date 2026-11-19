@@ -330,6 +330,37 @@ def test_a_muse_placeholder_hint_is_an_empty_editor() -> None:
     )
 
 
+def test_word_wrapped_hints_on_narrow_panes_read_empty() -> None:
+    # #1902: every hint word-clipped to its first row on a narrow pane reads
+    # empty; the same opening words mid-row in a wide pane stay a draft.
+    footer = "m · xhigh · /w · YOLO"
+    for width in (30, 42, 80):
+        rule = "─" * width
+
+        def frame(editor: str) -> str:
+            return f"◆ prior answer\n{rule}\n{editor}\n{rule}\n{footer}"
+
+        presented = 0
+        for hint in client_module._MUSE_PROMPT_HINTS:
+            prefix = ""
+            for word in hint.split(" "):
+                nxt = word if not prefix else f"{prefix} {word}"
+                if 2 + len(nxt) > width - 2:
+                    break
+                prefix = nxt
+            if len(prefix) < 20:
+                continue
+            presented += 1
+            assert muse_verified_process_idle_composer(frame(f"❯ {prefix}")), (width, hint)
+        assert presented > 0, width
+    rule = "─" * 42
+    live = f"◆ prior answer\n{rule}\n❯ Paste an image with Ctrl+V — file\n{rule}\n{footer}"
+    assert muse_verified_process_idle_composer(live)
+    wide = "─" * 141
+    draft = f"◆ prior answer\n{wide}\n❯ Paste an image with Ctrl+V — file\n{wide}\n{footer}"
+    assert not muse_verified_process_idle_composer(draft)
+
+
 def test_every_muse_hint_and_a_long_bare_prefix_read_empty() -> None:
     # #1888: every ghost in the versioned table reads empty, and a hint
     # captured mid-draw (a long bare prefix, no edge, no ellipsis) too.

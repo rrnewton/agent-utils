@@ -237,7 +237,9 @@ _MUSE_HINT_PREFIX_MIN = 20
 _MUSE_HINT_BARE_PREFIX_MIN = 34
 
 
-def _muse_is_hint_prefix(text: str, *, at_edge: bool) -> bool:
+def _muse_is_hint_prefix(
+    text: str, *, at_edge: bool, clip: tuple[int, int] | None = None
+) -> bool:
     """Whether `text` is a truncated hint prefix (see the Rust reader)."""
     joined = _muse_normalize(text)
     core, ellipsis = joined, False
@@ -247,15 +249,28 @@ def _muse_is_hint_prefix(text: str, *, at_edge: bool) -> bool:
             break
     if len(core) < _MUSE_HINT_PREFIX_MIN:
         return False
-    return any(
-        len(hint) > len(core)
-        and hint.startswith(core)
-        and (
+
+    def qualifies(hint: str) -> bool:
+        if len(hint) <= len(core) or not hint.startswith(core):
+            return False
+        # A word-wrapped ghost stops at a word boundary because the next
+        # word crosses the editor's inner edge (#1902; 33 of 58 chars on a
+        # 42-column pane, the next word taking the row past it).
+        wrapped = False
+        if clip is not None:
+            row, width = clip
+            rest = hint[len(core):]
+            following = rest[1:].split(" ", 1)[0] if rest.startswith(" ") else ""
+            wrapped = bool(following) and row + 1 + len(following) > width - 2
+        return bool(
             ellipsis
             or at_edge
+            or wrapped
             or (len(core) >= _MUSE_HINT_BARE_PREFIX_MIN and len(core) * 3 >= len(hint) * 2)
         )
-        for hint in (_muse_normalize(hint) for hint in _MUSE_PROMPT_HINTS)
+
+    return any(
+        qualifies(hint) for hint in (_muse_normalize(hint) for hint in _MUSE_PROMPT_HINTS)
     )
 
 
@@ -285,9 +300,16 @@ def _muse_editor_is_hint(editor: str, width: int | None = None) -> bool:
     at_edge = width is not None and any(
         len(line.rstrip()) + 1 >= width for line in editor.splitlines()
     )
-    return _muse_is_hint_prefix(spaced, at_edge=at_edge) or _muse_is_hint_prefix(
-        tight, at_edge=at_edge
-    )
+    # A word-wrapped ghost is a single row clipped at a word boundary:
+    # hand the prefix check the row and the frame so it can tell that clip
+    # from a person stopping mid-row (#1902).
+    clip = None
+    if width is not None and len(segments) == 1:
+        row = max(len(line.rstrip()) for line in editor.splitlines())
+        clip = (row, width)
+    return _muse_is_hint_prefix(
+        spaced, at_edge=at_edge, clip=clip
+    ) or _muse_is_hint_prefix(tight, at_edge=at_edge, clip=clip)
 
 
 def is_muse_placeholder_hint(text: str) -> bool:

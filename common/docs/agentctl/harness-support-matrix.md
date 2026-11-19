@@ -260,9 +260,11 @@ draft, and to feed the backstop above.
   `rs/agentctl/src/client.rs` (`muse_verified_process_editor_rows` and
   friends), used by delivery, status, and the sweep. Its placeholder
   hints (one versioned table, both editions) read as an empty composer
-  whole, wrapped, edge- or ellipsis-truncated, or as a long bare prefix
-  captured mid-draw (#1773, #1888 agentctl-muse-placeholder-hint-reads-as-staged);
-  shorter prefixes and any other text still read as a draft.
+  whole, wrapped, edge- or ellipsis-truncated, as a long bare prefix
+  captured mid-draw, or word-clipped at a narrow frame's inner edge
+  (#1773, #1888 agentctl-muse-placeholder-hint-reads-as-staged, #1902
+  agentctl-muse-hint-wordwrap-clip); shorter prefixes and any other
+  text still read as a draft.
 - **Unknown TUI**: none. There is no composer to read; readiness is
   screen quiet for two seconds with clock digits and spinner glyphs
   masked (`rs/agentctl/src/unknown_harness.rs`,
