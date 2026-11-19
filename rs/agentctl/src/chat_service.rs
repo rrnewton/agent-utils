@@ -1124,6 +1124,7 @@ fn spawn_trace_driver(
                                 crate::chat_trace::TracePost {
                                     text: format!("[{dropped} trace posts omitted]"),
                                     trigger: "omission".to_owned(),
+                                    sent: None,
                                 },
                                 None,
                             ),
@@ -1238,10 +1239,23 @@ fn spawn_trace_driver(
                 let pending = std::mem::take(&mut held);
                 let mut rest = Vec::new();
                 let mut failed = false;
-                for (post, uuid) in pending {
+                for (mut post, uuid) in pending {
                     if failed || !budget.take(now) {
                         rest.push((post, uuid));
                         continue;
+                    }
+                    // #1907: claim pending sent refs for this entry once,
+                    // so a retry carries the same refs and a root (posted
+                    // above, never here) claims none.
+                    if post.sent.is_none() {
+                        if let Some(state) = &link_state {
+                            match state.take_pending_sent_refs() {
+                                Ok(claimed) => post.sent = Some(claimed),
+                                Err(error) => service_log(format!(
+                                    "agentctl: trace pending sent refs could not be claimed: {error}"
+                                )),
+                            }
+                        }
                     }
                     // One UUID per post across retries: publish is
                     // idempotent per request id, so a timed-out post that
@@ -1279,7 +1293,14 @@ fn spawn_trace_driver(
                         } else {
                             format!("{uuid}-{index}")
                         };
-                        let metadata = crate::chat_trace::trace_metadata(
+                        // #1907: only the first part carries the sent
+                        // refs; a ref is never split across entries.
+                        let part_sent: &[crate::chat_trace::SentRef] = if index == 0 {
+                            post.sent.as_deref().unwrap_or(&[])
+                        } else {
+                            &[]
+                        };
+                        let metadata = crate::chat_trace::trace_metadata_with_sent(
                             "entry",
                             &agent,
                             team.as_deref(),
@@ -1287,6 +1308,7 @@ fn spawn_trace_driver(
                             &thread_date,
                             seq + 1,
                             Some(&post.trigger),
+                            part_sent,
                         );
                         match publish_trace(
                             &root_dir,

@@ -31,7 +31,72 @@ pub struct TracePost {
     /// The prompt(s) that started the turn (`owner message`, `reply CHAT_REPLY_007`,
     /// `agent lane-a`, ...), for the post's metadata.
     pub trigger: String,
+    /// Pending sent refs claimed for this post's first entry part, or
+    /// `None` when none have been claimed yet (#1907). `Some` (even empty)
+    /// means the claim already happened, so a retry carries the same refs.
+    pub sent: Option<Vec<SentRef>>,
 }
+
+/// One chat message the agent sent, named by a v2 trace entry's `sent`
+/// list (#1886 Bridge v2 `sent` spec, #1907): the thread it went into,
+/// the message itself, its instant, and how long it was.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SentRef {
+    /// The thread the sent message went into (its own `msg` when top-level).
+    pub thread: String,
+    /// The sent message's own id (`ts` on Slack).
+    pub msg: String,
+    /// The sent message's instant (the same text as `msg`).
+    pub ts: String,
+    /// How many characters the sent text held.
+    pub chars: u64,
+}
+
+impl SentRef {
+    /// The ref for one posted chat message, or `None` when the provider
+    /// message id names no message. `thread_id` is the provider thread
+    /// resource (`<channel>/threads/<ts>`) or a bare thread ts; `None`
+    /// (a top-level post, including a threaded send's fallback) names
+    /// the message's own thread. `text` is the text as sent.
+    #[must_use]
+    pub fn from_post(
+        thread_id: Option<&str>,
+        provider_message_id: &str,
+        text: &str,
+    ) -> Option<Self> {
+        let msg = provider_message_id
+            .split_once("/messages/")
+            .map_or(provider_message_id, |(_, rest)| rest)
+            .rsplit('/')
+            .next()
+            .filter(|part| !part.is_empty())?
+            .to_owned();
+        let thread = match thread_id {
+            Some(thread) => thread
+                .split_once("/threads/")
+                .map_or(thread, |(_, rest)| rest)
+                .rsplit('/')
+                .next()
+                .filter(|part| !part.is_empty())
+                .map_or_else(|| msg.clone(), str::to_owned),
+            None => msg.clone(),
+        };
+        Some(Self {
+            thread,
+            ts: msg.clone(),
+            msg,
+            chars: text.chars().count() as u64,
+        })
+    }
+}
+
+/// The most `sent` refs one v2 entry carries (#1886 spec).
+pub const MAX_SENT_REFS: usize = 8;
+
+/// The binding budget for one serialised trace `event_payload`, in
+/// bytes: readers refuse a payload over this, far inside the shim's
+/// 8 KB whole-metadata rule (#1886 spec).
+pub const MAX_TRACE_PAYLOAD_BYTES: usize = 2_048;
 
 /// The Slack metadata `event_type` of every trace post (#832).
 pub const TRACE_EVENT_TYPE: &str = "agentctl_trace";
@@ -40,7 +105,9 @@ pub const TRACE_EVENT_TYPE: &str = "agentctl_trace";
 /// [`TRACE_EVENT_TYPE`] and payload `{v: 1, kind, agent, team, session, day, seq, trigger}`.
 /// `kind` is `root` for the day's thread root and `entry` for a post in it; `day` is the ET
 /// date; `seq` counts the day's posts from 0 at the root; `team` and `session` are null when
-/// unknown, and the root's `trigger` is null.
+/// unknown, and the root's `trigger` is null. Entries posted by the trace
+/// driver use [`trace_metadata_with_sent`] (v2 with `sent`, #1907); this
+/// v1 shape stays for roots and v1 readers.
 #[must_use]
 pub fn trace_metadata(
     kind: &str,
@@ -58,6 +125,73 @@ pub fn trace_metadata(
             "day": day, "seq": seq, "trigger": trigger,
         },
     })
+}
+
+/// [`trace_metadata`] for a v2 entry carrying `sent` refs (#1907, the
+/// #1886 Bridge v2 `sent` spec). Roots stay exactly the v1 shape above
+/// with no `sent`; entries are `v: 2` and include `sent` only when the
+/// fitted list is non-empty. The fitted list is `pending` capped and
+/// budget-dropped by [`fit_sent_refs`].
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn trace_metadata_with_sent(
+    kind: &str,
+    agent: &str,
+    team: Option<&str>,
+    session: Option<&str>,
+    day: &str,
+    seq: u64,
+    trigger: Option<&str>,
+    sent: &[SentRef],
+) -> serde_json::Value {
+    if kind != "entry" {
+        return trace_metadata(kind, agent, team, session, day, seq, trigger);
+    }
+    let fitted = fit_sent_refs(agent, team, session, day, seq, trigger, sent);
+    let mut payload = serde_json::json!({
+        "v": 2, "kind": kind, "agent": agent, "team": team, "session": session,
+        "day": day, "seq": seq, "trigger": trigger,
+    });
+    if !fitted.is_empty() {
+        payload["sent"] = serde_json::to_value(&fitted).unwrap_or(serde_json::Value::Null);
+    }
+    serde_json::json!({"event_type": TRACE_EVENT_TYPE, "event_payload": payload})
+}
+
+/// The refs one v2 entry may carry from `pending` (oldest first, in send
+/// order): at most [`MAX_SENT_REFS`], dropping the OLDEST past the cap,
+/// then dropping the OLDEST until the whole serialised `event_payload`
+/// fits in [`MAX_TRACE_PAYLOAD_BYTES`]. A ref is never truncated or
+/// split; a dropped ref simply never interleaves (#1886 spec).
+#[must_use]
+pub fn fit_sent_refs(
+    agent: &str,
+    team: Option<&str>,
+    session: Option<&str>,
+    day: &str,
+    seq: u64,
+    trigger: Option<&str>,
+    pending: &[SentRef],
+) -> Vec<SentRef> {
+    let mut fitted: Vec<SentRef> = pending.to_vec();
+    while fitted.len() > MAX_SENT_REFS {
+        fitted.remove(0);
+    }
+    loop {
+        if fitted.is_empty() {
+            return fitted;
+        }
+        let payload = serde_json::json!({
+            "v": 2, "kind": "entry", "agent": agent, "team": team, "session": session,
+            "day": day, "seq": seq, "trigger": trigger, "sent": fitted,
+        });
+        if serde_json::to_string(&payload)
+            .map_or(true, |text| text.len() <= MAX_TRACE_PAYLOAD_BYTES)
+        {
+            return fitted;
+        }
+        fitted.remove(0);
+    }
 }
 
 /// File extensions after which Slack's auto-linker takes a bare name for a web address (many
@@ -519,6 +653,7 @@ impl Collector {
             posts.push(TracePost {
                 text: part,
                 trigger: trigger.clone(),
+                sent: None,
             });
         }
         posts
@@ -762,6 +897,7 @@ mod tests {
             .map(|i| TracePost {
                 text: format!("p{i}"),
                 trigger: "prompt".to_owned(),
+                sent: None,
             })
             .collect();
         assert_eq!(cap_held(&mut held, 3), 2);
@@ -840,6 +976,170 @@ mod tests {
         assert_eq!(entry["event_payload"]["seq"], 7);
         assert_eq!(entry["event_payload"]["trigger"], "owner message");
         assert!(entry["event_payload"]["team"].is_null());
+    }
+
+    fn sent(thread: &str, msg: &str, chars: u64) -> SentRef {
+        SentRef {
+            thread: thread.to_owned(),
+            msg: msg.to_owned(),
+            ts: msg.to_owned(),
+            chars,
+        }
+    }
+
+    #[test]
+    fn v2_entry_carries_sent_in_send_order_and_root_is_unchanged() {
+        // #1907 / #1886 spec example shape, oldest first.
+        let pending = vec![
+            sent("1763510400.000100", "1763510400.000100", 212),
+            sent("1763509900.000200", "1763510460.000300", 96),
+        ];
+        let entry = trace_metadata_with_sent(
+            "entry",
+            "liaison",
+            None,
+            Some("s1"),
+            "2026-11-19",
+            7,
+            Some("owner message"),
+            &pending,
+        );
+        assert_eq!(entry["event_type"], "agentctl_trace");
+        assert_eq!(entry["event_payload"]["v"], 2);
+        assert_eq!(entry["event_payload"]["kind"], "entry");
+        assert_eq!(
+            entry["event_payload"]["sent"],
+            serde_json::json!([
+                {"thread": "1763510400.000100", "msg": "1763510400.000100", "ts": "1763510400.000100", "chars": 212},
+                {"thread": "1763509900.000200", "msg": "1763510460.000300", "ts": "1763510460.000300", "chars": 96}
+            ])
+        );
+        assert!(serde_json::to_string(&entry).unwrap().len() < 8_192);
+        // Roots stay the v1 shape with no sent, even when refs are pending.
+        let root = trace_metadata_with_sent(
+            "root",
+            "liaison",
+            None,
+            Some("s1"),
+            "2026-11-19",
+            0,
+            None,
+            &pending,
+        );
+        assert_eq!(root["event_payload"]["v"], 1);
+        assert_eq!(root["event_payload"]["kind"], "root");
+        assert!(root["event_payload"].get("sent").is_none());
+        // v1 fallback: the plain builder is still v1, and a v2 entry
+        // with no pending refs carries no sent list.
+        assert_eq!(
+            trace_metadata("entry", "liaison", None, None, "2026-11-19", 1, None)["event_payload"]
+                ["v"],
+            1
+        );
+        let empty =
+            trace_metadata_with_sent("entry", "liaison", None, None, "2026-11-19", 1, None, &[]);
+        assert_eq!(empty["event_payload"]["v"], 2);
+        assert!(empty["event_payload"].get("sent").is_none());
+    }
+
+    #[test]
+    fn sent_refs_cap_at_eight_dropping_the_oldest() {
+        let pending: Vec<SentRef> = (0..12)
+            .map(|n| {
+                sent(
+                    &format!("1700000000.00010{n}"),
+                    &format!("1700000001.00010{n}"),
+                    n,
+                )
+            })
+            .collect();
+        let fitted = fit_sent_refs("a", None, None, "2026-11-19", 1, Some("t"), &pending);
+        assert_eq!(fitted.len(), MAX_SENT_REFS);
+        assert_eq!(
+            fitted,
+            pending[4..].to_vec(),
+            "oldest dropped, send order kept"
+        );
+        let entry = trace_metadata_with_sent(
+            "entry",
+            "a",
+            None,
+            None,
+            "2026-11-19",
+            1,
+            Some("t"),
+            &pending,
+        );
+        assert_eq!(entry["event_payload"]["sent"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn sent_refs_drop_oldest_until_the_payload_fits_two_kb() {
+        // Long ids make each ref large; fitting must drop whole oldest
+        // refs, never truncate or split one.
+        let pending: Vec<SentRef> = (0..8)
+            .map(|n| {
+                let id = format!("{}-{}", "1".repeat(120), n);
+                sent(&id, &id, 10)
+            })
+            .collect();
+        let fitted = fit_sent_refs(
+            "agent",
+            None,
+            None,
+            "2026-11-19",
+            1,
+            Some("trigger"),
+            &pending,
+        );
+        assert!(!fitted.is_empty() && fitted.len() < pending.len());
+        assert_eq!(fitted, pending[pending.len() - fitted.len()..].to_vec());
+        for kept in &fitted {
+            assert!(pending.contains(kept), "a kept ref is whole: {kept:?}");
+        }
+        let entry = trace_metadata_with_sent(
+            "entry",
+            "agent",
+            None,
+            None,
+            "2026-11-19",
+            1,
+            Some("trigger"),
+            &pending,
+        );
+        assert!(
+            serde_json::to_string(&entry["event_payload"])
+                .unwrap()
+                .len()
+                <= MAX_TRACE_PAYLOAD_BYTES
+        );
+        // One ref too large on its own is dropped whole, not truncated.
+        let huge = vec![sent(&"9".repeat(4_000), &"9".repeat(4_000), 1)];
+        assert!(fit_sent_refs("a", None, None, "2026-11-19", 1, None, &huge).is_empty());
+        let entry =
+            trace_metadata_with_sent("entry", "a", None, None, "2026-11-19", 1, None, &huge);
+        assert!(entry["event_payload"].get("sent").is_none());
+        assert_eq!(entry["event_payload"]["v"], 2);
+    }
+
+    #[test]
+    fn sent_ref_names_thread_message_and_character_count() {
+        let threaded = SentRef::from_post(
+            Some("C0123ABCD/threads/1763509900.000200"),
+            "C0123ABCD/messages/1763510460.000300",
+            "héllo",
+        )
+        .expect("threaded ref");
+        assert_eq!(threaded, sent("1763509900.000200", "1763510460.000300", 5));
+        // A top-level post's thread is its own message; chars count
+        // characters, not bytes.
+        let top = SentRef::from_post(None, "C0123ABCD/messages/1763510400.000100", "ab")
+            .expect("top-level ref");
+        assert_eq!(top.thread, top.msg);
+        assert_eq!(top.ts, top.msg);
+        assert_eq!(top.chars, 2);
+        assert!(SentRef::from_post(None, "", "x").is_none());
+        assert!(SentRef::from_post(Some(""), "C1/messages/", "x").is_none());
     }
 
     #[test]

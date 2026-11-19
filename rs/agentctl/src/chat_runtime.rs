@@ -3342,6 +3342,20 @@ struct PublishLedger {
     posts: Vec<PublishLedgerPost>,
 }
 
+const MAX_PENDING_SENT_REFS: usize = 64;
+const MAX_PENDING_SENT_BYTES: usize = 256 * 1_024;
+const PENDING_SENT_FILE: &str = "pending-sent.json";
+
+/// Chat messages posted for the agent that no trace entry has named
+/// yet (#1907): a new persisted bridge-state file, not a field of an
+/// existing document, so a pinned older bridge ignores it whole.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PendingSentRefs {
+    version: u32,
+    #[serde(default)]
+    refs: Vec<crate::chat_trace::SentRef>,
+}
+
 /// A recent outbound post too like the text about to go out (#1239).
 pub(crate) struct DuplicateMatch {
     /// When the earlier post went through, in milliseconds since the epoch.
@@ -13594,6 +13608,68 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         write_document(&self.publish_ledger_path(), &ledger)
     }
 
+    fn pending_sent_path(&self) -> PathBuf {
+        self.root.join(PENDING_SENT_FILE)
+    }
+
+    fn read_pending_sent(&self) -> Result<PendingSentRefs> {
+        match read_document(&self.pending_sent_path(), MAX_PENDING_SENT_BYTES) {
+            Ok(pending) => Ok(pending),
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(PendingSentRefs::default())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Record one posted chat message as a pending sent ref (#1907),
+    /// dropping the oldest past [`MAX_PENDING_SENT_REFS`]. Callers that
+    /// already hold the state lock use
+    /// [`Self::record_pending_sent_locked`]; this unlocked entry is for
+    /// the rest (the restart test exercises it directly).
+    #[allow(dead_code)]
+    pub(crate) fn record_pending_sent(&self, sent: crate::chat_trace::SentRef) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
+        self.record_pending_sent_locked(sent)
+    }
+
+    /// [`Self::record_pending_sent`] with the state lock already held.
+    pub(crate) fn record_pending_sent_locked(
+        &self,
+        sent: crate::chat_trace::SentRef,
+    ) -> Result<()> {
+        let mut pending = self.read_pending_sent()?;
+        pending.refs.push(sent);
+        if pending.refs.len() > MAX_PENDING_SENT_REFS {
+            let excess = pending.refs.len() - MAX_PENDING_SENT_REFS;
+            pending.refs.drain(..excess);
+        }
+        pending.version = 1;
+        write_document(&self.pending_sent_path(), &pending)
+    }
+
+    /// Take every pending sent ref, oldest first, clearing the queue
+    /// (#1907): the trace driver claims them for its next entry, and a
+    /// ref it then drops for the budget simply never interleaves.
+    pub(crate) fn take_pending_sent_refs(&self) -> Result<Vec<crate::chat_trace::SentRef>> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
+        let pending = self.read_pending_sent()?;
+        if !pending.refs.is_empty() {
+            let cleared = PendingSentRefs {
+                version: 1,
+                refs: Vec::new(),
+            };
+            write_document(&self.pending_sent_path(), &cleared)?;
+        }
+        Ok(pending.refs)
+    }
+
     /// The channel and thread a reply to `key` goes to, or `None` when no request has the key.
     pub(crate) fn request_destination(&self, key: &str) -> Result<Option<(String, String)>> {
         match self.read_request(key) {
@@ -14969,6 +15045,26 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             return Err(ChatRuntimeError::invalid(
                 "reply artifact changed during outbound send",
             ));
+        }
+        // #1907: name this posted reply as a pending sent ref for the
+        // next v2 trace entry. Bookkeeping only: the reply already went
+        // through, so a recording failure never changes its result. A
+        // top-level fallback's thread is its own message.
+        if let Some(sent_ref) = crate::chat_trace::SentRef::from_post(
+            if fallback {
+                None
+            } else {
+                Some(&request_snapshot.message.thread_id)
+            },
+            &provider_message_id,
+            &body_text,
+        ) {
+            if let Err(error) = self.record_pending_sent_locked(sent_ref) {
+                crate::chat_service::service_log(format_args!(
+                    "agentctl: reply {} of request {key} was posted but not recorded as a pending sent ref: {error}",
+                    reply.ordinal
+                ));
+            }
         }
         current.phase = ReplyPhase::Sent;
         current.send_attempts = current.send_attempts.saturating_add(1);
@@ -21767,6 +21863,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// A fake Slack-shaped reply transport (#1907): posts are named
+    /// `<channel>/messages/<ts>`, as the Slack outbound helper names them.
+    #[derive(Default)]
+    struct FakeSlackReplyTransport {
+        submissions: Vec<String>,
+    }
+
+    impl ReplyTransport for FakeSlackReplyTransport {
+        fn send(
+            &mut self,
+            submission: ReplySubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            self.submissions.push(submission.body.to_owned());
+            Ok(format!(
+                "{}/messages/1763510460.00030{}",
+                submission.channel_id,
+                self.submissions.len()
+            ))
+        }
+    }
+
     #[derive(Default)]
     struct FakeReplyTransport {
         submissions: Vec<(String, String, String, String)>,
@@ -22111,6 +22228,157 @@ pub(crate) mod tests {
             "Run `:thread:001` first.\n```\n:thread:001\n```\nThen :thread:001.",
         );
         assert_eq!(wire.matches("|:thread:001>").count(), 1, "{wire}");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_posted_reply_is_named_by_the_next_v2_trace_entry() {
+        // #1907 end to end on the bridge side, with a fake Slack-shaped
+        // transport: a reply is posted, claimed as a pending sent ref,
+        // and the next v2 trace entry's sent[] names that reply. The
+        // reopened state proves the queue is persisted, not in-memory.
+        let root = temporary("trace-v2-sent-e2e");
+        let mut configuration = config_without_reaction();
+        configuration.channel_ids = vec!["C0123ABCD".to_owned()];
+        let state = BridgeState::initialize(&root, configuration).expect("initialize state");
+        let message = InboundMessage::new(
+            ChannelId::new("C0123ABCD").expect("channel"),
+            MessageId::new("1763509900.000200").expect("message"),
+            ThreadId::new("1763509900.000200").expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "please look",
+            "2026-11-19T12:00:00Z",
+            false,
+        )
+        .expect("normalized message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(1).expect("sequence"),
+            ProviderCursor::new("cursor-1").expect("cursor"),
+            DeliveryId::new("delivery-1").expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery");
+        let key = state
+            .admit_batch(&batch)
+            .expect("admission")
+            .new_request_keys
+            .into_iter()
+            .next()
+            .expect("key");
+        state
+            .set_delivery_phase(&key, RequestPhase::Delivered, None)
+            .expect("mark delivered");
+        let route = state
+            .next_reply_route(&key)
+            .expect("route")
+            .expect("open route");
+        state
+            .capture_replies(
+                &key,
+                &format!(
+                    "<CHAT_REPLY_{}>\nthe deploy is done\n</CHAT_REPLY_{}>",
+                    route.identifier, route.identifier
+                ),
+            )
+            .expect("capture reply");
+        let mut transport = FakeSlackReplyTransport::default();
+        let posted = state
+            .publish_one(&key, &mut transport)
+            .expect("reply posted")
+            .expect("provider id");
+        assert_eq!(posted, "C0123ABCD/messages/1763510460.000301");
+        assert_eq!(transport.submissions.len(), 1);
+        // Persisted: a reopened state claims the same pending ref the
+        // posting bridge recorded, and claiming drains the queue.
+        let reopened = BridgeState::open(&root).expect("reopen state");
+        let claimed = reopened.take_pending_sent_refs().expect("claim refs");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].thread, "1763509900.000200");
+        assert_eq!(claimed[0].msg, "1763510460.000301");
+        assert_eq!(claimed[0].ts, claimed[0].msg);
+        assert_eq!(
+            claimed[0].chars,
+            transport.submissions[0].chars().count() as u64,
+            "chars counts the sent text"
+        );
+        let pending = claimed.clone();
+        assert!(reopened
+            .take_pending_sent_refs()
+            .expect("second claim")
+            .is_empty());
+        let entry = crate::chat_trace::trace_metadata_with_sent(
+            "entry",
+            "liaison",
+            None,
+            Some("s1"),
+            "2026-11-19",
+            7,
+            Some("owner message"),
+            &claimed,
+        );
+        assert_eq!(entry["event_payload"]["v"], 2);
+        assert_eq!(
+            entry["event_payload"]["sent"],
+            json!([{"thread": "1763509900.000200", "msg": "1763510460.000301", "ts": "1763510460.000301", "chars": pending[0].chars}])
+        );
+        assert!(
+            serde_json::to_string(&entry["event_payload"])
+                .unwrap()
+                .len()
+                <= crate::chat_trace::MAX_TRACE_PAYLOAD_BYTES
+        );
+        assert!(serde_json::to_string(&entry).unwrap().len() < 8_192);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn pending_sent_refs_survive_a_restart_and_a_stale_ref_still_classes() {
+        // #1907, at coordb's check: if the bridge restarts between a
+        // send and the next trace entry, the pending refs survive in
+        // pending-sent.json (that persistence is the point), so the
+        // reopened bridge claims exactly what the old one recorded, in
+        // send order. One ref here names a message no reader still
+        // holds (a stale ref): the entry still carries it whole and
+        // still classes its thread (v2, kind entry, agent, day are all
+        // present); vibe-talk's interleave then simply skips a ref its
+        // cache cannot resolve, never faking it (#1886 spec).
+        let root = temporary("trace-v2-sent-restart");
+        let state =
+            BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
+        for (thread, msg) in [
+            ("1763509900.000200", "1763510460.000300"),
+            ("1763509900.000200", "1111111111.000999"),
+        ] {
+            state
+                .record_pending_sent(crate::chat_trace::SentRef {
+                    thread: thread.to_owned(),
+                    msg: msg.to_owned(),
+                    ts: msg.to_owned(),
+                    chars: 42,
+                })
+                .expect("record pending ref");
+        }
+        drop(state);
+        let reopened = BridgeState::open(&root).expect("reopen after restart");
+        let claimed = reopened.take_pending_sent_refs().expect("claim after restart");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].msg, "1763510460.000300");
+        assert_eq!(claimed[1].msg, "1111111111.000999", "the stale ref, whole");
+        let entry = crate::chat_trace::trace_metadata_with_sent(
+            "entry",
+            "liaison",
+            None,
+            Some("s1"),
+            "2026-11-19",
+            3,
+            Some("owner message"),
+            &claimed,
+        );
+        assert_eq!(entry["event_payload"]["v"], 2);
+        assert_eq!(entry["event_payload"]["kind"], "entry");
+        assert_eq!(entry["event_payload"]["agent"], "liaison");
+        assert_eq!(entry["event_payload"]["day"], "2026-11-19");
+        assert_eq!(entry["event_payload"]["sent"].as_array().unwrap().len(), 2);
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
