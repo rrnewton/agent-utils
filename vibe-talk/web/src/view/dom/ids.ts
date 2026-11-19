@@ -119,6 +119,7 @@ export interface ElementById {
   "control-bar-bottom": HTMLDivElement;
   "control-bar-top": HTMLDivElement;
   "control-pane": HTMLDivElement;
+  "data-reach-back": HTMLInputElement;
   "discord-channel": HTMLSelectElement;
   "discord-log": HTMLOListElement;
   "discuss-actions": HTMLDivElement;
@@ -225,9 +226,6 @@ export interface ElementById {
   "empty-line": HTMLParagraphElement;
   "empty-state": HTMLDivElement;
   "enter-sends": HTMLInputElement;
-  "windowed-lists": HTMLInputElement;
-  "data-reach-back": HTMLInputElement;
-  "render-row-cap": HTMLInputElement;
   "enter-sends-hint": HTMLParagraphElement;
   "error": HTMLSpanElement;
   "error-wrap": HTMLDivElement;
@@ -527,6 +525,7 @@ export interface ElementById {
   "remove-channel-state": HTMLParagraphElement;
   "rename-channel": HTMLButtonElement;
   "rename-fields": HTMLDivElement;
+  "render-row-cap": HTMLInputElement;
   "reply-branch": HTMLInputElement;
   "reply-branch-row": HTMLLabelElement;
   "reply-cancel": HTMLButtonElement;
@@ -770,6 +769,8 @@ export interface ElementById {
   "welcome-snippet": HTMLPreElement;
   "welcome-start": HTMLButtonElement;
   "width-grip": HTMLDivElement;
+  "windowed-lists": HTMLInputElement;
+  "windowed-lists-hint": HTMLParagraphElement;
   "wit-voice-picker": HTMLDivElement;
   "wit-voice-state": HTMLParagraphElement;
 }

@@ -357,23 +357,23 @@ test("`#624 voice-page-modularity`: the reading preferences' switches reach what
     lookup: (id) => target(id),
     toggleSpeedPopover: act("pace"), applyOwnRead: act("own apply"), undoOwnRead: act("own undo"), markOwnReadChanged: act("own"),
     hideEmptyChanged: act("empty"), combineChanged: act("combine"), richHeadersChanged: act("headers"), inAppLinksChanged: act("links"),
-    openInViewChanged: act("open in view"), afterDoneChanged: act("after done"), summariesChanged: act("summaries"), enterSendsChanged: act("enter sends"),
+    openInViewChanged: act("open in view"), afterDoneChanged: act("after done"), summariesChanged: act("summaries"), enterSendsChanged: act("enter sends"), windowedChanged: act("windowed"),
     markReadChanged: act("mark"), markReadQuoteGuardChanged: act("mark size"), markReadFoldGuardChanged: act("mark fold"),
     markReadNonquoteChanged: act("mark plain"), markReadFinalGuardChanged: act("mark final"), markReadFirstGuardChanged: act("mark first"),
   });
   const order = [["read-speed", "click"], ["own-read-apply", "click"], ["own-read-undo", "click"], ["mark-own-read", "change"],
     ["hide-empty-messages", "change"], ["combine-messages", "change"], ["rich-headers", "change"], ["in-app-links", "change"],
-    ["open-in-view", "change"], ["after-done", "change"], ["summarize-collapsed", "change"], ["enter-sends", "change"],
+    ["open-in-view", "change"], ["after-done", "change"], ["summarize-collapsed", "change"], ["enter-sends", "change"], ["windowed-lists", "change"], ["data-reach-back", "change"], ["render-row-cap", "change"],
     ["mark-read-on-reply", "change"], ["mark-read-quote-guard", "change"], ["mark-read-fold-guard", "change"],
     ["mark-read-nonquote", "change"], ["mark-read-final-guard", "change"], ["mark-read-first-guard", "change"]];
   assert.deepStrictEqual(log, order.map(([id, type]) => `listen ${id} ${type}`), "a switch was heard out of the page's order");
   log.length = 0;
   nodes["enter-sends"].checked = true;
   assert.deepStrictEqual(order.flatMap(([id, type]) => fire(id, type)),
-    ["pace", "own apply", "own undo", "own", "empty", "combine", "headers", "links", "open in view", "after done", "summaries", "enter sends",
+    ["pace", "own apply", "own undo", "own", "empty", "combine", "headers", "links", "open in view", "after done", "summaries", "enter sends", "windowed", "windowed", "windowed",
      "mark", "mark size", "mark fold", "mark plain", "mark final", "mark first"]);
   assert.deepStrictEqual(log, ["pace", "own apply", "own undo", "own", "empty", "combine", "headers", "links", "open in view", "after done", "summaries",
-    "enter sends true", "mark", "mark size", "mark fold", "mark plain", "mark final", "mark first"], "an act was handed the event, or Enter sends not read as the switch says");
+    "enter sends true", "windowed false", "windowed false", "windowed false", "mark", "mark size", "mark fold", "mark plain", "mark final", "mark first"], "an act was handed the event, or Enter sends not read as the switch says");
   switches.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
