@@ -203,6 +203,26 @@ def test_remove_refuses_unpushed_private_history_like_python(tmp_path: Path) -> 
     assert (rust_root / "worktrees" / "slot-a").is_dir()
 
 
+def test_remove_refuses_deinitialized_submodule_with_retained_store(
+    tmp_path: Path,
+) -> None:
+    """#1878: `-` in submodule status is deinitialized, not empty.
+
+    Deinitializing keeps the module repository (and the private commits
+    made on its side branch) under ``modules/<name>``; the Rust edition
+    must fail closed and keep the slot instead of deleting that store.
+    """
+
+    rust_root = _fixture(tmp_path / "rust", cover_with_tag=False)
+    checkout = rust_root / "worktrees" / "slot-a" / "repo"
+    _git(checkout, "submodule", "deinit", "-f", "leaf")
+    result = _rust_remove(rust_root)
+    assert result.returncode == 1
+    assert "deinitialized submodule" in result.stderr
+    assert "submodule salvage stays with the Python edition" in result.stderr
+    assert (rust_root / "worktrees" / "slot-a").is_dir()
+
+
 def test_remove_advertised_tag_cover_skips_private_history_refusal(
     tmp_path: Path,
 ) -> None:

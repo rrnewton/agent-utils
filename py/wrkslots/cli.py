@@ -35786,12 +35786,59 @@ def _nested_module_repository_checkouts(
         if not parts:
             continue
         relative = Path(*parts)
-        if _submodule_worktree_populated(checkout_path / relative):
-            continue
+        # Judge this repository by the worktree IT records, never by
+        # the same-named path (#1878): a submodule declared with a
+        # name that differs from its path would otherwise be skipped
+        # (or bundled) by another submodule's populated worktree.
+        # Deinitializing a submodule deletes both records (the `gitdir`
+        # file and `core.worktree`), so then the declaring
+        # superprojects' `.gitmodules` name-to-path mapping is the only
+        # record of where its worktree belongs.
+        recorded_worktree = _module_recorded_worktree(current)
+        declared_worktree = (
+            None
+            if recorded_worktree is not None
+            else _module_declared_worktree(vcs, checkout_path, parts)
+        )
+        worktree = recorded_worktree or declared_worktree
+        judged_worktree = worktree or (checkout_path / relative)
+        if _submodule_worktree_populated(judged_worktree):
+            if recorded_worktree is not None:
+                continue
+            owner = _worktree_gitdir(judged_worktree)
+            if owner is not None and owner.resolve() == current.resolve():
+                continue
+            if declared_worktree is None:
+                # The path spelled by the module NAME is another
+                # repository's populated worktree, and nothing records
+                # where this module's own worktree is: judging either
+                # way could delete its history unseen.
+                raise Refusal(
+                    f"nested module repository {current} of checkout "
+                    f"{checkout.name} cannot be judged: {judged_worktree} is a "
+                    "different repository's populated worktree, and "
+                    "neither the module nor its superproject's "
+                    ".gitmodules records this module's worktree; "
+                    "preserve it"
+                )
+            # The declared path now holds another repository; this
+            # module's own worktree is not populated there, so it is
+            # judged here as a candidate in its own right.
+        candidate_relative = relative
+        if worktree is not None and worktree.is_relative_to(checkout_path):
+            candidate_relative = worktree.relative_to(checkout_path)
         # Git refuses every command in a module repository whose recorded
         # worktree has gone; an empty directory at that path (removed with
-        # the slot) lets its history be read and bundled.
-        (checkout_path / relative).mkdir(parents=True, exist_ok=True)
+        # the slot) lets its history be read and bundled. The directory is
+        # made inside THIS checkout, never at the recorded path itself:
+        # after the path fence that path is the original slot location,
+        # and recreating it there would resurrect the slot being removed.
+        mkdir_target = (
+            worktree
+            if worktree is not None and worktree.is_relative_to(checkout_path)
+            else checkout_path / candidate_relative
+        )
+        mkdir_target.mkdir(parents=True, exist_ok=True)
         try:
             head = vcs.head(current)
             authority = vcs.remote_authority(current, remote)
@@ -35803,7 +35850,7 @@ def _nested_module_repository_checkouts(
             # judged through its candidate path instead. Any other
             # unreadable module repository refuses, or its history,
             # refs/rescue/* included, would be deleted unseen.
-            nested_name = f"{checkout.name}/{relative.as_posix()}"
+            nested_name = f"{checkout.name}/{candidate_relative.as_posix()}"
             same_name = [
                 candidate_path
                 for name, candidate_path in known_candidates
@@ -35857,8 +35904,8 @@ def _nested_module_repository_checkouts(
         result.append(
             (
                 Checkout(
-                    name=f"{checkout.name}/{relative.as_posix()}",
-                    path=(Path(checkout.path) / relative).as_posix(),
+                    name=f"{checkout.name}/{candidate_relative.as_posix()}",
+                    path=(Path(checkout.path) / candidate_relative).as_posix(),
                     repository=repository,
                     branch="",
                     start_point=head,
@@ -60249,6 +60296,104 @@ def _repair_checkout_at_slot(
             f"fenced checkout {checkout.name} changed after finish was prepared; preserve it for inspection"
         )
     return path
+
+
+def _module_recorded_worktree(gitdir: Path) -> Path | None:
+    """The worktree a module Git directory records for itself (#1878).
+
+    A module repository's own ``gitdir`` file names its worktree's
+    ``.git`` file, and ``core.worktree`` is the fallback. The module
+    NAME (its directory under ``modules/``) is not its worktree path:
+    a submodule declared with ``--name y`` at path x records x here,
+    and judging y's worktree instead would skip x's repository
+    entirely.
+    """
+
+    try:
+        recorded = (gitdir / "gitdir").read_text(
+            encoding="utf-8", errors="strict"
+        ).strip()
+    except (OSError, UnicodeError):
+        recorded = ""
+    if recorded:
+        candidate = Path(recorded)
+        if not candidate.is_absolute():
+            candidate = (gitdir / candidate).resolve()
+        return candidate.parent
+    # Fallback: core.worktree in the module's own config file.
+    try:
+        config_lines = (gitdir / "config").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        config_lines = []
+    in_core = False
+    for line in config_lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_core = stripped.lower() == "[core]"
+            continue
+        if in_core and stripped.lower().startswith("worktree"):
+            _key, _equals, value = stripped.partition("=")
+            value = value.strip()
+            if value:
+                candidate = Path(value)
+                if not candidate.is_absolute():
+                    candidate = (gitdir / candidate).resolve()
+                return candidate
+    return None
+
+
+def _module_declared_worktree(
+    vcs: _GitVcs, checkout_path: Path, names: Sequence[str]
+) -> Path | None:
+    """The worktree the declaring superprojects assign to a module chain (#1878).
+
+    ``names`` are the module names under successive ``modules/``
+    directories. Each superproject's `.gitmodules` maps its submodule
+    NAME to the path it is checked out at, which need not be the same
+    string. This is the only surviving record after `git submodule
+    deinit`, which deletes the module's own `gitdir` file and
+    `core.worktree`. Returns None when any declaration in the chain is
+    missing or unsafe, leaving the caller to refuse rather than guess.
+    """
+
+    superproject = checkout_path
+    worktree = checkout_path
+    for name in names:
+        declared = dict(_declared_submodules(vcs, superproject))
+        raw = declared.get(name)
+        if raw is None:
+            return None
+        relative = Path(raw)
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            return None
+        worktree = superproject / relative
+        superproject = worktree
+    return worktree
+
+
+def _worktree_gitdir(worktree: Path) -> Path | None:
+    """The Git directory a populated worktree's `.git` entry resolves to."""
+
+    entry = worktree / ".git"
+    if entry.is_dir():
+        return entry
+    if not entry.is_file():
+        return None
+    try:
+        text = entry.read_text(encoding="utf-8", errors="strict").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    target = text[len("gitdir:") :].strip()
+    if not target:
+        return None
+    gitdir = Path(target)
+    if not gitdir.is_absolute():
+        gitdir = worktree / gitdir
+    return gitdir if gitdir.is_dir() else None
 
 
 def _submodule_worktree_populated(nested: Path) -> bool:

@@ -1647,12 +1647,51 @@ fn salvage_checkout(cfg: &Cfg, checkout: &Value, repository: &Path) -> Result<Va
 }
 
 /// Whether `git submodule status` output names an initialized submodule. A line starting with
-/// `-` is a submodule that was never initialized: an empty directory with nothing to salvage,
-/// as the Python edition's `submodule foreach` (initialized only) also treats it.
+/// `-` names a submodule with no checked-out worktree, as the Python edition's
+/// `submodule foreach` (initialized only) also treats it. That alone does not prove
+/// nothing can be lost: a deinitialized submodule keeps its module repository
+/// under `modules/<name>` (#1878), so callers must also check
+/// `retained_module_store_names` before treating a `-` line as empty.
 fn has_initialized_submodule(status: &str) -> bool {
     status
         .lines()
         .any(|line| !line.trim().is_empty() && !line.starts_with('-'))
+}
+
+/// Whether `git submodule status` output names a submodule with no worktree.
+fn has_uninitialized_submodule(status: &str) -> bool {
+    status.lines().any(|line| line.starts_with('-'))
+}
+
+/// Names of module repositories retained under one `modules/` directory.
+///
+/// A retained repository (a `HEAD` file beside an `objects/` directory) can
+/// hold private history even when its worktree was deinitialized (#1878).
+/// A submodule that was never initialized has no such repository.
+fn retained_module_store_names(modules_root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = std::fs::read_dir(modules_root) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let store = entry.path();
+        if store.join("HEAD").is_file() && store.join("objects").is_dir() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Retained module repositories of one checkout with no populated worktree.
+fn uninitialized_module_stores(checkout_path: &Path, status: &str) -> Vec<String> {
+    if !has_uninitialized_submodule(status) {
+        return Vec::new();
+    }
+    let Ok(git_directory) = git(checkout_path, &["rev-parse", "--absolute-git-dir"]) else {
+        return Vec::new();
+    };
+    retained_module_store_names(&Path::new(git_directory.trim()).join("modules"))
 }
 
 /// Expand the configured cache globs inside one checkout and judge
@@ -4011,6 +4050,18 @@ fn salvage_gate(
             "checkout {name} has initialized submodules; submodule salvage stays with the Python edition for now"
         ));
     }
+    // A `-` status line is not proof of an empty submodule (#1878):
+    // deinitializing leaves the module repository, and any private
+    // history in it, under `modules/<name>`. This edition has no
+    // counterpart to the Python nested-module salvage, so fail closed
+    // and hand the slot to that edition instead of deleting the store.
+    let retained_stores = uninitialized_module_stores(&path, &submodules);
+    if !retained_stores.is_empty() {
+        return Err(format!(
+            "checkout {name} has deinitialized submodule module repositories retained ({}) whose history is not checked out; submodule salvage stays with the Python edition for now; preserve it",
+            retained_stores.join(", ")
+        ));
+    }
     let updated = salvage_checkout(cfg, checkout, repository).map_err(|error| {
         format!(
             "checkout {name} is not fully published; salvage stays with the Python edition for now: {error}"
@@ -6218,7 +6269,29 @@ mod census_gone_tests {
 
 #[cfg(test)]
 mod submodule_tests {
-    use super::has_initialized_submodule;
+    use super::{
+        has_initialized_submodule, has_uninitialized_submodule, retained_module_store_names,
+    };
+
+    #[test]
+    fn deinitialized_submodule_with_retained_store_is_detected() {
+        // #1878: a `-` line alone used to read as "nothing to salvage",
+        // but deinitializing keeps the module repository on disk.
+        let status = "-56714bf4884cdc74b4a0b9d9e2a7b8427bd24fd7 x\n";
+        assert!(has_uninitialized_submodule(status));
+        assert!(!has_initialized_submodule(status));
+
+        let base = std::env::temp_dir().join(format!("wrkslots-retained-{}", std::process::id()));
+        let modules = base.join("modules");
+        let store = modules.join("y");
+        std::fs::create_dir_all(store.join("objects")).unwrap();
+        std::fs::write(store.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        // A bare directory with no repository in it is not a store.
+        std::fs::create_dir_all(modules.join("never-initialized")).unwrap();
+        assert_eq!(retained_module_store_names(&modules), vec!["y".to_string()]);
+        assert!(retained_module_store_names(&base.join("missing")).is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn uninitialized_submodules_do_not_block_removal() {
