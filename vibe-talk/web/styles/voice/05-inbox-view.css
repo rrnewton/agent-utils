@@ -339,9 +339,9 @@
 #side-log li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-cards li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-stack-under] > :not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#side-cards li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.thread-unread-preview):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-cards li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.thread-unread-preview):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-unread-replies] > :not(.thread-strip):not(.thread-unread):not(.thread-unread-preview):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-log li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #side-cards li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
 #discord-log li.discord-message[data-reply-marker] > :not(.thread-strip):not(.reply-marker):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
@@ -364,8 +364,11 @@
    parts, for a root that is also a reply. (`:not(.thread-strip)` is weight only, as on the rules over
    a row's parts above, which `#299 all-thread-strip` gave it.) */
 #side-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#side-log li.discord-message[data-unread-replies] > .thread-unread-preview,
 #side-cards li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
-#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather) {
+#side-cards li.discord-message[data-unread-replies] > .thread-unread-preview,
+#discord-log li.discord-message[data-unread-replies] > .thread-unread:not(.thread-strip):not(.reply-jump):not(.reply-bridge):not(.reply-ungather),
+#discord-log li.discord-message[data-unread-replies] > .thread-unread-preview {
   position: relative;
   z-index: 1;
   filter: none;

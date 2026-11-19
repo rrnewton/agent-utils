@@ -2321,7 +2321,7 @@ const replyCounts = createReplyCounts({
   selectedChannelId: () => selectedChannelId(), selection: () => selection(),
   sentFromThisPage: (m) => sentFromThisPage(m), setSearchOpen: (open) => setSearchOpen(open),
   setStatus: (text) => setStatus(text), shownNode: (node) => shownNode(/** @type {any} */ (node)),
-  stillToDo: (m, done) => stillToDo(m, done), threadCount: (count, exact) => threadCount(count, exact),
+  stillToDo: (m, done) => stillToDo(m, done), startsRead: (m) => startsRead(m), threadCount: (count, exact) => threadCount(count, exact),
   threadHue: (id) => threadHue(id), threadReplyCount: (id, m) => threadReplyCount(id, /** @type {any} */ (m)),
   timeOf: (m, field) => timeOf(m, field), viewKey: (view, threadId) => viewKey(view, /** @type {any} */ (threadId)),
   channelStore: () => channelStore, providerFacts, broadcastSupported: () => providerFacts.broadcastSupported(),
@@ -4617,7 +4617,7 @@ const threadList = createThreadList({
 });
 const {
   noteThreadListLanded, threadWords, threadName, threadChoices, openThreadChoice,
-  knownThreadChoice, openThreadName, olderThreadsOnServer, renderThreadSelect,
+  knownThreadChoice, openThreadName, olderThreadsOnServer, renderThreadSelect, refreshOpenPicker,
   renderThreadHeading, onThreadSelect, refreshThreadDirectory, openThread, closeThread,
   olderThreadsToRead, loadOlderThreads, olderThreadsFailure, threadCards, addThreadDecoration, gatherCount,
   noteNewestThreadPage,
@@ -4676,6 +4676,7 @@ const threadStripOwner = createThreadStrip({
   fromGatheredThread,
   canonChannel: () => channelStore.current().channel,
   timelineMessages: () => timelineRows().messages,
+  renderThreadSelect: () => refreshOpenPicker(),
 });
 const {
   allThreadSelected, drawingAll, markListView, paintThreadStrip, paintAllThreadFocus,

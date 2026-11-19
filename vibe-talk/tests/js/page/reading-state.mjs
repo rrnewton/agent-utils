@@ -1700,10 +1700,10 @@ test("ON MAIN a root whose thread holds unread replies says how many, beside N r
   assert.equal(unreadChip(page, inboxId(2)).getAttribute("aria-label"),
     "Open this thread at its first unread reply, 1 unread reply");
   assert.equal(chip.getAttribute("title"), "Open this thread at its first unread reply");
-  // Beside N replies, after it, as the last thing on the row: "3 replies  2 unread".
+  // Beside N replies, after it: "3 replies  2 unread", then the newest reply's preview (`#1906`).
   const root = rowWithId(page, inboxId(7));
   const order = root.children.map((node) => node.className);
-  assert.deepStrictEqual(order.slice(-2), ["thread-replies", "thread-unread"], `not beside N replies: ${order}`);
+  assert.deepStrictEqual(order.slice(-3), ["thread-replies", "thread-unread", "thread-unread-preview"], `not beside N replies: ${order}`);
   assert.equal(threadButton(root).textContent, "3 replies");
   assert.equal(threadBadge(root).textContent, "Thread(3)", "the way into the thread changed its words");
   assert.equal(root.getAttribute("data-unread-replies"), "2");
@@ -1839,6 +1839,47 @@ test("A REPLY ARRIVING counts on its root at once and brings it back under Hide 
   await page.settle();
   await page.settle();
   assert.deepStrictEqual(unreadSaid(page), { 2: "1 unread", 5: "1 unread", 7: "2 unread" }, "the read behind the arrivals changed the counts");
+});
+
+test("`#1906`: A LIVE REPLY TO THE OWNER'S OWN ROOT shows its words on the root's card, keeps it under the read-hiding mode, and the unread keys land on it", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  await inboxOnMain(page, messages);
+  await turnTodoOn(page);
+  // Question B is the owner's own, read on arrival (`#1881`); its one reply is Done.
+  const b = { ...messages[4].thread, is_root: false };
+  const first = message({ id: inboxId(13), content: "first answer: the page failed to render", thread: b, ...CODER });
+  const second = message({ id: inboxId(14), content: "fixed: cache cleared", thread: b, ...CODER });
+  page.messages = [...page.messages, first, second];
+  await deliver(page, page.stream(), sseMessage(first));
+  await deliver(page, page.stream(), sseMessage(second));
+  // The root stays in Main under the read-hiding mode (Fold read, #1168's successor to
+  // Hide read), says how many are waiting, and shows the newest one's words.
+  assert.ok(rowWithId(page, inboxId(5)), "the read-hiding mode hid the owner's root with unread replies");
+  assert.equal(unreadChip(page, inboxId(5)).textContent, "2 unread");
+  const root = rowWithId(page, inboxId(5));
+  const preview = root.descendants().find((node) => node.className === "thread-unread-preview");
+  assert.ok(preview && !preview.hidden, "the root's card shows no preview of the newest reply");
+  assert.ok(preview.textContent.includes("fixed: cache cleared"),
+    `the preview says "${preview.textContent}", not the newest reply's words`);
+  // Shift+Up from the newest row lands on each root whose thread holds unread replies,
+  // the owner's read roots included, and on nothing read.
+  await press(page, page.el("scroll-area"), "ArrowDown");
+  await page.settle();
+  for (let i = 0; i < 8; i++) { await press(page, page.el("scroll-area"), "ArrowDown"); await page.settle(); }
+  assert.equal(selectedId(page), inboxId(12));
+  const landed = [];
+  for (let i = 0; i < 3; i++) {
+    await pressHere(page, "ArrowUp", { shiftKey: true });
+    await page.settle();
+    landed.push(selectedId(page));
+  }
+  assert.deepStrictEqual(landed, [inboxId(7), inboxId(5), inboxId(2)],
+    "Shift+Up did not land on the roots with unread replies");
+  // The preview is the way in, as the count is: it opens the thread.
+  await preview.click();
+  await page.settle();
+  assert.equal(page.el("thread-select").value, `thread:${INBOX.b}`, "the preview did not open its thread");
 });
 
 test("FROM THE COUNT, the thread opens on its first unread reply, unfolded, in every read mode", async () => {

@@ -724,6 +724,38 @@
   white-space: nowrap;
 }
 
+/* `#1906`: the newest unread reply's own words under its count, on the root's card. */
+.thread-unread-preview {
+  display: block;
+  max-width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.3rem 0.65rem;
+  border: 1px solid var(--accent);
+  border-radius: 0.6rem;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+/* The thread picker's unread badge on a thread row (`#1906`). */
+.thread-picker-unread {
+  flex: none;
+  border: 1px solid var(--accent);
+  border-radius: 1rem;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-size: 0.8em;
+  font-weight: 600;
+  padding: 0.1rem 0.5rem;
+  white-space: nowrap;
+}
+
 /* N replies gives up its line to share it. */
 #side-log li.discord-message[data-unread-replies] > .thread-replies,
 #side-cards li.discord-message[data-unread-replies] > .thread-replies,

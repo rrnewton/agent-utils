@@ -113,6 +113,8 @@ export interface ThreadList {
   openThreadName(): string;
   olderThreadsOnServer(): boolean;
   renderThreadSelect(): void;
+  /** Redraw the thread picker's pop-up while it is open, and nothing while it is shut (`#1906`). */
+  refreshOpenPicker(): void;
   renderThreadHeading(): unknown;
   onThreadSelect(): unknown;
   refreshThreadDirectory(): Promise<void>;
@@ -428,7 +430,7 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   let pickerPopup: HTMLElement | null = null;
   let pickerPopupMounted = false;
 
-  function pinButton(choice: ThreadChoice): HTMLButtonElement {
+  function pinButton(choice: ThreadChoice, unread = ""): HTMLButtonElement {
     const pinned = threadIsPinned(choice);
     const button = document.createElement("button");
     button.setAttribute("type", "button");
@@ -447,7 +449,10 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     button.setAttribute("aria-pressed", String(pinned));
     const label = bangAgent(choice) ? `@${bangAgent(choice)}` : threadName(choice, Infinity);
     button.setAttribute("aria-label", pinned ? `Unpin ${label}` : `Pin ${label}`);
-    button.title = button.getAttribute("aria-label") || "";
+    // `#1906`: the pin itself carries the thread's unread state, so a pinned thread
+    // with waiting replies is marked where the owner looks for it.
+    if (unread) button.setAttribute("data-unread-replies", unread);
+    button.title = unread ? `${button.getAttribute("aria-label") || ""} (${unread})` : button.getAttribute("aria-label") || "";
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       toggleThreadPin(choice);
@@ -481,11 +486,19 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
       const shown = choices.slice(0, THREAD_SELECT_LIMIT);
       const open = openThreadChoice();
       const listed = open && !shown.some((choice) => choice.id === open.id) ? [...shown, open] : shown;
+      const tally = deps.replyTally();
       for (const choice of listed) {
         const row = document.createElement("div");
         row.className = "thread-picker-row thread-picker-thread";
         row.setAttribute("role", "option");
         if (threadIsPinned(choice)) row.setAttribute("data-pinned", "");
+        // `#1906 vibe-talk-agent-replies-to-owner-root-not-surfaced`: a pinned (or any)
+        // thread with replies the owner has not read says so on its picker row, beside
+        // its pin, in the same words its thread card uses (`sideCardUnread`). Without
+        // it, a pinned thread the owner works from shows nothing when an agent answers
+        // inside it — the owner must open it to learn a reply exists.
+        const unread = deps.sideCardUnread(choice, tally);
+        if (unread) row.setAttribute("data-unread-replies", unread);
         const openButton = document.createElement("button");
         openButton.setAttribute("type", "button");
         openButton.className = "thread-picker-open";
@@ -508,9 +521,15 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
         titleEl.className = "thread-picker-title";
         titleEl.textContent = title || (slug ? "" : "Thread");
         openButton.append(titleEl);
-        openButton.setAttribute("aria-label", threadLabel(choice, Infinity));
+        openButton.setAttribute("aria-label", unread ? `${threadLabel(choice, Infinity)}, ${unread}` : threadLabel(choice, Infinity));
         openButton.addEventListener("click", () => choosePickerValue(select, `thread:${choice.id}`));
-        row.append(pinButton(choice), openButton);
+        row.append(pinButton(choice, unread), openButton);
+        if (unread) {
+          const badge = document.createElement("span");
+          badge.className = "thread-picker-unread";
+          badge.textContent = unread;
+          row.append(badge);
+        }
         rows.push(row);
       }
     }
@@ -929,9 +948,13 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
     return typeof count === "number" ? { count: Math.max(count as number, held), exact } : { count: held || null, exact: true };
   }
 
+  function refreshOpenPicker(): void {
+    if (pickerPopup && !pickerPopup.hidden) drawThreadPickerPopup(el("thread-select") as HTMLSelectElement);
+  }
+
   return {
     noteThreadListLanded, threadWords, threadName, threadChoices, openThreadChoice,
-    knownThreadChoice, openThreadName, olderThreadsOnServer, renderThreadSelect,
+    knownThreadChoice, openThreadName, olderThreadsOnServer, renderThreadSelect, refreshOpenPicker,
     renderThreadHeading, onThreadSelect, refreshThreadDirectory, openThread, closeThread,
     olderThreadsToRead, loadOlderThreads, olderThreadsFailure, threadCards, addThreadDecoration, gatherCount,
     threadPagesLoading: () => threadPages.loading && threadPages.channel === String(deps.selectedChannelId()),

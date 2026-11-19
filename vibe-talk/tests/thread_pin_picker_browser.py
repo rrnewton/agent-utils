@@ -206,10 +206,13 @@ POPUP_JS = """() => {
         const openRect = open ? open.getBoundingClientRect() : null;
         const slug = row.querySelector('.thread-picker-slug');
         const title = row.querySelector('.thread-picker-title');
+        const badge = row.querySelector('.thread-picker-unread');
         return {
             text: (open ? open.textContent : row.textContent).trim(),
             slug: slug ? slug.textContent.trim() : null,
             title: title ? title.textContent.trim() : null,
+            unread: badge ? badge.textContent.trim() : null,
+            pinUnread: pin ? pin.getAttribute('data-unread-replies') : null,
             pinned: pin ? pin.getAttribute('aria-pressed') : null,
             pinLeft: pinRect ? pinRect.left : null,
             openLeft: openRect ? openRect.left : null,
@@ -326,6 +329,13 @@ def picker_walk(desk: Desk, api: PinApi) -> None:
                f"the bang-bound thread is not first with its @label: {names}")
     desk.check(thread_rows[0]["pinned"] == "true",
                f"the bang-bound thread is not pinned by default: {thread_rows[0]}")
+    # `#1906`: each thread's one reply is unread, and its row and its pin say so.
+    for row in thread_rows:
+        desk.check(row["unread"] == "1 unread",
+                   f"a thread row with an unread reply shows no badge: {row}")
+        desk.check(row["pinUnread"] == "1 unread",
+                   f"the pin does not carry the thread's unread replies: {row}")
+    desk.notes.append("every picker thread row and pin shows its 1 unread reply")
     desk.check("release" in str(thread_rows[1]["text"]).lower()
                and "incident" in str(thread_rows[2]["text"]).lower(),
                f"recent threads are not newest first after the pinned group: {names}")

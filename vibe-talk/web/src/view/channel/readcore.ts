@@ -2717,7 +2717,13 @@ function cycleReadMode() {
 
 function rowIsRead(row: Element): boolean {
   const held = rowMessages(row);
-  return held.length > 0 && held.every((message) => !stillToDo(message));
+  // `#1906 vibe-talk-agent-replies-to-owner-root-not-surfaced`: a Main root whose thread
+  // holds unread replies (drawn `data-unread-replies` by `drawThreadChips`) is not read
+  // for navigation: Shift+Up/Down, the jump-to-unread chip and the next-unread keys must
+  // land on it, as they land on a thread card with unread replies (`data-thread-read`).
+  // The root's own messages may all be read — the owner's own are read on arrival
+  // (`#1881`) — while the agent's answers in its thread are not.
+  return held.length > 0 && !row.hasAttribute("data-unread-replies") && held.every((message) => !stillToDo(message));
 }
 
 /** Is `row` the root of the thread on screen? By identity, never by position: older replies may not be loaded. */

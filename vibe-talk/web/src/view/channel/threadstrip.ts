@@ -40,6 +40,8 @@ export interface ThreadStripDependencies {
   fromGatheredThread(row: Element): boolean;
   canonChannel(): string;
   timelineMessages(): Message[];
+  /** Redraw the thread picker/select, whose rows carry thread unread badges (`#1906`). Optional. */
+  renderThreadSelect?(): void;
 }
 
 /** The strip's commands and questions. */
@@ -180,10 +182,13 @@ export function createThreadStrip(deps: ThreadStripDependencies): ThreadStrip {
       const drawn = [...el("discord-log").children].filter((row) => !deps.fromGatheredThread(row)).flatMap(idsOf).sort().join(" ");
       if (wanted !== drawn) {
         deps.renderCachedTimeline();
+        if (deps.renderThreadSelect) deps.renderThreadSelect();
         return;
       }
     }
     deps.renderChannelRows();
+    // The picker's rows carry the same threads' unread badges; keep them current too.
+    if (deps.renderThreadSelect) deps.renderThreadSelect();
   }
 
   return {

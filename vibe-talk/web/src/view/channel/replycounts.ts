@@ -6,7 +6,7 @@
 
 import { allReachesThread, emptyTally, exactReplyCount, replyTallyOf, tallyRecord, threadOf, unseenRepliesIn } from "../../core/channels/index.ts";
 import type { ChannelCanon, ReplyTally } from "../../core/channels/index.ts";
-import { countOf, filedThreadSlug, replyMarkerName } from "../../present/rows/index.ts";
+import { countOf, filedThreadSlug, firstLineOf, replyMarkerName } from "../../present/rows/index.ts";
 import { childByClass } from "../../view/dom/index.ts";
 import type { Message, ThreadSummary } from "../../contract/index.ts";
 import { QUOTE_REPLY_TITLE } from "./quoting.ts";
@@ -53,6 +53,8 @@ export interface ReplyCountsDependencies {
   setStatus(text: string): void;
   shownNode(node: unknown): boolean;
   stillToDo(message: Message, done?: Set<string>): boolean;
+  /** Whether `message` is one of the reader's own that starts read (`startsRead`). Optional. */
+  startsRead?(message: Message): boolean;
   threadCount(count: number | null, exact: boolean): string;
   threadHue(id: string): string;
   threadReplyCount(id: string, message: unknown): number | null;
@@ -494,9 +496,11 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
     const id = state && state.id !== null && (own === null || state.id === own) ? state.id : null;
     const [unread, unseen] = id !== null && state ? [state.unread, state.unseen] : [0, 0];
     let chip = childByClass(row, "thread-unread");
+    let preview = childByClass(row, "thread-unread-preview");
     if (id === null || (unread === 0 && unseen === 0)) {
       if (row.hasAttribute("data-unread-replies")) row.removeAttribute("data-unread-replies");
       if (chip && !chip.hidden) chip.hidden = true;
+      if (preview && !preview.hidden) preview.hidden = true;
       return;
     }
     row.setAttribute("data-unread-replies", String(unread || unseen));
@@ -523,6 +527,47 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
       chip.setAttribute("aria-label", `Open this thread at its first unread reply, ${label}`);
     }
     if (chip.hidden) chip.hidden = false;
+    // `#1906 vibe-talk-agent-replies-to-owner-root-not-surfaced`: the newest unread reply
+    // itself, in words on the owner's own root's card. A count alone is easy to overlook
+    // on a root the owner wrote (and which therefore reads as done); the answer's own
+    // first line proves a response exists without opening the thread. Only on the
+    // owner's own roots — the brief's case — and only for a reply the store holds:
+    // a merely reported one ("1 new") has no words to show yet.
+    const newest = deps.startsRead && deps.startsRead(message) ? newestUnreadReply(id) : null;
+    if (!newest) {
+      if (preview && !preview.hidden) preview.hidden = true;
+      return;
+    }
+    if (!preview) {
+      preview = document.createElement("button");
+      preview.className = "thread-unread-preview";
+      preview.setAttribute("type", "button");
+      preview.setAttribute("title", "Open this thread at its first unread reply");
+      preview.addEventListener("click", deps.inThisColumn(() => deps.guardQuietly(() => deps.openThread(id))()));
+      row.append(preview);
+    }
+    const author = typeof newest.author === "string" && newest.author ? `${newest.author}: ` : "";
+    // One line, the chip's own footprint: a taller preview would take a reader who is
+    // following the foot off it as it appears. The full first line is the label.
+    const said = firstLineOf(`${author}${newest.content}`, 38);
+    if (preview.textContent !== said) {
+      preview.textContent = said;
+      preview.setAttribute("aria-label", `Open this thread at its first unread reply. Newest reply: ${author}${firstLineOf(newest.content, 90)}`);
+    }
+    if (preview.hidden) preview.hidden = false;
+  }
+
+  /** The newest unread reply the store holds in thread `id`, or null when it holds none.
+   * The store is in time order, so the walk runs newest first and stops at the first hit:
+   * the newest reply is the recent one, a step or two from the end. */
+  function newestUnreadReply(id: string): Message | null {
+    const held = deps.channelStore().current().messages;
+    for (let at = held.length - 1; at >= 0; at -= 1) {
+      const message = held[at] as Message;
+      if (threadOf(message) !== id || message.thread?.is_root) continue;
+      if (deps.stillToDo(message)) return message;
+    }
+    return null;
   }
 
   // A thread's strip in All, and selecting a thread there, are web/src/view/channel's now
