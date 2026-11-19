@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-discuss-message-link-opens-new-window: Discuss message links open a new window instead of jumping in the same window'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -9,7 +9,8 @@ labels:
 - ui
 - links
 created_at: 2026-11-19T14:07:31-05:00
-updated_at: 2026-11-19T14:07:31-05:00
+updated_at: 2026-11-19T17:45:35-05:00
+closed_at: 2026-11-19T17:45:35-05:00
 ---
 
 # Description
@@ -36,3 +37,11 @@ So the (HH:MM ↩) citation link in a Discuss summary — it points at a channel
 # Notes
 
 [watermelon-full-preview] mu-discusslink, owner thread 221, 2026-11-19. Number pre-assigned by coordb; filed by mu-discusslink before implementation. Related: #543 in-app-message-links, #890 voice-page-linked-highlight, #1395 discuss-scope-binding, #1846 windowed lists, #1886 vibe-talk-transcripts-view, #1898 vibe-talk-nested-slack-link-in-markdown-label.
+
+## Resolution
+
+[watermelon-full-preview] Root cause, two compounding defects. (1) Every server-rendered anchor carries `target="_blank"` (the renderer stamps all links), and citations drawn in the Discuss timeline — earlier summaries and follow-up turns under a saved summary — had no tap routing at all, so those taps followed the plain in-app address into a new vibe-talk window; the answer box was routed, the timeline was not. (2) Since 2c61217e (#1886), a step back the server's copy cannot prove is answered with an empty page at the same cursor while the background fill runs, and the message seek counted those as pages: five stalls spent its whole budget, so an older linked message was given up on (reproduced at HEAD: a target 350 messages back ended "Further back than 5 pages — scroll up." after 15 s with no landing or mark; a near target landed in 0.2 s). 7b9f8dbb (#1898) was cleared: its unwrap only rewrites Markdown links with web targets, and Discuss citations are relative in-app addresses.
+
+Fix, two landings. 9023b5e4: timeline citation taps route through the same answerTap jump as the answer's, and in-app citation anchors the panel draws lose the `target="_blank"` stamp (external links keep it), so even an unrouted tap follows the address in the same window as a deep link. 7134da49: the seek counts only steps that move the cursor and waits out a bounded number of no-progress (server-copy) steps at the same cursor, stepping again at once since each step is itself a provider-paced read.
+
+Proof: two new fake-DOM unit tests (timeline tap jumps in-app; a drawn in-app citation loses `_blank`, an external link keeps it) fail before and pass after; a new real-server browser check (dag.d 167, `discuss_link_browser.py`, 412x915 and 1280x800) clicks answer and timeline citations to targets outside the loaded window — the timeline walk first meeting six same-cursor stalls — asserting no new page, no `_blank`, and a visible "Linked message" landing; it fails pre-fix on the stamps and on the stall walk. Evidence from landed 9023b5e4 on a local test server (never the live instance): /tmp/mu-discusslink-evidence with BUILD.txt and phone/desk x light/dark before/after shots. Gates: commit 1 local validate green, owner gate's only red (discuss-browser waits under three concurrent validates) passed its solo rerun 4/4 locally and exclusively; commit 2's gate reds were real and fixed (constants-table entry for REPLY_JUMP_STALLS; no page-clock wait in the stall retry), slices 0/4 (642) and 3/4 (641) green, and its only remaining red (screenshot scene 59, a known failure on main, no Discuss scene) passed its solo rerun, with each moved combined tree verified before landing. Unverified: behaviour on the live instance after deploy (coordb deploys and watches), and the screenshot harness's keyboard-open Discuss scenes for this change (the harness skips Discuss on a cacheless server; targeted before/after shots stand instead).
