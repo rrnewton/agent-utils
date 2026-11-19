@@ -16,9 +16,12 @@ slot's private state differs (the state image, or ``<control>/slot-state/``).
 * **Isolation modes.** ``userns`` builds the view in a new unprivileged user and
   mount namespace. ``root`` builds the identical view through a short-lived
   ``sudo -n`` launcher in a plain mount namespace, then drops to the invoking
-  user's uid, gid, and groups before exec, so setuid helpers inside the box
-  (``sudo``, a harness launcher that enters a site sandbox) still work.
-  ``cgroup`` applies the limits only and leaves the file system alone.
+  user's uid, gid, and groups and seals it (``no_new_privs``) before exec, so
+  setuid helpers inside the box (``sudo``, a harness launcher's seteuid step)
+  fail exactly as under ``userns``. ``cgroup`` applies the limits only and
+  leaves the file system alone. Every mode is an accident boundary for
+  cooperative but sloppy agents, not a security boundary against a hostile
+  or racing process running as the same user.
 * **The view** (``userns`` and ``root``), built by :func:`build_view`:
 
   1. ``/tmp`` is a fresh tmpfs for this launch, discarded at exit.
@@ -216,14 +219,16 @@ SETTING_DOCS: dict[str, str] = {
     "isolation": (
         "How `wrkslots run`, `shell-command`, and agent launchers box a command. userns "
         "(default): limits plus the file-system view below, built in an unprivileged user "
-        "namespace. root: the same view built by a short-lived `sudo -n` launcher, then "
-        "privileges dropped to your uid, gid, and groups; use it for harness launchers that "
-        "perform a setuid step, which a user namespace refuses. Setuid programs (sudo included) "
-        "work inside, and your processes outside the box stay reachable through /proc. Needs "
-        "passwordless sudo. cgroup: per-slot limits only, no file-system view. The box is an "
-        "accident boundary for cooperative agents, not containment of a hostile process: the "
-        "user's systemd bus stays reachable, so `systemd-run --user` without --scope starts work "
-        "outside it."
+        "namespace. root: the same view, built by a short-lived `sudo -n` launcher, dropped "
+        "to your uid, gid, and groups, and sealed with no_new_privs before COMMAND runs, so "
+        "setuid steps (sudo, a launcher's seteuid) fail inside exactly as under userns; root "
+        "exists for tools that refuse user namespaces or need host-visible processes, which "
+        "stay reachable through /proc. Needs passwordless sudo. cgroup: per-slot limits only, "
+        "no file-system view. Every mode is an accident boundary for cooperative but sloppy "
+        "agents — it keeps wayward writes out of the real home directory and the host /tmp — "
+        "not a security boundary against a hostile or racing process running as the same "
+        "user: the user's systemd bus stays reachable, so `systemd-run --user` without "
+        "--scope starts work outside it."
     ),
     "home": (
         "ro (default): $HOME inside the box is this slot's persistent private layer, in "

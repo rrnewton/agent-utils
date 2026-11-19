@@ -720,10 +720,12 @@ def _view_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "userns: limits plus the file-system view in an unprivileged user namespace; root: "
-            "the same view built through sudo -n, then privileges dropped (setuid helpers, sudo "
-            "included, work inside); cgroup: limits only, no file-system "
+            "the same view built through sudo -n, dropped to you and sealed with no_new_privs "
+            "(setuid helpers, sudo included, fail inside); cgroup: limits only, no file-system "
             "view (default: configuration.sandbox.isolation, else userns). Every mode is an "
-            "accident boundary, not containment of a hostile process"
+            "accident boundary for cooperative but sloppy agents — it keeps wayward writes out "
+            "of the real home directory and the host /tmp — not a security boundary against a "
+            "hostile or racing process running as the same user"
         ),
     )
     parser.add_argument(

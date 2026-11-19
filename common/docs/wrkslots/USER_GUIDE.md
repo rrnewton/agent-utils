@@ -3285,10 +3285,11 @@ slot is stored: a plain-worktree slot and an image-backed slot get the same limi
 view. Only the location of the slot's private state differs (`state.img` for an image slot,
 `<control>/slot-state/<type>/<slot>/` for a plain slot). Nothing is written to host configuration.
 
-**What the box is for.** It is an accident boundary for cooperative agents: it keeps an agent's
-writes (stray checkouts, build output, edits to the wrong tree) inside its slot and the paths it
-was given. It is not containment against a hostile agent. What each mode leaves open is listed
-under "Limits of the box" below.
+**What the box is for.** It is an accident boundary for cooperative but sloppy agents: it keeps
+an agent's writes (stray checkouts, build output, junk files, edits to the wrong tree) inside its
+slot and the paths it was given, and out of the real home directory and the host `/tmp`. It is not
+a security boundary, and not containment against a hostile or racing agent running as the same
+user. What each mode leaves open is listed under "Limits of the box" below.
 
 - **Limits.** The calling process joins a transient systemd user scope inside the slot's own slice,
   `wrkslots-<slot>.slice` below `wrkslots.slice`, and then execs COMMAND. Memory, CPU, task, and IO
@@ -3308,20 +3309,20 @@ under "Limits of the box" below.
   | `root` | yes | the same view, built by a short-lived `sudo -n` launcher in a plain mount namespace, then privileges dropped | passwordless `sudo` |
   | `cgroup` | yes | none: the host file system as is | nothing more |
 
-  Setuid programs cannot gain privilege inside a user namespace, so `sudo`, and any harness
-  launcher that performs a setuid step, fail under `userns`. `root` exists for them. The launcher
-  enters the slot's scope first (so the cgroup is inherited), checks that `sudo -n` will not
-  prompt, and passes the complete environment in a private 0600 spec file in the per-user runtime
-  tmpfs (`$XDG_RUNTIME_DIR/wrkslots`, read-only inside every box), because sudo scrubs it. The
-  helper takes your identity from sudo (`SUDO_UID`, `SUDO_GID`, and your groups from the group
-  database) and refuses a spec that disagrees. It deletes the spec as soon as it has read it. It
-  switches to your uid, gid, and supplementary groups at once, keeping only `CAP_SYS_ADMIN` while it
-  builds the view (so a FUSE mount you own stays reachable). It then drops that capability too and
-  execs COMMAND. No user namespace exists, so setuid programs inside the box work. One consequence:
-  sudo stays in front of COMMAND and relays a private terminal to it. A terminal multiplexer
-  therefore sees only `sudo` as the pane's foreground process. It can neither start an agent in
-  such a pane nor detect one, so an agent launcher runs the boxed harness itself
-  (`shell-command SLOT -- HARNESS ...`) and tracks it without the multiplexer's agent start.
+  The view is sealed before COMMAND runs: the helper sets `no_new_privs`, so a setuid step
+  (`sudo`, a harness launcher's seteuid) fails inside the box exactly as it does under `userns`.
+  `root` exists for tools that refuse user namespaces or need host-visible processes, not for
+  setuid. The launcher enters the slot's scope first (so the cgroup is inherited), checks that
+  `sudo -n` will not prompt, and feeds the helper its spec on stdin (no spec file exists, so
+  there is nothing for a racing process to swap). The helper takes your identity from sudo
+  (`SUDO_UID`, `SUDO_GID`) cross-checked against the sudo parent process, and refuses a spec
+  that disagrees. It switches to your uid, gid, and supplementary groups at once, keeping only
+  `CAP_SYS_ADMIN` while it builds the view (so a FUSE mount you own stays reachable), then drops
+  that capability too, seals, and execs COMMAND. One consequence: sudo stays in front of COMMAND
+  and relays a private terminal to it. A terminal multiplexer therefore sees only `sudo` as the
+  pane's foreground process. It can neither start an agent in such a pane nor detect one, so an
+  agent launcher runs the boxed harness itself (`shell-command SLOT -- HARNESS ...`) and tracks
+  it without the multiplexer's agent start.
 
 ### The view
 
@@ -3455,13 +3456,17 @@ The box stops accidents, not a process that sets out to leave it:
   manager to start a *service* (`systemd-run --user` without `--scope`, or `systemctl --user
   start`), which runs outside the box and outside the slot's slice. `systemd-run --user --scope`
   keeps the command inside.
-- **`root` isolation** runs COMMAND with your uid and no user namespace, so it can run setuid
-  programs (that is its purpose): `sudo` works inside and can do anything sudo allows.
-  `no_new_privs` cannot be set, because harness launchers that need a setuid step would then fail.
-  It shares the host's PID namespace: a process in the box can reach the real file system through
-  `/proc/<pid>/root` of any of your processes outside it, and can ptrace them. A PID namespace
-  would close that, but harness launchers that talk to your systemd manager fail inside one (the
-  bus cannot identify a peer in another PID namespace).
+- **`root` isolation** runs COMMAND with your uid and no user namespace, sealed with
+  `no_new_privs` before it starts: setuid programs gain nothing inside, so `sudo` and any
+  launcher seteuid step fail, exactly as under `userns`. What `root` removes is the user
+  namespace, not the seal — that is for tools that refuse user namespaces or need host-visible
+  processes. It shares the host's PID namespace: a process in the box can reach the real file
+  system through `/proc/<pid>/root` of any of your processes outside it, and can ptrace them.
+  A PID namespace would close that, but harness launchers that talk to your systemd manager fail
+  inside one (the bus cannot identify a peer in another PID namespace). Read this plainly: the
+  box is an accident boundary for cooperative but sloppy agents — it keeps junk out of your real
+  home directory and the host `/tmp` — not a security boundary; a hostile or racing process
+  running as you can still find ways to leave it.
 - **`userns` isolation** runs COMMAND in a user namespace, where setuid programs gain nothing and
   host processes cannot be ptraced or entered through `/proc/<pid>/root`.
 - **`home_shared` and `read_write` paths are writable by design**, and harness settings and hooks
