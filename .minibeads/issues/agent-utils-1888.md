@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-muse-placeholder-hint-reads-as-staged: Muse placeholder hints read as unsent composer text hold deliveries'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -29,3 +29,7 @@ Recovery: prompts already held by this are never typed or quarantined — they w
 # Notes
 
 Reported from live lanes on two teams on 2026-11-18 (placeholder examples quoted in the report match table entries; the failing captures were transient mid-draw frames). No lane, host or person is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed 698bb308 on github/main (owner-priority gate: 62 passed, 0 failed, 1 no-result on an untouched step class; combined tree with #1893 verified: Rust muse_editor+hooks tests, Python launch suite). Live frames of the reported shape (background panel plus hint, both reported strings) already read empty on the gated build, and a native 1.4.24 hint-state send delivered; the shape no reader covered was a hint captured short of the whole ghost. Both editions now treat a bare prefix of at least 34 chars covering at least two-thirds of its hint as an empty composer (`is_hint_prefix` / `_muse_is_hint_prefix`); every table hint is fixture-tested whole in both editions, and short prefixes, hint-plus-words and ordinary drafts still read staged. Live check: a prompt sent with the fixed build to a hint-showing test Muse agent delivered and was answered. Stuck prompts were never typed or quarantined (readiness refused first), so the next drain by a fixed build delivers each exactly once.
