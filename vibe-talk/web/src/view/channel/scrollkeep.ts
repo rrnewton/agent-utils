@@ -256,32 +256,31 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   function scrollAnchor(area: HTMLElement): Element | null {
     const edge = area.getBoundingClientRect().top;
     const items = visibleList().children;
-    // `#1913`: a reader parked near the newest line — the common case — is found from the
-    // foot: the first row reaching past the edge stands a screenful above the last row, so
-    // scanning up from there measures the neighbourhood, not the whole history above it.
-    // In the upper half the scan runs from the head as before. Rows with no box (hidden, or
-    // in a collapsed run) are passed over in either direction.
-    const fromFoot = items.length > 0 && area.scrollTop > (area.scrollHeight - (area.clientHeight || 0)) / 2;
-    if (fromFoot) {
-      let anchor: Element | null = null;
-      for (let at = items.length - 1; at >= 0; at -= 1) {
-        const li = items[at] as Element;
-        if (li.getAttribute("data-read-run") === "member") continue;
-        const box = li.getBoundingClientRect();
-        if (box.bottom === 0 && box.top === 0) continue;
-        if (box.bottom <= edge) break;
-        anchor = li;
-      }
-      if (anchor !== null) return anchor;
-    } else {
-      for (const li of items) {
-        // A row hidden in a collapsed run of read messages has no box to be looking at. `#221 read-modes`.
-        if (li.getAttribute("data-read-run") === "member") continue;
-        if (li.getBoundingClientRect().bottom > edge) {
-          return li;
-        }
-      }
+    // `#1920 vibe-talk-main-thread-switch-and-scroll-lag`: the anchor is the first drawn row
+    // reaching past the edge, and drawn rows stand in list order with non-decreasing bottoms,
+    // so a binary search finds it in O(log n) measured rows however long the history is. The
+    // `#1913` scans this replaces walked from the head, or up from the foot, and a reader
+    // parked mid-list — the ordinary case on a long channel — paid one layout read per row
+    // between the foot (or the head) and the screen on every capture: about a thousand reads
+    // on a 2000-row channel, inside every view switch and every held redraw. Rows with no
+    // box of their own (hidden, or members of a collapsed run of read messages, `#221
+    // read-modes`) are left out before the search, as `readerPlace` leaves them out, so the
+    // measured bottoms never decrease.
+    const drawn: Element[] = [];
+    for (const li of items) {
+      if (li.getAttribute("data-read-run") === "member") continue;
+      if ((li as HTMLElement).hidden) continue;
+      drawn.push(li);
     }
+    let lo = 0;
+    let hi = drawn.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((drawn[mid] as HTMLElement).getBoundingClientRect().bottom > edge) hi = mid;
+      else lo = mid + 1;
+    }
+    const found = drawn[lo];
+    if (found) return found;
     return items.length > 0 ? items[items.length - 1] as Element : null;
   }
 
