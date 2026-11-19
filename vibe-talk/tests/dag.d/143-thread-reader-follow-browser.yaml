@@ -1,8 +1,13 @@
 steps:
+  # DISABLED from gating (`disabled-optin`, #1903): fails solo on
+  # main since 2026-11-19 (#jump-reading click timeout); the script
+  # itself also exits 0 with a DISABLED line until mu-readerdrill's
+  # #1880/#1872 follow-up fixes it. Needs hot-host proof (solo green,
+  # then 10/10 under burners) before this label comes off.
   - group: check
     job: thread-reader-follow-browser
     desc: read-aloud follow is never yanked up while following in a thread, and the Reading chip returns to it from off screen, in current Chromium at 412x915 and 1280x800
-    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
     cmd: cd vibe-talk && python3 tests/thread_reader_follow_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
