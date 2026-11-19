@@ -19,6 +19,8 @@ export interface ScrollMark {
   readonly composerTop?: number | null;
   /** When the reader last gave input in the view, as the mark was taken (`#1880`): a restore made after later input would move a view the reader has taken over. */
   readonly inputAt?: number;
+  /** The list's scroll position as the mark was taken (`#1880b`): how far the reader has scrolled since is the part of a restore that is theirs, not the change's. */
+  readonly scrollTop?: number;
 }
 
 /** A walk for the search whose control holds still while it reads, as far as keeping the reader reads it. */
@@ -215,6 +217,20 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return mark.inputAt !== undefined && userInputAt > mark.inputAt;
   }
 
+  /**
+   * The write that holds an anchor at the place the reader's own scroll chose (`#1880b`):
+   * a change above the anchor moves its drawn top by its growth, and holding the list's
+   * scroll position still would let that growth push what the reader is reading down the
+   * screen by the same amount. So the write is the change's own displacement — the
+   * anchor's drawn-top delta plus however far the reader has scrolled since the
+   * capture — never the capture's place. With no reader scroll since, it is the
+   * classic hold exactly.
+   */
+  function compensatedDelta(area: HTMLElement, mark: ScrollMark, topNow: number): number {
+    const userDelta = mark.scrollTop !== undefined ? area.scrollTop - mark.scrollTop : 0;
+    return (topNow - mark.top) + userDelta;
+  }
+
   function visibleList(): HTMLElement {
     return el(deps.currentView() === "discord"
       ? (deps.channelView() === "threads" && !deps.pinnedOnly() ? "thread-list" : shownChannelList().id)
@@ -294,11 +310,11 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // `#1224 mention-jump-in-view`. A jump's landed row is the reader's latest explicit place:
     // what changes after it holds that row first, not the row that happens to stand at the top.
     const landed = deps.jumpAnchorRow ? deps.jumpAnchorRow() : null;
-    if (landed) return { pinned: false, anchor: landed, top: landed.getBoundingClientRect().top, inputAt: userInputAt };
+    if (landed) return { pinned: false, anchor: landed, top: landed.getBoundingClientRect().top, inputAt: userInputAt, scrollTop: area.scrollTop };
     // `#243 filter-keeps-selection`. While a filter change holds a message in place, that message is
     // where the reader is, and the newest line is not followed: nothing but the reader moves it.
     const held = deps.heldFilterRow();
-    if (held) return { pinned: false, anchor: held, top: held.getBoundingClientRect().top, inputAt: userInputAt };
+    if (held) return { pinned: false, anchor: held, top: held.getBoundingClientRect().top, inputAt: userInputAt, scrollTop: area.scrollTop };
     // `#262 search-load-older`. While a walk for the search reads older pages, its control holds still and
     // the matches open under it — never the newest line followed, on a list short enough to be at its
     // foot — until the reader scrolls it away, which lets it go. At the head of the list it may have moved
@@ -310,7 +326,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       const top = chip.getBoundingClientRect().top;
       if (!chip.hidden && (Math.abs(top - walk.chipTop) <= 1 || area.scrollTop <= 1)) {
         walk.chipTop = top;
-        return { pinned: false, anchor: chip, top, inputAt: userInputAt };
+        return { pinned: false, anchor: chip, top, inputAt: userInputAt, scrollTop: area.scrollTop };
       }
       walk.anchored = false;
     }
@@ -323,6 +339,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       anchorId: anchor ? anchor.getAttribute("data-id") : null,
       composerTop: composerBefore(area),
       inputAt: userInputAt,
+      scrollTop: area.scrollTop,
     };
   }
 
@@ -424,13 +441,15 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    * False where no composer holds the view, or it stood out of view, so the caller
    * keeps its own hold.
    */
-  function keepComposerInView(area: HTMLElement, beforeTop: number | null): boolean {
+  function keepComposerInView(area: HTMLElement, beforeTop: number | null, userDelta = 0): boolean {
     const composer = deps.composerHeld ? deps.composerHeld() : null;
     if (!composer || beforeTop === null) return false;
     const rect = composer.getBoundingClientRect();
     if (!rect || rect.height <= 0) return true;
+    // `#1880b`: the place kept is where the reader's own scroll since the capture
+    // left the box, not where it stood at the capture.
     noteOwnWrite();
-    area.scrollTop += rect.top - beforeTop;
+    area.scrollTop += rect.top - (beforeTop - userDelta);
     // The restore can still leave the box past an edge (the list grew at the foot):
     // bring it just inside, never through the history between.
     const band = visibleBand(area);
@@ -463,16 +482,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     } finally {
       holdDepth -= 1;
     }
-    if (keepComposerInView(area, composerWas)) {
-      if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
-      return;
-    }
-    // `#1880`: the reader has scrolled or touched since this hold was captured, and
-    // no composer keep above answered for the view: no anchor write puts it back.
-    // (A held composer outranks this, #1839: the reader dictating into a box that
-    // stood in view at the capture is kept on it, scrolled-away boxes already are
-    // not, by `composerBefore`.)
-    if (userMovedSince(mark)) {
+    if (keepComposerInView(area, composerWas, mark.scrollTop !== undefined ? area.scrollTop - mark.scrollTop : 0)) {
       if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
       return;
     }
@@ -487,10 +497,10 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       const shown = shownRowFor(mark.anchor);
       const held = shown !== mark.anchor ? shown as Element : mark.anchor;
       noteOwnWrite();
-      area.scrollTop += held.getBoundingClientRect().top - mark.top;
+      area.scrollTop += compensatedDelta(area, mark, held.getBoundingClientRect().top);
     } else if (mark.anchorId) {
       const refound = [...visibleList().children].find((one) => one.getAttribute("data-id") === mark.anchorId);
-      if (refound) { noteOwnWrite(); area.scrollTop += (refound as Element).getBoundingClientRect().top - mark.top; }
+      if (refound) { noteOwnWrite(); area.scrollTop += compensatedDelta(area, mark, (refound as Element).getBoundingClientRect().top); }
     }
     if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
   }
@@ -544,11 +554,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // `#1839`: while the composer holds the view and stood in view as the change began,
     // it outranks both the newest line and the message anchor - putting either back can
     // carry the box being dictated into off screen. `mark.composerTop` is its place then.
-    if (keepComposerInView(area, typeof mark.composerTop === "number" ? mark.composerTop : null)) return;
+    if (keepComposerInView(area, typeof mark.composerTop === "number" ? mark.composerTop : null, mark.scrollTop !== undefined ? area.scrollTop - mark.scrollTop : 0)) return;
     // `#1880`: the reader has scrolled or touched since this mark was taken (a live
     // read landed while they were up the thread) and no composer keep answered for
-    // the view: nothing else is put back, not the newest line, not the anchor.
-    if (userMovedSince(mark)) {
+    // the view: the newest line is not followed, and with no anchor there is
+    // nothing to compensate. With an anchor, the write below compensates only the
+    // change's own displacement (`#1880b`), never the capture's place.
+    if (userMovedSince(mark) && (mark.pinned || !mark.anchor)) {
       deps.renderJumpNewest();
       return;
     }
@@ -575,7 +587,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     const shown = shownRowFor(mark.anchor);
     if (shown !== mark.anchor) mark = { ...mark, anchor: shown as Element };
     noteOwnWrite();
-    area.scrollTop += (mark.anchor as Element).getBoundingClientRect().top - mark.top;
+    area.scrollTop += compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top);
     // Wherever that put the reader decides the jump, now: up the history it is offered, on the
     // newest line it is not. `#207 scrollback-jump`.
     deps.renderJumpNewest();

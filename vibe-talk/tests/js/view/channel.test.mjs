@@ -638,15 +638,18 @@ test("`#624 voice-page-modularity`: the reader is left on the message their eye 
   assert.equal(calls.at(-1), "newest");
 });
 
-test("`#1880 vibe-talk-no-programmatic-scroll-after-user-scroll`: a restore does not move a view the reader has scrolled since the capture", () => {
+test("`#1880 vibe-talk-no-programmatic-scroll-after-user-scroll` x `#1880b`: a restore holds the anchor's screen place, compensating only the change's growth", () => {
   const { createScrollKeeping } = CHANNEL_VIEW;
   let shift = 0;
-  const row = (id, top) => ({ id, parentNode: {}, getAttribute: () => null, getBoundingClientRect: () => ({ top: top + shift, bottom: top + shift + 40 }) });
-  const rows = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
-  const log = { id: "discord-log", children: rows };
-  const handlers = {};
   const area = { scrollTop: 300, getBoundingClientRect: () => ({ top: 0 }),
     addEventListener: (type, fn) => { handlers[type] = fn; } };
+  const handlers = {};
+  // A row's screen top is its place in the list less the scroll, plus any growth
+  // above it (`shift`), as the drawn page's boxes move.
+  const row = (id, top) => ({ id, parentNode: {}, getAttribute: () => null,
+    getBoundingClientRect: () => ({ top: top + shift - (area.scrollTop - 300), bottom: top + shift - (area.scrollTop - 300) + 40 }) });
+  const rows = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
+  const log = { id: "discord-log", children: rows };
   const chip = { hidden: true, getBoundingClientRect: () => ({ top: 0 }) };
   const els = { "discord-log": log, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": chip, transcript: { children: [] } };
   const keep = createScrollKeeping({
@@ -658,21 +661,31 @@ test("`#1880 vibe-talk-no-programmatic-scroll-after-user-scroll`: a restore does
   // No reader input since the capture: the change above is held as before.
   keep.preservingScroll(() => { shift = 25; });
   assert.equal(area.scrollTop, 325, "with no reader input, the reader was not held on their message");
+  assert.ok(Math.abs(rows[2].getBoundingClientRect().top - 0) <= 2, "the anchor's screen place moved with no reader input");
+  // (the anchor is row c: the first row not scrolled off the top at the capture)
   shift = 0;
   area.scrollTop = 300;
-  // The reader wheels up the thread while a live read is in flight; its landing
-  // must not restore the place captured before the wheel.
+  // The reader wheels up the thread while a live read is in flight, then the
+  // change grows what is above their anchor by 150px: the anchor must stay at
+  // the screen place the wheel left it (scrollTop rises by the growth), never
+  // back at the capture's place.
   const mark = keep.captureScroll();
   handlers.wheel();
   area.scrollTop = 180;
+  const chosen = rows[2].getBoundingClientRect().top;
+  shift = 150;
   keep.restoreScroll(mark);
-  assert.equal(area.scrollTop, 180, "a restore moved a view the reader had scrolled");
-  // And a redraw hold captured before the wheel does not write either.
+  assert.ok(Math.abs(rows[2].getBoundingClientRect().top - chosen) <= 2,
+    `a restore moved the anchor off the reader's chosen place (${chosen} -> ${rows[2].getBoundingClientRect().top})`);
+  assert.equal(area.scrollTop, 330, "scrollTop did not rise by the growth above (180 + 150)");
+  // And a redraw hold captured before a touch compensates the same way.
   const mark2 = keep.captureScroll();
   handlers.touchstart();
-  shift = 40;
-  keep.holdingRows(() => {});
-  assert.equal(area.scrollTop, 180, "a redraw hold moved a view the reader had touched");
+  area.scrollTop = 200;
+  const chosen2 = rows[2].getBoundingClientRect().top;
+  keep.holdingRows(() => { shift = 190; });
+  assert.ok(Math.abs(rows[2].getBoundingClientRect().top - chosen2) <= 2,
+    "a redraw hold moved the anchor off the reader's chosen place");
 });
 
 test("`#1229 keyed-row-patching`: a redraw keeps the node of every row whose messages are the very objects it was drawn from", () => {
