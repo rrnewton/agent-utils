@@ -64,7 +64,7 @@ def permission_bypass_flag(harness: str, argv: Sequence[str]) -> str | None:
     Verified against each harness's real ``--help``: claude takes
     ``--dangerously-skip-permissions`` or ``--permission-mode bypassPermissions``,
     codex takes ``--dangerously-bypass-approvals-and-sandbox`` or ``--yolo``, and
-    muse takes ``--approval-mode never``. Harnesses with no known requirement
+    muse takes ``--approval-mode never`` or ``--yolo``. Harnesses with no known requirement
     (agentcloud, agy, unknown) return None here; agentcloud's gap is reported
     by :func:`permission_bypass_warning` instead.
     """
@@ -87,9 +87,9 @@ def permission_bypass_flag(harness: str, argv: Sequence[str]) -> str | None:
             return None
         return "--dangerously-bypass-approvals-and-sandbox (or --yolo)"
     if harness == "muse":
-        if has_value("--approval-mode", "never"):
+        if has_value("--approval-mode", "never") or "--yolo" in arguments:
             return None
-        return "--approval-mode never"
+        return "--approval-mode never (or --yolo)"
     return None
 
 

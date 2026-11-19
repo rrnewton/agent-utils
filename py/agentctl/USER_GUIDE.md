@@ -433,7 +433,7 @@ arguments that lack it. The refusal names the profile (or agent), the
 harness, and the exact flag to add: Claude Code takes
 `--dangerously-skip-permissions` (or `--permission-mode bypassPermissions`),
 Codex takes `--dangerously-bypass-approvals-and-sandbox` (or `--yolo`), and
-Muse takes `--approval-mode never`. Headless profiles load without a
+Muse takes `--approval-mode never` (or `--yolo`). Headless profiles load without a
 flag (their argv is empty by rule for codex/agy), but a headless Claude
 start or wrapper launch refuses unless its harness args carry
 `--permission-mode bypassPermissions` (or `--dangerously-skip-permissions`);

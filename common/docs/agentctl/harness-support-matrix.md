@@ -561,8 +561,9 @@ and `py/agentctl/cli.py`, `py/agentctl/revive.py`).
 - **Codex**: supported — `--dangerously-bypass-approvals-and-sandbox`
   or `--yolo` (the first verified against `codex --help` on the filing
   host; `--yolo` is accepted as the documented alias).
-- **Muse**: supported — `--approval-mode never` (verified against
-  `muse --help`).
+- **Muse**: supported — `--approval-mode never` or `--yolo`
+  (both verified against `muse --help`: `--yolo` disables approval
+  and sandbox).
 - **Unknown TUI**: n/a — agentctl knows no launch arguments for the
   program it drives, so there is no flag to require.
 - **Headless**: supported — headless profiles carry no raw argv for

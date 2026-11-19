@@ -303,6 +303,8 @@ def test_interactive_profiles_require_a_permission_bypass_flag(tmp_path: Path) -
         ("codex", ["--yolo"]),
         ("muse", ["--approval-mode", "never"]),
         ("muse", ["--approval-mode=never"]),
+        ("muse", ["--yolo"]),
+        ("muse", ["--approval-mode=never", "--yolo"]),
     ):
         assert permission_bypass_flag(harness, argv) is None
         require_permission_bypass("agent 'lane' launch", harness, argv)

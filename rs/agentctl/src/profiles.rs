@@ -71,7 +71,7 @@ pub(crate) const PROTOCOLS: [&str; 2] = ["self-tooling", "hands-delegating"];
 /// against the harness's real `--help`: claude takes
 /// `--dangerously-skip-permissions` or `--permission-mode bypassPermissions`,
 /// codex takes `--dangerously-bypass-approvals-and-sandbox` or `--yolo`, and
-/// muse takes `--approval-mode never`. `None` means no requirement is known
+/// muse takes `--approval-mode never` or `--yolo`. `None` means no requirement is known
 /// for the harness: agentcloud has no permission-bypass equivalent
 /// (`agentcloudctl create --dangerously-skip-sandbox` is a sandbox switch,
 /// not permissions), and agy/unknown launches are not judged here.
@@ -107,10 +107,10 @@ pub(crate) fn permission_bypass_flag(harness: &str, argv: &[String]) -> Option<&
             }
         }
         "muse" => {
-            if has_value("--approval-mode", "never") {
+            if has_value("--approval-mode", "never") || argv.iter().any(|item| item == "--yolo") {
                 None
             } else {
-                Some("--approval-mode never")
+                Some("--approval-mode never (or --yolo)")
             }
         }
         _ => None,
@@ -2699,6 +2699,8 @@ mod tests {
             ("codex", vec!["--yolo"]),
             ("muse", vec!["--approval-mode", "never"]),
             ("muse", vec!["--approval-mode=never"]),
+            ("muse", vec!["--yolo"]),
+            ("muse", vec!["--approval-mode=never", "--yolo"]),
         ] {
             parse(serde_json::json!({"harness": harness, "mode": "interactive", "argv": argv}))
                 .unwrap_or_else(|error| panic!("{harness} {argv:?} refused: {error}"));
