@@ -22,6 +22,7 @@ process.on("exit", () => {
   }
 });
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { SourceMap } from "node:module";
 import { tmpdir } from "node:os";
@@ -72,6 +73,46 @@ test("assets.json's digests are the files as written", () => {
   for (const [path, want] of Object.entries(MANIFEST.files)) assert.equal(digest(read(path)), want, path);
   assert.deepStrictEqual(JSON.parse(text("assets.json")), MANIFEST);
   assert.equal(MANIFEST.tools.esbuild, "0.28.2", "the build ran another esbuild than the lockfile pins");
+});
+
+test("`#1919 vibe-talk-esbuild-gomaxprocs`: the esbuild service inherits a capped GOMAXPROCS unless one is already set", () => {
+  // A fresh node process, so the parent suite's own service cannot stand in for this one's:
+  // load esbuild, run one transform (which starts its Go service), then read that service's
+  // own environment back out of /proc where the host has one.
+  const probe = `
+    import { loadTool } from ${JSON.stringify(pathToFileURL(join(WEB, "build.mjs")).href)};
+    import { existsSync, readdirSync, readFileSync } from "node:fs";
+    const esbuild = loadTool("esbuild");
+    await esbuild.transform("let probe = 1;", { loader: "js" });
+    let service = null;
+    if (existsSync("/proc")) {
+      for (const name of readdirSync("/proc")) {
+        if (!/^[0-9]+$/.test(name)) continue;
+        try {
+          const cmd = readFileSync("/proc/" + name + "/cmdline", "utf8");
+          if (!cmd.includes("esbuild") || !cmd.includes("--service")) continue;
+          const stat = readFileSync("/proc/" + name + "/stat", "utf8");
+          if (Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]) !== process.pid) continue;
+          const entry = readFileSync("/proc/" + name + "/environ", "utf8").split("\\0")
+            .find((part) => part.startsWith("GOMAXPROCS="));
+          service = entry ? entry.slice("GOMAXPROCS=".length) : null;
+        } catch { /* the service exited between listing and reading */ }
+      }
+    }
+    console.log(JSON.stringify({ node: process.env.GOMAXPROCS ?? null, service }));
+  `;
+  const run = (gomaxprocs) => {
+    const env = { ...process.env };
+    if (gomaxprocs === null) delete env.GOMAXPROCS;
+    else env.GOMAXPROCS = gomaxprocs;
+    const runResult = spawnSync(process.execPath, ["--input-type=module", "-e", probe],
+      { cwd: join(WEB, ".."), env, encoding: "utf8", timeout: 60000 });
+    assert.equal(runResult.status, 0, `the esbuild probe failed: ${runResult.stderr}`);
+    return JSON.parse(runResult.stdout.trim().split("\n").at(-1));
+  };
+  assert.deepStrictEqual(run(null), { node: "4", service: existsSync("/proc") ? "4" : null },
+    "with no GOMAXPROCS set, esbuild's service must start capped at 4");
+  assert.equal(run("7").node, "7", "a GOMAXPROCS the caller already set must be left alone");
 });
 
 test("the shell is the source shell with its script tags made one and its stylesheet links made one, and nothing else changed", () => {

@@ -57,8 +57,20 @@ const REPOSITORY = resolve(WEB, "..", "..");
 /** The first 128 bits of the SHA-256 of `bytes`, in lowercase hex. */
 export const digest = (bytes) => createHash("sha256").update(bytes).digest("hex").slice(0, 32);
 
+/**
+ * The `GOMAXPROCS` the esbuild service runs under when the caller set none (`#1919
+ * vibe-talk-esbuild-gomaxprocs`): measured on one page slice (shard 0/4, 642 tests) on
+ * 2026-11-19, esbuild used 455-486 CPU-s uncapped against node's 183-209, and 119 at
+ * this cap (121 at 2, 138 at 8), with the page build's output byte-identical.
+ */
+const ESBUILD_GOMAXPROCS = "4";
+
 /** One of the lockfile-pinned tools (esbuild, typescript), or an error saying how to install it. */
 export function loadTool(name) {
+  // esbuild's service is a Go binary the JS API spawns lazily from this process, inheriting
+  // its environment; uncapped, Go sizes its scheduler to every CPU the host has and its idle
+  // threads burn CPU beside node. Cap it here, where every test and build loads esbuild.
+  if (name === "esbuild" && !process.env.GOMAXPROCS) process.env.GOMAXPROCS = ESBUILD_GOMAXPROCS;
   const require = createRequire(join(TOOLS, "package.json"));
   try {
     return require(name);
