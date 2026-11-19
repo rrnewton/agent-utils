@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-nested-module-name-vs-path: populated check conflates submodule name and path'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: unassigned
@@ -23,3 +23,7 @@ Skip the nested-module candidate only when the populated worktree's Git director
 The y/x mismatch case keeps or refuses on the private commit in both editions; the z control still bundles; no other remove behaviour changes.
 
 # Notes
+
+## Resolution
+
+Landed as 3d3eb9d4 ('wrkslots: judge nested module repositories by their own worktree'). The Python scan resolves the worktree a module itself records (`gitdir` file, then `core.worktree`), falling back to the declaring superprojects' `.gitmodules` name-to-path mapping chained per nesting level — the only record `git submodule deinit` leaves behind — names the salvage candidate by that declared worktree path, and refuses when the name-spelled path is another repository's populated worktree and nothing records this module's own. The placeholder directory for reading an unpopulated module is made only inside the current checkout, never at the recorded path, so a post-fence recheck cannot resurrect the slot being removed. The Rust remove gate fails closed when a `-` submodule-status line retains a module repository under `modules/`, handing the slot to the Python edition. Pre-fix reproduction: y/x mismatch lost the private commit (receipts only product, product/y); z control bundled. Post-fix: y/x and z both bundle, Rust refuses deinitialized stores.
