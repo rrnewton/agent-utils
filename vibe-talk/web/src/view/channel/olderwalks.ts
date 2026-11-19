@@ -1213,7 +1213,14 @@ function renderServerSearch() {
   // that replace it move nothing (`#243`). (`#1852`: Whole threads moved to
   // the search bar, so the row carries buckets alone.)
   if (bucketRow.hidden) bucketRow.hidden = false;
-  placeServerHits(grouped);
+  // `#1901 vibe-talk-search-late-hits-shift-anchor`: a late round (a gated
+  // second page, a Search-further-back grow) inserts its hits above the
+  // reader's anchor with scrollTop unchanged, shifting what they read down
+  // (+105.9 / +287 px measured). Hold the anchor through the placement with
+  // the #1880 scroll owner's hold (`preservingScroll`): it restores the
+  // anchor's rect.top after, moves nothing for insertions below it, and
+  // follows the newest line instead when the reader is pinned there.
+  preservingScroll(() => placeServerHits(grouped));
   if (!serverExpanded) return;
   setTextIfChanged(el("search-scope"), searchScopeLine());
   const checkbox = el("search-all-channels") as HTMLInputElement;
