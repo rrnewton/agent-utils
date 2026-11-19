@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-agent-replies-to-owner-root-not-surfaced: agent thread replies to the owner''s own messages are not surfaced where the owner reads'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -33,3 +33,7 @@ This follows #222 unread-replies ("N replies, M unread" on Main, roots with unre
 # Notes
 
 Owner-priority, fast-track: deployed on landing. Related: #222 unread-replies (the Main chip and Hide-read keeping this builds on), #1881 vibe-talk-own-messages-read-on-arrival (own roots read on arrival; check it does not hide a root with unread replies), #1316 catchup-side-agent (Discuss; not this surface). No consumer, host, or person is named here beyond the owner's own report.
+
+## Resolution
+
+[watermelon-full-preview] Landed 0350ba75 on github/main. Root cause, in three parts: (1) the only surface on a Main root was #222's small count chip — a root the owner wrote, drawn read under #1881, carrying "2 unread" with none of the answer's words, reads as "no response"; the card now shows the newest unread reply's own first line in a one-line preview button beside the count (owner's own roots only, via `startsRead`; the full line is its accessible label; one line so a following reader is not taken off the foot as it appears). (2) Unread navigation used `rowIsRead` over the root's own messages only, so Shift+Up/Down, the jump-to-unread chip and the next-unread keys skipped every answered own root; a Main row carrying `data-unread-replies` now counts as unread for navigation, as a thread card with unread replies already did. (3) The thread picker's rows and their pin buttons said nothing about unread replies; they now carry the thread card's own "N unread"/"N new" words, refreshed live while the picker is open. Hide/Fold keeping was verified not regressed by #1881 (the read own root stays, kept by its replies). Evidence: new page test in reading-state (live replies to an own root: preview, keeping, Shift+Up landings, preview opens the thread); pin badge checked in real Chromium (thread_pin_picker_browser, phone and desk); screenshot scenes 81 (Main under Fold, preview on the kept root) and 82 (jump-to-unread landing on it) in /tmp/mu-replysurface-shots with BUILD.txt, and the same scene on the base tree in /tmp/mu-replysurface-before showing only the count chip and no reply words. Gate: owner gate red only on screenshots-desks scene 59, passed on exclusive rerun (flake waiver); `vibe-talk.check.fmt` stayed NO_RESULT (OOM at its learned cap, a known host-wide condition; its only fmt diff is pre-existing on main in a file this change does not touch).
