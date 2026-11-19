@@ -4815,11 +4815,21 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
         .filter(|pane| pane.idle_shell && !claimed.contains(pane.pane_id.as_str()))
         .map(|pane| (pane.pane_id.clone(), 0.0))
         .collect();
+    // Same assumption for orphan tabs (#1918): previewed as long-seen.
+    let live_tabs: std::collections::BTreeSet<&str> =
+        pane_facts.iter().map(|pane| pane.tab_id.as_str()).collect();
+    let assumed_tab_since: BTreeMap<String, f64> = order_tabs
+        .iter()
+        .map(|(_, tab)| tab.as_str())
+        .filter(|tab| !live_tabs.contains(tab))
+        .map(|tab| (tab.to_owned(), 0.0))
+        .collect();
     let (rows, actions) = crate::tabs::plan(
         &pane_facts,
         &order_tabs,
         &agent_facts,
         &assumed_since,
+        &assumed_tab_since,
         grace,
         grace,
         workspaces.first().copied(),
@@ -4848,12 +4858,20 @@ pub fn tabs_listing<A: ManagedApi + ?Sized>(
 /// come from the bridges registered for discovery
 /// ([`crate::chat_lookup::candidates`]); a registry with none and no
 /// liaison mark keeps the designated coordinator first.
+/// Whether a fresh herdr pane listing still shows no pane in `tab_id`
+/// (#1918 close-time re-check): a pane that appeared after the census
+/// vetoes the orphan close.
+fn orphan_still_empty(panes_now: &[crate::client::Pane], tab_id: &str) -> bool {
+    !panes_now.iter().any(|pane| pane.tab_id == tab_id)
+}
+
 fn hygiene_pass<A: ManagedApi + ?Sized>(
     client: &A,
     registry: &Path,
     config: &RestoreConfig,
     host: &dyn Host,
     bare_since: &mut BTreeMap<String, f64>,
+    tab_since: &mut BTreeMap<String, f64>,
     closed: &mut Vec<Value>,
 ) -> Vec<Value> {
     let findings = Vec::new();
@@ -4907,6 +4925,30 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
     }
     let Ok(panes) = client.panes() else {
         return findings;
+    };
+    // #1918 (a): snapshot every workspace's tab order BEFORE the pane
+    // census below (per-pane info, idle state and screen; over 90 s with
+    // ~110 panes). The planner judges orphans against this snapshot only,
+    // so a tab created during the census is not in it and cannot be
+    // called an orphan this pass.
+    let order_snapshot: Vec<(String, String)> = {
+        let mut workspaces: Vec<&str> = panes.iter().map(|p| p.workspace_id.as_str()).collect();
+        workspaces.sort_unstable();
+        workspaces.dedup();
+        workspaces
+            .iter()
+            .filter_map(|workspace| {
+                crate::tab_order::socket_path()
+                    .filter(|path| path.exists())
+                    .and_then(|socket| crate::tab_order::list_tabs(&socket, workspace).ok())
+                    .map(|tabs| {
+                        tabs.into_iter()
+                            .map(|tab| (workspace.to_string(), tab))
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .flatten()
+            .collect()
     };
     // #1793: a workspace is also managed when a pane's tab label names a
     // registered agent (a duplicate tab in a second workspace), so its bare
@@ -5047,20 +5089,29 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
             })
         })
         .collect();
-    let order_tabs: Vec<(String, String)> = managed_workspaces
-        .iter()
-        .filter_map(|workspace| {
-            crate::tab_order::socket_path()
-                .filter(|path| path.exists())
-                .and_then(|socket| crate::tab_order::list_tabs(&socket, workspace).ok())
-                .map(|tabs| {
-                    tabs.into_iter()
-                        .map(|tab| (workspace.clone(), tab))
-                        .collect::<Vec<_>>()
-                })
-        })
-        .flatten()
+    // #1918: orphans are judged against the pre-census snapshot only,
+    // restricted to managed workspaces (never a fresh post-census read).
+    let order_tabs: Vec<(String, String)> = order_snapshot
+        .into_iter()
+        .filter(|(workspace, _)| managed_workspaces.contains(workspace))
         .collect();
+    // #1918 (b): stamp first-seen for each current orphan; forget tabs
+    // that gained a pane or left the order, so the clock restarts if a
+    // tab id is ever reused for a genuinely new empty tab.
+    {
+        let live: std::collections::BTreeSet<&str> =
+            pane_facts.iter().map(|fact| fact.tab_id.as_str()).collect();
+        let orphans: std::collections::BTreeSet<String> = order_tabs
+            .iter()
+            .map(|(_, tab)| tab.as_str())
+            .filter(|tab| !live.contains(tab))
+            .map(str::to_owned)
+            .collect();
+        for tab in &orphans {
+            tab_since.entry(tab.clone()).or_insert(now);
+        }
+        tab_since.retain(|tab, _| orphans.contains(tab));
+    }
     let viewer_workspace = config
         .coordinator
         .as_deref()
@@ -5085,6 +5136,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
         &order_tabs,
         &agent_facts,
         bare_since,
+        tab_since,
         now,
         config.bare_shell_grace_seconds as f64,
         viewer_workspace.as_deref(),
@@ -5110,8 +5162,25 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 }
             }
             crate::tabs::TabAction::CloseTab { tab_id, why } => {
-                if config.close_bare_shells && client.close_tab(&tab_id).is_ok() {
+                // #1918 (c): an orphan close re-lists the tab's panes from
+                // herdr at close time; any pane that appeared since the
+                // census vetoes the close. A failed re-list also vetoes
+                // (fail-closed). Stale-viewer closes keep their own path:
+                // their tab holds a live pane by design.
+                if !config.close_bare_shells {
+                    continue;
+                }
+                if why == "orphan tab, no live pane" {
+                    let still_empty = client
+                        .panes()
+                        .is_ok_and(|panes_now| orphan_still_empty(&panes_now, &tab_id));
+                    if !still_empty {
+                        continue;
+                    }
+                }
+                if client.close_tab(&tab_id).is_ok() {
                     closed.push(json!({"tab_id": tab_id, "why": why, "closed_at": now}));
+                    tab_since.remove(&tab_id);
                 }
             }
             crate::tabs::TabAction::RenameTab { tab_id, to } => {
@@ -5152,6 +5221,13 @@ pub fn watch<A: ManagedApi + ?Sized>(
         .as_deref()
         .and_then(read_report)
         .and_then(|previous| serde_json::from_value(previous["bare_shell_since"].clone()).ok())
+        .unwrap_or_default();
+    // #1918: orphan-tab first-seen clock, persisted like bare_shell_since
+    // so the grace survives a watch restart. Absent in older health files.
+    let mut tab_since: BTreeMap<String, f64> = path
+        .as_deref()
+        .and_then(read_report)
+        .and_then(|previous| serde_json::from_value(previous["orphan_tab_since"].clone()).ok())
         .unwrap_or_default();
     let mut timer_repaired_at: BTreeMap<String, f64> = path
         .as_deref()
@@ -5199,6 +5275,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
                 config,
                 host,
                 &mut bare_since,
+                &mut tab_since,
                 &mut closed_bare_shells,
             ));
         }
@@ -5259,6 +5336,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
             "timer_repaired_at": timer_repaired_at,
             "timer_stopped_noted": timer_stopped_noted,
             "bare_shell_since": bare_since,
+            "orphan_tab_since": tab_since,
             "closed_bare_shells": closed_bare_shells,
         });
         if let Some(path) = path.as_deref() {
@@ -5326,6 +5404,27 @@ mod tests {
         assert_eq!(in_pass["daemon_started_at"], first["daemon_started_at"]);
         drop(progress);
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_tab_whose_relist_shows_a_pane_is_not_closed() {
+        // #1918 (c): the census saw no pane in w1:t9, so the planner
+        // (past grace) emitted an orphan close; by close time a lane's
+        // pane has appeared in the tab. The re-list vetoes the close.
+        let appeared = vec![crate::client::Pane {
+            pane_id: "w1:p9".into(),
+            tab_id: "w1:t9".into(),
+            workspace_id: "w1".into(),
+        }];
+        assert!(!orphan_still_empty(&appeared, "w1:t9"));
+        // Still genuinely empty: no pane, or only other tabs' panes.
+        assert!(orphan_still_empty(&[], "w1:t9"));
+        let other = vec![crate::client::Pane {
+            pane_id: "w1:p1".into(),
+            tab_id: "w1:t1".into(),
+            workspace_id: "w1".into(),
+        }];
+        assert!(orphan_still_empty(&other, "w1:t9"));
     }
 
     #[test]

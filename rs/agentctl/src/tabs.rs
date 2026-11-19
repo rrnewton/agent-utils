@@ -175,15 +175,22 @@ pub fn managed_workspaces(
 }
 
 /// Plan one pass. `order_tabs` lists every tab of every workspace (from the
-/// workspace tab order); `bare_since`/`now`/`grace_seconds` drive the idle
-/// grace with injected time (no wall clock). `viewer_workspace` is where a
-/// missing headless viewer is created.
+/// workspace tab order, snapshotted before the pane census by the caller);
+/// `bare_since`/`now`/`grace_seconds` drive the idle grace with injected
+/// time (no wall clock). `tab_since` is the first-seen clock for orphan
+/// tabs (#1918): an orphan closes only when first seen strictly before
+/// `now` and at least `grace_seconds` ago, so a tab first seen this pass —
+/// including one created between the census and the order read on the old
+/// code path — is never closed. `viewer_workspace` is where a missing
+/// headless viewer is created.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn plan(
     panes: &[PaneFacts],
     order_tabs: &[(String, String)],
     agents: &[AgentFacts],
     bare_since: &BTreeMap<String, f64>,
+    tab_since: &BTreeMap<String, f64>,
     now: f64,
     grace_seconds: f64,
     viewer_workspace: Option<&str>,
@@ -265,22 +272,41 @@ pub fn plan(
         .collect();
     for tab in managed_tabs {
         if !live_tabs.contains(tab) {
-            rows.push(TabRow {
-                workspace_id: order_tabs
-                    .iter()
-                    .find(|(_, t)| t == tab)
-                    .map_or_else(String::new, |(w, _)| w.clone()),
-                tab_id: tab.to_owned(),
-                label: String::new(),
-                owner: by_viewer.get(tab).map(|agent| agent.name.clone()),
-                foreground: String::new(),
-                idle_seconds: None,
-                verdict: "close (orphan tab, no live pane)".to_owned(),
-            });
-            actions.push(TabAction::CloseTab {
-                tab_id: tab.to_owned(),
-                why: "orphan tab, no live pane".to_owned(),
-            });
+            // #1918: only an orphan first seen strictly before this pass
+            // and at least `grace_seconds` ago may close. A tab first seen
+            // this pass (no entry, or an entry stamped `now`) is kept.
+            let aged = tab_since
+                .get(tab)
+                .is_some_and(|since| *since < now && now - since >= grace_seconds);
+            let workspace_id = order_tabs
+                .iter()
+                .find(|(_, t)| t == tab)
+                .map_or_else(String::new, |(w, _)| w.clone());
+            if aged {
+                rows.push(TabRow {
+                    workspace_id,
+                    tab_id: tab.to_owned(),
+                    label: String::new(),
+                    owner: by_viewer.get(tab).map(|agent| agent.name.clone()),
+                    foreground: String::new(),
+                    idle_seconds: tab_since.get(tab).map(|since| now - since),
+                    verdict: "close (orphan tab, no live pane)".to_owned(),
+                });
+                actions.push(TabAction::CloseTab {
+                    tab_id: tab.to_owned(),
+                    why: "orphan tab, no live pane".to_owned(),
+                });
+            } else {
+                rows.push(TabRow {
+                    workspace_id,
+                    tab_id: tab.to_owned(),
+                    label: String::new(),
+                    owner: by_viewer.get(tab).map(|agent| agent.name.clone()),
+                    foreground: String::new(),
+                    idle_seconds: tab_since.get(tab).map(|since| now - since),
+                    verdict: "keep (orphan grace)".to_owned(),
+                });
+            }
         }
     }
     for agent in agents {
@@ -375,7 +401,16 @@ mod tests {
         for p in &panes {
             bare.insert(p.pane_id.clone(), 0.0);
         }
-        let (rows, actions) = plan(&panes, &order, &agents, &bare, 10_000.0, 600.0, None);
+        let (rows, actions) = plan(
+            &panes,
+            &order,
+            &agents,
+            &bare,
+            &BTreeMap::new(),
+            10_000.0,
+            600.0,
+            None,
+        );
         assert_eq!(
             actions,
             vec![TabAction::ClosePane {
@@ -408,6 +443,7 @@ mod tests {
             &order,
             &agents,
             &since("w2:p9", 0.0),
+            &BTreeMap::new(),
             10_000.0,
             600.0,
             None,
@@ -418,6 +454,7 @@ mod tests {
             &order,
             &agents,
             &since("w2:p9", 9_900.0),
+            &BTreeMap::new(),
             10_000.0,
             600.0,
             None,
@@ -445,6 +482,7 @@ mod tests {
             &order,
             &agents,
             &since("w9:p1", 0.0),
+            &BTreeMap::new(),
             10_000.0,
             600.0,
             None,
@@ -466,12 +504,15 @@ mod tests {
             ("w1".to_owned(), "w1:t1".to_owned()),
             ("w1".to_owned(), "w1:t9".to_owned()), // no pane: orphan
         ];
+        // The orphan has been seen since t=0; at t=10_000 it is past grace.
+        let tab_since = BTreeMap::from([("w1:t9".to_owned(), 0.0)]);
         let (_, actions) = plan(
             &panes,
             &order,
             &agents,
             &BTreeMap::new(),
-            0.0,
+            &tab_since,
+            10_000.0,
             600.0,
             Some("w1"),
         );
@@ -482,6 +523,86 @@ mod tests {
         assert!(actions.contains(&TabAction::CreateViewer {
             agent: "coord".into(),
             workspace_id: "w1".into()
+        }));
+    }
+
+    #[test]
+    fn a_tab_created_between_the_census_and_the_order_read_is_not_closed() {
+        // #1918 regression (fails on the old code, which closed every
+        // order tab with no live pane): the census saw only t1; t9 was
+        // created afterwards and appears only in the order snapshot's
+        // successor read. First seen this pass — whether the caller has
+        // just stamped it `now` or has no entry for it yet — it is kept.
+        let panes = vec![pane("w1:p1", "w1:t1", "w1", "agent-a", false, false)];
+        let agents = vec![agent("agent-a", Some("w1:p1"))];
+        let order = vec![
+            ("w1".to_owned(), "w1:t1".to_owned()),
+            ("w1".to_owned(), "w1:t9".to_owned()),
+        ];
+        for tab_since in [
+            BTreeMap::new(),
+            BTreeMap::from([("w1:t9".to_owned(), 10_000.0)]),
+        ] {
+            let (rows, actions) = plan(
+                &panes,
+                &order,
+                &agents,
+                &BTreeMap::new(),
+                &tab_since,
+                10_000.0,
+                600.0,
+                None,
+            );
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, TabAction::CloseTab { tab_id, .. } if tab_id == "w1:t9")),
+                "new tab must not close: {actions:?}"
+            );
+            assert!(rows
+                .iter()
+                .find(|r| r.tab_id == "w1:t9")
+                .is_some_and(|r| r.verdict == "keep (orphan grace)"));
+        }
+    }
+
+    #[test]
+    fn an_orphan_tab_closes_only_past_grace_across_passes() {
+        // #1918: pass sequence with a controllable clock. First seen at
+        // t=1000: kept that pass and within grace; closed once past it.
+        let panes = vec![pane("w1:p1", "w1:t1", "w1", "agent-a", false, false)];
+        let agents = vec![agent("agent-a", Some("w1:p1"))];
+        let order = vec![
+            ("w1".to_owned(), "w1:t1".to_owned()),
+            ("w1".to_owned(), "w1:t9".to_owned()),
+        ];
+        let tab_since = BTreeMap::from([("w1:t9".to_owned(), 1_000.0)]);
+        for now in [1_000.0, 1_599.0] {
+            let (_, actions) = plan(
+                &panes,
+                &order,
+                &agents,
+                &BTreeMap::new(),
+                &tab_since,
+                now,
+                600.0,
+                None,
+            );
+            assert!(actions.is_empty(), "now={now}: {actions:?}");
+        }
+        let (_, actions) = plan(
+            &panes,
+            &order,
+            &agents,
+            &BTreeMap::new(),
+            &tab_since,
+            1_600.0,
+            600.0,
+            None,
+        );
+        assert!(actions.contains(&TabAction::CloseTab {
+            tab_id: "w1:t9".into(),
+            why: "orphan tab, no live pane".into()
         }));
     }
 
@@ -501,6 +622,7 @@ mod tests {
             &panes,
             &order,
             &[stale],
+            &BTreeMap::new(),
             &BTreeMap::new(),
             0.0,
             600.0,
@@ -524,6 +646,7 @@ mod tests {
             &order,
             &[fresh],
             &BTreeMap::new(),
+            &BTreeMap::new(),
             0.0,
             600.0,
             Some("w1"),
@@ -544,6 +667,7 @@ mod tests {
             &panes,
             &order,
             &[live, dead],
+            &BTreeMap::new(),
             &BTreeMap::new(),
             0.0,
             600.0,
