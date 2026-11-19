@@ -35587,9 +35587,10 @@ def _archive_ignored_files(
 ) -> dict[str, object]:
     """Write, verify and receipt one checkout's ignored-files tar (#1302).
 
-    The tar is deterministic (USTAR, sorted members, zeroed ownership
-    and timestamps) so the Python and Rust editions write identical
-    bytes for identical files; it sits beside the slot's salvage
+    The tar is deterministic (PAX with sorted members, zeroed ownership
+    and timestamps, extended headers only for names or link targets
+    USTAR cannot hold, #1873) so the Python and Rust editions write
+    identical bytes for identical files; it sits beside the slot's salvage
     bundles under the archive root and nothing deletes it.
     """
 
@@ -35607,7 +35608,7 @@ def _archive_ignored_files(
             f".{tar_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         )
         try:
-            with tarfile.open(temporary, "w", format=tarfile.USTAR_FORMAT) as archive:
+            with tarfile.open(temporary, "w", format=tarfile.PAX_FORMAT) as archive:
                 for item in files:
                     info = tarfile.TarInfo(f"{checkout.name}/{item.path}")
                     info.mtime = 0

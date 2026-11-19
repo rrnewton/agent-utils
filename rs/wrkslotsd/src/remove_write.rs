@@ -2318,6 +2318,10 @@ fn parse_octal(field: &[u8]) -> Result<u64> {
         .map_err(|error| format!("invalid octal field in ignored-files archive: {error}"))
 }
 
+/// One tar header block, byte-identical to the Python edition's
+/// (#1302): name and linkname fields hold at most 100 bytes each,
+/// truncated as Python's tarfile writes them; anything longer rides
+/// in a preceding PAX extended header (`pax_block`).
 fn ustar_header(
     name: &str,
     size: u64,
@@ -2325,30 +2329,14 @@ fn ustar_header(
     typeflag: u8,
     linkname: &str,
 ) -> Result<[u8; 512]> {
-    if linkname.len() > 100 {
-        return Err("ignored-files archive link target is too long".to_string());
-    }
-    let (prefix, short_name): (String, String) = if name.len() <= 100 {
-        (String::new(), name.to_string())
-    } else {
-        let components: Vec<&str> = name.split('/').collect();
-        let mut split = None;
-        for index in 1..components.len() {
-            let candidate_prefix = components[..index].join("/");
-            let candidate_name = components[index..].join("/");
-            if candidate_prefix.len() <= 155 && candidate_name.len() <= 100 {
-                split = Some((candidate_prefix, candidate_name));
-                break;
-            }
-        }
-        split.ok_or_else(|| "ignored-files archive path is too long".to_string())?
-    };
+    let short_name = &name.as_bytes()[..name.len().min(100)];
+    let short_link = &linkname.as_bytes()[..linkname.len().min(100)];
     let mut header = [0u8; 512];
     let write_field = |header: &mut [u8; 512], start: usize, width: usize, bytes: &[u8]| {
         header[start..start + bytes.len()].copy_from_slice(bytes);
         let _ = width;
     };
-    write_field(&mut header, 0, 100, short_name.as_bytes());
+    write_field(&mut header, 0, 100, short_name);
     write_field(
         &mut header,
         100,
@@ -2361,12 +2349,36 @@ fn ustar_header(
     write_field(&mut header, 136, 12, b"00000000000\0");
     header[148..156].copy_from_slice(b"        ");
     header[156] = typeflag;
-    write_field(&mut header, 157, 100, linkname.as_bytes());
+    write_field(&mut header, 157, 100, short_link);
     header[257..265].copy_from_slice(b"ustar\x0000");
-    write_field(&mut header, 345, 155, prefix.as_bytes());
     let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
     header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
     Ok(header)
+}
+
+/// The PAX extended-header block Python's tarfile writes before a
+/// member whose name or link target overflows USTAR (#1873): an
+/// `x` header named ././@PaxHeader, then `<len> key=value` records
+/// padded to a 512-byte boundary.
+fn pax_block(records: &[(&str, &str)]) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    for (key, value) in records {
+        let body = format!("{key}={value}\n");
+        let mut length = body.len() + 2;
+        loop {
+            let digits = length.to_string().len();
+            if body.len() + 1 + digits == length {
+                break;
+            }
+            length = body.len() + 1 + digits;
+        }
+        data.extend_from_slice(format!("{length} {body}").as_bytes());
+    }
+    let header = ustar_header("././@PaxHeader", data.len() as u64, 0, b'x', "")?;
+    let mut block = header.to_vec();
+    block.extend_from_slice(&data);
+    block.resize(block.len() + (512 - (data.len() % 512)) % 512, 0);
+    Ok(block)
 }
 
 fn verify_ignored_archive(
@@ -2386,6 +2398,8 @@ fn verify_ignored_archive(
         .map(|item| format!("{checkout_name}/{}", item.path))
         .collect();
     let mut index = 0usize;
+    let mut pax_path: Option<String> = None;
+    let mut pax_link: Option<String> = None;
     let mut zero_blocks = 0usize;
     loop {
         let mut header = [0u8; 512];
@@ -2427,6 +2441,71 @@ fn verify_ignored_archive(
                 tar_path.display()
             ));
         }
+        if header[156] == b'x' {
+            // PAX extended header (#1873): its records override the
+            // next member's name and link target. Read and discard
+            // the data blocks; the member itself follows.
+            let data_size = parse_octal(&header[124..136])?;
+            let mut data = vec![0u8; usize::try_from(data_size).unwrap_or(0)];
+            reader.read_exact(&mut data).map_err(|error| {
+                format!(
+                    "cannot verify ignored-files archive {}: {error}",
+                    tar_path.display()
+                )
+            })?;
+            let mut rest = &data[..];
+            while !rest.is_empty() {
+                let Some(space) = rest.iter().position(|byte| *byte == b' ') else {
+                    break;
+                };
+                let Ok(length_text) = std::str::from_utf8(&rest[..space]) else {
+                    break;
+                };
+                let Ok(length) = length_text.parse::<usize>() else {
+                    break;
+                };
+                if length == 0 || length > rest.len() {
+                    break;
+                }
+                let record = &rest[..length];
+                if let Some(equals) = record.iter().position(|byte| *byte == b'=') {
+                    let key = String::from_utf8_lossy(&record[space + 1..equals]).into_owned();
+                    let value = String::from_utf8_lossy(
+                        record[equals + 1..]
+                            .strip_suffix(b"\n")
+                            .unwrap_or(&record[equals + 1..]),
+                    )
+                    .into_owned();
+                    match key.as_str() {
+                        "path" => pax_path = Some(value),
+                        "linkpath" => pax_link = Some(value),
+                        _ => {}
+                    }
+                }
+                rest = &rest[length..];
+            }
+            let padding = (512 - (data_size % 512)) % 512;
+            let mut rest_padding = padding;
+            let mut buffer = [0u8; 512];
+            while rest_padding > 0 {
+                let wanted =
+                    usize::try_from(rest_padding.min(buffer.len() as u64)).unwrap_or(buffer.len());
+                let read = reader.read(&mut buffer[..wanted]).map_err(|error| {
+                    format!(
+                        "cannot verify ignored-files archive {}: {error}",
+                        tar_path.display()
+                    )
+                })?;
+                if read == 0 {
+                    return Err(format!(
+                        "ignored-files archive is truncated: {}",
+                        tar_path.display()
+                    ));
+                }
+                rest_padding -= read as u64;
+            }
+            continue;
+        }
         let name_field = &header[0..100];
         let name_end = name_field.iter().position(|byte| *byte == 0).unwrap_or(100);
         let short_name = String::from_utf8_lossy(&name_field[..name_end]).into_owned();
@@ -2436,11 +2515,11 @@ fn verify_ignored_archive(
             .position(|byte| *byte == 0)
             .unwrap_or(155);
         let prefix = String::from_utf8_lossy(&prefix_field[..prefix_end]).into_owned();
-        let member_name = if prefix.is_empty() {
+        let member_name = pax_path.take().unwrap_or(if prefix.is_empty() {
             short_name
         } else {
             format!("{prefix}/{short_name}")
-        };
+        });
         if index >= expected.len() || member_name != expected[index] {
             return Err(format!(
                 "ignored-files archive does not list the expected files: {}",
@@ -2453,7 +2532,9 @@ fn verify_ignored_archive(
         if let Some(target) = &item.link_target {
             let link_field = &header[157..257];
             let link_end = link_field.iter().position(|byte| *byte == 0).unwrap_or(100);
-            let linkname = String::from_utf8_lossy(&link_field[..link_end]).into_owned();
+            let linkname = pax_link
+                .take()
+                .unwrap_or_else(|| String::from_utf8_lossy(&link_field[..link_end]).into_owned());
             if typeflag != b'2' || linkname != *target || size != 0 {
                 return Err(format!(
                     "ignored-files archive member is not the expected symlink {member_name}: {}",
@@ -2567,6 +2648,27 @@ pub(crate) fn archive_ignored_files(
             let mut written: u64 = 0;
             for item in files {
                 let member_name = format!("{checkout_name}/{}", item.path);
+                // PAX extended header for whatever USTAR cannot hold
+                // (#1873), byte-identical to the Python edition.
+                let mut records: Vec<(&str, &str)> = Vec::new();
+                if member_name.len() > 100 {
+                    records.push(("path", member_name.as_str()));
+                }
+                if let Some(target) = &item.link_target {
+                    if target.len() > 100 {
+                        records.push(("linkpath", target.as_str()));
+                    }
+                }
+                if !records.is_empty() {
+                    let block = pax_block(&records)?;
+                    output.write_all(&block).map_err(|error| {
+                        format!(
+                            "cannot write ignored-files archive {}: {error}",
+                            temporary.display()
+                        )
+                    })?;
+                    written += block.len() as u64;
+                }
                 if let Some(target) = &item.link_target {
                     let header = ustar_header(&member_name, 0, 0o777, b'2', target)?;
                     output.write_all(&header).map_err(|error| {

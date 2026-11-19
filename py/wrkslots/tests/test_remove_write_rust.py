@@ -779,6 +779,59 @@ def test_remove_ignored_file_discards_in_both_editions(tmp_path: Path) -> None:
             assert not list(root.rglob("ignored-*.tar"))
 
 
+def _add_long_ignored_entries(root: Path) -> tuple[str, str]:
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / ".gitignore").write_text("long-link\ndeep/\n")
+    _git(checkout, "add", ".gitignore")
+    _git(checkout, "commit", "-q", "-m", "ignore long entries")
+    _git(checkout, "push", "-q", "origin", "HEAD:suite/work")
+    target = "/" + "/".join(f"target{i:02d}" for i in range(18))
+    assert len(target) > 100
+    (checkout / "long-link").symlink_to(target)
+    deep = "deep/" + "/".join(f"segment{i:02d}" for i in range(27)) + "/leaf.txt"
+    assert len(f"repo/{deep}") > 255
+    deep_path = checkout / deep
+    deep_path.parent.mkdir(parents=True, exist_ok=True)
+    deep_path.write_bytes(b"deep scratch\n")
+    return target, deep
+
+
+def test_remove_ignored_long_symlink_archives_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    """#1873: a >100-byte symlink target and a >255-byte member name
+    archive (PAX) instead of dying on USTAR limits."""
+
+    import tarfile
+
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        expected: dict[Path, tuple[str, str]] = {}
+        for root in (rust_root, oracle_root):
+            expected[root] = _add_long_ignored_entries(root)
+        assert _python_remove(oracle_root, archive_ignored=True) == 0
+        result = _rust_remove(rust_root, archive_ignored=True)
+        assert result.returncode == 0, result.stderr
+        assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
+            oracle_root, "ARCHIVED.node-a.json"
+        )
+        archives = []
+        for root in (rust_root, oracle_root):
+            found = list(root.rglob("ignored-*.tar"))
+            assert len(found) == 1
+            archives.append(found[0].read_bytes())
+            target, deep = expected[root]
+            with tarfile.open(found[0], "r:") as bundle:
+                members = {member.name: member for member in bundle.getmembers()}
+            link = members["repo/long-link"]
+            assert link.issym() and link.linkname == target
+            leaf = members[f"repo/{deep}"]
+            assert leaf.isfile()
+            with tarfile.open(found[0], "r:") as bundle:
+                assert bundle.extractfile(leaf).read() == b"deep scratch\n"  # type: ignore[union-attr]
+        assert archives[0] == archives[1]
+
+
 def test_remove_ignored_file_archives_in_both_editions(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         rust_root, oracle_root = _pair(base)
