@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-thread-ref-opens-thread-view: a :thread: reference opens the thread view, root highlighted'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -32,3 +32,7 @@ Page (`vibe-talk/web/src/view/shell/navigation.ts`, `jumpToShortRef`): a thread 
 # Notes
 
 Related: #1565 vibe-talk-short-ref-links (closed, specified this behaviour), #657 thread-reference-links (open, in-app thread jumps), #1713 vibe-talk-short-ref-link-double-render (bridge-expanded shape), #543 in-app-message-links. Owner clarification (thread 193): dynamic testing is manual exercise on a real test server with evidence, not a new slow browser DAG step; screenshots follow the standing matrix on the #1855 harness.
+
+## Resolution
+
+Landed 64ab9596 on github/main (gate pass on 65f60bfd, owner priority; renumbered from #1877 after a number collision on main). Bridge-expanded `:thread:` references now render with `data-shortref="thread"` and a thread target; the click opens the thread view (right column in two columns) from All, Main and two-column views with the root message highlighted. Plain message links and pasted permalinks keep the message jump, as designed. Evidence: cargo render tests (2 new), short-refs browser walk at 390px and 1280px asserting the root highlight, screenshot matrix in /tmp/mu-threadref-shots (BUILD.txt head 9ba33d19, pre-renumber tree; code-identical except the renumber) and /tmp/mu-threadref-browsertest. Not verified live: a production bridge file end to end; coordb deploys.
