@@ -1,12 +1,13 @@
 ---
 title: 'agentctl-profile-requires-bypass: every launch profile carries its harness permission-bypass flag'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - agentctl
 created_at: 2026-11-17T20:05:52-05:00
-updated_at: 2026-11-17T20:05:52-05:00
+updated_at: 2026-11-18T23:51:32-05:00
+closed_at: 2026-11-18T23:51:32-05:00
 ---
 
 # Description
@@ -80,3 +81,15 @@ is already appended by the foreign (headless worker) runners for codex,
 and `blocking_question_warning` (#1158) is the shape precedent for a
 per-harness launch-argument rule surfaced in the public listing. The
 diff goes to coordb before the gate.
+
+## Resolution
+
+[watermelon-full-preview] Landed ab980463 on github/main (gate pass on
+641fe39b). Every interactive profile now refuses to load without its
+harness's bypass flag, and start, revive, restart, restore, turnover,
+refresh-profile, and ad-hoc starts refuse the same way, naming the
+profile, harness, and exact flag; headless Claude starts and wrapper
+relaunches refuse without `--permission-mode bypassPermissions` (or
+`--dangerously-skip-permissions`) in the harness args. agentcloud
+warns only (no bypass flag known). Regression tests in both editions
+fail before and pass after; the differential shards agree.
