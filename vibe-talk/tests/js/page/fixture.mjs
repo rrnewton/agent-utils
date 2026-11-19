@@ -2038,6 +2038,9 @@ const SETTINGS = await moduleForTests("src/core/settings/index.ts");
 const SERVER_API = await moduleForTests("src/core/api/index.ts");
 
 function newPage(store = new Map(), script = SCRIPT, arrange = null) {
+  // `#1846` S1: the existing suite exercises the Off path (full rendering); windowed
+  // variants live in the windowing suites. Seed explicit Off unless a test chose otherwise.
+  if (!store.has("vibe-talk.voice.windowed-lists") && !store.has("vibe-talk.voice.windowed-lists-off")) store.set("vibe-talk.voice.windowed-lists-off", "1");
   // A page whose MODULES are broken on purpose (`brokenModule`): its prelude, and the legacy script.
   let prelude = PRELUDE_COMPILED;
   if (script && typeof script === "object") ({ prelude, script } = script);
@@ -6374,6 +6377,7 @@ const TUNING_BANDS = {
   // `#1846 vibe-talk-windowed-rendering`. The render window beside the viewport and its row
   // caps (Q1/Q2 approved starting values): under a screenful of prefetch a fast flick lands on
   // unmounted rows; caps far above these mount the list the issue exists to stop mounting.
+  CARD_EST_PX: [40, 200, "estimated thread-card height before first measure, px"],
   RENDER_PREFETCH_PHONE_PX: [600, 4000, "phone prefetch beside the viewport, px per side"],
   RENDER_PREFETCH_DESKTOP_PX: [800, 6000, "desktop prefetch beside the viewport, px per side"],
   RENDER_CAP_PHONE: [20, 200, "mounted rows per list on a phone"],

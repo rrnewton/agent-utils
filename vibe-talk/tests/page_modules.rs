@@ -70,6 +70,7 @@ const SUITES: &[&str] = &[
     "tests/js/view/settings-editors.test.mjs",
     "tests/js/view/voice.test.mjs",
     "tests/js/view/windowing.test.mjs",
+    "tests/js/view/hydration.test.mjs",
 ];
 
 /// How many tests the suites define between them. Raise it with them: it is a floor against a

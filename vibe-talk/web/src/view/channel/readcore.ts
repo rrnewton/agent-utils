@@ -532,7 +532,7 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
     }
     // Step 5 pins: jump/search/speaking ids and the focused row stay mounted.
     const pinIds = new Set<string>(deps.pinnedIds ? deps.pinnedIds() : []);
-    const active = list.ownerDocument.activeElement;
+    const active = list.ownerDocument?.activeElement;
     if (active && list.contains(active)) {
       const row = (active as HTMLElement).closest("[data-context-id],[data-message-id]");
       const pid = row?.getAttribute("data-context-id") || row?.getAttribute("data-message-id");
