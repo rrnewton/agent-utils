@@ -155,6 +155,8 @@ export interface ScrollKeeping {
   holdingReader(mutate: () => void): void;
   /** Where the reader is: which message their eye is on, and how far down the viewport it sits. */
   captureScroll(): ScrollMark;
+  /** Whether the reader has scrolled or touched since `mark` was captured (`#1880`): holders outside this owner (the filter anchor's) ask it of their own capture instead of tracking input a second time. */
+  userMovedSince(mark: ScrollMark): boolean;
   /** Put the reader back where `captureScroll` found them. */
   restoreScroll(mark: ScrollMark): void;
   /** A turn arrived: follow it only if the reader had not scrolled away. */
@@ -631,5 +633,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     return onScreen;
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned, rowsOnScreen, userMovedSince };
 }
