@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-own-messages-read-on-arrival: own messages are read on arrival in every view'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -32,4 +32,8 @@ The rule (#549 own-read-stored): the owner's own messages (sender = the owner's 
 
 # Notes
 
-May share a root with #1880's echo replacement (mu-readerdrill owns that lane); coordinate before touching echo-replace code.
+May share a root with #1880's echo replacement (mu-readerdrill owns that lane); coordinate before touching echo-replace code. No echo-replace code was touched: the stream copy that replaces the optimistic one goes through the same start-read noting as any live arrival.
+
+## Resolution
+
+[watermelon-full-preview] Root cause, server side: the live hub notes a first sight once, and `decide_waiting` drained the queue before deciding; when the settings read failed at that moment (the restart window), `decide` answered nothing and the sightings were gone, so an own message ingested then stayed unread until an unrelated write-scope read met it again — the owner's settings round-trip. `decide` now reports an unmakeable decision as `None`, and `decide_waiting` puts those sightings back for the next sight; a store that is absent still settles as nothing. Client side: replayed stream copies skipped start-read noting (`if (!replayed)`), and messages carried by a folded page or delta were never offered to it, so own messages drawn from replay, backfill or history waited on the server's read state. Both paths now note start-read, which also feeds unread navigation, counts and Newest(N) through the one read bit. Regression tests: `a_hub_sighting_that_cannot_be_decided_yet_is_decided_at_the_next_sight` (fails pre-fix) and a readcore page test for page/delta noting. Dynamic evidence: screenshot state `79-own-messages-read` fails on the base tree ("drawn read, not unread" unreached) and passes on this tree; matrix in /tmp/mu-ownread-shots with BUILD.txt.
