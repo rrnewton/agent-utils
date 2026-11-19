@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-link-search-semantics: with Links on, match the query inside link addresses and names, and list links with no query'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -34,3 +34,9 @@ Current semantics (read from the code, 2026-11-19): the shared search language (
 # Notes
 
 Lane mu-linksearch on branch mu-linksearch/1895. Functions this lane expects to edit: `view/channel/searchrows.ts` (`applySearch`, the message subject's link names), `view/channel/cardruns.ts` (`filterSideCards` links handling), and tests under `vibe-talk/tests/js/`; told to mu-labelsdrop (#1894) and coordb before editing so the two lanes' search edits do not collide.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as bf2a2444 + 430ca1f2 (tip 430ca1f2). With Links on, the query now matches as a folded substring of each link's address AND name: the matcher joins the drawn anchors with the addresses read from the text as written (`linksIn`, covering Slack `<url|label>`, markdown `[label](url)`, and nested forms), keeping the fuller name, and link names join the search haystack beside their addresses. Thread cards, roots, main rows, and unpacked rows are chosen by their threads' links under Links, and Links with no query narrows every list to link-holding rows and threads at once (the toggle refilters the cards immediately). The shared search language and its Rust twin are unchanged.
+
+Evidence: page tests in `tests/js/page/search.mjs` (owner shape, label-only word, cards with and without a query; the label and card cases fail on the old code) plus reading-state/search/links/channel suites, typecheck and architecture clean. Dynamic: the shared screenshot harness against the real throwaway server (fake upstream and model stub only) seeded the owner's exact nested shape live; scenes 37/73–76/80 pass in light/dark at 412x915 and 1280x800, every image inspected, in /tmp/mu-linksearch-shots (BUILD.txt: commit 71582d32, page-build 9aa8776b); thread narrowing is pinned by the page tests rather than a separate in-thread browser drive. Gate on 71582d32 failed only `vibe-talk.check.search-unmatched-browser`, waived as a load flake (5/5 solo passes on the exact tree; two failures at different wait stages; gate log loadavg 130, CPU PSI 34.6, 3 gates; exclusive rerun passed). Follow-up for the flake queue: that test waits by deadline for the opened run (phone) and for the server-hit count after the All-channels toggle (desk), against owner rule 346.
