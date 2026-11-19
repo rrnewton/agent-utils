@@ -4312,18 +4312,46 @@ def _act_all_thread_strip(driver: Driver) -> None:
     _open_threaded_all(driver)
 
 
+def _wait_scroll_stable(driver: Driver) -> None:
+    """Wait until #scroll-area's scrollTop has not moved for 300 ms.
+
+    A fixed settle races late layout: the threaded timeline's late
+    arrivals grow rows and the scroll holders re-anchor, so a
+    scrollTop read after a fixed sleep can be mid-adjustment and the
+    'nothing scrolled' comparison that follows judges the walk, not
+    the selection. Stability is the condition: the same value across
+    several animation frames (this poll runs per frame) and 300 ms;
+    the timeout only reports a scroll that never settles.
+    """
+    driver.page.evaluate(
+        "() => { window.__stableTop = undefined; window.__stableFrames = 0; "
+        "window.__stableTopAt = 0; }"
+    )
+    driver.page.wait_for_function(
+        "() => { const a = document.getElementById('scroll-area'); "
+        "const now = performance.now(); "
+        "if (window.__stableTop !== a.scrollTop) { "
+        "window.__stableTop = a.scrollTop; window.__stableTopAt = now; "
+        "window.__stableFrames = 0; return false; } "
+        "window.__stableFrames = (window.__stableFrames || 0) + 1; "
+        "return window.__stableFrames >= 3 && now - (window.__stableTopAt || now) >= 300; }",
+        timeout=15_000,
+    )
+
+
 def _act_all_thread_selected(driver: Driver) -> None:
     """`#299 all-thread-strip`: the summarised thread selected by a click on a reply's strip, in All: the
     rest dimmed and drained, nothing scrolled."""
     page = driver.page
     _open_threaded_all(driver)
+    _wait_scroll_stable(driver)
     page.evaluate("() => { window.__beforeTop = document.getElementById('scroll-area').scrollTop; }")
     page.click(f"#discord-log > li[data-id='{THREADED_STRIP_ROW}'] > .thread-strip")
     page.wait_for_function(
         f"() => document.getElementById('discord-log').getAttribute('data-focus-thread') === '{THREADED_RUNNER}'",
         timeout=10_000,
     )
-    driver.settle(300)
+    _wait_scroll_stable(driver)
 
 
 def _act_settings_voice_agent(driver: Driver) -> None:
