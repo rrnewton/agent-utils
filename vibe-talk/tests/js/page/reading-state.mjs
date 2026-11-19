@@ -5833,8 +5833,8 @@ test("`#251 author-filter`: Mine with nothing typed is every message of the owne
   assert.equal(page.el("search-empty").textContent, "None of the messages loaded so far are yours.");
   // THE CONTROL: without the author test in the pass, Mine filters nothing.
   const unwired = newPage(new Map(), await brokenModule([{ file: "src/view/channel/searchrows.ts",
-    find: "        const hit = said && (!links || shown > 0) && deps.authorPasses(row, author);",
-    replace: "        const hit = said && (!links || shown > 0);" }]));
+    find: "        const hit = said && (!links || shown > 0 || threadLinkHit) && deps.authorPasses(row, author);",
+    replace: "        const hit = said && (!links || shown > 0 || threadLinkHit);" }]));
   await signIn(unwired);
   await showDiscord(unwired, authorChannel());
   await chooseAuthor(unwired, "mine");
