@@ -46,7 +46,7 @@ pub struct AgentFacts {
     /// Whether it runs headless (no pane of its own).
     pub headless: bool,
     /// Whether the recorded viewer explicitly runs `agentctl tail` (#1879);
-    /// only an explicit tail viewer is stale. A legacy record with no kind
+    /// only an explicit tail viewer is stale. An older record with no kind
     /// is left untouched until a deliberate turnover.
     pub viewer_is_tail: bool,
     /// Its recorded working directory.
