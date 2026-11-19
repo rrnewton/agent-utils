@@ -31414,7 +31414,8 @@ def _load_eden_draft_ledger(
         raise StateError(f"{label} names another slot or checkout")
     if generation is not None and ledger.generation not in (None, generation):
         raise StateError(
-            f"{label} belongs to generation {ledger.generation}, not {generation}"
+            f"{label} belongs to generation {ledger.generation}, not {generation}; "
+            f"run 'wrkslots capture-drafts {slot}' to recapture for this generation"
         )
     return ledger
 
