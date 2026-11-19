@@ -499,7 +499,7 @@ CONTAINMENT_NICE = 10
 
 
 def _contained_command(
-    command: list[str], run_id: str, quota_cpus: int
+    command: list[str], run_id: str, quota_cpus: int, slice_name: str | None = None
 ) -> tuple[list[str], bool]:
     """`command` wrapped in a systemd user scope capped at `quota_cpus`
     and running at nice CONTAINMENT_NICE.
@@ -522,8 +522,12 @@ def _contained_command(
     wrapped = [
         systemd_run, "--user", "--scope", "--quiet", f"--unit={unit}",
         "-p", f"CPUQuota={quota_cpus * 100}%",
-        "--", *niced,
     ]
+    if slice_name:
+        # The operator named the slice (ci-hub policy): this gate's
+        # scope lives under it; absent, it stays under the user slice.
+        wrapped.append(f"--slice={slice_name}")
+    wrapped += ["--", *niced]
     return wrapped, True
 
 
@@ -2167,7 +2171,7 @@ def preflight_command() -> list[str]:
             "--selected", ",".join(PREFLIGHT_STEPS)]
 
 
-def run_preflight() -> tuple[bool, float, list[str], list[str]]:
+def run_preflight(slice_name: str | None = None) -> tuple[bool, float, list[str], list[str]]:
     """Run the preflight in this checkout: (passed, seconds, failed steps, lines to show).
 
     Contained like a gate (#1370): the per-gate CPU cap and nice 10 through
@@ -2176,7 +2180,7 @@ def run_preflight() -> tuple[bool, float, list[str], list[str]]:
     started = time.time()
     quota_cpus = host_cpu_quota_cpus()
     run_id = f"preflight-{os.getpid()}"
-    command, contained = _contained_command(preflight_command(), run_id, quota_cpus)
+    command, contained = _contained_command(preflight_command(), run_id, quota_cpus, slice_name)
     if contained:
         print(f"gate: preflight containment: systemd scope agent-utils-gate-{run_id}, "
               f"CPUQuota={quota_cpus * 100}% ({quota_cpus} CPUs), "
@@ -2365,7 +2369,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     elif getattr(args, "skip_preflight", False):
         preflight = "skipped: --skip-preflight"
     else:
-        passed, seconds, failed, shown = run_preflight()
+        passed, seconds, failed, shown = run_preflight(args.slice)
         if not passed:
             print(f"gate: preflight FAILED in {seconds:.0f}s, so this run was not queued; "
                   "fix these and run the gate again (--skip-preflight overrides, recorded):",
@@ -2489,7 +2493,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         time.sleep(1.0)
     waited = time.time() - queued_at
     quota_cpus = host_cpu_quota_cpus()
-    run_command, contained = _contained_command(command, run_id, quota_cpus)
+    run_command, contained = _contained_command(command, run_id, quota_cpus, args.slice)
     print(f"gate: admitted after {waited:.0f}s (class={args.cls})", flush=True)
     if contained:
         print(f"gate: CPU containment: systemd scope agent-utils-gate-{run_id}, "
@@ -3634,6 +3638,9 @@ def main(argv: list[str] | None = None) -> int:
                              "(FIFO among reruns); it still waits for running gates. "
                              "Example: gate.py --rerun -- common/bin/dagrun run --dag validation.dag.yaml "
                              "--keep-going --selected vibe-talk.check.fold-latency-browser")
+    parser.add_argument("--slice", default=None, metavar="NAME",
+                        help="run the gate's systemd scope under slice NAME (systemd-run --slice); "
+                             "absent keeps the scope directly under the user slice")
     parser.add_argument("--priority", choices=["normal", "owner"], default=None,
                         help="queue priority (default $GATE_PRIORITY, else normal). `owner` "
                              "fast-tracks work the owner asked for (#1180): the ticket is "

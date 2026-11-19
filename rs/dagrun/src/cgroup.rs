@@ -1433,8 +1433,9 @@ pub fn attempt_scope_reexec(
     memory_max: Option<i64>,
     cpu_count: Option<i64>,
     runtime_max_s: Option<i64>,
+    slice: Option<&str>,
 ) -> ScopeAttempt {
-    attempt_scope_reexec_inner(memory_max, cpu_count, runtime_max_s)
+    attempt_scope_reexec_inner(memory_max, cpu_count, runtime_max_s, slice)
 }
 
 /// Env var carrying the outer scope's requested `RuntimeMaxSec` into the in-scope child.
@@ -1550,6 +1551,7 @@ fn attempt_scope_reexec_inner(
     memory_max: Option<i64>,
     cpu_count: Option<i64>,
     runtime_max_s: Option<i64>,
+    slice: Option<&str>,
 ) -> ScopeAttempt {
     if in_scope() {
         // THE SENTINEL SAYS WE ARE BOXED; GO AND LOOK. Everything downstream keyed "boxing ACTIVE"
@@ -1639,7 +1641,12 @@ fn attempt_scope_reexec_inner(
             if cpu == 1 { "" } else { "s" }
         );
     }
-    if ensure_aggregate_slice(DEFAULT_CPU_BUDGET_FRACTION) {
+    if let Some(name) = slice {
+        // The operator named the slice (ci-hub policy): the run's boxes
+        // live under it instead of the shared aggregate slice.
+        args.push(format!("--slice={name}"));
+        eprintln!("{LOG_PREFIX} outer slice: {name} (operator-named).");
+    } else if ensure_aggregate_slice(DEFAULT_CPU_BUDGET_FRACTION) {
         args.push(format!("--slice={SLICE_NAME}"));
         eprintln!(
             "{LOG_PREFIX} CPU cap: shared {SLICE_NAME} CPUQuota={}% (~90% of {} cores, AGGREGATE \

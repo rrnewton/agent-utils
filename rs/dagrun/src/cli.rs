@@ -360,6 +360,22 @@ delegated_children: opt into child dagrun; preserves cgroups or names an unboxed
 /// Does this argument list request help (`-h`/`--help`)? The dispatcher checks this at the START of
 /// each subcommand — before argument parsing — so `--help` prints a usage page and exits 0 instead of
 /// tripping the unknown-argument arm.
+/// A systemd slice name for `--slice`: the charset systemd itself
+/// accepts for slice units, bounded so a typo fails at parse time.
+fn validate_slice_name(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(format!("--slice: invalid slice name '{value}'"));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '@'))
+        || value.starts_with(['.', '-'])
+    {
+        return Err(format!("--slice: invalid slice name '{value}'"));
+    }
+    Ok(())
+}
+
 fn wants_help(rest: &[String]) -> bool {
     rest.iter()
         .take_while(|argument| argument.as_str() != "--")
@@ -1259,6 +1275,9 @@ struct RunArgs {
     keep_going: bool,
     /// OUTER wall budget for the WHOLE run, in seconds (`None` = unbounded).
     run_timeout: Option<i64>,
+    /// systemd slice for the outer scope (`--slice NAME`); `None` keeps
+    /// the shared aggregate slice.
+    slice: Option<String>,
     /// Host-wide memory admission (opt-in). `None` = off; `Some(wait_s)` = on, waiting that long
     /// while QUEUED.
     admission: Option<f64>,
@@ -1325,6 +1344,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         show_plan: false,
         no_profile_feedback: false,
         profile_memory_feedback: false,
+        slice: None,
         profile_sync: None,
         profile_sync_direction: "both".to_string(),
         keep_going: false,
@@ -1392,6 +1412,11 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                 a.cores = Some(cores);
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
+            "--slice" => {
+                let value = take_value(inline, &mut i)?;
+                validate_slice_name(&value)?;
+                a.slice = Some(value);
+            }
             "--selected" => a.selected = Some(take_value(inline, &mut i)?),
             "--skip" => a.skip.push(take_value(inline, &mut i)?),
             "--labels" => a.labels = Some(take_value(inline, &mut i)?),
@@ -1836,6 +1861,7 @@ fn resolve_cgroups(
     max_cpus: Option<i64>,
     run_timeout_s: Option<i64>,
     max_mem_bytes: Option<i64>,
+    slice: Option<&str>,
 ) -> Result<BoxedCgroups, i32> {
     if unsafe_no_cgroups {
         // Deliberate opt-out (--unsafe-no-cgroups): skip scope bring-up entirely and run unboxed
@@ -1919,7 +1945,7 @@ fn resolve_cgroups(
         // variant would be unreachable from the binary, and mutating the enum's observation away
         // would not fail a single test. Measured: it did not. So the in-scope branch goes through
         // the same entry point as every other outcome.
-        let attempt = attempt_scope_reexec(None, None, None);
+        let attempt = attempt_scope_reexec(None, None, None, None);
         if !attempt.is_contained() {
             let msg = format!(
                 "the in-scope sentinel is set but containment could NOT be observed: {}",
@@ -2079,6 +2105,7 @@ fn resolve_cgroups(
         Some(outer_memory_max),
         max_cpus,
         run_timeout_s.map(|s| s + scope_grace_s(s)),
+        slice,
     );
     match &attempt {
         ScopeAttempt::SkippedByPolicy { reason } => eprintln!(
@@ -3893,6 +3920,7 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         inherited_max_cpus,
         None,
         inherited_max_mem_bytes,
+        None,
     ) {
         Ok(cg) => cg,
         Err(code) => return code,
@@ -4083,6 +4111,7 @@ fn cmd_target_time_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         inherited_max_cpus,
         None,
         inherited_max_mem_bytes,
+        None,
     ) {
         Ok(cgroups) => cgroups,
         Err(code) => return code,
@@ -4652,6 +4681,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         Some(max_cpus),
         a.run_timeout,
         effective_max_mem_bytes,
+        a.slice.as_deref(),
     ) {
         Ok(cg) => cg,
         Err(code) => return code,
@@ -5220,6 +5250,7 @@ fn run_inner(argv: &[String]) -> i32 {
                     Some(max_cpus),
                     a.run_timeout,
                     requested_max_mem_bytes(a.max_mem.as_deref()),
+                    a.slice.as_deref(),
                 ) {
                     return code;
                 }
@@ -7669,5 +7700,25 @@ mod tests {
         let c = Palette { enabled: false };
         assert!(help_text(&c).contains(" box "));
         assert_eq!(run(&["box".to_string(), "--help".to_string()]), 0);
+    }
+}
+
+#[cfg(test)]
+mod slice_option_tests {
+    use super::{parse_run_args, validate_slice_name};
+
+    #[test]
+    fn slice_option_parses_and_validates() {
+        let parsed = parse_run_args(&[
+            "--slice".into(),
+            "validate-slot01.slice".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.slice.as_deref(), Some("validate-slot01.slice"));
+        let inline = parse_run_args(&["--slice=validate-slot01.slice".into()]).unwrap();
+        assert_eq!(inline.slice.as_deref(), Some("validate-slot01.slice"));
+        assert!(parse_run_args(&["--slice".into(), "bad name!".into()]).is_err());
+        assert!(validate_slice_name("").is_err());
+        assert!(validate_slice_name("-leading").is_err());
     }
 }
