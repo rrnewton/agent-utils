@@ -4750,6 +4750,37 @@ def _act_discuss_summary(driver: Driver) -> None:
         driver.settle(200)
 
 
+def _act_discuss_timeline_layout(driver: Driver) -> None:
+    """`#1912`: summarize, ask one follow-up, summarize again — so the timeline
+    holds a collapsible Q/A pair and a superseded earlier summary, through the
+    real routes and the loopback model stub only."""
+    _act_discuss_summary(driver)
+    driver.page.fill("#discuss-followup", "What is the next step?")
+    driver.click("discuss-send")
+    driver.page.wait_for_function(
+        "() => document.querySelector('.discuss-qa') "
+        "&& document.querySelector('.discuss-qa').textContent.includes('What is the next step?')",
+        timeout=30_000,
+    )
+    if int(cast(float, driver.js("Number(document.getElementById('discuss-count').value)"))) == 0:
+        driver.page.fill("#discuss-count", "6")
+    driver.click("discuss-summarize")
+    driver.page.wait_for_function(
+        "() => document.querySelector('.discuss-old') "
+        "&& document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
+        timeout=30_000,
+    )
+    # Open the earlier summary headings-first; its sections stay folded.
+    driver.page.locator(".discuss-old > summary").first.click()
+    driver.page.wait_for_function(
+        "() => document.querySelector('.discuss-old').open "
+        "&& [...document.querySelectorAll('.discuss-old-body details')].every((d) => !d.open)",
+        timeout=5_000,
+    )
+    driver.js("document.getElementById('discuss-timeline-heading').scrollIntoView({block: 'start'})")
+    driver.settle(200)
+
+
 def _after_discuss_summary(driver: Driver) -> None:
     """Put the summarized messages back to unread, so the next profile's preview is real too."""
     if bool(driver.js("window.__visible('discuss-mark-unread')")):
@@ -7709,6 +7740,43 @@ SCENES: tuple[Scene, ...] = (
                 "the star toggle on the bottom bar is pressed and filled",
                 "document.getElementById('docs-starred-toggle').getAttribute('aria-pressed') === 'true' "
                 "&& document.getElementById('docs-starred-toggle').textContent === '★'",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="84-discuss-timeline-layout",
+        what="Discuss after a follow-up and a re-summarize: headed current summary, "
+             "collapsible Q/A pair and an earlier summary open headings-first",
+        act=_act_discuss_timeline_layout,
+        after=_after_discuss_summary,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            (
+                "the current summary stands under its heading and covers line",
+                "document.getElementById('discuss-current-heading').textContent.includes('Current summary') "
+                "&& /Covers \\d+ messages/.test(document.getElementById('discuss-current-covers').textContent)",
+            ),
+            (
+                "the timeline holds a Follow-up question pair",
+                "[...document.querySelectorAll('.discuss-qa > summary')].some((s) => s.textContent.includes('Follow-up question'))",
+            ),
+            (
+                "the earlier summary is open headings-first with its small expand all",
+                "document.querySelector('.discuss-old').open "
+                "&& [...document.querySelectorAll('.discuss-old-body details')].every((d) => !d.open) "
+                "&& [...document.querySelectorAll('.discuss-old-toggle')].some((b) => b.textContent === 'expand all')",
+            ),
+            (
+                "both centred chip pairs stand on the page",
+                "!!document.querySelector('.discuss-chip-bar--current') && !!document.querySelector('.discuss-chip-bar--timeline')",
+            ),
+            (
+                "Save draft is stacked over Send in the composer",
+                "(() => { const a = document.getElementById('discuss-save-draft').getBoundingClientRect(); "
+                "const b = document.getElementById('discuss-send').getBoundingClientRect(); "
+                "return a.bottom <= b.top + 1 && Math.abs(a.left - b.left) < 2; })()",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),

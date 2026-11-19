@@ -127,6 +127,7 @@ export interface ElementById {
   "discuss-close": HTMLButtonElement;
   "discuss-count": HTMLInputElement;
   "discuss-covers": HTMLParagraphElement;
+  "discuss-current-covers": HTMLSpanElement;
   "discuss-dock-toggle": HTMLButtonElement;
   "discuss-draft-discard": HTMLButtonElement;
   "discuss-draft-keep": HTMLButtonElement;

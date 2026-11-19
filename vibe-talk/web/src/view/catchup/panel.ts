@@ -1317,6 +1317,42 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
+  /** `#1912`: open or close every fold under `root`, nested folds included. */
+  function setDetailsDeep(root: HTMLElement, open: boolean): void {
+    for (const kid of Array.from(root.children as ArrayLike<HTMLElement>)) {
+      const el = kid as HTMLElement & { open?: boolean };
+      if (el.tagName === "DETAILS") el.open = open;
+      setDetailsDeep(el, open);
+    }
+  }
+
+  /** `#1912`: one low-key chip pair, centred, in the Save draft style. */
+  function makeChipBar(kind: string, onAll: (open: boolean) => void): HTMLDivElement {
+    const bar = document.createElement("div");
+    bar.className = `discuss-collapse-bar discuss-chip-bar discuss-chip-bar--${kind}`;
+    const expand = document.createElement("button");
+    expand.type = "button";
+    expand.className = "chip discuss-chip";
+    expand.textContent = "Expand all";
+    expand.addEventListener("click", () => onAll(true));
+    const collapse = document.createElement("button");
+    collapse.type = "button";
+    collapse.className = "chip discuss-chip";
+    collapse.textContent = "Collapse all";
+    collapse.addEventListener("click", () => onAll(false));
+    bar.append(expand, collapse);
+    return bar;
+  }
+
+  /** `#1912`: the current summary's headed covers line ("Covers N messages"). */
+  function drawCurrentCovers(answer: CatchupAnswer): void {
+    const line = maybe("discuss-current-covers");
+    if (line === null) return;
+    const count = answer.unread_ids.length > 0 ? answer.unread_ids.length : (answer.window?.count ?? 0);
+    line.textContent = count > 0 ? `Covers ${count} message${count === 1 ? "" : "s"}` : "";
+    line.hidden = count === 0;
+  }
+
   /**
    * Draw one answer (`discuss-markdown-render`): the server's sanitized render as
    * markup when it sent one, the shaped text as text otherwise. Model text reaches
@@ -1360,6 +1396,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (record !== null) lastFoldRecord = record;
     const box = deps.byId("discuss-answer");
     box.replaceChildren();
+    drawCurrentCovers(answer);
     if (answer.text_html !== "") {
       setClassWord(box, "discuss-answer--plain", false);
       insertSanitizedHtml(box, answer.text_html);
@@ -1373,23 +1410,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
             kid.addEventListener("toggle", () => keepFoldsNow(box));
           }
         }
-        const bar = document.createElement("div");
-        bar.className = "discuss-collapse-bar";
-        const expand = document.createElement("button");
-        expand.type = "button";
-        expand.textContent = "Expand all";
-        expand.addEventListener("click", () => {
-          setAllSections(box as never, true);
+        const bar = makeChipBar("current", (open) => {
+          setAllSections(box as never, open);
           keepFoldsNow(box);
         });
-        const collapse = document.createElement("button");
-        collapse.type = "button";
-        collapse.textContent = "Collapse all";
-        collapse.addEventListener("click", () => {
-          setAllSections(box as never, false);
-          keepFoldsNow(box);
-        });
-        bar.append(expand, collapse);
         box.prepend(bar);
       }
     } else {
@@ -1517,27 +1541,92 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       `${stale.new_unread} new unread · ${stale.marked_read} marked read since summary`;
   }
 
-  /** The timeline under a saved summary: turns, and superseded summaries collapsed. */
+  /**
+   * The timeline under the current summary (`#1912`): follow-up Q/A pairs and
+   * superseded summaries, interleaved in the order the record returns (its
+   * timestamp order). A pair collapses together under "Follow-up question
+   * <datetime>", so a long answer never reads as a summary; an earlier summary
+   * shares the current summary's folded style and opens headings-first, with a
+   * small expand-all to the right of its header for the second step.
+   */
   function drawTimeline(entries: DiscussEntryShape[], scope: DiscussScope): void {
     const box = deps.byId("discuss-timeline");
     box.replaceChildren();
-    for (const entry of entries) {
+    if (entries.length === 0) return;
+    const bar = makeChipBar("timeline", (open) => setDetailsDeep(box as unknown as HTMLElement, open));
+    box.appendChild(bar);
+    let at = 0;
+    while (at < entries.length) {
+      const entry = entries[at];
       if (entry.kind === "turn") {
-        const line = document.createElement("p");
-        line.className = entry.speaker === "you" ? "discuss-turn discuss-you" : "discuss-turn discuss-agent";
-        if (entry.text_html !== "") insertSanitizedHtml(line, entry.text_html);
-        else line.textContent = entry.text;
-        box.appendChild(line);
-      } else {
+        const pair: DiscussEntryShape[] = [entry];
+        at += 1;
+        if (entry.speaker === "you" && at < entries.length) {
+          const next = entries[at];
+          if (next.kind === "turn" && next.speaker !== "you") {
+            pair.push(next);
+            at += 1;
+          }
+        }
+        const first = pair[0];
+        const when = first.kind === "turn" ? first.at_ms : 0;
         const details = document.createElement("details");
-        details.className = "discuss-old";
+        details.className = "discuss-qa discuss-collapsible";
         const summary = document.createElement("summary");
-        const count = entry.answer.window?.unread_count ?? entry.answer.unread_ids.length;
-        summary.textContent = `Earlier summary · ${entry.created_ms > 0 ? summaryTimeLabel(entry.created_ms, nowMs()) : "—"} · ${count} unread`;
+        summary.className = "discuss-collapsible-head";
+        const label = document.createElement("span");
+        label.className = "discuss-collapsible-label";
+        label.textContent = `Follow-up question ${when > 0 ? summaryTimeLabel(when, nowMs()) : "—"}`;
+        summary.appendChild(label);
         details.appendChild(summary);
         const body = document.createElement("div");
-        if (entry.answer.text_html !== "") insertSanitizedHtml(body, entry.answer.text_html);
-        else body.textContent = entry.answer.text;
+        body.className = "discuss-qa-body";
+        for (const turn of pair) {
+          if (turn.kind !== "turn") continue;
+          const line = document.createElement("p");
+          line.className = turn.speaker === "you" ? "discuss-turn discuss-you" : "discuss-turn discuss-agent";
+          if (turn.text_html !== "") insertSanitizedHtml(line, turn.text_html);
+          else line.textContent = turn.text;
+          body.appendChild(line);
+        }
+        details.appendChild(body);
+        box.appendChild(details);
+      } else {
+        at += 1;
+        const details = document.createElement("details");
+        details.className = "discuss-old discuss-collapsible";
+        const summary = document.createElement("summary");
+        summary.className = "discuss-collapsible-head discuss-old-head";
+        const label = document.createElement("span");
+        label.className = "discuss-collapsible-label";
+        const count = entry.answer.window?.unread_count ?? entry.answer.unread_ids.length;
+        label.textContent = `Earlier summary · ${entry.created_ms > 0 ? summaryTimeLabel(entry.created_ms, nowMs()) : "—"} · ${count} unread`;
+        summary.appendChild(label);
+        const body = document.createElement("div");
+        body.className = "discuss-old-body";
+        const small = (words: string, open: boolean): HTMLButtonElement => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "chip discuss-chip discuss-old-toggle";
+          button.textContent = words;
+          button.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            details.open = true;
+            setDetailsDeep(body as unknown as HTMLElement, open);
+            if (!open) details.open = true;
+          });
+          return button;
+        };
+        summary.appendChild(small("expand all", true));
+        summary.appendChild(small("collapse all", false));
+        details.appendChild(summary);
+        if (entry.answer.text_html !== "") {
+          insertSanitizedHtml(body, entry.answer.text_html);
+          foldSectionsByHeading(body as never, (tag) => document.createElement(tag) as never);
+        } else {
+          body.textContent = entry.answer.text;
+        }
         details.appendChild(body);
         box.appendChild(details);
       }

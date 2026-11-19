@@ -101,7 +101,7 @@ const IDS = [
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
-  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline",
+  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline", "discuss-current-covers",
   "discuss-followup", "discuss-send", "discuss-uncovered", "discuss-uncovered-go", "discuss-uncovered-text",
   "discuss-actions", "discuss-resize", "discuss-head", "discuss-title",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
@@ -1265,8 +1265,10 @@ test("catchup: reopening draws the saved record and asks nothing", async () => {
     assert.equal(fx.els["discuss-stale"].hidden, false, "the staleness banner did not show");
     assert.equal(fx.els["discuss-stale-text"].textContent, "3 new unread · 1 marked read since summary");
     const timeline = fx.els["discuss-timeline"].children;
-    assert.equal(timeline.length, 2, "the timeline did not draw");
-    assert.equal(timeline[1].textContent, "and the deploy?");
+    assert.equal(timeline.length, 3, "the timeline did not draw its chip bar, old summary and Q/A pair");
+    assert.match(timeline[2].children[0].textContent, /Follow-up question/, "the turn did not draw as a collapsible pair");
+    assert.equal(timeline[2].children[1].textContent, "and the deploy?");
+    assert.equal(fx.els["discuss-current-covers"].textContent, "Covers 2 messages");
     // [Update] is the incremental delta (`#1388` landing 2): one update
     // call, no full re-summarize POST.
     click(fx.els["discuss-update"]);
@@ -1332,8 +1334,97 @@ test("catchup: timeline and saved labels date a previous day's summary (#1787)",
     await flush();
     assert.match(fx.els["discuss-status"].textContent, /Saved summary · Sun \d{1,2}:\d{2}\s?(AM|PM)/);
     const timeline = fx.els["discuss-timeline"].children;
-    assert.match(timeline[0].children[0].textContent, /Earlier summary · Sun \d{1,2}:\d{2}\s?(AM|PM) · 1 unread/);
+    assert.match(timeline[1].children[0].textContent, /Earlier summary · Sun \d{1,2}:\d{2}\s?(AM|PM) · 1 unread/);
   } finally { fx.restore(); }
+});
+
+test("catchup: timeline pairs follow-ups, earlier summaries open headings-first, both chip pairs act (#1912)", async () => {
+  const HTML = "<h2>Old Alpha</h2><p>old a</p><h2>Old Beta</h2><p>old b</p>";
+  const scope = { channelId: "chan-1", threadId: null, view: "flat", label: "Channel chan-1" };
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text), children: [] }),
+    createElement: (tag) => {
+      if (tag !== "template") return foldEl(tag);
+      const template = { _html: "", content: null };
+      Object.defineProperty(template, "innerHTML", {
+        set(value) {
+          template._html = String(value);
+          const nodes = [];
+          for (const match of template._html.matchAll(/<(h[1-6]|p)>([^<]*)<\/\1>/g)) nodes.push(foldEl(match[1], match[2]));
+          template.content = { childNodes: nodes };
+        },
+        get() { return template._html; },
+      });
+      return template;
+    },
+  };
+  try {
+    const els = {};
+    for (const id of IDS) els[id] = foldEl(id.endsWith("open") || id.endsWith("close") || id.includes("mark") ? "button" : "div");
+    els["discuss-panel"].hidden = true;
+    const panel = createDiscussPanel({
+      byId: (id) => {
+        const found = els[id];
+        if (!found) throw new Error(`no element ${id}`);
+        return found;
+      },
+      catchupPost: () => Promise.resolve(answer()),
+      catchupPreview: () => Promise.resolve(preview()),
+      catchupRecord: () => Promise.resolve({
+        exists: true,
+        current_summary: {
+          window: { count: 12, unread_count: 2 }, covered_ids: ["m1", "m2"], markable_ids: ["m1", "m2"],
+          cited_ids: [], footer_links: [], text: "saved point", text_html: "", unknown_terms: [], stamp: null, created_ms: T2,
+        },
+        timeline: [
+          { kind: "summary", summary: { view: "flat", window: { count: 9, unread_count: 1 }, covered_ids: ["m0"], markable_ids: ["m0"], footer_links: [], text: "older point", text_html: HTML, unknown_terms: [], stamp: null, created_ms: T1 } },
+          { kind: "turn", turn: { speaker: "you", text: "and the deploy?", text_html: "", at_ms: T2 } },
+          { kind: "turn", turn: { speaker: "agent", text: "It shipped.", text_html: "", at_ms: T2 } },
+        ],
+        staleness: null,
+      }),
+      catchupFollowup: () => Promise.resolve({}),
+      serviceName: () => "discord",
+      onJump: () => {},
+      dismissMessages: async () => {},
+      restoreMessages: async () => {},
+    });
+    panel.mount();
+    panel.openWith(scope);
+    await flush();
+    await flush();
+    assert.equal(els["discuss-current-covers"].textContent, "Covers 2 messages");
+    const timeline = els["discuss-timeline"].children;
+    // Chip bar, then the earlier summary, then ONE collapsible Q/A pair.
+    assert.equal(timeline.length, 3);
+    assert.ok(String(timeline[0].className).includes("discuss-chip-bar--timeline"), "timeline chip pair missing");
+    const old = timeline[1];
+    assert.match(old.children[0].children[0].textContent, /Earlier summary/);
+    const oldBody = old.children[1];
+    const oldFolds = () => oldBody.children.filter((kid) => kid.tagName === "DETAILS");
+    assert.equal(oldFolds().length, 2, "earlier summary did not fold by heading");
+    assert.deepEqual(oldFolds().map((fold) => fold.open), [false, false], "earlier summary did not open headings-first");
+    const smallExpand = old.children[0].children.find((kid) => kid.textContent === "expand all");
+    assert.ok(smallExpand, "small expand all missing on the earlier summary header");
+    click(smallExpand);
+    assert.deepEqual(oldFolds().map((fold) => fold.open), [true, true], "small expand all did not expand the earlier summary");
+    const pair = timeline[2];
+    assert.match(pair.children[0].textContent, /Follow-up question/);
+    assert.equal(pair.children[1].children.length, 2, "question and answer do not collapse together");
+    assert.equal(pair.children[1].children[0].textContent, "and the deploy?");
+    assert.equal(pair.children[1].children[1].textContent, "It shipped.");
+    // The timeline chip pair opens and closes every timeline collapsible at once.
+    click(timeline[0].children[0]);
+    assert.equal(pair.open, true, "timeline Expand all did not open the pair");
+    assert.equal(old.open, true, "timeline Expand all did not open the earlier summary");
+    click(timeline[0].children[1]);
+    assert.equal(pair.open, false, "timeline Collapse all did not close the pair");
+    assert.equal(old.open, false, "timeline Collapse all did not close the earlier summary");
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+  }
 });
 
 test("catchup: a follow-up sends from the composer and joins the timeline", async () => {
@@ -1962,7 +2053,7 @@ test("catchup folds: open sections survive close/reopen and a reload; a new summ
         keepFolds: (state) => { stored.value = state; stored.keeps.push(state); },
       });
       const folds = () => els["discuss-answer"].children.filter((kid) => kid.tagName === "DETAILS");
-      const bar = () => els["discuss-answer"].children.find((kid) => kid.className === "discuss-collapse-bar");
+      const bar = () => els["discuss-answer"].children.find((kid) => String(kid.className).includes("discuss-collapse-bar"));
       return { els, panel, folds, bar };
     };
 

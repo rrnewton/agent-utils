@@ -510,13 +510,27 @@
             </div>
             <p id="discuss-scope"></p>
             <p id="discuss-status" role="status"></p>
-            <div id="discuss-answer"></div>
-            <details id="discuss-terms" hidden>
-              <summary id="discuss-terms-summary"></summary>
-              <ul id="discuss-terms-list"></ul>
-            </details>
-            <p id="discuss-stale" hidden><span id="discuss-stale-text"></span> <button id="discuss-update" type="button">Update</button></p>
-            <div id="discuss-timeline"></div>
+            <!-- `#1912 vibe-talk-discuss-summary-timeline-layout`: the current
+                 summary stands under its own headed section, then Terms, then
+                 the Timeline under its own heading, with separators between. -->
+            <section class="discuss-section discuss-current-section" aria-labelledby="discuss-current-heading">
+              <hr class="discuss-sep">
+              <div class="discuss-section-head">
+                <h2 id="discuss-current-heading" class="discuss-section-title">Current summary</h2>
+                <span id="discuss-current-covers" class="discuss-current-covers" hidden></span>
+              </div>
+              <div id="discuss-answer"></div>
+              <details id="discuss-terms" hidden>
+                <summary id="discuss-terms-summary"></summary>
+                <ul id="discuss-terms-list"></ul>
+              </details>
+              <p id="discuss-stale" hidden><span id="discuss-stale-text"></span> <button id="discuss-update" type="button">Update</button></p>
+            </section>
+            <section class="discuss-section discuss-timeline-section" aria-labelledby="discuss-timeline-heading">
+              <hr class="discuss-sep">
+              <h2 id="discuss-timeline-heading" class="discuss-section-title">Timeline</h2>
+              <div id="discuss-timeline"></div>
+            </section>
             <div id="discuss-draft-offer" class="draft-sync-offer" role="group" aria-labelledby="discuss-draft-offer-text" hidden>
               <p id="discuss-draft-offer-text"></p>
               <button id="discuss-draft-use" type="button">Use draft</button>
@@ -526,8 +540,10 @@
             <!-- `discuss-followup-composer`: the main composer's box and keys. -->
             <div class="discuss-compose">
               <textarea id="discuss-followup" enterkeyhint="send" rows="2" data-lpignore="true" data-1p-ignore="true" data-form-type="other" autocomplete="off" placeholder="Ask about this…" aria-label="Ask a follow-up"></textarea>
-              <button id="discuss-save-draft" class="chip" type="button">Save draft</button>
-              <button id="discuss-send" type="button">Send</button>
+              <span class="discuss-compose-buttons">
+                <button id="discuss-save-draft" class="chip" type="button">Save draft</button>
+                <button id="discuss-send" type="button">Send</button>
+              </span>
             </div>
             <p id="discuss-draft-note" class="hint" role="status" aria-live="polite" hidden></p>
             <div id="discuss-footer" hidden>

@@ -408,16 +408,145 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
 .discuss-you {
   color: var(--muted);
+  font-weight: 600;
+}
+
+/* `#1912 vibe-talk-discuss-summary-timeline-layout`: headed sections with
+ * separators, one shared collapsible style, and low-key centred chips. */
+.discuss-sep {
+  border: 0;
+  border-top: 1px solid var(--edge);
+  margin: 14px 0 8px;
+}
+
+.discuss-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.discuss-section-title {
+  font-size: 1rem;
+  font-weight: 700;
+  margin: 4px 0 6px;
+}
+
+.discuss-current-covers {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.discuss-collapsible {
+  margin-top: 10px;
+}
+
+.discuss-collapsible > summary,
+.discuss-old > summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  box-sizing: border-box;
+  min-height: 2.75rem;
+  padding: 0.55rem 0;
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--ink);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.discuss-collapsible > summary::-webkit-details-marker {
+  display: none;
+}
+
+.discuss-collapsible > summary::before {
+  content: "▸";
+  flex: 0 0 auto;
+  margin-top: 0.12rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.2;
+}
+
+.discuss-collapsible[open] > summary::before {
+  content: "▾";
+}
+
+.discuss-collapsible-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.discuss-collapsible[open],
+#discuss-answer details[open] {
+  border-top: 1px solid var(--edge);
+  border-bottom: 1px solid var(--edge);
 }
 
 .discuss-old {
   margin-top: 10px;
-  color: var(--muted);
   font-size: 0.9rem;
 }
 
-.discuss-old summary {
+.discuss-old-body h2,
+.discuss-old-body h3 {
+  font-size: 0.95rem;
+  margin: 10px 0 4px;
+}
+
+.discuss-old-body details > summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  box-sizing: border-box;
+  min-height: 2.75rem;
+  padding: 0.55rem 0;
   cursor: pointer;
+  list-style: none;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.discuss-old-body details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.discuss-old-body details > summary::before {
+  content: "▸";
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.discuss-old-body details[open] > summary::before {
+  content: "▾";
+}
+
+.discuss-old-body details[open] {
+  border-top: 1px solid var(--edge);
+  border-bottom: 1px solid var(--edge);
+}
+
+.discuss-old-toggle {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 0.72rem;
+  padding: 0.15rem 0.45rem;
+}
+
+.discuss-old-toggle + .discuss-old-toggle {
+  margin-left: 4px;
+}
+
+.discuss-old:not([open]) .discuss-old-toggle {
+  display: none;
+}
+
+.discuss-qa-body {
+  padding-bottom: 8px;
 }
 
 /* The follow-up composer (`discuss-followup-composer`). */
@@ -779,6 +908,30 @@ stay its owner's (#1524). The pane itself already ends above the
 
 .discuss-collapse-bar { display: flex; gap: 8px; margin: 0 0 6px; }
 .discuss-collapse-bar button { font: inherit; }
+
+/* `#1912`: the Expand/Collapse pairs are small, low-key, centred chips. */
+.discuss-chip-bar {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+
+.discuss-chip {
+  font-size: 0.72rem;
+  padding: 0.18rem 0.5rem;
+}
+
+.discuss-compose-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.discuss-compose-buttons button {
+  width: 100%;
+}
 
 /* `#1525 fold-marker-on-heading-line` (owner request 054): the fold's
  * disclosure marker shares the heading's line. `foldSectionsByHeading`
