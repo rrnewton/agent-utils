@@ -5621,8 +5621,9 @@ SCENES: tuple[Scene, ...] = (
                 # "Over the list" is over the list's place: its box less its top margin, which on a
                 # narrow phone is the room under the author filter hanging below the bar, where the
                 # list starts (`#251 author-filter`).
-                "field, count, Links, Pinned and glass are one row, in that order, on the bar over "
-                "the list",
+                "field, count, Links, Labels and glass in order on the bar over the list: one "
+                "row on a desk, and on a phone the field and count on their own first row with "
+                "the toggles below (`#1853`)",
                 "(() => { const f = document.getElementById('search-field').getBoundingClientRect(); "
                 "const c = document.getElementById('search-count').getBoundingClientRect(); "
                 "const l = document.getElementById('links-filter').getBoundingClientRect(); "
@@ -5632,6 +5633,11 @@ SCENES: tuple[Scene, ...] = (
                 "const area = document.getElementById('scroll-area'); "
                 "const s = area.getBoundingClientRect(); "
                 "const head = s.top - (parseFloat(getComputedStyle(area).marginTop) || 0); "
+                "if (window.innerWidth <= 480) return f.width > 240 && c.width > 0 && g.width > 0 "
+                "&& l.width >= 44 && p.width >= 44 && f.right <= c.left + 1 "
+                "&& l.top >= f.bottom - 1 && l.left < p.left && p.right <= g.left + 1 && l.top < g.bottom && g.top < l.bottom "
+                "&& g.right <= bar.right + 1 && bar.top >= head - 1 && bar.right <= s.right + 1 "
+                "&& !window.__visible('topbar') && f.top < c.bottom && c.top < f.bottom; "
                 "return f.width > 80 && c.width > 0 && g.width > 0 && l.width >= 44 && p.width >= 44 "
                 "&& f.right <= c.left + 1 && c.right <= l.left + 1 && l.right <= p.left + 1 "
                 "&& p.right <= g.left + 1 && g.right <= bar.right + 1 "
