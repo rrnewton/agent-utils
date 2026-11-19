@@ -24,7 +24,9 @@
 //! The newest prompt is a different matter where Up on an empty composer recalls it, as it does
 //! in Claude Code and Codex, which never take back a prompt they showed as taken. There
 //! ([`Vouching::Unproven`]) one prompt vouches for a draft only when agentctl quarantined it in
-//! `failed/`, not proved delivered (a prompt still staged when its key was given up on, say); a
+//! `failed/`, not proved delivered (a prompt still staged when its key was given up on, say), or
+//! left it stranded, not proved delivered, in its inbox or as possibly submitted (#1905), and a
+//! stranded prompt is searched beyond the latest few deliveries for the same reason; a
 //! run of two or more, which the history keys do not recall, may also be prompts it delivered,
 //! as Codex moves the inputs it held for a turn back into the composer when the turn is
 //! interrupted. Muse ([`Vouching::Recent`]) can take a steer back after it showed it, so any of
@@ -474,13 +476,23 @@ pub(crate) fn find(
     } else {
         Vec::new()
     };
+    // Stranded records are searched beyond the latest-deliveries
+    // window too (#1905): on a busy lane dozens of deliveries can
+    // follow the typing of a prompt that is only now back in the
+    // composer, and it is exactly the not-proved-delivered ones that
+    // can be sitting there.
+    let stranded_records: Vec<Record> = records
+        .iter()
+        .filter(|record| crate::paste_backstop::stranded_marked(&record.2))
+        .cloned()
+        .collect();
     let mut times: Vec<f64> = records.iter().map(|record| record.0).collect();
     times.dedup();
     let Some(&oldest) = times.get(deliveries - 1).or(times.last()) else {
         return digest_without_record(queue, draft);
     };
     records.retain(|record| record.0 >= oldest);
-    for record in &records {
+    for record in records.iter().chain(&stranded_records) {
         if record_matches(record, draft, vouching) {
             return Some(typed_prompt(&record.1, &record.2, Vec::new()));
         }
@@ -556,6 +568,11 @@ fn record_matches(record: &Record, draft: &Draft, vouching: Vouching) -> bool {
             .parent()
             .and_then(Path::file_name)
             .is_some_and(|phase| phase == "failed");
+    // A record a pass left stranded is not proved delivered either
+    // (#1905): agentctl gave up on its key, in its inbox or filed as
+    // possibly submitted, so it vouches like a quarantined one — a
+    // history recall cannot produce a prompt the agent never took.
+    let stranded = crate::paste_backstop::stranded_marked(document);
     typed_texts(document).into_iter().any(|text| {
         if !framed(text) && !digest {
             return false;
@@ -569,7 +586,8 @@ fn record_matches(record: &Record, draft: &Draft, vouching: Vouching) -> bool {
             // prompt), so a fragment vouches either way.
             Draft::Text(rows) => {
                 fragment_matches(rows, text)
-                    || (text_matches(rows, text) && (vouching == Vouching::Recent || quarantined))
+                    || (text_matches(rows, text)
+                        && (vouching == Vouching::Recent || quarantined || stranded))
             }
             // A numbered paste placeholder matches a record holding
             // that exact label (#808), or a recent record holding no
@@ -580,7 +598,7 @@ fn record_matches(record: &Record, draft: &Draft, vouching: Vouching) -> bool {
             Draft::PastedLines(_) => placeholder_matches_q(draft, text, document, quarantined),
             _ => {
                 placeholder_matches(draft, text, document)
-                    && (vouching == Vouching::Recent || quarantined)
+                    && (vouching == Vouching::Recent || quarantined || stranded)
             }
         }
     })

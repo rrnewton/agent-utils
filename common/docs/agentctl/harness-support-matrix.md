@@ -228,7 +228,12 @@ in `rs/agentctl/src/stale_draft.rs`.
   delivery-path recovery and the in-lock stage wait alike, and the
   Python edition's same-prompt region flush matches it too; foreign
   text, which cannot contain that run of a delivered prompt, still
-  gets no key.
+  gets no key. Since #1905 the match set times a record a pass left
+  stranded (`stranded_at`, possibly submitted, or a lost paste) by
+  its stranding rather than its typing and never evicts it for newer
+  deliveries, and a stranded record vouches on the composer-shaped
+  path beyond the latest few deliveries — whatever sender typed it,
+  as long as the recipient's own queue records it.
 
 This is the row the owner did not know diverged: the backstop grew up
 Claude-first, reached Muse in #1546, and an unrecognised TUI still gets

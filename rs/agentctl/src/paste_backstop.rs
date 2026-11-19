@@ -110,6 +110,9 @@ pub struct DeliveredPrompt {
     pub text: String,
     /// When it was typed, in Unix seconds.
     pub typed_at: f64,
+    /// Whether a pass left it stranded, not proved delivered: it may sit
+    /// in a composer long after newer deliveries were typed (#1905).
+    pub stranded: bool,
 }
 
 /// Whether `text` is one agentctl framed: a sender header, one of its own
@@ -126,16 +129,41 @@ fn framed(text: &str) -> bool {
             })
 }
 
+/// Whether a queue record says a pass left its prompt stranded, not
+/// proved delivered (#1905): the prompt may have been typed long before
+/// it was stranded, and dozens of newer deliveries may follow it, yet
+/// it can only now be sitting in the composer. Records in `processed/`
+/// as possibly submitted and in `failed/` as a lost paste are the same
+/// shape as one still in its inbox: agentctl gave up on the key, so the
+/// text is treated as typed until a recovery notes it.
+pub(crate) fn stranded_marked(document: &serde_json::Map<String, Value>) -> bool {
+    document
+        .get("stranded_at")
+        .is_some_and(|value| !value.is_null())
+        || document.get("possibly_submitted") == Some(&Value::Bool(true))
+        || ["delivery_error", "error"].iter().any(|field| {
+            document
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|error| error.contains("late_paste_lost"))
+        })
+}
+
 /// The prompts agentctl typed for the agent whose queue is at `queue`,
-/// newest first, typed within `lookback` of `now` (Unix seconds). Typed
-/// lanes are `processed/` and `failed/` (typed at `inflight_at`); a pending
-/// prompt a pass left stranded (its record carries `stranded_at`) was typed
-/// too and may be drawn late. A prompt quarantined as typed into the wrong
-/// program never counts.
+/// newest first, timed within `lookback` of `now` (Unix seconds). Typed
+/// lanes are `processed/` and `failed/`; a pending prompt a pass left
+/// stranded was typed too and may be drawn late. The sender named in a
+/// prompt's header never filters this set: the recipient's queue is the
+/// attribution (#1905). A prompt timed by its stranding (see
+/// [`stranded_marked`]) counts from that later moment and is never
+/// evicted by the newest-candidates cap below; every other prompt is
+/// timed by when it was typed (`inflight_at`) and the cap keeps the
+/// match set recent on a busy lane. A prompt quarantined as typed into
+/// the wrong program never counts.
 pub fn delivered_prompts(queue: &Path, now: f64, lookback: Duration) -> Vec<DeliveredPrompt> {
     let oldest = now - lookback.as_secs_f64();
     let mut found: Vec<DeliveredPrompt> = Vec::new();
-    for (phase, stranded) in [
+    for (phase, pending) in [
         ("processed", false),
         ("failed", false),
         ("inbox", true),
@@ -155,13 +183,21 @@ pub fn delivered_prompts(queue: &Path, now: f64, lookback: Duration) -> Vec<Deli
             if document.get("probable_misroute") == Some(&Value::Bool(true)) {
                 continue;
             }
-            let typed_at = if stranded {
-                if document.get("stranded_at").is_none_or(Value::is_null) {
-                    continue;
-                }
-                document.get("stranded_at").and_then(Value::as_f64)
-            } else {
-                document.get("inflight_at").and_then(Value::as_f64)
+            let stranded = pending || stranded_marked(&document);
+            let stranded_at = document.get("stranded_at").and_then(Value::as_f64);
+            if pending && stranded_at.is_none() {
+                continue;
+            }
+            // A stranded prompt is timed by when it was left, which can
+            // be long after it was typed (#1905); others by the typing.
+            let typed_at = match (
+                document.get("inflight_at").and_then(Value::as_f64),
+                stranded_at,
+            ) {
+                (Some(typed), Some(left)) if stranded => Some(typed.max(left)),
+                (Some(typed), _) => Some(typed),
+                (None, Some(left)) => Some(left),
+                (None, None) => None,
             };
             let Some(typed_at) = typed_at.filter(|at| *at >= oldest && *at <= now + 1.0) else {
                 continue;
@@ -180,12 +216,23 @@ pub fn delivered_prompts(queue: &Path, now: f64, lookback: Duration) -> Vec<Deli
                 id: id.to_owned(),
                 text: text.to_owned(),
                 typed_at,
+                stranded,
             });
         }
     }
     found.sort_by(|left, right| right.typed_at.total_cmp(&left.typed_at));
     found.dedup_by(|next, kept| next.id == kept.id);
-    found.truncate(20);
+    // The cap bounds the unmarked set (delivered prompts, whose echoes
+    // must stay recent to be safe to compare); stranded prompts keep
+    // their place however many deliveries followed them (#1905).
+    let mut unmarked = 0usize;
+    found.retain(|prompt| {
+        if prompt.stranded {
+            return true;
+        }
+        unmarked += 1;
+        unmarked <= 20
+    });
     found
 }
 
@@ -582,6 +629,76 @@ mod tests {
         assert_eq!(found[0].id, "lane");
         // Outside the lookback it is no longer a candidate.
         assert!(delivered_prompts(&queue, 9_999.0, Duration::from_secs(3600)).is_empty());
+        let _ = std::fs::remove_dir_all(&queue);
+    }
+
+    #[test]
+    fn delivered_prompts_keeps_stranded_records_beyond_the_newest_cap() {
+        // #1905: a prompt typed long ago but stranded recently — filed
+        // in processed/ as possibly submitted, or in failed/ as a lost
+        // paste — stays a candidate, timed by its stranding, however
+        // many newer deliveries a busy lane has had since.
+        use std::os::unix::fs::DirBuilderExt;
+        let queue =
+            std::env::temp_dir().join(format!("agentctl-backstop-stranded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue);
+        for phase in ["processed", "failed"] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(queue.join(phase))
+                .unwrap();
+        }
+        let write = |phase: &str, name: &str, document: serde_json::Value| {
+            crate::agent::atomic_json(&queue.join(phase).join(name), &document).unwrap();
+        };
+        write(
+            "processed",
+            "old-stranded.json",
+            serde_json::json!({"id": "old-stranded", "text": PROMPT,
+                               "inflight_at": 100.0, "stranded_at": 3_900.0,
+                               "possibly_submitted": true}),
+        );
+        write(
+            "failed",
+            "lost.json",
+            serde_json::json!({"id": "lost", "text": PROMPT,
+                               "inflight_at": 100.0, "stranded_at": 3_800.0,
+                               "possibly_submitted": true,
+                               "delivery_error": "late_paste_lost: the paste never showed"}),
+        );
+        write(
+            "processed",
+            "old-delivered.json",
+            serde_json::json!({"id": "old-delivered", "text": PROMPT,
+                               "inflight_at": 100.0}),
+        );
+        for index in 0..25 {
+            write(
+                "processed",
+                &format!("new-{index}.json"),
+                serde_json::json!({"id": format!("new-{index}"), "text": PROMPT,
+                                   "inflight_at": 3_900.0 - index as f64}),
+            );
+        }
+        let found = delivered_prompts(&queue, 4_000.0, Duration::from_secs(3600));
+        let ids: Vec<&str> = found.iter().map(|prompt| prompt.id.as_str()).collect();
+        assert!(ids.contains(&"old-stranded"), "{ids:?}");
+        assert!(ids.contains(&"lost"), "{ids:?}");
+        assert!(!ids.contains(&"old-delivered"), "{ids:?}");
+        assert!(
+            found
+                .iter()
+                .find(|prompt| prompt.id == "old-stranded")
+                .is_some_and(|prompt| prompt.stranded && prompt.typed_at == 3_900.0),
+            "{found:?}"
+        );
+        // Once the stranding itself is outside the lookback, it goes.
+        assert!(
+            delivered_prompts(&queue, 99_999.0, Duration::from_secs(3600))
+                .iter()
+                .all(|prompt| prompt.id != "old-stranded")
+        );
         let _ = std::fs::remove_dir_all(&queue);
     }
 }

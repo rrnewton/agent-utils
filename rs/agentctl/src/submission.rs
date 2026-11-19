@@ -6622,6 +6622,99 @@ mod tests {
         }
     }
 
+    /// Record `text` in `processed/` as a pass left it after stranding:
+    /// typed long ago, stranded just now, possibly submitted (#1905).
+    fn processed_stranded_record(queue: &TypedQueue, id: &str, text: &str) {
+        let now = unix_seconds();
+        crate::agent::atomic_json(
+            &queue.0.join(format!("processed/{id}.json")),
+            &serde_json::json!({
+                "id": id,
+                "text": text,
+                "typed_as": text,
+                "delivery_state": "queued",
+                "possibly_submitted": true,
+                "inflight_at": now - 3.0 * 3600.0,
+                "stranded_at": now,
+            }),
+        )
+        .unwrap();
+    }
+
+    /// #1905: a stranded prompt from another sender, filed in
+    /// `processed/` as possibly submitted with an old typing time, is
+    /// still ours at 30, 42 and 80 columns: one Enter, never a retype,
+    /// and its processed record is noted recovered.
+    #[test]
+    fn a_processed_stranded_prompt_from_another_sender_is_submitted_at_narrow_widths() {
+        for width in [30usize, 42, 80] {
+            let lane = narrow_prompt().replace("lane-a", "lane-b");
+            let queue = TypedQueue::new(&format!("region-processed-{width}"));
+            processed_stranded_record(&queue, "lane", &lane);
+            let screen = RegionScreen::stuck_screen(
+                tail_only_screen(&lane, width, 5),
+                submitted_screen(&lane),
+            );
+            let clock = Clock {
+                queue: Some(queue.0.clone()),
+                ..Clock::default()
+            };
+            let evidence = recover_typed_draft(&screen, "w1:p1", "claude", &queue.0, &clock)
+                .unwrap()
+                .unwrap_or_else(|| panic!("width {width}: the stranded draft is ours"));
+            assert!(
+                evidence.contains("lower region"),
+                "width {width}: {evidence}"
+            );
+            assert_eq!(screen.keys(), ["Enter"], "width {width}");
+            assert!(screen.pastes().is_empty(), "width {width}: never retyped");
+            let record: serde_json::Value =
+                crate::agent::read_private_json(&queue.0.join("processed/lane.json")).unwrap();
+            assert!(
+                record["draft_recovered_at"].is_number(),
+                "width {width}: {record}"
+            );
+        }
+    }
+
+    /// #1905: the same stranded record, drawn where a composer reader
+    /// parses the screen, vouches beyond the latest five deliveries:
+    /// the next delivery submits it first, then its own, each once.
+    #[test]
+    fn a_processed_stranded_prompt_beyond_the_latest_five_is_submitted_by_the_next_drain() {
+        let lane = narrow_prompt().replace("lane-a", "lane-b");
+        let queue = TypedQueue::new("processed-stranded-parseable");
+        // Six newer proved deliveries evict it from the latest five.
+        for index in 0..6 {
+            queue.typed(
+                &format!("new-{index}"),
+                &format!("{LANE}\nnewer delivery {index} already proved"),
+                2.0 + index as f64,
+            );
+        }
+        processed_stranded_record(&queue, "lane", &lane);
+        // The processed record's typing time is its stranding setup's,
+        // not the old queued time above: keep it the oldest delivery.
+        let path = queue.0.join("processed/lane.json");
+        let mut document = crate::agent::read_private_json(&path).unwrap();
+        document["inflight_at"] = serde_json::json!(1.0);
+        crate::agent::atomic_json(&path, &document).unwrap();
+
+        let screen = FakeScreen::new("claude", false);
+        screen.leave_draft(&lane);
+        let owner = format!("{OWNER}\nstatus?");
+        receipt(submit_following(&screen, &queue, &owner, Some("Enter")));
+        assert_eq!(taken(&screen), [lane.clone(), owner]);
+        assert_eq!(screen.state().keys, ["Enter", "Enter"]);
+        assert_eq!(
+            screen.state().pastes.len(),
+            1,
+            "the owner prompt typed once"
+        );
+        let record: serde_json::Value = crate::agent::read_private_json(&path).unwrap();
+        assert!(record["draft_recovered_at"].is_number(), "{record}");
+    }
+
     /// #1897: a foreign draft that shows only its tail at the same
     /// widths gets no key at all.
     #[test]
