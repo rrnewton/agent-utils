@@ -704,6 +704,7 @@ mod tests {
                 &[],
                 None,
                 crate::render::Names::TextOnly,
+                None,
                 |_, _| (),
             )
             .0

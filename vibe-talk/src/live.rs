@@ -2153,13 +2153,14 @@ fn judge(
                 .record(channel, &message.author_id, &message.id, tag);
         }
         let confirmed = |tag: &str| app.headings.confirmed(channel, &message.author_id, tag);
-        (message.content_html, message.heading) = crate::render::headed_body(
+        (message.content_html, message.heading) = crate::render::headed_body_in(
             &message.content,
             markup,
             message.author_is_bot,
             &confirmed,
             &message.mentions,
             profiles,
+            Some(message.channel_id.as_str()),
         );
         // `#408 copy-upstream-link`: as `ops::stamp` forms it on a read, so a message that
         // arrived live offers its link like one a read brought — and never the one an adapter

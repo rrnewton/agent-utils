@@ -323,12 +323,14 @@ impl SearchText {
     /// so a bridge-expanded short reference draws as one short-labelled link,
     /// its thread or message label the emoji and number (`#1713
     /// vibe-talk-short-ref-link-double-render`).
+    /// `render-11`: a short reference resolves in the channel it is drawn
+    /// in, falling back to a unique number only (`#1915`).
     /// `render-10`: a `:msg:` reference draws as a message link, a resolved
     /// thread reference may carry its filed slug (`🧵NNN/slug`), short links
     /// carry the `Opens here` title, and only bridge-canonical numbers are
     /// references (`#1796 vibe-talk-bare-short-refs-render`); the slug is a
     /// page label, never indexed, as a PR name is (`render-5`).
-    pub const VERSION: &'static str = "render-10";
+    pub const VERSION: &'static str = "render-11";
 
     /// The rendering for every provider `config` names, each with its own markup.
     #[must_use]
@@ -358,6 +360,19 @@ impl SearchText {
         bot: bool,
         mentions: &[MentionName],
     ) -> crate::cache::Rendered {
+        Self::drawn_named_in(text, markup, bot, mentions, None)
+    }
+
+    /// [`SearchText::drawn_named`] drawn in `channel` (the message's own),
+    /// so its short references resolve per channel (`#1915`).
+    #[must_use]
+    pub fn drawn_named_in(
+        text: &str,
+        markup: Markup,
+        bot: bool,
+        mentions: &[MentionName],
+        channel: Option<&str>,
+    ) -> crate::cache::Rendered {
         let (html, _heading) = headed_body_by(
             render_named_for_index,
             text,
@@ -366,6 +381,7 @@ impl SearchText {
             &|_| false,
             mentions,
             None,
+            channel,
         );
         if html.is_empty() {
             return crate::cache::Rendered {
@@ -398,11 +414,12 @@ impl crate::cache::SearchTextSource for SearchText {
 
     fn rendered(&self, provider_key: &str, message: &Message) -> crate::cache::Rendered {
         let markup = self.markups.get(provider_key).copied().unwrap_or_default();
-        Self::drawn_named(
+        Self::drawn_named_in(
             &message.content,
             markup,
             message.author_is_bot,
             &message.mentions,
+            Some(message.channel_id.as_str()),
         )
     }
 }
@@ -628,13 +645,14 @@ fn fill_impl(
     let profiles = profile_base_for(config, channel);
     for message in messages {
         let confirmed = |tag: &str| headings.confirmed(&channel.id, &message.author_id, tag);
-        (message.content_html, message.heading) = headed_body(
+        (message.content_html, message.heading) = headed_body_in(
             &message.content,
             markup,
             message.author_is_bot,
             &confirmed,
             &message.mentions,
             profiles.as_deref(),
+            Some(channel.id.as_str()),
         );
     }
 }
@@ -702,13 +720,14 @@ pub fn fill_pins<'p>(
         let confirmed = |tag: &str| headings.confirmed(&channel.id, &snapshot.author_id, tag);
         // A pin keeps the text it was pinned with and not who its mentions named: its chips are
         // drawn by id, and linked like a read's are.
-        (pin.content_html, pin.heading) = headed_body(
+        (pin.content_html, pin.heading) = headed_body_in(
             &text,
             markup,
             snapshot.author_is_bot,
             &confirmed,
             &[],
             profile_base_for(config, channel).as_deref(),
+            Some(channel.id.as_str()),
         );
     }
 }
@@ -740,21 +759,41 @@ pub fn headed_body(
     mentions: &[MentionName],
     profiles: Option<&str>,
 ) -> (String, Option<crate::model::Heading>) {
+    headed_body_in(text, markup, bot, confirmed, mentions, profiles, None)
+}
+
+/// [`headed_body`] drawn in `channel` (the message's own channel), so its
+/// short references resolve per channel (`#1915
+/// vibe-talk-short-refs-per-channel`).
+#[must_use]
+pub fn headed_body_in(
+    text: &str,
+    markup: Markup,
+    bot: bool,
+    confirmed: &dyn Fn(&str) -> bool,
+    mentions: &[MentionName],
+    profiles: Option<&str>,
+    channel: Option<&str>,
+) -> (String, Option<crate::model::Heading>) {
     headed_body_by(
-        to_html_named,
+        to_html_named_in_render,
         text,
         markup,
         bot,
         confirmed,
         mentions,
         profiles,
+        channel,
     )
 }
 
-/// How a body is rendered: [`to_html_named`], through the cache, or [`render_named`], past it.
-type Render = fn(&str, Markup, &[MentionName], Option<&str>) -> String;
+/// How a body is rendered: [`to_html_named_in_render`], through the cache, or
+/// [`render_named`], past it. The last argument is the channel the body is
+/// drawn in (`#1915`).
+type Render = fn(&str, Markup, &[MentionName], Option<&str>, Option<&str>) -> String;
 
 /// [`headed_body`], rendering with `render`.
+#[allow(clippy::too_many_arguments)]
 fn headed_body_by(
     render: Render,
     text: &str,
@@ -763,8 +802,9 @@ fn headed_body_by(
     confirmed: &dyn Fn(&str) -> bool,
     mentions: &[MentionName],
     profiles: Option<&str>,
+    channel: Option<&str>,
 ) -> (String, Option<crate::model::Heading>) {
-    let html = render(text, markup, mentions, profiles);
+    let html = render(text, markup, mentions, profiles, channel);
     let plain = html == plain_html(text);
     let Some(found) = crate::heading::extract(text, bot, confirmed) else {
         return (if plain { String::new() } else { html }, None);
@@ -780,6 +820,7 @@ fn headed_body_by(
         markup,
         mentions,
         profiles,
+        channel,
     ) {
         Some(marked) => (marked, Some(heading)),
         None => (html, None),
@@ -804,8 +845,9 @@ fn mark_restated(
     markup: Markup,
     mentions: &[MentionName],
     profiles: Option<&str>,
+    channel: Option<&str>,
 ) -> Option<String> {
-    let alone = render(prefix, markup, mentions, profiles);
+    let alone = render(prefix, markup, mentions, profiles, channel);
     let words = alone.strip_prefix("<p>")?.strip_suffix("</p>\n")?;
     if words.contains("<p>") || words.contains("</p>") {
         return None;
@@ -890,13 +932,40 @@ pub fn to_html_named(
     mentions: &[MentionName],
     profiles: Option<&str>,
 ) -> String {
+    to_html_named_in(text, markup, mentions, profiles, None)
+}
+
+/// [`to_html_named`] drawn in `channel` (the message's own channel), so
+/// its short references resolve per channel (`#1915`). The render cache
+/// keys on the channel beside the text: the same words in two channels
+/// may draw different links.
+#[must_use]
+pub fn to_html_named_in(
+    text: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+    profiles: Option<&str>,
+    channel: Option<&str>,
+) -> String {
     let rule = newline_rule(text, markup);
-    if let Some(html) = RENDERED.get(text, markup, rule, mentions, profiles) {
+    if let Some(html) = RENDERED.get_in(text, markup, rule, mentions, profiles, channel) {
         return html;
     }
-    let html = render_named(text, markup, mentions, profiles);
-    RENDERED.put(text, markup, rule, mentions, profiles, &html);
+    let html = render_named(text, markup, mentions, profiles, channel);
+    RENDERED.put_in(text, markup, rule, mentions, profiles, channel, &html);
     html
+}
+
+/// [`to_html_named_in`] with the [`Render`] argument order [`headed_body_by`]
+/// hands it: profiles, then channel.
+fn to_html_named_in_render(
+    text: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+    profiles: Option<&str>,
+    channel: Option<&str>,
+) -> String {
+    to_html_named_in(text, markup, mentions, profiles, channel)
 }
 
 /// Whether one render draws thread names (`#1058 pr-name-enrichment`, [`crate::pr_names`]).
@@ -919,15 +988,35 @@ fn render_named(
     markup: Markup,
     mentions: &[MentionName],
     profiles: Option<&str>,
+    channel: Option<&str>,
 ) -> String {
-    render_visiting(text, markup, mentions, profiles, Names::Page, |_, _| ()).0
+    render_visiting(
+        text,
+        markup,
+        mentions,
+        profiles,
+        Names::Page,
+        channel,
+        |_, _| (),
+    )
+    .0
 }
 
 /// [`render_named`] for one Discuss answer: `trusted` addresses (see [`body_html_catchup`]) keep
 /// their links. Never cached in [`RENDERED`]: what a body renders to here depends on the trusted
 /// set, which the cache key does not hold, and a Discuss answer is rendered once.
 fn render_named_catchup(text: &str, markup: Markup, trusted: &HashSet<String>) -> String {
-    render_visiting_trusted(text, markup, &[], None, Names::Page, trusted, |_, _| ()).0
+    render_visiting_trusted(
+        text,
+        markup,
+        &[],
+        None,
+        Names::Page,
+        None,
+        trusted,
+        |_, _| (),
+    )
+    .0
 }
 
 /// [`render_named`] for the search index: drawn as the page draws it but for thread names,
@@ -938,8 +1027,18 @@ fn render_named_for_index(
     markup: Markup,
     mentions: &[MentionName],
     profiles: Option<&str>,
+    channel: Option<&str>,
 ) -> String {
-    render_visiting(text, markup, mentions, profiles, Names::TextOnly, |_, _| ()).0
+    render_visiting(
+        text,
+        markup,
+        mentions,
+        profiles,
+        Names::TextOnly,
+        channel,
+        |_, _| (),
+    )
+    .0
 }
 
 /// The bytes one generation of [`RENDERED`] holds before it becomes the old one: its bodies' text
@@ -979,12 +1078,16 @@ struct RenderedBody {
     text: String,
     mentions: Vec<MentionName>,
     profiles: Option<String>,
+    /// The channel this body was drawn in (`#1915`): the same words in
+    /// another channel may hold different short-ref links.
+    channel: Option<String>,
     /// The thread-name stamp this body was drawn under ([`crate::pr_names::stamp`]).
     names_stamp: u64,
     html: String,
 }
 
 impl RenderedBody {
+    #[allow(clippy::too_many_arguments)]
     fn is(
         &self,
         text: &str,
@@ -992,6 +1095,7 @@ impl RenderedBody {
         rule: SingleNewline,
         mentions: &[MentionName],
         profiles: Option<&str>,
+        channel: Option<&str>,
         names_stamp: u64,
     ) -> bool {
         self.markup == markup
@@ -999,6 +1103,7 @@ impl RenderedBody {
             && self.text == text
             && self.mentions == mentions
             && self.profiles.as_deref() == profiles
+            && self.channel.as_deref() == channel
             && self.names_stamp == names_stamp
     }
 
@@ -1017,6 +1122,7 @@ impl RenderedBody {
             + self.html.len()
             + mentions
             + self.profiles.as_ref().map_or(0, String::len)
+            + self.channel.as_ref().map_or(0, String::len)
     }
 }
 
@@ -1028,6 +1134,7 @@ impl RenderCache {
         rule: SingleNewline,
         mentions: &[MentionName],
         profiles: Option<&str>,
+        channel: Option<&str>,
     ) -> u64 {
         self.hasher.hash_one((
             markup,
@@ -1038,9 +1145,11 @@ impl RenderCache {
                 .map(|mention| (&mention.id, &mention.name))
                 .collect::<Vec<_>>(),
             profiles,
+            channel,
         ))
     }
 
+    #[cfg(test)]
     fn get(
         &self,
         text: &str,
@@ -1049,7 +1158,19 @@ impl RenderCache {
         mentions: &[MentionName],
         profiles: Option<&str>,
     ) -> Option<String> {
-        let key = self.key(text, markup, rule, mentions, profiles);
+        self.get_in(text, markup, rule, mentions, profiles, None)
+    }
+
+    fn get_in(
+        &self,
+        text: &str,
+        markup: Markup,
+        rule: SingleNewline,
+        mentions: &[MentionName],
+        profiles: Option<&str>,
+        channel: Option<&str>,
+    ) -> Option<String> {
+        let key = self.key(text, markup, rule, mentions, profiles, channel);
         let names_stamp =
             crate::pr_names::stamp() ^ crate::short_refs::thread_slugs_stamp().rotate_left(32);
         let mut generations = self
@@ -1059,20 +1180,21 @@ impl RenderCache {
         if let Some(found) = generations.young.get(&key).and_then(|bodies| {
             bodies
                 .iter()
-                .find(|body| body.is(text, markup, rule, mentions, profiles, names_stamp))
+                .find(|body| body.is(text, markup, rule, mentions, profiles, channel, names_stamp))
         }) {
             return Some(found.html.clone());
         }
         let bodies = generations.old.get_mut(&key)?;
-        let at = bodies
-            .iter()
-            .position(|body| body.is(text, markup, rule, mentions, profiles, names_stamp))?;
+        let at = bodies.iter().position(|body| {
+            body.is(text, markup, rule, mentions, profiles, channel, names_stamp)
+        })?;
         let body = bodies.swap_remove(at);
         let html = body.html.clone();
         generations.insert(key, body);
         Some(html)
     }
 
+    #[cfg(test)]
     fn put(
         &self,
         text: &str,
@@ -1082,13 +1204,28 @@ impl RenderCache {
         profiles: Option<&str>,
         html: &str,
     ) {
-        let key = self.key(text, markup, rule, mentions, profiles);
+        self.put_in(text, markup, rule, mentions, profiles, None, html);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_in(
+        &self,
+        text: &str,
+        markup: Markup,
+        rule: SingleNewline,
+        mentions: &[MentionName],
+        profiles: Option<&str>,
+        channel: Option<&str>,
+        html: &str,
+    ) {
+        let key = self.key(text, markup, rule, mentions, profiles, channel);
         let body = RenderedBody {
             markup,
             rule,
             text: text.to_owned(),
             mentions: mentions.to_vec(),
             profiles: profiles.map(str::to_owned),
+            channel: channel.map(str::to_owned),
             names_stamp: crate::pr_names::stamp()
                 ^ crate::short_refs::thread_slugs_stamp().rotate_left(32),
             html: html.to_owned(),
@@ -1110,6 +1247,7 @@ impl Generations {
                 body.rule,
                 &body.mentions,
                 body.profiles.as_deref(),
+                body.channel.as_deref(),
                 body.names_stamp,
             )
         }) {
@@ -1134,6 +1272,7 @@ pub fn to_html_as(text: &str, markup: Markup, rule: SingleNewline) -> String {
         None,
         rule,
         Names::Page,
+        None,
         &HashSet::new(),
         |_, _| (),
     )
@@ -1149,6 +1288,7 @@ fn render_visiting<T>(
     mentions: &[MentionName],
     profiles: Option<&str>,
     names: Names,
+    channel: Option<&str>,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
     render_visiting_trusted(
@@ -1157,18 +1297,21 @@ fn render_visiting<T>(
         mentions,
         profiles,
         names,
+        channel,
         &HashSet::new(),
         visit,
     )
 }
 
 /// [`render_visiting`] with a trusted-address set (see [`body_html_catchup`]).
+#[allow(clippy::too_many_arguments)]
 fn render_visiting_trusted<T>(
     text: &str,
     markup: Markup,
     mentions: &[MentionName],
     profiles: Option<&str>,
     names: Names,
+    channel: Option<&str>,
     trusted: &HashSet<String>,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
@@ -1179,6 +1322,7 @@ fn render_visiting_trusted<T>(
         profiles,
         newline_rule(text, markup),
         names,
+        channel,
         trusted,
         visit,
     )
@@ -1193,6 +1337,7 @@ fn render_visiting_as<T>(
     profiles: Option<&str>,
     rule: SingleNewline,
     names: Names,
+    channel: Option<&str>,
     trusted: &HashSet<String>,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
@@ -1231,7 +1376,7 @@ fn render_visiting_as<T>(
         }
     }
     let linked = adjust(
-        &arena, root, &source, &inserted, markup, mentions, profiles, names, trusted,
+        &arena, root, &source, &inserted, markup, mentions, profiles, names, channel, trusted,
     );
     // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
     if deeper_than(root, MAX_DEPTH) {
@@ -1391,7 +1536,7 @@ fn bridge_thread_target(
     if !(tail.is_empty() || tail.starts_with('/')) {
         return None;
     }
-    let resolved = crate::short_refs::short_refs().thread(number)?;
+    let resolved = crate::short_refs::short_refs().thread(Some(&target.channel), number)?;
     if resolved.channel != target.channel {
         return None;
     }
@@ -1538,6 +1683,7 @@ pub fn source_blocks(text: &str, markup: Markup, mentions: &[MentionName]) -> Ve
         mentions,
         None,
         Names::TextOnly,
+        None,
         |root, source| {
             let lines = line_starts(source);
             let mut found = Vec::new();
@@ -2853,6 +2999,7 @@ fn adjust<'a>(
     mentions: &[MentionName],
     profiles: Option<&str>,
     names: Names,
+    channel: Option<&str>,
     trusted: &HashSet<String>,
 ) -> usize {
     let lines = line_starts(source);
@@ -2937,7 +3084,7 @@ fn adjust<'a>(
             }
             NodeValue::Link(_) => {
                 drop(ast);
-                label_link(node, names);
+                label_link(node, names, channel);
             }
             NodeValue::Text(text) => {
                 let pieces = mention_pieces(text, mentions, profiles);
@@ -2955,7 +3102,7 @@ fn adjust<'a>(
     // Last, so every link the walks above made or kept is a link by now and its text is passed
     // over, and a mention is a chip rather than text.
     link_references(arena, root, &references::reference_links(), &refused)
-        + link_short_refs(arena, root, &refused, names)
+        + link_short_refs(arena, root, &refused, names, channel)
 }
 
 /// The host short-reference links are first drawn on; [`mark_message_links`] rewrites every
@@ -2979,6 +3126,7 @@ fn link_short_refs<'a>(
     root: &'a AstNode<'a>,
     refused: &HashSet<*const AstNode<'a>>,
     names: Names,
+    channel: Option<&str>,
 ) -> usize {
     const LINK_MARKUP: usize = 160;
     let refs = crate::short_refs::short_refs();
@@ -3008,7 +3156,7 @@ fn link_short_refs<'a>(
             let shown = &text[token.start..token.end];
             let slug = match (token.kind, names) {
                 (ShortRefKind::Thread, Names::Page) => {
-                    refs.thread(token.number).and_then(|resolved| {
+                    refs.thread(channel, token.number).and_then(|resolved| {
                         resolved.thread.as_deref().and_then(|root| {
                             crate::short_refs::thread_slug(&resolved.channel, root)
                         })
@@ -3017,29 +3165,31 @@ fn link_short_refs<'a>(
                 _ => None,
             };
             let label = short_ref_label(token.kind, shown, slug.as_deref());
-            let made: &'a AstNode<'a> = match short_ref_url(&refs, token.kind, token.number) {
-                Some(url) => {
-                    added += LINK_MARKUP + 2 * url.len() + label.len();
-                    // The owner's form (`#1796`): a thread or message short
-                    // link opens here, so it says so; an issue link opens
-                    // the tracker and carries no title, as before.
-                    let title = match token.kind {
-                        ShortRefKind::Issue => String::new(),
-                        _ => "Opens here".to_owned(),
-                    };
-                    let link: &'a AstNode<'a> = arena.alloc(
-                        NodeValue::Link(Box::new(comrak::nodes::NodeLink { url, title })).into(),
-                    );
-                    link.append(arena.alloc(NodeValue::Text(label.into()).into()));
-                    link
-                }
-                None => arena.alloc(
-                    NodeValue::Raw(format!(
-                        "<span class=\"{SHORTREF_UNKNOWN_CLASS}\">{label}</span>"
-                    ))
-                    .into(),
-                ),
-            };
+            let made: &'a AstNode<'a> =
+                match short_ref_url(&refs, token.kind, token.number, channel) {
+                    Some(url) => {
+                        added += LINK_MARKUP + 2 * url.len() + label.len();
+                        // The owner's form (`#1796`): a thread or message short
+                        // link opens here, so it says so; an issue link opens
+                        // the tracker and carries no title, as before.
+                        let title = match token.kind {
+                            ShortRefKind::Issue => String::new(),
+                            _ => "Opens here".to_owned(),
+                        };
+                        let link: &'a AstNode<'a> = arena.alloc(
+                            NodeValue::Link(Box::new(comrak::nodes::NodeLink { url, title }))
+                                .into(),
+                        );
+                        link.append(arena.alloc(NodeValue::Text(label.into()).into()));
+                        link
+                    }
+                    None => arena.alloc(
+                        NodeValue::Raw(format!(
+                            "<span class=\"{SHORTREF_UNKNOWN_CLASS}\">{label}</span>"
+                        ))
+                        .into(),
+                    ),
+                };
             node.insert_before(made);
             written = token.end;
         }
@@ -3155,17 +3305,18 @@ fn short_ref_url(
     refs: &crate::short_refs::ShortRefs,
     kind: ShortRefKind,
     number: u64,
+    channel: Option<&str>,
 ) -> Option<String> {
     match kind {
         ShortRefKind::Issue => crate::short_refs::issue_url_configured(number),
-        ShortRefKind::Thread => refs.thread(number).map(|resolved| {
+        ShortRefKind::Thread => refs.thread(channel, number).map(|resolved| {
             format!(
                 "{SHORTREF_HOST}/thread/{}/{}",
                 resolved.channel,
                 resolved.thread.unwrap_or_default()
             )
         }),
-        ShortRefKind::Email | ShortRefKind::Msg => refs.message(number).map(|resolved| {
+        ShortRefKind::Email | ShortRefKind::Msg => refs.message(channel, number).map(|resolved| {
             format!(
                 "{SHORTREF_HOST}/message/{}/{}/{}",
                 resolved.channel,
@@ -3324,7 +3475,7 @@ fn unwrap_link<'a>(
 ///
 /// Every other link loses any title the message gave it, as it always has: the sanitizer keeps a
 /// link's title now, and the only one it may keep is the one written here.
-fn label_link<'a>(node: &'a AstNode<'a>, names: Names) {
+fn label_link<'a>(node: &'a AstNode<'a>, names: Names, channel: Option<&str>) {
     let mut ast = node.data.borrow_mut();
     let NodeValue::Link(link) = &mut ast.value else {
         return;
@@ -3356,7 +3507,7 @@ fn label_link<'a>(node: &'a AstNode<'a>, names: Names) {
             let slug = match (token.kind, names) {
                 (ShortRefKind::Thread, Names::Page) => {
                     let refs = crate::short_refs::short_refs();
-                    refs.thread(token.number).and_then(|resolved| {
+                    refs.thread(channel, token.number).and_then(|resolved| {
                         resolved.thread.as_deref().and_then(|root| {
                             crate::short_refs::thread_slug(&resolved.channel, root)
                         })
@@ -6164,6 +6315,10 @@ mod search_text_tests {
             "render-10",
             "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
         ),
+        (
+            "render-11",
+            "0380ec298f8053549b6d60cb5338b9516226c992700a82d8fa781910810b704c",
+        ),
     ];
 
     fn corpus_digest() -> String {
@@ -6965,10 +7120,12 @@ mod message_link_tests {
 
 #[cfg(test)]
 mod short_ref_tests {
-    use super::{to_html, Markup};
+    use super::{to_html, to_html_named_in, Markup};
     use crate::short_refs::{ShortRefs, ShortRefsGuard};
 
     const FIXTURE: &str = r#"{"schema":"agentctl-short-refs/v1","threads":[{"n":60,"channel":"C0123ABCD","root_ts":"1700000000.000100","root_message":"1700000000.000100"}],"messages":[{"n":1846,"channel":"C0123ABCD","message":"1700000000.000100","thread_root_ts":"1700000000.000100"},{"n":1847,"channel":"C0123ABCD","message":"1700000050.000300","thread_root_ts":"1700000000.000100"}]}"#;
+
+    const OTHER: &str = r#"{"schema":"agentctl-short-refs/v1","threads":[{"n":60,"channel":"C9999ZZZZ","root_ts":"1700000200.000400","root_message":"1700000200.000400"}],"messages":[{"n":1847,"channel":"C9999ZZZZ","message":"1700000200.000400","thread_root_ts":"1700000200.000400"}]}"#;
 
     fn drawn(text: &str) -> String {
         let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
@@ -6977,6 +7134,103 @@ mod short_ref_tests {
             Some("https://tracker.example.invalid/issues/{n}".to_owned()),
         );
         to_html(text, Markup::Slack)
+    }
+
+    fn drawn_in(text: &str, channel: &str) -> String {
+        let mut refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        refs.merge(ShortRefs::parse(OTHER).expect("the other fixture parses"));
+        let _guard = ShortRefsGuard::set(
+            refs,
+            Some("https://tracker.example.invalid/issues/{n}".to_owned()),
+        );
+        to_html_named_in(text, Markup::Slack, &[], None, Some(channel))
+    }
+
+    #[test]
+    fn overlapping_references_link_in_their_own_channel() {
+        // `#1915`: the same number in two channels links to the thread of
+        // the channel the message is drawn in.
+        let own = drawn_in("see :thread:060 and :msg:1847", "C0123ABCD");
+        assert!(
+            own.contains("href=\"?c=C0123ABCD&v=thread&t=1700000000.000100\""),
+            "{own}"
+        );
+        let other = drawn_in("see :thread:060 and :msg:1847", "C9999ZZZZ");
+        assert!(
+            other.contains("href=\"?c=C9999ZZZZ&v=thread&t=1700000200.000400\""),
+            "{other}"
+        );
+        assert!(!other.contains("C0123ABCD"), "{other}");
+    }
+
+    #[test]
+    fn fill_links_each_channels_message_to_its_own_thread() {
+        // `#1915`: through `fill`, the page path itself — the same words
+        // in two channels link to each channel's own thread.
+        let (state, _discord, _voice) =
+            crate::testing::state_from_toml(&crate::testing::config_toml());
+        let mut refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        refs.merge(ShortRefs::parse(OTHER).expect("the other fixture parses"));
+        let _guard = ShortRefsGuard::set(refs, None);
+        let channel = |id: &str| crate::model::ChannelInfo {
+            id: crate::model::ChannelId(id.to_owned()),
+            label: id.to_owned(),
+            writable: false,
+            alias: None,
+            added: false,
+            provider: None,
+            write_source: None,
+        };
+        let mut own = vec![crate::cache::fixtures::message(
+            "1",
+            "ada",
+            "see :thread:060",
+            1_000,
+        )];
+        super::fill(
+            &state.config,
+            &state.headings,
+            &channel("C0123ABCD"),
+            &mut own,
+        );
+        assert!(
+            own[0]
+                .content_html
+                .contains("?c=C0123ABCD&v=thread&t=1700000000.000100"),
+            "{}",
+            own[0].content_html
+        );
+        let mut other = vec![crate::cache::fixtures::message(
+            "2",
+            "ada",
+            "see :thread:060",
+            2_000,
+        )];
+        super::fill(
+            &state.config,
+            &state.headings,
+            &channel("C9999ZZZZ"),
+            &mut other,
+        );
+        assert!(
+            other[0]
+                .content_html
+                .contains("?c=C9999ZZZZ&v=thread&t=1700000200.000400"),
+            "{}",
+            other[0].content_html
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_reference_without_its_channel_stays_plain() {
+        // `#1915`: drawn with no channel (or another one), an ambiguous
+        // number is the dotted plain text, never the other channel's link.
+        let mut refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        refs.merge(ShortRefs::parse(OTHER).expect("the other fixture parses"));
+        let _guard = ShortRefsGuard::set(refs, None);
+        let html = to_html("see :thread:060 and :msg:1847", Markup::Slack);
+        assert!(html.contains("class=\"shortref-unknown\""), "{html}");
+        assert!(!html.contains("data-shortref"), "{html}");
     }
 
     #[test]

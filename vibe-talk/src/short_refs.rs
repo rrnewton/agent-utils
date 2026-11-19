@@ -68,13 +68,39 @@ pub struct Resolved {
 }
 
 /// The resolved references from every configured file, merged. A later file
-/// wins on a duplicate number only within its own kind; numbers are only
-/// meaningful beside the bridge that assigned them, and deployments name the
-/// files of the bridges whose channels this server reads.
+/// wins on a duplicate `(channel, number)` only within its own kind; numbers
+/// are only meaningful beside the bridge and channel that assigned them, and
+/// deployments name the files of the bridges whose channels this server reads.
+/// `#1915 vibe-talk-short-refs-per-channel`.
 #[derive(Clone, Debug, Default)]
 pub struct ShortRefs {
-    threads: HashMap<u64, ThreadEntry>,
-    messages: HashMap<u64, MessageEntry>,
+    threads: HashMap<(String, u64), ThreadEntry>,
+    messages: HashMap<(String, u64), MessageEntry>,
+}
+
+/// The entry `n` names in `map`: the one in `render_channel` when it
+/// holds that number, else the only entry with that number across every
+/// channel, else nothing — an ambiguous number never guesses. `#1915`.
+fn pick<'a, T>(
+    map: &'a HashMap<(String, u64), T>,
+    render_channel: Option<&str>,
+    n: u64,
+) -> Option<&'a T> {
+    if let Some(channel) = render_channel {
+        if let Some(entry) = map.get(&(channel.to_owned(), n)) {
+            return Some(entry);
+        }
+    }
+    let mut found = None;
+    for ((_, number), entry) in map {
+        if *number == n {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(entry);
+        }
+    }
+    found
 }
 
 /// A provider message id as this server names it: a Slack `ts` becomes its
@@ -97,26 +123,30 @@ impl ShortRefs {
             threads: file
                 .threads
                 .into_iter()
-                .map(|entry| (entry.n, entry))
+                .map(|entry| ((entry.channel.clone(), entry.n), entry))
                 .collect(),
             messages: file
                 .messages
                 .into_iter()
-                .map(|entry| (entry.n, entry))
+                .map(|entry| ((entry.channel.clone(), entry.n), entry))
                 .collect(),
         })
     }
 
-    /// Merge `other` into this, its entries winning on duplicate numbers.
-    fn merge(&mut self, other: Self) {
+    /// Merge `other` into this, its entries winning on a duplicate
+    /// `(channel, number)`.
+    pub(crate) fn merge(&mut self, other: Self) {
         self.threads.extend(other.threads);
         self.messages.extend(other.messages);
     }
 
-    /// The thread `n` names, drilled into at its root.
+    /// The thread `n` names in `render_channel` (the channel the reference
+    /// is drawn in), drilled into at its root. Without a channel match, the
+    /// number resolves only when exactly one channel holds it; an ambiguous
+    /// number resolves to nothing, never a wrong link. `#1915`.
     #[must_use]
-    pub fn thread(&self, n: u64) -> Option<Resolved> {
-        let entry = self.threads.get(&n)?;
+    pub fn thread(&self, render_channel: Option<&str>, n: u64) -> Option<Resolved> {
+        let entry = pick(&self.threads, render_channel, n)?;
         Some(Resolved {
             channel: entry.channel.clone(),
             message: None,
@@ -124,10 +154,11 @@ impl ShortRefs {
         })
     }
 
-    /// The message `n` names, in Main; a reply also names its thread's root.
+    /// The message `n` names in `render_channel`, in Main; a reply also
+    /// names its thread's root. Resolution as [`ShortRefs::thread`]. `#1915`.
     #[must_use]
-    pub fn message(&self, n: u64) -> Option<Resolved> {
-        let entry = self.messages.get(&n)?;
+    pub fn message(&self, render_channel: Option<&str>, n: u64) -> Option<Resolved> {
+        let entry = pick(&self.messages, render_channel, n)?;
         let thread = entry
             .thread_root_ts
             .clone()
@@ -469,20 +500,48 @@ mod tests {
     #[test]
     fn the_fixture_resolves_threads_and_messages() {
         let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
-        let thread = refs.thread(60).expect("thread 60");
+        let thread = refs.thread(None, 60).expect("thread 60");
         assert_eq!(thread.channel, "C0123ABCD");
         assert_eq!(thread.message, None);
         assert_eq!(thread.thread.as_deref(), Some("1700000000.000100"));
         // A root message names no thread over itself; a reply names its root.
-        let root = refs.message(1846).expect("message 1846");
+        let root = refs.message(None, 1846).expect("message 1846");
         assert_eq!(root.thread, None);
         assert!(root
             .message
             .is_some_and(|id| !id.is_empty() && id != "1700000000.000100"));
-        let reply = refs.message(1847).expect("message 1847");
+        let reply = refs.message(None, 1847).expect("message 1847");
         assert_eq!(reply.thread.as_deref(), Some("1700000000.000100"));
-        assert_eq!(refs.thread(999), None);
-        assert_eq!(refs.message(999), None);
+        assert_eq!(refs.thread(None, 999), None);
+        assert_eq!(refs.message(None, 999), None);
+    }
+
+    #[test]
+    fn overlapping_numbers_resolve_in_their_own_channel() {
+        // `#1915`: two bridges assign the same numbers in different
+        // channels; each resolves in the channel where it is rendered.
+        const OTHER: &str = r#"{"schema":"agentctl-short-refs/v1","threads":[{"n":60,"channel":"C9999ZZZZ","root_ts":"1700000200.000400","root_message":"1700000200.000400"}],"messages":[{"n":1847,"channel":"C9999ZZZZ","message":"1700000200.000400","thread_root_ts":"1700000200.000400"}]}"#;
+        let mut refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        refs.merge(ShortRefs::parse(OTHER).expect("the other fixture parses"));
+        let own = refs.thread(Some("C0123ABCD"), 60).expect("own thread 60");
+        assert_eq!(own.thread.as_deref(), Some("1700000000.000100"));
+        let other = refs.thread(Some("C9999ZZZZ"), 60).expect("other thread 60");
+        assert_eq!(other.thread.as_deref(), Some("1700000200.000400"));
+        let own_msg = refs.message(Some("C0123ABCD"), 1847).expect("own message");
+        assert_eq!(own_msg.channel, "C0123ABCD");
+        let other_msg = refs
+            .message(Some("C9999ZZZZ"), 1847)
+            .expect("other message");
+        assert_eq!(other_msg.channel, "C9999ZZZZ");
+        // Ambiguous with no channel match: nothing, never a wrong link.
+        assert_eq!(refs.thread(None, 60), None);
+        assert_eq!(refs.message(None, 1847), None);
+        assert_eq!(refs.thread(Some("C0000NONE"), 60), None);
+        // A unique number resolves from any channel.
+        let unique = refs
+            .thread(Some("C9999ZZZZ"), 61)
+            .expect("unique thread 61");
+        assert_eq!(unique.channel, "C0123ABCD");
     }
 
     #[test]
