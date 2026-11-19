@@ -491,15 +491,22 @@ fn strip_deleted(path: PathBuf) -> PathBuf {
     }
 }
 
-/// The health timeout for a service: a watcher gets at least its pass budget, a soak and a margin,
-/// since its first pass may take that long.
+/// The health timeout for a service: a watcher or watch daemon gets at least its pass
+/// budget (or, for `watch`, its interval), a soak and a margin, since its first pass may
+/// take that long (#1900; kept minimal for the #1890 rebase).
 fn health_timeout(service: &Service, options: &RefreshOptions) -> Duration {
-    if service.kind != Kind::Watcher {
-        return options.health_timeout;
-    }
-    let budget = option_value(&service.args, "pass-budget-seconds")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(120);
+    let budget = match service.kind {
+        Kind::Watcher => option_value(&service.args, "pass-budget-seconds")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(120),
+        Kind::Watch => ["pass-budget-seconds", "interval"]
+            .iter()
+            .filter_map(|name| option_value(&service.args, name))
+            .filter_map(|value| value.parse::<u64>().ok())
+            .max()
+            .unwrap_or(120),
+        _ => return options.health_timeout,
+    };
     options
         .health_timeout
         .max(Duration::from_secs(budget + 60) + SOAK)
@@ -514,6 +521,7 @@ fn preflight(host: &dyn Host, service: &Service) -> Result<String, String> {
             host.sleep(Duration::from_secs(2));
         }
         let mut first_pid = None;
+        let mut progress = ProgressSeen::default();
         match probe(
             host,
             service,
@@ -521,6 +529,7 @@ fn preflight(host: &dyn Host, service: &Service) -> Result<String, String> {
             &service.environment,
             UNIX_EPOCH,
             &mut first_pid,
+            &mut progress,
         ) {
             Ok(detail) => return Ok(detail),
             Err(Fatal(detail) | Pending(detail)) => last = detail,
@@ -546,8 +555,17 @@ pub fn health(
     let deadline = process_started + timeout;
     let mut last;
     let mut first_pid: Option<u32> = None;
+    let mut progress = ProgressSeen::default();
     loop {
-        let outcome = probe(host, service, binary, environment, started, &mut first_pid);
+        let outcome = probe(
+            host,
+            service,
+            binary,
+            environment,
+            started,
+            &mut first_pid,
+            &mut progress,
+        );
         let now = host.now();
         match outcome {
             Ok(detail) if now.duration_since(process_started).unwrap_or_default() >= SOAK => {
@@ -575,6 +593,76 @@ enum ProbeFailure {
 }
 use ProbeFailure::{Fatal, Pending};
 
+/// Heartbeats seen from one process's `pass-progress.json`, across probes (#1900).
+#[derive(Default)]
+struct ProgressSeen {
+    heartbeat: Option<f64>,
+    advances: u32,
+}
+
+/// How old a progress heartbeat may be and still count as advancing (the daemon
+/// heartbeats every few seconds).
+const PROGRESS_FRESH: f64 = 60.0;
+/// Heartbeat advances a pass in progress must show before it proves health.
+const PROGRESS_ADVANCES: u32 = 2;
+
+/// Progress proof for a watch pass (#1900): a pass that began after `started`, whose
+/// heartbeat is fresh and has advanced at least twice across probes. `Ok` is the health
+/// detail; `Err` is why the pass does not prove health yet. A frozen heartbeat never
+/// proves health, so a daemon stuck in its first pass still fails.
+fn progress_proof(
+    host: &dyn Host,
+    directory: &Path,
+    started: SystemTime,
+    seen: &mut ProgressSeen,
+) -> Result<String, String> {
+    let path = directory.join(crate::restore::PASS_PROGRESS_FILE);
+    let report: Value = host
+        .read_file(&path)
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| {
+            format!(
+                "no watch pass has begun since the restart ({} unreadable)",
+                path.display()
+            )
+        })?;
+    let pass_started = report["pass_started_at"].as_f64().unwrap_or(0.0);
+    let heartbeat = report["heartbeat_at"].as_f64().unwrap_or(0.0);
+    if pass_started < unix_seconds(started) {
+        return Err("the watch pass in progress began before the restart".to_owned());
+    }
+    if heartbeat < pass_started {
+        return Err("the watch progress heartbeat predates its pass start".to_owned());
+    }
+    let now = unix_seconds(host.now());
+    if heartbeat > now + 5.0 {
+        return Err("the watch progress heartbeat is in the future".to_owned());
+    }
+    if now - heartbeat > PROGRESS_FRESH {
+        return Err(format!(
+            "the watch pass heartbeat is {:.0} s old (stuck pass?)",
+            now - heartbeat
+        ));
+    }
+    match seen.heartbeat {
+        Some(last) if heartbeat > last => seen.advances = seen.advances.saturating_add(1),
+        Some(last) if heartbeat < last => seen.advances = 0,
+        _ => {}
+    }
+    seen.heartbeat = Some(heartbeat);
+    if seen.advances >= PROGRESS_ADVANCES {
+        Ok(format!(
+            "watch pass in progress (began {:.0} s ago, heartbeat advancing)",
+            (now - pass_started).max(0.0)
+        ))
+    } else {
+        Err(format!(
+            "watch pass in progress; heartbeat has advanced {} of {PROGRESS_ADVANCES} times",
+            seen.advances
+        ))
+    }
+}
+
 fn probe(
     host: &dyn Host,
     service: &Service,
@@ -582,6 +670,7 @@ fn probe(
     environment: &[(String, String)],
     started: SystemTime,
     first_pid: &mut Option<u32>,
+    progress: &mut ProgressSeen,
 ) -> Result<String, ProbeFailure> {
     let state = host
         .show(std::slice::from_ref(&service.unit))
@@ -713,20 +802,22 @@ fn probe(
                 .as_ref()
                 .ok_or_else(|| Fatal("no state directory".into()))?;
             let path = directory.join("agent-watch.json");
-            let report: Value = host
+            let completed = host
                 .read_file(&path)
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .ok_or_else(|| Pending(format!("{} is not readable yet", path.display())))?;
-            let checked = report["checked_at"].as_f64().unwrap_or(0.0);
-            if checked >= unix_seconds(started) {
-                Ok(format!(
-                    "watch pass completed ({} agents)",
-                    report["agents"]
-                ))
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .filter(|report| {
+                    report["checked_at"].as_f64().unwrap_or(0.0) >= unix_seconds(started)
+                })
+                .map(|report| format!("watch pass completed ({} agents)", report["agents"]));
+            if let Some(detail) = completed {
+                Ok(detail)
             } else {
-                Err(Pending(
-                    "no watch pass has completed since the restart".to_owned(),
-                ))
+                match progress_proof(host, directory, started, progress) {
+                    Ok(detail) => Ok(detail),
+                    Err(why) => Err(Pending(format!(
+                        "no watch pass has completed since the restart; {why}"
+                    ))),
+                }
             }
         }
         Kind::Watch => {
@@ -735,17 +826,21 @@ fn probe(
                 .as_ref()
                 .ok_or_else(|| Fatal("no state directory".into()))?;
             let path = directory.join("health.json");
-            let report: Value = host
+            let completed = host
                 .read_file(&path)
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .ok_or_else(|| Pending(format!("{} is not readable yet", path.display())))?;
-            let checked = report["checked_at"].as_f64().unwrap_or(0.0);
-            if checked >= unix_seconds(started) {
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .filter(|report| {
+                    report["checked_at"].as_f64().unwrap_or(0.0) >= unix_seconds(started)
+                });
+            if completed.is_some() {
                 Ok("watch health pass completed".to_owned())
             } else {
-                Err(Pending(
-                    "no watch health pass has completed since the restart".to_owned(),
-                ))
+                match progress_proof(host, directory, started, progress) {
+                    Ok(detail) => Ok(detail),
+                    Err(why) => Err(Pending(format!(
+                        "no watch health pass has completed since the restart; {why}"
+                    ))),
+                }
             }
         }
         Kind::Restore => Ok("active on the new binary".to_owned()),

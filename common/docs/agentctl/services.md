@@ -195,7 +195,8 @@ alone and the run stops, so a problem it already had (a bridge whose target
 agent is gone, say) is never blamed on the new build or rolled back over.
 
 After the change, within `--health-timeout` (default 120 seconds; a watcher
-gets at least its `--pass-budget-seconds` plus 90 seconds) — counted from the
+or the watch daemon gets at least its `--pass-budget-seconds` — or, for the
+watch daemon, its `--interval` — plus 90 seconds) — counted from the
 new process's start, so however long stopping the old process took (a bridge
 can spend its whole 90-second stop timeout) is added to the window and said
 in the report — and for at least
@@ -209,8 +210,12 @@ kind:
   run with the snapshot's `AGENTCTL_HOME` (read from `/proc/PID/environ`); and
   its event stream must have delivered something (a batch or a heartbeat) after
   the restart;
-- **watcher**: `agent-watch.json` in its state directory must show a pass
-  (`checked_at`) completed after the restart;
+- **watcher / watch daemon**: `agent-watch.json` (or `health.json`) in its
+  state directory must show a pass (`checked_at`) completed after the
+  restart, or `pass-progress.json` there must show a pass that began after
+  the restart whose heartbeat has advanced at least twice while the process
+  stays up — a first pass over a large registry can take longer than any
+  health window, and a pass with a frozen heartbeat still fails;
 - **headless wrapper**: its control socket must answer `status` from that
   process.
 

@@ -34,6 +34,7 @@ impl OptionTables for Tables {
         let extra: &[&str] = match path {
             ["chat", "run"] | ["chat"] => &["bridge-state"],
             ["watch-agents"] => &["state-dir", "stall-minutes"],
+            ["watch"] => &["state-dir", "interval"],
             ["run-headless"] => &["approval-timeout"],
             _ => &[],
         };
@@ -82,6 +83,15 @@ struct Fake {
     event_delay: Cell<Duration>,
     /// How long `stop` takes (clock time).
     stop_delay: Cell<Duration>,
+    /// How long a watch pass takes after its process starts, on the fake clock: the completed
+    /// pass file is not readable until then (#1900).
+    watch_pass_delay: Cell<Duration>,
+    /// Whether the watch daemon writes `pass-progress.json` with an advancing heartbeat.
+    watch_progress: Cell<bool>,
+    /// Whether that heartbeat is frozen at the pass start.
+    watch_progress_frozen: Cell<bool>,
+    /// Agents the completed watch pass reports.
+    watch_agent_count: Cell<usize>,
     /// Chat-health runs so far, and the run after which the bridge dies.
     health_runs: Cell<usize>,
     die_after_health_runs: Cell<usize>,
@@ -117,6 +127,10 @@ impl Fake {
             refuse_property: RefCell::new(None),
             restart_delay: Cell::new(Duration::ZERO),
             starts: RefCell::default(),
+            watch_pass_delay: Cell::new(Duration::ZERO),
+            watch_progress: Cell::new(true),
+            watch_progress_frozen: Cell::new(false),
+            watch_agent_count: Cell::new(3),
             event_delay: Cell::new(Duration::ZERO),
             stop_delay: Cell::new(Duration::ZERO),
             health_runs: Cell::new(0),
@@ -215,6 +229,33 @@ impl Fake {
 
     fn pid(&self, name: &str) -> Option<u32> {
         self.units.borrow().get(name).and_then(|unit| unit.pid)
+    }
+
+    /// When the running watch daemon that owns `path` started, on the fake clock: the unit
+    /// whose definition names the file's directory, else the unit of the file's kind.
+    fn watch_started(&self, path: &Path) -> Option<SystemTime> {
+        let units = self.units.borrow();
+        let parent = path
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned());
+        let by_dir = parent.as_ref().and_then(|parent| {
+            units.values().find(|unit| {
+                unit.active == "active"
+                    && !parent.is_empty()
+                    && unit.loaded.contains(parent.as_str())
+            })
+        });
+        let unit = by_dir.or_else(|| {
+            units.values().find(|unit| {
+                unit.active == "active"
+                    && if path.ends_with("agent-watch.json") {
+                        unit.loaded.contains("watch-agents")
+                    } else {
+                        unit.loaded.contains(" watch ")
+                    }
+            })
+        })?;
+        self.starts.borrow().get(&unit.pid?).copied()
     }
 }
 
@@ -424,21 +465,45 @@ impl Host for Fake {
     }
 
     fn read_file(&self, path: &Path) -> Option<Vec<u8>> {
-        if path.ends_with("agent-watch.json") {
-            // The watcher completes a pass as soon as it runs.
-            let running = self
-                .units
-                .borrow()
-                .values()
-                .any(|unit| unit.active == "active" && unit.loaded.contains("watch-agents"));
-            let now = self
-                .clock
-                .get()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64();
-            return running
-                .then(|| serde_json::to_vec(&json!({"checked_at": now, "agents": 3})).unwrap());
+        let now = self
+            .clock
+            .get()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        if path.ends_with("pass-progress.json") {
+            // The new daemon writes this at pass start and keeps its heartbeat advancing.
+            if !self.watch_progress.get() {
+                return None;
+            }
+            let started = self.watch_started(path)?;
+            let started = started.duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+            let heartbeat = if self.watch_progress_frozen.get() {
+                started
+            } else {
+                now
+            };
+            return Some(
+                serde_json::to_vec(&json!({
+                    "schema": "agentctl-watch-progress/v1",
+                    "pass_started_at": started,
+                    "heartbeat_at": heartbeat,
+                }))
+                .unwrap(),
+            );
+        }
+        if path.ends_with("agent-watch.json") || path.ends_with("health.json") {
+            // The watcher completes a pass `watch_pass_delay` after its process starts.
+            let started = self.watch_started(path)?;
+            if self.clock.get() < started + self.watch_pass_delay.get() {
+                return None;
+            }
+            return Some(
+                serde_json::to_vec(
+                    &json!({"checked_at": now, "agents": self.watch_agent_count.get()}),
+                )
+                .unwrap(),
+            );
         }
         fs::read(path).ok()
     }
@@ -955,6 +1020,161 @@ fn a_failed_health_check_rolls_back_and_stops_the_run() {
     );
     assert_eq!(world.fake.service_text("bridge.service"), before_bridge);
     assert!(report.text.contains("rolled back to"), "{}", report.text);
+}
+
+/// Add the repair watch (`agentctl watch`, kind `watch`) as a unit file.
+fn add_repair_watch(world: &World) {
+    let registry = world.registry.to_string_lossy().into_owned();
+    let state = world._temporary.0.join("repair-watch-state");
+    fs::create_dir_all(&state).unwrap();
+    world.fake.add_unit_file(
+        "repair-watch.service",
+        &format!(
+            "[Unit]\nDescription=repair watch\n\n[Service]\nEnvironment=PATH=/usr/bin:/bin\nExecStart=/state/bin/agentctl-old --registry {registry} watch --interval 60 --state-dir {}\nRestart=on-failure\n",
+            state.display()
+        ),
+    );
+}
+
+#[test]
+fn repair_watch_first_pass_slower_than_the_health_window_still_refreshes() {
+    // #1900: a first pass over a large registry (4000 records on the fake clock: 600 s)
+    // exceeds the 120 s health window. The new daemon began its pass after the restart
+    // and its heartbeat advances, so health passes instead of rolling back a healthy
+    // process. This rolled back before the progress proof.
+    let world = world();
+    add_repair_watch(&world);
+    world.fake.watch_pass_delay.set(Duration::from_secs(600));
+    world.fake.watch_agent_count.set(4000);
+    // The old daemon has long since completed a pass, so the preflight passes.
+    world.fake.sleep(Duration::from_secs(3600));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let repair = services
+        .iter()
+        .find(|service| service.unit == "repair-watch.service")
+        .unwrap();
+    assert_eq!(repair.kind, Kind::Watch);
+    let mut only = options(&world);
+    only.only = vec!["repair-watch.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(
+        report.document["services"][0]["action"], "refreshed",
+        "{}",
+        report.text
+    );
+    assert!(
+        report.document["services"][0]["health"]
+            .as_str()
+            .unwrap()
+            .contains("in progress"),
+        "{}",
+        report.text
+    );
+}
+
+#[test]
+fn watcher_first_pass_slower_than_the_health_window_still_refreshes() {
+    // #1900: the same progress proof for `watch-agents` (kind `watcher`).
+    let world = world();
+    world.fake.watch_pass_delay.set(Duration::from_secs(600));
+    world.fake.watch_agent_count.set(4000);
+    world.fake.sleep(Duration::from_secs(3600));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["watch.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(report.document["services"][0]["action"], "refreshed");
+}
+
+#[test]
+fn watch_health_window_scales_with_its_interval_without_a_progress_file() {
+    // #1900: kind `watch` gets the scaled window too (interval 60 -> 150 s), so a
+    // 140 s first pass from a daemon that writes no progress file still completes.
+    let world = world();
+    add_repair_watch(&world);
+    world.fake.watch_progress.set(false);
+    world.fake.watch_pass_delay.set(Duration::from_secs(140));
+    world.fake.sleep(Duration::from_secs(3600));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["repair-watch.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(report.document["services"][0]["action"], "refreshed");
+    assert!(
+        report.document["services"][0]["health"]
+            .as_str()
+            .unwrap()
+            .contains("pass completed"),
+        "{}",
+        report.text
+    );
+}
+
+#[test]
+fn a_watch_that_never_begins_a_pass_still_rolls_back() {
+    // #1900: no progress file and no completed pass within the window: rollback stays.
+    let world = world();
+    add_repair_watch(&world);
+    world.fake.watch_progress.set(false);
+    world.fake.watch_pass_delay.set(Duration::from_secs(600));
+    world.fake.sleep(Duration::from_secs(3600));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["repair-watch.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_ne!(report.exit_code, 0, "{}", report.text);
+    // The old definition and binary are restored; the old daemon's own first pass is
+    // just as slow, so its rollback health may also time out (rollback-failed).
+    assert!(
+        matches!(
+            report.document["services"][0]["action"].as_str(),
+            Some("rolled-back" | "rollback-failed")
+        ),
+        "{}",
+        report.text
+    );
+    let pid = world.fake.pid("repair-watch.service").unwrap();
+    assert_eq!(
+        world.fake.process_exe(pid),
+        Some(PathBuf::from("/state/bin/agentctl-old"))
+    );
+}
+
+#[test]
+fn a_watch_with_a_frozen_heartbeat_still_rolls_back() {
+    // #1900: a pass that began but whose heartbeat never advances is a stuck pass,
+    // not a healthy one (coordinator's strict rule: at least two advances).
+    let world = world();
+    add_repair_watch(&world);
+    world.fake.watch_progress_frozen.set(true);
+    world.fake.watch_pass_delay.set(Duration::from_secs(600));
+    world.fake.sleep(Duration::from_secs(3600));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["repair-watch.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_ne!(report.exit_code, 0, "{}", report.text);
+    assert!(
+        matches!(
+            report.document["services"][0]["action"].as_str(),
+            Some("rolled-back" | "rollback-failed")
+        ),
+        "{}",
+        report.text
+    );
+    let pid = world.fake.pid("repair-watch.service").unwrap();
+    assert_eq!(
+        world.fake.process_exe(pid),
+        Some(PathBuf::from("/state/bin/agentctl-old"))
+    );
 }
 
 #[test]

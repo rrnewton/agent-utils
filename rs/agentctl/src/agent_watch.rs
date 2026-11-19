@@ -5522,8 +5522,15 @@ pub fn watch_agents(
     // Episode rows already written to the log, as (agent, kind, detail, owed)
     // signatures, so an unchanged episode is logged once, not on every pass (#932).
     let mut logged_episodes: BTreeMap<(String, String, String, bool), ()> = BTreeMap::new();
+    let progress = crate::restore::PassProgress::new(paths.as_ref().map(|(_, report_path)| {
+        report_path
+            .parent()
+            .map(|dir| dir.join(crate::restore::PASS_PROGRESS_FILE))
+            .unwrap_or_else(|| PathBuf::from(crate::restore::PASS_PROGRESS_FILE))
+    }));
     loop {
         let now = clock.now();
+        progress.begin(now);
         let mut session_follows = Vec::new();
         if !options.check_only {
             for name in &options.auto_recover {

@@ -1653,6 +1653,13 @@ fn watch_tells_a_live_coordinator_once_an_hour_about_what_it_could_not_repair() 
         "{sent:?}"
     );
     assert!(fixture.root.join("watch/health.json").is_file());
+    // #1900: a pass start is recorded for the services progress proof.
+    let progress: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.root.join("watch/pass-progress.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(progress["schema"], "agentctl-watch-progress/v1");
+    assert!(progress["pass_started_at"].as_f64().unwrap_or(0.0) > 0.0);
     host.sleep(Duration::from_secs(600));
     let second =
         crate::restore::watch(&fixture.client, &registry, &host, &config, &options).unwrap();
