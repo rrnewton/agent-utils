@@ -545,6 +545,16 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_only_number_never_resolves_as_a_message() {
+        // The two counters are independent: a number that names only a
+        // thread is no message, in either channel. `#1915` (coordb).
+        let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
+        assert_eq!(refs.message(Some("C0123ABCD"), 60), None);
+        assert_eq!(refs.message(None, 60), None);
+        assert_eq!(refs.thread(Some("C0123ABCD"), 1847), None);
+    }
+
+    #[test]
     fn other_schemas_and_bad_json_resolve_nothing() {
         assert!(ShortRefs::parse(r#"{"schema":"other/v9","threads":[],"messages":[]}"#).is_none());
         assert!(ShortRefs::parse("not json").is_none());

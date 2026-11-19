@@ -7125,7 +7125,7 @@ mod short_ref_tests {
 
     const FIXTURE: &str = r#"{"schema":"agentctl-short-refs/v1","threads":[{"n":60,"channel":"C0123ABCD","root_ts":"1700000000.000100","root_message":"1700000000.000100"}],"messages":[{"n":1846,"channel":"C0123ABCD","message":"1700000000.000100","thread_root_ts":"1700000000.000100"},{"n":1847,"channel":"C0123ABCD","message":"1700000050.000300","thread_root_ts":"1700000000.000100"}]}"#;
 
-    const OTHER: &str = r#"{"schema":"agentctl-short-refs/v1","threads":[{"n":60,"channel":"C9999ZZZZ","root_ts":"1700000200.000400","root_message":"1700000200.000400"}],"messages":[{"n":1847,"channel":"C9999ZZZZ","message":"1700000200.000400","thread_root_ts":"1700000200.000400"}]}"#;
+    const OTHER: &str = r#"{"schema":"agentctl-short-refs/v1","threads":[{"n":60,"channel":"C9999ZZZZ","root_ts":"1700000200.000400","root_message":"1700000200.000400"}],"messages":[{"n":1847,"channel":"C9999ZZZZ","message":"1700000200.000500","thread_root_ts":"1700000200.000400"}]}"#;
 
     fn drawn(text: &str) -> String {
         let refs = ShortRefs::parse(FIXTURE).expect("the fixture parses");
@@ -7219,6 +7219,27 @@ mod short_ref_tests {
             "{}",
             other[0].content_html
         );
+    }
+
+    #[test]
+    fn second_channel_thread_and_email_link_and_thread_only_email_stays_plain() {
+        // `#1915` (coordb acceptance): in the SECOND channel, both
+        // `:thread:N` and `:email:N` link from that channel's bridge
+        // file; `:email:` of a thread-only number never links to it.
+        let html = drawn_in(
+            "see :thread:060 and :email:1847 and :email:60",
+            "C9999ZZZZ",
+        );
+        assert!(
+            html.contains("href=\"?c=C9999ZZZZ&v=thread&t=1700000200.000400\""),
+            "{html}"
+        );
+        assert!(html.contains("data-shortref=\"email\""), "{html}");
+        assert!(html.contains("slack:C9999ZZZZ"), "{html}");
+        assert!(!html.contains("C0123ABCD"), "{html}");
+        // `:email:60` names only a thread in this channel: plain, dotted.
+        assert!(html.contains("class=\"shortref-unknown\""), "{html}");
+        assert!(html.contains("✉️60"), "{html}");
     }
 
     #[test]
