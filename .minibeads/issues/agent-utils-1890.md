@@ -1,12 +1,12 @@
 ---
 title: 'agentctl-turnover-watch-health-window: scale the watch health window and continue past rollbacks'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - agentctl
 created_at: 2026-11-19T01:37:09-05:00
-updated_at: 2026-11-19T01:37:09-05:00
+updated_at: 2026-11-19T16:02:19-05:00
 ---
 
 # Description
@@ -43,3 +43,16 @@ stop-on-failure order.
 [watermelon-full-preview] Filed from coordb's brief after the 05:30 ET
 failure. Services/turnover is Rust-only (the Python edition refuses
 `services`), so there is no Python mirror or differential group.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as
+871a07ff4ee1b1d94bc729c0a022c5e7b79b4fa0, rebased over #1900
+(cde2597f) keeping both behaviours: #1900's scaled window and
+pass-progress proof, plus this issue's exact per-unit
+`--health-timeout-for UNIT=SECONDS` override and turnover continuing
+past a completed rollback (rolled-back units reported at the end in
+text and the `rolled_back` field; standalone refresh unchanged).
+No new persisted field. Tests: slow first watch pass, explicit
+per-unit override, continue-past-rollback, and the full services
+suite (58) on the rebased tree; gate passed with no overlap flags.
