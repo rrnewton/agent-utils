@@ -741,7 +741,7 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
   // THE CONTROL. Without it the fixture could be one that never moves scrollTop at all.
   const control = await run(
     await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
-      find: "    area.scrollTop += (mark.anchor as Element).getBoundingClientRect().top - mark.top;",
+      find: "    area.scrollTop += compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top);",
       replace: "    void mark;" }])
   );
   assert.notEqual(
@@ -758,8 +758,8 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
   // the same row it was.
   const wrongAnchor = await run(
     await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
-      find: "    area.scrollTop += (mark.anchor as Element).getBoundingClientRect().top - mark.top;",
-      replace: '    area.scrollTop += (el("discord-log").children[0] as Element).getBoundingClientRect().top - mark.top;' }])
+      find: "    area.scrollTop += compensatedDelta(area, mark, (mark.anchor as Element).getBoundingClientRect().top);",
+      replace: '    area.scrollTop += compensatedDelta(area, mark, (el("discord-log").children[0] as Element).getBoundingClientRect().top);' }])
   );
   assert.notEqual(
     wrongAnchor.moved,
