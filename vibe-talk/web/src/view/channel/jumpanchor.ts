@@ -51,6 +51,8 @@ export interface JumpAnchor {
   note(row: HTMLElement, id: string): void;
   /** The held row, re-found by its message in the rows now drawn, or null once the hold is over. */
   row(): HTMLElement | null;
+  /** `#1846` step 5: the held message id, or null (the window pins it mounted). */
+  id(): string | null;
   /** Put the held row back where the jump put it. True where a row is held and was placed. */
   place(): boolean;
   /** Let the anchor go: the reader moved, the mark went out, or another place was taken. */
@@ -209,6 +211,7 @@ export function createJumpAnchor(deps: JumpAnchorDependencies): JumpAnchor {
       watch();
     },
     row,
+    id: () => (current() ? (hold as JumpHold).id : null),
     place,
     clear,
     checkLost,

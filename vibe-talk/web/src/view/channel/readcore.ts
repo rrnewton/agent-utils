@@ -317,6 +317,8 @@ export interface TimelineViewDependencies {
    * the viewport and the mounted-row cap, from the device settings (windowed.ts). Absent: off.
    */
   windowed?(): { prefetchPx: number; rowCap: number } | null;
+  /** `#1846` step 5: ids pinned into the window (jump/search target, speaking row). Absent: none. */
+  pinnedIds?(): readonly string[];
   screensView(): string;
   renderJumpNewest(): void;
 }
@@ -523,6 +525,21 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
     const selectionNow = deps.selectionIn ? deps.selectionIn(list) : null;
     if (selectionNow) {
       const at = groups.findIndex((group) => group.some((message) => String(message.id) === selectionNow.id));
+      if (at >= 0 && (at < slice.from || at >= slice.to)) {
+        const from = Math.max(0, Math.min(at - Math.floor(cfg.rowCap / 3), groups.length - cfg.rowCap));
+        slice = { from, to: Math.min(groups.length, from + cfg.rowCap) };
+      }
+    }
+    // Step 5 pins: jump/search/speaking ids and the focused row stay mounted.
+    const pinIds = new Set<string>(deps.pinnedIds ? deps.pinnedIds() : []);
+    const active = list.ownerDocument.activeElement;
+    if (active && list.contains(active)) {
+      const row = (active as HTMLElement).closest("[data-context-id],[data-message-id]");
+      const pid = row?.getAttribute("data-context-id") || row?.getAttribute("data-message-id");
+      if (pid) pinIds.add(pid);
+    }
+    for (const pid of pinIds) {
+      const at = groups.findIndex((group) => group.some((message) => String(message.id) === pid));
       if (at >= 0 && (at < slice.from || at >= slice.to)) {
         const from = Math.max(0, Math.min(at - Math.floor(cfg.rowCap / 3), groups.length - cfg.rowCap));
         slice = { from, to: Math.min(groups.length, from + cfg.rowCap) };
