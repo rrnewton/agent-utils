@@ -1558,18 +1558,18 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     let at = 0;
     while (at < entries.length) {
       const entry = entries[at];
+      if (entry === undefined) break;
       if (entry.kind === "turn") {
         const pair: DiscussEntryShape[] = [entry];
         at += 1;
         if (entry.speaker === "you" && at < entries.length) {
           const next = entries[at];
-          if (next.kind === "turn" && next.speaker !== "you") {
+          if (next !== undefined && next.kind === "turn" && next.speaker !== "you") {
             pair.push(next);
             at += 1;
           }
         }
-        const first = pair[0];
-        const when = first.kind === "turn" ? first.at_ms : 0;
+        const when = entry.at_ms;
         const details = document.createElement("details");
         details.className = "discuss-qa discuss-collapsible";
         const summary = document.createElement("summary");
