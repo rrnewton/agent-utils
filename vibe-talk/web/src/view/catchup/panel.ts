@@ -1909,7 +1909,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         // `#1761`: a window cut short of the thread's start says so, visibly —
         // never a partial window presented as the whole.
         sayStatus(answer.window?.truncated === true
-          ? `Read ${unread} unread of ${count}. Older messages are not covered: fetching them did not finish.`
+          ? `Read ${unread} unread of ${count}. Older messages weren't fetched, so this covers the newest part only — summarize again later to include more of them.`
           : `Read ${unread} unread of ${count}`);
         drawAnswer(answer, null);
         drawTerms(answer);

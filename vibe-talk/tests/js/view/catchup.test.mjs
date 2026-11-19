@@ -722,6 +722,22 @@ test("catchup: a scope's covered ranges survive a reload through the kept covera
 });
 
 
+
+test("catchup: a cut-short window says it covers the newest part only and what to do (#1875)", async () => {
+  const fx = fixture({
+    respond: () => Promise.resolve(answer({ window: { count: 99, unread_count: 2, truncated: true } })),
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    assert.equal(
+      fx.els["discuss-status"].textContent,
+      "Read 2 unread of 99. Older messages weren't fetched, so this covers the newest part only — summarize again later to include more of them.");
+  } finally { fx.restore(); }
+});
+
 test("catchup: a gap in a scope's summaries shows the uncovered line and its press cleans up exactly the missed messages (#1843)", async () => {
   const T25 = new Date(2026, 8, 20, 9, 52, 30).getTime();
   const T3 = new Date(2026, 8, 20, 9, 53).getTime();

@@ -304,12 +304,20 @@ class Walk:
         self.shot(f"{label}-05-gap-line")
         viewport = page.viewport_size
         if viewport is not None and viewport["width"] == 412:
+            # The keyboard shot stands with the Ask field focused, as a
+            # reader mid-question would have it.
+            page.locator("#discuss-followup").click()
             # The phone corner with the keyboard really open: the viewport
             # shrinks by the keyboard's 336px and the visual viewport with it.
             page.set_viewport_size({"width": 412, "height": viewport["height"] - 336})
             page.wait_for_function(
                 "() => (window.visualViewport ? window.visualViewport.height : window.innerHeight)"
                 f" === {viewport['height'] - 336}", timeout=20_000)
+            # Focus stays in the Ask field; the pane scrolls to its foot,
+            # where the line stands and the field is still in view.
+            page.evaluate(
+                "() => { const p = document.getElementById('discuss-panel');"
+                " p.scrollTop = p.scrollHeight; }")
             self.shot(f"{label}-05b-gap-line-keyboard-open")
             page.set_viewport_size(viewport)
             page.wait_for_function(
