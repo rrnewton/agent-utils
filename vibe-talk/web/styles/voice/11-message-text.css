@@ -485,6 +485,12 @@
   min-height: 2.5rem;
 }
 
+/* With no chip to show the row does not render at all: no blank panel
+   over the head of the list, and no space taken (`#1899` follow-up). */
+.search-bucket-row:not(:has(> .search-bucket-chip:not([hidden]))) {
+  display: none !important;
+}
+
 .search-bucket-chip {
   min-height: 2.5rem;
   padding: 0.45rem 0.85rem;

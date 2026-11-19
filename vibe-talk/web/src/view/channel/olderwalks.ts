@@ -1195,6 +1195,7 @@ function renderServerSearch() {
   const grouped = bucketHits();
   const counts = bucketCounts(grouped);
   const view = bucketView();
+  let anyChip = false;
   for (const def of searchBucketDefs) {
     const chip = bucketChip(def.id);
     if (!chip) continue;
@@ -1202,17 +1203,21 @@ function renderServerSearch() {
     const show = count > 0;
     if (chip.hidden === show) chip.hidden = !show;
     if (!show) continue;
+    anyChip = true;
     const words = typeof def.words === "function" ? def.words(view) : def.words;
     setTextIfChanged(chip, `${count} ${words}`);
     const pressed = bucketOnNow(def.id) ? "true" : "false";
     if (chip.getAttribute("aria-pressed") !== pressed) chip.setAttribute("aria-pressed", pressed);
   }
   const bucketRow = el("search-bucket-row");
-  // The row stands whenever a search is typed, at the stable height
-  // web/voice.css gives it, so a pending answer's empty row and the chips
-  // that replace it move nothing (`#243`). (`#1852`: Whole threads moved to
-  // the search bar, so the row carries buckets alone.)
-  if (bucketRow.hidden) bucketRow.hidden = false;
+  // The row stands only while a chip stands (`#1899` follow-up, liaison
+  // scene 80): with no bucket hits it takes no space at all, so its opaque
+  // panel never covers the head of the list. While an answer is pending
+  // the chips are simply not up yet; the head the row will take is the
+  // panel's stable height once they land (`#243` still holds for the
+  // reader's place through `preservingScroll` below). (`#1852`: Whole
+  // threads moved to the search bar, so the row carries buckets alone.)
+  if (bucketRow.hidden === anyChip) bucketRow.hidden = !anyChip;
   // `#1901 vibe-talk-search-late-hits-shift-anchor`: a late round (a gated
   // second page, a Search-further-back grow) inserts its hits above the
   // reader's anchor with scrollTop unchanged, shifting what they read down

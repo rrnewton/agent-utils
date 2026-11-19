@@ -234,6 +234,14 @@ def walk_through(walk: Walk, keyboard: bool) -> None:
     walk.check(threads is not None and threads["pressed"] == "false" and main is not None and main["pressed"] == "true",
                f"the new search states are main={main} threads={threads}")
     walk.shot("new-search-unpressed")
+    # A search with no bucket hits: the pinned row does not render at all
+    # (no blank panel over the head of the list, no space taken).
+    page.fill("#search-field", "routine")
+    walk.until("() => { const r = document.getElementById('search-bucket-row');"
+               " return r && r.hidden && getComputedStyle(r).display === 'none'; }",
+               "the empty bucket row still renders with no chips to show")
+    walk.settled()
+    walk.shot("no-bucket-hits-no-panel")
     if keyboard:
         page.evaluate("() => window.__iosClose()")
 
