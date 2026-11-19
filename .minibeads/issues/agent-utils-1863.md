@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-run-sh-mocks-bind-port-zero: every mock run.sh starts binds port 0 and reports its bound port back'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -32,3 +32,7 @@ The screenshot port claims (#1037, extended to four ports by #1855) only exclude
 # Notes
 
 Gate infrastructure, not owner UI: gate normally, no owner priority. Follow-up to #1855 vibe-talk-screenshot-harness-real-states, whose four-port claim this replaces for the mocks.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as f9688c88 (gate pass on b573f74c, ledger verdict pass, finished 2026-11-19T00:57:36Z; overlap on screenshots.py verified — replayed tree identical to the checked tree). Every mock run.sh starts now binds port 0 and reports its bound port back: the ElevenLabs mock gained `--ports-file` (with a new `MockHandle::http_addr()`), the model stub gained `--port-file`; run.sh starts both on port 0, waits on the port files, readiness-polls the learned ports, and only then writes the server config with the real `api_base`/`base_url`. The P+1/P+2/P+3 derivation and its refusal checks are gone; the server port keeps its claim. Also in this change, per coordb: keyboard-open shots focus the field under test first (`shrink_keyboard` focuses the composer or the Discuss box, scrolls it into the shrunk viewport, and fails the run by name when it lands outside; new matrix state 77-composer-keyboard-open; scenes 75/76 checked — 76 now focuses the Discuss box), and every screenshot run writes `BUILD.txt` (commit, commit-date, page-build) into the shot folder. Overlap note: mu-flakes3's dc86e5fa implemented the same mock pattern independently and was dropped in favour of this one; their JSON ports-file protocol is equivalent to the text one landed here. Evidence: two concurrent screenshot runs under a squatter on 18091-18094 both passed (mocks on kernel ports); matrix 20/20 (73-77, both themes, android-412 + laptop-1280); self-test 62 controls; local validates green (181 passed). The first gate's two reds (keyboard-browser, scroll-stability-browser) pass in all local validates and in exclusive --selected reruns (both EXIT 0) — contention on the loaded host, not this change.
