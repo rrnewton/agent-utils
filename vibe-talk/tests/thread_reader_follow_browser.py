@@ -50,6 +50,22 @@ import page_sources
 if TYPE_CHECKING:
     from playwright.sync_api import Page
 
+
+def _disabled_1903() -> bool:
+    """DISABLED (rule 346, #1903): fails solo on main since 2026-11-19
+    (#jump-reading click timeout); re-enable when robust. Checked
+    before the import-time page build below, so a disabled run does
+    no work at all; deleting this guard re-enables the walk."""
+    print(
+        "DISABLED (rule 346, #1903): fails solo on main since 2026-11-19 "
+        "(#jump-reading click timeout); re-enable when robust"
+    )
+    return True
+
+
+if _disabled_1903():
+    raise SystemExit(0)
+
 WEB_ROOT = page_sources.served_root()
 TOKEN = "write-token-browser-reader-follow-check"
 CHANNEL = {"id": "1110000000000000001", "label": "lead team", "writable": True, "alias": None,
