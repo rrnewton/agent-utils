@@ -59,6 +59,8 @@ pub struct TurnoverOptions {
     pub dry_run: bool,
     /// Also print the JSON document fields the text report carries.
     pub health_timeout: Duration,
+    /// Explicit per-unit health timeouts; see `RefreshOptions`.
+    pub health_timeouts: std::collections::BTreeMap<String, Duration>,
     /// Headless turn wait, as in refresh.
     pub headless_wait: Duration,
     /// Notify command (flag form; a registry's own setting wins per registry).
@@ -973,6 +975,7 @@ pub fn turnover(
         notes.extend(plan_lines.into_iter().map(|line| format!("plan: {line}")));
     }
 
+    let mut rolled_back: Vec<String> = Vec::new();
     if !options.report_only && !options.dry_run && any_refresh {
         let (snapshot, _built) = snapshot::build(
             host,
@@ -1044,6 +1047,8 @@ pub fn turnover(
                     dry_run: false,
                     force: false,
                     health_timeout: options.health_timeout,
+                    health_timeouts: options.health_timeouts.clone(),
+                    continue_after_rollback: true,
                     headless_wait: options.headless_wait,
                     refreshes_dir: options.root.join("refreshes"),
                     drop_in_dir: options.drop_in_dir.clone(),
@@ -1053,7 +1058,36 @@ pub fn turnover(
                     super::refresh(host, tables, registry, &options.root, &refresh_options)?;
                 refresh_text.push_str(&report.text);
                 exit_code = exit_code.max(report.exit_code);
-                if report.exit_code != 0 {
+                // A unit whose rollback completed stays on its old binary
+                // and is reported at the end; the remaining units still
+                // move (#1890). Anything harder stops the run.
+                let actions: Vec<&str> = report.document["services"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry["action"].as_str())
+                    .collect();
+                for entry in report.document["services"].as_array().into_iter().flatten() {
+                    if entry["action"] == "rolled-back" {
+                        if let Some(unit) = entry["unit"].as_str() {
+                            rolled_back.push(unit.to_owned());
+                        }
+                    }
+                }
+                let only_rollbacks = actions.iter().any(|action| *action == "rolled-back")
+                    && actions.iter().all(|action| {
+                        matches!(
+                            *action,
+                            "rolled-back"
+                                | "refreshed"
+                                | "current"
+                                | "skipped"
+                                | "updated-inactive"
+                                | "would-refresh"
+                        )
+                    });
+                let hard_failure = report.exit_code != 0 && !only_rollbacks;
+                if hard_failure {
                     stopped = true;
                 }
                 for entry in report.document["services"].as_array().into_iter().flatten() {
@@ -1186,6 +1220,7 @@ pub fn turnover(
         &notes,
         &refresh_documents,
         &refresh_text,
+        &rolled_back,
         options,
         exit_code,
     ))
@@ -1213,6 +1248,7 @@ fn render(
     notes: &[String],
     refresh_documents: &[Value],
     refresh_text: &str,
+    rolled_back: &[String],
     options: &TurnoverOptions,
     exit_code: i32,
 ) -> TurnoverReport {
@@ -1249,6 +1285,7 @@ fn render(
         "unreadable": unreadable.iter().map(|(unit, error)| json!({"unit": unit, "error": error})).collect::<Vec<_>>(),
         "notes": notes,
         "refreshes": refresh_documents,
+        "rolled_back": rolled_back,
         "behind": behind,
         "exit_code": exit_code,
     });
@@ -1302,6 +1339,13 @@ fn render(
         let _ = writeln!(text, "{note}");
     }
     text.push_str(refresh_text);
+    if !rolled_back.is_empty() {
+        let _ = writeln!(
+            text,
+            "turnover: rolled back and left on the old binary: {}",
+            rolled_back.join(", ")
+        );
+    }
     let _ = writeln!(
         text,
         "turnover: {} service(s), {} to refresh, candidate {}",

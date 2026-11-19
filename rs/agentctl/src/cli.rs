@@ -758,6 +758,9 @@ struct ServicesRefresh {
     /// Seconds a restarted service has to pass its health check, 10-3600 (default: 120)
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(10..=3600), value_name = "SECONDS")]
     health_timeout: u64,
+    /// Explicit health timeout for one unit, UNIT=SECONDS (10-3600); repeat for several. Wins exactly over the scaled watch window
+    #[arg(long = "health-timeout-for", value_name = "UNIT=SECONDS")]
+    health_timeout_for: Vec<String>,
     /// Seconds to wait for a headless agent in a turn to go idle before skipping it, 0-86400 (default: 600)
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
     headless_wait: u64,
@@ -801,6 +804,9 @@ struct ServicesTurnover {
     /// Seconds a restarted service has to pass its health check, 10-3600 (default: 120)
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(10..=3600), value_name = "SECONDS")]
     health_timeout: u64,
+    /// Explicit health timeout for one unit, UNIT=SECONDS (10-3600); repeat for several. Wins exactly over the scaled watch window
+    #[arg(long = "health-timeout-for", value_name = "UNIT=SECONDS")]
+    health_timeout_for: Vec<String>,
     /// Seconds to wait for a headless agent in a turn to go idle before skipping it, 0-86400 (default: 600)
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
     headless_wait: u64,
@@ -3644,6 +3650,8 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
                 dry_run: refresh.dry_run,
                 force: refresh.force,
                 health_timeout: Duration::from_secs(refresh.health_timeout),
+                health_timeouts: parse_health_timeouts(&refresh.health_timeout_for)?,
+                continue_after_rollback: false,
                 headless_wait: Duration::from_secs(refresh.headless_wait),
                 refreshes_dir: root.join("refreshes"),
                 drop_in_dir,
@@ -3753,6 +3761,7 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
                 report_only: turnover.report,
                 dry_run: turnover.dry_run,
                 health_timeout: Duration::from_secs(turnover.health_timeout),
+                health_timeouts: parse_health_timeouts(&turnover.health_timeout_for)?,
                 headless_wait: Duration::from_secs(turnover.headless_wait),
                 notify,
                 global_binary,
@@ -6095,6 +6104,29 @@ fn waiting_requests(registry: &Path, name: &str) -> Option<(Value, String)> {
 /// Every agent's failed-queue entries (#903 queue-failed-digest), as
 /// `failed_queue` rows for `agentctl requests`: agent, id, sender, first
 /// line and arrival label, newest first per agent.
+/// Parse `--health-timeout-for UNIT=SECONDS` entries into per-unit timeouts.
+fn parse_health_timeouts(
+    entries: &[String],
+) -> Result<std::collections::BTreeMap<String, Duration>, Failure> {
+    let mut timeouts = std::collections::BTreeMap::new();
+    for entry in entries {
+        let (unit, seconds) = entry
+            .split_once('=')
+            .ok_or_else(|| Failure::Usage(format!("--health-timeout-for {entry:?}: use UNIT=SECONDS")))?;
+        let seconds: u64 = seconds
+            .parse()
+            .ok()
+            .filter(|value| (10..=3600).contains(value))
+            .ok_or_else(|| {
+                Failure::Usage(format!(
+                    "--health-timeout-for {entry:?}: seconds must be 10-3600"
+                ))
+            })?;
+        timeouts.insert(unit.to_owned(), Duration::from_secs(seconds));
+    }
+    Ok(timeouts)
+}
+
 fn failed_queue_rows(registry: &Path) -> Vec<Value> {
     let mut rows = Vec::new();
     let Ok(names) = agent_queue::registry::names(registry) else {

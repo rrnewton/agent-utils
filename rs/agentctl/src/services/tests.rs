@@ -770,6 +770,8 @@ fn options(world: &World) -> RefreshOptions {
         dry_run: false,
         force: false,
         health_timeout: Duration::from_secs(60),
+        health_timeouts: std::collections::BTreeMap::new(),
+        continue_after_rollback: false,
         headless_wait: Duration::from_secs(30),
         refreshes_dir: world.root.join("refreshes"),
         drop_in_dir: world.fake.drop_in_dir.clone(),
@@ -989,6 +991,155 @@ fn dry_run_changes_and_writes_nothing() {
         .iter()
         .all(|call| !call.starts_with("stop")));
     assert!(!world.root.join("refreshes").exists());
+}
+
+fn add_repair_watch(world: &World, interval: u64) {
+    let registry = world.registry.to_string_lossy().into_owned();
+    world.fake.add_unit_file(
+        "repair-watch.service",
+        &format!(
+            "[Unit]\nDescription=repair watch\n\n[Service]\nEnvironment=PATH=/usr/bin:/bin\nExecStart=/state/bin/agentctl-old --registry {registry} watch --state-dir /state/repairwatch --interval {interval}\nRestart=on-failure\n"
+        ),
+    );
+}
+
+#[test]
+fn a_slow_first_watch_pass_gets_a_scaled_health_window() {
+    // #1890: a kind=watch unit's first pass on a large registry takes
+    // longer than the plain 120 s window; the window scales from its
+    // configured interval (600 + 90), so a healthy slow pass refreshes.
+    let world = world();
+    add_repair_watch(&world, 600);
+    world
+        .fake
+        .watch_pass_delay
+        .set(Duration::from_secs(300));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["repair-watch.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert_eq!(
+        report.document["services"][0]["action"], "refreshed",
+        "{}",
+        report.text
+    );
+}
+
+#[test]
+fn an_explicit_per_unit_health_timeout_wins_over_the_scaled_window() {
+    // #1890: --health-timeout-for names the window exactly, even when
+    // the scaled window would have waited longer.
+    let world = world();
+    add_repair_watch(&world, 600);
+    world
+        .fake
+        .watch_pass_delay
+        .set(Duration::from_secs(300));
+    let (services, _) = discover(&world.fake, &Tables, &world.registry).unwrap();
+    let mut only = options(&world);
+    only.only = vec!["repair-watch.service".into()];
+    only.health_timeout = Duration::from_secs(120);
+    only.health_timeouts
+        .insert("repair-watch".to_owned(), Duration::from_secs(30));
+    let report = refresh(&world.fake, &services, &only).unwrap();
+    // The exact 30 s window governs the forward check (and the rollback
+    // check, which therefore also fails): the scaled 690 s never applies.
+    assert!(
+        report.text.contains("no healthy state within 30 s"),
+        "{}",
+        report.text
+    );
+    assert_eq!(report.exit_code, 4, "{}", report.text);
+}
+
+#[test]
+fn turnover_continues_past_a_completed_rollback() {
+    // #1890: one unit's rollback no longer stops the whole run; the
+    // remaining units still move and the rollback is reported at the end.
+    let world = world();
+    let (checkout, old, new) = turnover_checkout(&world._temporary.0);
+    // Fabricate the candidate snapshot so the build step reuses it
+    // (as in turnover_refreshes_bridges_last_and_notifies_in_order).
+    let release = world._temporary.0.join("release");
+    fs::create_dir_all(&release).unwrap();
+    for name in ["agentctl", "agentctl-slack-outbound", "agentctl-slack-plugin"] {
+        fs::write(release.join(name), format!("#!/bin/sh\necho {name}\n")).unwrap();
+    }
+    let destination = world.root.join("snapshots").join(&new[..12]);
+    fs::create_dir_all(destination.join("bin")).unwrap();
+    fs::create_dir_all(destination.join("home/plugins/slack")).unwrap();
+    for (from, to) in [
+        ("agentctl", snapshot::AGENTCTL),
+        ("agentctl-slack-outbound", snapshot::OUTBOUND),
+        ("agentctl-slack-plugin", snapshot::PLUGIN),
+    ] {
+        fs::copy(release.join(from), destination.join(to)).unwrap();
+    }
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../chat-subscription-slack/manifest.json"),
+        destination.join(snapshot::MANIFEST),
+    )
+    .unwrap();
+    let files: serde_json::Map<String, Value> = [
+        snapshot::AGENTCTL,
+        snapshot::OUTBOUND,
+        snapshot::PLUGIN,
+        snapshot::MANIFEST,
+    ]
+    .into_iter()
+    .map(|relative| {
+        (
+            relative.to_owned(),
+            json!({"sha256": world.fake.file_sha256(&destination.join(relative)), "bytes": 1}),
+        )
+    })
+    .collect();
+    fs::write(
+        destination.join("snapshot.json"),
+        json!({
+            "schema": snapshot::SNAPSHOT_SCHEMA,
+            "commit": new,
+            "built_at": 1_800_000_000_u64,
+            "source": {"test": true},
+            "files": files,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(destination.join(snapshot::AGENTCTL), new.clone());
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    // Every unit starts from the candidate binary, and it crashes: the
+    // watcher group rolls back first, and the bridge group must still be
+    // attempted (and roll back too) instead of never being tried.
+    *world.fake.crashing.borrow_mut() = Some(destination.join(snapshot::AGENTCTL));
+    let mut options = turnover_options(&world, checkout);
+    options.report_only = false;
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 1, "{}", report.text);
+    let rolled = report.document["rolled_back"].as_array().unwrap();
+    assert!(
+        rolled.iter().any(|unit| unit == "watch.service")
+            && rolled.iter().any(|unit| unit == "bridge.service"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report
+            .text
+            .contains("rolled back and left on the old binary:"),
+        "{}",
+        report.text
+    );
 }
 
 #[test]
@@ -1521,6 +1672,7 @@ fn turnover_options(world: &World, checkout: PathBuf) -> TurnoverOptions {
         report_only: true,
         dry_run: false,
         health_timeout: Duration::from_secs(60),
+        health_timeouts: std::collections::BTreeMap::new(),
         headless_wait: Duration::from_secs(30),
         notify: None,
         global_binary: None,
@@ -2100,6 +2252,7 @@ fn turnover_expands_percent_h_in_execstart_and_honours_the_pin_it_finds() {
         report_only: true,
         dry_run: false,
         health_timeout: Duration::from_secs(60),
+        health_timeouts: std::collections::BTreeMap::new(),
         headless_wait: Duration::from_secs(30),
         notify: None,
         global_binary: None,

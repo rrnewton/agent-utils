@@ -59,6 +59,12 @@ pub struct RefreshOptions {
     pub force: bool,
     /// How long a restarted service has to pass its health check.
     pub health_timeout: Duration,
+    /// Explicit per-unit health timeouts (unit name, with or without
+    /// `.service`): these win exactly over the scaled window (#1890).
+    pub health_timeouts: std::collections::BTreeMap<String, Duration>,
+    /// Keep refreshing the remaining units after one unit's rollback
+    /// completes (turnover); a failed rollback still stops the run.
+    pub continue_after_rollback: bool,
     /// How long to wait for a busy headless agent to finish its turn before skipping it.
     pub headless_wait: Duration,
     /// Where rollback material goes: one directory per run under it.
@@ -491,10 +497,16 @@ fn strip_deleted(path: PathBuf) -> PathBuf {
     }
 }
 
-/// The health timeout for a service: a watcher or watch daemon gets at least its pass
-/// budget (or, for `watch`, its interval), a soak and a margin, since its first pass may
-/// take that long (#1900; kept minimal for the #1890 rebase).
+/// The health timeout for a service: an explicit per-unit timeout wins
+/// exactly (#1890); a watcher or watch daemon otherwise gets at least its
+/// pass budget (or, for `watch`, its interval), a soak and a margin, since
+/// its first pass may take that long (#1900).
 fn health_timeout(service: &Service, options: &RefreshOptions) -> Duration {
+    for name in [service.unit.as_str(), service.unit.trim_end_matches(".service")] {
+        if let Some(timeout) = options.health_timeouts.get(name) {
+            return *timeout;
+        }
+    }
     let budget = match service.kind {
         Kind::Watcher => option_value(&service.args, "pass-budget-seconds")
             .and_then(|value| value.parse::<u64>().ok())
@@ -1192,9 +1204,9 @@ pub fn refresh(
                 rollback,
                 changed,
             }) => {
-                stopped = true;
                 entry["error"] = json!(error);
                 if !changed {
+                    stopped = true;
                     exit_code = exit_code.max(1);
                     entry["action"] = json!("failed-unchanged");
                     text.push_str(&format!(
@@ -1205,6 +1217,10 @@ pub fn refresh(
                 }
                 match rollback {
                     Ok(detail) => {
+                        // A completed rollback leaves the unit as it was:
+                        // turnover continues with the remaining units
+                        // (#1890); other callers keep stop-on-failure.
+                        stopped = !options.continue_after_rollback;
                         exit_code = exit_code.max(1);
                         entry["action"] = json!("rolled-back");
                         entry["rollback_health"] = json!(detail);
@@ -1213,6 +1229,7 @@ pub fn refresh(
                         ));
                     }
                     Err(rollback_error) => {
+                        stopped = true;
                         exit_code = 4;
                         entry["action"] = json!("rollback-failed");
                         entry["rollback_error"] = json!(rollback_error);
