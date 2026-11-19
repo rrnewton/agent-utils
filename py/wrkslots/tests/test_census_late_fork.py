@@ -642,3 +642,119 @@ def test_unrelated_churn_that_dies_before_its_scan_never_blocks_closure(
     census.assert_slot_unused(slot, None, ignore_current_process=False)
     # Closure needed only the proven rounds, not the refusal bound.
     assert len(host.inventories) < cli._SAME_UID_CENSUS_INVENTORIES + 2
+
+
+_CHAIN_HOLDER = """
+import os, sys, time
+
+os.chdir(sys.argv[1])
+sys.stdout.write("ready\\n")
+sys.stdout.flush()
+for _hop in range(2):
+    sys.stdin.readline()
+    if os.fork() == 0:
+        sys.stdout.write(f"{os.getpid()}\\n")
+        sys.stdout.flush()
+        continue
+    os._exit(0)
+while True:
+    time.sleep(60)
+"""
+
+
+@_REAL_CENSUS_COMMANDS
+def test_a_real_holder_dying_during_the_batched_read_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slot: Path,
+) -> None:
+    """H passes the direct probe alive, forks C and dies while find/grep
+    reads it (so the batched stage reports it complete and gone); C does
+    the same to G; G lives in the slot.  With the real readers the census
+    must still report G or refuse, never close clean (#1883 review)."""
+
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    real_observations = cli._same_uid_process_observations
+    inventories: list[tuple[int, ...]] = []
+    holder = subprocess.Popen(
+        [sys.executable, "-I", "-c", _CHAIN_HOLDER, str(slot)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        cwd="/",
+    )
+    descendants: list[int] = []
+    forked: list[bool] = []
+    try:
+        assert holder.stdout is not None and holder.stdin is not None
+        assert holder.stdout.readline() == "ready\n"
+        (proc_root / str(holder.pid)).symlink_to(Path("/proc") / str(holder.pid))
+        current = [holder]
+
+        def observations(
+            budget: cli._ReadOnlyCommandBudget,
+        ) -> tuple[cli._AbsentProcessObservation, ...]:
+            listed = real_observations(budget, proc_root)
+            inventories.append(tuple(process.pid for process in listed))
+            return listed
+
+        real_run = cli._run_same_uid_command
+
+        def run_timed(
+            program: Path,
+            arguments: Sequence[str],
+            *,
+            input_data: bytes | None = None,
+            input_limit: int = 1024 * 1024,
+            budget: cli._ReadOnlyCommandBudget | None = None,
+        ) -> tuple[int, bytes, bytes]:
+            # The holder forks and dies as the batched find starts, so
+            # it passed the direct probe alive and is gone for find.
+            if program.name.startswith("find") and len(descendants) < 2:
+                parent = current[0]
+                assert parent.stdin is not None and parent.stdout is not None
+                parent.stdin.write("fork\n")
+                parent.stdin.flush()
+                child = int(parent.stdout.readline())
+                descendants.append(child)
+                assert parent.wait(timeout=10) == 0
+                (proc_root / str(child)).symlink_to(Path("/proc") / str(child))
+                deadline = time.monotonic() + 10
+                while os.readlink(Path("/proc") / str(child) / "cwd") != str(slot):
+                    assert time.monotonic() < deadline, "descendant never ran in the slot"
+                    time.sleep(0.01)
+                forked.append(True)
+            return real_run(
+                program, arguments, budget=budget or _budget(), input_data=input_data
+            )
+
+        def privileged_as_same_uid(
+            program: Path,
+            arguments: Sequence[str],
+            *,
+            input_data: bytes | None = None,
+            input_limit: int = 1024 * 1024,
+            budget: cli._ReadOnlyCommandBudget | None = None,
+        ) -> tuple[int, bytes, bytes]:
+            del input_limit
+            return run_timed(
+                program, arguments, budget=budget, input_data=input_data
+            )
+
+        monkeypatch.setattr(cli, "_same_uid_process_observations", observations)
+        monkeypatch.setattr(cli, "_run_same_uid_command", run_timed)
+        monkeypatch.setattr(cli, "_run_root_owned_command", privileged_as_same_uid)
+        census = cli._capture_same_uid_process_path_census((slot,), budget=_budget())
+        (last,) = descendants[-1:]
+        assert {(pid, kind, detail) for pid, _s, kind, detail in census.matches} == {
+            (last, "link", str(slot))
+        }, f"inventories={inventories} descendants={descendants} matches={census.matches}"
+        with pytest.raises(cli.Refusal, match=rf"live process {last} uses slot "):
+            census.assert_slot_unused(slot, None)
+    finally:
+        for pid in descendants:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        holder.kill()
+        holder.wait(timeout=10)
