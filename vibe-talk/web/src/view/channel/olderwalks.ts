@@ -199,9 +199,13 @@ export interface SearchBucketDef {
 
 const searchBucketDefs: SearchBucketDef[] = [
   { id: "thread", words: "in this thread", defaultOn: (view) => view === "thread" },
-  { id: "main", words: "in main", defaultOn: (view) => view !== "thread" },
+  // `#1894 vibe-talk-search-extra-hits-off-by-default`: only the home bucket
+  // (this thread in a thread view, main elsewhere, Transcripts on its own
+  // screen) starts on at a new search; every extra bucket is the reader's
+  // tap on its chip away, never an uninvited interleave that moves them.
+  { id: "main", words: "in main", defaultOn: (view) => view !== "thread" && view !== "transcripts" },
   { id: "threads", words: (view) => (view === "thread" ? "in other threads" : "in threads"),
-    defaultOn: (view) => view === "flat" || view === "threads" },
+    defaultOn: () => false },
 ];
 
 /** The bucket registry: `#1608` plugs its Agent Transcripts bucket in here. */

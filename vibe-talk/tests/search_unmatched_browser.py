@@ -495,6 +495,12 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     walk.check(scope.startswith("No upstream search · this page: back to ") and
                " · server: back to " in scope and "(still expanding)" in scope and
                scope.endswith("messages searched"), f"the line says {scope!r}")
+    # `#1894`: the thread hits are extra results - off by default at the new
+    # search, standing only when the reader taps their chip.
+    walk.check(page.evaluate(HITS_JS) == ["150"], f"before the chip the hits are {page.evaluate(HITS_JS)}")
+    walk.press("#search-bucket-threads")
+    walk.until("() => document.querySelectorAll('#discord-log > li[data-server-hit]').length === 3",
+               "the threads chip did not interleave its hits")
     walk.check(page.evaluate(HITS_JS) == ["151", "152", "150"], f"the hits are {page.evaluate(HITS_JS)}")
     line = page.evaluate(BOX_JS, "#search-scope")
     width = float(page.evaluate("() => window.innerWidth"))
