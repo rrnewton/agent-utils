@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-bucket-chips-pinned: bucket chips stay under the search bar, plainly pressed or not'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,7 @@ labels:
 - search
 - ui
 created_at: 2026-11-19T04:42:21-05:00
-updated_at: 2026-11-19T04:42:21-05:00
+updated_at: 2026-11-19T12:59:27-05:00
 ---
 
 # Description
@@ -34,3 +34,7 @@ The bucket row `search-bucket-row` in `vibe-talk/web/voice.html` stands inside `
 # Notes
 
 Follow-up to #1894 vibe-talk-search-extra-hits-off-by-default. Coordinates on the same code: `searchBucketDefs`/`renderServerSearch` in `vibe-talk/web/src/view/channel/olderwalks.ts`, `listcontrols.ts` chip listeners, `voice.html` `search-bucket-row`, and the bucket-row / chip rules in `11-message-text.css` and `12-channel-rows.css`.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 5730d703 on github/main. The bucket row moved out of the scrolling list into the search panel directly under the search field/filter row (#channel-freshness-anchor, outside #scroll-area), on an opaque panel ground with its head reserved while a chip stands, so the chips stay visible after scrolling to the bottom at 412x915 and 1280x800, keyboard open and closed; a pressed chip wears a filled accent ground with a check from aria-pressed at AA contrast in light and dark, unpressed quiet. #1894 held: extra buckets start off at every new search, late landings keep the scroll. Also folded in the liaison's two shot findings: the pinned row's opaque backing (no scrolled content through it) and the author-filter tooltip as a real page bug — edge-aligned inside the viewport and never raised by sticky touch hover. Evidence: pinned walk 5/5 plus page suite 2564/2564 on the final tree and on main, gate pass on the gated tree with the overlap verified on the combined tree; shots in /tmp/mu-chippin-shots-after with BUILD.txt, before in /tmp/mu-chippin-shots-before, scene 80 before/after in /tmp/scene80-check and /tmp/scene80-after.
