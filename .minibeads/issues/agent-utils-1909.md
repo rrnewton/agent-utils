@@ -1,12 +1,12 @@
 ---
 title: 'vibe-talk-documents-filter-bar-fixed: the Documents filter row is a fixed bar above the bottom bar, Starred a star icon on the bottom bar'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
 - vibe-talk
 created_at: 2026-11-19T15:14:54.000000000+00:00
-updated_at: 2026-11-19T15:14:54.000000000+00:00
+updated_at: 2026-11-19T22:06:27.000000000+00:00
 ---
 
 # Description
@@ -64,3 +64,24 @@ per-card stars), #1176 doc-kind-buckets (the type buckets).
 Owner screenshots (phone, dark) showed the chip row at the foot of
 the list with Starred wrapped to a second row, and All and Starred
 both reading pressed over a one-document starred result.
+
+## Resolution
+
+[watermelon-full-preview] Landed 525c8e88 on github/main. The bucket
+chips now render into a fixed dock bar (`#docs-filter-bar`) directly
+above the bottom control bar — one row, sideways scroll, opaque,
+list-only — and Starred is a star icon toggle (`#docs-starred-toggle`)
+in the bottom bar's pack (outline off, filled gold on, `aria-pressed`,
+label "Starred", CSS-hidden in the reader), composing with the bucket
+through `list.setStarredOnly`. A pressed bucket is filled accent with
+a check; exactly one bucket reads pressed in light and dark. The
+sibling lane's Back/filter walk (#1908) now clicks the new toggle.
+Evidence: the shared harness matrix (scenes 73-76 and
+83-documents-filter-bar; light and dark, phone 412x915 and desktop
+1280x800) and a seeded 12-document real-server walk (mid-scroll with
+the bar fixed, star off and on, all four theme/size combinations),
+retaken from landed main. The owner gate's only reds were
+reload-place and thread-pin-picker, each passing alone three times
+and in an exclusive rerun; screenshots-desks scene 59 is a
+pre-existing failure on unmodified main under load, waived by the
+coordinator. Deployment is the coordinator's batch.
