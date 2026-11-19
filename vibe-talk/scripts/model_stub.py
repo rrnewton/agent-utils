@@ -38,7 +38,13 @@ ANSWER = (
     "## Review\n"
     "Nothing is blocked. The next step is the review pass.\n\n"
     "Model stub summary: this answer came from the loopback model stub "
-    "through the real Discuss route."
+    "through the real Discuss route.\n\n"
+    # `#1924` (c): the trailing Terms section is the server's own split
+    # (`split_unknown_terms`): it leaves the answer body and stands in
+    # the pane's Terms block, so a shot can show Terms rendering.
+    "## Terms I didn't understand\n"
+    "- cache-key rewrite\n"
+    "- flaky ordering test"
 )
 
 

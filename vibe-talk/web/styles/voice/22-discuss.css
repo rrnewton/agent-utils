@@ -374,10 +374,55 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   margin-top: 10px;
   color: var(--muted);
   font-size: 0.85rem;
+  /* A jump to Terms lands below the pane's sticky head, not under it. */
+  scroll-margin-top: 4.5rem;
 }
 
+/* `#1924` (b)+(c): Terms folds with the same readable triangle as the
+ * summary sections, on a row at least 32px tall, and its list stands
+ * clear of the fold line. */
 #discuss-terms summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  box-sizing: border-box;
+  min-height: 2rem;
+  padding: 0.4rem 0;
   cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#discuss-terms summary::-webkit-details-marker {
+  display: none;
+}
+
+#discuss-terms summary::before {
+  content: "▸";
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 1.5rem;
+  color: var(--muted);
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+#discuss-terms[open] summary::before {
+  content: "▾";
+}
+
+#discuss-terms-list {
+  margin: 2px 0 8px;
+  padding-left: 1.4em;
+}
+
+#discuss-terms-list li {
+  margin: 2px 0;
 }
 
 /* `#1787`: the previous summary's terms while its replacement is read —
@@ -462,13 +507,21 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   display: none;
 }
 
+/* `#1924 vibe-talk-discuss-chips-triangles-terms` (b): the disclosure triangle
+ * stands at a readable size (past the 0.95rem heading's cap height), centred on
+ * the heading's first line in a 2rem-wide box, and the summary row itself is
+ * the tap target (min-height 2.75rem, above the 32px floor). */
 .discuss-collapsible > summary::before {
   content: "▸";
   flex: 0 0 auto;
-  margin-top: 0.12rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 1.5rem;
   color: var(--muted);
-  font-size: 0.8rem;
-  line-height: 1.2;
+  font-size: 1.2rem;
+  line-height: 1;
 }
 
 .discuss-collapsible[open] > summary::before {
@@ -514,11 +567,18 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   display: none;
 }
 
+/* `#1924` (b): same readable triangle as the timeline rows above. */
 .discuss-old-body details > summary::before {
   content: "▸";
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 1.5rem;
   color: var(--muted);
-  font-size: 0.8rem;
+  font-size: 1.2rem;
+  line-height: 1;
 }
 
 .discuss-old-body details[open] > summary::before {
@@ -530,11 +590,11 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
   border-bottom: 1px solid var(--edge);
 }
 
+/* `#1924` (a): size and padding come from `.discuss-chip` alone, so the
+ * per-summary toggles match the chip bars exactly. */
 .discuss-old-toggle {
   flex: 0 0 auto;
   margin-left: auto;
-  font-size: 0.72rem;
-  padding: 0.15rem 0.45rem;
 }
 
 .discuss-old-toggle + .discuss-old-toggle {
@@ -872,6 +932,9 @@ stay its owner's (#1524). The pane itself already ends above the
   #discuss-panel {
     display: flex;
     flex-direction: column;
+    /* `#1924` (d): scrolled-to content clears the sticky composer stacked
+     * over the ask bar, not the ask bar alone. */
+    scroll-padding-bottom: calc(8.5rem + env(safe-area-inset-bottom));
   }
 
   #discuss-panel > * {
@@ -904,12 +967,34 @@ stay its owner's (#1524). The pane itself already ends above the
     order: 1;
     margin-left: auto;
   }
+
+  /* `#1924` (d): the follow-up composer sticks just above the ask bar, so
+   * the whole composer (field, Save draft, Send) stands inside the sheet
+   * instead of sliding half under the sticky Summarize row, keyboard
+   * open and closed. The sticky offset is the ask bar's own height
+   * (8px + 8px padding around its one row); the panel's solid ground
+   * keeps scrolled text from showing through, and the composer's later
+   * place in the panel paints it above the bar if they ever touch. */
+  .discuss-compose {
+    position: sticky;
+    bottom: calc(2.2rem + env(safe-area-inset-bottom));
+    z-index: 1;
+    background: var(--panel);
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
 }
 
 .discuss-collapse-bar { display: flex; gap: 8px; margin: 0 0 6px; }
-.discuss-collapse-bar button { font: inherit; }
 
-/* `#1912`: the Expand/Collapse pairs are small, low-key, centred chips. */
+/* `#1912`: the Expand/Collapse pairs are small, low-key, centred chips.
+ * `#1924` (a): no bar-level font rule stands here. The old
+ * `.discuss-collapse-bar button { font: inherit }` out-specified
+ * `.discuss-chip` (a class plus an element beats a lone class) and reset
+ * every bar chip to the pane's full text size, while the per-summary
+ * toggles outside a bar stayed small — the summary pair read large on
+ * phone for that reason alone. `.discuss-chip` below is now the one
+ * size every pair shares. */
 .discuss-chip-bar {
   display: flex;
   justify-content: center;
@@ -959,13 +1044,18 @@ stay its owner's (#1524). The pane itself already ends above the
   display: none;
 }
 
+/* `#1924` (b): same readable triangle as the timeline rows (Progress, Review). */
 #discuss-answer details > summary::before {
   content: "▸";
   flex: 0 0 auto;
-  margin-top: 0.12rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 1.5rem;
   color: var(--muted);
-  font-size: 0.8rem;
-  line-height: 1.2;
+  font-size: 1.2rem;
+  line-height: 1;
 }
 
 #discuss-answer details[open] > summary::before {

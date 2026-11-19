@@ -4781,6 +4781,25 @@ def _act_discuss_timeline_layout(driver: Driver) -> None:
     driver.settle(200)
 
 
+def _act_discuss_terms(driver: Driver) -> None:
+    """`#1924` (c): summarize through the real route, then open the Terms
+    block the stub answer carries and bring it into view, so the shot
+    shows Terms rendering (heading, triangle, list)."""
+    _act_discuss_summary(driver)
+    driver.page.wait_for_function(
+        "() => !document.getElementById('discuss-terms').hidden "
+        "&& document.getElementById('discuss-terms-list').children.length >= 2",
+        timeout=30_000,
+    )
+    driver.page.locator("#discuss-terms > summary").click()
+    driver.page.wait_for_function(
+        "() => document.getElementById('discuss-terms').open",
+        timeout=5_000,
+    )
+    driver.js("document.getElementById('discuss-terms').scrollIntoView({block: 'start'})")
+    driver.settle(200)
+
+
 def _after_discuss_summary(driver: Driver) -> None:
     """Put the summarized messages back to unread, so the next profile's preview is real too."""
     if bool(driver.js("window.__visible('discuss-mark-unread')")):
@@ -7547,6 +7566,28 @@ SCENES: tuple[Scene, ...] = (
                 "document.getElementById('discuss-answer').textContent.includes('Model stub summary')",
             ),
             (
+                # `#1924` (a): the summary chips stand at the one small chip size.
+                "the summary chips stand at the small shared chip size",
+                "(() => { const chip = document.querySelector('.discuss-chip-bar--current .discuss-chip'); "
+                "if (!chip) return false; const root = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "return Math.abs(parseFloat(getComputedStyle(chip).fontSize) - root * 0.72) < 0.6; })()",
+            ),
+            (
+                # `#1924` (b): the section triangles read at heading size on a tall row.
+                "the summary triangles are readable on a tap-tall row",
+                "(() => { const s = document.querySelector('#discuss-answer details > summary'); "
+                "if (!s) return false; const root = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "return parseFloat(getComputedStyle(s, '::before').fontSize) >= root "
+                "&& s.getBoundingClientRect().height >= 32; })()",
+            ),
+            (
+                # `#1924` (c): the stub answer's Terms stand in the Terms block.
+                "the Terms block shows the stub answer's terms",
+                "!document.getElementById('discuss-terms').hidden "
+                "&& document.getElementById('discuss-terms-list').children.length >= 2 "
+                "&& document.getElementById('discuss-terms-summary').textContent.includes(\"Terms I didn't understand\")",
+            ),
+            (
                 "no fixture refusal is showing for Discuss",
                 "!document.getElementById('discuss-panel').textContent.includes('not served by this check') "
                 "&& !document.getElementById('discuss-panel').textContent.includes('not_found')",
@@ -7565,6 +7606,14 @@ SCENES: tuple[Scene, ...] = (
                 "the viewport is at the profile's full height",
                 "(window.visualViewport ? window.visualViewport.height : window.innerHeight) > 500",
             ),
+            (
+                # `#1924` (d): the whole Discuss composer clears the bottom row.
+                "the whole composer stands clear of the Summarize row",
+                "(() => { const ask = document.querySelector('.discuss-ask').getBoundingClientRect(); "
+                "const send = document.getElementById('discuss-send').getBoundingClientRect(); "
+                "const field = document.getElementById('discuss-followup').getBoundingClientRect(); "
+                "return ask.top < send.top || (send.bottom <= ask.top + 1 && field.bottom <= ask.top + 1); })()",
+            ),
         ),
     ),
     Scene(
@@ -7578,6 +7627,16 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the viewport really shrank (not the closed height under an open name)",
                 "(window.visualViewport ? window.visualViewport.height : window.innerHeight) <= 579",
+            ),
+            (
+                # `#1924` (d): with the keyboard up the composer still clears the row.
+                "the whole composer stands clear of the Summarize row",
+                "(() => { const ask = document.querySelector('.discuss-ask').getBoundingClientRect(); "
+                "const send = document.getElementById('discuss-send').getBoundingClientRect(); "
+                "const field = document.getElementById('discuss-followup').getBoundingClientRect(); "
+                "const draft = document.getElementById('discuss-save-draft').getBoundingClientRect(); "
+                "return ask.top < send.top || (send.bottom <= ask.top + 1 && field.bottom <= ask.top + 1 "
+                "&& draft.bottom <= ask.top + 1); })()",
             ),
             ("the switcher cards are not over the page", "!window.__visible('view-cards')"),
         ),
@@ -7773,10 +7832,54 @@ SCENES: tuple[Scene, ...] = (
                 "!!document.querySelector('.discuss-chip-bar--current') && !!document.querySelector('.discuss-chip-bar--timeline')",
             ),
             (
+                # `#1924` (a): every chip pair shares the one small size.
+                "every chip pair shares the one small size",
+                "(() => { const fs = (el) => (el ? parseFloat(getComputedStyle(el).fontSize) : -1); "
+                "const cur = fs(document.querySelector('.discuss-chip-bar--current .discuss-chip')); "
+                "const tl = fs(document.querySelector('.discuss-chip-bar--timeline .discuss-chip')); "
+                "const old = fs(document.querySelector('.discuss-old-toggle')); "
+                "const root = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "return cur > 0 && Math.abs(cur - tl) < 0.6 && Math.abs(cur - old) < 0.6 "
+                "&& Math.abs(cur - root * 0.72) < 0.6; })()",
+            ),
+            (
+                # `#1924` (b): the timeline triangles read at heading size on tall rows.
+                "the timeline triangles are readable on tap-tall rows",
+                "(() => { const root = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "return [...document.querySelectorAll('.discuss-collapsible > summary')].every((s) => "
+                "parseFloat(getComputedStyle(s, '::before').fontSize) >= root "
+                "&& s.getBoundingClientRect().height >= 32); })()",
+            ),
+            (
                 "Save draft is stacked over Send in the composer",
                 "(() => { const a = document.getElementById('discuss-save-draft').getBoundingClientRect(); "
                 "const b = document.getElementById('discuss-send').getBoundingClientRect(); "
                 "return a.bottom <= b.top + 1 && Math.abs(a.left - b.left) < 2; })()",
+            ),
+            ("no error banner is up", "!window.__visible('error-wrap')"),
+        ),
+    ),
+    Scene(
+        name="85-discuss-terms",
+        what="Discuss Terms open: the stub answer's unknown terms, listed under their fold",
+        act=_act_discuss_terms,
+        after=_after_discuss_summary,
+        profiles=MATRIX_PROFILES,
+        expect=(
+            ("the Discuss panel is open", "window.__visible('discuss-panel')"),
+            (
+                "the Terms block is open with its terms listed",
+                "document.getElementById('discuss-terms').open "
+                "&& document.getElementById('discuss-terms-list').children.length >= 2 "
+                "&& document.getElementById('discuss-terms-list').textContent.includes('cache-key rewrite')",
+            ),
+            (
+                # `#1924` (b): the Terms triangle reads at heading size on a tall row.
+                "the Terms triangle is readable on a tap-tall row",
+                "(() => { const s = document.querySelector('#discuss-terms > summary'); "
+                "const root = parseFloat(getComputedStyle(document.documentElement).fontSize); "
+                "return parseFloat(getComputedStyle(s, '::before').fontSize) >= root "
+                "&& s.getBoundingClientRect().height >= 32; })()",
             ),
             ("no error banner is up", "!window.__visible('error-wrap')"),
         ),
@@ -8048,7 +8151,7 @@ def run_captures(
     # empty pane there is the failure the matrix exists to catch. A wider walk skips those
     # states BY NAME instead — its server is deliberately cacheless (the Settings and Help
     # states photograph exactly that), so Discuss has no window to show there.
-    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-"))]
+    discuss_scenes = [s for s in scenes if s.name.startswith(("73-", "74-", "75-", "76-", "78-", "84-", "85-"))]
     discuss_only = bool(wanted) and len(wanted) == len(discuss_scenes)
     if discuss_scenes and not seed_discuss_cache(60 if discuss_only else 10):
         if discuss_only:
