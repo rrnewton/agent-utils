@@ -3675,6 +3675,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
           // is started again from that part on fresh tickets, a few times, before it is given up. A part
           // fetched ahead that fails while the one before it is still heard starts the read again from
           // the one being heard, so nothing is skipped.
+          // `#1872`: a truncated or undecodable body gets its one retry at this
+          // segment before any of the below: an aborted prefetch produces one
+          // without the vendor being at fault.
+          if (streamed && reason === "malformed" && retrySegmentOnce(at)) return;
           const wait = streamed && lost ? recoveryWait(recovery) : null;
           if (wait !== null) {
             const heard = nowPlaying !== null && nowPlaying!.id === id && !started[at] ? nowPlaying!.segment! : at;
