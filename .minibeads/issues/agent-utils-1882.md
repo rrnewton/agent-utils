@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-false-failed-deliveries: delivered prompts are filed failed when screen verification misses them'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -32,3 +32,7 @@ Before a queue drain files a delivery as failed, confirm against the harness's o
 # Notes
 
 Related closed precedent: #1099 claude-stranded-false-lost (stranded Claude Code pastes proved from the session transcript), #1085 muse-send-staged-unsubmitted, #1413 revive-keeps-queued-messages. Audit evidence was read-only and per-lane; no lane, host or person is named here.
+
+## Resolution
+
+[watermelon-full-preview] Landed 447ae119 on github/main (normal-priority gate: validate OK; combined tree verified, 190 focused Rust tests). A new `HarnessAdapter::transcript_took` proves a prompt from the harness's own session file — Claude Code's session JSONL (the #1099 reader), Codex's rollout (user `response_item`/`user_message`), Muse's journal (`runtime.user_intent.accepted`) — located by the record's own session, so another session's identical text never counts. The queue drain consults it only where it was about to file failed (the undelivered outcome, single and batched, and the lost-paste bound): a match at or after the claim (60 s slack) is recorded delivered (`queued`, never retyped), and absent a match the screen verdict stands. Tests: per-harness fake transcripts (accepted shapes prove; older, prefix, tool-result and assistant shapes do not), a drain test for both failure modes (typed exactly once, processed with the proof, `failed/` empty), and a forward-compat test: queue records are free-form documents read by known keys only (the #809/#813 rule: unknown keys are ignored or kept, never refused), pinned by `a_processed_record_carrying_transcript_proof_still_loads` — the one new persisted field is `transcript_proof` (string, only on processed records rescued this way; additive, default-off semantics unchanged). Live: a send through the fixed build to a test Muse agent delivered with an empty `failed/` queue. The Python edition keeps the screen-only rule; that divergence is recorded in the harness-support matrix, and the matrix's delivery-receipts row names the proof.
